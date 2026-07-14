@@ -49,6 +49,15 @@ Before filing, build the **capability manifest** (`gates.md` → *Capability Man
 
 Commit the manifest beside the PRD (the overlay names the path; generic default `<prd-path-without-ext>.capability-manifest.md`). This is the artifact a dispatch-time architect or downstream verifier diffs against substrate — the point is to pay the substrate check **once, here**, not once per task at dispatch. The empty-value sentinel, the production-entry-path grep targets, and the floor references are **[overlay]**-supplied; in generic mode, bind by hand against the codebase.
 
+**Also emit the machine-readable YAML sidecar twin**, alongside the `.md` manifest, at the **strictly derived** path `re.sub(r'\.md$', '', prd_path) + '.capability-manifest.yaml'` — never a hand-named or overlay-supplied path, unlike the `.md` twin (PRD §Resolved design decisions #2; the existing `.md` manifests drifted from their PRD's filename — e.g. `cross-project-task-deps.capability-manifest.md` vs `…-task-deps-prd.md` — so the sidecar convention is mechanical instead, letting a downstream stamper locate it from `metadata.prd_path` alone). **The two filenames may therefore legitimately have different stems — the `.md` path can be hand-named or overlay-supplied, the `.yaml` path is always PRD-derived; never rename the sidecar to match a drifted `.md` manifest.** Schema + validating loader: `shared/src/shared/capability_manifest.py` (`CapabilityManifestDoc`); full field reference at `plans/capability-delivered-checks-prd.md` §Contract. Imitate the committed exemplar, `plans/capability-delivered-checks-prd.capability-manifest.yaml`.
+
+For each capability, optionally bind a `delivered_check` — the dispatch-time-checkable twin of the authoring-time evidence binding above:
+- **Pattern-anchored, never `file:line`.** A check is either `kind: grep` (an ERE run via `git grep -E`, with `pattern` + `expect: present|absent` + optional `paths`) or `kind: script` (a short repo-relative committed script, must exist & be executable, exit 0 = delivered, bounded `timeout_secs`). Never bind a check to `file:line` — line anchors go stale the moment the file changes again.
+- **`expect: absent`** is how a rejection-style capability (G6 branch 4) is expressed mechanically — the check passes when the asserted diagnostic/pattern does **not** appear.
+- **`kind: manual`** for capabilities that aren't mechanically expressible — field-population judgments, rejection-mechanism nuances a fixture already covers qualitatively. Record it in the sidecar (with a `reason`), but it is **excluded from the dispatch gate**: only mechanical (`grep`/`script`) checks get copied into a producer task's `metadata.delivered_checks`.
+
+The sidecar's `task_id` fields stay `null` (Greek labels only) until it is stamped — see the post-`commit_planning` step after Step 5.
+
 ### Step 3 — File tasks (ALWAYS planning_mode=True; synchronous, curator-bypassing)
 
 PRD-decomposition batches are the canonical use case for `planning_mode=True`. **Every task in the batch is filed with `planning_mode=True`, no exceptions.** This lands them as `deferred` so the scheduler picks nothing up before the wiring is complete and the batch is flipped together in Step 5.
@@ -129,6 +138,14 @@ mcp__fused-memory__commit_planning(
 
 If a single bulk call is rejected (e.g. payload-size cap), split into the smallest number of bulk calls that fit — still never one-at-a-time.
 
+### Step 5.5 — Stamp + commit the sidecar
+
+`commit_planning` is also the mechanical Greek-label → real-task-id mapping point: for every task in the batch carrying `metadata.prd_path` + `metadata.prd_task_label`, it locates the YAML sidecar from Step 2.5, stamps the matching label's `task_id`, writes the file back, and copies that label's mechanical (`grep`/`script`) `delivered_check`s into the producer task's `metadata.delivered_checks` (`manual` checks are never copied — they stay sidecar-only, excluded from the dispatch gate). The response carries a structured `manifest_stamping` report (`{path, stamped: [...], missing_labels: [...], errors: [...]}`); no sidecar on disk is a no-op — every non-manifest batch is byte-identical to today.
+
+The decompose session then commits the stamped sidecar — `git commit --only <sidecar>` in the same skill turn — mirroring how the `.md` manifest is committed beside the PRD (see CLAUDE.md "Working in the main checkout" for the `--only` rationale: it avoids sweeping up unrelated concurrent state in a machine-operated checkout).
+
+> **Interim reality.** Until sibling task γ lands, `commit_planning` does not yet perform this stamp. Hand-stamp `task_id` into the sidecar and commit it yourself, matching the committed exemplar's file header.
+
 ### Step 6 — Verify
 
 ```
@@ -148,6 +165,7 @@ State:
 - Number of tasks filed.
 - Number of intra-batch and out-of-batch dependencies wired.
 - The committed **capability-manifest** path, and any bindings that had to be resolved (re-scoped / re-homed / bound relaxed) to clear the gate.
+- The **YAML sidecar** path, whether `commit_planning` stamped it (or it was hand-stamped per the Step 5.5 interim note), and which producer tasks now carry `metadata.delivered_checks`.
 - Any tasks that came back `combined` (and into what).
 - A note that the orchestrator does **not** currently read `user_observable_signal` / `consumer_ref` / the substrate-confirmed flag — this metadata is substrate for a future tracking-infra session.
 
