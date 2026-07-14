@@ -2258,6 +2258,8 @@ def _emit_merge_attempt(
     train_id: str | None = None,
     member_task_ids: list[str] | None = None,
     disposition: MergeFailureDisposition | None = None,
+    origin_host: str | None = None,
+    probe_host: str | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` event for the given outcome.
 
@@ -2286,6 +2288,18 @@ def _emit_merge_attempt(
     added — existing callers' payloads stay byte-identical. Production
     call sites are threaded by task 2383 β; this parameter's mechanism is
     proven independently by a direct-emit unit test.
+
+    *origin_host* / *probe_host* are the optional HOST-AFFINITY placement
+    record for a ``main_health_red`` outcome (task 2565): ``origin_host`` is
+    ``'local'``/``'remote'`` depending on which host ran the failing
+    post-merge verify that triggered the main-health probe; ``probe_host``
+    is always ``'local'`` — the probe itself never runs remote-affine (see
+    :func:`verify_failure_is_preexisting_on_main`'s LEASE-SAFETY &
+    HOST-AFFINITY contract). Recording both makes the deliberate local-only
+    placement decision OBSERVABLE in telemetry even when the triggering
+    verify ran remote. When omitted (the default; every non-main-health-red
+    call site), neither key is added — existing callers' payloads stay
+    byte-identical.
     """
     if event_store is not None:
         data: dict = {'outcome': outcome}
@@ -2297,6 +2311,10 @@ def _emit_merge_attempt(
             data['member_task_ids'] = member_task_ids
         if disposition is not None:
             data['disposition'] = disposition.value
+        if origin_host is not None:
+            data['origin_host'] = origin_host
+        if probe_host is not None:
+            data['probe_host'] = probe_host
         event_store.emit(
             EventType.merge_attempt, task_id=task_id, phase='merge',
             data=data, duration_ms=duration_ms,
