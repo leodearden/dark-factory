@@ -340,3 +340,79 @@ class TestParsePiSuccess:
         agent_result = _parse_pi_output(result, 'anthropic/claude-haiku-4-5')
         assert agent_result.turns == 2
         assert agent_result.cost_usd == pytest.approx(0.0018225)
+
+
+class TestParsePiStreamError:
+    """`_parse_pi_output` must NOT derive success from the process exit code
+    alone (spike Q1, LOAD-BEARING): pi's `--mode json -p` exits 0 even on a
+    hard API failure (401/400/out-of-quota) — the failure lives IN the
+    stream as a terminal assistant message with stopReason=='error' and/or
+    errorMessage set, willRetry=false. This is the key divergence from
+    _parse_codex_output, which leans on returncode==0 alone."""
+
+    def test_stop_reason_error_is_failure_despite_returncode_zero(self):
+        """returncode==0 but the terminal assistant message carries
+        stopReason=='error' and errorMessage -> success False, subtype
+        'error', even though the process exited cleanly."""
+        error_message = {
+            'role': 'assistant',
+            'stopReason': 'error',
+            'errorMessage': '401 invalid x-api-key',
+            'usage': {'input': 50, 'output': 0, 'totalTokens': 50, 'cost': {'total': 0.0}},
+            'content': [],
+        }
+        events = [
+            {'type': 'session', 'id': 'sess-err-1'},
+            {'type': 'turn_end', 'message': error_message},
+            {'type': 'agent_end', 'messages': [error_message], 'willRetry': False},
+            {'type': 'agent_settled'},
+        ]
+        payload = '\n'.join(json.dumps(e) for e in events)
+        result = _make_subprocess_result(stdout=payload, returncode=0)
+        agent_result = _parse_pi_output(result, 'anthropic/claude-haiku-4-5')
+        assert agent_result.success is False
+        assert agent_result.subtype == 'error'
+
+    def test_non_error_stop_reason_is_success(self):
+        """A natural terminal stopReason (e.g. 'tool_calls', not 'error')
+        with returncode==0 is a success — only 'error'/errorMessage marks
+        failure, not any other stopReason value."""
+        message = {
+            'role': 'assistant',
+            'stopReason': 'tool_calls',
+            'usage': {'input': 50, 'output': 10, 'totalTokens': 60, 'cost': {'total': 0.0005}},
+            'content': [{'type': 'text', 'text': 'done'}],
+        }
+        events = [
+            {'type': 'session', 'id': 'sess-ok-1'},
+            {'type': 'turn_end', 'message': message},
+            {'type': 'agent_end', 'messages': [message], 'willRetry': False},
+            {'type': 'agent_settled'},
+        ]
+        payload = '\n'.join(json.dumps(e) for e in events)
+        result = _make_subprocess_result(stdout=payload, returncode=0)
+        agent_result = _parse_pi_output(result, 'anthropic/claude-haiku-4-5')
+        assert agent_result.success is True
+        assert agent_result.subtype == 'success'
+
+    def test_error_message_present_without_error_stop_reason_is_failure(self):
+        """A well-formed stopReason=='stop' but with errorMessage present is
+        still a failure — errorMessage alone is sufficient to fail it."""
+        message = {
+            'role': 'assistant',
+            'stopReason': 'stop',
+            'errorMessage': 'partial failure mid-stream',
+            'usage': {'input': 50, 'output': 5, 'totalTokens': 55, 'cost': {'total': 0.0002}},
+            'content': [{'type': 'text', 'text': 'partial'}],
+        }
+        events = [
+            {'type': 'session', 'id': 'sess-err-2'},
+            {'type': 'turn_end', 'message': message},
+            {'type': 'agent_end', 'messages': [message], 'willRetry': False},
+            {'type': 'agent_settled'},
+        ]
+        payload = '\n'.join(json.dumps(e) for e in events)
+        result = _make_subprocess_result(stdout=payload, returncode=0)
+        agent_result = _parse_pi_output(result, 'anthropic/claude-haiku-4-5')
+        assert agent_result.success is False
+        assert agent_result.subtype == 'error'
