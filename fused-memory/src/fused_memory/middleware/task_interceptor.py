@@ -3772,6 +3772,26 @@ class TaskInterceptor:
                     tm.remove_tasks(list(ids), project_root, tag),
                 )
             )
+            # Layer A witness-eviction (curator corpus RC1 — task 2520):
+            # evict each removed task's vector from the curator corpus so it
+            # never lingers as a stale duplicate-detection neighbour.
+            # Best-effort, and still inside the curator lock so the next
+            # curator waiter sees row-gone AND vector-gone together. Wrapped
+            # defense-in-depth beyond evict_task's own swallow — an eviction
+            # error must never fail the removal itself. Evictions run
+            # concurrently (not a sequential loop) so a multi-id batch does
+            # not serialize N Qdrant round-trips while holding both locks —
+            # each evict_task call already swallows its own errors, so a
+            # failure in one does not short-circuit the others.
+            try:
+                removed = result.get('removed_ids') or ids
+                curator = await self._get_curator()
+                if curator is not None:
+                    await asyncio.gather(
+                        *(curator.evict_task(project_id, str(tid)) for tid in removed)
+                    )
+            except Exception:
+                logger.warning('remove_tasks: curator eviction failed', exc_info=True)
         # One task_deleted event per requested id — clearer reconciliation
         # signal than a single batched event, and matches the existing
         # per-id semantics elsewhere in the journal.

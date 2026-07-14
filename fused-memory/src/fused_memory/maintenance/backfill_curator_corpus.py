@@ -32,7 +32,12 @@ from typing import TYPE_CHECKING
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.maintenance._utils import maintenance_service
-from fused_memory.middleware.task_curator import BackfillResult, TaskCurator, flatten_task_tree
+from fused_memory.middleware.task_curator import (
+    BackfillResult,
+    PruneResult,
+    TaskCurator,
+    flatten_task_tree,
+)
 from fused_memory.models.scope import resolve_project_id
 
 if TYPE_CHECKING:
@@ -51,6 +56,18 @@ class BackfillReport:
     upserted: int = 0
     skipped: int = 0
     errors: int = 0
+
+
+@dataclass
+class PruneReport:
+    """Aggregate report from a prune run."""
+
+    project_root: str
+    project_id: str
+    live_tasks: int = 0
+    pruned: int = 0
+    skipped: bool = False
+    reason: str = ''
 
 
 class BackfillManager:
@@ -100,6 +117,67 @@ class BackfillManager:
             report.upserted, report.skipped, report.errors,
         )
         return report
+
+    async def prune(self, project_root: str) -> PruneReport:
+        """Fetch the full task tree and prune corpus vectors orphaned by task removal.
+
+        Reads the KNOWN-COMPLETE live task snapshot via ``get_tasks`` and diffs
+        it against the corpus (curator corpus RC1 — task 2520, Layer C). This is
+        the explicit reconciliation-sweep backstop to Layer A's witness-eviction
+        in TaskInterceptor.remove_tasks — it also cleans any pre-existing strays.
+
+        CAUTION — tag scope: ``get_tasks(project_root)`` below is called
+        with no ``tag``, so it defaults to ``DEFAULT_TAG`` (the SQLite
+        backend's own default) and only ever sees that one tag's tasks. The
+        curator corpus, however, is populated for every tag a task is ever
+        filed under (see ``TaskCurator.prune_orphans``'s docstring). If any
+        task was ever recorded under a non-default tag, its corpus vector is
+        invisible to this snapshot and will be pruned as a false orphan.
+        This is a known gap — tracked for follow-up, not fixed here — because
+        closing it needs a way to enumerate/aggregate all tags, which the
+        task backend does not currently expose.
+
+        Args:
+            project_root: Absolute path to the project root (used to derive project_id
+                          and to call get_tasks).
+
+        Returns:
+            PruneReport with live-task count and prune outcome.
+        """
+        project_id = resolve_project_id(project_root)
+
+        logger.info('backfill_curator_corpus: fetching task tree for prune sweep %s', project_root)
+        try:
+            tasks_result = await self.taskmaster.get_tasks(project_root)
+        except Exception:
+            logger.warning(
+                'prune: get_tasks failed — skipping prune (fail-safe)', exc_info=True,
+            )
+            return PruneReport(
+                project_root=project_root,
+                project_id=project_id,
+                skipped=True,
+                reason='read_failed',
+            )
+        flat_tasks = flatten_task_tree(tasks_result)
+        live_ids = {
+            str(t.get('id')) for t in flat_tasks if t.get('id') is not None and str(t.get('id'))
+        }
+
+        result: PruneResult = await self.curator.prune_orphans(project_id, live_ids)
+
+        logger.info(
+            'backfill_curator_corpus: prune complete — pruned=%d live=%d skipped=%s',
+            result.pruned, len(live_ids), result.skipped,
+        )
+        return PruneReport(
+            project_root=project_root,
+            project_id=project_id,
+            live_tasks=len(live_ids),
+            pruned=result.pruned,
+            skipped=result.skipped,
+            reason=result.reason,
+        )
 
 
 async def run_backfill(
@@ -156,6 +234,46 @@ async def run_backfill(
         )
 
 
+async def run_prune(
+    config_path: str | None = None,
+    project_root: str = '.',
+) -> PruneReport:
+    """Load config, open the task backend, run the orphan-vector prune sweep, and close resources.
+
+    This is the CLI-callable entrypoint for curator corpus RC1 Layer C. It:
+    1. Loads FusedMemoryConfig (honouring CONFIG_PATH env var or config_path arg).
+    2. Creates a SqliteTaskBackend from config.taskmaster and connects it.
+    3. Creates a TaskCurator and runs BackfillManager.prune().
+    4. Returns a PruneReport with the live-task count and prune outcome.
+
+    Args:
+        config_path: Optional path to the YAML config file.  When given it is
+                     set as CONFIG_PATH before constructing FusedMemoryConfig.
+        project_root: Absolute path to the project root directory.
+
+    Returns:
+        PruneReport with live-task count and prune outcome.
+    """
+    async with maintenance_service(config_path) as (config, _service):
+        if config.taskmaster is not None:
+            tm_config = config.taskmaster.model_copy(update={'project_root': project_root})
+        else:
+            tm_config = TaskmasterConfig(project_root=project_root)
+        taskmaster = SqliteTaskBackend(config=tm_config)
+        await taskmaster.start()
+
+        curator = TaskCurator(config=config, taskmaster=taskmaster)
+
+        try:
+            manager = BackfillManager(config=config, taskmaster=taskmaster, curator=curator)
+            report = await manager.prune(project_root=project_root)
+        finally:
+            await curator.close()
+            await taskmaster.close()
+
+        return report
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -174,10 +292,27 @@ if __name__ == '__main__':
         default=None,
         help='Path to the YAML config file (overrides CONFIG_PATH env var).',
     )
+    parser.add_argument(
+        '--prune',
+        action='store_true',
+        help=(
+            'Run the orphan-vector prune sweep (curator corpus RC1 Layer C) '
+            'instead of the default backfill.'
+        ),
+    )
     args = parser.parse_args()
 
-    result = asyncio.run(run_backfill(config_path=args.config, project_root=args.project_root))
-    print(
-        f'Backfill complete: upserted={result.upserted} skipped={result.skipped} '
-        f'errors={result.errors}'
-    )
+    if args.prune:
+        prune_report = asyncio.run(
+            run_prune(config_path=args.config, project_root=args.project_root)
+        )
+        print(
+            f'Prune complete: pruned={prune_report.pruned} live={prune_report.live_tasks} '
+            f'skipped={prune_report.skipped} reason={prune_report.reason!r}'
+        )
+    else:
+        result = asyncio.run(run_backfill(config_path=args.config, project_root=args.project_root))
+        print(
+            f'Backfill complete: upserted={result.upserted} skipped={result.skipped} '
+            f'errors={result.errors}'
+        )

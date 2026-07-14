@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -5247,4 +5249,164 @@ class TestCuratorBatchRouteDeterministic:
         assert decisions[1].action == "drop"
         assert decisions[1].batch_target_index == 0
         assert decisions[1].justification == "pre-batch-dedup: identical payload_hash"
+
+
+# ----------------------------------------------------------------------
+# TaskCurator.evict_task() — witness deletion at task-removal time
+# (curator corpus RC1 — task 2520)
+# ----------------------------------------------------------------------
+
+
+def _expected_point_id(project_id: str, task_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f'{project_id}/{task_id}'))
+
+
+class TestEvictTask:
+    @pytest.mark.asyncio
+    async def test_evict_task_deletes_point(self):
+        """evict_task() deletes the exact deterministic point for (project_id, task_id)."""
+        from qdrant_client.models import PointIdsList
+
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        mock_client = AsyncMock()
+        mock_client.collection_exists = AsyncMock(return_value=True)
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client):
+            await curator.evict_task('proj', '292')
+
+        mock_client.delete.assert_awaited_once()
+        call_kwargs = mock_client.delete.call_args.kwargs
+        assert call_kwargs.get('collection_name') == 'task_curator_proj'
+        points_selector = call_kwargs.get('points_selector')
+        assert isinstance(points_selector, PointIdsList)
+        assert points_selector.points == [_expected_point_id('proj', '292')]
+
+    @pytest.mark.asyncio
+    async def test_evict_task_best_effort_on_qdrant_error(self, caplog):
+        """evict_task() swallows Qdrant errors (logs WARNING) and no-ops when
+        the collection doesn't exist — never fails task removal."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        # Qdrant error during delete: must not raise, must log a WARNING.
+        mock_client = AsyncMock()
+        mock_client.collection_exists = AsyncMock(return_value=True)
+        mock_client.delete = AsyncMock(side_effect=RuntimeError('qdrant down'))
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client), \
+             caplog.at_level(
+                 logging.WARNING, logger='fused_memory.middleware.task_curator',
+             ):
+            result = await curator.evict_task('proj', '7')
+
+        assert result is None
+        assert any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        ), f'expected a WARNING log, got: {[(r.levelno, r.message) for r in caplog.records]}'
+
+        # Missing collection: delete must not even be attempted (no-op).
+        mock_client_missing = AsyncMock()
+        mock_client_missing.collection_exists = AsyncMock(return_value=False)
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client_missing):
+            await curator.evict_task('proj', '7')
+
+        mock_client_missing.delete.assert_not_called()
+
+
+# ----------------------------------------------------------------------
+# TaskCurator.prune_orphans() — health-gated reconciliation sweep
+# (curator corpus RC1 — task 2520, Layer C)
+# ----------------------------------------------------------------------
+
+
+class TestPruneOrphans:
+    @pytest.mark.asyncio
+    async def test_prune_deletes_orphans(self):
+        """prune_orphans() deletes corpus points whose task id is absent from
+        the live snapshot, computing orphans via the deterministic point-id
+        scheme rather than payload task_id."""
+        from types import SimpleNamespace
+
+        from qdrant_client.models import PointIdsList
+
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        corpus_task_ids = {'1', '2', '2506', '2519'}
+        records = [
+            SimpleNamespace(id=_expected_point_id('proj', tid))
+            for tid in corpus_task_ids
+        ]
+
+        mock_client = AsyncMock()
+        mock_client.collection_exists = AsyncMock(return_value=True)
+        mock_client.scroll = AsyncMock(return_value=(records, None))
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client):
+            result = await curator.prune_orphans('proj', {'1', '2'})
+
+        mock_client.delete.assert_awaited_once()
+        call_kwargs = mock_client.delete.call_args.kwargs
+        assert call_kwargs.get('collection_name') == 'task_curator_proj'
+        points_selector = call_kwargs.get('points_selector')
+        assert isinstance(points_selector, PointIdsList)
+        assert set(points_selector.points) == {
+            _expected_point_id('proj', '2506'),
+            _expected_point_id('proj', '2519'),
+        }
+        assert result.pruned == 2
+
+    @pytest.mark.asyncio
+    async def test_prune_empty_live_is_noop(self):
+        """Corpus-nuke regression guard: an empty live set (e.g. from a total
+        live-read failure) must never be treated as 'every point is an
+        orphan'. The hard gate must refuse before touching Qdrant at all."""
+        from types import SimpleNamespace
+
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        records = [
+            SimpleNamespace(id=_expected_point_id('proj', tid))
+            for tid in ('1', '2')
+        ]
+
+        mock_client = AsyncMock()
+        mock_client.collection_exists = AsyncMock(return_value=True)
+        mock_client.scroll = AsyncMock(return_value=(records, None))
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client):
+            result = await curator.prune_orphans('proj', set())
+
+        mock_client.scroll.assert_not_called()
+        mock_client.delete.assert_not_called()
+        assert result.skipped is True
+        assert result.pruned == 0
+
+    @pytest.mark.asyncio
+    async def test_prune_best_effort_on_qdrant_error(self, caplog):
+        """A Qdrant error mid-sweep (e.g. scroll failing) must degrade to a
+        safe skipped no-op, not raise — never fail the reconciliation sweep."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        mock_client = AsyncMock()
+        mock_client.collection_exists = AsyncMock(return_value=True)
+        mock_client.scroll = AsyncMock(side_effect=RuntimeError('qdrant down'))
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client), \
+             caplog.at_level(
+                 logging.WARNING, logger='fused_memory.middleware.task_curator',
+             ):
+            result = await curator.prune_orphans('proj', {'1', '2'})
+
+        mock_client.delete.assert_not_called()
+        assert result.skipped is True
+        assert result.pruned == 0
+        assert any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        ), f'expected a WARNING log, got: {[(r.levelno, r.message) for r in caplog.records]}'
 

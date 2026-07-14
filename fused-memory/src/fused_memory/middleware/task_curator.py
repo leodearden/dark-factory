@@ -51,6 +51,7 @@ from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.reconciliation.context_assembler import estimate_tokens
 
 if TYPE_CHECKING:
+    from qdrant_client.models import ExtendedPointId
     from shared.usage_gate import UsageGate
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -265,6 +266,17 @@ class BackfillResult:
     upserted: int = 0
     skipped: int = 0
     errors: int = 0
+
+
+@dataclass
+class PruneResult:
+    """Result of a prune_orphans() call."""
+
+    pruned: int = 0
+    corpus_scanned: int = 0
+    live: int = 0
+    skipped: bool = False
+    reason: str = ''
 
 
 @dataclass
@@ -1561,6 +1573,33 @@ class TaskCurator:
         """
         await self.record_task(task_id, candidate, project_id)
 
+    async def evict_task(self, project_id: str, task_id: str) -> None:
+        """Delete a task's vector from the curator corpus.
+
+        Called when a task is removed, so its embedding never lingers as a
+        stale duplicate-detection neighbour. Reuses record_task's
+        deterministic point-id scheme (_point_id) to target the exact point
+        that record_task/backfill_corpus wrote. Best-effort — degrades to a
+        logged warning on any error (see caller wrapping).
+        """
+        try:
+            client = await self._get_qdrant()
+            collection = self._collection_name(project_id)
+            if not await client.collection_exists(collection):
+                return
+
+            from qdrant_client.models import PointIdsList
+
+            point_id = self._point_id(project_id, task_id)
+            await client.delete(
+                collection_name=collection,
+                points_selector=PointIdsList(points=[point_id]),
+            )
+        except Exception:
+            logger.warning(
+                'task_curator: evict_task failed for %s', task_id, exc_info=True,
+            )
+
     @staticmethod
     def _point_id(project_id: str, task_id: str) -> str:
         """Deterministic UUID5 point ID for a task in a project.
@@ -1731,6 +1770,81 @@ class TaskCurator:
             project_id, result.upserted, result.skipped, result.errors,
         )
         return result
+
+    async def prune_orphans(self, project_id: str, live_task_ids) -> PruneResult:
+        """Health-gated reconciliation sweep: delete corpus points for tasks
+        that no longer exist in a live snapshot.
+
+        Orphans are computed by mapping ``live_task_ids`` through the same
+        deterministic point-id scheme record_task/backfill_corpus use to
+        write points (_point_id), then diffing against the actual corpus
+        point ids — robust to payload drift, no reliance on payload task_id.
+
+        CAUTION — tag scope: the corpus is keyed by ``project_id`` alone
+        (``_point_id``/``_collection_name`` take no ``tag``), and
+        ``record_task``/``index_committed_tasks`` record a task's vector
+        regardless of which tag it was filed under. ``live_task_ids`` MUST
+        therefore already aggregate every tag the corpus could contain a
+        vector for — if it only reflects a single tag's tasks, tasks filed
+        under any other tag will look orphaned and be deleted here. As of
+        this writing the only caller (``BackfillManager.prune``) reads a
+        single tag (``get_tasks`` defaults to ``DEFAULT_TAG``), which is a
+        known gap tracked for follow-up rather than fixed in this method —
+        see the matching note on ``BackfillManager.prune``.
+        """
+        live = {str(t) for t in live_task_ids}
+        if not live:
+            # Hard gate: a total live-read failure surfaces as an empty
+            # set. Without this, an empty live set would make every corpus
+            # point look orphaned and prune_orphans would nuke the whole
+            # corpus. Refuse before ever touching Qdrant.
+            logger.warning(
+                'task_curator: prune_orphans refused — empty live snapshot '
+                'for %s (fail-safe, no prune)', project_id,
+            )
+            return PruneResult(skipped=True, reason='empty_live_snapshot')
+
+        try:
+            client = await self._get_qdrant()
+            collection = self._collection_name(project_id)
+            if not await client.collection_exists(collection):
+                return PruneResult(live=len(live))
+
+            corpus_ids: list[str] = []
+            offset = None
+            while True:
+                records, offset = await client.scroll(
+                    collection_name=collection,
+                    limit=256,
+                    offset=offset,
+                    with_payload=False,
+                    with_vectors=False,
+                )
+                corpus_ids.extend(str(r.id) for r in records)
+                if offset is None:
+                    break
+
+            live_point_ids = {self._point_id(project_id, tid) for tid in live}
+            orphans: list[ExtendedPointId] = [
+                pid for pid in corpus_ids if pid not in live_point_ids
+            ]
+
+            if orphans:
+                from qdrant_client.models import PointIdsList
+
+                await client.delete(
+                    collection_name=collection,
+                    points_selector=PointIdsList(points=orphans),
+                )
+
+            return PruneResult(
+                pruned=len(orphans), corpus_scanned=len(corpus_ids), live=len(live),
+            )
+        except Exception:
+            logger.warning(
+                'task_curator: prune_orphans failed for %s', project_id, exc_info=True,
+            )
+            return PruneResult(skipped=True, reason='error', live=len(live))
 
     async def close(self) -> None:
         if self._qdrant_client is not None:
