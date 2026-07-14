@@ -1209,6 +1209,7 @@ async def _run_deferred_main_health_probe(
     escalation_queue: Any = None,
     event_store: EventStore | None = None,
     auto_heal: Callable[[MergeOutcome, MergeRequest], Awaitable[None]] | None = None,
+    origin_is_local: bool = True,
 ) -> None:
     """Off-critical-path main-health classification (task 2564).
 
