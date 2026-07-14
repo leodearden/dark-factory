@@ -384,6 +384,79 @@ class TestFindStaleMarkers:
 
 
 # ===========================================================================
+# Tests: find_terminal_task_markers
+# ===========================================================================
+
+class TestFindTerminalTaskMarkers:
+    """Tests for the pure function
+    find_terminal_task_markers(members, terminal_task_ids) (task 2596 —
+    restores the terminal-drain semantics of the retired
+    _sweep_terminal_task_flag_markers, task 2103/2150).
+    """
+
+    _TERMINAL = {'2440', '1944', '12', '15'}
+
+    def test_numeric_terminal_task_id_is_returned(self):
+        """A numeric task_id present in terminal_task_ids is returned."""
+        member = _member('m1', task_id='2440')
+        result = _mod.find_terminal_task_markers([member], self._TERMINAL)
+        assert result == [member], f'Expected [m1], got: {result!r}'
+
+    def test_numeric_pending_task_id_is_kept(self):
+        """A numeric task_id NOT in terminal_task_ids is kept (not returned)."""
+        member = _member('m2', task_id='2408')
+        result = _mod.find_terminal_task_markers([member], self._TERMINAL)
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_comma_joined_requires_all_components_terminal(self):
+        """A comma-joined task_id with one non-terminal component is kept."""
+        member = _member('m3', task_id='1944,2408')  # 1944 done, 2408 pending
+        result = _mod.find_terminal_task_markers([member], self._TERMINAL)
+        assert result == [], f'Expected [] (2408 not terminal), got: {result!r}'
+
+    def test_comma_joined_all_terminal_is_returned(self):
+        """A comma-joined task_id whose every component is terminal is returned."""
+        member = _member('m4', task_id='12,15')
+        result = _mod.find_terminal_task_markers([member], self._TERMINAL)
+        assert result == [member], f'Expected [m4], got: {result!r}'
+
+    def test_fp_hash_task_id_is_never_returned(self):
+        """An fp:-hash task_id is never matched, regardless of terminal_task_ids."""
+        member = _member('m5', task_id='fp:' + 'a' * 32)
+        result = _mod.find_terminal_task_markers([member], self._TERMINAL)
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_null_or_invalid_task_id_is_never_returned(self):
+        """A missing/None task_id is never matched."""
+        member = _taskless('m6')
+        result = _mod.find_terminal_task_markers([member], self._TERMINAL)
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_empty_terminal_set_returns_empty(self):
+        """An empty terminal_task_ids set matches nothing, even a would-be
+        terminal id."""
+        member = _member('m7', task_id='2440')
+        result = _mod.find_terminal_task_markers([member], set())
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_preserves_order_and_identity(self):
+        """Returned dicts are the same objects, in input order."""
+        term_a = _member('ta', task_id='2440')
+        kept = _member('kp', task_id='2408')
+        term_b = _member('tb', task_id='12,15')
+        members = [term_a, kept, term_b]
+        result = _mod.find_terminal_task_markers(members, self._TERMINAL)
+        assert result == [term_a, term_b], f'Expected [ta, tb], got: {result!r}'
+        assert result[0] is term_a, 'Expected same object identity'
+        assert result[1] is term_b, 'Expected same object identity'
+
+    def test_empty_input_returns_empty(self):
+        """Empty input list returns empty list."""
+        result = _mod.find_terminal_task_markers([], self._TERMINAL)
+        assert result == []
+
+
+# ===========================================================================
 # Tests: delete_orphan_markers
 # ===========================================================================
 
