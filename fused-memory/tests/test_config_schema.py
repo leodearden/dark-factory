@@ -969,5 +969,11 @@ class TestTaskStatusConfig:
     def test_override_enables_enforce_mode(self):
         assert TaskStatusConfig(enforce_transitions=True).enforce_transitions is True
 
-    def test_fused_memory_config_attaches_disabled_by_default(self):
-        assert FusedMemoryConfig().task_status.enforce_transitions is False
+    def test_fused_memory_config_loads_enforce_flip_from_yaml(self):
+        # The committed config.yaml enables enforce-mode: task 2216 flipped
+        # task_status.enforce_transitions -> true on 2026-07-14 (operator gate
+        # esc-2216-1) after the Gamma soak proved the transition table clean.
+        # FusedMemoryConfig() loads that committed config, so this pins the
+        # deployed Γ-flip and tripwires an accidental revert. The pure MODEL
+        # default (False) is covered by test_defaults_to_log_mode above.
+        assert FusedMemoryConfig().task_status.enforce_transitions is True
