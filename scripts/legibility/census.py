@@ -60,3 +60,27 @@ import config  # noqa: E402
 import digest  # noqa: E402
 import inventory  # noqa: E402
 from legibility import census_trigger  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# is_duplicate / batch_dup_rate — the saturation-mining novelty signal
+# ---------------------------------------------------------------------------
+
+def is_duplicate(record: dict) -> bool:
+    """A §7.3 coding record is a *duplicate* (a re-observation of an
+    already-known cause) iff it carries zero candidates -- a candidate is
+    the sole novelty signal in a coding record; matches-only or entirely
+    empty (``{"matches": [], "candidates": []}``) both mean "nothing new
+    here"."""
+    return len(record.get("candidates") or []) == 0
+
+
+def batch_dup_rate(records: list[dict]) -> float:
+    """Fraction of *records* that are duplicates (``is_duplicate`` True).
+    Returns ``0.0`` for an empty batch rather than raising
+    ZeroDivisionError -- an empty/all-failed batch has no signal either
+    way, and the saturation loop must be able to treat it as "not
+    saturated" without crashing."""
+    if not records:
+        return 0.0
+    return sum(1 for record in records if is_duplicate(record)) / len(records)
