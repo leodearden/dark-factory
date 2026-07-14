@@ -115,6 +115,65 @@ class TestParseTriageResult:
 
 
 # ---------------------------------------------------------------------------
+# extract_triage_verdict — verdict-tools artifact envelope unwrapping
+#
+# Local (function-scope) imports below, matching the codebase convention
+# (e.g. test_workflow_verdict_tools_injection.py) of importing not-yet-built
+# symbols inside the test body rather than at module level, so a RED failure
+# here does not cascade into an ImportError for every other test in this file.
+# ---------------------------------------------------------------------------
+
+class TestExtractTriageVerdict:
+    def test_valid_envelope_returns_verdict_payload(self):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        envelope = {
+            'role': 'triage',
+            'schema_version': 1,
+            'session_id': 'sess-1',
+            'emitted_at': '2026-07-14T00:00:00+00:00',
+            'verdict': {
+                'accepted': [{'index': 0, 'suggestion': 'x', 'reason': 'y',
+                              'files': ['a.py'], 'proposed_task_title': 'Fix x'}],
+                'skipped': [{'index': 1, 'suggestion': 'z', 'reason': 'n/a'}],
+                'proposed_task_groups': [{'title': 'Fix x', 'description': 'do it',
+                                          'accepted_indices': [0]}],
+            },
+        }
+        result = extract_triage_verdict(envelope)
+        assert result == envelope['verdict']
+
+    def test_none_envelope_returns_none(self):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        assert extract_triage_verdict(None) is None
+
+    def test_missing_verdict_key_returns_none(self):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        envelope = {'role': 'triage', 'schema_version': 1, 'session_id': 's'}
+        assert extract_triage_verdict(envelope) is None
+
+    def test_verdict_missing_required_key_returns_none(self):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        # 'proposed_task_groups' is absent from the verdict payload.
+        envelope = {'verdict': {'accepted': [], 'skipped': []}}
+        assert extract_triage_verdict(envelope) is None
+
+    def test_non_dict_envelope_returns_none(self):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        assert extract_triage_verdict('not a dict') is None
+
+    def test_non_dict_verdict_returns_none(self):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        envelope = {'verdict': 'not a dict'}
+        assert extract_triage_verdict(envelope) is None
+
+
+# ---------------------------------------------------------------------------
 # format_pretriaged_detail
 # ---------------------------------------------------------------------------
 
