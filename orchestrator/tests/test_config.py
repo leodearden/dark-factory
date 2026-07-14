@@ -2270,6 +2270,14 @@ class TestOrchestratorConfigPrices:
         assert set(table) == self._SEED_KEYS
         assert table['o4-mini'] == {'input_per_1m': 1.10, 'output_per_1m': 4.40}
 
+    def test_default_price_table_matches_defaults_yaml(self):
+        """config.py's `_DEFAULT_PRICES` constant and defaults.yaml's
+        `prices:` block are two hand-maintained copies of the same seed
+        table (task 2459 amendment) — nothing else enforces they agree, so
+        assert equality directly to catch future drift.
+        """
+        assert default_price_table() == _load_package_defaults()['prices']
+
 
 class TestPricesReloadDisposition:
     """`prices` is a green-tier hot-reloadable dict-valued top-level leaf,
