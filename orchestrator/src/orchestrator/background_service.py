@@ -151,3 +151,25 @@ class LifecycleRegistry:
         """Await each registered service's start(), in registration order."""
         for service in self._services:
             await service.start()
+
+    async def stop_all(self) -> None:
+        """Stop every registered service in REVERSE registration order.
+
+        Each ``stop()`` is bounded by the service's own ``stop_timeout_secs``
+        (LR-2 / S1): a wedging service is abandoned with a WARNING and the
+        ladder proceeds to the next service; a ``stop()`` that raises a
+        plain ``Exception`` is caught and logged so one failing service can
+        never abort the ladder. This is the structural elimination of the
+        shutdown-hang class this module exists to fix.
+        """
+        for service in reversed(self._services):
+            try:
+                await asyncio.wait_for(service.stop(), timeout=service.stop_timeout_secs)
+            except TimeoutError:
+                logger.warning(
+                    '%s did not stop within %.2fs — abandoning',
+                    service.name,
+                    service.stop_timeout_secs,
+                )
+            except Exception as exc:
+                logger.warning('%s stop() failed: %s', service.name, exc)
