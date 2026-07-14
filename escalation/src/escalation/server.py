@@ -13,6 +13,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
+from shared.branch_names import canonical_queued_branch_name
 
 from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
@@ -997,7 +998,7 @@ def create_server(
         # The resolved tip is also stored as merge_req.snapshot_tip (β1 D8).
         resolved_tip: str | None = None
         if git_ops_for_scan is not None:
-            full_branch = f'{orch_config.git.branch_prefix}{branch}'
+            full_branch = canonical_queued_branch_name(branch, orch_config.git.branch_prefix)
             resolved_tip = await git_ops_for_scan.resolve_branch_sha(full_branch)
             if resolved_tip is not None and await git_ops_for_scan.is_ancestor(
                 resolved_tip, orch_config.git.main_branch
@@ -1540,8 +1541,7 @@ def create_server(
                 )
         else:
             branch = path_or_branch
-            if not branch.startswith(gops.config.branch_prefix):
-                branch = f'{gops.config.branch_prefix}{branch}'
+            branch = canonical_queued_branch_name(branch, gops.config.branch_prefix)
             slug = branch.removeprefix(gops.config.branch_prefix)
             path = gops.worktree_base / f'{gops.config.iact_prefix}{slug}'
 
@@ -1830,13 +1830,6 @@ def create_server(
             key = branch if branch is not None else task_id
             if key is not None:
                 try:
-                    # Runtime-only reverse import: orchestrator depends on escalation,
-                    # not vice versa (mirrors the pattern above) — unresolvable in
-                    # escalation's standalone typecheck env, hence the suppression.
-                    from orchestrator.git_ops import (  # type: ignore[reportMissingImports]
-                        canonical_queued_branch_name,
-                    )
-
                     prefix = orch_config.git.branch_prefix
                     full_branch = canonical_queued_branch_name(key, prefix)
                     tip = await git_ops.resolve_branch_sha(full_branch)
