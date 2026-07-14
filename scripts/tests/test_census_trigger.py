@@ -19,6 +19,7 @@ import pytest
 import yaml
 
 from legibility import census_trigger as ct
+from legibility.config import Census as LegibilityCensus
 
 NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -56,6 +57,26 @@ def test_census_config_from_mapping_none_returns_defaults():
 
 def test_census_config_from_mapping_empty_dict_returns_defaults():
     assert ct.CensusConfig.from_mapping({}) == ct.CensusConfig()
+
+
+# ---------------------------------------------------------------------------
+# amendment pass (review finding #3): CensusConfig defaults must not
+# silently drift from task β's legibility.config.Census model, now that β
+# has landed and lives alongside this module in scripts/legibility/.
+# ---------------------------------------------------------------------------
+
+def test_census_config_defaults_match_legibility_config_census_model():
+    """Regression guard for the reuse fix: CensusConfig's field defaults are
+    sourced from legibility.config.Census (task β), not independently
+    hardcoded, so the two schemas cannot silently drift apart."""
+    beta_defaults = LegibilityCensus()
+    config = ct.CensusConfig()
+    assert config.max_interval_days == beta_defaults.max_interval_days
+    assert config.tasks_landed_threshold == beta_defaults.tasks_landed_threshold
+    assert config.tasks_landed_min_days == beta_defaults.tasks_landed_min_days
+    assert config.novelty_spike_count == beta_defaults.novelty_spike.count
+    assert config.novelty_spike_window_hours == beta_defaults.novelty_spike.window_hours
+    assert config.floor_days == beta_defaults.floor_days
 
 
 # ---------------------------------------------------------------------------

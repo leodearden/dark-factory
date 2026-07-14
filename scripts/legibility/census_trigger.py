@@ -20,10 +20,17 @@ delta is uncomputable without a persisted baseline. When
 `last_census_done_count` is absent (never censused, or η not yet writing
 it), condition (b) fails SAFE — it never fires — rather than guessing.
 
-This module deliberately does NOT import task β's `legibility.yaml` config
-loader (β has not landed; this task's only dependency is γ / codebook.py):
-`load_census_config` reads the `census:` block directly with a light
-pyyaml read, falling back to the §7.4 defaults hardcoded in `CensusConfig`.
+This module does NOT import task β's `legibility.yaml` config *loader*
+(`legibility.config.load_config`): that loader requires four mandatory
+top-level fields and raises `pydantic.ValidationError` on malformed input,
+which is the wrong contract for this module's fail-safe/silent-defaults
+`census:` block reader -- `load_census_config` instead reads the `census:`
+block directly with a light pyyaml read, falling back to defaults on a
+missing/malformed file. Those defaults ARE sourced from β's
+`legibility.config.Census` pydantic model (scripts/legibility/config.py),
+though -- now that β has landed, it is the single source of truth for the
+six §7.4 threshold values, so `CensusConfig`'s fields read their defaults
+from it rather than re-hardcoding them (see the `CensusConfig` docstring).
 
 The get_statuses done-count fetch is injected (`status_fetcher`), not a
 hardcoded MCP/HTTP client: the scripts/ test env (`uv run --project
@@ -47,6 +54,7 @@ from pathlib import Path
 import yaml
 
 from legibility import codebook
+from legibility.config import Census as _LegibilityCensus
 
 logger = logging.getLogger("legibility.census_trigger")
 
@@ -66,19 +74,31 @@ def _as_utc(value: datetime | None) -> datetime | None:
 # CensusConfig — §7.4 census: block, with hardcoded defaults
 # ---------------------------------------------------------------------------
 
+# Single source of truth for the six §7.4 threshold *values*: task β's
+# `Census` pydantic model (scripts/legibility/config.py), instantiated once
+# at import time. `CensusConfig` below stays its own flat dataclass (not
+# `Census` itself) because its nested `novelty_spike.count`/`window_hours`
+# shape doesn't match the flat attributes `evaluate()` and `from_mapping`
+# read/merge -- but its field *defaults* are pulled from here so the two
+# schemas cannot silently drift apart (review finding, task 2579 amendment
+# pass: config.py did not exist yet when this module was first written).
+_CENSUS_DEFAULTS = _LegibilityCensus()
+
+
 @dataclass(frozen=True)
 class CensusConfig:
-    """The six §7.4 census-trigger thresholds, with their documented
-    defaults. `from_mapping` merges a partial override mapping (e.g. the
-    `census:` sub-dict of a project's legibility.yaml) over these
+    """The six §7.4 census-trigger thresholds. Field defaults are sourced
+    from `legibility.config.Census` (see `_CENSUS_DEFAULTS` above), not
+    re-hardcoded here. `from_mapping` merges a partial override mapping
+    (e.g. the `census:` sub-dict of a project's legibility.yaml) over these
     defaults."""
 
-    max_interval_days: int = 10
-    tasks_landed_threshold: int = 120
-    tasks_landed_min_days: int = 7
-    novelty_spike_count: int = 4
-    novelty_spike_window_hours: int = 72
-    floor_days: int = 5
+    max_interval_days: int = _CENSUS_DEFAULTS.max_interval_days
+    tasks_landed_threshold: int = _CENSUS_DEFAULTS.tasks_landed_threshold
+    tasks_landed_min_days: int = _CENSUS_DEFAULTS.tasks_landed_min_days
+    novelty_spike_count: int = _CENSUS_DEFAULTS.novelty_spike.count
+    novelty_spike_window_hours: int = _CENSUS_DEFAULTS.novelty_spike.window_hours
+    floor_days: int = _CENSUS_DEFAULTS.floor_days
 
     @classmethod
     def from_mapping(cls, mapping: dict | None) -> "CensusConfig":
@@ -320,12 +340,14 @@ def codebook_signal(codebook: dict) -> tuple[datetime | None, list[datetime]]:
 def load_census_config(project_root: str | Path) -> CensusConfig:
     """Read `<project_root>/docs/legibility/legibility.yaml`'s `census:`
     sub-dict (§7.4) directly via a light pyyaml read -- deliberately NOT
-    task β's `legibility.config.load_config` loader, since β is not a
-    dependency of this task (see module docstring). An absent file returns
-    defaults silently (no legibility.yaml is a normal pre-β-adoption
+    task β's `legibility.config.load_config` loader, whose four required
+    top-level fields and raise-on-malformed-input contract are the wrong
+    shape for this fail-safe reader (see module docstring). An absent file
+    returns defaults silently (no legibility.yaml is a normal pre-adoption
     state). A malformed file (YAML parse error, non-dict top level, or a
     non-dict `census:` block) returns defaults plus exactly one WARNING --
-    never raises.
+    never raises. Those defaults are `Census`'s, not independently
+    hardcoded -- see `CensusConfig`.
     """
     path = Path(project_root) / "docs" / "legibility" / "legibility.yaml"
     if not path.exists():
