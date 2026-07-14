@@ -145,16 +145,10 @@ async def _run_script_check(
     propagates to :func:`run_delivered_check`'s catch-all, which maps it to
     :attr:`DeliveredCheckResult.ERRORED`.
 
-    Known limitation (reviewer_comprehensive amendment; the fix is outside
-    this task's locked-file scope): on timeout, ``asyncio.wait_for``
-    cancels the ``runner`` coroutine, but ``orchestrator.git_ops._run``
-    does not kill its spawned subprocess when ``proc.communicate()`` is
-    cancelled. A script that hangs past ``timeout_secs`` still correctly
-    maps to ERRORED here, but the orphaned child process (and its pipes)
-    can be left running — recurring every sweep for a persistently-hung
-    script. Fixing this requires a try/finally (kill + reap) around
-    ``proc.communicate()`` in ``git_ops._run``, which this task does not
-    hold a lock for; tracked for follow-up via ``escalate_info``.
+    On timeout, ``asyncio.wait_for`` cancels the ``runner`` coroutine;
+    ``orchestrator.git_ops._run`` kills and reaps its spawned subprocess in
+    that case (task 2608), so a script that hangs past ``timeout_secs`` no
+    longer leaks an orphaned child process.
     """
     assert meta.script is not None  # enforced by the script cross-field validator
     assert meta.timeout_secs is not None  # enforced by the script cross-field validator
