@@ -29,19 +29,22 @@ from orchestrator.evals.prompt_opt.canary import (
 from orchestrator.run_store import _SCHEMA
 
 
-def _explicit_thresholds() -> CanaryThresholds:
-    """Shared EXPLICIT thresholds for compare_windows tests.
+def _explicit_thresholds(**overrides: object) -> CanaryThresholds:
+    """Shared EXPLICIT thresholds for compare_windows tests, with optional
+    per-field overrides (e.g. ``min_samples=5``).
 
     Never the module's documented defaults — the PRD §9 calibration
     starting points are not something a deterministic unit test should
     assert against (see plan design decision on explicit thresholds).
     """
-    return CanaryThresholds(
+    kwargs: dict[str, object] = dict(
         cost_per_done_task_rel_tol=0.2, cost_per_done_task_abs_floor=1.0,
         requeue_rate_rel_tol=0.2, requeue_rate_abs_floor=0.05,
         mean_review_cycles_rel_tol=0.2, mean_review_cycles_abs_floor=1.0,
         mean_verify_attempts_rel_tol=0.2, mean_verify_attempts_abs_floor=1.0,
     )
+    kwargs.update(overrides)
+    return CanaryThresholds(**kwargs)
 
 
 def _make_runs_db(path: Path, rows: list[dict]) -> None:
@@ -375,3 +378,50 @@ class TestCompareWindows:
         assert cost_comparison.regressed is False
         assert 'cost_per_done_task' not in verdict.regressed_metrics
         assert verdict.verdict == 'pass'
+
+
+class TestInsufficientDataGuard:
+    """A thin baseline or post window must not yield a false pass/regress
+    verdict — compare_windows short-circuits to 'insufficient_data' when
+    either window's n_rows is below thresholds.min_samples."""
+
+    def test_thin_baseline_window_yields_insufficient_data(self) -> None:
+        thresholds = _explicit_thresholds(min_samples=5)
+        baseline = WindowMetrics(
+            n_rows=2, n_done=2, cost_per_done_task=10.0, requeue_rate=0.0,
+            mean_review_cycles=1.0, mean_verify_attempts=1.0,
+        )
+        post = WindowMetrics(
+            n_rows=20, n_done=20, cost_per_done_task=50.0, requeue_rate=0.9,
+            mean_review_cycles=9.0, mean_verify_attempts=9.0,
+        )
+        verdict = compare_windows(baseline, post, thresholds)
+        assert verdict.verdict == 'insufficient_data'
+
+    def test_thin_post_window_yields_insufficient_data(self) -> None:
+        thresholds = _explicit_thresholds(min_samples=5)
+        baseline = WindowMetrics(
+            n_rows=20, n_done=20, cost_per_done_task=10.0, requeue_rate=0.1,
+            mean_review_cycles=1.0, mean_verify_attempts=1.0,
+        )
+        post = WindowMetrics(
+            n_rows=2, n_done=2, cost_per_done_task=50.0, requeue_rate=0.9,
+            mean_review_cycles=9.0, mean_verify_attempts=9.0,
+        )
+        verdict = compare_windows(baseline, post, thresholds)
+        assert verdict.verdict == 'insufficient_data'
+
+    def test_sufficient_samples_still_yields_pass_or_regress(self) -> None:
+        """Sanity: once both windows meet min_samples, insufficient_data
+        must NOT mask a real regression."""
+        thresholds = _explicit_thresholds(min_samples=5)
+        baseline = WindowMetrics(
+            n_rows=10, n_done=10, cost_per_done_task=10.0, requeue_rate=0.1,
+            mean_review_cycles=2.0, mean_verify_attempts=1.5,
+        )
+        post = WindowMetrics(
+            n_rows=10, n_done=10, cost_per_done_task=50.0, requeue_rate=0.9,
+            mean_review_cycles=9.0, mean_verify_attempts=9.0,
+        )
+        verdict = compare_windows(baseline, post, thresholds)
+        assert verdict.verdict == 'regress'
