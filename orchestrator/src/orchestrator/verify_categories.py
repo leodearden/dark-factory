@@ -24,9 +24,11 @@ from typing import cast
 
 
 class FailureCategory(StrEnum):
-    """The closed 12-value output domain of ``verify_classify.classify_failure``."""
+    """The closed 14-value output domain of ``verify_classify.classify_failure``."""
 
     INFRA_TIMEOUT = 'infra_timeout'
+    DISK_FULL = 'disk_full'
+    SEMAPHORE_TIMEOUT = 'semaphore_timeout'
     CARGO_CLI_ERROR = 'cargo_cli_error'
     COMPILE_ERROR = 'compile_error'
     TREE_SITTER_GENERATE_ERROR = 'tree_sitter_generate_error'
@@ -43,7 +45,7 @@ class FailureCategory(StrEnum):
 class RetryKind(Enum):
     """How ``run_verification`` recovers from a given category, if at all.
 
-    Populated for all 12 ``CATEGORY_POLICY`` rows per the PRD contract
+    Populated for all 14 ``CATEGORY_POLICY`` rows per the PRD contract
     (plans/verify-plan-prd.md task α item 4: ``CategoryPolicy(severity_rank,
     archive, preexisting_probe, is_infra_transient, retry_kind)``) but NOT
     yet dispatched on. ``run_verification`` still decides retries via two
@@ -80,48 +82,56 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
         severity_rank=0, archive=False, preexisting_probe=False,
         is_infra_transient=False, retry_kind=RetryKind.TIMEOUT,
     ),
+    FailureCategory.DISK_FULL: CategoryPolicy(
+        severity_rank=1, archive=False, preexisting_probe=False,
+        is_infra_transient=True, retry_kind=RetryKind.NONE,
+    ),
+    FailureCategory.SEMAPHORE_TIMEOUT: CategoryPolicy(
+        severity_rank=2, archive=False, preexisting_probe=False,
+        is_infra_transient=True, retry_kind=RetryKind.NONE,
+    ),
     FailureCategory.CARGO_CLI_ERROR: CategoryPolicy(
-        severity_rank=1, archive=True, preexisting_probe=True,
-        is_infra_transient=False, retry_kind=RetryKind.NONE,
-    ),
-    FailureCategory.COMPILE_ERROR: CategoryPolicy(
-        severity_rank=2, archive=False, preexisting_probe=True,
-        is_infra_transient=False, retry_kind=RetryKind.NONE,
-    ),
-    FailureCategory.TREE_SITTER_GENERATE_ERROR: CategoryPolicy(
         severity_rank=3, archive=True, preexisting_probe=True,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
-    FailureCategory.FLOCK_ERROR: CategoryPolicy(
-        severity_rank=4, archive=True, preexisting_probe=False,
+    FailureCategory.COMPILE_ERROR: CategoryPolicy(
+        severity_rank=4, archive=False, preexisting_probe=True,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
-    FailureCategory.NPM_ERROR: CategoryPolicy(
+    FailureCategory.TREE_SITTER_GENERATE_ERROR: CategoryPolicy(
         severity_rank=5, archive=True, preexisting_probe=True,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
+    FailureCategory.FLOCK_ERROR: CategoryPolicy(
+        severity_rank=6, archive=True, preexisting_probe=False,
+        is_infra_transient=False, retry_kind=RetryKind.NONE,
+    ),
+    FailureCategory.NPM_ERROR: CategoryPolicy(
+        severity_rank=7, archive=True, preexisting_probe=True,
+        is_infra_transient=False, retry_kind=RetryKind.NONE,
+    ),
     FailureCategory.PYTEST_INTERNALERROR: CategoryPolicy(
-        severity_rank=6, archive=False, preexisting_probe=False,
+        severity_rank=8, archive=False, preexisting_probe=False,
         is_infra_transient=True, retry_kind=RetryKind.NONE,
     ),
     FailureCategory.ENV_TRANSIENT: CategoryPolicy(
-        severity_rank=7, archive=False, preexisting_probe=False,
+        severity_rank=9, archive=False, preexisting_probe=False,
         is_infra_transient=True, retry_kind=RetryKind.ENV_SERIAL,
     ),
     FailureCategory.TEST_FAILURE: CategoryPolicy(
-        severity_rank=8, archive=False, preexisting_probe=True,
-        is_infra_transient=False, retry_kind=RetryKind.NONE,
-    ),
-    FailureCategory.UNKNOWN_TEST_FAILURE: CategoryPolicy(
-        severity_rank=9, archive=True, preexisting_probe=True,
-        is_infra_transient=False, retry_kind=RetryKind.NONE,
-    ),
-    FailureCategory.PASSED: CategoryPolicy(
         severity_rank=10, archive=False, preexisting_probe=True,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
+    FailureCategory.UNKNOWN_TEST_FAILURE: CategoryPolicy(
+        severity_rank=11, archive=True, preexisting_probe=True,
+        is_infra_transient=False, retry_kind=RetryKind.NONE,
+    ),
+    FailureCategory.PASSED: CategoryPolicy(
+        severity_rank=12, archive=False, preexisting_probe=True,
+        is_infra_transient=False, retry_kind=RetryKind.NONE,
+    ),
     FailureCategory.NONE: CategoryPolicy(
-        severity_rank=11, archive=False, preexisting_probe=True,
+        severity_rank=13, archive=False, preexisting_probe=True,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
 }
@@ -185,7 +195,7 @@ def should_archive(category: str) -> bool:
     """Return True when *category* warrants durable human-triage archival.
 
     Pure CATEGORY_POLICY table lookup — no ``endswith('_error')`` heuristic.
-    A category outside the known 12 (e.g. a verify_runner UNSCOPED_TYPECHECK_*
+    A category outside the known 14 (e.g. a verify_runner UNSCOPED_TYPECHECK_*
     sentinel, or any other unrecognized string) defaults to False. See
     ``verify_classify.classify_failure``'s docstring for the closed-domain
     contract that keeps this default from silently misfiring on a future
@@ -205,7 +215,7 @@ def _assert_sentinels_disjoint(sentinels, enum_cls) -> None:
     an out-of-band sentinel namespace (e.g. verify_runner's
     UNSCOPED_TYPECHECK_* gate signals, injected into ``VerifyResult.category``
     but never produced by ``classify_failure``) is provably separate from
-    ``FailureCategory``'s closed 12-value output domain, so a future
+    ``FailureCategory``'s closed 14-value output domain, so a future
     accidental collision is caught fail-loud at import time instead of
     silently conflating a gate signal with a real classifier category.
     """

@@ -489,6 +489,156 @@ def _extract_cause_hint(output: str) -> str:
     return meaningful[0].strip()[:200]
 
 
+# ---------------------------------------------------------------------------
+# Failure-anchored excerpting (PART 1, task 2549) — VerifyResult.failure_report
+# used to slice a fixed test_output[-3000:] tail for its "## Test Failures"
+# section. For a long suite that tail is a PASS-wall that elides the actual
+# failing test, so downstream block reports/investigators chase the wrong
+# thing. _failure_anchored_excerpt locates failure markers instead and
+# excerpts bounded context windows around them, falling back to the tail
+# only when no marker is found. A separate, deliberately independent concern
+# from _extract_cause_hint (the one-line human hint ladder above) and from
+# verify_classify.classify_failure (the machine FailureCategory) — this only
+# decides what raw text goes into the report's code block.
+# ---------------------------------------------------------------------------
+
+# "Strong" markers: structurally specific to a real failure line, effectively
+# never emitted by unrelated prose or fixture/decoy data (e.g. a test whose
+# body happens to print the literal string "FAIL:" to demonstrate parsing
+# behavior). Reuses the existing _PYTEST_FAILED_LINE_RE / _PYTEST_INTERNALERROR_RE
+# constants above so the excerpt anchors on the same grounded pytest-line
+# shapes _extract_cause_hint already relies on.
+_TRAILING_FAILED_RE = re.compile(r'^.+\s+FAILED\s*$', re.MULTILINE)
+_TRACEBACK_HEADER_RE = re.compile(r'Traceback \(most recent call last\)')
+_RUST_PANIC_RE = re.compile(r'\bpanicked\b')
+_RUSTC_ERROR_CODE_RE = re.compile(r'error\[E\d+\]:')
+
+_STRONG_FAILURE_MARKER_RE = re.compile(
+    '|'.join(p.pattern for p in (
+        _PYTEST_FAILED_LINE_RE,
+        _TRAILING_FAILED_RE,
+        _PYTEST_INTERNALERROR_RE,
+        _TRACEBACK_HEADER_RE,
+        _RUST_PANIC_RE,
+        _RUSTC_ERROR_CODE_RE,
+    )),
+    re.MULTILINE,
+)
+
+# "Weak" markers: real failure signal, but generic enough that fixture/decoy
+# output can emit lookalikes (a test asserting on parser behavior might print
+# a literal "FAIL:" line; a benign log line can start with "error:"). Only
+# consulted for anchoring windows — never preferred over a strong marker's
+# window when the excerpt must be capped (see _failure_anchored_excerpt).
+_BARE_FAIL_COLON_RE = re.compile(r'^FAIL:\s', re.MULTILINE)
+_GENERIC_ERROR_LINE_RE = re.compile(r'^error:', re.MULTILINE)
+
+_WEAK_FAILURE_MARKER_RE = re.compile(
+    '|'.join(p.pattern for p in (
+        _BARE_FAIL_COLON_RE,
+        _GENERIC_ERROR_LINE_RE,
+        _PYTEST_TRACEBACK_E_RE,
+    )),
+    re.MULTILINE,
+)
+
+# Union of strong+weak, plus a trailing bare "FAILED" substring alternative —
+# used by failure_report() as the emit-gate for the ## Test Failures section
+# (broadened from the legacy `'FAILED' in test_output` substring check to
+# "any failure marker present, OR that legacy substring itself"). The
+# trailing `FAILED` alternative is what makes this a *genuine* superset: a
+# structurally-anchored marker alone is NOT one, since e.g. a cargo summary
+# line like "test result: FAILED. 3 passed; 1 failed" has no line-start/
+# line-end FAILED (see _PYTEST_FAILED_LINE_RE / _TRAILING_FAILED_RE) and no
+# strong/weak marker at all, yet still contains the old substring — without
+# this alternative such output would silently stop emitting the section.
+# Note this union is the emit *gate* only; _failure_anchored_excerpt anchors
+# windows using _STRONG_FAILURE_MARKER_RE/_WEAK_FAILURE_MARKER_RE directly
+# (not this pattern), so a gate-only match like the cargo line above falls
+# back to _failure_anchored_excerpt's tail slice — identical to pre-anchoring
+# (legacy) behavior for that case, i.e. no regression there either.
+_FAILURE_MARKER_RE = re.compile(
+    _STRONG_FAILURE_MARKER_RE.pattern + '|' + _WEAK_FAILURE_MARKER_RE.pattern + '|FAILED',
+    re.MULTILINE,
+)
+
+
+def _failure_anchored_excerpt(output: str, *, cap: int = 3000, window: int = 10) -> str:
+    """Excerpt *output* around failure markers instead of a fixed tail slice.
+
+    Locates every failure-marker line (FAILED / trailing "... FAILED" /
+    INTERNALERROR> / Traceback / panicked / error[E..]: / bare FAIL: /
+    generic error: / pytest "E   " lines), builds a *window*-line context
+    block around each, and merges overlapping/adjacent blocks into one
+    contiguous excerpt (joining any remaining disjoint blocks with a short
+    "..." elision separator). Falls back to ``output[-cap:]`` (today's
+    behavior) when no marker is found at all. Pure string function, no I/O.
+
+    Decoy suppression (best-effort): when the merged excerpt exceeds *cap*,
+    windows anchored ONLY on a "weak" marker (bare ``FAIL:``, generic
+    ``error:``, or a lone pytest ``E   `` line — patterns fixture/decoy data
+    can emit incidentally) are dropped before falling back to hard
+    tail-truncation, so a "strong" structured marker (FAILED <path>::<test>,
+    trailing "... FAILED", Traceback, panicked, error[E..]:, INTERNALERROR>)
+    is preferred to survive the cap.
+
+    Short-circuit: when *output* already fits within *cap*, it is returned
+    unchanged (byte-identical to today's tail slice, which is a no-op for
+    anything shorter than the cap) — windowing only matters once *output*
+    is long enough to need trimming in the first place.
+    """
+    if len(output) <= cap:
+        return output
+
+    lines = output.split('\n')
+    strong_idxs = {i for i, ln in enumerate(lines) if _STRONG_FAILURE_MARKER_RE.search(ln)}
+    weak_idxs = {
+        i for i, ln in enumerate(lines)
+        if i not in strong_idxs and _WEAK_FAILURE_MARKER_RE.search(ln)
+    }
+    marker_idxs = strong_idxs | weak_idxs
+    if not marker_idxs:
+        return output[-cap:]
+
+    # One window per marker line, sorted by start so overlap-merging is a
+    # single left-to-right sweep.
+    raw_windows = sorted(
+        (max(0, i - window), min(len(lines), i + window + 1), i in strong_idxs)
+        for i in marker_idxs
+    )
+    merged: list[list] = []
+    for start, end, is_strong in raw_windows:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+            merged[-1][2] = merged[-1][2] or is_strong
+        else:
+            merged.append([start, end, is_strong])
+
+    def _render(windows: list[list]) -> str:
+        blocks = []
+        prev_end = None
+        for start, end, _is_strong in windows:
+            if prev_end is not None and start > prev_end:
+                blocks.append('...')
+            blocks.append('\n'.join(lines[start:end]))
+            prev_end = end
+        return '\n'.join(blocks)
+
+    excerpt = _render(merged)
+    if len(excerpt) <= cap:
+        return excerpt
+
+    # Over budget: drop windows with no strong marker (decoy de-prioritization).
+    strong_only = [w for w in merged if w[2]]
+    if strong_only:
+        excerpt = _render(strong_only)
+        if len(excerpt) <= cap:
+            return excerpt
+
+    # Still over cap (or no strong windows survived) — hard tail-truncate.
+    return excerpt[-cap:]
+
+
 # _ARCHIVE_DENY_LIST, _CATEGORY_PRIORITY, and PREEXISTING_BREAK_SKIP_CATEGORIES
 # are re-exported (imported above) from orchestrator.verify_categories, the
 # single source of truth for the per-category policy (archive / priority /
@@ -2090,8 +2240,9 @@ class VerifyResult:
                 for p in self.archive_log_paths:
                     log_lines.append(f'- {p}')
             sections.append('\n'.join(log_lines))
-        if self.test_output and 'FAILED' in self.test_output:
-            sections.append(f'## Test Failures\n\n```\n{self.test_output[-3000:]}\n```')
+        if self.test_output and _FAILURE_MARKER_RE.search(self.test_output):
+            excerpt = _failure_anchored_excerpt(self.test_output, cap=3000)
+            sections.append(f'## Test Failures\n\n```\n{excerpt}\n```')
         if self.lint_output and self.lint_output.strip():
             sections.append(f'## Lint Issues\n\n```\n{self.lint_output[-2000:]}\n```')
         if self.type_output and 'error' in self.type_output.lower():

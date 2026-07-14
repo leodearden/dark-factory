@@ -7506,3 +7506,157 @@ class TestVerifyPlanClassificationDelegation:
         assert verify._is_structural_python_file(path, content) == (
             verify_plan.classify_file(path, content) is verify_plan.FileKind.STRUCTURAL
         )
+
+
+class TestFailureAnchoredExcerpt:
+    """``verify._failure_anchored_excerpt`` locates failure markers (FAILED /
+    FAIL: / Traceback / panicked / error[E..]: / ...) in a long test_output
+    and excerpts bounded context windows around them, instead of a fixed
+    tail slice that elides a failing test buried mid-suite (PART 1, task 2549).
+
+    RED today: the helper does not exist yet — every test below fails on the
+    local ``from orchestrator.verify import _failure_anchored_excerpt``.
+    """
+
+    # (a) a buried failure marker deep inside a long PASS-wall must survive.
+    def test_buried_failure_is_included_with_context(self):
+        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+
+        pass_lines = [f'tests/test_mod.py::test_pass_{i} PASSED' for i in range(200)]
+        buried = 'FAILED tests/pkg/test_mod.py::test_buried - AssertionError'
+        lines = pass_lines[:100] + [buried] + pass_lines[100:]
+        output = '\n'.join(lines)
+
+        excerpt = _failure_anchored_excerpt(output, cap=3000)
+
+        assert 'test_buried' in excerpt
+        assert len(excerpt) <= 3000
+
+    # (b) no marker anywhere -> tail fallback, byte-identical to today's slice.
+    def test_no_marker_falls_back_to_tail_slice(self):
+        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+
+        output = '\n'.join(f'plain line {i}' for i in range(500))
+
+        excerpt = _failure_anchored_excerpt(output, cap=3000)
+
+        assert excerpt == output[-3000:]
+
+    # (c) multiple markers: overlapping windows merge into one contiguous block.
+    def test_overlapping_marker_windows_merge_without_elision_gap(self):
+        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+
+        lines = [f'noise line {i}' for i in range(200)]
+        lines[50] = 'FAILED tests/test_mod.py::test_alpha - AssertionError'
+        lines[55] = 'FAILED tests/test_mod.py::test_beta - AssertionError'
+        output = '\n'.join(lines)
+
+        excerpt = _failure_anchored_excerpt(output, cap=3000, window=10)
+
+        assert 'test_alpha' in excerpt
+        assert 'test_beta' in excerpt
+        # Windows at 50±10 and 55±10 overlap -> merged into ONE contiguous
+        # block, so no elision separator appears between the two markers.
+        assert '...' not in excerpt
+
+    # (c) multiple far-apart markers: total excerpt is capped.
+    def test_many_far_apart_markers_capped_to_budget(self):
+        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+
+        lines = []
+        for i in range(40):
+            lines.extend(f'noise {i}-{j}' for j in range(30))
+            lines.append(f'FAILED tests/test_mod.py::test_{i} - AssertionError')
+        output = '\n'.join(lines)
+
+        excerpt = _failure_anchored_excerpt(output, cap=500, window=5)
+
+        assert len(excerpt) <= 500
+
+    # (d) each marker type is independently anchored.
+    @pytest.mark.parametrize(
+        ('marker_line', 'needle'),
+        [
+            ('Traceback (most recent call last):', 'Traceback (most recent call last):'),
+            ("thread 'main' panicked at src/lib.rs:10:5:", 'panicked'),
+            ('error[E0308]: mismatched types', 'error[E0308]'),
+        ],
+    )
+    def test_marker_type_is_anchored(self, marker_line, needle):
+        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+
+        pad = [f'noise line {i}' for i in range(100)]
+        lines = pad[:50] + [marker_line] + pad[50:]
+        output = '\n'.join(lines)
+
+        excerpt = _failure_anchored_excerpt(output, cap=3000)
+
+        assert needle in excerpt
+
+
+class TestFailureReportUsesAnchoredExcerpt:
+    """``VerifyResult.failure_report()``'s "## Test Failures" section must use
+    ``_failure_anchored_excerpt`` instead of a fixed ``test_output[-3000:]``
+    tail (PART 1, task 2549), so a failing test buried in a long PASS-wall
+    survives into the report instead of being elided by the tail slice.
+
+    RED today: failure_report() still slices ``test_output[-3000:]`` directly
+    — (a)/(b) fail because the buried/real failure names sit outside the last
+    3000 characters of the (deliberately long) synthetic test_output.
+    """
+
+    # (a) a failure buried early in a long PASS-wall must survive the report.
+    def test_buried_failure_survives_the_report(self):
+        pass_lines = [f'tests/test_mod.py::test_pass_{i} PASSED' for i in range(200)]
+        buried = 'FAILED tests/pkg/test_mod.py::test_buried - AssertionError'
+        lines = pass_lines[:20] + [buried] + pass_lines[20:]
+        test_output = '\n'.join(lines)
+
+        vr = VerifyResult(
+            passed=False,
+            test_output=test_output,
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+        )
+        report = vr.failure_report()
+
+        assert '## Test Failures' in report
+        assert 'test_buried' in report, (
+            f'buried failure name elided from the report — still tail-slicing?\n{report[:300]!r}'
+        )
+
+    # (b) decoy suppression best-effort: a fixture-emitted 'FAIL:' line must
+    # not shadow a real, later FAILED marker out of the report.
+    def test_decoy_fail_colon_does_not_shadow_real_failure(self):
+        pad = [f'tests/test_mod.py::test_pass_{i} PASSED' for i in range(200)]
+        decoy = 'FAIL: this is fixture data, not a real failure'
+        real = 'FAILED tests/pkg/test_mod.py::test_real - AssertionError'
+        lines = pad[:20] + [decoy] + pad[20:40] + [real] + pad[40:]
+        test_output = '\n'.join(lines)
+
+        vr = VerifyResult(
+            passed=False,
+            test_output=test_output,
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+        )
+        report = vr.failure_report()
+
+        assert 'test_real' in report, (
+            f'real failure elided from the report:\n{report[:300]!r}'
+        )
+
+    # (c) regression: short output with a FAILED marker still emits the section.
+    def test_short_output_with_failed_marker_still_emits_section(self):
+        vr = VerifyResult(
+            passed=False,
+            test_output='test my::mod::it FAILED\n',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+        )
+        report = vr.failure_report()
+
+        assert '## Test Failures' in report

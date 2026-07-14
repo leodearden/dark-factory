@@ -32,11 +32,15 @@ import pytest
 # step-1: core surface
 # ---------------------------------------------------------------------------
 
-# The exact 12-member closed output domain of verify._classify_failure today,
-# including the '' (NONE) empty-string sentinel (default of _worst_category on
-# empty input; a member of both _CATEGORY_PRIORITY and _ARCHIVE_DENY_LIST).
+# The exact 14-member closed output domain of verify._classify_failure today
+# (the 12 legacy category strings plus task 2549's DISK_FULL/SEMAPHORE_TIMEOUT
+# host-infrastructure categories), including the '' (NONE) empty-string
+# sentinel (default of _worst_category on empty input; a member of both
+# _CATEGORY_PRIORITY and _ARCHIVE_DENY_LIST).
 _EXPECTED_CATEGORY_VALUES = {
     'infra_timeout',
+    'disk_full',
+    'semaphore_timeout',
     'cargo_cli_error',
     'compile_error',
     'tree_sitter_generate_error',
@@ -52,15 +56,15 @@ _EXPECTED_CATEGORY_VALUES = {
 
 
 class TestFailureCategoryMemberSet:
-    """FailureCategory is a StrEnum with exactly the 12 legacy category strings."""
+    """FailureCategory is a StrEnum with exactly the 14 category strings."""
 
     def test_member_values_match_legacy_category_set_exactly(self):
         from orchestrator.verify_categories import FailureCategory
         assert {c.value for c in FailureCategory} == _EXPECTED_CATEGORY_VALUES
 
-    def test_member_count_is_twelve(self):
+    def test_member_count_is_fourteen(self):
         from orchestrator.verify_categories import FailureCategory
-        assert len(list(FailureCategory)) == 12
+        assert len(list(FailureCategory)) == 14
 
     def test_is_strenum_subclass(self):
         from enum import StrEnum
@@ -128,9 +132,9 @@ class TestCategoryPolicyExhaustive:
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
         assert set(CATEGORY_POLICY) == set(FailureCategory)
 
-    def test_row_count_is_twelve(self):
+    def test_row_count_is_fourteen(self):
         from orchestrator.verify_categories import CATEGORY_POLICY
-        assert len(CATEGORY_POLICY) == 12
+        assert len(CATEGORY_POLICY) == 14
 
 
 class TestCategoryPolicyGoldenRows:
@@ -157,7 +161,7 @@ class TestCategoryPolicyGoldenRows:
     def test_none_row(self):
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
         row = CATEGORY_POLICY[FailureCategory.NONE]
-        assert row.severity_rank == 11
+        assert row.severity_rank == 13
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +234,8 @@ class TestDerivedRegistriesByteIdentity:
         from orchestrator.verify_categories import CATEGORY_PRIORITY
         assert CATEGORY_PRIORITY == [
             'infra_timeout',
+            'disk_full',
+            'semaphore_timeout',
             'cargo_cli_error',
             'compile_error',
             'tree_sitter_generate_error',
@@ -247,19 +253,20 @@ class TestDerivedRegistriesByteIdentity:
         from orchestrator.verify_categories import ARCHIVE_DENY_LIST
         assert frozenset({
             'compile_error', 'test_failure', 'infra_timeout', 'passed', '',
-            'pytest_internalerror', 'env_transient',
+            'pytest_internalerror', 'env_transient', 'disk_full', 'semaphore_timeout',
         }) == ARCHIVE_DENY_LIST
 
     def test_preexisting_break_skip_categories_matches_legacy_set(self):
         from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES
         assert frozenset({
             'infra_timeout', 'flock_error', 'pytest_internalerror', 'env_transient',
+            'disk_full', 'semaphore_timeout',
         }) == PREEXISTING_BREAK_SKIP_CATEGORIES
 
     def test_infra_transient_categories_matches_legacy_sweep_set(self):
         from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
         assert frozenset({
-            'pytest_internalerror', 'env_transient',
+            'pytest_internalerror', 'env_transient', 'disk_full', 'semaphore_timeout',
         }) == INFRA_TRANSIENT_CATEGORIES
 
 
@@ -499,3 +506,57 @@ class TestCrossModulePreexistingSingleSourced:
             workflow.PREEXISTING_BREAK_SKIP_CATEGORIES
             is verify_categories.PREEXISTING_BREAK_SKIP_CATEGORIES
         )
+
+
+# ---------------------------------------------------------------------------
+# PART 2 (task 2549): two new host-infrastructure FailureCategory members —
+# DISK_FULL (ENOSPC / linker SIGBUS-on-full-disk) and SEMAPHORE_TIMEOUT
+# (flock/semaphore slot-acquisition timeout) — that previously had no
+# category at all and fell through to whichever code-fault category the
+# classifier matched first. Both are env_transient-family policy rows
+# (is_infra_transient=True, archive=False, preexisting_probe=False,
+# retry_kind=NONE — a serial re-run cannot fix a host condition) ranked
+# just below INFRA_TIMEOUT and above every code-fault category.
+#
+# RED today: neither member/row exists yet, so every test below fails on
+# the local ``from orchestrator.verify_categories import FailureCategory``
+# attribute access (``FailureCategory.DISK_FULL`` / ``.SEMAPHORE_TIMEOUT``
+# don't exist) or on the corresponding _worst_category priority check.
+# ---------------------------------------------------------------------------
+
+
+class TestEnvironmentalCategoriesExistWithInfraTransientPolicy:
+    """DISK_FULL / SEMAPHORE_TIMEOUT are new FailureCategory members with an
+    env_transient-family CATEGORY_POLICY row."""
+
+    def test_disk_full_value_and_policy(self):
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, RetryKind
+        assert FailureCategory.DISK_FULL.value == 'disk_full'
+        row = CATEGORY_POLICY[FailureCategory.DISK_FULL]
+        assert row.is_infra_transient is True
+        assert row.archive is False
+        assert row.preexisting_probe is False
+        assert row.retry_kind == RetryKind.NONE
+
+    def test_semaphore_timeout_value_and_policy(self):
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, RetryKind
+        assert FailureCategory.SEMAPHORE_TIMEOUT.value == 'semaphore_timeout'
+        row = CATEGORY_POLICY[FailureCategory.SEMAPHORE_TIMEOUT]
+        assert row.is_infra_transient is True
+        assert row.archive is False
+        assert row.preexisting_probe is False
+        assert row.retry_kind == RetryKind.NONE
+
+
+class TestEnvironmentalCategoriesOutrankCodeFaults:
+    """_worst_category must pick the infra root cause over a co-occurring
+    downstream code-fault category — DISK_FULL/SEMAPHORE_TIMEOUT are ranked
+    just below INFRA_TIMEOUT and above every code-fault category."""
+
+    def test_disk_full_outranks_compile_error(self):
+        from orchestrator.verify import _worst_category
+        assert _worst_category(['disk_full', 'compile_error']) == 'disk_full'
+
+    def test_semaphore_timeout_outranks_test_failure(self):
+        from orchestrator.verify import _worst_category
+        assert _worst_category(['semaphore_timeout', 'test_failure']) == 'semaphore_timeout'

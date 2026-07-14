@@ -682,6 +682,89 @@ class TestStructuredOutputParsingC2:
         assert _classify(ToolKind.CARGO_TEST, output, 1, False) == FailureCategory.CARGO_CLI_ERROR
 
 
+# ---------------------------------------------------------------------------
+# PART 2 (task 2549): host-infrastructure pre-dispatch guard —
+# _classify_environmental(output), checked immediately after the
+# timed_out->INFRA_TIMEOUT guard and before per-tool dispatch. ENOSPC (incl.
+# linker SIGBUS-on-full-disk) and flock/semaphore slot-acquisition timeouts
+# previously had no category at all and fell through to whichever code-fault
+# category each tool's table happened to match first. Both conditions are
+# tool-blind (a full disk means the same thing regardless of which tool hit
+# it), so the guard must fire identically for every ToolKind — mirrors
+# TestGuardsApplyToEveryToolKind above.
+#
+# RED today: neither _classify_environmental nor its patterns exist yet, so
+# every positive case below falls through to per-tool dispatch and lands on
+# whatever category that tool's table matches first (or unknown_test_failure).
+# ---------------------------------------------------------------------------
+
+_DISK_FULL_ENOSPC_OUTPUT = 'error: No space left on device (os error 28)\n'
+
+_DISK_FULL_LINKER_SIGBUS_OUTPUT = (
+    'error: linking with `cc` failed: exit status: 1\n'
+    '  = note: collect2: fatal error: ld terminated with signal 7 [Bus error], core dumped\n'
+    '  = note: No space left on device (os error 28)\n'
+)
+
+_SEMAPHORE_TIMEOUT_FLOCK_OUTPUT = 'flock: timeout while waiting to acquire lock\n'
+
+_SEMAPHORE_TIMEOUT_SLOT_OUTPUT = 'Timeout waiting for semaphore slot after 300s\n'
+
+
+class TestEnvironmentalGuardsApplyToEveryToolKind:
+    """PART 2 (task 2549): the new tool-blind environmental pre-dispatch
+    guard fires identically for every ToolKind — mirrors
+    TestGuardsApplyToEveryToolKind's rc==0/timed_out coverage, but for the
+    DISK_FULL/SEMAPHORE_TIMEOUT host-infrastructure categories."""
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_enospc_is_disk_full(self, tool):
+        assert _classify(tool, _DISK_FULL_ENOSPC_OUTPUT, 1, False) == FailureCategory.DISK_FULL
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_linker_sigbus_on_full_disk_is_disk_full(self, tool):
+        assert (
+            _classify(tool, _DISK_FULL_LINKER_SIGBUS_OUTPUT, 1, False)
+            == FailureCategory.DISK_FULL
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_flock_timeout_is_semaphore_timeout(self, tool):
+        assert (
+            _classify(tool, _SEMAPHORE_TIMEOUT_FLOCK_OUTPUT, 1, False)
+            == FailureCategory.SEMAPHORE_TIMEOUT
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_semaphore_slot_timeout_is_semaphore_timeout(self, tool):
+        assert (
+            _classify(tool, _SEMAPHORE_TIMEOUT_SLOT_OUTPUT, 1, False)
+            == FailureCategory.SEMAPHORE_TIMEOUT
+        )
+
+
+class TestEnvironmentalGuardNegatives:
+    """Negatives that must NOT regress once the environmental guard is wired
+    in: a plain flock-contention error (no timeout token) still classifies
+    FLOCK_ERROR, and a bare 'SIGBUS' mention with no disk/linker context does
+    not false-positive into DISK_FULL."""
+
+    def test_flock_failed_to_acquire_lock_stays_flock_error(self):
+        """The existing OPAQUE golden — no timeout token present, so the
+        narrower SEMAPHORE_TIMEOUT guard must not shadow the pre-existing
+        FLOCK_ERROR pattern."""
+        output = 'flock: failed to acquire lock on /var/lock/mylock\n'
+        assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.FLOCK_ERROR
+
+    def test_bare_sigbus_mention_without_disk_context_not_disk_full(self):
+        output = 'test_signal_handling: caught SIGBUS in signal handler test\n'
+        result = _classify(ToolKind.OPAQUE, output, 1, False)
+        assert result != FailureCategory.DISK_FULL, (
+            f'a bare SIGBUS mention with no disk/linker context must not '
+            f'false-positive into disk_full, got {result!r}'
+        )
+
+
 # step-9: verify._summarize_checks must thread the per-check config command
 # (test_cmd/lint_cmd/type_cmd) into classify_failure as that check's
 # ToolKind, instead of discarding tool identity (today's tool-blind
