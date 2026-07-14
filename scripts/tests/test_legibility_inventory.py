@@ -1,0 +1,129 @@
+"""Tests for scripts/legibility/inventory.py — session enumeration (PRD §5.2 point 2).
+
+``inventory.encode_cwd`` mirrors
+``orchestrator.session_registry.transcript_path_for_cwd``'s cwd encoding
+(both ``/`` and ``.`` map to ``-``). A project's agents span many encoded
+dirs (57 for dark-factory today: main checkout + ``.worktrees``/
+``.claude-worktrees`` children), so membership is resolved from the
+session's REAL ``cwd`` (read from a transcript line) via path-component
+semantics (``Path.is_relative_to``) — never a raw string prefix match on
+the encoded dir name, which would over-include a sibling project sharing
+the same literal prefix (e.g. ``dark-factory-cockpit``).
+
+Imported as ``from legibility import inventory`` (PEP-420 namespace
+package; see test_legibility_config.py's module docstring for the import
+mechanics).
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from legibility import inventory as mod
+
+MAIN_CWD = '/home/leo/src/dark-factory'
+WORKTREE_CWD = '/home/leo/src/dark-factory/.worktrees/2573'
+COCKPIT_CWD = '/home/leo/src/dark-factory-cockpit'
+
+
+class TestEncodeCwd:
+    def test_plain_path(self):
+        assert mod.encode_cwd(MAIN_CWD) == '-home-leo-src-dark-factory'
+
+    def test_worktrees_child_maps_slash_and_dot(self):
+        # Both '/' and '.' -> '-', mirroring transcript_path_for_cwd exactly.
+        assert mod.encode_cwd(WORKTREE_CWD) == '-home-leo-src-dark-factory--worktrees-2573'
+
+    def test_cockpit_sibling_shares_literal_prefix(self):
+        # This is exactly why a raw string-prefix match over-includes: the
+        # encoded cockpit dir name starts with the encoded main dir name.
+        encoded_main = mod.encode_cwd(MAIN_CWD)
+        encoded_cockpit = mod.encode_cwd(COCKPIT_CWD)
+        assert encoded_cockpit.startswith(encoded_main)
+        assert encoded_cockpit != encoded_main
+
+
+def _write_session(dir_path: Path, session_id: str, cwd: str, timestamp: str = '2026-07-13T10:00:00.000Z'):
+    dir_path.mkdir(parents=True, exist_ok=True)
+    session_path = dir_path / f'{session_id}.jsonl'
+    lines = [
+        {'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'message': {'content': 'hello'}},
+    ]
+    session_path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
+    return session_path
+
+
+class TestIsMember:
+    """is_member uses Path.is_relative_to path-component semantics."""
+
+    def test_main_dir_is_member(self):
+        assert mod.is_member(MAIN_CWD, [MAIN_CWD]) is True
+
+    def test_worktree_child_is_member(self):
+        assert mod.is_member(WORKTREE_CWD, [MAIN_CWD]) is True
+
+    def test_cockpit_sibling_is_not_member(self):
+        assert mod.is_member(COCKPIT_CWD, [MAIN_CWD]) is False
+
+
+class TestProjectDirMembershipResolution:
+    """End-to-end: a tmp projects_root with main + worktree + cockpit-sibling
+    encoded dirs. Membership resolution (iter_project_dirs + is_member on
+    each session's real cwd) includes the main dir and worktree child but
+    excludes the cockpit sibling — even though the cockpit dir's encoded
+    name is a candidate under the cheap prefix pre-filter.
+    """
+
+    def _build_tree(self, tmp_path: Path) -> Path:
+        projects_root = tmp_path / 'projects'
+        _write_session(projects_root / '-home-leo-src-dark-factory', 'main-session', MAIN_CWD)
+        _write_session(
+            projects_root / '-home-leo-src-dark-factory--worktrees-2573',
+            'worktree-session',
+            WORKTREE_CWD,
+        )
+        _write_session(
+            projects_root / '-home-leo-src-dark-factory-cockpit',
+            'cockpit-session',
+            COCKPIT_CWD,
+        )
+        return projects_root
+
+    def test_iter_project_dirs_over_includes_cockpit_as_a_candidate(self, tmp_path):
+        # The cheap encoded-prefix pre-filter is intentionally imprecise —
+        # confirms the design premise that a further real-cwd check is needed.
+        projects_root = self._build_tree(tmp_path)
+        dirs = {d.name for d in mod.iter_project_dirs(projects_root, [MAIN_CWD])}
+        assert '-home-leo-src-dark-factory-cockpit' in dirs
+
+    def test_enumerate_membership_excludes_cockpit_includes_worktree(self, tmp_path):
+        projects_root = self._build_tree(tmp_path)
+        candidate_dirs = mod.iter_project_dirs(projects_root, [MAIN_CWD])
+        members = []
+        for project_dir in candidate_dirs:
+            for session_path in project_dir.glob('*.jsonl'):
+                cwd = mod.session_cwd(session_path)
+                if cwd is not None and mod.is_member(cwd, [MAIN_CWD]):
+                    members.append(session_path.stem)
+        assert set(members) == {'main-session', 'worktree-session'}
+        assert 'cockpit-session' not in members
+
+
+class TestSessionCwd:
+    def test_reads_cwd_from_first_matching_line(self, tmp_path):
+        session_path = _write_session(tmp_path, 'sess', MAIN_CWD)
+        assert mod.session_cwd(session_path) == MAIN_CWD
+
+    def test_returns_none_when_no_cwd_anywhere(self, tmp_path):
+        # Mirrors real ~/.claude/projects stub files: metadata-only lines
+        # (ai-title/agent-name/queue-operation) carry no 'cwd' at all.
+        session_path = tmp_path / 'stub.jsonl'
+        lines = [
+            {'type': 'ai-title', 'aiTitle': 'x', 'sessionId': 'stub'},
+            {'type': 'agent-name', 'agentName': 'x', 'sessionId': 'stub'},
+        ]
+        session_path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
+        assert mod.session_cwd(session_path) is None
+
+    def test_returns_none_for_unreadable_path(self, tmp_path):
+        assert mod.session_cwd(tmp_path / 'does-not-exist.jsonl') is None
