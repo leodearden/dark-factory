@@ -77,6 +77,8 @@ from orchestrator import (
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeRequest
+from orchestrator.verify_categories import FailureCategory
+from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
