@@ -42,6 +42,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from escalation.models import Escalation
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import ActorClass, is_legal_transition, outcome_allows_status
 
@@ -69,11 +70,13 @@ from test_workflow_merge_provenance import _bind_landed_row, _make
 from test_workflow_warm_lane_requeue import _make_workflow as _make_warmlane_workflow
 
 from orchestrator.agents.roles import _FAMILY_TOOL_PREFIXES, ROLES, AgentRole
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
 from orchestrator.landed_outbox import MergeProvenance
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.steward import TaskSteward
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
@@ -762,3 +765,347 @@ class TestHarnessConsumesTerminalReport:
         assert report.reason.lower().startswith('all accounts capped')
         assert report.detail
         assert report.phase == workflow.machine.state
+
+
+# ---------------------------------------------------------------------------
+# Boundary rows 8-9 — StewardOutcome routing (steward ``_publish_outcome``/
+# ``_handle_escalation`` PRODUCER ↔ workflow ``_await_steward_completion``/
+# ``_mark_blocked`` CONSUMER), SO-1 / task 2060.
+# ---------------------------------------------------------------------------
+
+
+def _make_workflow(
+    *, tmp_path: Path, task_id: str = '2253', with_escalation_queue: bool = False,
+) -> TaskWorkflow:
+    """Minimal ``TaskWorkflow`` harness for rows 8-9 — mirrors
+    ``test_steward_outcome.py``'s ``_make_workflow`` (this module's file-level
+    lock does not cover that sibling, so the factory is duplicated per the
+    established 26+-file convention rather than imported).
+    """
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = {'id': task_id, 'title': 'T', 'description': 'd'}
+    assignment.modules = ['mod_a']
+
+    _spec = pydantic_spec(OrchestratorConfig)
+    config = MagicMock(spec_set=_spec)
+    config.fused_memory.project_id = 'dark_factory'
+    config.fused_memory.url = 'http://localhost:8002'
+    config.max_review_cycles = 2
+    config.max_amendment_rounds = 1
+    config.lock_depth = 2
+    config.steward_completion_timeout = 300.0
+    config.project_root = tmp_path / 'proj'
+    config.merge_train_former_enabled = False
+    config.merge_train_max_members = 3
+    # _spawn_dry_run_unblock runs unconditionally from the top of
+    # _mark_blocked — keep it inert so rows 8-9 exercise only the
+    # steward-outcome dispatch, not the dry-run-unblock hook.
+    config.unblock_auto.enabled = False
+
+    scheduler = MagicMock()
+    scheduler.set_task_status = AsyncMock()
+    git_ops = MagicMock()
+
+    wf = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,
+        briefing=MagicMock(),
+        mcp=MagicMock(),
+    )
+    worktree = tmp_path / 'wt'
+    worktree.mkdir(parents=True, exist_ok=True)
+    (worktree / '.task').mkdir(exist_ok=True)
+    wf.artifacts = TaskArtifacts(worktree)
+    wf.worktree = worktree
+    wf.merge_queue = MagicMock()
+    wf.plan = {'files': ['a.py', 'b.py', 'c.py']}
+    wf._base_commit = 'base_sha'
+    wf._module_configs = []
+    wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
+    wf.event_store = None
+
+    if with_escalation_queue:
+        eq = MagicMock()
+        eq.has_open_l1.return_value = False
+        eq.make_id.return_value = f'esc-{task_id}-1'
+        wf.escalation_queue = eq
+
+    return wf
+
+
+def _make_steward(*, worktree: Path) -> TaskSteward:
+    """Minimal ``TaskSteward`` harness for row 9's producer-side coverage —
+    trims ``test_steward.py``'s ``steward``/``mock_config``/``mock_queue``/
+    ``mock_mcp``/``mock_briefing`` fixture graph down to a single factory
+    (this module's file lock does not cover that sibling either).
+    """
+    worktree.mkdir(parents=True, exist_ok=True)
+    (worktree / '.task').mkdir(exist_ok=True)
+
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    config.steward_max_attempts = 1
+    config.steward_lifetime_budget = 12.0
+    config.steward_max_timeouts_per_escalation = 3
+    config.steward_max_empty_outputs_per_escalation = 2
+
+    queue = MagicMock()
+    queue.get_by_task.return_value = []
+    queue.get.return_value = None
+    queue.make_id.return_value = 'esc-42-99'
+
+    mcp = MagicMock()
+    mcp.mcp_config_json.return_value = {'mcpServers': {}}
+
+    briefing = AsyncMock()
+
+    return TaskSteward(
+        task_id='42',
+        task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
+        worktree=worktree,
+        config=config,
+        mcp=mcp,
+        escalation_queue=queue,
+        briefing=briefing,
+    )
+
+
+def _make_escalation(**overrides) -> Escalation:
+    defaults: dict = dict(
+        id='esc-42-1',
+        task_id='42',
+        agent_role='orchestrator',
+        severity='blocking',
+        category='limit_exhausted',
+        summary='execute limit exhausted',
+    )
+    defaults.update(overrides)
+    return Escalation(**defaults)
+
+
+@pytest.mark.asyncio
+class TestStewardOutcomeRouting:
+    """Boundary rows 8-9 (PRD §9): steward ``_publish_outcome``/
+    ``_handle_escalation`` (PRODUCER) ↔ workflow ``_await_steward_completion``/
+    ``_mark_blocked`` (CONSUMER), SO-1 / task 2060.
+    """
+
+    # -- Row 8: StewardResolved ---------------------------------------------
+
+    async def test_row8_await_steward_completion_returns_channel_published_resolved(
+        self, tmp_path: Path,
+    ):
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardResolved(resolution_text='fixed the flaky import'),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        outcome = await wf._await_steward_completion()
+
+        assert outcome == StewardResolved(resolution_text='fixed the flaky import')
+
+    async def test_row8_mark_blocked_routes_resolved_to_requeued_via_pending(
+        self, tmp_path: Path,
+    ):
+        """The SINGLE isinstance dispatch (workflow.py:8685-8759):
+        StewardResolved -> REQUEUED via ``_requeue()``/pending, with NO
+        timestamp-window/queue-forensics read — ``escalation_queue.get_by_task``
+        is never consulted for this outcome."""
+        wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
+        wf._steward = MagicMock()
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardResolved(resolution_text='fixed it'),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        outcome = await wf._mark_blocked('agent hit a transient failure')
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        wf.scheduler.set_task_status.assert_any_call(  # type: ignore[attr-defined]
+            wf.task_id, 'pending',
+        )
+        wf.escalation_queue.get_by_task.assert_not_called()  # type: ignore[union-attr]
+
+    # -- Row 8: StewardTerminalDecision --------------------------------------
+
+    @pytest.mark.parametrize('status', ['done', 'cancelled', 'deferred'])
+    async def test_row8_await_steward_completion_synthesizes_terminal_decision_from_scheduler_status(
+        self, tmp_path: Path, status: str,
+    ):
+        """``StewardTerminalDecision`` is NEVER published on the channel — it
+        is SYNTHESIZED from a single fresh ``scheduler.get_status`` read that
+        always overrides whatever (if anything) the channel produced (the
+        pre-W9-delta terminal/deferred-wins ordering, preserved)."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf._steward_outcome_channel = asyncio.Queue()
+        # An unrelated outcome sits on the channel; the terminal/deferred
+        # status read still wins.
+        wf._steward_outcome_channel.put_nowait(
+            StewardResolved(resolution_text='irrelevant — status overrides'),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value=status)
+
+        outcome = await wf._await_steward_completion()
+
+        assert outcome == StewardTerminalDecision(new_status=TaskStatus(status))
+
+    async def test_row8_mark_blocked_routes_terminal_decision_done_to_done(
+        self, tmp_path: Path,
+    ):
+        wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
+        wf._steward = MagicMock()
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardResolved(resolution_text='irrelevant — status overrides'),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='done')
+
+        outcome = await wf._mark_blocked('agent hit a transient failure')
+
+        assert outcome == WorkflowOutcome.DONE
+        assert wf.state == WorkflowState.DONE
+        wf.escalation_queue.get_by_task.assert_not_called()  # type: ignore[union-attr]
+
+    async def test_row8_mark_blocked_routes_terminal_decision_non_done_to_blocked_preserved(
+        self, tmp_path: Path,
+    ):
+        """A steward-adjacent terminal decision that is NOT 'done'
+        (cancelled/deferred) preserves the status rather than re-queueing —
+        no L1, since this is a legitimate steward-observed decision, not a
+        failure to resolve."""
+        wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
+        wf._steward = MagicMock()
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardResolved(resolution_text='irrelevant — status overrides'),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='cancelled')
+        wf._ensure_l1_escalation_for_blocked = AsyncMock()
+
+        outcome = await wf._mark_blocked('agent hit a transient failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        wf._ensure_l1_escalation_for_blocked.assert_not_awaited()
+
+    # -- Row 9 (task 2060): StewardInterrupted(attempt_cap, wip=True) -------
+
+    async def test_row9_mark_blocked_wip_interrupted_dismisses_l0_and_requeues_not_l1(
+        self, tmp_path: Path,
+    ):
+        """workflow.py:8716-8742's resume-plan path: dismiss the still-
+        pending L0 and re-pend — NOT an L1 re-escalation."""
+        wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
+        wf._steward = MagicMock()
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardInterrupted('attempt_cap', wip_commits_present=True),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+        pending_l0 = MagicMock(id='esc-orig-0')
+        wf.escalation_queue.get_by_task.return_value = [pending_l0]  # type: ignore[union-attr]
+        wf._ensure_l1_escalation_for_blocked = AsyncMock()
+
+        outcome = await wf._mark_blocked('agent kept hitting the retry cap')
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        wf.escalation_queue.resolve.assert_called_once()  # type: ignore[union-attr]
+        call = wf.escalation_queue.resolve.call_args  # type: ignore[union-attr]
+        assert call.args[0] == 'esc-orig-0'
+        assert call.kwargs.get('dismiss') is True
+        assert call.kwargs.get('resolved_by') == 'auto-dismissed'
+        wf.scheduler.set_task_status.assert_any_call(  # type: ignore[attr-defined]
+            wf.task_id, 'pending',
+        )
+        wf._ensure_l1_escalation_for_blocked.assert_not_awaited()
+
+    # -- Row 9 producer: _ensure_steward_started wiring ----------------------
+
+    async def test_row9_ensure_steward_started_wires_outcome_channel_and_wip_probe(
+        self, tmp_path: Path,
+    ):
+        """The producer wiring choke point: a freshly-built steward is
+        handed THIS workflow's outcome channel and wip probe — the SAME
+        primitive the workflow uses for its own grace-timeout derivation
+        (:meth:`TaskWorkflow._worktree_has_wip_commits`)."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf._steward = None
+        wf._steward_outcome_channel = None
+        mock_steward = MagicMock()
+        mock_steward.start = AsyncMock()
+        wf._steward_factory = MagicMock(return_value=mock_steward)
+        wf.escalation_queue = MagicMock()
+        wf.escalation_queue.get_by_task.return_value = [MagicMock()]
+
+        await wf._ensure_steward_started()
+
+        assert wf._steward is mock_steward
+        wf._steward_factory.assert_called_once_with(wf.worktree, wf._config_dir)
+        assert isinstance(wf._steward_outcome_channel, asyncio.Queue)
+        mock_steward.set_outcome_channel.assert_called_once_with(
+            wf._steward_outcome_channel,
+        )
+        mock_steward.set_wip_probe.assert_called_once_with(
+            wf._worktree_has_wip_commits,
+        )
+        mock_steward.start.assert_awaited_once()
+
+    # -- Row 9 producer: steward attempt-cap branch, wip=True ---------------
+
+    async def test_row9_steward_attempt_cap_wip_true_publishes_directly_skips_l1(
+        self, tmp_path: Path,
+    ):
+        """When the per-escalation retry cap fires with WIP present, the
+        steward publishes the wip-gated ``StewardInterrupted`` DIRECTLY —
+        ``_auto_escalate_to_human`` (and therefore any L1 filing) is skipped
+        entirely (task-2060 fix)."""
+        steward = _make_steward(worktree=tmp_path / 'wt')
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        steward.set_wip_probe(AsyncMock(return_value=True))
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 1  # at cap (>= steward_max_attempts)
+
+        with patch(
+            'orchestrator.steward.invoke_agent', new_callable=AsyncMock,
+        ) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        mock_invoke.assert_not_called()
+        steward.escalation_queue.submit.assert_not_called()  # type: ignore[attr-defined]  # no L1 filed
+        assert channel.get_nowait() == StewardInterrupted(
+            reason='attempt_cap', wip_commits_present=True,
+        )
+
+    # -- Row 9 cancel-safety guard --------------------------------------------
+
+    async def test_row9_cancel_event_set_forces_no_wip_so_mark_blocked_skips_resume_branch(
+        self, tmp_path: Path,
+    ):
+        """Amendment guard, exercised through the FULL ``_mark_blocked``
+        dispatch (not just ``_await_steward_completion``'s return value): a
+        soft-cancel in flight must never be routed into the task-2060
+        resume-plan branch, even when the worktree genuinely carries WIP —
+        ``_cancel_event`` forces ``wip_commits_present=False`` at the
+        synthesis choke point, so the channel-empty case falls through to
+        the generic BLOCKED+L1 path instead of dismiss-and-requeue."""
+        wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
+        wf._steward = MagicMock()
+        wf._steward_outcome_channel = asyncio.Queue()  # nothing published
+        wf._worktree_has_wip_commits = AsyncMock(return_value=True)
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+        wf.escalation_queue.get_by_task.return_value = []  # type: ignore[union-attr]
+        wf._ensure_l1_escalation_for_blocked = AsyncMock()
+        wf._cancel_event.set()
+
+        outcome = await wf._mark_blocked('agent kept hitting the retry cap')
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        wf._ensure_l1_escalation_for_blocked.assert_awaited_once()
+        wf.scheduler.set_task_status.assert_called_once_with(  # type: ignore[attr-defined]
+            wf.task_id, 'blocked',
+        )
