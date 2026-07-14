@@ -46,7 +46,7 @@ def _fixture_config(state):
 
     knob_line = {
         "unflipped": "",
-        "flipped": f'  {KNOB}: "1"\n',
+        "flipped": f'  {KNOB_RUN_ALL}: "1"\n  {KNOB}: "1"\n',
         "flipped_zero": f'  {KNOB}: "0"\n',
     }[state]
 
@@ -71,7 +71,9 @@ def _make_fake_reify_repo(tmp_path, *, state="unflipped", failing_precommit=Fals
 
     state:
       "unflipped"     - no REIFY_GATE_EXCLUDE_HEAVY key present (default).
-      "flipped"       - REIFY_GATE_EXCLUDE_HEAVY: "1" already present.
+      "flipped"       - both REIFY_GATE_EXCLUDE_HEAVY: "1" and
+                         REIFY_RUN_ALL_EXCLUDE_HOST_INFRA: "1" already
+                         present (is_flipped() requires every knob).
       "flipped_zero"  - REIFY_GATE_EXCLUDE_HEAVY: "0" already present (a
                          stray/stale value apply must normalize to "1").
       "no_verify_env" - no top-level verify_env: anchor at all (malformed
