@@ -199,13 +199,36 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
 
     from orchestrator.harness import Harness  # type: ignore[reportMissingImports]
     from orchestrator.scheduler import TaskAssignment  # type: ignore[reportMissingImports]
-    from orchestrator.workflow import WorkflowOutcome  # type: ignore[reportMissingImports]
+    from orchestrator.workflow import (  # type: ignore[reportMissingImports]
+        TerminalReport,
+        WorkflowOutcome,
+        WorkflowState,
+    )
 
     tid = '42'
 
     # ── Build bypass-__init__ Harness (mirrors harness_for_run_slot fixture) ──
     h: Harness = Harness.__new__(Harness)
     h._init_digest_state()
+
+    # Scheduler: get_status='in-progress' → release_workflow parks as 'blocked'.
+    # Must be assigned before ``_workflow_cancel_at`` below — that attribute is
+    # now a property (task 2235) whose setter delegates to
+    # ``self.scheduler._workflow_cancel_at``, so ``self.scheduler`` must exist
+    # first or the setter raises AttributeError.
+    h.scheduler = MagicMock()
+    h.scheduler.get_status = AsyncMock(return_value='in-progress')
+    h.scheduler.set_task_status = AsyncMock()
+    h.scheduler.release = MagicMock()
+    # Substrate gate: _run_slot now calls substrate_gate.carries_substrate_probe
+    # (module-level, not a Scheduler method — task 2121) directly on
+    # assignment.task below, which carries no 'metadata' key — the real
+    # predicate returns False so _run_slot skips _run_substrate_gate (which
+    # needs git_ops.worktree_base — left None since TaskWorkflow is patched).
+    # is_deterministic gate: stub False so _run_slot follows the normal TaskWorkflow
+    # path instead of misrouting to _run_deterministic_slot on a truthy MagicMock
+    # (task 1899 deterministic-runner drift; mirrors the test_crash_recovery 1919 fix).
+    h.scheduler.is_deterministic = MagicMock(return_value=False)
 
     # cancel / slot registries
     h._workflow_cancel_events = {}  # type: ignore[assignment]
@@ -237,21 +260,6 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     h._run_id = None  # type: ignore[assignment]
     h.review_checkpoint = None  # type: ignore[assignment]
 
-    # Scheduler: get_status='in-progress' → release_workflow parks as 'blocked'
-    h.scheduler = MagicMock()
-    h.scheduler.get_status = AsyncMock(return_value='in-progress')
-    h.scheduler.set_task_status = AsyncMock()
-    h.scheduler.release = MagicMock()
-    # Substrate gate: _run_slot now calls substrate_gate.carries_substrate_probe
-    # (module-level, not a Scheduler method — task 2121) directly on
-    # assignment.task below, which carries no 'metadata' key — the real
-    # predicate returns False so _run_slot skips _run_substrate_gate (which
-    # needs git_ops.worktree_base — left None since TaskWorkflow is patched).
-    # is_deterministic gate: stub False so _run_slot follows the normal TaskWorkflow
-    # path instead of misrouting to _run_deterministic_slot on a truthy MagicMock
-    # (task 1899 deterministic-runner drift; mirrors the test_crash_recovery 1919 fix).
-    h.scheduler.is_deterministic = MagicMock(return_value=False)
-
     assignment = TaskAssignment(  # type: ignore[reportMissingImports]
         task_id=tid,
         task={'id': tid, 'title': 'real slot exit test'},
@@ -273,7 +281,16 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
             # Block until release_workflow triggers the cancel event.
             if cancel_event_holder:
                 await cancel_event_holder[-1].wait()
-            return WorkflowOutcome.SOFT_CANCELLED
+            # _run_slot's TR-1 terminal contract (harness.py) reads
+            # terminal_report.outcome — a bare WorkflowOutcome enum has no
+            # such attribute and would route to the except-path (requeued=True).
+            return TerminalReport(
+                outcome=WorkflowOutcome.SOFT_CANCELLED,
+                reason='',
+                phase=WorkflowState.CANCELLED,
+                detail='',
+                category=None,
+            )
 
         mock_wf.run = _run_soft_cancelled
         return mock_wf
