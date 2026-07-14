@@ -653,6 +653,22 @@ class DeterministicRunner:
         posture as the trailing blocked-status write below, since the
         escalation above is already durable regardless.
 
+        Consequence of that phase advance failing (reviewer amendment, task
+        2240): if it raises transiently — e.g. the SAME severed connection
+        that triggered this escalation in the first place — the disk-backed
+        escalation above is still filed, but ``deploy_state.phase`` stays at
+        its PRE-escalation value (typically ``RAN``) instead of advancing to
+        ``ESCALATED``. Once a human resolves that escalation, the runner's
+        resume path reads ``phase != ESCALATED`` and treats it as a
+        crash-window rather than a resolved gate — re-filing a fresh
+        ``infra_issue`` and blocking again instead of driving to done, i.e.
+        one spurious extra human round-trip. This self-heals: the re-filed
+        escalation's OWN best-effort advance retries the SAME
+        ``RAN -> ESCALATED`` edge, and once the connection recovers it lands,
+        after which the next resolution correctly proves ``phase ==
+        ESCALATED`` and resumes to done. No state is corrupted either way —
+        only convergence is delayed by one extra escalate/resolve cycle.
+
         Returns:
             WorkflowOutcome.BLOCKED
         """
@@ -686,7 +702,10 @@ class DeterministicRunner:
 
         if metadata is not None and metadata.get('before_done') is not None:
             try:
-                await self._advance_deploy_phase(task_id, metadata, DeployPhase.ESCALATED)
+                await self._advance_deploy_phase(
+                    task_id, metadata, DeployPhase.ESCALATED,
+                    phase_timestamp=datetime.now(UTC).isoformat(),
+                )
             except Exception as exc:
                 logger.warning(
                     'DeterministicRunner: task %s deploy_state phase-escalated '
@@ -855,6 +874,7 @@ class DeterministicRunner:
         new_phase: DeployPhase,
         *,
         verify_baseline: VerifyBaseline | dict | None = None,
+        phase_timestamp: str | None = None,
     ) -> DeployState:
         """DS-2: enforce the transition and build the advanced ``DeployState``.
 
@@ -875,6 +895,17 @@ class DeterministicRunner:
         ``verify_baseline``, when omitted, carries forward whatever baseline
         was already recorded — a phase advance must never drop previously
         persisted DS-3 evidence.
+
+        ``phase_timestamp`` (reviewer amendment, task 2240): when given, is
+        written into whichever ONE of ``ran_at`` / ``verified_at`` /
+        ``escalated_at`` matches *new_phase* (RAN / VERIFIED / ESCALATED
+        respectively — a SCHEDULED advance, or any other, has no matching
+        field and leaves all three untouched). Callers pass the SAME ISO
+        timestamp already being written to the corresponding top-level
+        evidence stamp (e.g. ``before_done_ran_at``), so ``DeployState``
+        stays self-describing instead of emitting these fields as ``null``
+        on every write forever. Omitted (``None``) leaves the OLD
+        carried-forward value in place, exactly as before.
         """
         old_state = DeployState.from_metadata(metadata)
         old_phase = old_state.phase if old_state is not None else None
@@ -889,12 +920,22 @@ class DeterministicRunner:
             verify_baseline if verify_baseline is not None
             else (old_state.verify_baseline if old_state is not None else None)
         )
+        ran_at = old_state.ran_at if old_state is not None else None
+        verified_at = old_state.verified_at if old_state is not None else None
+        escalated_at = old_state.escalated_at if old_state is not None else None
+        if phase_timestamp is not None:
+            if new_phase == DeployPhase.RAN:
+                ran_at = phase_timestamp
+            elif new_phase == DeployPhase.VERIFIED:
+                verified_at = phase_timestamp
+            elif new_phase == DeployPhase.ESCALATED:
+                escalated_at = phase_timestamp
         return DeployState(
             phase=new_phase,
             verify_baseline=carried_baseline,
-            ran_at=old_state.ran_at if old_state is not None else None,
-            verified_at=old_state.verified_at if old_state is not None else None,
-            escalated_at=old_state.escalated_at if old_state is not None else None,
+            ran_at=ran_at,
+            verified_at=verified_at,
+            escalated_at=escalated_at,
         )
 
     async def _advance_deploy_phase(
@@ -905,6 +946,7 @@ class DeterministicRunner:
         *,
         evidence: dict | None = None,
         verify_baseline: VerifyBaseline | dict | None = None,
+        phase_timestamp: str | None = None,
     ) -> DeployState:
         """DS-1/DS-2: atomically advance ``metadata.deploy_state.phase`` + evidence.
 
@@ -913,10 +955,12 @@ class DeterministicRunner:
         ``metadata['deploy_state']`` in place so a LATER call within the SAME
         ``run()`` invocation observes the just-written phase as ``old``. See
         ``_compute_deploy_phase_advance`` for the transition-enforcement +
-        state-construction logic this wraps.
+        state-construction logic this wraps, including what
+        ``phase_timestamp`` does.
         """
         new_state = self._compute_deploy_phase_advance(
-            task_id, metadata, new_phase, verify_baseline=verify_baseline,
+            task_id, metadata, new_phase,
+            verify_baseline=verify_baseline, phase_timestamp=phase_timestamp,
         )
         payload = {**new_state.to_metadata(), **(evidence or {})}
         await self.scheduler.update_task(task_id, payload, metadata_mode='merge')
@@ -1017,6 +1061,7 @@ class DeterministicRunner:
 
         verified_deploy_state = self._compute_deploy_phase_advance(
             task_id, metadata, DeployPhase.VERIFIED,
+            phase_timestamp=verified_iso,
         )
         deploy_state_payload = verified_deploy_state.to_metadata()
 
@@ -1200,6 +1245,7 @@ class DeterministicRunner:
             await self._advance_deploy_phase(
                 task_id, metadata, DeployPhase.ESCALATED,
                 evidence={'gate_escalated_at': now_iso},
+                phase_timestamp=now_iso,
             )
         else:
             await self.scheduler.update_task(
@@ -1769,6 +1815,7 @@ class DeterministicRunner:
             await self._advance_deploy_phase(
                 task_id, metadata, DeployPhase.RAN,
                 evidence={'before_done_ran_at': now_iso},
+                phase_timestamp=now_iso,
             )
 
             # ── ε: self-target detection ─────────────────────────────────────

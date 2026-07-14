@@ -843,6 +843,11 @@ class TestBeforeDoneCrossUnitDeploy:
         assert stamp_calls, 'update_task must be called with a truthy before_done_ran_at stamp'
         payload = stamp_calls[0].args[1]
         assert payload.get('deploy_state', {}).get('phase') == 'ran'
+        # Reviewer amendment (task 2240): deploy_state.ran_at must mirror the
+        # SAME timestamp as the top-level before_done_ran_at stamp — not
+        # stay null forever (it previously carried the OLD state's ran_at,
+        # which was always None since nothing ever populated it).
+        assert payload['deploy_state']['ran_at'] == payload['before_done_ran_at']
 
     async def test_b6_persists_verify_baseline_from_captured_baseline(self, tmp_path: Path):
         """ζ DS-3: deploy_state.verify_baseline is persisted from the captured
@@ -914,6 +919,13 @@ class TestBeforeDoneCrossUnitDeploy:
         ]
         assert deploy_state_calls
         assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
+        # Reviewer amendment (task 2240): deploy_state.escalated_at must
+        # mirror the SAME timestamp as the top-level gate_escalated_at
+        # stamp written in this exact call, not stay null forever.
+        assert (
+            deploy_state_calls[-1].args[1]['deploy_state']['escalated_at']
+            == deploy_state_calls[-1].args[1]['gate_escalated_at']
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1608,6 +1620,13 @@ class TestCrossUnitWritebackResilience:
         )
         assert verified_calls[0].args[1].get('deploy_state', {}).get('phase') == 'verified', (
             'the verified-stamp write must atomically carry deploy_state.phase==verified'
+        )
+        # Reviewer amendment (task 2240): deploy_state.verified_at must
+        # mirror the SAME timestamp as the top-level before_done_verified_at
+        # stamp written in this exact call, not stay null forever.
+        assert (
+            verified_calls[0].args[1]['deploy_state']['verified_at']
+            == verified_calls[0].args[1]['before_done_verified_at']
         )
 
 
@@ -2602,6 +2621,119 @@ class TestBeforeDoneRcNonZero:
         ]
         assert deploy_state_calls
         assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
+
+
+# ---------------------------------------------------------------------------
+# Reviewer amendment (task 2240): _file_infra_issue_and_block's best-effort
+# ran->escalated phase advance can itself fail transiently (e.g. the SAME
+# severed connection that triggered the escalation). Pin the documented
+# consequence: no state corruption, but a resume sees phase stuck at 'ran'
+# and re-escalates instead of resuming to done — one spurious extra
+# escalate/resolve round-trip that self-heals once the advance lands.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestFileInfraIssueEscalatedAdvanceFailureConverges:
+    """A transient failure of the best-effort ESCALATED phase advance must
+    not corrupt state, but does cost one extra human round-trip before the
+    task converges to done — see _file_infra_issue_and_block's docstring."""
+
+    async def test_advance_failure_then_resolve_converges_after_extra_round_trip(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2240')
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(1, 'boom: unit failed to start'))
+
+        # Connection severed ONLY for the ESCALATED phase-advance write
+        # (deploy_state.phase=='escalated'); the RAN stamp write and every
+        # set_task_status call are unaffected — the escalation itself is
+        # still filed durably (EscalationQueue.submit writes to local disk).
+        escalated_advance_should_fail = [True]
+
+        def _update_task_side_effect(_task_id, metadata, **_kwargs):
+            ds = metadata.get('deploy_state') or {}
+            if ds.get('phase') == 'escalated' and escalated_advance_should_fail[0]:
+                raise RuntimeError('connection severed (simulated)')
+            return True
+
+        scheduler.update_task = AsyncMock(side_effect=_update_task_side_effect)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+
+        # --- Run 1: deploy fails (rc≠0), escalation filed, but the
+        # best-effort advance to ESCALATED itself fails transiently — phase
+        # stays at 'ran'.
+        outcome1 = await runner.run(_make_assignment(task))
+        assert outcome1 == WorkflowOutcome.BLOCKED
+        assert task['metadata']['deploy_state']['phase'] == 'ran', (
+            'the best-effort advance failed, so phase must stay at its '
+            'pre-escalation value, not silently jump to escalated'
+        )
+        first_pending = queue.get_by_task('2240', status='pending')
+        assert len(first_pending) == 1
+
+        # The runner mirrors deploy_state into `metadata` in place (needed
+        # for same-run multi-advance reads), but a plain top-level evidence
+        # stamp like before_done_ran_at is only ever sent to the (mocked)
+        # scheduler — it does not round-trip back into this dict the way a
+        # real get_task() would on the next dispatch. Simulate that landed
+        # write explicitly, mirroring how every other resume-path test in
+        # this file seeds before_done_ran_at via _deploy_task's kwarg — only
+        # the ESCALATED advance failed, not this one.
+        task['metadata']['before_done_ran_at'] = '2026-07-01T00:00:00+00:00'
+
+        # A human resolves the (only) escalation — but the phase is still
+        # stuck at 'ran', not 'escalated'.
+        queue.resolve(first_pending[0].id, 'human restarted the unit manually')
+
+        # --- Run 2 (resume): connection recovers. The phase==ESCALATED
+        # resolution proof is NOT satisfied (still 'ran'), so this is
+        # indistinguishable from an unresolved crash-window — it
+        # re-escalates instead of resuming to done (the documented spurious
+        # extra round-trip). This time the advance itself succeeds, landing
+        # phase=='escalated'.
+        escalated_advance_should_fail[0] = False
+        outcome2 = await runner.run(_make_assignment(task))
+        assert outcome2 == WorkflowOutcome.BLOCKED, (
+            'phase never reached ESCALATED, so resume must NOT phantom-complete'
+        )
+        assert task['metadata']['deploy_state']['phase'] == 'escalated', (
+            'the connection recovered, so this advance must land'
+        )
+        second_pending = queue.get_by_task('2240', status='pending')
+        assert len(second_pending) == 1
+        assert second_pending[0].id != first_pending[0].id, (
+            'a NEW escalation must be filed — this is the spurious extra '
+            'round-trip, not a re-use of the already-resolved one'
+        )
+
+        # A human resolves the second escalation.
+        queue.resolve(second_pending[0].id, 'human confirmed the unit is healthy')
+
+        # --- Run 3 (resume): phase==ESCALATED + own_escalation_resolved now
+        # both hold — converges to done, no further escalation.
+        outcome3 = await runner.run(_make_assignment(task))
+        assert outcome3 == WorkflowOutcome.DONE, (
+            'once phase==ESCALATED is actually persisted, resolution proof '
+            'holds and the task converges to done'
+        )
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert len(done_calls) == 1
 
 
 # ---------------------------------------------------------------------------
