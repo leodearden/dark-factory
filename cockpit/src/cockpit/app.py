@@ -38,6 +38,9 @@ from orchestrator.session_registry import (
     set_manual_boost,
     update_decision_state,
 )
+from orchestrator.session_registry import (
+    fleet_root as resolve_fleet_root,
+)
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -58,7 +61,8 @@ from cockpit.panes.detail_pane import DetailPane
 from cockpit.panes.session_table import SessionTable, filter_live_sessions, order_sessions
 from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv, default_skip_perms
 from cockpit.panes.spawn_tree import SpawnTreeScreen
-from cockpit.priority import Priorities, load_priorities
+from cockpit.panes.weight_editor import WeightEditorScreen, known_projects
+from cockpit.priority import Priorities, load_priorities, save_priorities
 from cockpit.registry_reader import (
     SessionScanner,
     SessionScannerProtocol,
@@ -161,6 +165,7 @@ class CockpitApp(App):
         Binding('n', 'new_session', 'New session', show=False),
         Binding('t', 'toggle_tree', 'Spawn tree', show=False),
         Binding('h', 'toggle_history', 'Toggle history', show=False),
+        Binding('w', 'edit_weights', 'Edit weights', show=False),
         # All ten digits are bound, but a digit's SCORE effect saturates
         # once it exceeds the active Priorities.manual_boost.max (default 5
         # -- see priority.py's score(), which clamps manual_boost into
@@ -200,7 +205,17 @@ class CockpitApp(App):
         }
         self._spawn_runner = spawn_runner if spawn_runner is not None else _default_spawn_runner
         self._spawn_script = spawn_script if spawn_script is not None else _default_spawn_script()
-        self._priorities = priorities if priorities is not None else load_priorities()
+        self._priorities_path = resolve_fleet_root(self.fleet_root) / 'priorities.yaml'
+        # Logged at DEBUG (not WARNING -- this is routine, not a fault) so a
+        # deployment that sets $CLAUDE_FLEET_ROOT can confirm which
+        # priorities.yaml this session is reading/writing: the path is
+        # fleet_root-relative (see TestPrioritiesPathResolution), which
+        # diverges from a fixed ~/.claude/fleet default whenever
+        # fleet_root/$CLAUDE_FLEET_ROOT points elsewhere.
+        _log.debug('CockpitApp: priorities path resolved to %s', self._priorities_path)
+        self._priorities = (
+            priorities if priorities is not None else load_priorities(self._priorities_path)
+        )
         self._records: list[SessionRecord] = []
         self._decisions: list[DecisionRecord] = []
         self._snapshot: dict[str, tuple] = {}
@@ -747,6 +762,46 @@ class CockpitApp(App):
         title = f'{role}:{Path(project_root).name}'
         argv = build_spawn_argv(script, project_root, title, prompt, skip_perms=skip_perms)
         self._spawn_runner(argv)
+
+    def action_edit_weights(self) -> None:
+        """'w' -- push the in-cockpit priority weight editor (PRD §9 C9b).
+
+        Seeds the screen with a snapshot of self._priorities (the current
+        weights, mutated only via apply_priorities/the injected callback --
+        never in place) and the known project names -- the sorted union of
+        self._records'/self._decisions' own .project plus
+        self._priorities.project_weights' existing keys (known_projects),
+        so an already-weighted project is always offered even with no live
+        session/decision right now. Submitting the screen calls back into
+        apply_priorities, this task's leaf signal; the screen itself never
+        persists priorities.yaml or rebuilds the queue.
+        """
+        self.push_screen(
+            WeightEditorScreen(
+                self._priorities,
+                known_projects(self._records, self._decisions, self._priorities.project_weights),
+                self.apply_priorities,
+            )
+        )
+
+    def apply_priorities(self, new_priorities: Priorities) -> None:
+        """Apply an edited Priorities snapshot (PRD §9 C9b weight editor) -- this task's leaf signal.
+
+        Swaps self._priorities to *new_priorities*, persists it to
+        self._priorities_path via C3's save_priorities (fail-soft -- see
+        save_priorities's own docstring: a write fault is logged and
+        swallowed, never raised), then calls _rebuild_queue() immediately
+        so the DecisionQueue re-scores and re-renders against the new
+        weights right now -- exactly like a boost/drop/defer keypress,
+        never waiting for the next poll tick. The caller (eventually
+        WeightEditorScreen, via action_edit_weights) builds *new_priorities*
+        itself from the pure merge_weight_edits helper; this method never
+        parses raw edits and never touches priorities.yaml except through
+        save_priorities.
+        """
+        self._priorities = new_priorities
+        save_priorities(new_priorities, self._priorities_path)
+        self._rebuild_queue()
 
     def action_toggle_tree(self) -> None:
         """'t' -- open the spawn-tree modal (Fleet Cockpit C9a, PRD §9).
