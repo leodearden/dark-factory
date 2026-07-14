@@ -202,17 +202,24 @@ class SignalCounts:
         )
 
 
-def score_signals(path: Path) -> SignalCounts:
-    """Zero-token single pass over a transcript, counting the 5 confusion-signal classes.
+def _score_and_find_first_turn(path: Path) -> tuple[SignalCounts, dict[str, Any] | None]:
+    """Single pass over *path*, producing both a signal score and the first user turn.
 
-    One increment per class per RECORD (not per pattern match) — a record
-    carrying multiple synonymous markers for the same class still counts
-    once. ``tool_error`` and the tool-use half of ``df_guard`` are
-    structural checks; every other class is a plain case-insensitive
-    substring scan. Malformed/unreadable input degrades to an all-zero
-    :class:`SignalCounts` rather than raising.
+    :func:`score_signals` already has to read every record in *path* (a
+    confusion signal can occur anywhere in the file); :func:`main`'s
+    scoring loop separately called :func:`_find_first_user_turn` on the
+    same path, re-opening and re-parsing the same transcript purely to
+    locate its first non-sidechain, non-meta user turn
+    (reviewer_comprehensive/performance, task 2573 amendment pass #2).
+    This helper folds both searches into the SAME iteration over
+    :func:`legibility.inventory._iter_json_lines`, so a session transcript
+    is read once instead of twice. :func:`score_signals` and
+    :func:`_find_first_user_turn` both delegate to this function, so every
+    other caller (including the direct unit tests of :func:`score_signals`)
+    keeps its existing single-purpose signature and exact return value.
     """
     tool_error = not_found = self_correct = df_guard = interrupt = 0
+    first_turn: dict[str, Any] | None = None
     try:
         for record in _iter_json_lines(path):
             if _has_tool_error(record):
@@ -235,15 +242,42 @@ def score_signals(path: Path) -> SignalCounts:
             )
             if _has_guard_tool_use(record) or has_guard_text:
                 df_guard += 1
+
+            if (
+                first_turn is None
+                and record.get('type') == 'user'
+                and not record.get('isSidechain')
+                and not record.get('isMeta')
+            ):
+                first_turn = record
     except OSError:
-        pass
-    return SignalCounts(
+        return SignalCounts(), None
+
+    counts = SignalCounts(
         tool_error=tool_error,
         not_found=not_found,
         self_correct=self_correct,
         df_guard=df_guard,
         interrupt=interrupt,
     )
+    return counts, first_turn
+
+
+def score_signals(path: Path) -> SignalCounts:
+    """Zero-token single pass over a transcript, counting the 5 confusion-signal classes.
+
+    One increment per class per RECORD (not per pattern match) — a record
+    carrying multiple synonymous markers for the same class still counts
+    once. ``tool_error`` and the tool-use half of ``df_guard`` are
+    structural checks; every other class is a plain case-insensitive
+    substring scan. Malformed/unreadable input degrades to an all-zero
+    :class:`SignalCounts` rather than raising. Delegates to
+    :func:`_score_and_find_first_turn` (shared with
+    :func:`_find_first_user_turn` so :func:`main`'s scoring loop can get
+    both in one file read); see its docstring for why.
+    """
+    counts, _ = _score_and_find_first_turn(path)
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -415,12 +449,27 @@ def dedupe_shapes(records: Sequence[ScoredRecord]) -> list[ScoredRecord]:
 
 @dataclass(frozen=True)
 class SampleResult:
-    """The result of :func:`stratified_sample`: the selection plus accounting."""
+    """The result of :func:`stratified_sample`: the selection plus accounting.
+
+    ``zero_signal_dropped`` and ``dedupe_collapsed`` count records that
+    never got a chance to compete for budget — no signal at all, or a
+    near-duplicate shape collapsed by :func:`dedupe_shapes` — while
+    ``budget_skipped`` counts records that DID survive to the candidate
+    stage but were cut solely because the byte budget ran out (a
+    reserved-floor group skipped whole, or a leftover candidate excluded by
+    the greedy fill's halt). Surfacing all three lets an operator reading
+    :func:`main`'s summary tell "there was nothing to sample" apart from
+    "the budget cut off real signal" (reviewer_comprehensive/observability,
+    task 2573 amendment pass #2) — the previous summary reported the first
+    two but left budget-driven truncation invisible.
+    """
 
     selected: list[ScoredRecord]
     per_stratum_counts: dict[str, int]
     zero_signal_dropped: int
     bytes_used: int
+    dedupe_collapsed: int = 0
+    budget_skipped: int = 0
 
 
 def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig) -> SampleResult:
@@ -448,7 +497,11 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
     in global score-descending order, stopping outright at the first
     candidate that would exceed the budget (a strict greedy halt, not a
     skip-ahead bin-pack). The final selection is returned in
-    score-descending order.
+    score-descending order. ``dedupe_collapsed`` (records collapsed away by
+    :func:`dedupe_shapes` in step 3) and ``budget_skipped`` (candidates
+    excluded solely by the byte cap in steps 5-6) are accumulated
+    alongside the selection for :func:`main`'s summary — see
+    :class:`SampleResult`.
     """
     top_fraction = config.sampling.top_fraction
     per_stratum_min = config.sampling.per_stratum_min
@@ -459,6 +512,7 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
         by_stratum.setdefault(record.stratum, []).append(record)
 
     zero_signal_dropped = 0
+    dedupe_collapsed = 0
     reserved_groups: list[list[ScoredRecord]] = []
     leftover: list[ScoredRecord] = []
 
@@ -468,7 +522,9 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
         nonzero = [r for r in stratum_records if r.score > 0]
         zero_signal_dropped += stratum_size - len(nonzero)
 
-        survivors = sorted(dedupe_shapes(nonzero), key=lambda r: r.score, reverse=True)
+        deduped = dedupe_shapes(nonzero)
+        dedupe_collapsed += len(nonzero) - len(deduped)
+        survivors = sorted(deduped, key=lambda r: r.score, reverse=True)
 
         candidate_count = min(
             max(math.ceil(top_fraction * stratum_size), per_stratum_min),
@@ -483,15 +539,19 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
 
     selected: list[ScoredRecord] = []
     bytes_used = 0
+    budget_skipped = 0
     for group in sorted(reserved_groups, key=lambda g: sum(r.size_bytes for r in g)):
         group_bytes = sum(r.size_bytes for r in group)
         if bytes_used + group_bytes > max_bytes:
+            budget_skipped += len(group)
             continue
         selected.extend(group)
         bytes_used += group_bytes
 
-    for record in sorted(leftover, key=lambda r: r.score, reverse=True):
+    sorted_leftover = sorted(leftover, key=lambda r: r.score, reverse=True)
+    for index, record in enumerate(sorted_leftover):
         if bytes_used + record.size_bytes > max_bytes:
+            budget_skipped += len(sorted_leftover) - index
             break
         selected.append(record)
         bytes_used += record.size_bytes
@@ -507,6 +567,8 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
         per_stratum_counts=per_stratum_counts,
         zero_signal_dropped=zero_signal_dropped,
         bytes_used=bytes_used,
+        dedupe_collapsed=dedupe_collapsed,
+        budget_skipped=budget_skipped,
     )
 
 
@@ -538,18 +600,11 @@ def _find_first_user_turn(path: Path) -> dict[str, Any] | None:
 
     Returns the raw record dict (as :func:`classify_agent_class` expects),
     or None if the transcript has no such turn. Malformed/unreadable input
-    degrades to None rather than raising.
+    degrades to None rather than raising. Delegates to
+    :func:`_score_and_find_first_turn`; see its docstring for why.
     """
-    try:
-        for record in _iter_json_lines(path):
-            if record.get('type') != 'user':
-                continue
-            if record.get('isSidechain') or record.get('isMeta'):
-                continue
-            return record
-    except OSError:
-        return None
-    return None
+    _, first_turn = _score_and_find_first_turn(path)
+    return first_turn
 
 
 def main(argv: Sequence[str]) -> int:
@@ -590,8 +645,7 @@ def main(argv: Sequence[str]) -> int:
 
     scored: list[ScoredRecord] = []
     for session in sessions:
-        counts = score_signals(session.path)
-        first_turn = _find_first_user_turn(session.path)
+        counts, first_turn = _score_and_find_first_turn(session.path)
         stratum = classify_agent_class(first_turn, session.path)
         scored.append(
             ScoredRecord(
@@ -609,11 +663,13 @@ def main(argv: Sequence[str]) -> int:
     summary = ['=== legibility sampler summary ===', '']
     summary.append(f'sessions enumerated: {len(sessions)}')
     summary.append(f'zero-signal dropped: {result.zero_signal_dropped}')
+    summary.append(f'near-duplicate clones collapsed: {result.dedupe_collapsed}')
     for stratum in sorted(result.per_stratum_counts):
         summary.append(f'  {stratum}: {result.per_stratum_counts[stratum]} selected')
     summary.append(
         f'bytes used: {result.bytes_used} / {cfg.budgets.max_daily_digest_bytes}'
     )
+    summary.append(f'budget-skipped candidates (would exceed cap): {result.budget_skipped}')
     print('\n'.join(summary), file=sys.stderr)
 
     return 0
