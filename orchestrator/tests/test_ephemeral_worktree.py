@@ -24,6 +24,10 @@ Test coverage:
            contender with an independent Python OFD; released+unlinked on
            normal exit and on a body exception; no lock-file leak when
            `git worktree add` exhausts its retries)
+  task 2507 step-3: flock-denied path — TestEphemeralWorktreeFlockDenied (a
+           LOCK_NB-denied acquire raises EphemeralWorktreeError BEFORE any
+           `git worktree add`, the CM body never runs, and a pre-existing
+           foreign-held lock file is never unlinked)
 """
 from __future__ import annotations
 
@@ -31,6 +35,7 @@ import asyncio
 import fcntl
 import logging
 import os
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
@@ -565,6 +570,80 @@ class TestEphemeralWorktreeFlock:
         assert not leaked_locks, (
             f'expected no leaked {kind.value}*.lock file under worktree_base '
             f'after add exhausts retries; found {leaked_locks}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2507 step-3: flock-denied path raises EphemeralWorktreeError
+# ---------------------------------------------------------------------------
+
+
+class TestEphemeralWorktreeFlockDenied:
+    """task 2507 step-3: a LOCK_NB-denied flock acquire (another live
+    consumer already holds the sibling lock — should never happen in
+    practice, since ephemeral_worktree mints a fresh uuid4 hex per call,
+    but must fail safe if it ever does) converts to
+    ``EphemeralWorktreeError`` BEFORE any ``git worktree add`` is
+    attempted: the CM body never runs, and — critically — a lock file we
+    did not acquire is NEVER unlinked out from under its real holder.
+
+    Patches ``orchestrator.git_ops.fcntl.flock`` directly to raise
+    ``BlockingIOError``, modelling the denial without needing a real
+    second holder process.
+
+    RED today: step-2 leaves the ``fcntl.flock`` acquire un-wrapped, so
+    the raised ``BlockingIOError`` propagates as a bare
+    ``BlockingIOError`` instead of ``EphemeralWorktreeError``.
+    """
+
+    def test_flock_denied_raises_ephemeral_worktree_error_before_add(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.git_ops import EphemeralWorktreeError
+
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        entered = False
+        fixed_uuid = uuid.UUID('11111111-2222-3333-4444-555555555555')
+
+        # Derive the EXACT lock path ephemeral_worktree will compute (by
+        # patching uuid4 to the same fixed value), so a foreign-held lock
+        # file can be pre-created there and asserted untouched afterward.
+        expected_name = f'{WorktreeKind.MAIN_PROBE.value}{fixed_uuid.hex[:8]}'
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        lock_path = git_ops.worktree_base / f'{expected_name}.lock'
+        lock_path.write_text('foreign holder')
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                entered = True  # must never run
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            patch('orchestrator.git_ops.uuid.uuid4', return_value=fixed_uuid),
+            patch(
+                'orchestrator.git_ops.fcntl.flock',
+                side_effect=BlockingIOError(11, 'Resource temporarily unavailable'),
+            ),
+            pytest.raises(EphemeralWorktreeError),
+        ):
+            asyncio.run(_body())
+
+        assert not entered, (
+            'expected the CM body to NEVER run when the flock acquire is denied'
+        )
+        add_calls = [c for c in calls if 'worktree' in c and 'add' in c]
+        assert not add_calls, (
+            f'expected NO git worktree add when the flock acquire is denied; '
+            f'got {add_calls}'
+        )
+        assert lock_path.exists(), (
+            'expected the pre-existing foreign-held lock file to survive the '
+            'failure untouched — we must never unlink a lock we did not acquire'
+        )
+        assert lock_path.read_text() == 'foreign holder', (
+            'expected the foreign lock file contents to be untouched'
         )
 
 
