@@ -67,7 +67,7 @@ from orchestrator.git_ops import (
     is_wip_safety_commit,
 )
 from orchestrator.landed_outbox import LandedRow, MergeProvenance
-from orchestrator.mcp_lifecycle import plan_tools_mcp_server
+from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.scheduler import (
     SetTaskStatusRejected,
@@ -172,6 +172,42 @@ def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path) -> dict:
         mcp_config = {'mcpServers': {}}
     mcp_config.setdefault('mcpServers', {})['plan-tools'] = plan_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable,
+        meta_root=_meta_root_for_worktree(cwd),
+    )
+    return mcp_config
+
+
+def _inject_verdict_tools_mcp(mcp_config: dict | None, cwd: Path, role: AgentRole) -> dict:
+    """Inject the verdict-tools stdio MCP server entry into *mcp_config*.
+
+    Creates a minimal ``{'mcpServers': {}}`` skeleton when *mcp_config* is
+    ``None`` — the same None-skeleton path ``_inject_plan_tools_mcp`` uses.
+    This is what lets the reviewer (which declares NO ``'orchestrator'``
+    family, so its ``mcp_config`` would otherwise stay ``None``) still
+    acquire the verdict-tools server: the family check that gates this
+    injector (PRD task β's spawn-site gate) is independent of the
+    ``'orchestrator'`` gate, so a role with only ``'verdict_tools'`` in
+    ``mcp_families`` gets a config built from scratch here.
+
+    ``role.name`` is passed as ``--verdict-role`` — the authoritative
+    selector for both the single tool the verdict-tools server registers
+    (judge/merger/reviewer-name, see ``verdict_tools.create_server``) and the
+    ``verdicts/<role>.json`` filename it writes (α's I-AUTHORITATIVE-PATH
+    invariant: never an agent-supplied field). This mirrors the existing
+    review-key convention (``write_review(role.name)`` elsewhere in this
+    file), so ``verdicts/reviewer_comprehensive.json`` mirrors
+    ``reviews/reviewer_comprehensive.json``.
+
+    Modeled on ``_inject_plan_tools_mcp``: same direct-interpreter no-uv hot
+    path (``python_executable=sys.executable``) and the same
+    ``meta_root=_meta_root_for_worktree(cwd)`` passthrough so the agent-side
+    verdict-tools server targets the identical relocated `.task-meta` root
+    the orchestrator's own ``TaskArtifacts`` instance reads from.
+    """
+    if not mcp_config:
+        mcp_config = {'mcpServers': {}}
+    mcp_config.setdefault('mcpServers', {})['verdict-tools'] = verdict_tools_mcp_server(
+        _ORCH_PROJECT_DIR, cwd, role.name, python_executable=sys.executable,
         meta_root=_meta_root_for_worktree(cwd),
     )
     return mcp_config
