@@ -21,7 +21,6 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label
 
-
 _TRUTHY_SKIP_PERMS_TOKENS = frozenset({'true', '1', 'yes', 'on'})
 
 

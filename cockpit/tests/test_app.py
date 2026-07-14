@@ -1239,9 +1239,10 @@ class TestSpawnBar:
         from the injected default_skip_perms ctor param, and submitting
         passes the checkbox's value through as the on_submit callback's
         4th arg."""
+        from textual.widgets import Checkbox
+
         from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
-        from textual.widgets import Checkbox
 
         calls: list[tuple[str, str, str, bool]] = []
 
@@ -1274,9 +1275,10 @@ class TestSpawnBar:
         """Toggling SpawnScreen's skip-perms Checkbox on overrides a False
         injected default -- the per-spawn toggle wins over the operator's
         env-configured default (F9 fix, task 2518)."""
+        from textual.widgets import Checkbox
+
         from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
-        from textual.widgets import Checkbox
 
         calls: list[tuple[str, str, str, bool]] = []
 
@@ -1315,9 +1317,10 @@ class TestSpawnBar:
         env -> screen -> spawn_session -> build_spawn_argv -> runner,
         landing the 'true' literal spawn-claude.sh's positional contract
         expects at argv[2]."""
+        from textual.widgets import Checkbox, Input
+
         from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
-        from textual.widgets import Checkbox, Input
 
         monkeypatch.setenv('CLAUDE_SPAWN_SKIP_PERMS', 'true')
 
@@ -1356,9 +1359,10 @@ class TestSpawnBar:
         """Complementary env-unset case (F9 fix, task 2518): with
         $CLAUDE_SPAWN_SKIP_PERMS unset, 'n' pushes a SpawnScreen whose
         skip-perms Checkbox is seeded False -- the safe default."""
+        from textual.widgets import Checkbox
+
         from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
-        from textual.widgets import Checkbox
 
         monkeypatch.delenv('CLAUDE_SPAWN_SKIP_PERMS', raising=False)
 
