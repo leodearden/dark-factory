@@ -5535,6 +5535,12 @@ class GitOps:
           unmeasurable *n_after* is treated the same as a confirmed wipe
           (fail toward restoring + escalating rather than silently trusting
           an unreadable post-state).
+        * If ``git rev-parse HEAD`` itself fails (an unreadable pre-rebase
+          HEAD, ``pre_rebase_head == ''``), there is no usable restore
+          target for a recovery ``git reset --hard`` — *n_before* is forced
+          to ``0`` so the guard no-ops the same way a genuinely unmeasurable
+          *n_before* does, rather than proceed toward a wipe check it could
+          not actually recover from.
         * The recovery ``git reset --hard`` back to the pre-rebase HEAD is
           itself best-effort: if it fails too, :class:`BranchResetError` is
           still raised, but with ``restore_ok=False`` so the resulting
@@ -5566,6 +5572,14 @@ class GitOps:
         try:
             n_before = int(before_out.strip()) if rc == 0 else 0
         except ValueError:
+            n_before = 0
+
+        if not pre_rebase_head:
+            # HEAD itself was unreadable — there is no usable restore target
+            # if a wipe were later detected (`git reset --hard ''` would
+            # fail with "ambiguous argument"). Treat the pre-state as
+            # unmeasurable and no-op the guard, mirroring the existing
+            # fail-safe treatment of an unreadable n_before.
             n_before = 0
 
         ok = await self.rebase_onto_main(worktree, onto=onto)
