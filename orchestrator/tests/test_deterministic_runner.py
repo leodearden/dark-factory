@@ -1227,6 +1227,54 @@ class TestCrossUnitDeployDelegatesToRestartPlan:
         assert stamp_calls, 'update_task must be called with a truthy before_done_ran_at stamp'
         assert stamp_calls[0].args[1]['deploy_state']['phase'] == 'ran'
 
+    async def test_empty_baseline_install_fresh_timer_deploy_is_done_not_blocked(
+        self, tmp_path: Path,
+    ):
+        """esc-2584-1 regression (task 2611): a deploy whose target_unit is a
+        systemd ``.timer`` (installing a ``Type=oneshot`` service) ALWAYS
+        reports MainPID=0 — both at the pre-deploy baseline inspect and at
+        the post-deploy verify inspect — even when the install succeeded and
+        the unit is genuinely active. This must converge to DONE with
+        pid==0 provenance, not be falsely BLOCKED with an infra_issue
+        escalation."""
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='967', target_unit='legibility-trickle@dark-factory.timer',
+        )
+        assignment = _make_assignment(task)
+        baseline_state = {
+            'MainPID': 0,
+            'ActiveState': 'inactive',
+            'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        }
+        fresh_state = {
+            'MainPID': 0,
+            'ActiveState': 'active',
+            'ActiveEnterTimestamp': 'Mon 2026-06-23 10:01:00 UTC',
+            'ActiveEnterTimestampMonotonic': 5_000_000,
+        }
+        unit_inspector = AsyncMock(side_effect=[baseline_state, fresh_state])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner, queue, scheduler = self._make_runner(
+            tmp_path, task, unit_inspector=unit_inspector, script_runner=script_runner,
+        )
+
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.set_task_status.assert_awaited_once()
+        call = scheduler.set_task_status.call_args
+        assert call.args[1] == 'done'
+        provenance = call.kwargs.get('done_provenance')
+        assert provenance['kind'] == 'deterministic-deploy'
+        assert provenance['pid'] == 0
+        assert provenance['unit'] == 'legibility-trickle@dark-factory.timer'
+
+        pending = queue.get_by_task('967', status='pending')
+        assert pending == [], 'a genuinely-successful install-fresh deploy must not escalate'
+
 
 # ---------------------------------------------------------------------------
 # Task 2066: cross-unit writeback resilience — severed-then-recovered connection

@@ -788,6 +788,161 @@ class TestCrossUnitBlockingVerifyFail:
 
 
 # ---------------------------------------------------------------------------
+# task 2611 (esc-2584-1): RED — empty-baseline (install-fresh oneshot/timer)
+# freshness on the LIVE verify leg
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCrossUnitBlockingEmptyBaselineFreshness:
+    """A ``.timer`` unit or a ``Type=oneshot`` service never holds a
+    persistent MainPID, so ``baseline_main_pid==0`` (an EMPTY baseline — no
+    persistent process at inspect time, before the deploy ran) must not be
+    treated the way a stale-PID daemon-restart baseline is (task 2611,
+    esc-2584-1: install-trickle-timer.sh was falsely verify-failed even
+    though the timer installed and activated correctly). When the baseline
+    is empty, freshness falls back to "the unit's activation clock strictly
+    advanced past the baseline AND it did not end up failed" — the
+    ``pid>0``/``pid!=baseline_pid`` identity check (the right signal for a
+    persistent-PID daemon restart, see ``TestCrossUnitBlockingVerifyFail``
+    above) is dropped on this branch, since it could never be satisfied for
+    a timer/oneshot target."""
+
+    async def test_empty_baseline_activation_advance_is_deployed_and_verified(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        from orchestrator.proc_supervision import (
+            EscalationSpec,
+            FreshPidVerify,
+            RestartDisposition,
+            RestartPlan,
+        )
+
+        runner = FakeRunner(returncode=0)
+        inspector = make_fake_inspector({
+            'MainPID': 0,
+            'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 2000,
+        })
+        spec = EscalationSpec(
+            queue_dir=str(tmp_queue_dir),
+            task_id='task-301',
+            summary='Cross-unit deploy verify failed',
+        )
+        plan = RestartPlan(
+            script=Path('/proj/scripts/deploy.sh'),
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='legibility-trickle@dark-factory.timer',
+            own_unit='orch.service',
+            on_failure_escalation=spec,
+            verify=FreshPidVerify(
+                baseline_active_enter_monotonic=0,
+                baseline_main_pid=0,
+                inspect_timeout_secs=10.0,
+            ),
+        )
+
+        outcome = await plan.execute(runner=runner, inspector=inspector)
+
+        assert outcome.disposition == RestartDisposition.DEPLOYED_AND_VERIFIED
+        assert outcome.escalated is False
+
+        # Success path: no in-process escalation filed even though one was
+        # configured via on_failure_escalation.
+        assert read_escalations(tmp_queue_dir, 'task-301') == []
+
+    async def test_empty_baseline_activated_then_failed_is_verify_failed(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        """An activated-then-FAILED oneshot (monotonic advanced, but
+        ActiveState ended up 'failed') must not be reported fresh — the
+        ``ActiveState not in ('', 'failed')`` guard is the only new hole the
+        empty-baseline branch must close."""
+        from orchestrator.proc_supervision import RestartDisposition
+
+        await self._assert_not_deployed_and_escalates(
+            tmp_queue_dir,
+            task_id='task-302',
+            inspector=make_fake_inspector({
+                'MainPID': 0,
+                'ActiveState': 'failed',
+                'ActiveEnterTimestampMonotonic': 2000,
+            }),
+            expected_disposition=RestartDisposition.VERIFY_FAILED,
+        )
+
+    async def test_empty_baseline_no_activation_is_verify_failed(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        """No activation at all (monotonic unchanged from the empty
+        baseline) must still fail — an empty baseline is not a free pass."""
+        from orchestrator.proc_supervision import RestartDisposition
+
+        await self._assert_not_deployed_and_escalates(
+            tmp_queue_dir,
+            task_id='task-303',
+            inspector=make_fake_inspector({
+                'MainPID': 0,
+                'ActiveState': 'inactive',
+                'ActiveEnterTimestampMonotonic': 0,
+            }),
+            expected_disposition=RestartDisposition.VERIFY_FAILED,
+        )
+
+    async def _assert_not_deployed_and_escalates(
+        self,
+        tmp_queue_dir: Path,
+        *,
+        task_id: str,
+        inspector,
+        expected_disposition,
+    ) -> None:
+        from orchestrator.proc_supervision import (
+            EscalationSpec,
+            FreshPidVerify,
+            RestartDisposition,
+            RestartPlan,
+        )
+
+        spec = EscalationSpec(
+            queue_dir=str(tmp_queue_dir),
+            task_id=task_id,
+            summary='Cross-unit deploy verify failed',
+        )
+        plan = RestartPlan(
+            script=Path('/proj/scripts/deploy.sh'),
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='legibility-trickle@dark-factory.timer',
+            own_unit='orch.service',
+            on_failure_escalation=spec,
+            verify=FreshPidVerify(
+                baseline_active_enter_monotonic=0,
+                baseline_main_pid=0,
+                inspect_timeout_secs=10.0,
+            ),
+        )
+
+        outcome = await plan.execute(runner=FakeRunner(returncode=0), inspector=inspector)
+
+        assert outcome.disposition == expected_disposition
+        assert outcome.disposition != RestartDisposition.DEPLOYED_AND_VERIFIED, (
+            'a non-fresh empty-baseline cross-unit restart must never be reported done'
+        )
+        assert outcome.escalated is True
+
+        escalations = read_escalations(
+            tmp_queue_dir, task_id, agent_role='orchestrator-deterministic',
+        )
+        assert len(escalations) == 1
+        esc = escalations[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'infra_issue'
+
+
+# ---------------------------------------------------------------------------
 # amend (task 2237): escalated reflects actual filing, not dedup-existence
 # ---------------------------------------------------------------------------
 
