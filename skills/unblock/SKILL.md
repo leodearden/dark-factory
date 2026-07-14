@@ -282,9 +282,10 @@ The merge procedure is iterative — don't assume one pass will be enough:
        worktree="<WORKTREE>",
        description="<brief description of what landed>",
        wait_secs=100,
+       verified_green=True,
    )
    ```
-   `wait_secs=100` equals the server's `_MAX_WAIT_SECS` clamp ceiling. A fast merge can resolve terminally inside this single bounded call; a backlogged queue returns `queued` or `attached` within ≤100 s.
+   `wait_secs=100` equals the server's `_MAX_WAIT_SECS` clamp ceiling. A fast merge can resolve terminally inside this single bounded call; a backlogged queue returns `queued` or `attached` within ≤100 s. `verified_green=True` vouches that this branch just passed the full verification suite (steps 3–6 above looped until green) — it emits a `workflow_verify` event so a later merge failure caused by an unrelated main landing can be attributed as `INTEGRATION_SKEW` instead of degrading to `INDETERMINATE`.
 
    **Classify the immediate response** (`merge_request` discriminates on `status`):
 
