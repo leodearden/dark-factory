@@ -2862,7 +2862,7 @@ class MemoryService:
         project_id: str,
         run_id: str,
         stage: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Report whether the AUTHORITATIVE cycle_summary ReconLedgerStore row exists.
 
         Thin read against ``ReconLedgerStore.get_by_identity``, mapping
@@ -2887,6 +2887,14 @@ class MemoryService:
                 'run_id': run_id,
                 'stage': stage,
             }
+        # Presence is intentionally state-agnostic here: any row matching the
+        # five-part identity counts as present, regardless of `record.state`.
+        # This is safe because cycle_summary rows are always upserted with a
+        # fixed state='active' by write_cycle_summary — no writer ever flips
+        # a cycle_summary row to a different state — and expiry is a hard
+        # DELETE via ReconLedgerStore.gc(), not a soft-delete/supersede. If a
+        # future writer introduces a non-active cycle_summary state, revisit
+        # this to filter on `record.state == 'active'`.
         record = await ledger.get_by_identity(
             project_id,
             record_kind='cycle_summary',
