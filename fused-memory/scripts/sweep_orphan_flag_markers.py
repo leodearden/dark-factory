@@ -222,6 +222,55 @@ def find_stale_markers(
     return stale
 
 
+def find_terminal_task_markers(
+    members: list[dict],
+    terminal_task_ids: set[str],
+) -> list[dict]:
+    """Return members whose ``task_id`` references only terminal tasks.
+
+    Restores the terminal-drain semantics of the retired
+    ``_sweep_terminal_task_flag_markers`` (task 2103/2150; deleted by task
+    2228 W5-κ), routed through :func:`classify_marker_task_id`:
+
+    - ``'numeric'``: returned iff the task_id is a member of
+      *terminal_task_ids*.
+    - ``'comma_joined'``: returned iff EVERY comma-separated component is a
+      member of *terminal_task_ids* (mirrors the retired sweep's
+      split-and-all-terminal rule — a single non-terminal component keeps
+      the whole marker).
+    - ``'fp_hash'`` / ``'null_or_invalid'``: never returned, regardless of
+      *terminal_task_ids*.
+
+    An empty *terminal_task_ids* matches nothing (returns ``[]``).
+
+    Pure, sync, no I/O.
+
+    Args:
+        members: List of scroll-shaped dicts ``{'id', 'created_at', 'metadata'}``,
+            as returned by ``MemoryService.get_memories_by_metadata``.
+        terminal_task_ids: Set of task_id strings whose status is terminal
+            (e.g. ``{'done', 'cancelled'}`` per
+            ``flag_dedup.TERMINAL_STATUSES``). Injected by the caller — this
+            function performs no taskmaster I/O itself.
+
+    Returns:
+        Subset of *members* referencing only terminal tasks. Order is
+        preserved.
+    """
+    result: list[dict] = []
+    for m in members:
+        tid = (m.get('metadata') or {}).get('task_id')
+        bucket = classify_marker_task_id(tid)
+        if bucket == 'numeric':
+            if tid in terminal_task_ids:
+                result.append(m)
+        elif bucket == 'comma_joined':
+            components = [part.strip() for part in tid.split(',')]
+            if all(part in terminal_task_ids for part in components):
+                result.append(m)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Async delete
 # ---------------------------------------------------------------------------
