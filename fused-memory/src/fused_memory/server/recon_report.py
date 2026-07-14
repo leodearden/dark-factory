@@ -1030,11 +1030,15 @@ class ReconReportState:
     ) -> None:
         """Remove *finding* from *owning_entry* and every dedup index it may
         be registered under: ``_run_finding_index``, whichever of
-        ``_run_sig_index`` / ``_run_desc_index`` it was filed under, and
-        ``_run_cited_task_index`` if it is a primary-cited-task fold anchor.
+        ``_run_sig_index`` / ``_run_desc_index`` it was filed under,
+        ``_run_cited_task_index`` if it is a primary-cited-task fold anchor
+        (task-2425), and the derived projectless ``(cited_task_id,
+        flag_type)`` key in ``_run_sig_index`` if it is an entity-scoped
+        fold anchor (task-2432) — see :meth:`cite_task`'s docstring for both
+        folds.
 
         Single-sourced (task-2425) by :meth:`delete_finding` and the in-run
-        cited-task fold's retract path in :meth:`cite_task`, so the four
+        cited-task fold's retract path in :meth:`cite_task`, so the
         run-level dedup indices can never drift out of sync between the two
         removal paths, and neither path can leave a stale pointer to a
         finding that no longer exists.
@@ -1074,6 +1078,22 @@ class ReconReportState:
             run_cited_tasks = self._run_cited_task_index.get(run_id, {})
             if run_cited_tasks.get(primary_key) == finding.finding_id:
                 run_cited_tasks.pop(primary_key, None)
+
+        # task-2432: clear the entity-scoped fold's derived (cited_task_id,
+        # flag_type) anchor. Unlike the project-scoped anchor above, this
+        # is NOT gated on finding.task_id is None — a finding whose top-level
+        # task_id matched its primary citation (single or comma-joined) can
+        # also be a derived-sig anchor (see cite_task's docstring). A finding
+        # purged MID-FOLD in cite_task (the losing side of a collision) has
+        # empty cited_tasks at purge time — its citation is only appended
+        # after the fold-check succeeds — so this guard correctly skips it;
+        # only an established anchor (whose citation is already recorded)
+        # clears its derived sig here.
+        if finding.flag_type is not None and finding.cited_tasks:
+            derived_sig = (_canonical_sig_field(finding.cited_tasks[0]['task_id']), finding.flag_type)
+            run_sig_index = self._run_sig_index.get(run_id, {})
+            if run_sig_index.get(derived_sig) == finding.finding_id:
+                run_sig_index.pop(derived_sig, None)
 
     # ------------------------------------------------------------------
     # cite_* tools (task β)
