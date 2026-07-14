@@ -9,6 +9,8 @@ test_config_psi_admission_reload.py's stated rationale).
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from pydantic import ValidationError
 
@@ -19,7 +21,9 @@ from orchestrator.config import (
     RoutingConfig,
     apply_reload,
 )
-from orchestrator.routing import DEFAULT_ALLOWED_MODELS
+from orchestrator.routing import DEFAULT_ALLOWED_MODELS, FABLE_CANDIDATE_MODEL, probe_models
+from shared.cli_invoke import AgentResult
+from shared.config_models import AccountConfig
 
 
 class TestRoutingConfigDefaults:
@@ -196,3 +200,137 @@ class TestRoutingAllowlistReloadDisposition:
         with pytest.raises(ValidationError) as exc_info:
             OrchestratorConfig(models=ModelsConfig(architect='sonnett'))
         assert 'architect' in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# probe_models: per-account x per-model availability probe. invoke_fn and
+# token_resolver are dependency-injected (mirrors invoke_with_cap_retry's
+# invoke_fn= seam) so every scenario below runs network-free.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedProbeCli:
+    """Keyed fake invoke_fn standing in for invoke_claude_agent: looks up a
+    canned AgentResult by (model, oauth_token), defaulting to a successful
+    result when no override is scripted for that pair -- so a test only
+    needs to script the (model, token) combinations it actually cares
+    about. Records every call's kwargs, in order, for the call-count /
+    argument assertions below."""
+
+    def __init__(self, overrides: dict[tuple[str, str], AgentResult] | None = None) -> None:
+        self._overrides = overrides or {}
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs: object) -> AgentResult:
+        self.calls.append(kwargs)
+        key = (kwargs.get('model'), kwargs.get('oauth_token'))
+        return self._overrides.get(key, AgentResult(success=True, output='ok'))
+
+
+class TestProbeModelsTargetSet:
+    """The probe's default target model set is dedup(allowed_models +
+    [claude-fable-5]), order-preserving -- fable is probed even though it is
+    NOT admitted to the runtime allowlist (task beta is the G3 gate that
+    produces the fable-availability data task xi's admission gate later
+    consumes; see this task's plan design_decisions)."""
+
+    def test_default_target_set_is_allowed_models_plus_fable(self):
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        cli = _ScriptedProbeCli()
+
+        report = asyncio.run(probe_models(
+            accounts, ['haiku', 'sonnet'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+        ))
+
+        assert report.models == ['haiku', 'sonnet', FABLE_CANDIDATE_MODEL]
+
+    def test_explicit_models_argument_overrides_default(self):
+        accounts = [AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')]
+        cli = _ScriptedProbeCli()
+
+        report = asyncio.run(probe_models(
+            accounts, ['haiku', 'sonnet'],
+            models=['opus'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,
+        ))
+
+        assert report.models == ['opus']
+        assert {call['model'] for call in cli.calls} == {'opus'}
+
+
+class TestProbeModelsStatusMappingAndDispatch:
+    """Per-account x per-model status uses classify_invocation's outcome --
+    OK->available, ModelNotFound->unavailable, AuthFailed->auth_error,
+    CapHit->capped -- and invoke_fn is dispatched accounts x models times
+    with the right model and resolved token."""
+
+    def test_status_mapping_and_call_count_and_arguments(self):
+        accounts = [
+            AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN'),
+            AccountConfig(name='max-y', oauth_token_env='MAX_Y_TOKEN'),
+        ]
+        token_map = {'MAX_X_TOKEN': 'tok-x', 'MAX_Y_TOKEN': 'tok-y'}
+        not_found_body = (
+            '{"type":"error","error":{"type":"not_found_error",'
+            '"message":"model: sonnet"}}'
+        )
+        overrides = {
+            ('sonnet', 'tok-x'): AgentResult(
+                success=False, api_error_status=404, output=not_found_body,
+            ),
+            ('haiku', 'tok-y'): AgentResult(
+                success=False, api_error_status=401, output='unauthorized',
+            ),
+            ('sonnet', 'tok-y'): AgentResult(
+                success=False,
+                output="You've hit your usage limit. Your plan resets in 3h.",
+            ),
+        }
+        cli = _ScriptedProbeCli(overrides)
+
+        report = asyncio.run(probe_models(
+            accounts, ['haiku', 'sonnet'],
+            invoke_fn=cli,
+            token_resolver=token_map.get,
+        ))
+
+        assert report.accounts['max-x']['haiku'] == 'available'
+        assert report.accounts['max-x']['sonnet'] == 'unavailable'
+        assert report.accounts['max-x'][FABLE_CANDIDATE_MODEL] == 'available'
+        assert report.accounts['max-y']['haiku'] == 'auth_error'
+        assert report.accounts['max-y']['sonnet'] == 'capped'
+        assert report.accounts['max-y'][FABLE_CANDIDATE_MODEL] == 'available'
+
+        # accounts (2) x models (haiku, sonnet, claude-fable-5 = 3) == 6.
+        assert len(cli.calls) == 6
+        for call in cli.calls:
+            assert call['model'] in {'haiku', 'sonnet', FABLE_CANDIDATE_MODEL}
+            assert call['oauth_token'] in {'tok-x', 'tok-y'}
+
+
+class TestProbeModelsMissingToken:
+    """An account whose env token cannot be resolved yields a distinct
+    'no_token' status for every target model, without ever calling
+    invoke_fn for that account."""
+
+    def test_missing_token_account_yields_no_token_status_without_invoking(self):
+        accounts = [
+            AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN'),
+            AccountConfig(name='max-missing', oauth_token_env='MAX_MISSING_TOKEN'),
+        ]
+        cli = _ScriptedProbeCli()
+
+        report = asyncio.run(probe_models(
+            accounts, ['haiku'],
+            invoke_fn=cli,
+            token_resolver={'MAX_X_TOKEN': 'tok-x'}.get,  # MAX_MISSING_TOKEN absent
+        ))
+
+        assert report.accounts['max-missing']['haiku'] == 'no_token'
+        assert report.accounts['max-missing'][FABLE_CANDIDATE_MODEL] == 'no_token'
+        # Only max-x's calls were dispatched (2 models: haiku + fable).
+        assert len(cli.calls) == 2
+        assert all(call['oauth_token'] == 'tok-x' for call in cli.calls)
