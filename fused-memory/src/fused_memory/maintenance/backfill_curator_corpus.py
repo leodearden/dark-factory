@@ -281,10 +281,27 @@ if __name__ == '__main__':
         default=None,
         help='Path to the YAML config file (overrides CONFIG_PATH env var).',
     )
+    parser.add_argument(
+        '--prune',
+        action='store_true',
+        help=(
+            'Run the orphan-vector prune sweep (curator corpus RC1 Layer C) '
+            'instead of the default backfill.'
+        ),
+    )
     args = parser.parse_args()
 
-    result = asyncio.run(run_backfill(config_path=args.config, project_root=args.project_root))
-    print(
-        f'Backfill complete: upserted={result.upserted} skipped={result.skipped} '
-        f'errors={result.errors}'
-    )
+    if args.prune:
+        prune_report = asyncio.run(
+            run_prune(config_path=args.config, project_root=args.project_root)
+        )
+        print(
+            f'Prune complete: pruned={prune_report.pruned} live={prune_report.live_tasks} '
+            f'skipped={prune_report.skipped} reason={prune_report.reason!r}'
+        )
+    else:
+        result = asyncio.run(run_backfill(config_path=args.config, project_root=args.project_root))
+        print(
+            f'Backfill complete: upserted={result.upserted} skipped={result.skipped} '
+            f'errors={result.errors}'
+        )
