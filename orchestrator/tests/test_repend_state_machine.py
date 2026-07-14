@@ -45,7 +45,7 @@ from test_harness_reblock_signature_guard import (
     _make_mock_queue,
 )
 from test_stranded_blocked_sweep import _make_pending_l1, _make_resolved_l1
-from test_workflow_e2e import (
+from _workflow_helpers import (
     PLAN,
     AgentStub,
     _build_workflow_with_escalation,
