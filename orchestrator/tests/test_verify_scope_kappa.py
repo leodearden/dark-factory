@@ -44,7 +44,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from test_verify import _canned_passing_result, _real_worktree_reader
+from test_verify import _canned_passing_result, _real_worktree_reader, _write_guard_script
 from test_verify_plan import (  # noqa: F401 — reused by this module's byte-identical goldens (steps 3/7/9)
     DATA_MODULE_DIFF,
     ROOT_CONFTEST_DIFF,
@@ -880,3 +880,233 @@ class TestFallbackPlanAuthorityGoldens:
             ('pyright:', executed[0].type_check_command),
         ):
             _assert_plan_run_matches_executed(result.plan, prefix, cmd, executed[0].prefix)
+
+
+# ---------------------------------------------------------------------------
+# step-9/step-10: preservation of the non-scoping branches
+# ---------------------------------------------------------------------------
+
+
+class TestNonScopingBranchesPreserved:
+    """Guards pinning that the derive→execute rewrite (task κ) leaves the
+    NON-scoping branches of ``run_scoped_verification`` untouched: the
+    docs-only TRIVIAL short-circuit (+ its merge-role pipeline-guard
+    override, at both call sites), ``force_workspace``, and the
+    scoped-fallback-never-global-fanout boundary row
+    (verify-scope-inversion-prd.md boundary row 9). None of these branches
+    are driven by the plan->execution bridge (steps 1-8) — they sit
+    strictly outside it — so a regression here would mean the rewrite
+    widened its own footprint into territory task κ was never meant to
+    touch.
+    """
+
+    # -- (a) docs-only TRIVIAL short-circuit, both branches, both roles --
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ['task', 'merge'])
+    async def test_docs_only_module_configs_branch_trivially_passes(
+        self, tmp_path: Path, role: str,
+    ):
+        """(a) .md-only diff, module_configs branch -> TRIVIAL, zero
+        run_verification calls, at BOTH role='task' and role='merge' (no
+        guard script present, so the merge-role override never fires).
+        """
+        (tmp_path / 'skills').mkdir()
+        (tmp_path / 'skills' / 'foo.md').write_text('# foo\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(prefix='mymod', test_command='uv run --directory mymod pytest tests/'),
+        ]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=['skills/foo.md'], role=role,
+            )
+
+        assert result.passed
+        assert 'No source files' in result.summary
+        assert mock_run_verification.await_count == 0, (
+            f'docs-only diff must execute zero commands (role={role!r}); '
+            f'got {mock_run_verification.await_count} call(s)'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ['task', 'merge'])
+    async def test_docs_only_no_module_configs_branch_trivially_passes(
+        self, tmp_path: Path, role: str,
+    ):
+        """(a) .md-only diff, no-module_configs branch — the mirror of the
+        module_configs short-circuit above (verify.py's "Mirror the same
+        docs-only short-circuit as the module_configs branch" comment) ->
+        TRIVIAL, zero run_verification calls, at BOTH role='task' and
+        role='merge'.
+        """
+        (tmp_path / 'skills').mkdir()
+        (tmp_path / 'skills' / 'foo.md').write_text('# foo\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [], task_files=['skills/foo.md'], role=role,
+            )
+
+        assert result.passed
+        assert 'No source files' in result.summary
+        assert mock_run_verification.await_count == 0, (
+            f'docs-only diff must execute zero commands (role={role!r}); '
+            f'got {mock_run_verification.await_count} call(s)'
+        )
+
+    # -- (b) merge-role pipeline-guard full-gate override, both call sites --
+
+    @pytest.mark.asyncio
+    async def test_pipeline_guard_override_fires_module_configs_branch(self, tmp_path: Path):
+        """(b) role='merge', config-only diff, guard exits 0 -> full gate
+        override still fires at the module_configs call site (mirrors
+        TestMergeGuardModuleConfigs.test_guard_exit_0_merge_overrides_trivial_pass,
+        test_verify.py — kept green by this task, pinned again here through
+        the new module's spy helpers).
+        """
+        (tmp_path / 'orchestrator').mkdir(parents=True)
+        (tmp_path / 'orchestrator' / 'config.yaml').write_text('foo: bar\n')
+        _write_guard_script(tmp_path, exit_code=0)
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [ModuleConfig(prefix='orchestrator', test_command='__orch_cmd__')]
+
+        calls, fake_run_cmd = _run_cmd_spy()
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['orchestrator/config.yaml'], role='merge',
+            )
+
+        assert result.passed
+        assert 'No source files' not in result.summary, (
+            f'expected the trivial pass to be overridden; got: {result.summary!r}'
+        )
+        assert '__orch_cmd__' in ' | '.join(calls), (
+            f'expected the per-subproject fan-out to run after the override; calls={calls!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_pipeline_guard_override_fires_no_module_configs_branch(self, tmp_path: Path):
+        """(b) role='merge', config-only diff, guard exits 0 -> full gate
+        override still fires at the no-module_configs call site (mirrors
+        TestMergeGuardNoModuleConfigs.test_guard_exit_0_merge_overrides_trivial_pass,
+        test_verify.py).
+        """
+        (tmp_path / 'scripts').mkdir(parents=True)
+        (tmp_path / 'scripts' / 'verify.sh').write_text('#!/usr/bin/env bash\n')
+        _write_guard_script(tmp_path, exit_code=0)
+
+        config = OrchestratorConfig(project_root=tmp_path, test_command='__scope_all_cmd__')
+
+        calls, fake_run_cmd = _run_cmd_spy()
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, [], task_files=['scripts/verify.sh'], role='merge',
+            )
+
+        assert result.passed
+        assert 'No source files' not in result.summary, (
+            f'expected the trivial pass to be overridden; got: {result.summary!r}'
+        )
+        assert '__scope_all_cmd__' in ' | '.join(calls), (
+            f'expected the full-gate command to run after the override; calls={calls!r}'
+        )
+
+    # -- (c) force_workspace bypasses scoping AND plan derivation --
+
+    @pytest.mark.asyncio
+    async def test_force_workspace_bypasses_scoping_and_plan(self, tmp_path: Path):
+        """(c) force_workspace=True -> the global run_verification call runs
+        (scoping bypassed entirely — no ModuleConfig is built from the plan)
+        and VerifyResult.plan is never derived (mirrors
+        TestRunScopedVerificationForceWorkspace, test_verify.py).
+        """
+        (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
+        (tmp_path / 'mymod' / 'tests' / 'test_thing.py').write_text('def test_thing(): pass\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(prefix='mymod', test_command='uv run --directory mymod pytest tests/'),
+        ]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['mymod/tests/test_thing.py'], force_workspace=True,
+            )
+
+        assert result.passed
+        assert mock_run_verification.await_count == 1
+        assert _executed_module_configs(mock_run_verification) == [], (
+            'force_workspace must bypass ALL scoping — no ModuleConfig should '
+            'be built from the plan'
+        )
+        assert result.plan is None, (
+            'force_workspace bypasses derive_verify_plan entirely — '
+            'VerifyResult.plan must stay unset'
+        )
+
+    # -- (d) unregistered-path diff never falls through to the whole-repo fan-out --
+
+    @pytest.mark.asyncio
+    async def test_unregistered_path_diff_never_falls_through_to_global_fanout(
+        self, tmp_path: Path,
+    ):
+        """(d) UNREGISTERED_PATH_DIFF, role='task' -> scoped commands only;
+        the whole-repo fan-out chain never appears in the executed commands
+        (verify-scope-inversion-prd.md boundary row 9, "the wall-clock win",
+        asserted structurally: exactly ONE scoped ModuleConfig executes, not
+        a per-fleet-subproject fan-out and not the unscoped global command).
+        """
+        test_path = UNREGISTERED_PATH_DIFF[0]
+        full = tmp_path / test_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('def test_x():\n    pass\n')
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command=_FLEET_TEST_COMMAND,
+            lint_command=_FLEET_LINT_COMMAND,
+            type_check_command=_FLEET_TYPE_COMMAND,
+        )
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [], task_files=UNREGISTERED_PATH_DIFF,
+                # role='task' is the default
+            )
+
+        assert result.passed
+        assert mock_run_verification.await_count == 1, (
+            f'expected exactly one scoped call, not a per-subproject fan-out '
+            f'or an extra global fallthrough; got {mock_run_verification.await_count}'
+        )
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1, (
+            f'expected exactly one scoped ModuleConfig, not a per-subproject '
+            f'fan-out: {executed!r}'
+        )
+        assert executed[0].prefix == '__fallback__', (
+            f'the diff must route through the plan-driven fallback branch, '
+            f'not the unscoped global branch: {executed[0].prefix!r}'
+        )
+        for other in ('escalation', 'fused-memory', 'dashboard'):
+            assert other not in (executed[0].lint_command or ''), (
+                f'whole-repo fleet chain leaked into lint_command: '
+                f'{executed[0].lint_command!r}'
+            )
+            assert other not in (executed[0].type_check_command or ''), (
+                f'whole-repo fleet chain leaked into type_check_command: '
+                f'{executed[0].type_check_command!r}'
+            )
+        assert result.plan is not None
