@@ -16,6 +16,7 @@ from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
     GitOps,
+    MergeParkContentionError,
     MergeResult,
     TrainStackResult,
     WorktreeConflictError,
@@ -3212,6 +3213,42 @@ class TestMergeParkRef:
         )
         assert not unstaged.strip(), f'expected clean working tree, unstaged: {unstaged}'
         assert not staged.strip(), f'expected clean working tree, staged: {staged}'
+
+    async def test_park_wip_stale_ref_raises_and_does_not_overwrite(
+        self, git_ops: GitOps,
+    ):
+        """A pre-existing merge-park ref is never overwritten — raises instead."""
+        _, head_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root,
+        )
+        head_sha = head_sha.strip()
+
+        # Pre-create the private ref at a KNOWN sha (simulating a stale
+        # crash-leftover ref from a prior, unrecovered park).
+        await _run(
+            ['git', 'update-ref', 'refs/dark-factory/merge-park', head_sha],
+            cwd=git_ops.project_root,
+        )
+
+        # Dirty a tracked file so there is WIP to (attempt to) park.
+        (git_ops.project_root / 'README.md').write_text('# WIP racing a stale ref\n')
+
+        with pytest.raises(MergeParkContentionError):
+            await git_ops._park_wip_on_private_ref('lbl')
+
+        # The ref must be UNCHANGED — never overwritten.
+        _, ref_after, _ = await _run(
+            ['git', 'rev-parse', 'refs/dark-factory/merge-park'], cwd=git_ops.project_root,
+        )
+        assert ref_after.strip() == head_sha, (
+            'stale merge-park ref must never be overwritten'
+        )
+
+        # The shared stash stack must still be untouched.
+        _, stash_list, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_list.strip() == ''
 
 
 @pytest.mark.asyncio
