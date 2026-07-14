@@ -616,6 +616,79 @@ class TestShutdownDrainsMainHealthProbeTask:
 
 
 # ---------------------------------------------------------------------------
+# Step-23 (RED): production auto_heal wiring — next to step-15's wiring
+# tests above. The _run_inflight_verify call site currently builds
+# _MainHealthProbeHandles WITHOUT an auto_heal callback (it defaults to
+# None), so the deferred probe (test_merge_queue_main_health_deferred.py's
+# TestDeferredProbeRoutesToAutoHeal, step-21/22) has no way to reach
+# SpeculativeMergeWorker._auto_heal_main_health_deferred (step-17/18/19/20)
+# in production. This pins the call-site wiring step-24 must add.
+# ---------------------------------------------------------------------------
+
+
+class TestRunInflightVerifyPassesAutoHealCallback:
+    """_run_inflight_verify must thread
+    worker._auto_heal_main_health_deferred (bound-method identity) as the
+    auto_heal callback on main_health_probe_handles, alongside the existing
+    background_tasks=worker._background_tasks wiring (step-16, pinned above
+    by TestRunInflightVerifyPassesMainHealthProbeHandles).
+    """
+
+    def test_run_inflight_verify_passes_auto_heal_callback(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops = _make_git_ops(tmp_path)
+        config = _make_config(tmp_path)
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        merge_result = MagicMock()
+        merge_result.merge_commit = 'abc123def456789abc1'
+        item = RealMergeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt,
+            base_sha='base123',
+            speculative=False,
+        )
+
+        # REMOTE lease — bypasses the local warm-swap path, keeping this
+        # test focused on the main_health_probe_handles kwarg (mirrors
+        # TestRunInflightVerifyPassesMainHealthProbeHandles above).
+        fake_runner = MagicMock()
+        fake_runner.name = 'leo-laptop'
+        fake_runner.is_local = False
+        lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
+
+        spy = AsyncMock(return_value=None)
+
+        async def _run() -> None:
+            with patch('orchestrator.merge_queue._run_post_merge_verify', new=spy):
+                await worker._run_inflight_verify(item, lease)
+
+        asyncio.run(_run())
+
+        assert spy.await_args is not None, '_run_post_merge_verify was not called'
+        handles = spy.await_args.kwargs.get('main_health_probe_handles')
+        assert handles is not None, (
+            '_run_inflight_verify must pass a live main_health_probe_handles '
+            'into _run_post_merge_verify'
+        )
+        assert handles.auto_heal == worker._auto_heal_main_health_deferred, (
+            'Expected main_health_probe_handles.auto_heal to be '
+            "worker._auto_heal_main_health_deferred (bound-method identity); "
+            f'got {handles.auto_heal!r}'
+        )
+        assert handles.background_tasks is worker._background_tasks, (
+            'Expected main_health_probe_handles.background_tasks to remain '
+            'bound to the SAME set instance as worker._background_tasks'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Step-17 (RED): worker-side auto-heal HAPPY PATH.
 #
 # SpeculativeMergeWorker._auto_heal_main_health_deferred does not exist yet.
