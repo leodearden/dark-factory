@@ -123,8 +123,9 @@ if [ -z "$LEVEL" ]; then
 fi
 
 # Wrapper-owned exclude-file: an explicit --exclude-file wins, else default
-# to a per-level path inside the queue dir (mkdir/touch + wiring into the
-# watcher invocation land alongside the invocation itself).
+# to a per-level path inside the queue dir. Always exists once we proceed
+# past --check, so a caller can append a deliberately-pending id without
+# checking first.
 EXCLUDE_FILE="${EXCLUDE_FILE_ARG:-$QUEUE_DIR/.watcher-rearm-exclude-l$LEVEL}"
 
 if [ "$CHECK" -eq 1 ]; then
@@ -132,13 +133,17 @@ if [ "$CHECK" -eq 1 ]; then
     exit 0
 fi
 
+mkdir -p "$(dirname "$EXCLUDE_FILE")"
+touch "$EXCLUDE_FILE"
+echo "watcher-rearm.sh: exclude-file=$EXCLUDE_FILE (append a deliberately-pending esc-id here to suppress it)" >&2
+
 # Interpreter prefix: WATCHER_REARM_PYTHON overrides the default `uv run`
 # invocation (tests inject sys.executable to drive the real module without
 # uv). Deliberately unquoted below so a multi-word override word-splits
 # into separate argv entries, same as the default.
 WATCHER_CMD=${WATCHER_REARM_PYTHON:-uv run --project "$DARK_FACTORY_ROOT/escalation" python}
 
-WATCHER_ARGS=(-m escalation.watcher --queue-dir "$QUEUE_DIR" --level "$LEVEL" --timeout "$TIMEOUT")
+WATCHER_ARGS=(-m escalation.watcher --queue-dir "$QUEUE_DIR" --level "$LEVEL" --timeout "$TIMEOUT" --exclude-file "$EXCLUDE_FILE")
 [ -n "$NTFY_URL" ] && WATCHER_ARGS+=(--ntfy-url "$NTFY_URL")
 [ -n "$TASK_ID" ] && WATCHER_ARGS+=(--task-id "$TASK_ID")
 [ "$BASELINE" -eq 1 ] && WATCHER_ARGS+=(--baseline)
