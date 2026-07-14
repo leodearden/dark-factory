@@ -2488,9 +2488,9 @@ class TestGetMergeQueue:
 
         # Capture the LIVE phase that snapshot() would surface at advance_main
         # time: read it through the live finalize-head entry's per-entry phase
-        # (worker._finalizing_head, set by _finalize_inflight — the production
-        # object, not a test-held reference) and snapshot()'s verify_in_progress
-        # (the real merge_status observability path).
+        # (worker._finalizing_head_entry(), set by _finalize_inflight — the
+        # production object, not a test-held reference) and snapshot()'s
+        # verify_in_progress (the real merge_status observability path).
         captured_phases: list[str | None] = []
         captured_snapshot_phases: list[str | None] = []
 
@@ -2499,7 +2499,7 @@ class TestGetMergeQueue:
         # defined below — without it, embedding fake_advance_main in git_ops_stub
         # makes pyright report it as self-referential.
         async def fake_advance_main(*args, **kwargs) -> AdvanceOutcome:
-            fh = worker._finalizing_head
+            fh = worker._finalizing_head_entry()
             captured_phases.append(worker._entry_phase(fh) if fh is not None else None)
             snap = worker.snapshot()
             vip = snap.get('verify_in_progress')
@@ -2567,8 +2567,8 @@ class TestGetMergeQueue:
         assert req.result.done(), 'request future should be resolved after terminal advance_main'
 
         # Finalize-head window cleared after _finalize_inflight returns.
-        assert worker._finalizing_head is None, (
-            f'Expected _finalizing_head cleared, got: {worker._finalizing_head!r}'
+        assert worker._finalizing_head_entry() is None, (
+            f'Expected _finalizing_head_entry() cleared, got: {worker._finalizing_head_entry()!r}'
         )
 
         # snapshot has no active verifier states (entry was popped/finalized).
@@ -2645,7 +2645,7 @@ class TestGetMergeQueue:
                 # Read the live finalize-head entry (production object set by
                 # _finalize_inflight), not a test-held reference, to avoid a
                 # forward closure ref to the later-bound `entry`.
-                fh = worker._finalizing_head
+                fh = worker._finalizing_head_entry()
                 captured_phases_advance2.append(
                     worker._entry_phase(fh) if fh is not None else None
                 )
