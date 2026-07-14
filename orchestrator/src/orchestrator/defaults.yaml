@@ -123,10 +123,15 @@ verify_env: {}
 scope_cargo: true
 
 # Per-model USD price per 1M tokens, for backends without native cost
-# reporting (codex, pi). Migrated from invoke.py's former hardcoded
+# reporting (codex, gemini). Migrated from invoke.py's former hardcoded
 # _MODEL_COSTS (task 2459); seeds OrchestratorConfig.prices (config.py's
-# _DEFAULT_PRICES mirrors this block as a safety-net default). Green-tier
-# hot-reloadable — retune a rate here and reload without a restart.
+# _DEFAULT_PRICES mirrors this block as a safety-net default — the two are
+# kept in lockstep by test_config.py's
+# test_default_price_table_matches_defaults_yaml). Green-tier hot-reloadable,
+# but NOT YET wired to any invoke_agent() call site — retuning a rate here
+# has no effect on cost estimation until a follow-up task threads
+# config.prices through (see OrchestratorConfig.prices' docstring in
+# config.py).
 prices:
   gpt-5.4:
     input_per_1m: 2.50

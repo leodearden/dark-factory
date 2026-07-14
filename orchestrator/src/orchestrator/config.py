@@ -1533,12 +1533,13 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
 
 _DEFAULT_PRICES: dict[str, dict[str, float]] = {
     # Per-model USD cost per 1M tokens, for backends without native cost
-    # reporting (codex, gemini, pi). Migrated from the former invoke.py
+    # reporting (codex, gemini). Migrated from the former invoke.py
     # `_MODEL_COSTS` constant (task 2459). defaults.yaml's `prices:` block is
     # the operator-editable seed source; this constant is the safety-net
     # default for OrchestratorConfig.prices and backs default_price_table(),
     # which orchestrator.agents.invoke's cost estimator falls back to when no
-    # config is threaded in.
+    # config is threaded in. Kept in lockstep with defaults.yaml's `prices:`
+    # block by test_config.py's test_default_price_table_matches_defaults_yaml.
     'gpt-5.4': {'input_per_1m': 2.50, 'output_per_1m': 10.00},
     'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40},
     'gemini-3.1-pro-preview': {'input_per_1m': 1.25, 'output_per_1m': 5.00},
@@ -1550,7 +1551,7 @@ class PriceEntry(BaseModel):
     """Per-model USD price, in dollars per 1M tokens.
 
     Used by cost estimation for backends without native cost reporting
-    (codex, gemini, pi) — see orchestrator.agents.invoke._estimate_cost.
+    (codex, gemini) — see orchestrator.agents.invoke._estimate_cost.
     """
 
     input_per_1m: float = Field(ge=0, description='USD per 1M input tokens.')
@@ -1879,15 +1880,25 @@ class OrchestratorConfig(BaseSettings):
     scope_cargo: bool = Field(default=True)
 
     # Per-model USD/1M-token prices for backends without native cost
-    # reporting (codex, pi). Seeded from defaults.yaml's `prices:` block
+    # reporting (codex, gemini). Seeded from defaults.yaml's `prices:` block
     # (task 2459; migrated off invoke.py's former hardcoded _MODEL_COSTS).
-    # Green-tier hot-reloadable (see RELOADABLE_FIELDS) — an operator can
-    # retune per-model rates without a process restart.
+    # Green-tier hot-reloadable (see RELOADABLE_FIELDS): a `prices` edit is
+    # picked up by reload_config like any other green-tier field.
+    #
+    # NOT YET WIRED: as of task 2459, no production invoke_agent() call site
+    # (cli.py, workflow.py, steward.py, evals/*) passes prices=config.prices,
+    # so orchestrator.agents.invoke._estimate_cost() always resolves the
+    # packaged default_price_table() regardless of what is configured here.
+    # Editing (or reloading) this field has no observable effect on cost
+    # estimation until that follow-up wiring lands — tracked as T1/T3/T4 in
+    # plans/harness-backend-reconnect-pi-prd.md; this task (T-price) delivers
+    # only the shared substrate.
     prices: dict[str, PriceEntry] = Field(
         default_factory=lambda: {k: PriceEntry(**v) for k, v in _DEFAULT_PRICES.items()},
         description=(
             'Per-model USD/1M token prices for backends without native cost '
-            'reporting (codex, pi).'
+            'reporting (codex, gemini). NOT YET consulted by any production '
+            'invoke_agent() call site as of task 2459 — see field comment.'
         ),
     )
 
@@ -3046,8 +3057,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'review.full_review_min_tasks',
         # Verify env (fresh config's value already carries the sccache fold)
         'verify_env',
-        # Per-model USD/1M-token price table (task 2459) — an operator can
-        # retune rates without a process restart, same as verify_env above.
+        # Per-model USD/1M-token price table (task 2459) — green-tier like
+        # verify_env above. NOTE: not yet consulted by any production
+        # invoke_agent() call site (see OrchestratorConfig.prices docstring);
+        # registered now so no second reload-tier migration is needed once
+        # T1/T3/T4 wire it in.
         'prices',
         # Offline-lane tunables (leaf fields on the existing `git` submodel —
         # leaf-mutation only per I3)
