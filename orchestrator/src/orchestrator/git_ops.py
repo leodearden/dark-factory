@@ -6795,8 +6795,13 @@ class GitOps:
           with unresolved (column-0) conflict markers (permanent; stop
           retrying).  esc-2128-8 Layer-2 backstop — see
           :func:`_assert_no_conflict_markers`.
-        * ``'stash_failed'`` — ``git stash push`` failed before the advance
-          (permanent; halt merge to prevent code loss).
+        * ``'stash_failed'`` — parking pre-advance WIP onto the private
+          ``MERGE_PARK_REF`` failed before the advance, either because the
+          ``git stash create`` / ``update-ref`` infra sequence itself failed
+          (:class:`MergeParkError`) or because ``MERGE_PARK_REF`` already
+          existed — a stale or contended ref that is never overwritten
+          (:class:`MergeParkContentionError`).  Permanent; halt merge to
+          prevent code loss.  See :meth:`GitOps._park_wip_on_private_ref`.
         * ``'pop_conflict_no_advance'`` — CAS ``update-ref`` failed AND the
           subsequent stash pop conflicted.  The merge did NOT land.  WIP is
           preserved on a ``wip/recovery-*`` branch; routes to a human-level
@@ -6992,8 +6997,9 @@ class GitOps:
 
         # ── Pre-advance unmerged state guard ────────────────────────
         # Belt-and-braces: reject immediately if project_root already has
-        # unresolved merge conflicts in the index.  Any git stash push in
-        # this state would fail with "fatal: needs merge", producing
+        # unresolved merge conflicts in the index.  Any git-stash-create-based
+        # park (see _park_wip_on_private_ref) in this state would fail too
+        # ("needs merge" / "Cannot save the current index state"), producing
         # 'stash_failed' and hiding the real problem.  Detecting here
         # produces a distinct 'unmerged_state' code that routes to a
         # human-escalation path instead of the steward corrective loop.
@@ -7010,9 +7016,15 @@ class GitOps:
 
         # ── Working-tree protection ──────────────────────────────────
         # When project_root has main checked out, update-ref will desync
-        # the working tree from HEAD.  Park any uncommitted work on the
-        # private MERGE_PARK_REF first, sync after, then restore.  This
-        # prevents silent reverts (see 0ea23cb5c).
+        # the working tree from HEAD.  Park any uncommitted work first, sync
+        # after, then restore.  Parking uses `git stash create` (writes a
+        # stash commit WITHOUT touching refs/stash) plus `git update-ref` to
+        # record it on the private MERGE_PARK_REF the merge worker
+        # exclusively owns — never the shared refs/stash stack, which a
+        # human or other session in project_root can race (incident
+        # 13674d3c68).  This prevents silent reverts (see 0ea23cb5c).  See
+        # MERGE_PARK_REF's module-level docstring and
+        # GitOps._park_wip_on_private_ref.
         is_on_main = False
         did_park = False
 
@@ -7083,12 +7095,23 @@ class GitOps:
                 if dirty_tracked:
                     try:
                         await self._park_wip_on_private_ref(branch or merge_sha[:8])
+                    except MergeParkContentionError as e:
+                        # The merge worker is serialized, so a resolvable
+                        # MERGE_PARK_REF here is either an invariant
+                        # violation or a crash-leftover holding real,
+                        # unrecovered WIP — never overwritten (see
+                        # GitOps._park_wip_on_private_ref).  Halt loudly so
+                        # a human can recover the ref rather than silently
+                        # destroying the preserved work.
+                        logger.critical(
+                            'CRITICAL: stale %s present — refusing to '
+                            'overwrite; halting to preserve WIP. error=%s',
+                            MERGE_PARK_REF, e,
+                        )
+                        return AdvanceOutcome('stash_failed')
                     except MergeParkError as e:
-                        # Covers the create/update-ref infra-failure case.
-                        # A stale/contended ref (MergeParkContentionError, a
-                        # subclass) is also caught here for now — task 2556
-                        # step-8 adds a more specific except clause with a
-                        # distinct CRITICAL message for that case.
+                        # git stash create / update-ref infra failure (not a
+                        # contention condition — see above).
                         logger.error(
                             'CRITICAL: park failed before advance_main '
                             '— halting merge to prevent code loss. error=%s',
