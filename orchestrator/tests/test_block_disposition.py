@@ -27,7 +27,7 @@ import asyncio
 import dataclasses
 import inspect
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -681,3 +681,203 @@ class TestMarkBlockedDispositionSourcedBlockClass:
         assert len(calls) == 1
         assert calls[0]['block_class'] == classify_block_reason(reason)
         assert wf._terminal_report.category is None
+
+
+# ---------------------------------------------------------------------------
+# step-13: BD-1 four-cap-site-identity test (boundary row 10). The SAME
+# AllAccountsCappedException classification must be consulted by all four
+# independent cap-catch sites: workflow.py (already covered by step-07's
+# TestRunLevelBlockOutcomeKind.test_all_accounts_capped_still_blocks_with_
+# cap_reason), steward.py, review_checkpoint.py, dry_run_unblock.py.
+# ---------------------------------------------------------------------------
+
+
+class TestBD1CanonicalCapDisposition:
+    """classify_failure(AllAccountsCappedException) is canonical — the
+    resolved disposition depends only on the exception's TYPE, never on the
+    instance's retries/elapsed_secs/label — so every one of the four sites
+    below is guaranteed to consult the identical BlockDisposition regardless
+    of the retries/elapsed/label it happens to observe."""
+
+    def test_two_distinct_cap_instances_classify_identically(self):
+        from shared.cli_invoke import AllAccountsCappedException
+
+        from orchestrator.workflow_types import classify_failure
+
+        exc_a = AllAccountsCappedException(retries=1, elapsed_secs=10.0, label='A')
+        exc_b = AllAccountsCappedException(retries=99, elapsed_secs=9999.0, label='B')
+        assert classify_failure(exc_a) == classify_failure(exc_b)
+
+
+@pytest.mark.asyncio
+class TestBD1StewardConsultsSharedClassifier:
+    """steward.py's pre-triage cap handler (steward.py:703) must derive its
+    inline-triage-fallback warning from ``classify_failure(exc).reason_
+    prefix`` — not a hand-written 'all accounts capped' literal.
+
+    Patches ``orchestrator.steward.classify_failure`` to return a
+    disposition with a distinctive sentinel ``reason_prefix`` and asserts
+    the emitted warning reflects it — the un-patched value already contains
+    'all accounts capped' today (coincidentally matching the table's own
+    row), so a plain substring assertion against that literal would pass
+    whether or not the site actually consults the table.
+
+    RED today: the handler hard-codes its own prose inline, never calling
+    classify_failure, so the patch has no observable effect. Turns GREEN in
+    step-14.
+    """
+
+    async def test_pre_triage_warning_is_single_sourced_from_table(self, caplog):
+        import json
+        import logging
+
+        from shared.cli_invoke import AllAccountsCappedException
+        from test_suggestion_triage import _make_escalation, _make_steward, _make_suggestions
+
+        from orchestrator.unblock_types import BlockClass
+        from orchestrator.workflow_types import BlockDisposition, RequeueKind
+
+        steward = _make_steward()
+        suggestions = _make_suggestions(15)
+        escalation = _make_escalation(detail=json.dumps(suggestions))
+        cap_exc = AllAccountsCappedException(
+            retries=2, elapsed_secs=30.0, label='Steward for task 42 [pre-triage]',
+        )
+        sentinel = BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='SENTINEL_steward_cap',
+            block_class=BlockClass.AGENT_FAILURE,
+        )
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry',
+            AsyncMock(side_effect=cap_exc),
+        ), patch(
+            'orchestrator.steward.classify_failure', lambda _e: sentinel,
+        ), caplog.at_level(logging.WARNING, logger='orchestrator.steward'):
+            result = await steward._pre_triage_suggestions(escalation)
+
+        assert result is escalation
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('sentinel_steward_cap' in t.lower() for t in warning_texts), (
+            f'Expected warning single-sourced from classify_failure, got: {warning_texts}'
+        )
+
+
+@pytest.mark.asyncio
+class TestBD1ReviewCheckpointConsultsSharedClassifier:
+    """review_checkpoint.py's cap handler (review_checkpoint.py:192) must
+    derive its skip-review warning from classify_failure(exc).reason_prefix.
+
+    RED today: hard-coded 'all accounts capped' literal; patching
+    orchestrator.review_checkpoint.classify_failure has no effect on the
+    emitted warning. Turns GREEN in step-14.
+    """
+
+    async def test_review_warning_is_single_sourced_from_table(self, monkeypatch, caplog):
+        import logging
+
+        from shared.cli_invoke import AllAccountsCappedException
+        from test_review_checkpoint_cap import _PHASE1_RESULT, _make_checkpoint
+
+        from orchestrator.unblock_types import BlockClass
+        from orchestrator.workflow_types import BlockDisposition, RequeueKind
+
+        checkpoint = _make_checkpoint()
+        cap_exc = AllAccountsCappedException(
+            retries=4, elapsed_secs=300.0, label='Review checkpoint [x]',
+        )
+        sentinel = BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='SENTINEL_review_cap',
+            block_class=BlockClass.AGENT_FAILURE,
+        )
+
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.invoke_with_cap_retry',
+            AsyncMock(side_effect=cap_exc),
+        )
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.run_full_verification',
+            AsyncMock(return_value=_PHASE1_RESULT),
+        )
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.classify_failure', lambda _e: sentinel,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.review_checkpoint'):
+            report = await checkpoint.run_focused()
+
+        assert report.findings_count == 0
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('sentinel_review_cap' in t.lower() for t in warning_texts), (
+            f'Expected warning single-sourced from classify_failure, got: {warning_texts}'
+        )
+
+
+@pytest.mark.asyncio
+class TestBD1DryRunUnblockConsultsSharedClassifier:
+    """dry_run_unblock.py's internal cap handler + _cap_exhausted_entry
+    (:358/598) must derive BOTH proposal_text and block_class from
+    classify_failure(cap_exc) — not independent literals.
+
+    RED today: proposal_text hard-codes 'all accounts capped' and
+    block_class is stamped generically from the OUTER block_class param /
+    classify_block_reason(reason) — unrelated to the cap exception itself
+    — so patching orchestrator.dry_run_unblock.classify_failure affects
+    neither. Turns GREEN in step-14.
+    """
+
+    async def test_cap_exhausted_entry_is_single_sourced_from_table(self, tmp_path):
+        from shared.cli_invoke import AllAccountsCappedException
+        from test_dry_run_unblock import _make_config
+
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+        from orchestrator.unblock_types import BlockClass
+        from orchestrator.workflow_types import BlockDisposition, RequeueKind
+
+        cap_exc = AllAccountsCappedException(
+            retries=3, elapsed_secs=1800.0, label='Task 42 [unblock_auto]',
+        )
+        # block_class deliberately differs from AGENT_FAILURE (what
+        # classify_block_reason('verify exhausted') would derive) so the
+        # assertion below can't pass by coincidence.
+        sentinel = BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='SENTINEL_dry_run_cap',
+            block_class=BlockClass.MERGE_VERIFY_RED,
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_with_cap_retry',
+            AsyncMock(side_effect=cap_exc),
+        ), patch(
+            'orchestrator.dry_run_unblock.classify_failure', lambda _e: sentinel,
+        ):
+            await run_dry_run_unblock(
+                task_id='42', worktree=str(tmp_path), reason='verify exhausted',
+                detail='', scheduler=scheduler, mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert 'sentinel_dry_run_cap' in entry['proposal_text'].lower(), (
+            f'Expected proposal_text single-sourced from classify_failure, got: '
+            f'{entry["proposal_text"]!r}'
+        )
+        assert entry['block_class'] == 'merge_verify_red', (
+            f'Expected block_class from classify_failure(cap_exc), got: '
+            f'{entry["block_class"]!r}'
+        )
