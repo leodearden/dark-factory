@@ -287,6 +287,8 @@ The merge procedure is iterative — don't assume one pass will be enough:
    ```
    `wait_secs=100` equals the server's `_MAX_WAIT_SECS` clamp ceiling. A fast merge can resolve terminally inside this single bounded call; a backlogged queue returns `queued` or `attached` within ≤100 s. `verified_green=True` vouches that this branch just passed the full verification suite (steps 3–6 above looped until green) — it emits a `workflow_verify` event so a later merge failure caused by an unrelated main landing can be attributed as `INTEGRATION_SKEW` instead of degrading to `INDETERMINATE`.
 
+   **Caution — not retractable:** the classifier's green fact is *any-prior-green, keyed by task ID*, not scoped to the specific commit that was verified. Once `verified_green=True` has been emitted once for this task ID, a **later** resubmission for the same task (e.g. another `/unblock` pass after a conflict fix-up you didn't loop steps 3–6 on again) can still inherit that earlier green even though this round wasn't re-verified — a genuine `BRANCH_BUG` could then be misattributed to `INTEGRATION_SKEW`. Only pass `True` when steps 3–6 just passed, in this iteration, on the branch you're submitting now.
+
    **Classify the immediate response** (`merge_request` discriminates on `status`):
 
    - `status: "done"` or `status: "already_merged"` → **terminal success.** Thread the merge commit SHA:
