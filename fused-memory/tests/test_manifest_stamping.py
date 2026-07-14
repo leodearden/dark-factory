@@ -49,6 +49,22 @@ tasks:
           reason: 'no automated check available'
 """
 
+_MALFORMED_SIDECAR_YAML = """\
+prd: plans/bad-prd.md
+schema_version: 1
+tasks:
+  - label: beta
+    task_id: null
+    title: Broken task
+    capabilities:
+      - name: broken_check
+        binding: 'grep for something'
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'something'
+"""
+
 
 @pytest.mark.asyncio
 async def test_no_prd_metadata_returns_none(tmp_path):
@@ -155,4 +171,42 @@ async def test_sidecar_missing_on_disk_returns_none(tmp_path):
     )
 
     assert result is None
+    task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_malformed_sidecar_is_fail_soft(tmp_path):
+    """A sidecar that fails α validation never raises; nothing is stamped or written."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'bad-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_MALFORMED_SIDECAR_YAML, encoding='utf-8')
+
+    task_interceptor = AsyncMock()
+    ids = ['202']
+    tasks_data = [
+        {
+            'id': '202',
+            'metadata': {
+                'prd_path': 'plans/bad-prd.md',
+                'prd_task_label': 'beta',
+            },
+        },
+    ]
+
+    report = await stamp_capability_manifests(
+        project_root=str(tmp_path),
+        ids=ids,
+        tasks_data=tasks_data,
+        task_interceptor=task_interceptor,
+    )
+
+    assert report is not None
+    assert report['path'] == 'plans/bad-prd.capability-manifest.yaml'
+    assert report['stamped'] == []
+    assert len(report['errors']) == 1
+    assert 'expect' in report['errors'][0]
+
+    # The sidecar on disk is byte-identical — no partial task_id stamp.
+    assert sidecar_path.read_text(encoding='utf-8') == _MALFORMED_SIDECAR_YAML
     task_interceptor.update_task.assert_not_called()
