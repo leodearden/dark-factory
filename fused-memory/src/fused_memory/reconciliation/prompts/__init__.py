@@ -1,5 +1,7 @@
 """Stage and judge system prompts."""
 
+import functools
+import inspect
 import logging
 
 logger = logging.getLogger(__name__)
@@ -118,11 +120,19 @@ def render_recon_report_tool_guidance() -> str:
     _RECON_REPORT_PLACEHOLDERS falls back to a generic ``<param_name>``
     placeholder, so even a newly-added required kwarg is guaranteed to render.
 
+    Every parameter still renders — dropping optional ones would reopen the
+    drift hole this task closed — but a parameter carrying a default value
+    (genuinely optional) is wrapped in square brackets, e.g.
+    ``[task_id=<task_id>]``, so the example does not read as though every
+    kwarg must always be supplied. A parameter with no default (required)
+    renders bare, mirroring common CLI usage-string conventions
+    (``cmd required [optional]``).
+
     start_report is harness-called (agents never call it themselves) and is
     intentionally excluded from generation — its mention below stays prose.
 
     Raises whatever :func:`get_recon_report_tool_signatures` raises (e.g. if
-    FastMCP's internals have changed shape) — the module-level call site below
+    FastMCP's internals have changed shape) — :func:`get_recon_report_tool_guidance`
     catches this and falls back to a frozen static string rather than letting
     it become an ImportError for every consumer of this package.
     """
@@ -131,11 +141,12 @@ def render_recon_report_tool_guidance() -> str:
     signatures = get_recon_report_tool_signatures()
 
     def render_call(tool_name: str) -> str:
-        args = ', '.join(
-            f'{param_name}={_RECON_REPORT_PLACEHOLDERS.get(param_name, f"<{param_name}>")}'
-            for param_name in signatures[tool_name].parameters
-        )
-        return f'mcp__recon-report__{tool_name}({args})'
+        parts = []
+        for param_name, param in signatures[tool_name].parameters.items():
+            placeholder = _RECON_REPORT_PLACEHOLDERS.get(param_name, f'<{param_name}>')
+            kwarg = f'{param_name}={placeholder}'
+            parts.append(kwarg if param.default is inspect.Parameter.empty else f'[{kwarg}]')
+        return f'mcp__recon-report__{tool_name}({", ".join(parts)})'
 
     add_finding_call = render_call('add_finding')
     cite_entity_call = render_call('cite_entity')
@@ -176,8 +187,8 @@ def render_recon_report_tool_guidance() -> str:
     )
 
 
-# Last-resort fallback if render_recon_report_tool_guidance() raises at import
-# time (e.g. a FastMCP upgrade changes the tool-manager internals guarded by
+# Last-resort fallback if render_recon_report_tool_guidance() raises when first
+# called (e.g. a FastMCP upgrade changes the tool-manager internals guarded by
 # get_recon_report_tool_signatures(), or recon_report's server construction
 # regresses). This is a FROZEN, hand-written snapshot of a known-good render
 # — it is not exercised on the normal path and is not re-verified against the
@@ -224,14 +235,37 @@ _RECON_REPORT_TOOL_GUIDANCE_FALLBACK = (
     ' authoritative output channel for this stage.'
 )
 
-try:
-    _RECON_REPORT_TOOL_GUIDANCE = render_recon_report_tool_guidance()
-except Exception:
-    logger.exception(
-        'render_recon_report_tool_guidance() failed at import time; falling back to '
-        'the frozen _RECON_REPORT_TOOL_GUIDANCE_FALLBACK static string. Recon-report '
-        'tool-call guidance may be stale until the underlying introspection failure '
-        '(see fused_memory.server.recon_report.get_recon_report_tool_signatures) is '
-        'fixed — this self-heals once that succeeds again.'
-    )
-    _RECON_REPORT_TOOL_GUIDANCE = _RECON_REPORT_TOOL_GUIDANCE_FALLBACK
+
+@functools.lru_cache(maxsize=1)
+def get_recon_report_tool_guidance() -> str:
+    """Return the recon-report tool-call guidance text, computed once and cached.
+
+    Deliberately lazy (task-2559 amendment): computing this at
+    ``prompts/__init__.py`` import time meant EVERY import of the ``prompts``
+    package — including sibling submodules unrelated to recon-report guidance,
+    e.g. ``prompts.judge`` (imported by ``reconciliation.judge``, which never
+    touches recon-report tool calls) — paid the cost of constructing a
+    throwaway FastMCP recon_report server. Deferring to first call means only
+    a consumer that actually needs the guidance (Stage 1/2/3, which interpolate
+    it into their system prompts at their own module import) triggers the
+    build, and ``lru_cache`` ensures it happens at most once per process.
+
+    Falls back to the frozen :data:`_RECON_REPORT_TOOL_GUIDANCE_FALLBACK`
+    static string if :func:`render_recon_report_tool_guidance` raises (e.g. a
+    FastMCP upgrade changes the tool-manager internals guarded by
+    ``get_recon_report_tool_signatures``) rather than letting it become an
+    ImportError for every consumer of this package. The fallback result is
+    cached too (a normal return, from ``lru_cache``'s point of view) — a
+    fresh process retries the real render.
+    """
+    try:
+        return render_recon_report_tool_guidance()
+    except Exception:
+        logger.exception(
+            'render_recon_report_tool_guidance() failed; falling back to '
+            'the frozen _RECON_REPORT_TOOL_GUIDANCE_FALLBACK static string. Recon-report '
+            'tool-call guidance may be stale until the underlying introspection failure '
+            '(see fused_memory.server.recon_report.get_recon_report_tool_signatures) is '
+            'fixed — this self-heals once that succeeds again in a fresh process.'
+        )
+        return _RECON_REPORT_TOOL_GUIDANCE_FALLBACK

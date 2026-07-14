@@ -7,9 +7,9 @@ from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_PROJECT_ID as _AUTOPILOT_VIDEO_PROJECT_ID,
 )
 from fused_memory.reconciliation.prompts import (
-    _RECON_REPORT_TOOL_GUIDANCE,
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
+    get_recon_report_tool_guidance,
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_cycle_summary_section,
@@ -158,7 +158,7 @@ cancel, use `set_task_status('cancelled')`; do not route the status change throu
 - {_STAGE2_PROJECT_ID_GUIDELINE}
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross_project_routing findings emitted above): \
-{_RECON_REPORT_TOOL_GUIDANCE}
+{get_recon_report_tool_guidance()}
 
 ## Provenance rules for "shipped via X" edges
 These rules prevent fabrication of temporal facts like "Task N shipped via X" \

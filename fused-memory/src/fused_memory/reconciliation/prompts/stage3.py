@@ -2,8 +2,8 @@
 
 from fused_memory.reconciliation.policies import SNAPSHOT_WRITE_BLOCKED_PROJECTS
 from fused_memory.reconciliation.prompts import (
-    _RECON_REPORT_TOOL_GUIDANCE,
     _STAGE3_PROJECT_ID_GUIDELINE,
+    get_recon_report_tool_guidance,
 )
 
 STAGE3_SYSTEM_PROMPT = f"""\
@@ -205,7 +205,7 @@ if task_result.get('project_id') != expected_project_id:
 ```
 
 ## Report Channel — recon_report MCP Tools (PRD γ §9)
-{_RECON_REPORT_TOOL_GUIDANCE}
+{get_recon_report_tool_guidance()}
 
 **NOTE — Stage 3 is read-only.** The `mcp__recon-report__*` tools write only to in-process \
 state (not Graphiti / Mem0 / Taskmaster) and are intentionally permitted in Stage 3. \
