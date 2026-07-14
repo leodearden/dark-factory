@@ -224,7 +224,14 @@ class TestReviewCheckpointVerifyRole:
     """
 
     async def test_run_focused_verify_call_omits_role_kwarg(self, monkeypatch):
-        """run_focused()'s run_full_verification call must not pass role='background'.
+        """run_focused()'s run_full_verification call must verify at 'task' priority.
+
+        Asserts the *effective* role (kwarg present-and-'task', or absent so
+        run_full_verification's 'task' default applies) rather than the
+        kwarg's mere absence — a behavior-preserving refactor that starts
+        passing the equivalent ``role='task'`` explicitly should still pass
+        this test, while a real regression to ``role='background'`` (or any
+        other non-task role) must still fail it.
 
         Reuses the AllAccountsCappedException short-circuit (see
         test_run_review_handles_all_accounts_capped above) to reach the Phase 1
@@ -255,8 +262,9 @@ class TestReviewCheckpointVerifyRole:
         mock_run_full_verification.assert_awaited_once()
         assert mock_run_full_verification.await_args is not None
         call_kwargs = mock_run_full_verification.await_args.kwargs
-        assert 'role' not in call_kwargs, (
-            'review-checkpoint must not stamp a role on its verify call — '
-            "expected the role kwarg to be absent so run_full_verification's "
-            f"'task' default applies; got kwargs={call_kwargs!r}"
+        assert call_kwargs.get('role', 'task') == 'task', (
+            'review-checkpoint must verify at task priority — expected the '
+            "effective role to be 'task' (whether via an absent kwarg, relying "
+            "on run_full_verification's default, or an explicit role='task'); "
+            f"got kwargs={call_kwargs!r}"
         )
