@@ -28,6 +28,7 @@ from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.background_service import (
+    DEFAULT_BACKOFF_SECS,
     BackgroundService,
     BackoffPolicy,
     LifecycleRegistry,
@@ -190,8 +191,10 @@ _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
 # Fixed quiescent gap after a failed background-loop pass (seconds). Shared by
 # the main-tip sweep and no-landings breaker loops. Guarantees neither loop can
 # tight-spin on a pass that fails immediately, even if the configured interval
-# is non-numeric (task 1907).
-_BG_LOOP_FAILURE_BACKOFF_SECS: float = 60.0
+# is non-numeric (task 1907). Derives from background_service.DEFAULT_BACKOFF_SECS
+# (task 2241 amendment) rather than duplicating the literal, so the two
+# constants cannot drift apart.
+_BG_LOOP_FAILURE_BACKOFF_SECS: float = DEFAULT_BACKOFF_SECS
 
 # LifecycleRegistry stop-bound constants (task 2241, W10-η — PRD §5.3 LR-2).
 # No prior code bounded these stops at all: every existing _stop_* simply

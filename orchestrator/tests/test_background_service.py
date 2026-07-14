@@ -64,6 +64,18 @@ class TestBackoffPolicy:
         assert DEFAULT_BACKOFF_SECS == _BG_LOOP_FAILURE_BACKOFF_SECS
         assert DEFAULT_BACKOFF_SECS == 60.0
 
+    def test_delay_secs_defaults_to_default_backoff_secs(self) -> None:
+        """Amendment (reviewer_comprehensive): DEFAULT_BACKOFF_SECS is now
+        load-bearing as BackoffPolicy's own default, rather than a
+        parity-test-only constant — a bare ``BackoffPolicy()`` already
+        carries the parity value."""
+        from orchestrator.background_service import DEFAULT_BACKOFF_SECS, BackoffPolicy
+
+        policy = BackoffPolicy()
+
+        assert policy.delay_secs == DEFAULT_BACKOFF_SECS
+        assert policy.delay_for(0) == DEFAULT_BACKOFF_SECS
+
 
 def _make_service(pass_fn, **overrides):
     """Construct a BackgroundService with test-friendly defaults.

@@ -20,9 +20,12 @@ from typing import Protocol, runtime_checkable
 logger = logging.getLogger(__name__)
 
 # Parity default (Open-Q Q5): the only current failure backoff across the
-# eleven harness background loops is this fixed constant — mirrors
-# harness._BG_LOOP_FAILURE_BACKOFF_SECS verbatim (see
-# test_background_service.py::test_default_backoff_secs_matches_harness_parity_constant).
+# eleven harness background loops is this fixed constant. This is the
+# canonical definition: BackoffPolicy defaults to it below, and
+# harness._BG_LOOP_FAILURE_BACKOFF_SECS derives from it directly (see
+# harness.py) rather than duplicating the literal, so production code keeps
+# the two in sync by construction — not merely via
+# test_background_service.py::test_default_backoff_secs_matches_harness_parity_constant.
 DEFAULT_BACKOFF_SECS: float = 60.0
 
 
@@ -35,10 +38,11 @@ class BackoffPolicy:
     the eleven loops is a fixed constant (no exponential/attempt-dependent
     shape exists today). ``delay_for`` still accepts an ``attempt`` argument
     so the call-site shape stays stable if a non-constant policy is
-    introduced later.
+    introduced later. ``delay_secs`` defaults to ``DEFAULT_BACKOFF_SECS`` so
+    a bare ``BackoffPolicy()`` already carries the parity value.
     """
 
-    delay_secs: float
+    delay_secs: float = DEFAULT_BACKOFF_SECS
 
     def delay_for(self, attempt: int) -> float:
         del attempt  # constant policy: same delay regardless of attempt
