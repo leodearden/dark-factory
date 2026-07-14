@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import sys
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import asdict
 from pathlib import Path
 
@@ -476,12 +477,20 @@ def corpus_audit(min_diffs: int) -> None:
 # Mine: FN-candidate mining + frontier labeling (task 2495 / PRD D-6)
 # ---------------------------------------------------------------------------
 
-_MINE_DEFAULT_DB = Path('/home/leo/src/dark-factory/data/orchestrator/runs.db')
-_MINE_DEFAULT_ESC_DIR = Path('/home/leo/src/dark-factory/data/escalations')
-_MINE_DEFAULT_REPO = Path('/home/leo/src/dark-factory')
+# Overridable via env var for portability across checkouts -- the mining
+# sources are offline, gitignored data that live in the MAIN repo, not a
+# task worktree (see corpus/README.md "Regenerating / extending the
+# corpus"). Defaults match this deployment's on-disk layout unchanged.
+_MINE_DEFAULT_DB = Path(os.environ.get(
+    'REVIEWER_TRIAL_RUNS_DB', '/home/leo/src/dark-factory/data/orchestrator/runs.db',
+))
+_MINE_DEFAULT_ESC_DIR = Path(os.environ.get(
+    'REVIEWER_TRIAL_ESCALATIONS_DIR', '/home/leo/src/dark-factory/data/escalations',
+))
+_MINE_DEFAULT_REPO = Path(os.environ.get(
+    'REVIEWER_TRIAL_REPO_ROOT', '/home/leo/src/dark-factory',
+))
 _MINE_SPLIT_SEED = 'reviewer_trial-2495-fn-mining'
-_RESAVE_BATCH_SIZE = 10  # persist every K successfully-labeled diffs (not every 1) to bound
-                          # the O(n^2) full-corpus manifest+adjudication-log rewrite cost
 
 _LANG_EXTENSIONS = {
     'python': {'.py', '.pyi'},
@@ -545,24 +554,41 @@ def _fetch_titles(db_path: Path, task_ids: list[str]) -> dict[str, str]:
         conn.close()
 
 
-def _select_spot_check_subset(diff_ids: list[str], fraction: float = 0.1, minimum: int = 5) -> set[str]:
+def _select_spot_check_subset(
+    diff_ids: list[str],
+    fraction: float = 0.1,
+    minimum: int = 5,
+    sticky: Iterable[str] = (),
+) -> set[str]:
     """Deterministic, evenly-spread sample of *diff_ids* for the documented
-    human spot-check subset (~10% of mined diffs, floor 5, capped at N)."""
+    human spot-check subset (~10% of mined diffs, floor 5, capped at N).
+
+    Membership only grows: any id in *sticky* (already flagged
+    ``in_spot_check_subset=True``, or carrying a non-``'pending'``
+    ``spot_check_status`` from a prior save -- i.e. a human has already
+    acted on it) is always kept in the result, even though the
+    deterministic even-spread sample below runs over a larger *diff_ids* on
+    every call as the corpus grows and would not, on its own, land on the
+    same ids twice. New ids are added -- via that same deterministic
+    sampling -- only to grow the subset toward the target fraction; prior
+    sign-off is never silently dropped (see corpus/README.md's spot-check
+    protocol)."""
     ordered = sorted(diff_ids)
     n = len(ordered)
     if n == 0:
         return set()
+    sticky_ids = {diff_id for diff_id in sticky if diff_id in ordered}
     k = min(n, max(minimum, round(n * fraction)))
     step = n / k
-    indices = sorted({int(i * step) for i in range(k)})
-    return {ordered[i] for i in indices}
+    sampled = {ordered[int(i * step)] for i in range(k)}
+    return sticky_ids | sampled
 
 
 @cli.command('mine')
 @click.option('--runs-db', default=str(_MINE_DEFAULT_DB), type=click.Path(path_type=Path),
-              help='Path to the offline orchestrator runs.db')
+              help='Path to the offline orchestrator runs.db (env: REVIEWER_TRIAL_RUNS_DB)')
 @click.option('--escalations-dir', default=str(_MINE_DEFAULT_ESC_DIR), type=click.Path(path_type=Path),
-              help='Path to the offline escalations directory')
+              help='Path to the offline escalations directory (env: REVIEWER_TRIAL_ESCALATIONS_DIR)')
 @click.option('--repo-path', default=str(_MINE_DEFAULT_REPO), type=click.Path(path_type=Path),
               help='Git repo to recover mined diffs from')
 @click.option('--target-total', default=100, type=int, help='Aim for this many total diffs (existing + mined)')
@@ -585,10 +611,8 @@ def mine(
 
     Idempotent and resumable: re-running skips diff_ids already present in the
     corpus, and persists (manifest + adjudication log, re-split every time)
-    every ``_RESAVE_BATCH_SIZE`` successfully-labeled diffs (plus once more at
-    the end of the run) -- bounding the full-corpus rewrite cost to roughly
-    ``total_added / _RESAVE_BATCH_SIZE`` saves instead of one per diff. An
-    interrupted run loses at most the current in-progress batch.
+    after every successfully-labeled diff, so an interrupted run only loses
+    whatever was still in flight.
     """
 
     async def _run() -> int:
@@ -604,6 +628,19 @@ def mine(
             recover_diff,
             resolve_merge_sha_by_task_id,
         )
+
+        if not runs_db.is_file():
+            click.echo(
+                f'runs.db not found at {runs_db}\n'
+                '  This is an offline generation tool that reads the gitignored '
+                'orchestrator run history (data/orchestrator/runs.db in the MAIN repo '
+                "checkout, not a task worktree -- see corpus/README.md). Pass --runs-db, "
+                'or set REVIEWER_TRIAL_RUNS_DB, to point at a real runs.db -- otherwise '
+                "sqlite3 silently creates an empty one and this fails later with "
+                "'no such table: task_results'.",
+                err=True,
+            )
+            return 1
 
         oauth_token = os.environ.get(oauth_token_env)
         if not oauth_token:
@@ -624,14 +661,26 @@ def mine(
             """Persist manifest + adjudication log, re-deriving split + the
             spot-check subset from the CURRENT full diff set. Synchronous (no
             ``await`` inside) so it's safe to call from within a worker's
-            critical section -- called every ``_RESAVE_BATCH_SIZE`` successful
-            mines (plus a final flush after the batch completes, including on
-            interrupt/error) rather than after every single one, bounding the
-            full-corpus rewrite cost; an interrupted run leaves a fully
-            consistent, resumable on-disk corpus as of the last save."""
+            critical section -- called after every successfully-labeled
+            diff, so an interrupted run leaves a fully consistent, resumable
+            on-disk corpus as of the last save.
+
+            Spot-check subset membership is STICKY: a diff already flagged
+            ``in_spot_check_subset=True`` (or carrying a non-``'pending'``
+            ``spot_check_status`` -- i.e. a human has already acted on it) is
+            always kept, even though the deterministic even-spread sample
+            below runs over a larger ``mined_ids`` on every call as the
+            corpus grows. Only newly-sampled ids are added to grow the
+            subset toward the target fraction; prior human sign-off is never
+            silently dropped (see corpus/README.md's spot-check protocol)."""
             mined_ids = sorted(d.diff_id for d in manifest.diffs if d.source == 'mined')
-            subset = _select_spot_check_subset(mined_ids) if mined_ids else set()
             entries_by_id = {e.diff_id: e for e in log.entries}
+            sticky = {
+                diff_id for diff_id in mined_ids
+                if (entry := entries_by_id.get(diff_id)) is not None
+                and (entry.in_spot_check_subset or entry.spot_check_status != 'pending')
+            }
+            subset = _select_spot_check_subset(mined_ids, sticky=sticky) if mined_ids else set()
             for diff_id in mined_ids:
                 entry = entries_by_id.get(diff_id)
                 if entry is not None:

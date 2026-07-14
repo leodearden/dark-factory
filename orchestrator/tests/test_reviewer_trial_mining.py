@@ -19,8 +19,14 @@ from _reviewer_trial_mining_fixtures import (
     write_archived_escalations,
     write_sample_escalations,
 )
+from click.testing import CliRunner
 from shared.cli_invoke import AgentResult
 
+from orchestrator.evals.reviewer_trial.__main__ import (
+    _infer_language,
+    _select_spot_check_subset,
+    cli,
+)
 from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest, GroundTruthIssue
 from orchestrator.evals.reviewer_trial.mining import (
@@ -507,3 +513,112 @@ class TestAuditCorpus:
 
         assert report.ok is False
         assert 'spot_check_subset_empty' in report.failures
+
+
+class TestSelectSpotCheckSubset:
+    """``__main__._select_spot_check_subset`` -- deterministic, evenly-spread
+    spot-check sampling with a floor and sticky (grow-only) membership.
+
+    Colocated here (rather than in test_reviewer_trial_main.py) because
+    these are CLI helpers that back the `mine` pipeline machinery this file
+    already tests end to end."""
+
+    def test_empty_input_returns_empty_set(self) -> None:
+        assert _select_spot_check_subset([]) == set()
+
+    def test_below_minimum_floor_selects_everything(self) -> None:
+        # n=3 < minimum=5 -> k is capped at n (not padded past the pool size).
+        diff_ids = ['a', 'b', 'c']
+        result = _select_spot_check_subset(diff_ids, minimum=5)
+        assert result == {'a', 'b', 'c'}
+
+    def test_fraction_rounds_to_target_size(self) -> None:
+        diff_ids = [f'd{i:03d}' for i in range(100)]
+        result = _select_spot_check_subset(diff_ids, fraction=0.1, minimum=5)
+        assert len(result) == 10
+
+    def test_deterministic_across_calls_and_input_order(self) -> None:
+        diff_ids = [f'd{i:03d}' for i in range(37)]
+        first = _select_spot_check_subset(diff_ids)
+        reordered = _select_spot_check_subset(list(reversed(diff_ids)))
+        again = _select_spot_check_subset(diff_ids)
+        assert first == reordered == again
+
+    def test_sticky_ids_survive_even_when_sampling_would_drop_them(self) -> None:
+        """A diff flagged in a smaller corpus must stay flagged after the
+        corpus grows, even though the deterministic even-spread sample over
+        the larger id set no longer lands on it -- this is the bug the
+        `sticky` param fixes: prior human sign-off silently disappearing on
+        a later `mine` resave."""
+        small = [f'd{i:02d}' for i in range(10)]
+        prior_subset = _select_spot_check_subset(small)
+        assert prior_subset == {'d00', 'd02', 'd04', 'd06', 'd08'}
+
+        grown = [f'd{i:02d}' for i in range(40)]
+        naive = _select_spot_check_subset(grown)  # no sticky: simulates the pre-fix bug
+        assert not prior_subset <= naive, 'test premise: naive resample must drop some prior ids'
+
+        result = _select_spot_check_subset(grown, sticky=prior_subset)
+        assert prior_subset <= result, 'sticky ids must never be dropped'
+        assert result - prior_subset, 'new ids should still be sampled to grow the subset'
+
+    def test_sticky_ids_no_longer_in_corpus_are_dropped(self) -> None:
+        """A sticky id that no longer exists in diff_ids (e.g. removed from
+        the corpus) must not leak into the result."""
+        diff_ids = ['a', 'b', 'c']
+        result = _select_spot_check_subset(diff_ids, sticky={'zzz-not-present'})
+        assert 'zzz-not-present' not in result
+
+
+class TestInferLanguage:
+    """``__main__._infer_language`` -- majority-vote language sniff from a
+    unified diff's ``diff --git`` headers."""
+
+    def test_majority_language_wins(self) -> None:
+        diff_text = (
+            'diff --git a/a.py b/a.py\n'
+            'diff --git a/b.py b/b.py\n'
+            'diff --git a/c.rs b/c.rs\n'
+        )
+        assert _infer_language(diff_text) == 'python'
+
+    def test_tie_breaks_by_first_encountered_file(self) -> None:
+        diff_text = (
+            'diff --git a/c.rs b/c.rs\n'
+            'diff --git a/a.py b/a.py\n'
+        )
+        assert _infer_language(diff_text) == 'rust'
+
+    def test_unrecognized_extension_defaults_to_python(self) -> None:
+        diff_text = 'diff --git a/README.md b/README.md\n'
+        assert _infer_language(diff_text) == 'python'
+
+    def test_empty_diff_defaults_to_python(self) -> None:
+        assert _infer_language('') == 'python'
+
+    def test_typescript_extension_recognized(self) -> None:
+        diff_text = (
+            'diff --git a/a.tsx b/a.tsx\n'
+            'diff --git a/b.tsx b/b.tsx\n'
+        )
+        assert _infer_language(diff_text) == 'typescript'
+
+
+class TestMineRunsDbValidation:
+    """`mine` fails fast with a clear message when --runs-db doesn't point at
+    a real file, instead of letting sqlite3 silently create an empty
+    database that then blows up deeper in the pipeline with a confusing
+    ``OperationalError: no such table``.
+
+    The missing-file check runs before `_load_corpus()` / any real I/O, so
+    this never touches the real committed corpus (consistent with this
+    file's synthetic-fixtures-only policy)."""
+
+    def test_missing_runs_db_exits_with_clear_error(self, tmp_path: Path) -> None:
+        missing_db = tmp_path / 'does-not-exist.db'
+        runner = CliRunner()
+        result = runner.invoke(cli, ['mine', '--runs-db', str(missing_db)])
+
+        assert result.exit_code == 1
+        assert 'runs.db not found' in result.output
+        assert str(missing_db) in result.output

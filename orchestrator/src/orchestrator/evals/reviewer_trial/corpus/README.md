@@ -172,7 +172,11 @@ mined ones:
 A deterministic, evenly-spread ~10% sample of the **mined** diffs (floor 5,
 `__main__._select_spot_check_subset`) is flagged `in_spot_check_subset: true`
 for a documented human spot-check, with `spot_check_status` starting at
-`"pending"`.
+`"pending"`. Membership is **sticky** across re-runs of `mine`: once an entry
+is flagged (or its `spot_check_status` moves past `"pending"`), it stays
+flagged even as later runs grow the mined set and recompute the sample --
+new ids are only ever added on top, so an operator's sign-off is never
+silently dropped by a subsequent `mine` invocation.
 
 **Protocol for an operator confirming the subset:** for each entry with
 `in_spot_check_subset: true` and `spot_check_status: "pending"`, read the
@@ -222,3 +226,10 @@ successfully-labeled diff, so an interrupted run only loses whatever was
 still in flight. Re-running with a higher `--target-total` extends the
 corpus further; the `--limit` option caps how many *new* candidates a single
 invocation attempts (useful for a small validation run before a full batch).
+
+`--runs-db`, `--escalations-dir`, and `--repo-path` default to this
+deployment's on-disk paths in the main repo checkout, and can be overridden
+either via the flag or via the `REVIEWER_TRIAL_RUNS_DB` /
+`REVIEWER_TRIAL_ESCALATIONS_DIR` / `REVIEWER_TRIAL_REPO_ROOT` env vars. If
+`--runs-db` doesn't point at a real file, `mine` fails fast with a clear
+error rather than letting `sqlite3` silently create an empty database.
