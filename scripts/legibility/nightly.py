@@ -515,6 +515,22 @@ def run_nightly(
     selected = select_digest_sessions(cfg, projects_root, target_date)
     digests, extractor_failures = build_digests(selected)
 
+    if extractor_failures:
+        # A digest builder raise is exceptional (build_digests already
+        # isolates per-record failures, so a non-empty extractor_failures
+        # means something crashed outright): fail loud (decision 8) and
+        # never proceed to coder/merge/commit.
+        summary = (
+            f'legibility trickle extractor crashed on {len(extractor_failures)} session(s)'
+        )
+        detail = '; '.join(f'{session}: {reason}' for session, reason in extractor_failures)
+        escalated = post_escalation(cfg, summary, detail, poster=poster)
+        return NightlyResult(
+            exit_code=1,
+            escalated=escalated,
+            reason=summary,
+        )
+
     codebook_path = Path(cfg.project_root) / _CODEBOOK_RELPATH
     cb = codebook.load(codebook_path)
 
