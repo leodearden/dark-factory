@@ -18,6 +18,7 @@ from typing import Literal
 _FAMILY_TOOL_PREFIXES: dict[str, tuple[str, ...]] = {
     'orchestrator': ('mcp__fused-memory__', 'mcp__escalation__'),
     'plan_tools': ('mcp__plan-tools__',),
+    'verdict_tools': ('mcp__verdict-tools__',),
 }
 
 
@@ -36,7 +37,7 @@ class AgentRole:
     # orchestrator-assembled MCP config and/or the per-worktree plan-tools
     # stdio server, replacing the old _MCP_CONFIG_ROLES / _PLAN_TOOLS_ROLES
     # name-string tuples.
-    mcp_families: frozenset[Literal['orchestrator', 'plan_tools']] = frozenset()
+    mcp_families: frozenset[Literal['orchestrator', 'plan_tools', 'verdict_tools']] = frozenset()
     # Whether this role's sessions run inside the module sandbox. Replaces
     # the old `role.name in ('implementer', 'debugger')` check in _invoke().
     sandboxed: bool = False
@@ -148,6 +149,14 @@ _MEMORY_TOOLS = [
 # load-bearing control; this allowlist is the role gate that keeps the
 # attack surface narrow.
 _NO_TASK_STATUS_WRITE = ['mcp__fused-memory__set_task_status']
+
+# --- Verdict-tools stdio server (PRD task β, task 2482) ---
+# The server registers exactly one submit_* tool per --verdict-role
+# invocation (judge -> submit_completion_verdict, merger ->
+# submit_merge_disposition, else -> submit_review_verdict), so the
+# full-server wildcard grants precisely that one tool — same idiom as
+# _JCODEMUNCH_TOOLS above.
+_VERDICT_TOOLS = ['mcp__verdict-tools__*']
 
 _PLAN_CREATOR_TOOLS = [
     'mcp__plan-tools__create_plan',
@@ -500,11 +509,12 @@ You MUST output ONLY valid JSON matching this schema:
 
 ## Your Specialization: {specialization}
 """,
-        allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS],
+        allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
         disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
         default_model='sonnet',
         default_budget=2.0,
         default_max_turns=30,
+        mcp_families=frozenset({'verdict_tools'}),
     )
 
 
@@ -595,7 +605,7 @@ worktree, and return a structured JSON verdict.
 You MUST output ONLY valid JSON matching the schema provided by the
 --json-schema flag. No markdown fences, no prose outside the JSON.
 """,
-    allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS],
+    allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='sonnet',
     default_budget=0.50,
@@ -603,7 +613,9 @@ You MUST output ONLY valid JSON matching the schema provided by the
     # No fused-memory/escalation tool in allowed_tools — 'orchestrator' is
     # declared purely so _invoke() attaches an MCP config for the
     # jcodemunch tools above (one-way lower bound, see __post_init__).
-    mcp_families=frozenset({'orchestrator'}),
+    # 'verdict_tools' is declared because of the submit_completion_verdict
+    # grant above (PRD task β, task 2482).
+    mcp_families=frozenset({'orchestrator', 'verdict_tools'}),
 )
 
 
@@ -668,12 +680,12 @@ git add -- . ':!.task'
 - Read both sides of every conflict carefully.
 - If the conflict involves architectural changes where both sides restructured the same code differently, mark as BLOCKED — don't attempt a creative merge.
 """ + _ESCALATION_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_JCODEMUNCH_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,
-    mcp_families=frozenset({'orchestrator'}),
+    mcp_families=frozenset({'orchestrator', 'verdict_tools'}),
 )
 
 
