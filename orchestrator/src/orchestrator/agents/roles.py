@@ -52,7 +52,24 @@ class AgentRole:
         (e.g. judge declares 'orchestrator' purely to get an MCP config for
         its jcodemunch tools, with no fused-memory/escalation tool in its
         allowed_tools).
+
+        Also guards the mcp_families Literal against drifting out of sync
+        with _FAMILY_TOOL_PREFIXES: a family with no prefix-mapping entry
+        would make the loop below silently skip validation for it,
+        reopening this same drift class for the new family.
         """
+        unknown_families = self.mcp_families - _FAMILY_TOOL_PREFIXES.keys()
+        if unknown_families:
+            raise ValueError(
+                f'AgentRole {self.name!r} declares mcp_families='
+                f'{unknown_families!r} with no matching entry in '
+                f'_FAMILY_TOOL_PREFIXES (known families: '
+                f'{sorted(_FAMILY_TOOL_PREFIXES)!r}). Every family usable in '
+                'mcp_families must have a tool-prefix mapping, or this '
+                'capability assertion silently stops validating that family '
+                '(reopening the SIMPLE_TASK-fallthrough regression class, '
+                'reify esc-4943-54, for it).'
+            )
         for family, prefixes in _FAMILY_TOOL_PREFIXES.items():
             if family in self.mcp_families:
                 continue

@@ -127,6 +127,24 @@ class TestImportTimeCapabilityAssertion:
         )
 
 
+class TestFamilyToolPrefixesDriftGuard:
+    """__post_init__ also guards the mcp_families Literal against drifting
+    out of sync with _FAMILY_TOOL_PREFIXES: declaring a family with no
+    prefix-mapping entry must fail loudly, not silently skip validation for
+    that family (the same drift class this task closes, reify esc-4943-54,
+    reopened for a hypothetical future family)."""
+
+    def test_declaring_an_unmapped_family_raises(self):
+        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
+
+        with pytest.raises(ValueError, match='unmapped_family'):
+            AgentRole(
+                name='probe',
+                system_prompt='x',
+                mcp_families=frozenset({'unmapped_family'}),  # type: ignore[arg-type]
+            )
+
+
 class TestRolesModuleImportsCleanly:
     """Every shipped role in ROLES satisfies the capability invariant at
     import time — importing the module must not raise."""
@@ -134,8 +152,11 @@ class TestRolesModuleImportsCleanly:
     def test_roles_import_succeeds_and_is_populated(self):
         from orchestrator.agents.roles import ROLES  # noqa: PLC0415
 
-        assert len(ROLES) == 9
-        assert set(ROLES) == {
+        # >= / superset (not ==) so a legitimate new role doesn't force an
+        # edit here — this test's contract is "these roles must still
+        # exist", not "exactly these roles exist forever".
+        assert len(ROLES) >= 9
+        assert set(ROLES) >= {
             'architect', 'implementer', 'debugger', 'merger', 'steward',
             'deep_reviewer', 'reviewer_comprehensive', 'judge', 'simple_task',
         }
