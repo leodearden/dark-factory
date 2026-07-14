@@ -288,6 +288,7 @@ def test_mine_to_saturation_stops_after_two_consecutive_saturated_batches():
     assert [s.total for s in result.batch_stats] == [10, 10, 10]
     assert [s.succeeded for s in result.batch_stats] == [10, 10, 10]
     assert [s.failed for s in result.batch_stats] == [0, 0, 0]
+    assert all(s.status == "ok" for s in result.batch_stats), "no storms in this fixture"
     # every successfully-coded record across all 3 consumed batches accumulates
     assert len(result.records) == 30
     assert fake_invoke.calls, "the fake invoke must actually have been reached"
@@ -313,6 +314,80 @@ def test_mine_to_saturation_exhausts_source_that_never_saturates():
     assert len(result.batch_stats) == 3
     assert all(s.dup_rate == pytest.approx(0.0) for s in result.batch_stats)
     assert len(result.records) == 12
+
+
+# ---------------------------------------------------------------------------
+# amend: mine_to_saturation() must never let a storm batch (coder.RunResult
+# .status == "failure", >50% coding failures, PRD §8.6) satisfy saturation —
+# a short run of storms must not be able to trip the saturation stop on a
+# handful of skewed, degraded-sample records (reviewer_comprehensive finding
+# #1).
+# ---------------------------------------------------------------------------
+
+def _mining_response_fn_with_failures(novel_sessions=(), fail_sessions=()):
+    """Like `_mining_response_fn`, but any digest whose session id is in
+    `fail_sessions` gets a reply that fails to parse as JSON at all -- that
+    digest's `code_digest` call comes back `ok=False` (a coding failure),
+    so a batch with enough `fail_sessions` members trips coder.code_digests'
+    own storm threshold (failed/total > 0.5)."""
+    def _fn(prompt, model):
+        for session_id in fail_sessions:
+            if session_id in prompt:
+                return "this is not JSON and will fail to parse"
+        for session_id in novel_sessions:
+            if session_id in prompt:
+                return json.dumps(
+                    {"matches": [], "candidates": [{"title": f"novel shape {session_id}"}]}
+                )
+        return json.dumps({"matches": [{"entry_id": "entry-a"}], "candidates": []})
+
+    return _fn
+
+
+def test_mine_to_saturation_storm_batch_never_counts_as_saturated():
+    live_codebook = _minimal_v2_codebook()
+    batch0 = _batch_digests(10, "b0")  # 1/10 novel -> dup_rate 0.9 (real saturation #1)
+    # storm: 6/10 digests fail to parse (60% > 50% -> RunResult.status="failure");
+    # of the 4 that DO succeed, every one is a duplicate -> dup_rate 1.0 on paper,
+    # but this must NOT count as saturated, and must reset the counter to 0.
+    batch1 = _batch_digests(10, "b1")
+    batch2 = _batch_digests(10, "b2")  # 1/10 novel -> dup_rate 0.9 (saturated #1, post-reset)
+    batch3 = _batch_digests(10, "b3")  # 1/10 novel -> dup_rate 0.9 (saturated #2, stop)
+    batch4 = _batch_digests(10, "b4")  # must never be pulled from the source
+
+    novel_sessions = {"b0-0", "b2-0", "b3-0"}
+    fail_sessions = {f"b1-{i}" for i in range(6)}
+    source = _TrackingBatchSource([batch0, batch1, batch2, batch3, batch4])
+    saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
+    fake_invoke = _make_fake_invoke(
+        _mining_response_fn_with_failures(novel_sessions, fail_sessions)
+    )
+
+    result = mod.mine_to_saturation(
+        source, live_codebook, project="dark_factory", model="sonnet",
+        config=saturation, invoke=fake_invoke,
+    )
+
+    assert result.stop_reason == "saturated"
+    assert source.pulled == [0, 1, 2, 3], "batch4 must never be consumed from the source"
+    assert len(result.batch_stats) == 4
+
+    assert result.batch_stats[0].saturated is True
+    assert result.batch_stats[0].status == "ok"
+
+    storm = result.batch_stats[1]
+    assert storm.total == 10
+    assert storm.succeeded == 4
+    assert storm.failed == 6
+    assert storm.status == "failure", "RunResult.status must be surfaced on BatchStats"
+    assert storm.dup_rate == pytest.approx(1.0), "dup_rate is still recorded for visibility"
+    assert storm.saturated is False, "a storm batch must never satisfy saturation"
+
+    # post-storm-reset: TWO fresh consecutive real-saturated batches are needed to stop
+    assert result.batch_stats[2].saturated is True
+    assert result.batch_stats[2].status == "ok"
+    assert result.batch_stats[3].saturated is True
+    assert result.batch_stats[3].status == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -949,6 +1024,118 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     assert outcome.report_path == str(kwargs["report_path"])
     assert outcome.filed_task_ids == ["task-1"]
     assert outcome.stop_reason == "exhausted"
+
+
+# ---------------------------------------------------------------------------
+# amend: run_census() must treat submit_fn as best-effort, per payload — a
+# raised exception or a non-dict result must never abort the run after
+# codebook.dump() has already persisted (reviewer_comprehensive finding #2).
+# ---------------------------------------------------------------------------
+
+def test_run_census_submit_fn_raising_is_best_effort_not_fatal(tmp_path, caplog):
+    batch = [
+        _hand_digest("dup-1", "nothing new here"),
+        _hand_digest("novel-verified", "a genuinely new confusion shape"),
+    ]
+    fake_invoke = _make_fake_invoke(_happy_invoke_response)
+    fake_verify_fn = _make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"})
+    fake_commit = _make_fake_commit()
+
+    def raising_submit_fn(**kwargs):
+        raise RuntimeError("simulated transient MCP failure")
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        batch_source=[batch],
+        verify_fn=fake_verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=raising_submit_fn,
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=fake_commit,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done", "one filing failure must not abort the pipeline"
+    assert outcome.filed_task_ids == []
+    assert any("submit_fn" in r.message for r in caplog.records), "must log loudly, not swallow silently"
+
+    # the codebook was already persisted before filing was attempted, and the
+    # rest of the pipeline (report + state + commit) must still complete
+    assert kwargs["codebook_path"].exists()
+    assert kwargs["census_state_path"].exists()
+    assert kwargs["report_path"].exists()
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "_none filed._" in report_text
+    assert len(fake_commit.calls) == 1
+
+
+def test_run_census_submit_fn_non_dict_result_records_none_id(tmp_path):
+    batch = [
+        _hand_digest("dup-1", "nothing new here"),
+        _hand_digest("novel-verified", "a genuinely new confusion shape"),
+    ]
+    fake_invoke = _make_fake_invoke(_happy_invoke_response)
+    fake_verify_fn = _make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"})
+
+    def none_returning_submit_fn(**kwargs):
+        return None
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        batch_source=[batch],
+        verify_fn=fake_verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=none_returning_submit_fn,
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert outcome.filed_task_ids == [None], "a non-dict submit_fn result must not crash .get('id')"
+
+
+def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
+    # 2/3 digests fail to parse (>50%) -> coder.RunResult.status="failure" for
+    # this batch (a storm, PRD §8.6); run_census must surface it rather than
+    # silently reporting on the degraded dup-rate signal.
+    batch = [
+        _hand_digest("bad-1", "x"),
+        _hand_digest("bad-2", "y"),
+        _hand_digest("dup-1", "z"),
+    ]
+
+    def storm_invoke(prompt, model):
+        if "bad-1" in prompt or "bad-2" in prompt:
+            return "not valid JSON -- this coding call fails to parse"
+        return json.dumps({"matches": [{"entry_id": "entry-a"}], "candidates": []})
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(storm_invoke),
+        batch_source=[batch],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done", "a storm degrades data, it does not defer/abort the census"
+    assert any("storm" in r.message.lower() for r in caplog.records), "must log loudly"
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "storm" in report_text.lower(), "the report's cost note must call out degraded data"
 
 
 # ---------------------------------------------------------------------------

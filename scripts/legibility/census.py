@@ -106,7 +106,15 @@ def batch_dup_rate(records: list[dict]) -> float:
 @dataclass
 class BatchStats:
     """Per-batch mining tally: how one ``coder.code_digests`` batch scored
-    against the saturation threshold."""
+    against the saturation threshold.
+
+    ``status`` mirrors ``coder.RunResult.status`` (``"ok"`` or
+    ``"failure"`` -- a storm, PRD §8.6, when this batch's failed/total
+    fraction strictly exceeds 0.5): surfaced so a caller (``run_census``,
+    or any future one) can tell a batch's ``dup_rate`` was drawn from a
+    small, skewed, storm-degraded sample rather than a healthy one, even
+    though ``saturated`` already accounts for it (a storm batch is never
+    ``saturated=True`` -- see ``mine_to_saturation``)."""
 
     index: int
     total: int
@@ -114,6 +122,7 @@ class BatchStats:
     failed: int
     dup_rate: float
     saturated: bool
+    status: str = "ok"
 
 
 @dataclass
@@ -143,11 +152,22 @@ def mine_to_saturation(
     its own successful records (``batch_dup_rate`` -- failed codings are
     excluded from the denominator per that function's own contract), and
     track a consecutive-saturated-batch counter: incremented when
-    ``dup_rate >= config.dup_rate``, reset to 0 otherwise. Mining stops
-    (``stop_reason="saturated"``) the moment the counter reaches
-    ``config.consecutive_batches`` -- right after that Nth consecutive
-    saturated batch, so no further batch is pulled. If *batch_source*
-    exhausts before that, ``stop_reason="exhausted"``.
+    ``dup_rate >= config.dup_rate`` AND the batch is not a storm, reset to
+    0 otherwise. Mining stops (``stop_reason="saturated"``) the moment the
+    counter reaches ``config.consecutive_batches`` -- right after that Nth
+    consecutive saturated batch, so no further batch is pulled. If
+    *batch_source* exhausts before that, ``stop_reason="exhausted"``.
+
+    A STORM batch (``coder.RunResult.status == "failure"`` -- PRD §8.6,
+    more than half the batch's digests failed to code) never counts toward
+    saturation, however high its ``dup_rate`` computes: that rate is drawn
+    from whatever handful of records happened to succeed, too small and
+    too skewed a sample to trust, and a run of storms would otherwise be
+    able to trip the saturation stop on degraded data rather than genuine
+    novelty exhaustion. The batch's ``dup_rate`` is still recorded on its
+    ``BatchStats`` (with ``status="failure"``) for visibility, but
+    ``saturated`` is forced False and the consecutive-saturated counter is
+    reset, exactly as if the batch scored below threshold.
 
     *config* is a ``config.Saturation``-shaped object (``.dup_rate``,
     ``.consecutive_batches`` -- i.e. a project's
@@ -166,7 +186,10 @@ def mine_to_saturation(
         result.records.extend(run_result.records)
 
         dup_rate = batch_dup_rate(run_result.records)
-        saturated = dup_rate >= config.dup_rate
+        # A storm (run_result.status == "failure") never satisfies
+        # saturation, no matter how high dup_rate computes over its few
+        # successful records -- see the storm paragraph above.
+        saturated = dup_rate >= config.dup_rate and run_result.status != "failure"
         result.batch_stats.append(
             BatchStats(
                 index=index,
@@ -175,6 +198,7 @@ def mine_to_saturation(
                 failed=run_result.failed,
                 dup_rate=dup_rate,
                 saturated=saturated,
+                status=run_result.status,
             )
         )
 
@@ -679,9 +703,15 @@ def run_census(
     clusters (resolved to the merge's real candidate ids by title) and
     ``retire_entry`` for any entry ids *verify_fn* reports fixed ->
     ``codebook.validate`` + ``codebook.dump`` -> ``build_task_payloads`` +
-    *submit_fn* per payload -> ``render_report`` -> write the report to
-    *report_path* -> ``advance_census_state`` (done-count from
-    *status_fetcher*) -> best-effort *commit* of report + codebook + state.
+    *submit_fn* per payload (best-effort -- a raised exception or a
+    non-dict/id-less result is logged and skipped rather than aborting the
+    run, since this happens AFTER the codebook is already persisted) ->
+    ``render_report`` -> write the report to *report_path* ->
+    ``advance_census_state`` (done-count from *status_fetcher*) ->
+    best-effort *commit* of report + codebook + state. A storm batch
+    encountered during mining (see ``mine_to_saturation``) is logged loudly
+    and called out in the report's cost note rather than silently folded
+    into a clean-looking result.
     """
     headroom = preflight_headroom(invoke, model=config.models.trickle)
     if not headroom.ok:
@@ -748,8 +778,34 @@ def run_census(
         )
     codebook.dump(updated_codebook, codebook_path)
 
+    # Best-effort per payload -- this runs AFTER codebook.dump() has already
+    # persisted, so one payload's submit_fn failure must never abort the
+    # rest of the run (which would strand the report/state unwritten).
+    # Mirrors the best-effort handling used for commit() below. A result
+    # that isn't a dict (or lacks "id") never crashes .get("id") -- it just
+    # contributes None rather than a real task id.
     task_payloads = build_task_payloads(verified, project_root=project_root, project_id=project_id)
-    filed_task_ids = [submit_fn(**payload).get("id") for payload in task_payloads]
+    filed_task_ids = []
+    for payload in task_payloads:
+        try:
+            submit_result = submit_fn(**payload)
+        except Exception as exc:  # noqa: BLE001 - best-effort, see comment above
+            logger.warning(
+                "census: submit_fn failed for payload %r: %s", payload.get("title"), exc,
+            )
+            continue
+        filed_task_ids.append(
+            submit_result.get("id") if isinstance(submit_result, dict) else None
+        )
+
+    storm_batch_indices = [s.index for s in mining_result.batch_stats if s.status == "failure"]
+    if storm_batch_indices:
+        logger.warning(
+            "census: %d storm batch(es) (>50%% coding failures, PRD §8.6) at "
+            "indices %s -- dup_rate for those batches was excluded from the "
+            "saturation decision but is still recorded in the report",
+            len(storm_batch_indices), storm_batch_indices,
+        )
 
     cost_note = (
         f"invoke calls: {config.models.census_miner} miner="
@@ -758,6 +814,12 @@ def run_census(
         f"{config.models.census_synthesis} synthesis=1, "
         f"{config.models.trickle} headroom-probe=1"
     )
+    if storm_batch_indices:
+        cost_note += (
+            f"; WARNING: {len(storm_batch_indices)} storm batch(es) at indices "
+            f"{storm_batch_indices} (>50% coding failures -- degraded dup-rate "
+            "signal, excluded from the saturation decision)"
+        )
     report_md = render_report(
         date=date,
         project_id=project_id,
