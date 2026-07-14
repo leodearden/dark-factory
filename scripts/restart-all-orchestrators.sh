@@ -38,7 +38,11 @@ set -euo pipefail
 #     ORCH_DRAIN_POLL_INTERVAL_SECS — until the unit drains (goes idle) or
 #     ORCH_RESTART_FORCE_FIRE_AFTER_SECS elapses, at which point the restart
 #     is FORCED anyway (one re-verified merge accepted; recover_pending_merges
-#     makes this crash-safe). Fails toward PROTECTING the merge.
+#     makes this crash-safe). Fails toward PROTECTING the merge. If a
+#     deferred unit's heartbeat itself goes stale/absent mid-wait (e.g. it
+#     crashed while mid-merge and stopped heartbeating), it is NOT held for
+#     the rest of the busy grace — a dead unit isn't merging, so it drops
+#     into the shorter stale/absent handling below instead.
 #   - stale/absent (heartbeat missing, unreadable, or too old): given a
 #     shorter ORCH_DRAIN_UNKNOWN_GRACE_SECS grace to start reporting,
 #     rechecked every ORCH_DRAIN_POLL_INTERVAL_SECS; a fresh idle/busy
@@ -144,43 +148,64 @@ drain_check_verdict() {
         --fresh-window "$DRAIN_FRESH_WINDOW_SECS" || echo absent
 }
 
+drain_await_fresh() {
+    # $1 = unit name.  Waits up to DRAIN_UNKNOWN_GRACE_SECS for a stale or
+    # absent heartbeat to become fresh (idle or busy), re-polling every
+    # DRAIN_POLL_INTERVAL_SECS.  Prints the resulting verdict to stdout ONLY
+    # -- idle or busy if a fresh reading appeared before the grace elapsed,
+    # or the original stale/absent verdict if the grace elapsed with no
+    # fresh reading (fail-toward-convergence: the caller proceeds with the
+    # restart).  Emits no journal lines itself, so it is safe to call via
+    # command substitution from anywhere in drain_gate.
+    local unit="$1"
+    local verdict grace_start elapsed_grace
+    verdict="$(drain_check_verdict "$unit")"
+    grace_start=$SECONDS
+    while [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; do
+        elapsed_grace=$((SECONDS - grace_start))
+        if [[ $elapsed_grace -ge $DRAIN_UNKNOWN_GRACE_SECS ]]; then
+            break
+        fi
+        sleep "$DRAIN_POLL_INTERVAL_SECS"
+        verdict="$(drain_check_verdict "$unit")"
+    done
+    printf '%s\n' "$verdict"
+}
+
 drain_gate() {
     # $1 = unit name.  Only called when --drain was passed.  Blocks
     # (poll-and-recheck) until it is safe to restart $1.
     #
     # - idle (fresh, merge_idle) returns immediately (transparent).
     # - stale/absent (heartbeat missing or too old) is given a bounded
-    #   ORCH_DRAIN_UNKNOWN_GRACE_SECS grace, re-polling every
-    #   DRAIN_POLL_INTERVAL_SECS: a fresh idle/busy reading that appears
-    #   during the grace re-classifies into the branch below; if the grace
-    #   elapses with the heartbeat still stale/absent, the restart proceeds
-    #   anyway (fail-toward-convergence -- the opposite fail direction from
-    #   a confirmed-busy unit, which fails toward protecting the merge).
+    #   ORCH_DRAIN_UNKNOWN_GRACE_SECS grace via drain_await_fresh: a fresh
+    #   idle/busy reading that appears during the grace re-classifies into
+    #   the branches below; if the grace elapses with the heartbeat still
+    #   stale/absent, the restart proceeds anyway (fail-toward-convergence
+    #   -- the opposite fail direction from a confirmed-busy unit, which
+    #   fails toward protecting the merge).
     # - busy (fresh, mid-merge) defers with a journal line and polls every
     #   DRAIN_POLL_INTERVAL_SECS until the unit drains (idle) or
     #   FORCE_FIRE_AFTER_SECS elapses, at which point it force-proceeds
-    #   anyway.
+    #   anyway.  A unit that goes stale/absent WHILE deferred (it stopped
+    #   heartbeating -- e.g. crashed mid-merge) is NOT held for the rest of
+    #   that busy grace: it drops into the same bounded drain_await_fresh
+    #   handling as the top-level stale/absent case, since a dead unit
+    #   isn't actually merging.
     local unit="$1"
-    local verdict start_secs elapsed grace_start elapsed_grace
-    verdict="$(drain_check_verdict "$unit")"
+    local verdict start_secs elapsed
+    verdict="$(drain_await_fresh "$unit")"
 
-    grace_start=$SECONDS
-    while [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; do
-        elapsed_grace=$((SECONDS - grace_start))
-        if [[ $elapsed_grace -ge $DRAIN_UNKNOWN_GRACE_SECS ]]; then
-            echo "proceeding with restart of ${unit}: heartbeat ${verdict} after ${DRAIN_UNKNOWN_GRACE_SECS}s grace"
-            return 0
-        fi
-        sleep "$DRAIN_POLL_INTERVAL_SECS"
-        verdict="$(drain_check_verdict "$unit")"
-    done
+    if [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; then
+        echo "proceeding with restart of ${unit}: heartbeat ${verdict} after ${DRAIN_UNKNOWN_GRACE_SECS}s grace"
+        return 0
+    fi
 
     if [[ "$verdict" == "idle" ]]; then
         return 0
     fi
 
-    # verdict == "busy" here: idle returned above, and the stale/absent
-    # grace loop only exits once a fresh idle/busy reading appears.
+    # verdict == "busy" here: idle and stale/absent are both handled above.
     echo "deferring restart of ${unit}: mid-merge (grace $((FORCE_FIRE_AFTER_SECS / 60))m)"
     start_secs=$SECONDS
     while true; do
@@ -194,6 +219,23 @@ drain_gate() {
         if [[ "$verdict" == "idle" ]]; then
             echo "resuming restart of ${unit}: drained"
             return 0
+        fi
+        if [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; then
+            # Stopped heartbeating mid-defer -- apply the shorter bounded
+            # grace instead of continuing to wait out the full busy grace.
+            verdict="$(drain_await_fresh "$unit")"
+            if [[ "$verdict" == "idle" ]]; then
+                echo "resuming restart of ${unit}: drained"
+                return 0
+            elif [[ "$verdict" == "busy" ]]; then
+                # Alive and merging again -- resume deferring with a fresh
+                # busy grace window.
+                echo "deferring restart of ${unit}: mid-merge (grace $((FORCE_FIRE_AFTER_SECS / 60))m)"
+                start_secs=$SECONDS
+            else
+                echo "proceeding with restart of ${unit}: heartbeat ${verdict} after ${DRAIN_UNKNOWN_GRACE_SECS}s grace"
+                return 0
+            fi
         fi
     done
 }
