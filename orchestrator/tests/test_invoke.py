@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,6 +18,7 @@ from orchestrator.agents.invoke import (
     _invoke_claude_with_sandbox,
     _invoke_codex,
     _invoke_gemini,
+    _invoke_pi,
     _parse_codex_output,
     _parse_gemini_output,
     _run_subprocess_local,
@@ -507,6 +509,107 @@ class TestPricesThreadedToParser:
                 prices={'gemini-3-flash': {'input_per_1m': 50.0, 'output_per_1m': 50.0}},
             )
         assert agent.cost_usd == pytest.approx((10 * 50.0 + 5 * 50.0) / 1_000_000)
+
+
+_PI_VALID_JSONL_STDOUT = '\n'.join(json.dumps(e) for e in [
+    {'type': 'session', 'id': 'sess-invoke-1'},
+    {'type': 'turn_end', 'message': {
+        'role': 'assistant', 'stopReason': 'stop',
+        'usage': {'input': 100, 'output': 20, 'totalTokens': 120, 'cost': {'total': 0.0011}},
+        'content': [{'type': 'text', 'text': 'done'}],
+    }},
+    {'type': 'agent_end', 'messages': [{
+        'role': 'assistant', 'stopReason': 'stop',
+        'usage': {'input': 100, 'output': 20, 'totalTokens': 120, 'cost': {'total': 0.0011}},
+        'content': [{'type': 'text', 'text': 'done'}],
+    }], 'willRetry': False},
+])
+
+
+@pytest.mark.asyncio
+class TestInvokePiCore:
+    """`_invoke_pi` core invocation (deliverable #2): builds the spike-template
+    argv, runs it via the UNCHANGED `_run_subprocess_local`, and parses the
+    result via `_parse_pi_output`."""
+
+    async def test_returns_parsed_success_result(self, tmp_path):
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=pi_result):
+            agent = await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0,
+                allowed_tools=['Bash', 'mcp__fused-memory__add_memory'],
+                disallowed_tools=None, mcp_config=None, sandbox_modules=None,
+                effort=None, oauth_token=None, resume_session_id=None,
+                session_id=None, timeout_seconds=30.0, prices=None,
+            )
+        assert agent.success is True
+        assert agent.cost_usd > 0.0
+        assert agent.session_id == 'sess-invoke-1'
+        assert agent.turns > 0
+
+    async def test_argv_matches_spike_template(self, tmp_path):
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=pi_result) as mock_run:
+            await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0,
+                allowed_tools=['Bash', 'mcp__fused-memory__add_memory'],
+                disallowed_tools=None, mcp_config=None, sandbox_modules=None,
+                effort=None, oauth_token=None, resume_session_id=None,
+                session_id=None, timeout_seconds=30.0, prices=None,
+            )
+        cmd = mock_run.call_args.args[0]
+        assert cmd[0] == 'pi'
+        for token in ('--mode', 'json', '-p', '--model', 'anthropic/claude-haiku-4-5',
+                      '--session-dir', '--system-prompt'):
+            assert token in cmd, f'{token!r} missing from argv: {cmd!r}'
+        tools_csv = cmd[cmd.index('--tools') + 1]
+        assert set(tools_csv.split(',')) == {'bash', 'fused_memory_add_memory'}
+
+    async def test_timed_out_propagates(self, tmp_path):
+        timed_result = _SubprocessResult(
+            stdout='', stderr='timeout', returncode=1, duration_ms=100, timed_out=True,
+        )
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=timed_result):
+            agent = await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+        assert agent.timed_out is True
+
+    async def test_mcp_config_written_via_write_pi_mcp_config(self, tmp_path):
+        """When mcp_config is a dict, _write_pi_mcp_config is invoked (patched
+        here) so the on-disk config carries directTools — see the dedicated
+        TestWritePiMcpConfig unit tests for the file CONTENT shape."""
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
+        with (
+            patch('orchestrator.agents.invoke._run_subprocess_local',
+                  new_callable=AsyncMock, return_value=pi_result),
+            patch('orchestrator.agents.invoke._write_pi_mcp_config') as mock_write,
+        ):
+            await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+        mock_write.assert_called_once()
+        assert mcp_cfg in mock_write.call_args.args
 
 
 @pytest.mark.asyncio
