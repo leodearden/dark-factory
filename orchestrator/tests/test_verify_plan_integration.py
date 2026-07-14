@@ -65,7 +65,28 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+# Cross-file test-module imports: an established convention in this suite
+# (test_merge_queue_dry_run_unblock.py imports these same test_dry_run_unblock
+# helpers), but one that couples this module to the internal helper shapes of
+# sibling test files — a rename or signature change in either breaks this
+# module with no compile-time guard. ROOT_CONFTEST_DIFF/DATA_MODULE_DIFF/
+# STRUCTURAL_DIFF below are deliberately NOT imported this same way (this
+# module keeps its own copies, see the comment above ROOT_CONFTEST_DIFF) to
+# avoid adding a second, tighter such dependency for its core golden
+# fixtures; test_golden_diffs_match_test_verify_plan_source() near the end of
+# the plan-golden section turns that copy's silent-drift risk into a loud
+# test failure instead.
 from test_dry_run_unblock import _make_agent_result, _RecordingScheduler
+from test_verify_plan import (
+    DATA_MODULE_DIFF as _SRC_DATA_MODULE_DIFF,
+)
+from test_verify_plan import (
+    ROOT_CONFTEST_DIFF as _SRC_ROOT_CONFTEST_DIFF,
+)
+from test_verify_plan import (
+    STRUCTURAL_DIFF as _SRC_STRUCTURAL_DIFF,
+)
 
 from orchestrator import verify
 from orchestrator.b3_gate import ABORT, FRESH, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
@@ -497,6 +518,27 @@ class TestPlanGoldenStructural:
         pytest_run = _run_for(plan, '__fallback__', 'pytest:')
         assert pytest_run is not None
         assert pytest_run.scope_kind is ScopeKind.SKIPPED
+
+
+def test_golden_diffs_match_test_verify_plan_source():
+    """Guard the three verbatim-copied golden diffs (scenarios 3-5) against
+    silent drift from their source of truth in test_verify_plan.py.
+
+    ROOT_CONFTEST_DIFF/DATA_MODULE_DIFF/STRUCTURAL_DIFF above are
+    deliberately this module's OWN copies rather than a direct import — this
+    integration-gate module already carries one cross-file dependency (the
+    test_dry_run_unblock helpers imported at module top) and reconstructing
+    the diffs keeps it from taking on a second, tighter one on
+    test_verify_plan.py's internals for its core golden fixtures. But a copy
+    can silently drift from its source. This test converts that risk into a
+    loud, isolated test failure: if test_verify_plan.py's own goldens are
+    ever renamed or their values updated without a matching update here,
+    this fails instead of the two modules quietly asserting different things
+    against the same historical incidents (task-1077 / task-1852).
+    """
+    assert ROOT_CONFTEST_DIFF == _SRC_ROOT_CONFTEST_DIFF
+    assert DATA_MODULE_DIFF == _SRC_DATA_MODULE_DIFF
+    assert STRUCTURAL_DIFF == _SRC_STRUCTURAL_DIFF
 
 
 # ── step-9/10: Scenario 6 — classifier tool-isolation (C1); Boundary-test
