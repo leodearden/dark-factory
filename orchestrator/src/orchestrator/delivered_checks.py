@@ -22,6 +22,7 @@ caller in production; both the git subprocess runner and the resolved
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from enum import Enum
@@ -125,5 +126,23 @@ async def _run_script_check(
     project_root: str | Path,
     runner: _Runner,
 ) -> DeliveredCheckResult:
-    """Placeholder — implemented in the next TDD step (script kind)."""
-    raise NotImplementedError('script-kind delivered checks are not yet implemented')
+    """``<project_root>/<script> <args>``, cwd=project_root, bounded by
+    ``meta.timeout_secs`` via ``asyncio.wait_for``.
+
+    PRD Open-Q 2 DECIDED: this is a documented WORKING-CHECKOUT
+    approximation — unlike the grep kind (which reads the exact committed
+    tree at *ref*), the script runs against whatever is currently checked
+    out at *project_root*. Acceptable because grep is the PRIMARY kind;
+    script is the escape hatch for non-greppable capabilities. Any
+    exception the runner raises (``asyncio.TimeoutError``/``TimeoutError``
+    from the outer guard, ``OSError`` for a missing/non-executable script)
+    propagates to :func:`run_delivered_check`'s catch-all, which maps it to
+    :attr:`DeliveredCheckResult.ERRORED`.
+    """
+    script_path = str(Path(project_root) / meta.script)
+    argv = [script_path, *meta.args]
+    assert meta.timeout_secs is not None  # enforced by the script cross-field validator
+    rc, _out, _err = await asyncio.wait_for(
+        runner(argv, cwd=Path(project_root)), timeout=meta.timeout_secs
+    )
+    return DeliveredCheckResult.DELIVERED if rc == 0 else DeliveredCheckResult.FAILED
