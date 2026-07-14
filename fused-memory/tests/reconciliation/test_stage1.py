@@ -160,6 +160,70 @@ class TestStage1PayloadThreadsProjectRootAssembled:
 
 
 # ---------------------------------------------------------------------------
+# Task 2552: pin that ALL Stage-1 payload builders include the project_root
+# directive, so a future fourth builder can't omit it the way
+# _assemble_remediation_payload did (task 2150 hardened the other two
+# builders but missed this one).
+# ---------------------------------------------------------------------------
+
+
+class TestStage1AllPayloadBuildersIncludeProjectRootDirective:
+    """Enumerates every Stage-1 payload builder and asserts each includes the
+    project_root directive emitted by ``_build_project_root_directive``.
+
+    Covers the legacy time-windowed ``assemble_payload`` branch, the
+    assembled-path ``_format_assembled_payload`` branch, and the remediation
+    payload (``_assemble_remediation_payload``, reached via ``assemble_payload``
+    when ``remediation_findings`` is set) — task 2552.
+    """
+
+    _EXPECTED_ROOT = '/home/leo/src/test_proj'
+    _DIRECTIVE = f'Use project_root="{_EXPECTED_ROOT}"'
+
+    @pytest.mark.asyncio
+    async def test_legacy_assemble_payload_includes_directive(self):
+        stage = _make_consolidator(project_root=self._EXPECTED_ROOT)
+        watermark = Watermark(project_id='test_project')
+
+        result = await stage.assemble_payload(
+            events=[], watermark=watermark, prior_reports=[]
+        )
+
+        assert self._DIRECTIVE in result, (
+            'legacy assemble_payload must include the project_root directive'
+        )
+
+    @pytest.mark.asyncio
+    async def test_assembled_payload_includes_directive(self):
+        stage = _make_consolidator(project_root=self._EXPECTED_ROOT)
+        stage.assembled_payload = AssembledPayload(events=[], context_items={})
+        watermark = Watermark(project_id='test_project')
+
+        result = await stage.assemble_payload(
+            events=[], watermark=watermark, prior_reports=[]
+        )
+
+        assert self._DIRECTIVE in result, (
+            '_format_assembled_payload must include the project_root directive'
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_payload_includes_directive(self):
+        stage = _make_consolidator(project_root=self._EXPECTED_ROOT)
+        stage.remediation_findings = []
+        watermark = Watermark(project_id='test_project')
+
+        result = await stage.assemble_payload(
+            events=[], watermark=watermark, prior_reports=[]
+        )
+
+        assert self._DIRECTIVE in result, (
+            '_assemble_remediation_payload must include the project_root directive '
+            '(task 2552 regression: it was the third builder missed by task 2150)'
+        )
+
+
+# ---------------------------------------------------------------------------
 # project_root omitted when empty — REMOVED (task 2146 / recon-project-scope PRD).
 #
 # The former class TestStage1PayloadOmitsProjectRootWhenUnset pinned a scenario
