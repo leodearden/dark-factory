@@ -1561,6 +1561,28 @@ class TaskCurator:
         """
         await self.record_task(task_id, candidate, project_id)
 
+    async def evict_task(self, project_id: str, task_id: str) -> None:
+        """Delete a task's vector from the curator corpus.
+
+        Called when a task is removed, so its embedding never lingers as a
+        stale duplicate-detection neighbour. Reuses record_task's
+        deterministic point-id scheme (_point_id) to target the exact point
+        that record_task/backfill_corpus wrote. Best-effort — degrades to a
+        logged warning on any error (see caller wrapping).
+        """
+        client = await self._get_qdrant()
+        collection = self._collection_name(project_id)
+        if not await client.collection_exists(collection):
+            return
+
+        from qdrant_client.models import PointIdsList
+
+        point_id = self._point_id(project_id, task_id)
+        await client.delete(
+            collection_name=collection,
+            points_selector=PointIdsList(points=[point_id]),
+        )
+
     @staticmethod
     def _point_id(project_id: str, task_id: str) -> str:
         """Deterministic UUID5 point ID for a task in a project.
