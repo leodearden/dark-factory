@@ -36,9 +36,11 @@ from orchestrator.event_store import EventStore
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     MergeOutcome,
+    OutcomeKind,
     RealMergeItem,
     SpeculativeMergeWorker,
     _build_main_health_outcome,
+    _emit_merge_attempt,
     _main_health_fingerprint,
     _MainHealthProbeHandles,
     _run_deferred_main_health_probe,
@@ -1136,3 +1138,44 @@ class TestDeferredProbeRoutesToAutoHeal:
             'A stale-main probe verdict must file no escalation and must '
             'not invoke auto_heal'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2565 step-1 (RED): _emit_merge_attempt origin_host/probe_host —
+# direct-emit unit test, mirroring test_merge_attempt_disposition.py's
+# independent proof of the `disposition` opt-in payload key. Proves the
+# HOST-AFFINITY placement decision (task 2565) is RECORDED in the
+# main_health_red merge-attempt telemetry as its own unit, independent of
+# the probe-chain threading proven by the steps below. Fails today with an
+# unexpected-keyword-argument TypeError — origin_host/probe_host are not
+# yet params of _emit_merge_attempt.
+# ---------------------------------------------------------------------------
+
+
+class TestEmitMergeAttemptOriginProbeHost:
+    """Unit tests for the optional origin_host/probe_host kwargs of
+    _emit_merge_attempt (task 2565)."""
+
+    def test_origin_and_probe_host_persisted_when_provided(self) -> None:
+        store = MagicMock(spec=EventStore)
+
+        _emit_merge_attempt(
+            store, 'T1', OutcomeKind.main_health_red,
+            origin_host='remote', probe_host='local',
+        )
+
+        assert store.emit.call_count == 1
+        data = store.emit.call_args.kwargs['data']
+        assert data['origin_host'] == 'remote', f'data={data}'
+        assert data['probe_host'] == 'local', f'data={data}'
+        assert data['outcome'] == OutcomeKind.main_health_red, f'data={data}'
+
+    def test_origin_and_probe_host_absent_when_not_supplied(self) -> None:
+        store = MagicMock(spec=EventStore)
+
+        _emit_merge_attempt(store, 'T2', OutcomeKind.main_health_red)
+
+        assert store.emit.call_count == 1
+        data = store.emit.call_args.kwargs['data']
+        assert 'origin_host' not in data, f'data={data}'
+        assert 'probe_host' not in data, f'data={data}'
