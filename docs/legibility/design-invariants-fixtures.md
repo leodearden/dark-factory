@@ -249,6 +249,15 @@ Walked 2026-07-14 against `skills/prd/references/gates.md` §"G7 — Design
 invariants pass" and `skills/review/references/phase2-architecture.md`
 "Step 5.5: Design-invariants audit", both as landed on `main`.
 
+**Snapshot caveat.** The Verdict column below quotes phrasing (trigger-shape
+list entries, checkable questions) directly from the G7 and Step 5.5 text as
+it read on 2026-07-14. That phrasing is a point-in-time transcription for
+this rehearsal record, not a live pin on the source docs — if
+`skills/prd/references/gates.md` §G7 or
+`skills/review/references/phase2-architecture.md` Step 5.5 wording changes,
+re-walk the fixtures against the new text rather than trusting this table's
+quoted rationale as still current.
+
 | Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
 |---|---|---|---|---|---|
 | `INV-1-PRD` | PRD | INV-1 contracts-machine-checked | `contracts-machine-checked` | G7's trigger-shape list fires on "a contract in prose" / "a tool without a declared filter/envelope convention": the row states the routing rule lives only in the plan row and a runbook → `flag: contracts-machine-checked` | Y |
