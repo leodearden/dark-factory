@@ -418,6 +418,31 @@ class TestOrderQueue:
 
         assert items[0].handling is True
 
+    def test_escalation_id_populated_from_backing_record_for_both_kinds(self):
+        """USER-OBSERVABLE SIGNAL (task 2517): the copy affordance needs the
+        escalation id on QueueItem for both a decision row and an
+        awaiting-input session row -- and a record with no escalation_id
+        must degrade to None rather than a missing attribute."""
+        from cockpit.panes.decision_queue import order_queue
+        from cockpit.priority import Priorities
+
+        decision = _make_decision(id='dec-1', state=sr.DecisionState.OPEN, escalation_id='esc-9')
+        no_escalation = _make_decision(
+            id='dec-2', state=sr.DecisionState.OPEN, escalation_id=None
+        )
+        session = _make_session(
+            session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT, escalation_id='esc-7'
+        )
+
+        items = order_queue(
+            [decision, no_escalation], [session], Priorities.default(), _NOW
+        )
+
+        by_key = {item.key: item for item in items}
+        assert by_key['decision:dec-1'].escalation_id == 'esc-9'
+        assert by_key['session:awaiting-1'].escalation_id == 'esc-7'
+        assert by_key['decision:dec-2'].escalation_id is None
+
     def test_fresh_critical_decision_outranks_week_old_content_less_session(self):
         """USER-OBSERVABLE SIGNAL (F7): a freshly-filed critical ask ranks at
         the top of the queue -- a week-old idle awaiting-input session (no
