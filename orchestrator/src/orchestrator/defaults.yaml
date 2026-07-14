@@ -230,7 +230,7 @@ effort:
   deep_reviewer: "max"
   judge: "medium"
 
-# Backend CLI per role (claude, codex, gemini)
+# Backend CLI per role (claude, codex, gemini, pi)
 backends:
   architect: "claude"
   implementer: "claude"
