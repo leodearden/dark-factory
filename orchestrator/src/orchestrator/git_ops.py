@@ -1241,7 +1241,13 @@ class GitOps:
                 generic fault) is logged and the CM proceeds COLD — a
                 seed fault never breaks the probe (fail-soft, mirrors
                 :meth:`create_interactive_worktree`'s
-                seed-then-retain-cold-on-fault contract). A
+                seed-then-retain-cold-on-fault contract). The whole gate
+                (base-health check + seed call) is also wrapped in a
+                broad ``except Exception`` so this holds even if an
+                unexpected exception escapes those helpers — the gate
+                runs before the ``git worktree remove --force`` cleanup
+                below, so an unsuppressed raise here would leak the
+                registered worktree instead of degrading to cold. A
                 non-resolvable base (ABSENT/INDETERMINATE) skips the seed
                 subprocess entirely. Default ``False`` keeps
                 ``run_main_tip_sweep`` (``MAIN_SWEEP``) byte-identical to
@@ -1358,22 +1364,39 @@ class GitOps:
             # lifetime; re-taking it inside _seed_warm_lane would
             # self-deadlock against the identical path (see that method's
             # take_lane_lock docstring note).
+            #
+            # task 2567 amendment: the whole gate is wrapped in a broad
+            # except so the never-raise contract is structural rather than
+            # relying on _warm_lane_base_resolvable() (catches only
+            # OSError) and _seed_warm_lane() (catches Exception) each
+            # behaving today. This runs BEFORE the `try: yield ... finally:
+            # git worktree remove --force` block below, so an unsuppressed
+            # raise here would skip that scoped cleanup entirely — leaking
+            # a registered git worktree that DD5 forbids reclaiming via a
+            # broad `git worktree prune`.
             if worktree_added and warm_seed:
-                if self._warm_lane_base_resolvable() is WarmBaseHealth.OK:
-                    seed_rc = await self._seed_warm_lane(
-                        tmp_path, '--fresh-checkout', take_lane_lock=False,
-                    )
-                    if seed_rc != 0:
-                        logger.info(
-                            'ephemeral_worktree(%s): warm seed failed (rc=%d) '
-                            'for %s — proceeding COLD (fail-soft)',
-                            kind.name, seed_rc, tmp_path,
+                try:
+                    if self._warm_lane_base_resolvable() is WarmBaseHealth.OK:
+                        seed_rc = await self._seed_warm_lane(
+                            tmp_path, '--fresh-checkout', take_lane_lock=False,
                         )
-                else:
-                    logger.debug(
-                        'ephemeral_worktree(%s): warm base not resolvable — '
-                        'skipping seed, proceeding COLD for %s',
-                        kind.name, tmp_path,
+                        if seed_rc != 0:
+                            logger.info(
+                                'ephemeral_worktree(%s): warm seed failed (rc=%d) '
+                                'for %s — proceeding COLD (fail-soft)',
+                                kind.name, seed_rc, tmp_path,
+                            )
+                    else:
+                        logger.debug(
+                            'ephemeral_worktree(%s): warm base not resolvable — '
+                            'skipping seed, proceeding COLD for %s',
+                            kind.name, tmp_path,
+                        )
+                except Exception:
+                    logger.warning(
+                        'ephemeral_worktree(%s): warm-seed gate raised '
+                        'unexpectedly for %s — proceeding COLD (fail-soft)',
+                        kind.name, tmp_path, exc_info=True,
                     )
 
             try:

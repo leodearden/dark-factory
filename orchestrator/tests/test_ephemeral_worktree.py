@@ -1122,6 +1122,50 @@ class TestEphemeralWorktreeWarmSeed:
         remove_calls = [c for c in calls if 'worktree' in c and 'remove' in c]
         assert len(remove_calls) == 1, f'expected cleanup remove to still run; got {remove_calls}'
 
+    @pytest.mark.parametrize('raiser', ['_warm_lane_base_resolvable', '_seed_warm_lane'])
+    def test_warm_seed_gate_exception_is_structural_fail_soft(
+        self, tmp_path: Path, raiser: str,
+    ) -> None:
+        """task 2567 amendment: an unexpected exception escaping the
+        warm-seed gate (not just a non-zero seed rc) must not propagate
+        out of the CM and must not skip the scoped ``git worktree remove
+        --force`` cleanup. The gate is wrapped in its own broad
+        ``except Exception`` so this is structural, not merely dependent
+        on ``_warm_lane_base_resolvable``/``_seed_warm_lane`` each
+        catching everything internally today.
+        """
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        entered = False
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(
+                WorktreeKind.MAIN_PROBE, MAIN_SHA, warm_seed=True,
+            ):
+                entered = True
+
+        patches = [
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            patch.object(git_ops, '_warm_lane_base_resolvable', return_value=WarmBaseHealth.OK),
+            patch.object(git_ops, '_seed_warm_lane', new=AsyncMock(return_value=0)),
+        ]
+        if raiser == '_warm_lane_base_resolvable':
+            patches[1] = patch.object(
+                git_ops, '_warm_lane_base_resolvable', side_effect=RuntimeError('boom'),
+            )
+        else:
+            patches[2] = patch.object(
+                git_ops, '_seed_warm_lane', new=AsyncMock(side_effect=RuntimeError('boom')),
+            )
+
+        with patches[0], patches[1], patches[2]:
+            asyncio.run(_body())  # must not raise
+
+        assert entered, 'expected the CM body to still run (fail-soft) on a gate exception'
+        remove_calls = [c for c in calls if 'worktree' in c and 'remove' in c]
+        assert len(remove_calls) == 1, f'expected cleanup remove to still run; got {remove_calls}'
+
     @pytest.mark.parametrize('health', [WarmBaseHealth.ABSENT, WarmBaseHealth.INDETERMINATE])
     def test_warm_seed_skipped_when_base_not_ok(
         self, tmp_path: Path, health: WarmBaseHealth,
