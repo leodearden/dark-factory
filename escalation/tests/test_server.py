@@ -2360,7 +2360,7 @@ class TestGetMergeQueue:
 
         # M — in the merger (merging)
         req_M = _req('M')
-        worker._inflight_req = req_M
+        worker._register_item(req_M, initial=ItemLifecycleState.MERGING)
 
         # A — in the verifier queue (awaiting_verify)
         merge_wt_A = tmp_path / 'mergeA'
