@@ -14,7 +14,9 @@ from orchestrator.agents.invoke import (
     _parse_codex_output,
     _parse_gemini_output,
     _parse_pi_output,
+    _pi_thinking,
     _pi_tool_name,
+    _warn_if_argv_near_arg_max,
     _write_pi_mcp_config,
 )
 from orchestrator.config import PriceEntry
@@ -254,6 +256,27 @@ class TestPiToolName:
         direct-tool name — callers drop it from --tools (with a logged
         warning; see TestInvokePiFlags)."""
         assert _pi_tool_name('mcp__jcodemunch__*') is None
+
+
+class TestPiThinking:
+    """`_pi_thinking` maps a Claude-style effort level to pi's
+    ``--thinking`` vocabulary (off/minimal/low/medium/high/xhigh/max)."""
+
+    def test_recognized_effort_passes_through_unchanged(self):
+        assert _pi_thinking('medium') == 'medium'
+        assert _pi_thinking('minimal') == 'minimal'
+        assert _pi_thinking('high') == 'high'
+
+    def test_empty_effort_returns_none(self):
+        assert _pi_thinking(None) is None
+        assert _pi_thinking('') is None
+
+    def test_unrecognized_effort_falls_back_to_high_not_dropped(self):
+        """The whole reason _pi_thinking has a fallback branch: an
+        unrecognized non-empty effort string must not be silently dropped
+        (e.g. via a bare `.get(effort)` regressing to None) — it maps to
+        pi's 'high' level instead."""
+        assert _pi_thinking('bogus') == 'high'
 
 
 class TestParsePiEmptyOutput:
@@ -518,6 +541,40 @@ class TestWritePiMcpConfig:
 
         written = json.loads(config_path.read_text())
         assert written == {'mcpServers': {}}
+
+
+class TestWarnIfArgvNearArgMax:
+    """`_warn_if_argv_near_arg_max` is _invoke_pi's guard against the user
+    prompt (which, unlike --system-prompt, still travels on argv per the
+    spike template) overflowing the OS exec() ARG_MAX and failing with
+    E2BIG. `os.sysconf` is patched so the test doesn't depend on the host's
+    real ARG_MAX."""
+
+    def test_small_argv_does_not_warn(self, caplog, monkeypatch):
+        monkeypatch.setattr(
+            'orchestrator.agents.invoke.os.sysconf', lambda name: 2 * 1024 * 1024,
+        )
+        with caplog.at_level(logging.WARNING):
+            _warn_if_argv_near_arg_max(['pi', '--model', 'x', 'hello'])
+        assert not [r for r in caplog.records if 'ARG_MAX' in r.getMessage()]
+
+    def test_large_argv_warns(self, caplog, monkeypatch):
+        monkeypatch.setattr('orchestrator.agents.invoke.os.sysconf', lambda name: 1024)
+        with caplog.at_level(logging.WARNING):
+            _warn_if_argv_near_arg_max(['pi', 'x' * 1000])
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('ARG_MAX' in r.getMessage() for r in warning_records), (
+            f'expected an ARG_MAX warning; got: {[r.getMessage() for r in warning_records]}'
+        )
+
+    def test_sysconf_unavailable_falls_back_without_raising(self, caplog, monkeypatch):
+        def _raise(name):
+            raise ValueError('unsupported sysconf name')
+
+        monkeypatch.setattr('orchestrator.agents.invoke.os.sysconf', _raise)
+        with caplog.at_level(logging.WARNING):
+            _warn_if_argv_near_arg_max(['pi', 'hello'])  # must not raise
+        assert not [r for r in caplog.records if 'ARG_MAX' in r.getMessage()]
 
     def test_empty_mcp_config_writes_empty_servers_without_raising(self, tmp_path):
         config_path = tmp_path / 'pi-mcp-config.json'

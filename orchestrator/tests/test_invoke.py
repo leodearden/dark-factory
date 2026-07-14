@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -611,6 +612,163 @@ class TestInvokePiCore:
         mock_write.assert_called_once()
         assert mcp_cfg in mock_write.call_args.args
 
+    async def test_system_prompt_passed_as_file_reference(self, tmp_path):
+        """The system prompt is written to a git-excluded file under
+        --session-dir and passed as `--system-prompt @<path>` rather than
+        embedded on argv — pi's `--system-prompt <text-or-@file>` form
+        documents the @file syntax (spike template,
+        plans/pi-spike-findings.md:201). Architect/deep-reviewer system
+        prompts can be large enough that embedding them (plus a large user
+        prompt) on argv risks exceeding the OS ARG_MAX and failing exec()
+        with E2BIG."""
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        big_system_prompt = 'you are an architect. ' * 50
+        captured: dict = {}
+
+        async def fake_run(cmd, cwd, env, backend, model, max_budget_usd, timeout_seconds):
+            captured['value'] = cmd[cmd.index('--system-prompt') + 1]
+            captured['path'] = Path(captured['value'].removeprefix('@'))
+            captured['content_during_call'] = captured['path'].read_text()
+            return pi_result
+
+        with patch('orchestrator.agents.invoke._run_subprocess_local', side_effect=fake_run):
+            await _invoke_pi(
+                'hello', big_system_prompt, cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+
+        assert captured['value'].startswith('@'), captured['value']
+        assert big_system_prompt not in captured['value']
+        assert captured['content_during_call'] == big_system_prompt
+        # Cleaned up afterwards (mirrors codex's AGENTS.md temp-file cleanup).
+        assert not captured['path'].exists()
+
+
+@pytest.mark.asyncio
+class TestInvokePiMcpConfigBackupRestore:
+    """The robustness-critical `.mcp.json` backup/restore in `_invoke_pi`:
+    placement into cwd, backing up a pre-existing repo-committed
+    `.mcp.json`, and restoring it in `finally`. Exercised with the REAL
+    (unpatched) `_write_pi_mcp_config`, unlike TestInvokePiCore's
+    mcp-config test, which patches it out and so never touches disk."""
+
+    async def test_preexisting_mcp_json_is_backed_up_and_restored(self, tmp_path):
+        original_content = '{"mcpServers": {"committed-server": {"command": "y"}}}'
+        mcp_json_path = tmp_path / '.mcp.json'
+        mcp_json_path.write_text(original_content)
+
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        captured: dict = {}
+
+        async def fake_run(cmd, cwd, env, backend, model, max_budget_usd, timeout_seconds):
+            # While _invoke_pi is "running" (subprocess in flight), the
+            # repo's own .mcp.json has been swapped out for pi's config.
+            captured['content_during_call'] = mcp_json_path.read_text()
+            return pi_result
+
+        mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
+        with patch('orchestrator.agents.invoke._run_subprocess_local', side_effect=fake_run):
+            await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+
+        written_during_call = json.loads(captured['content_during_call'])
+        assert written_during_call['mcpServers']['fused-memory']['directTools'] is True
+        # The original, pre-existing committed config is restored afterward.
+        assert mcp_json_path.read_text() == original_content
+        # No leftover backup file.
+        assert not (tmp_path / '.mcp.json.pi-invoke-backup').exists()
+
+    async def test_no_preexisting_mcp_json_leaves_none_behind(self, tmp_path):
+        mcp_json_path = tmp_path / '.mcp.json'
+        assert not mcp_json_path.exists()
+
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=pi_result):
+            await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+
+        assert not mcp_json_path.exists()
+        assert not (tmp_path / '.mcp.json.pi-invoke-backup').exists()
+
+
+@pytest.mark.asyncio
+class TestInvokePiMcpCacheWarmWarning:
+    """`_invoke_pi` warns when direct-tool MCP names are requested for
+    servers whose pi-mcp-adapter metadata cache (spike Q3 CRITICAL
+    GOTCHA — see _write_pi_mcp_config's docstring) hasn't been warmed
+    yet, so the silent proxy-`mcp`-tool fallback is observable instead of
+    surfacing later as mysterious missing-tool behavior."""
+
+    async def test_warns_when_cache_file_absent(self, tmp_path, caplog):
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        missing_cache = tmp_path / 'not-warmed' / 'mcp-cache.json'
+        mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
+        with (
+            patch('orchestrator.agents.invoke._run_subprocess_local',
+                  new_callable=AsyncMock, return_value=pi_result),
+            patch('orchestrator.agents.invoke._pi_mcp_cache_path', return_value=missing_cache),
+            caplog.at_level(logging.WARNING),
+        ):
+            await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'fused-memory' in r.getMessage() and 'cache' in r.getMessage().lower()
+            for r in warnings
+        ), [r.getMessage() for r in warnings]
+
+    async def test_no_warning_when_cache_file_present(self, tmp_path, caplog):
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        warmed_cache = tmp_path / 'warmed' / 'mcp-cache.json'
+        warmed_cache.parent.mkdir()
+        warmed_cache.write_text('{}')
+        mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
+        with (
+            patch('orchestrator.agents.invoke._run_subprocess_local',
+                  new_callable=AsyncMock, return_value=pi_result),
+            patch('orchestrator.agents.invoke._pi_mcp_cache_path', return_value=warmed_cache),
+            caplog.at_level(logging.WARNING),
+        ):
+            await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+        warnings = [r for r in caplog.records if 'direct-tools cache' in r.getMessage()]
+        assert not warnings
+
 
 @pytest.mark.asyncio
 class TestInvokePiFlags:
@@ -656,6 +814,27 @@ class TestInvokePiFlags:
         mock_run = await self._invoke(tmp_path, oauth_token='tok')
         env = mock_run.call_args.args[2]
         assert env.get('ANTHROPIC_OAUTH_TOKEN') == 'tok'
+
+    async def test_oauth_token_strips_lingering_anthropic_api_key(self, tmp_path, monkeypatch):
+        """A lingering ANTHROPIC_API_KEY must not shadow the OAuth token pi
+        is being asked to use — otherwise the multi-account OAuth failover
+        oauth_token exists for is silently defeated (mirrors
+        _invoke_claude_with_sandbox's credential-precedence guard)."""
+        monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-should-not-leak')
+        mock_run = await self._invoke(tmp_path, oauth_token='tok')
+        env = mock_run.call_args.args[2]
+        assert env.get('ANTHROPIC_OAUTH_TOKEN') == 'tok'
+        assert 'ANTHROPIC_API_KEY' not in env
+
+    async def test_no_oauth_token_leaves_anthropic_api_key_untouched(self, tmp_path, monkeypatch):
+        """Without oauth_token, a directly-configured ANTHROPIC_API_KEY
+        (pi's non-OAuth Anthropic auth path) must keep working — the strip
+        is scoped to the OAuth-token case, not unconditional."""
+        monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-direct-key')
+        mock_run = await self._invoke(tmp_path, oauth_token=None)
+        env = mock_run.call_args.args[2]
+        assert env.get('ANTHROPIC_API_KEY') == 'sk-direct-key'
+        assert 'ANTHROPIC_OAUTH_TOKEN' not in env
 
     async def test_resume_session_id_uses_session_flag(self, tmp_path):
         mock_run = await self._invoke(tmp_path, resume_session_id='r1')
