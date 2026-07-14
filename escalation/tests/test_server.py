@@ -2544,6 +2544,80 @@ class TestMergeRequestWorkflowVerifyEmission:
             if result.get('status') == 'queued':
                 await _call_merge_cancel(server, request_id=result['request_id'])
 
+    async def test_verified_green_true_on_resubmit_attach_emits_second_row(
+        self, tmp_path: Path,
+    ) -> None:
+        """A verified_green=True resubmission for a branch already in flight
+        (same task_id) coalesces onto the 'attached' path — which is reached
+        via the SAME emission block, placed before the coalesce/enqueue call.
+        This pins two previously-unverified facts (reviewer follow-up on
+        step-4): (1) the coalesce/'attached' path emits a row too, not just
+        fresh dispatch — harmless duplication since the classifier
+        (_branch_pre_merge_verify_green) is any-prior-green keyed by
+        task_id; and (2) with no harness/git_ops wired, resolved_tip stays
+        None so data['base_sha'] is None — the informational field degrades
+        gracefully instead of the emission being skipped.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-attach')
+
+        server = create_server(
+            esc_queue,
+            # No harness passed — git_ops_for_scan stays None, so resolved_tip
+            # is None on both calls (documents the base_sha=None case) and the
+            # coalesce gate's tip classifier is skipped (back-compat,
+            # registry-only comparison), guaranteeing the resubmit attaches.
+            orch_config=orch_config,
+            event_store=event_store,
+            merge_queue=asyncio.Queue(),
+        )
+
+        first = await _call_merge_request(
+            server,
+            task_id='790',
+            branch='790',
+            worktree=str(tmp_path / 'wt'),
+            description='',
+            verified_green=True,
+            wait_secs=0,
+        )
+        assert first.get('status') == 'queued', (
+            f'Expected first submission status queued, got: {first}'
+        )
+
+        try:
+            second = await _call_merge_request(
+                server,
+                task_id='790',
+                branch='790',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+                verified_green=True,
+                wait_secs=0,
+            )
+            assert second.get('status') == 'attached', (
+                f'Expected resubmit status attached (coalesced), got: {second}'
+            )
+
+            rows = event_store.fetch_events_by_type(EventType.workflow_verify)
+            assert len(rows) == 2, (
+                f'Expected two workflow_verify rows (dispatch + attach), got: {rows}'
+            )
+            for row in rows:
+                assert row['task_id'] == '790', f'Expected task_id 790, got: {row}'
+                assert row['data']['passed'] is True, (
+                    f"Expected data['passed'] is True, got: {row}"
+                )
+                assert row['data']['base_sha'] is None, (
+                    f"Expected data['base_sha'] is None (no git_ops wired), got: {row}"
+                )
+                assert row['data']['branch'] == 'task/790', (
+                    f"Expected data['branch']=='task/790', got: {row}"
+                )
+        finally:
+            await _call_merge_cancel(server, request_id=first['request_id'])
+
 
 # ---------------------------------------------------------------------------
 # TestGetMergeQueue — live merge-queue snapshot via get_merge_queue MCP tool
