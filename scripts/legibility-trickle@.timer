@@ -1,0 +1,14 @@
+[Unit]
+Description=Nightly timer for the legibility trickle (%i)
+
+[Timer]
+# Nightly at 03:00 local time; Persistent=true catches up a missed night
+# (laptop asleep/offline at 03:00) on next boot/login instead of silently
+# skipping it. A small randomized delay avoids every project's timer firing
+# at the exact same instant.
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
