@@ -644,3 +644,130 @@ class TestCheckRunTimeoutConsistency:
             _check_run('type', rc=1, timed_out=True),
         ])
         assert attempt.pure_timeout_failure is False
+
+
+# ── step-15/16: Scenario 9 — merge-verify block -> gateable proposal (the
+#               coverage gap + B4); Boundary-test sketch row 9 ──────────────
+
+
+class TestMergeVerifyBlockProducesGateableProposal:
+    """Scenario 9 — GOLDEN: a merge-verify RED (generic task-fault, non-timeout)
+
+    must, via the REAL (unpatched) _run_post_merge_verify + run_dry_run_unblock,
+    write a dry_run_proposals[] entry with block_class=MERGE_VERIFY_RED that
+    b3_gate.check_proposal accepts as non-ABORT (B4) — closing the coverage
+    gap where merge_queue's post-merge-verify block path produced a
+    MergeOutcome('blocked') but never spawned an investigation, leaving
+    check_proposal permanently ABORT ('no proposal to gate') for the entire
+    merge-verify-RED class.
+
+    FAKED (boundary only): run_scoped_verification (-> a failing non-timeout
+    VerifyResult), verify_failure_is_preexisting_on_main (-> not preexisting,
+    so the generic task-fault branch is reached rather than main-health-red),
+    and orchestrator.dry_run_unblock.invoke_agent (-> a low-risk structured
+    proposal). Everything else — GitOps, the real git_repo, the real
+    _run_post_merge_verify block path, the fire-and-forget spawn,
+    run_dry_run_unblock's own git-anchor capture, and check_proposal — runs
+    for real.
+
+    RED until step-16 imports _run_post_merge_verify/_DryRunInvestigationHandles
+    from orchestrator.merge_queue, check_proposal/ABORT from
+    orchestrator.b3_gate, BlockClass from orchestrator.unblock_types,
+    VerifyResult from orchestrator.verify, and _RecordingScheduler/
+    _make_agent_result from test_dry_run_unblock (cross-file convention
+    already used by test_merge_queue_dry_run_unblock.py).
+    """
+
+    def test_merge_verify_red_produces_gateable_proposal(
+        self, tmp_path, config, git_ops, git_repo,
+    ):
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+
+        scheduler = _RecordingScheduler({'dry_run_proposals': []})
+        handles = _DryRunInvestigationHandles(scheduler=scheduler)
+
+        compile_error_result = VerifyResult(
+            passed=False,
+            test_output='',
+            lint_output='',
+            type_output='error TS2322: StatusBar.tsx:12',
+            summary='tsc failed',
+            cause_hint='error TS2322: StatusBar.tsx',
+            category='compile_error',
+        )
+        structured = {
+            'proposal_text': 'Fix the scoped lint failure',
+            'risk_label': 'low',
+            'files_referenced': ['orchestrator/src/orchestrator/foo.py'],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        reqs: list = []
+
+        async def _drive():
+            # _make_req must run inside the loop it builds a Future against.
+            req = _make_req('99', 'task/99', config, git_repo)
+            reqs.append(req)
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=compile_error_result),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(return_value=(False, '')),
+                ),
+                patch(
+                    'orchestrator.dry_run_unblock.invoke_agent',
+                    new=AsyncMock(return_value=agent_result),
+                ),
+            ):
+                outcome = await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    dry_run_handles=handles,
+                    event_store=MagicMock(),
+                )
+                # Drain the fire-and-forget investigation (real
+                # run_dry_run_unblock, real git subprocess calls against
+                # req.worktree, mocked invoke_agent) before the loop tears
+                # down.
+                await asyncio.sleep(0)
+                if handles.background_tasks:
+                    await asyncio.gather(
+                        *handles.background_tasks, return_exceptions=True,
+                    )
+                return outcome
+
+        outcome = asyncio.run(_drive())
+        req = reqs[0]
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+
+        proposals = scheduler._meta.get('dry_run_proposals', [])
+        assert proposals, 'Expected a dry_run_proposals entry to be written'
+        entry = proposals[-1]
+        assert entry['block_class'] == BlockClass.MERGE_VERIFY_RED, (
+            f"Expected block_class=MERGE_VERIFY_RED; got {entry.get('block_class')!r}"
+        )
+        assert entry['risk_label'] == 'low', (
+            f"Expected risk_label='low'; got {entry.get('risk_label')!r}"
+        )
+
+        def _fake_run_git(args: list[str], cwd: str) -> tuple[int, str]:
+            """HEAD always matches the recorded sha; footprint diff is empty."""
+            if 'rev-parse' in args:
+                return (0, entry['head_sha'])
+            return (0, '')
+
+        verdict = check_proposal(
+            entry, worktree=str(req.worktree), category='task_failure',
+            run_git=_fake_run_git,
+        )
+        assert verdict['verdict'] != ABORT, (
+            f'Expected a non-ABORT (gateable) verdict; got {verdict!r}'
+        )
