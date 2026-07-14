@@ -255,3 +255,51 @@ class TestOrderSessions:
         ordered = order_sessions([no_ts, has_ts])
 
         assert [r.session_slug for r in ordered] == ['has-ts', 'no-ts']
+
+
+class TestFilterLiveSessions:
+    def test_terminal_statuses_are_dropped(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        exited = _make_record(session_slug='s-exited', status=sr.Status.EXITED)
+        failed = _make_record(session_slug='s-failed', status=sr.Status.FAILED_TO_START)
+
+        assert filter_live_sessions([exited, failed]) == []
+
+    def test_non_terminal_statuses_are_all_kept(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        awaiting = _make_record(session_slug='s-awaiting', status=sr.Status.AWAITING_INPUT)
+        running = _make_record(session_slug='s-running', status=sr.Status.RUNNING)
+        launching = _make_record(session_slug='s-launching', status=sr.Status.LAUNCHING)
+        idle = _make_record(session_slug='s-idle', status=sr.Status.IDLE)
+        records = [awaiting, running, launching, idle]
+
+        kept = filter_live_sessions(records)
+
+        assert [r.session_slug for r in kept] == [r.session_slug for r in records]
+
+    def test_foreign_status_is_kept_fail_soft(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        foreign = _make_record(session_slug='s-foreign', status='some-foreign-status')
+
+        assert filter_live_sessions([foreign]) == [foreign]
+
+    def test_relative_order_of_kept_records_is_preserved(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        awaiting = _make_record(session_slug='s-awaiting', status=sr.Status.AWAITING_INPUT)
+        exited = _make_record(session_slug='s-exited', status=sr.Status.EXITED)
+        running = _make_record(session_slug='s-running', status=sr.Status.RUNNING)
+        idle = _make_record(session_slug='s-idle', status=sr.Status.IDLE)
+        ordered_input = [awaiting, exited, running, idle]
+
+        kept = filter_live_sessions(ordered_input)
+
+        assert [r.session_slug for r in kept] == ['s-awaiting', 's-running', 's-idle']
+
+    def test_empty_input_returns_empty_list(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        assert filter_live_sessions([]) == []
