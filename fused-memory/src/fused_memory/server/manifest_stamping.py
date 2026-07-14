@@ -173,11 +173,22 @@ async def stamp_capability_manifests(
         return report
     report['stamped'] = stamped_labels
 
+    # 4b. Batch prd_task_labels that don't appear among this sidecar's own
+    #     task labels are recorded loudly rather than silently dropped —
+    #     e.g. the decompose session referenced a label that was renamed or
+    #     removed from the manifest after authoring. Order follows the
+    #     batch (manifest_tasks) order, deduped, first-occurrence.
+    stamped_label_set = set(stamped_labels)
+    missing_labels: list[str] = []
+    for _tid, label, rel in manifest_tasks:
+        if rel == sidecar_rel and label not in stamped_label_set and label not in missing_labels:
+            missing_labels.append(label)
+    report['missing_labels'] = missing_labels
+
     # 5. For each stamped label, copy only MECHANICAL (grep/script)
     #    delivered_checks into that producer's metadata.delivered_checks —
     #    a manual-only (or checkless) label collects an empty list and is
     #    skipped, leaving the δ gate a status-only no-op for it.
-    stamped_label_set = set(stamped_labels)
     for task in doc.tasks:
         if task.label not in stamped_label_set:
             continue
