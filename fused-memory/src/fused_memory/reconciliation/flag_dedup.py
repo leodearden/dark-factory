@@ -59,7 +59,11 @@ indexed ``(project_id, record_kind, state)`` ledger query, no Mem0 search
 row with ``flag_type == ''`` is a WILDCARD (blanket-suppresses every
 flag_type for its task_id); a row with a non-empty ``flag_type`` is
 SCOPED to that pair AND any flag_type FAMILY VARIANT of it (task 2503) —
-see ``canonical_flag_type_family``.  When both a wildcard and a scoped row
+see ``canonical_flag_type_family``.  Family matching is word-order
+insensitive, an ACCEPTED RISK reviewed and documented at both
+``canonical_flag_type_family``'s and ``filter_suppressed``'s docstrings
+(the latter's row-scan logs a WARNING on an observed family collision as a
+partial audit mitigation).  When both a wildcard and a scoped row
 exist for the same task_id, the wildcard wins (union semantics — a blanket
 suppression cannot be narrowed by a more specific record).
 ``write_suppression_record`` upserts these rows: ``flag_types=None``
@@ -71,8 +75,10 @@ operator-managed and persist until explicitly cleared.  Before upserting,
 requested flag_type already covered by an existing wildcard row, or by an
 existing scoped row whose flag_type family matches — the fix for the
 Mem0-mirror-never-upserts companion-record sprawl (mem0 c3a1bdfd on task
-544).  See ``filter_suppressed`` and ``write_suppression_record`` for full
-semantics.
+544) — and additionally dedups the requested flag_types AGAINST EACH OTHER
+by family within the same call, so one call cannot mint its own
+multi-row companion sprawl either.  See ``filter_suppressed`` and
+``write_suppression_record`` for full semantics.
 
 Completion-marker same-cycle self-delete (task-2312)
 -----------------------------------------------------
@@ -287,6 +293,13 @@ def canonical_flag_type_family(flag_type: str) -> str:
     pre-write coverage check still catches for reorder/case/separator
     variants of an already-covered flag_type.
 
+    Note the specific mechanism the word-order axis accepts: two flag_types
+    that merely share the same TOKEN MULTISET (e.g. ``'user_missing'`` and
+    ``'missing_user'``) collapse to the same family even if they describe
+    different findings -- see :func:`filter_suppressed`'s "ACCEPTED RISK"
+    docstring paragraph for the reviewed rationale and the audit-log
+    mitigation it emits on such a collision.
+
     Idempotent: the output is already lowercase, separator-free, and
     ``'_'``-joined in sorted order, so re-applying this function to its own
     output is a no-op.
@@ -344,6 +357,25 @@ async def filter_suppressed(
     the task_id entry is a wildcard. The remaining flags are returned
     unchanged so they can proceed through the signature-dedup loop.
 
+    ACCEPTED RISK -- word-order collisions (task 2503 review;
+    reviewer_comprehensive over-suppression-risk): :func:`canonical_flag_type_family`
+    is insensitive to word order, so two flag_types that merely share the same
+    TOKEN MULTISET -- not just case/separator/whitespace variants of the SAME
+    finding -- collapse to one family (e.g. ``'user_missing'`` ==
+    ``'missing_user'``, or ``'review_missing_deliverable'`` ==
+    ``'deliverable_missing_review'``). If two conceptually-DIFFERENT findings
+    for the same task_id happen to share a token multiset, the second is
+    silently over-suppressed here. This is a deliberate, reviewed tradeoff
+    (see the task 2503 design_decisions entry and
+    :func:`canonical_flag_type_family`'s docstring): under-suppression (missing
+    a genuine reworded/reordered-variant match) was judged the worse failure
+    mode. As a partial mitigation, the row-scan below logs a WARNING whenever
+    it observes two DISTINCT raw ``flag_type`` values for the same task_id
+    collapsing into the same family, so an operator can audit the ledger for a
+    suspected collision -- this can only detect a collision AMONG SUPPRESSION
+    ROWS themselves, not between a row and a flag being filtered, since only
+    the ledger side is available for comparison in this function.
+
     Rows with ``task_id == ''`` (or which decompose to no components) are
     skipped when building the map (a degenerate/malformed suppression with
     no task target) -- this mirrors the old producer-side guard that
@@ -384,11 +416,18 @@ async def filter_suppressed(
         )
         return flags
 
-    # task_id (str) -> None (wildcard/blanket) | set[str] (scoped flag_types
-    # allowlist).  See docstring for wildcard-wins union semantics.  Each
-    # row's task_id is decomposed into its component id(s) (task 2454) so a
-    # composite comma-joined row indexes every component.
-    suppressed: dict[str, set[str] | None] = {}
+    # task_id (str) -> None (wildcard/blanket) | dict[family -> set(raw
+    # flag_type strings observed for that family)].  See docstring for
+    # wildcard-wins union semantics.  Each row's task_id is decomposed into
+    # its component id(s) (task 2454) so a composite comma-joined row indexes
+    # every component.  The inner dict (rather than a flat set[str] of
+    # families) retains the raw strings purely so a FAMILY COLLISION -- two
+    # distinct raw flag_types landing in the same family bucket -- can be
+    # logged as a monitoring/audit signal (see "ACCEPTED RISK" above);
+    # membership testing for suppression matching (`family in allowlist`,
+    # below in `_keep`) is unaffected by this extra bookkeeping since `in` on
+    # a dict tests its keys.
+    suppressed: dict[str, dict[str, set[str]] | None] = {}
     for row in rows:
         if not row.task_id:
             continue  # degenerate row with no task target; can never match a kept flag
@@ -404,12 +443,33 @@ async def filter_suppressed(
                 continue
 
             scoped = suppressed.get(tid_str)
-            if not isinstance(scoped, set):
-                scoped = set()
+            if not isinstance(scoped, dict):
+                scoped = {}
                 suppressed[tid_str] = scoped
             # Store the flag_type FAMILY key (task 2503), not the raw string, so a
             # case/separator/word-order variant is recognized as the same finding.
-            scoped.add(canonical_flag_type_family(row.flag_type))
+            family = canonical_flag_type_family(row.flag_type)
+            raw_variants = scoped.setdefault(family, set())
+            if raw_variants and row.flag_type not in raw_variants:
+                # Monitoring/audit signal (task 2503 amendment,
+                # reviewer_comprehensive over-suppression-risk): two DISTINCT
+                # raw flag_type strings for the same task_id collapsed into the
+                # same family. This may be a benign reworded/reordered variant
+                # of the SAME finding (the intended case) or a genuine
+                # token-multiset collision between two DIFFERENT findings (the
+                # accepted-risk failure mode) -- this function cannot tell
+                # which, so it surfaces both raw values for operator review.
+                logger.warning(
+                    'filter_suppressed: flag_type family collision for project'
+                    ' %s task_id=%s: family=%r groups distinct raw flag_types'
+                    ' %r -- verify these describe the same finding (task 2503'
+                    ' accepted over-suppression risk)',
+                    project_id,
+                    tid_str,
+                    family,
+                    sorted(raw_variants | {row.flag_type}),
+                )
+            raw_variants.add(row.flag_type)
 
     def _keep(f: dict[str, Any]) -> bool:
         flag_tid = f.get('task_id')
@@ -424,6 +484,10 @@ async def filter_suppressed(
         flag_type = f.get('flag_type')
         if flag_type is None:
             return True  # cannot match a scoped allowlist without a flag_type
+        # ACCEPTED RISK (see docstring): this is a TOKEN-MULTISET (word-order
+        # insensitive) match, so a flag_type that merely shares tokens with an
+        # unrelated suppressed finding for this task_id (e.g. 'missing_user'
+        # vs 'user_missing') is treated as covered here.
         return canonical_flag_type_family(str(flag_type)) not in allowlist
 
     return [f for f in flags if _keep(f)]
@@ -959,6 +1023,15 @@ async def write_suppression_record(
     - If NOTHING is covered (the common case: no pre-existing rows, or a
       genuinely new flag_type), behavior is unchanged from before task 2503
       -- the full requested set is written and mirrored.
+    - IN-CALL family dedup (task 2503 amendment): the not-yet-covered subset
+      is additionally deduped AGAINST ITSELF by
+      :func:`canonical_flag_type_family`, keeping only the first raw variant
+      encountered per family. Without this, a single call requesting e.g.
+      ``flag_types=['missing_deliverable', 'deliverable_missing']`` with no
+      pre-existing rows would write/mirror BOTH (neither is covered by an
+      existing row), minting two rows for one family in one call -- the
+      pre-write coverage check alone only guards against existing ledger
+      rows, not duplicates within the same request.
 
     Each written row's identity is ``(project_id, 'stage1_flag_suppression',
     task_id, flag_type, run_id='')``, so a repeated call with the same
@@ -984,6 +1057,20 @@ async def write_suppression_record(
     failure (or when the ledger write happened but the mirror wasn't
     attempted for another reason) an empty :class:`AddMemoryResponse` is
     synthesized so the return type stays uniform.
+
+    ROBUSTNESS NOTE on mirror-gating permanence (task 2503 review;
+    reviewer_comprehensive robustness): coverage is inferred purely from
+    ``recon_ledger`` rows, never from Mem0 itself. If a FIRST call
+    successfully upserts the ledger row(s) but its best-effort Mem0 mirror
+    then fails (silently, per the try/except above), every SUBSEQUENT call
+    for that (or a flag_type-family-variant) request will see ledger
+    coverage and skip the mirror again — no Mem0 audit-journal entry is ever
+    created for that suppression. This is considered acceptable rather than
+    a bug: no runtime reader consults Mem0 for suppressions (the ledger is
+    the sole read source — see :func:`filter_suppressed`), so a missing Mem0
+    companion cannot cause a functional (suppression-matching) regression,
+    only a gap in the legacy Mem0-based audit trail during the ledger
+    cutover.
 
     The ``_source='stage1_flag_suppression'`` sentinel distinguishes these
     mirror writes from ``'targeted_recon'`` writes in the audit journal,
@@ -1022,7 +1109,25 @@ async def write_suppression_record(
             return False  # a blanket write is only covered by an existing wildcard
         return canonical_flag_type_family(ft) in covered_families
 
-    to_write = [ft for ft in requested if not _is_covered(ft)]
+    # In-call family dedup (task 2503 amendment, reviewer_comprehensive
+    # correctness-completeness): the coverage check above only guards against
+    # EXISTING ledger rows -- it does not dedup the requested flag_types
+    # against EACH OTHER. Without this pass, a single call requesting e.g.
+    # ['missing_deliverable', 'deliverable_missing'] with no prior rows would
+    # keep both (neither is covered by an existing row) and mint two ledger
+    # rows / two Mem0 mirror entries for one family in ONE call -- the same
+    # companion-record sprawl this task exists to eliminate. Keep only the
+    # first raw variant encountered per family (stable order == request order).
+    to_write: list[str] = []
+    seen_families: set[str] = set()
+    for ft in requested:
+        if _is_covered(ft):
+            continue
+        family = canonical_flag_type_family(ft)
+        if family in seen_families:
+            continue
+        seen_families.add(family)
+        to_write.append(ft)
 
     if not to_write:
         logger.info(

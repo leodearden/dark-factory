@@ -1377,6 +1377,56 @@ class TestFilterSuppressedFlagTypeFamily:
         result = await filter_suppressed(ledger_memory_service, 'p', [flag])
         assert result == [flag]
 
+    @pytest.mark.asyncio
+    async def test_family_collision_across_distinct_raw_flag_types_logs_warning(
+        self, ledger_memory_service, caplog
+    ):
+        """Two DIFFERENT raw flag_types for the SAME task_id that happen to
+        share a token multiset (word-order variants of each other, e.g.
+        'user_missing' / 'missing_user') collapse to the same family --
+        filter_suppressed logs a WARNING surfacing this as a potential
+        over-suppression collision for operator review (task 2503 amendment,
+        reviewer_comprehensive over-suppression-risk)."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '800', 'user_missing')
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '800', 'missing_user')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            await filter_suppressed(
+                ledger_memory_service, 'p', [{'task_id': 1, 'flag_type': 'unrelated'}]
+            )
+
+        assert any(
+            'family collision' in record.message
+            and '800' in record.message
+            and record.levelno == logging.WARNING
+            for record in caplog.records
+        ), f'Expected a WARNING family-collision log, got: {[r.message for r in caplog.records]}'
+
+    @pytest.mark.asyncio
+    async def test_no_collision_warning_for_single_raw_flag_type_per_family(
+        self, ledger_memory_service, caplog
+    ):
+        """No collision WARNING is logged when only ONE raw flag_type exists
+        per family for a task_id -- the common, non-colliding case."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '544', 'missing_deliverable'
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            await filter_suppressed(
+                ledger_memory_service, 'p', [{'task_id': 544, 'flag_type': 'missing_deliverable'}]
+            )
+
+        assert not any('family collision' in record.message for record in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # build_suppression_payload tests (task-1185 step-1)
@@ -2156,6 +2206,35 @@ class TestWriteSuppressionRecordPreWriteCheck:
         ledger_memory_service.add_memory.assert_called_once()
         kwargs = ledger_memory_service.add_memory.call_args.kwargs
         assert kwargs['metadata']['flag_types'] == ['b']
+        assert result.memory_ids == ['mirror-id']
+
+    @pytest.mark.asyncio
+    async def test_in_call_family_variants_collapse_to_one_write(self, ledger_memory_service):
+        """(h) A SINGLE call requesting two flag_types that are family
+        variants of each other (no pre-existing coverage) must still
+        collapse to ONE ledger row and ONE mirror entry -- the pre-write
+        coverage check alone only guards against EXISTING ledger rows, not
+        duplicates within the same request, so without an in-call dedup pass
+        one call could mint its own companion sprawl (task 2503 amendment,
+        reviewer_comprehensive correctness-completeness)."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        result = await write_suppression_record(
+            ledger_memory_service,
+            project_id='p',
+            task_id=544,
+            flag_types=['missing_deliverable', 'deliverable_missing'],
+        )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1, f'expected exactly one ledger row, got: {rows!r}'
+        assert rows[0].flag_type == 'missing_deliverable', (
+            'the first requested variant is kept as the representative'
+        )
+
+        ledger_memory_service.add_memory.assert_called_once()
+        kwargs = ledger_memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['flag_types'] == ['missing_deliverable']
         assert result.memory_ids == ['mirror-id']
 
     # -----------------------------------------------------------------
