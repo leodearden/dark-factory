@@ -502,3 +502,96 @@ def test_apply_coding_record_different_candidate_same_day_increments_id():
     assert ids["novel shape"] == "cand-20260714-1"
     assert ids["a different shape"] == "cand-20260714-2"
     assert mod.validate(twice) == []
+
+
+# ---------------------------------------------------------------------------
+# step-13: RED (§8.3 never-delete) — NeverDeleteError + assert_no_deletion
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("key", ["delete", "remove", "retract"])
+def test_apply_coding_record_raises_on_top_level_removal_directive(key):
+    codebook = _codebook_with_entry_a()
+    original = copy.deepcopy(codebook)
+    record = _match_record()
+    record[key] = ["entry-a"]
+
+    with pytest.raises(mod.NeverDeleteError):
+        mod.apply_coding_record(codebook, record)
+
+    assert codebook == original  # input untouched
+
+
+def test_apply_coding_record_raises_on_match_delete_action():
+    codebook = _codebook_with_entry_a()
+    original = copy.deepcopy(codebook)
+    record = _match_record()
+    record["matches"][0]["action"] = "delete"
+
+    with pytest.raises(mod.NeverDeleteError):
+        mod.apply_coding_record(codebook, record)
+
+    assert codebook == original
+
+
+def test_assert_no_deletion_raises_when_entry_missing():
+    before = _codebook_with_entry_a()
+    after = copy.deepcopy(before)
+    after["entries"] = []
+
+    with pytest.raises(mod.NeverDeleteError):
+        mod.assert_no_deletion(before, after)
+
+
+def test_assert_no_deletion_raises_when_sighting_shrinks():
+    before = _codebook_with_entry_a()
+    before["entries"][0]["sightings"] = [
+        {
+            "date": "2026-07-14",
+            "project": "dark_factory",
+            "session": "sess-1",
+            "origin_phase": "implement",
+            "manifested_phase": "merge",
+        }
+    ]
+    after = copy.deepcopy(before)
+    after["entries"][0]["sightings"] = []
+
+    with pytest.raises(mod.NeverDeleteError):
+        mod.assert_no_deletion(before, after)
+
+
+def test_assert_no_deletion_allows_growth():
+    before = _codebook_with_entry_a()
+    before["entries"][0]["sightings"] = [
+        {
+            "date": "2026-07-14",
+            "project": "dark_factory",
+            "session": "sess-1",
+            "origin_phase": "implement",
+            "manifested_phase": "merge",
+        }
+    ]
+    after = copy.deepcopy(before)
+    after["entries"][0]["sightings"].append(
+        {
+            "date": "2026-07-15",
+            "project": "dark_factory",
+            "session": "sess-2",
+            "origin_phase": "implement",
+            "manifested_phase": "merge",
+        }
+    )
+
+    mod.assert_no_deletion(before, after)  # must not raise
+
+
+def test_assert_no_deletion_allows_retirement_via_status_change():
+    before = _codebook_with_entry_a()
+    after = copy.deepcopy(before)
+    after["entries"][0]["status"] = "retired"
+
+    mod.assert_no_deletion(before, after)  # must not raise
+
+    assert after["entries"][0]["status"] == "retired"
+    assert len(after["entries"]) == 1
+    assert mod.validate(after) == []
