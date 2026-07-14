@@ -9874,6 +9874,89 @@ class TestSeedWarmLaneTakesLaneLock:
 
 
 # ---------------------------------------------------------------------------
+# Task 2599 amendment — the bounded-wait timeout branch (rc=124) added by
+# _seed_warm_lane's "Bounded wait, not unbounded" docstring note is not
+# exercised by TestSeedWarmLaneTakesLaneLock above: both of its tests
+# release the externally-held lock after ~0.3s, well inside the real 30s
+# bound, so they only ever prove the block-then-succeed path. This closes
+# that gap by monkeypatching the wait down to a small value and holding the
+# lock past it, forcing the timeout branch itself.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSeedWarmLaneLockTimeout:
+    """Pins the bounded-wait timeout path (task 2599 amendment).
+
+    ``_seed_warm_lane``'s outer ``<lane_dir>.lock`` flock -x is acquired
+    with ``-w _SEED_WARM_LANE_LOCK_WAIT_SECS -E _SEED_WARM_LANE_LOCK_TIMEOUT_RC``
+    (see its "Bounded wait, not unbounded" docstring note), not a plain
+    unbounded wait, so a live-but-wedged holder must fail closed with
+    rc=124 once the bound elapses rather than stalling the
+    latency-sensitive acquire path forever. A regression that dropped the
+    ``-w``/``-E`` args (reverting to an unbounded ``flock -x``) or
+    mishandled the 124 rc would pass every other lane-lock test in this
+    file and only be caught here.
+    """
+
+    async def test_lock_held_past_bound_returns_124_and_skips_script(
+        self, git_ops: GitOps, git_repo: Path, monkeypatch, caplog,
+    ):
+        from orchestrator import git_ops as git_ops_mod
+
+        # Shrink the bound from the real 30s so the test doesn't have to
+        # wait that long — _SEED_WARM_LANE_LOCK_WAIT_SECS is a plain module
+        # constant with no env override (by design — see its docstring), so
+        # monkeypatching the module attribute is the only way to shorten it.
+        monkeypatch.setattr(git_ops_mod, '_SEED_WARM_LANE_LOCK_WAIT_SECS', 0.5)
+
+        lane = git_repo / '_lane-0'
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True)
+        marker = lane / 'seeded.marker'
+        script = scripts_dir / 'seed-warm-lane.sh'
+        script.write_text(
+            f'#!/usr/bin/env bash\nset -euo pipefail\necho seeded > {marker}\nexit 0\n'
+        )
+        script.chmod(0o755)
+
+        # Hold <lane_dir>.lock from the test process for LONGER than the
+        # monkeypatched 0.5s bound, so the outer flock -w must genuinely
+        # time out rather than eventually acquire it.
+        lock_path = Path(f'{lane}.lock')
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+                rc = await asyncio.wait_for(
+                    git_ops._seed_warm_lane(lane, '--fresh-checkout'), 10,
+                )
+
+            assert rc == 124, (
+                'a lane lock held past the bounded wait must surface as '
+                'rc=124 (_SEED_WARM_LANE_LOCK_TIMEOUT_RC) — a regression '
+                'that dropped the -w/-E args (reverting to an unbounded '
+                'flock -x) would instead hang until the '
+                'asyncio.wait_for(10) bound fires this assertion'
+            )
+            assert not marker.exists(), (
+                'seed-warm-lane.sh must never have run — the outer '
+                'flock -x timed out before the script was even spawned'
+            )
+            timeout_warnings = [
+                r.getMessage() for r in caplog.records
+                if r.levelno >= logging.WARNING and 'timed out' in r.getMessage()
+            ]
+            assert timeout_warnings, (
+                'a lock-wait timeout must log its own fail-closed WARNING, '
+                'distinct from the generic non-zero-rc warning branch'
+            )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+
+# ---------------------------------------------------------------------------
 # Task 2599 (step-3) — end-to-end guard: _seed_warm_lane's new <lane_dir>.lock
 # and _run_thin_warm_lane's real script both agree on the SAME inode, so a
 # genuine concurrent seed really does make a racing thin exit 75 (benign
