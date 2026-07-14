@@ -13,6 +13,7 @@ test_ui_config.py.
 from __future__ import annotations
 
 import asyncio
+import shutil
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -1217,11 +1218,18 @@ class TestSpawnTreeEnterFocus:
         """Enter must resolve against the snapshot action_toggle_tree closed
         over when the tree was opened, not whatever self._records has been
         reassigned to by an intervening refresh_registry poll tick -- see
-        action_toggle_tree's and _focus_slug's docstrings. Reassigning
-        self._records to a set that no longer contains the highlighted child
-        (simulating that poll tick) must not change Enter's outcome: it
-        should still focus the original child's Display, exactly as if the
-        poll tick had never landed."""
+        action_toggle_tree's and _focus_slug's docstrings. The reassignment
+        is reproduced via a *real* refresh_registry() scan (not a hand-poked
+        app._records assignment): the child's on-disk record is removed
+        first, so the scan legitimately drops it and self._records
+        genuinely no longer contains the child by the time Enter is
+        pressed. This keeps the guard deterministic -- unlike overwriting
+        app._records directly, which the still-running poll_interval=0.05
+        background poller could silently re-populate from the (unchanged)
+        on-disk child before Enter lands, since nothing about that
+        alternate approach stops disk from still backing the child.
+        Enter must still focus the original child's Display, exactly as if
+        the poll tick had never landed."""
         from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
@@ -1255,8 +1263,15 @@ class TestSpawnTreeEnterFocus:
 
             # Simulate an intervening refresh_registry poll tick that
             # replaces self._records wholesale with a set no longer
-            # containing the highlighted child.
-            app._records = [parent]
+            # containing the highlighted child -- deterministically: the
+            # child's record.json is gone from disk, so this scan (like
+            # any later background poll tick) can only ever find parent-1.
+            shutil.rmtree(sr.record_path_for_slug('child-1', root=tmp_path).parent)
+            app.refresh_registry()
+            await pilot.pause()
+            # sanity: the simulated poll tick actually dropped the child,
+            # so the assertion below isn't vacuously true.
+            assert [r.session_slug for r in app._records] == ['parent-1']
 
             await pilot.press('enter')
             await pilot.pause()
