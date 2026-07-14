@@ -20,6 +20,7 @@ so the whole run is reproducible byte-for-byte.
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -44,6 +45,10 @@ _ACCEPTED_CANDIDATE = 'BASELINE: be concise. Also: cite line numbers explicitly.
 _NOOP_CANDIDATE = (
     'BASELINE: be concise. Also: cite line numbers explicitly, please. QUALITY_MARK=0.70'
 )
+# Strictly lower quality than _BASELINE_HEURISTICS — for the
+# rejects-a-worse-candidate case, where acceptance must fail on a clearly
+# negative paired delta rather than only on a positive-but-within-band one.
+_WORSE_CANDIDATE = 'BASELINE: be concise. Also: omit necessary detail. QUALITY_MARK=0.30'
 
 _QUALITY_RE = re.compile(r'QUALITY_MARK=([0-9.]+)')
 _JITTER_CYCLE = (0.03, -0.03)
@@ -211,3 +216,106 @@ class TestRunOptimizationLoopDryRun:
         assert run_optimization_loop is _engine_run_optimization_loop
         assert LoopResult is _EngineLoopResult
         assert isinstance(Scorer, type)
+
+
+class TestRunOptimizationLoopRejectsWorseCandidate:
+    @pytest.mark.asyncio
+    async def test_worse_candidate_is_rejected_and_nothing_accepted(self) -> None:
+        """A candidate scoring strictly WORSE than baseline must be rejected.
+
+        Also covers the "nothing was ever accepted" path: final_heuristics
+        must stay the baseline, the rejected buffer must hold the worse
+        candidate, and provenance.accept_delta must carry the NaN sentinel
+        rather than the misleading "accepted with zero delta" value 0.0.
+        """
+        spec = PromptSpec(
+            prompt_id='trial-prompt',
+            contract=_CONTRACT,
+            baseline_heuristics=_BASELINE_HEURISTICS,
+        )
+        corpus = _make_corpus(20)
+        scorer = _FakeScorer()
+
+        async def propose_fn(
+            current_heuristics: str,
+            scored_minibatch: list[Any],
+            rejected_buffer: list[str],
+            *,
+            max_edits: int,
+            optimizer_model: str,
+        ) -> str:
+            return _WORSE_CANDIDATE
+
+        result = await run_optimization_loop(
+            spec=spec,
+            corpus=corpus,
+            scorer=scorer,
+            executor_model=EXECUTOR_MODEL,
+            optimizer_model=OPTIMIZER_MODEL,
+            rollout_fn=_fake_rollout_fn,
+            propose_fn=propose_fn,
+            n_repeats=3,
+            max_steps=1,
+            split_seed=7,
+            minibatch_size=2,
+            git_sha='deadbeef',
+            date='2026-07-14',
+            harness_version='harness-test-v1',
+        )
+
+        assert len(result.accept_records) == 1
+        assert result.accept_records[0].accepted is False
+        # Strictly worse, not merely a positive delta caught within the band.
+        assert result.accept_records[0].paired_delta < 0
+
+        assert result.rejected_buffer == [_WORSE_CANDIDATE]
+        assert result.final_heuristics == _BASELINE_HEURISTICS
+
+        ArtifactProvenance.model_validate(result.provenance.model_dump())
+        assert math.isnan(result.provenance.accept_delta)
+
+
+class TestRunOptimizationLoopSmallCorpusGuard:
+    @pytest.mark.asyncio
+    async def test_empty_selection_split_raises_before_any_call(self) -> None:
+        """A corpus too small for a non-empty selection split fails fast and clearly.
+
+        n=5 with the default 2:1:7 ratios gives selection_n = 5 // 10 = 0;
+        without a guard this previously crashed deep inside
+        measure_repeatability_band -> paired_delta with a generic
+        'score lists must be non-empty' ValueError. It must instead raise a
+        clear, guard-level ValueError, and must do so before issuing any
+        rollout/propose call.
+        """
+        spec = PromptSpec(
+            prompt_id='trial-prompt',
+            contract=_CONTRACT,
+            baseline_heuristics=_BASELINE_HEURISTICS,
+        )
+        corpus = _make_corpus(5)
+        scorer = _FakeScorer()
+        calls: list[Any] = []
+
+        async def rollout_fn(composed_prompt: str, item: Any, model: str) -> str:
+            calls.append(item)
+            return await _fake_rollout_fn(composed_prompt, item, model)
+
+        with pytest.raises(ValueError, match='selection'):
+            await run_optimization_loop(
+                spec=spec,
+                corpus=corpus,
+                scorer=scorer,
+                executor_model=EXECUTOR_MODEL,
+                optimizer_model=OPTIMIZER_MODEL,
+                rollout_fn=rollout_fn,
+                propose_fn=_ScriptedProposeFn(),
+                n_repeats=3,
+                max_steps=2,
+                split_seed=7,
+                minibatch_size=2,
+                git_sha='deadbeef',
+                date='2026-07-14',
+                harness_version='harness-test-v1',
+            )
+
+        assert calls == []
