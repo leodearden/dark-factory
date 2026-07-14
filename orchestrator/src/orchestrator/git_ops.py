@@ -2039,7 +2039,12 @@ class GitOps:
                 # trains, main for non-train / order==0).  Critical for plan
                 # revalidation: the architect needs to see current file
                 # contents from the right base.
-                if await self.rebase_onto_main(worktree_path, onto=rebase_target):
+                #
+                # rebase_preserving_task_commits (not the bare primitive):
+                # guards against a silent branch-reset wipe (task 2403) — see
+                # its docstring.  A BranchResetError raised here propagates
+                # out of create_worktree to _drive()'s exception handler.
+                if await self.rebase_preserving_task_commits(worktree_path, onto=rebase_target):
                     # Re-capture base from worktree's own merge-base after the
                     # rebase completes.  merge-base from inside the worktree
                     # is race-immune to concurrent base-ref advances during
@@ -4158,8 +4163,13 @@ class GitOps:
         # 1. Commit WIP (returns None if nothing to commit — that's fine)
         await self.commit(lane_dir, 'chore: save WIP before requeue rebase')
 
-        # 2. Rebase onto main (best-effort; failure leaves the branch on old base)
-        rebased = await self.rebase_onto_main(lane_dir)
+        # 2. Rebase onto main (best-effort; failure leaves the branch on old
+        #    base).  rebase_preserving_task_commits (not the bare primitive):
+        #    guards against a silent branch-reset wipe (task 2403) — a
+        #    BranchResetError raised here propagates to the caller's
+        #    try/except-release wrapper (see docstring above) and on to
+        #    _drive()'s exception handler.
+        rebased = await self.rebase_preserving_task_commits(lane_dir)
         if not rebased:
             logger.info(
                 '_reuse_warm_lane: rebase failed for %s; continuing on old base', lane_dir,
