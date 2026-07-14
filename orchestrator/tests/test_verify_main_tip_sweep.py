@@ -23,9 +23,10 @@ Test coverage:
            test_run_main_tip_sweep_internalerror_on_retry_returns_none
   task 2507 step-5 (SECONDARY backstop): TestRunMainTipSweepEnoentOwnWorktree
            — an ENOENT result whose cause_hint names THIS sweep's own
-           tmp_path maps to the None sentinel (retry-next-tick, no drift);
-           a CONTROL test pins narrowness — an ENOENT naming a DIFFERENT
-           path is still real drift and passes through unchanged.
+           tmp_path maps to the None sentinel (retry-next-tick, no drift),
+           covered independently at BOTH the first-pass and the retry call
+           site; a CONTROL test pins narrowness — an ENOENT naming a
+           DIFFERENT path is still real drift and passes through unchanged.
 """
 
 from __future__ import annotations
@@ -686,6 +687,88 @@ class TestRunMainTipSweepEnoentOwnWorktree:
         assert remove_calls, (
             'git worktree remove --force must still run even when the '
             'own-worktree ENOENT backstop returns None (cleanup-in-finally guarantee)'
+        )
+
+    def test_enoent_naming_own_tmp_path_on_retry_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """Same backstop, but exercised on the RETRY call site
+        (verify.py:4217's ``_enoent_on_self(retry)``), not the first-pass
+        call site (verify.py:4179's ``_enoent_on_self(result)``) the sibling
+        test above covers.
+
+        The first-pass result is an ORDINARY (non-ENOENT) failure, so it
+        triggers the existing retry-on-flake path without ever tripping the
+        first-pass ENOENT check; only the retry result is an ENOENT naming
+        this sweep's own tmp_path. Without this test, a regression that
+        dropped or broke the retry-path branch specifically would ship
+        green, since the first-pass test short-circuits (returns None)
+        before any retry runs.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        captured: dict[str, str] = {}
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            if 'worktree' in cmd and 'add' in cmd:
+                detach_idx = cmd.index('--detach')
+                captured['tmp_path'] = cmd[detach_idx + 1]
+            return (0, '', '')
+
+        call_count = 0
+
+        async def _fake_full_verify(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Ordinary (non-ENOENT) first-pass failure: not in
+                # INFRA_TRANSIENT_CATEGORIES and _enoent_on_self(result) is
+                # False, so run_main_tip_sweep proceeds to the retry.
+                return FAILING_RESULT
+            return VerifyResult(
+                passed=False,
+                test_output='',
+                lint_output='',
+                type_output='',
+                summary='unknown_test_failure',
+                cause_hint=(
+                    f"[Errno 2] No such file or directory: "
+                    f"'{captured['tmp_path']}' | further traceback noise"
+                ),
+                category='unknown_test_failure',
+            )
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', side_effect=_fake_full_verify),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is None, (
+            f'Expected None (own-worktree ENOENT backstop on the RETRY path) '
+            f"when the retry's ENOENT cause_hint names this sweep's own "
+            f'tmp_path, got {result!r}'
+        )
+        assert call_count == 2, (
+            f'Expected exactly 2 calls to run_full_verification (first-pass '
+            f'+ retry) — this test is only meaningful if it actually '
+            f'reaches the retry-path branch, got {call_count}'
+        )
+        assert captured.get('tmp_path'), 'expected the fake add to have captured a tmp_path'
+
+        # Cleanup must still run even though we return None early.
+        remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
+        assert remove_calls, (
+            'git worktree remove --force must still run even when the '
+            'retry-path own-worktree ENOENT backstop returns None '
+            '(cleanup-in-finally guarantee)'
         )
 
     def test_enoent_naming_different_path_is_still_drift_passthrough(
