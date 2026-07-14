@@ -802,6 +802,24 @@ def test_build_task_row_prd_field_non_string_values_skipped():
     assert row_none['prd'] is None
 
 
+def test_build_task_row_prd_kwarg_overrides_metadata_coalescing():
+    """An explicit prd= kwarg wins verbatim over metadata coalescing.
+
+    Callers that already ran _coalesce_prd (e.g. the terminal-bucket loop, to
+    decide live-PRD membership) pass the result through instead of paying for
+    the split/strip work a second time; this proves the passthrough is used
+    rather than silently re-deriving from metadata.
+    """
+    task = {
+        'id': 1, 'title': 'x', 'status': 'pending',
+        'metadata': {'prd_path': 'plans/metadata-derived-prd.md'},
+    }
+    row = _build_task_row('p', task, 1, {}, 'p/T-1', prd='plans/explicit-prd.md')
+    assert row['prd'] == 'plans/explicit-prd.md', (
+        'an explicit prd kwarg must win over metadata coalescing'
+    )
+
+
 @pytest.mark.asyncio
 async def test_collect_active_tasks_includes_external_deps_with_unknown_sentinel(
     tmp_path, monkeypatch, dummy_client,
@@ -1676,3 +1694,86 @@ async def test_collect_active_tasks_no_provenance_terminal_row_stays_capped(
     assert 'noprd/T-2' in ids
     row = next(t for t in active if t['id'] == 'noprd/T-2')
     assert row['deps'] == []
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_live_prd_exemption_warns_when_unusually_large(
+    tmp_path, monkeypatch, dummy_client, caplog,
+):
+    """A pathological PRD with far more live terminal members than the warn
+    threshold logs a warning — but still emits every member; the exemption
+    never silently drops rows, it only gains defensive visibility for an
+    unusually large count.
+    """
+    import dashboard.data.active_tasks as active_tasks_mod
+
+    n = active_tasks_mod._LIVE_PRD_EXEMPTION_WARN_THRESHOLD + 5
+    done_tasks = [
+        {'id': 100 + i, 'title': f'huge-prd done member {i}', 'status': 'done',
+         'dependencies': [], 'metadata': {'prd_path': 'plans/huge-prd.md'},
+         'updated_at': f'2026-05-29T09:{i % 60:02d}:00+00:00'}
+        for i in range(n)
+    ]
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='hugeprd',
+        active_tasks=[
+            {'id': 1, 'title': 'active huge-prd member', 'status': 'in-progress',
+             'dependencies': [], 'metadata': {'prd_path': 'plans/huge-prd.md'}},
+        ],
+        done_tasks=done_tasks,
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    with caplog.at_level('WARNING', logger='dashboard.data.active_tasks'):
+        active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                                max_done_per_project=1)
+
+    done_rows = [t for t in active if t['status'] == 'done']
+    assert len(done_rows) == n, (
+        'the exemption must still emit every live member even when the count is huge'
+    )
+    assert any(
+        'live-PRD exemption' in rec.message and 'hugeprd' in rec.message
+        for rec in caplog.records
+    ), 'an unusually large exemption count should log a warning'
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_live_prd_exemption_no_warning_under_threshold(
+    tmp_path, monkeypatch, dummy_client, caplog,
+):
+    """A normal-sized live-PRD exemption (well under the threshold) logs nothing."""
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='smallprd',
+        active_tasks=[
+            {'id': 1, 'title': 'active small-prd member', 'status': 'in-progress',
+             'dependencies': [], 'metadata': {'prd_path': 'plans/small-prd.md'}},
+        ],
+        done_tasks=[
+            {'id': 2, 'title': 'small-prd done member', 'status': 'done',
+             'dependencies': [], 'metadata': {'prd_path': 'plans/small-prd.md'},
+             'updated_at': '2026-05-29T09:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    with caplog.at_level('WARNING', logger='dashboard.data.active_tasks'):
+        active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                                max_done_per_project=1)
+
+    assert any(t['id'] == 'smallprd/T-2' for t in active)
+    assert not any('live-PRD exemption' in rec.message for rec in caplog.records), (
+        'a small exemption count must not trigger the pathological-case warning'
+    )

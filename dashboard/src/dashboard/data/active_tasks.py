@@ -31,6 +31,7 @@ The bespoke FILE_LOCKS derivation has been removed; all lock display routes thro
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -41,6 +42,8 @@ from dashboard.data.orchestrator import _scan_worktrees
 from dashboard.data.tasks import fetch_external_statuses, fetch_statuses, fetch_tasks
 from dashboard.data.utils import resolve_now
 
+logger = logging.getLogger(__name__)
+
 _ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred', 'deferred'}
 
 # Maximum done / cancelled tasks to include per project when the caller opts in
@@ -48,6 +51,13 @@ _ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred', 'defe
 # Kept at module level so app.py can import them.
 _MAX_DONE_PER_PROJECT = 50
 _MAX_CANCELLED_PER_PROJECT = 50
+
+# Defensive-visibility threshold: the live-PRD terminal-member exemption (see
+# _shape_one_project) never drops rows — "all live members" is the contract,
+# not "up to N" — but a PRD with an unusually large number of live done/
+# cancelled members beyond the per-bucket cap logs a warning so a
+# pathological case is visible rather than silently inflating the payload.
+_LIVE_PRD_EXEMPTION_WARN_THRESHOLD = 200
 
 
 def _project_label(root: Path) -> str:
@@ -128,6 +138,8 @@ def _build_task_row(
     task_id: int,
     wt: dict,
     uid: str,
+    *,
+    prd: str | None = None,
 ) -> dict:
     """Build the common row fields shared by active and done task rows.
 
@@ -135,6 +147,14 @@ def _build_task_row(
     status.  Callers add status-specific fields afterwards:
     active rows add ``started`` (minutes) and ``deps``; done rows add
     ``started: 0``, ``deps: []``, and ``completed`` (ISO timestamp or '').
+
+    *prd*, if given, is used verbatim as the row's ``prd`` value instead of
+    re-deriving it from *task*'s metadata via ``_coalesce_prd`` — callers
+    that already computed it (e.g. the terminal-bucket loop, to decide
+    live-PRD membership) can pass it through to avoid doing the same
+    split/strip work twice. Omitting it (or passing ``None``, the actual
+    no-provenance value) falls back to deriving it from metadata, which is
+    safe because re-deriving a true ``None`` is idempotent.
     """
     metadata = task.get('metadata') or {}
     meta_files = list(metadata.get('files') or [])
@@ -164,7 +184,7 @@ def _build_task_row(
         'meta_files': meta_files,
         'train': train,
         'external_deps': external_deps,
-        'prd': _coalesce_prd(metadata),
+        'prd': prd if prd is not None else _coalesce_prd(metadata),
     }
 
 
@@ -275,21 +295,32 @@ async def _shape_one_project(
             reverse=True,
         )
         capped_ids = {t['id'] for t in bucket_tasks[:_bkt_cap]}
+        exempted_count = 0
         for task in bucket_tasks:
             task_id = task['id']
             prd = _coalesce_prd(task.get('metadata') or {})
             is_live_member = prd is not None and prd in live_prds
-            if task_id not in capped_ids and not is_live_member:
+            beyond_cap = task_id not in capped_ids
+            if beyond_cap and not is_live_member:
                 continue
+            if beyond_cap:
+                exempted_count += 1
             uid = _task_uid(project, task_id)
             wt = worktrees.get(task_id) or {}
-            row = _build_task_row(project, task, task_id, wt, uid)
+            row = _build_task_row(project, task, task_id, wt, uid, prd=prd)
             # terminal rows: no meaningful start time; deps only for live-PRD
             # members (the terminal-member exemption), else unsurfaced.
             row['started'] = 0
             row['deps'] = _resolve_deps(task, by_id, project) if is_live_member else []
             row['completed'] = task.get('updated_at') or ''
             active.append(row)
+        if exempted_count > _LIVE_PRD_EXEMPTION_WARN_THRESHOLD:
+            logger.warning(
+                'project %s: live-PRD exemption emitted %d %s rows beyond the '
+                'cap (max=%d) — a PRD may have an unusually large number of '
+                'live terminal members',
+                project, exempted_count, _bkt_status, _bkt_cap,
+            )
 
     return active, False, done_count
 
