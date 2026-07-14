@@ -87,6 +87,65 @@ _FLOCK_ERROR_RE = re.compile(r'^flock:', re.MULTILINE)
 _TREE_SITTER_GENERATE_RE = re.compile(r'tree-sitter generate', re.MULTILINE)
 
 
+# ---------------------------------------------------------------------------
+# Tool-blind environmental pre-dispatch guard (task 2549) — host-
+# infrastructure conditions mean the same thing regardless of which tool's
+# command hit them (a full disk is a full disk whether cargo, pytest, or npx
+# emitted the line), so DISK_FULL/SEMAPHORE_TIMEOUT are classified in
+# `_classify_environmental` BEFORE any per-tool dispatch — mirroring the
+# `timed_out` -> `INFRA_TIMEOUT` guard's "the root cause is the environment,
+# not the command output" precedent (checked immediately after it, in
+# `classify_failure` below). Neither category belongs to any single tool's
+# table, so Invariant C1 ("a tool-T pattern lives only in tool-T's table")
+# does not apply here.
+# ---------------------------------------------------------------------------
+
+# ENOSPC markers reused VERBATIM from merge_queue._ENOSPC_MARKERS (single
+# grounded vocabulary shared with merge_queue's _verify_hit_enospc and
+# git_ops's disk-pressure detection) — do not invent new ENOSPC strings;
+# extend that constant instead if a new grounded sample appears. Matched
+# case-insensitively against the whole output, same as _verify_hit_enospc.
+_ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
+
+# Linker SIGBUS-on-full-disk (git_ops.py: "proceeding into an ENOSPC build
+# that SIGBUSes the linker") — a real secondary disk-full mode where the
+# human-visible failure is the linker's signal rather than a literal ENOSPC
+# string. Requires a linking/collect2 context TOGETHER WITH a signal-7/
+# SIGBUS/Bus-error token (both, not either) so a bare 'SIGBUS' mention out of
+# context (e.g. a test asserting on signal-handling behavior) cannot
+# false-positive into disk_full.
+_LINKER_CONTEXT_RE = re.compile(r'linking with|collect2', re.IGNORECASE)
+_LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE)
+
+# flock/semaphore slot-acquisition timeout — a lock/slot/semaphore token
+# co-occurring with a timeout token. Deliberately NARROWER than
+# _FLOCK_ERROR_RE ('^flock:') so a plain flock-contention error with no
+# timeout token (e.g. the golden 'flock: failed to acquire lock on
+# /var/lock/mylock') still falls through to FLOCK_ERROR unchanged.
+_LOCK_TOKEN_RE = re.compile(r'\b(?:flock|lock|slot|semaphore)\b', re.IGNORECASE)
+_TIMEOUT_TOKEN_RE = re.compile(r'\btimed?\s*out\b', re.IGNORECASE)
+
+
+def _classify_environmental(output: str) -> FailureCategory | None:
+    """Tool-blind host-infrastructure guard: DISK_FULL / SEMAPHORE_TIMEOUT.
+
+    Checked in ``classify_failure`` immediately after the ``timed_out`` ->
+    ``INFRA_TIMEOUT`` guard and before any per-tool dispatch — these
+    conditions are properties of the HOST, not of any one tool, so no
+    per-tool table is the right home for them. Returns ``None`` (the caller
+    proceeds to per-tool dispatch) when neither condition is grounded in
+    *output*.
+    """
+    lower = output.lower()
+    if any(marker in lower for marker in _ENOSPC_MARKERS):
+        return FailureCategory.DISK_FULL
+    if _LINKER_CONTEXT_RE.search(output) and _LINKER_SIGNAL_RE.search(output):
+        return FailureCategory.DISK_FULL
+    if _LOCK_TOKEN_RE.search(output) and _TIMEOUT_TOKEN_RE.search(output):
+        return FailureCategory.SEMAPHORE_TIMEOUT
+    return None
+
+
 def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> FailureCategory:
     """Classify a command failure into a ``FailureCategory``, dispatched by tool.
 
@@ -96,6 +155,12 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
     2. ``timed_out`` -> ``FailureCategory.INFRA_TIMEOUT`` (wins over any
        output pattern — the root cause is the wall-clock limit, not the
        command output)
+    3. ``_classify_environmental(output)`` -> ``FailureCategory.DISK_FULL``
+       or ``FailureCategory.SEMAPHORE_TIMEOUT`` when grounded in *output*
+       (wins over any per-tool output pattern for the same "root cause is
+       the environment, not the command output" reason as guard 2 — a host
+       condition like a full disk or a lock/semaphore-slot timeout is not a
+       property of any one tool).
 
     Then dispatches on *tool* to a per-tool classification table (Invariant
     C1: a tool-T pattern lives ONLY in tool-T's table, so a cargo token can
@@ -131,13 +196,16 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
     human log is unchanged by construction.
 
     CLOSED DOMAIN: the return value is always a ``FailureCategory`` member —
-    see that enum's docstring for the closed 12-value output domain its
+    see that enum's docstring for the closed 14-value output domain its
     ``CATEGORY_POLICY`` table enforces exhaustively at import time.
     """
     if rc == 0:
         return FailureCategory.PASSED
     if timed_out:
         return FailureCategory.INFRA_TIMEOUT
+    environmental_category = _classify_environmental(output)
+    if environmental_category is not None:
+        return environmental_category
 
     if tool is ToolKind.PYTEST:
         return _classify_pytest(output)
