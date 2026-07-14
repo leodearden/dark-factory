@@ -18,6 +18,7 @@ systemd ``legibility-trickle@.service`` template runs nightly, and what
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import subprocess
 import sys
@@ -38,6 +39,9 @@ if __name__ == '__main__':
 
 from legibility import digest, inventory, sampling  # noqa: E402
 from legibility.config import LegibilityConfig, load_config  # noqa: E402
+
+logger = logging.getLogger('legibility.nightly')
+
 
 # ---------------------------------------------------------------------------
 # resolve_config_path — map a bare project_id to its legibility.yaml
@@ -282,6 +286,78 @@ def _git_commit_docs_only(
         return GitCommitResult(ok=False, sha=None, stderr=stderr, attempts=attempt)
 
     return GitCommitResult(ok=False, sha=None, stderr=stderr, attempts=retries)
+
+
+# ---------------------------------------------------------------------------
+# escalation — fail-loud contract (PRD decision 8): best-effort escalate_info
+# ---------------------------------------------------------------------------
+
+_ESCALATION_TOOL_NAME = 'escalate_info'
+_ESCALATION_AGENT_ROLE = 'legibility-trickle'
+_ESCALATION_CATEGORY = 'infra_issue'
+_ESCALATION_SEVERITY = 'info'
+
+
+def _build_escalation_arguments(cfg: LegibilityConfig, summary: str, detail: str) -> dict:
+    """Build the ``escalate_info`` MCP tool arguments (PRD decision 8): a
+    synthetic ``task_id`` labels the trickle as the source since it is a
+    timer-driven agent, not a Taskmaster task."""
+    return {
+        'task_id': f'legibility-trickle-{cfg.project_id}',
+        'agent_role': _ESCALATION_AGENT_ROLE,
+        'category': _ESCALATION_CATEGORY,
+        'severity': _ESCALATION_SEVERITY,
+        'summary': summary,
+        'detail': detail,
+    }
+
+
+def _default_poster(url: str, envelope: dict) -> None:
+    """Post *envelope* to *url* via a real (lazily-imported) httpx POST.
+
+    ``httpx`` is imported lazily since it is not a ``scripts/`` dependency
+    -- mirrors ``census_trigger.default_status_fetcher``. Raises on any
+    network/HTTP failure; :func:`post_escalation` wraps this best-effort.
+    """
+    import httpx
+
+    response = httpx.post(url, json=envelope, timeout=10.0)
+    response.raise_for_status()
+
+
+def post_escalation(
+    cfg: LegibilityConfig, summary: str, detail: str, *, poster=None,
+) -> bool:
+    """Best-effort escalate_info POST for a fail-loud trigger (PRD decision
+    8): extractor crash, coder storm, or commit failure.
+
+    Posts an MCP ``tools/call`` JSON-RPC envelope for tool
+    ``escalate_info`` to ``http://localhost:<cfg.escalation_port>/mcp``
+    (via *poster*, default :func:`_default_poster`). NEVER raises: any
+    failure (poster exception, network error) is logged as a warning and
+    swallowed, returning False -- a down escalation server must not mask
+    the underlying failure, since the caller's non-zero exit code is the
+    authoritative loud signal regardless of whether this POST succeeded.
+    Returns True on a successful post.
+    """
+    poster_fn = poster if poster is not None else _default_poster
+    url = f'http://localhost:{cfg.escalation_port}/mcp'
+    arguments = _build_escalation_arguments(cfg, summary, detail)
+    envelope = {
+        'jsonrpc': '2.0',
+        'id': 1,
+        'method': 'tools/call',
+        'params': {'name': _ESCALATION_TOOL_NAME, 'arguments': arguments},
+    }
+    try:
+        poster_fn(url, envelope)
+        return True
+    except Exception as exc:  # noqa: BLE001 - best-effort, never propagate
+        logger.warning(
+            'legibility trickle: escalation post failed (best-effort, run '
+            'still exits non-zero): %s', exc,
+        )
+        return False
 
 
 if __name__ == '__main__':
