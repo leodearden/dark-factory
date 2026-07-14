@@ -1423,9 +1423,17 @@ def _spawn_main_health_probe(
     *,
     escalation_queue: Any = None,
     event_store: EventStore | None = None,
+    origin_is_local: bool = True,
 ) -> bool:
     """Fire-and-forget: spawn the deferred (off-critical-path) main-health
     classification for a post-merge-verify failure.
+
+    *origin_is_local* (task 2565) is forwarded unchanged into the spawned
+    :func:`_run_deferred_main_health_probe` coroutine — it only RECORDS
+    where the triggering post-merge verify ran (for the ``origin_host``/
+    ``probe_host`` telemetry pair); the probe itself always classifies
+    locally regardless of this value.  Defaults to ``True`` (local) so
+    every caller not yet threading the signal is treated as local.
 
     None-safe: no-ops when *handles* is ``None`` (mirrors
     :func:`_spawn_merge_verify_dry_run`'s ``handles is None`` guard) — every
@@ -1495,6 +1503,7 @@ def _spawn_main_health_probe(
                 git_ops, req, verify,
                 escalation_queue=escalation_queue, event_store=event_store,
                 auto_heal=handles.auto_heal,
+                origin_is_local=origin_is_local,
             ),
             name=task_name,
         )
