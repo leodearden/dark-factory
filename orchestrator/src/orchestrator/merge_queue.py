@@ -10470,24 +10470,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     ) -> None:
         """Worker-side auto-heal for a confirmed deferred main-health break (task 2564).
 
-        Mirrors ``TaskWorkflow._auto_heal_main_health``'s happy path (signal
-        a): record the attempt, halt the 'normal' lane, submit/fold the
-        dedup'd halt-owner escalation, register lane-halt ownership, and
-        spawn a HIGH-lane fix task.  Called from the deferred main-health
-        probe (:func:`_run_deferred_main_health_probe`, via the
-        ``auto_heal`` callback on :class:`_MainHealthProbeHandles`) once it
-        confirms a still-fresh pre-existing break — this is the ONLY
-        production path that can reach a main-health-red outcome, since the
-        provisional outcome returned to the caller is always task-fault (see
+        Mirrors ``TaskWorkflow._auto_heal_main_health`` in full: branch (d)
+        non-mechanical / no escalation_queue, branch (e) attempt-cap, branch
+        (idempotency) lane-already-halted, and the (a) happy path — record
+        the attempt, halt the 'normal' lane, submit/fold the dedup'd
+        halt-owner escalation, register lane-halt ownership, and spawn a
+        HIGH-lane fix task.  Called from the deferred main-health probe
+        (:func:`_run_deferred_main_health_probe`, via the ``auto_heal``
+        callback on :class:`_MainHealthProbeHandles`) once it confirms a
+        still-fresh pre-existing break — this is the ONLY production path
+        that can reach a main-health-red outcome, since the provisional
+        outcome returned to the caller is always task-fault (see
         :func:`_run_post_merge_verify`'s DEFERRED-mode docstring), so
         ``TaskWorkflow._auto_heal_main_health`` (which keys off
         ``MAIN_HEALTH_RED_REASON_PREFIX``) never fires for it.
 
-        task 2564 step-18: happy path ONLY.  The guard branches mirroring
-        ``TaskWorkflow._auto_heal_main_health``'s (d) non-mechanical, (e)
-        attempt-cap, and (idempotency) already-halted branches are added in
-        step-20 — until then this unconditionally records an attempt, halts,
-        and spawns.
+        Unlike ``TaskWorkflow._auto_heal_main_health`` there is no
+        ``merge_worker is None`` guard — ``self`` (the
+        :class:`SpeculativeMergeWorker`) already owns every auto-heal
+        primitive directly (``auto_heal_registry``, ``halt_lane``, etc.), so
+        that branch collapses into the non-mechanical / no-queue check.
         """
         # Local import — the SAME signature-keying authority
         # workflow._compute_merge_outcome_signature delegates to.  merge_queue
@@ -10497,15 +10499,45 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         category = outcome.failure_category or ''
         cause_hint = outcome.failure_cause_hint or ''
+
+        # Branch (d): non-mechanical, or no escalation_queue (cannot register
+        # a halt-owner → unhalt_lanes_owned_by can never match → the 'normal'
+        # lane would stay halted permanently → livelock).  Escalate-only, no
+        # halt/spawn.
+        if not is_auto_heal_eligible(category, cause_hint) or self._escalation_queue is None:
+            _file_main_health_escalation(self._escalation_queue, req, outcome)
+            return
+
         sig = RetryLedger.compute_merge_outcome_signature(
             category, cause_hint, outcome.reason,
         )
 
+        # Branch (e): attempt cap reached — genuine re-break after a prior
+        # heal.  Only fires when the lane is NOT currently halted; an
+        # in-flight auto-heal (lane already halted) is the idempotency
+        # branch below, not a re-break loop.
+        if (
+            self.auto_heal_registry.attempts(sig) >= MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
+            and not self.is_lane_halted('normal')
+        ):
+            _file_main_health_escalation(self._escalation_queue, req, outcome)
+            return
+
+        # Build and submit/fold the dedup'd halt-owner escalation — shared by
+        # both the idempotency branch and the happy path below.
         esc_id = _file_main_health_escalation(
             self._escalation_queue, req, outcome,
             suggested_action='main_health_auto_heal_in_flight',
         )
 
+        # Branch (idempotency): lane already halted → an auto-heal is already
+        # in flight; the escalation above folds into it and no second
+        # attempt/halt/owner/spawn is recorded.
+        if self.is_lane_halted('normal'):
+            return
+
+        # Branch (a): happy path — record attempt, halt lane, register
+        # owner, spawn fix.
         self.auto_heal_registry.record_attempt(sig)
         self.halt_lane(
             'normal',
