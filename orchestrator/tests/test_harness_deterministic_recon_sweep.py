@@ -23,7 +23,9 @@ This file adds a new, cross-cutting background sweep (mirroring
 This file covers:
   step-1:  test_config_defaults_deterministic_recon_sweep
   step-3:  TestDeterministicDeployHealthVerdict / TestRevalidateDeployHealth
-  step-5:  TestIsStrandedDeterministicShape
+  step-5:  TestDeterministicDeployStranded (ζ/task 2240: phase-based
+           classifier replacing the deleted stamp-archaeology
+           TestIsStrandedDeterministicShape)
   step-7:  TestRecoverStrandedDeterministicTask
   step-9:  TestRevalidateOpenDeterministicEscalation
   step-11: TestRunDeterministicReconSweep
@@ -51,10 +53,11 @@ from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_
 from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.deploy_state import DeployPhase
 from orchestrator.harness import (
     Harness,
     _deterministic_deploy_health_verdict,
-    _is_stranded_deterministic_shape,
+    _deterministic_deploy_stranded,
     _recon_inspect_unit,
 )
 
@@ -259,44 +262,75 @@ def _strand_metadata(
     return base
 
 
-class TestIsStrandedDeterministicShape:
-    """step-5: harness._is_stranded_deterministic_shape pure classifier."""
+class TestDeterministicDeployStranded:
+    """step-5 (ζ/task 2240): harness._deterministic_deploy_stranded — the
+    phase-based classifier replacing the deleted 4-stamp combinatorial
+    ``_is_stranded_deterministic_shape`` (DS-4). Because ζ writes
+    ``deploy_state.phase`` atomically with every stamp, the old shape
+    collapses to a single enum compare: phase == RAN.
+    """
 
-    def test_true_for_canonical_strand_shape(self) -> None:
-        assert _is_stranded_deterministic_shape(_strand_metadata()) is True
+    # --- phase-authoritative (deploy_state present) --------------------------
+
+    def test_true_when_phase_ran(self) -> None:
+        assert _deterministic_deploy_stranded(_strand_metadata(phase=DeployPhase.RAN)) is True
+
+    def test_false_when_phase_verified(self) -> None:
+        assert _deterministic_deploy_stranded(_strand_metadata(phase=DeployPhase.VERIFIED)) is False
+
+    def test_false_when_phase_scheduled(self) -> None:
+        assert _deterministic_deploy_stranded(_strand_metadata(phase=DeployPhase.SCHEDULED)) is False
+
+    def test_false_when_phase_escalated(self) -> None:
+        assert _deterministic_deploy_stranded(_strand_metadata(phase=DeployPhase.ESCALATED)) is False
+
+    def test_false_when_phase_done(self) -> None:
+        assert _deterministic_deploy_stranded(_strand_metadata(phase=DeployPhase.DONE)) is False
+
+    # --- backward-compat migration shim (no deploy_state at all) -------------
+
+    def test_true_for_legacy_shape_no_deploy_state(self) -> None:
+        """A deploy that began before ζ activated has before_done_ran_at
+        stamped but no deploy_state key at all — treated as a RAN-strand
+        (bounded, documented migration shim) so it isn't silently un-stranded
+        the moment ζ ships."""
+        metadata = _strand_metadata()
+        assert 'deploy_state' not in metadata
+        assert _deterministic_deploy_stranded(metadata) is True
+
+    def test_false_for_legacy_shape_when_before_done_ran_at_missing(self) -> None:
+        assert _deterministic_deploy_stranded(_strand_metadata(before_done_ran_at=None)) is False
+
+    # --- gating checks unaffected by the phase/stamp swap --------------------
 
     def test_false_when_task_kind_not_deterministic(self) -> None:
-        assert _is_stranded_deterministic_shape(_strand_metadata(task_kind='normal')) is False
-
-    def test_false_when_before_done_ran_at_missing(self) -> None:
-        assert _is_stranded_deterministic_shape(_strand_metadata(before_done_ran_at=None)) is False
-
-    def test_false_when_before_done_verified_at_present(self) -> None:
-        assert _is_stranded_deterministic_shape(
-            _strand_metadata(before_done_verified_at='2026-07-02T00:00:00+00:00')
-        ) is False
-
-    def test_false_when_gate_escalated_at_present(self) -> None:
-        assert _is_stranded_deterministic_shape(
-            _strand_metadata(gate_escalated_at='2026-07-02T00:00:00+00:00')
-        ) is False
-
-    def test_false_when_done_provenance_present(self) -> None:
-        assert _is_stranded_deterministic_shape(
-            _strand_metadata(done_provenance={'kind': 'deterministic-deploy'})
+        assert _deterministic_deploy_stranded(
+            _strand_metadata(phase=DeployPhase.RAN, task_kind='normal')
         ) is False
 
     def test_false_when_before_done_is_none(self) -> None:
-        assert _is_stranded_deterministic_shape(_strand_metadata(before_done=None)) is False
+        assert _deterministic_deploy_stranded(
+            _strand_metadata(phase=DeployPhase.RAN, before_done=None)
+        ) is False
 
     def test_false_when_before_done_lacks_target_unit(self) -> None:
-        assert _is_stranded_deterministic_shape(_strand_metadata(before_done={})) is False
+        assert _deterministic_deploy_stranded(
+            _strand_metadata(phase=DeployPhase.RAN, before_done={})
+        ) is False
 
     def test_false_for_empty_metadata(self) -> None:
-        assert _is_stranded_deterministic_shape({}) is False
+        assert _deterministic_deploy_stranded({}) is False
 
     def test_false_for_none_metadata(self) -> None:
-        assert _is_stranded_deterministic_shape(None) is False
+        assert _deterministic_deploy_stranded(None) is False
+
+
+def test_is_stranded_deterministic_shape_no_longer_exists() -> None:
+    """Grep-delete proof: the old stamp-archaeology classifier is gone from
+    orchestrator.harness — DS-4 collapses it to _deterministic_deploy_stranded."""
+    import orchestrator.harness as harness_module
+
+    assert not hasattr(harness_module, '_is_stranded_deterministic_shape')
 
 
 # ---------------------------------------------------------------------------
