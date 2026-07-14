@@ -725,14 +725,42 @@ def _parse_pi_output(
     else:
         output_text = ''
 
+    # spike Q1 (LOAD-BEARING): pi's `--mode json -p` exits 0 even on a hard
+    # API failure (401/400/out-of-quota) — the failure lives IN the stream
+    # as the terminal assistant message's stopReason=='error'/errorMessage,
+    # not the process exit code. Contrast _parse_codex_output, which leans
+    # on returncode==0 alone. Do NOT derive success from returncode alone.
+    error_message = terminal.get('errorMessage') if terminal is not None else None
+    is_error = (
+        terminal is None
+        or terminal.get('stopReason') == 'error'
+        or bool(error_message)
+    )
+    success = result.returncode == 0 and not is_error
+
+    if success:
+        return AgentResult(
+            success=True,
+            output=output_text,
+            cost_usd=native_cost,
+            duration_ms=result.duration_ms,
+            turns=turns,
+            session_id=session_id,
+            subtype='success',
+            stderr=result.stderr,
+            timed_out=result.timed_out,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+        )
+
     return AgentResult(
-        success=True,
-        output=output_text,
+        success=False,
+        output=error_message or output_text or 'pi agent reported an error',
         cost_usd=native_cost,
         duration_ms=result.duration_ms,
         turns=turns,
         session_id=session_id,
-        subtype='success',
+        subtype='error',
         stderr=result.stderr,
         timed_out=result.timed_out,
         input_tokens=total_input_tokens,
