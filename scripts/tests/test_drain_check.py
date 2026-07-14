@@ -7,6 +7,10 @@ step-1: pure classify(heartbeat, now, fresh_window) taxonomy -- idle / busy
 """
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import time
 from pathlib import Path
 
 from drain_check import classify, heartbeat_path, resolve_fleet_dir
@@ -15,6 +19,8 @@ FRESH_WINDOW = 120.0
 NOW = 1_000_000.0
 
 UNIT = "orchestrator-dark-factory.service"
+
+SCRIPT = Path(__file__).parent.parent / "drain_check.py"
 
 
 def _heartbeat(**overrides):
@@ -121,3 +127,148 @@ def test_default_fleet_dir_matches_orchestrator_fleet_heartbeat():
     import orchestrator.fleet_heartbeat as fleet_heartbeat
 
     assert drain_check.DEFAULT_FLEET_DIR == fleet_heartbeat.DEFAULT_FLEET_DIR
+
+
+# ---------------------------------------------------------------------------
+# step-5: CLI (argparse) tests -- drive via subprocess.run
+# ---------------------------------------------------------------------------
+
+def _write_raw_heartbeat(fleet_dir: Path, unit: str, **overrides):
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "unit": unit,
+        "merge_idle": True,
+        "depth": 0,
+        "queue_empty": True,
+        "ts_epoch": NOW,
+    }
+    payload.update(overrides)
+    (fleet_dir / f"{unit}.json").write_text(json.dumps(payload))
+    return payload
+
+
+def _run_cli(*args, env=None):
+    full_env = dict(os.environ)
+    if env:
+        full_env.update(env)
+    return subprocess.run(
+        ["python3", str(SCRIPT), *args],
+        env=full_env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def test_cli_prints_idle_for_fresh_merge_idle_heartbeat(tmp_path):
+    _write_raw_heartbeat(tmp_path, UNIT, merge_idle=True, ts_epoch=NOW)
+
+    result = _run_cli(
+        "--unit", UNIT,
+        "--fleet-dir", str(tmp_path),
+        "--fresh-window", str(FRESH_WINDOW),
+        "--now", str(NOW),
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.stdout.strip() == "idle"
+
+
+def test_cli_prints_busy_for_fresh_merge_idle_false_heartbeat(tmp_path):
+    _write_raw_heartbeat(tmp_path, UNIT, merge_idle=False, ts_epoch=NOW)
+
+    result = _run_cli(
+        "--unit", UNIT,
+        "--fleet-dir", str(tmp_path),
+        "--fresh-window", str(FRESH_WINDOW),
+        "--now", str(NOW),
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.stdout.strip() == "busy"
+
+
+def test_cli_prints_stale_for_old_heartbeat(tmp_path):
+    _write_raw_heartbeat(tmp_path, UNIT, merge_idle=True, ts_epoch=NOW - FRESH_WINDOW - 1)
+
+    result = _run_cli(
+        "--unit", UNIT,
+        "--fleet-dir", str(tmp_path),
+        "--fresh-window", str(FRESH_WINDOW),
+        "--now", str(NOW),
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.stdout.strip() == "stale"
+
+
+def test_cli_prints_absent_for_missing_heartbeat_file(tmp_path):
+    result = _run_cli(
+        "--unit", UNIT,
+        "--fleet-dir", str(tmp_path),
+        "--fresh-window", str(FRESH_WINDOW),
+        "--now", str(NOW),
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.stdout.strip() == "absent"
+
+
+def test_cli_fresh_window_defaults_to_120(tmp_path):
+    """Omitting --fresh-window falls back to 120 -- a 100s-old heartbeat
+    (< 120) must still read idle."""
+    _write_raw_heartbeat(tmp_path, UNIT, merge_idle=True, ts_epoch=NOW - 100)
+
+    result = _run_cli(
+        "--unit", UNIT,
+        "--fleet-dir", str(tmp_path),
+        "--now", str(NOW),
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.stdout.strip() == "idle"
+
+
+def test_cli_now_defaults_to_current_time_when_omitted(tmp_path):
+    """Omitting --now falls back to the real current time -- a heartbeat
+    written far in the past reads stale against a small fresh-window, and
+    one written right now reads idle."""
+    _write_raw_heartbeat(tmp_path, UNIT, merge_idle=True, ts_epoch=time.time() - 10_000)
+
+    stale_result = _run_cli(
+        "--unit", UNIT,
+        "--fleet-dir", str(tmp_path),
+        "--fresh-window", "5",
+    )
+    assert stale_result.returncode == 0, (
+        f"stdout={stale_result.stdout!r} stderr={stale_result.stderr!r}"
+    )
+    assert stale_result.stdout.strip() == "stale"
+
+    _write_raw_heartbeat(tmp_path, UNIT, merge_idle=True, ts_epoch=time.time())
+
+    idle_result = _run_cli(
+        "--unit", UNIT,
+        "--fleet-dir", str(tmp_path),
+        "--fresh-window", "60",
+    )
+    assert idle_result.returncode == 0, (
+        f"stdout={idle_result.stdout!r} stderr={idle_result.stderr!r}"
+    )
+    assert idle_result.stdout.strip() == "idle"
+
+
+def test_cli_fleet_dir_defaults_via_resolve_fleet_dir(tmp_path):
+    """Omitting --fleet-dir falls back to resolve_fleet_dir() -- honouring
+    ORCH_FLEET_DIR from the environment."""
+    _write_raw_heartbeat(tmp_path, UNIT, merge_idle=True, ts_epoch=NOW)
+
+    result = _run_cli(
+        "--unit", UNIT,
+        "--fresh-window", str(FRESH_WINDOW),
+        "--now", str(NOW),
+        env={"ORCH_FLEET_DIR": str(tmp_path)},
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.stdout.strip() == "idle"
