@@ -635,6 +635,27 @@ def _pi_tool_name(spec: str) -> str | None:
     return _PI_BUILTIN_TOOL_MAP.get(base, base.lower())
 
 
+def _parse_pi_output(
+    result: _SubprocessResult,
+    model: str,
+    prices: dict[str, Any] | None = None,
+) -> AgentResult:
+    """Parse pi's `--mode json` JSONL stream into AgentResult.
+
+    timed_out/duration_ms are propagated from *result* unchanged, exactly
+    like _parse_codex_output / _parse_gemini_output.
+    """
+    if not result.stdout.strip():
+        return AgentResult(
+            success=False,
+            output='Agent produced no output',
+            subtype='error_empty_output',
+            stderr=result.stderr,
+            timed_out=result.timed_out,
+        )
+    raise NotImplementedError  # fleshed out in a subsequent TDD step
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers (orchestrator-local, for non-Claude backends)
 # ---------------------------------------------------------------------------
