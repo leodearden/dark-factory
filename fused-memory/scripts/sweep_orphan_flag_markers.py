@@ -361,14 +361,19 @@ async def run(
     """Enumerate dead-weight markers and optionally delete them.
 
     The delete set is the id-deduplicated, order-preserving UNION of four
-    independent predicates (task 2596 restores the two age/terminal drains
+    automatic predicates (task 2596 restores the two age/terminal drains
     deleted by task 2228 W5-κ alongside the pre-existing orphan/taskless
-    ones — see module docstring):
+    ones — see module docstring) plus an optional targeted correction list:
         - ``find_orphan_markers``: missing/mismatched ``kind`` (task 1659).
         - ``find_taskless_markers``: missing/empty ``task_id`` (task 2108).
         - ``find_stale_markers``: ``created_at`` older than ``max_age_days``.
         - ``find_terminal_task_markers``: references only terminal tasks.
-    A member matched by more than one predicate is deleted exactly once.
+        - targeted correction: exact member ids named in ``args.delete_ids``
+          (task 2596), force-included regardless of the other predicates —
+          the deterministic lever for correcting known-mistagged records
+          (e.g. a numeric task_id that is still pending, or a comma-joined
+          composite id) that no automatic predicate can catch.
+    A member matched by more than one predicate/list is deleted exactly once.
 
     Args:
         args: argparse.Namespace (or SimpleNamespace) with at least:
@@ -376,6 +381,10 @@ async def run(
             - project_id (str): project to sweep
             - max_age_days (int, optional): forwarded to find_stale_markers
               (default 14 when absent).
+            - delete_ids (list[str], optional): exact marker ids to
+              force-delete regardless of age/terminal/orphan status
+              (default: none). An id absent from the enumerated members is
+              silently ignored.
         memory_service: Live (or mock) MemoryService instance.
         now: Reference "current time" for the age cutoff. Defaults to
             ``datetime.now(UTC)``; tests inject a fixed value.
@@ -389,9 +398,9 @@ async def run(
         JSON-serialisable report dict:
             - dry_run (bool)
             - before (dict with total_source and total_with_kind counts)
-            - orphan_count (int): size of the deduplicated union of all four
-              predicates — the actual number of records deleted (or that
-              would be deleted).
+            - orphan_count (int): size of the deduplicated union of all
+              predicates/lists — the actual number of records deleted (or
+              that would be deleted).
             - orphan_ids (list[str])
             - taskless_orphan_count (int): raw len(find_taskless_markers(...)).
               Overlaps with the kind-orphan predicate for members missing
@@ -401,6 +410,9 @@ async def run(
               classify_marker_task_id bucket — always all four keys
               ('numeric', 'fp_hash', 'comma_joined', 'null_or_invalid'),
               even when a bucket's count is 0.
+            - targeted_correction_ids (list[str]): the subset of
+              ``args.delete_ids`` actually found among the enumerated
+              members (the found-intersection, not the raw input list).
             - deleted (int, only when apply=True)
             - failed (list[str], only when apply=True)
             - after (dict with counts, only when apply=True)
@@ -409,6 +421,7 @@ async def run(
     now_dt: datetime = now if now is not None else datetime.now(UTC)
     terminal_ids: set[str] = terminal_task_ids if terminal_task_ids else set()
     max_age_days: int = getattr(args, 'max_age_days', 14)
+    delete_ids: set[str] = set(getattr(args, 'delete_ids', None) or [])
 
     # --- Before counts (deterministic Qdrant payload-filter, not semantic) ---
     source_filter = {'source': MARKER_SOURCE}
@@ -442,21 +455,29 @@ async def run(
     # task_id (find_taskless_markers, task 2108), age-stale
     # (find_stale_markers, task 2596 restoring task 1944), and
     # terminal-task-referenced (find_terminal_task_markers, task 2596
-    # restoring task 2103/2150). A member caught by more than one predicate
-    # is deleted exactly once.
+    # restoring task 2103/2150) — plus the targeted correction list
+    # (args.delete_ids, task 2596), which force-includes specific member ids
+    # regardless of what the automatic predicates decide. A member caught by
+    # more than one predicate/list is deleted exactly once.
     kind_orphans = find_orphan_markers(members)
     taskless = find_taskless_markers(members)
     stale = find_stale_markers(members, now_dt, max_age_days=max_age_days)
     terminal = find_terminal_task_markers(members, terminal_ids)
+    # Best-effort: an id in delete_ids that doesn't match any enumerated
+    # member is simply absent from `targeted` — never a crash.
+    targeted = [m for m in members if m['id'] in delete_ids]
 
     orphans: list[dict] = []
     seen_ids: set = set()
-    for m in (*kind_orphans, *taskless, *stale, *terminal):
+    for m in (*kind_orphans, *taskless, *stale, *terminal, *targeted):
         if m['id'] not in seen_ids:
             seen_ids.add(m['id'])
             orphans.append(m)
 
     orphan_ids = [o['id'] for o in orphans]
+    # The found-intersection of args.delete_ids with the enumerated members
+    # (not the raw input list) — order-preserving per `members`.
+    targeted_correction_ids = [m['id'] for m in targeted]
 
     # Per-bucket counts over the final union (task 2596): makes the sweep's
     # action observable by task_id shape without changing orphan_count's
@@ -481,6 +502,7 @@ async def run(
         'orphan_ids': orphan_ids,
         'taskless_orphan_count': len(taskless),
         'bucket_counts': bucket_counts,
+        'targeted_correction_ids': targeted_correction_ids,
     }
 
     if args.apply:
