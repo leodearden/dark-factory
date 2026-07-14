@@ -856,9 +856,10 @@ class TestCrossUnitBlockingEmptyBaselineFreshness:
         self, tmp_queue_dir: Path,
     ) -> None:
         """An activated-then-FAILED oneshot (monotonic advanced, but
-        ActiveState ended up 'failed') must not be reported fresh — the
-        ``ActiveState not in ('', 'failed')`` guard is the only new hole the
-        empty-baseline branch must close."""
+        ActiveState ended up 'failed') must not be reported fresh — 'failed'
+        is outside the ``_empty_baseline_fresh`` allowlist (``'active'``/
+        ``'inactive'``), which is the only new hole the empty-baseline
+        branch must close."""
         from orchestrator.proc_supervision import RestartDisposition
 
         await self._assert_not_deployed_and_escalates(
@@ -886,6 +887,27 @@ class TestCrossUnitBlockingEmptyBaselineFreshness:
                 'MainPID': 0,
                 'ActiveState': 'inactive',
                 'ActiveEnterTimestampMonotonic': 0,
+            }),
+            expected_disposition=RestartDisposition.VERIFY_FAILED,
+        )
+
+    async def test_empty_baseline_transient_active_state_is_verify_failed(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        """Amendment (task 2611 review): a mid-transition ActiveState
+        ('activating') with an advanced monotonic must not be reported
+        fresh — wiring-level guard that the live verify leg really delegates
+        to the shared _empty_baseline_fresh allowlist (only 'active'/
+        'inactive' are trusted), not a wider ('', 'failed') blocklist."""
+        from orchestrator.proc_supervision import RestartDisposition
+
+        await self._assert_not_deployed_and_escalates(
+            tmp_queue_dir,
+            task_id='task-304',
+            inspector=make_fake_inspector({
+                'MainPID': 0,
+                'ActiveState': 'activating',
+                'ActiveEnterTimestampMonotonic': 2000,
             }),
             expected_disposition=RestartDisposition.VERIFY_FAILED,
         )

@@ -19,6 +19,7 @@ from shared.deploy_state import VerifyBaseline
 from orchestrator.systemd_inspect import (
     _INSPECT_TIMEOUT_SECS,
     _deterministic_deploy_health_verdict,
+    _empty_baseline_fresh,
     inspect_systemd_unit,
 )
 
@@ -97,6 +98,52 @@ class TestInspectSystemdUnit:
 
         assert result['MainPID'] == 0
         assert isinstance(result['MainPID'], int)
+
+
+class TestEmptyBaselineFresh:
+    """_empty_baseline_fresh (task 2611) — the shared pure predicate used by
+    both _deterministic_deploy_health_verdict below (with an empty baseline)
+    and proc_supervision.RestartPlan._execute_cross_unit_blocking. Directly
+    unit-tests the allowlist contract so both call sites can rely on a single
+    source of truth instead of re-verifying it themselves (amendment: a
+    reviewer noted the blocklist-vs-allowlist distinction and the None
+    ActiveState hole matter enough to lock in explicitly)."""
+
+    def test_fresh_when_monotonic_advanced_and_active(self) -> None:
+        assert _empty_baseline_fresh(0, 500, 'active') is True
+
+    def test_fresh_when_monotonic_advanced_and_inactive(self) -> None:
+        """A plain Type=oneshot service (no RemainAfterExit) settles back to
+        'inactive' after a successful run — this must count as fresh."""
+        assert _empty_baseline_fresh(0, 500, 'inactive') is True
+
+    def test_not_fresh_when_monotonic_not_advanced(self) -> None:
+        assert _empty_baseline_fresh(500, 500, 'active') is False
+
+    def test_not_fresh_when_monotonic_regressed(self) -> None:
+        assert _empty_baseline_fresh(500, 100, 'active') is False
+
+    def test_not_fresh_when_failed(self) -> None:
+        assert _empty_baseline_fresh(0, 500, 'failed') is False
+
+    def test_not_fresh_when_wedged_sentinel(self) -> None:
+        assert _empty_baseline_fresh(0, 500, '') is False
+
+    def test_not_fresh_when_active_state_missing(self) -> None:
+        """A missing ActiveState key (surfaced as None by dict.get) must be
+        treated conservatively as unconfirmed, not waved through by an
+        accidental `None not in (...)` blocklist gap."""
+        assert _empty_baseline_fresh(0, 500, None) is False
+
+    @pytest.mark.parametrize('transient_state', ['activating', 'deactivating', 'reloading'])
+    def test_not_fresh_when_active_state_transient(self, transient_state: str) -> None:
+        """A mid-transition ActiveState must not be reported fresh even if
+        the activation clock has already advanced (e.g. a race mid-restart)
+        — only the terminal 'active'/'inactive' states are trusted."""
+        assert _empty_baseline_fresh(0, 500, transient_state) is False
+
+    def test_not_fresh_when_live_monotonic_not_int(self) -> None:
+        assert _empty_baseline_fresh(0, None, 'active') is False
 
 
 class TestDeterministicDeployHealthVerdict:
@@ -217,6 +264,29 @@ class TestDeterministicDeployHealthVerdict:
         result = {
             'MainPID': 0, 'ActiveState': 'inactive',
             'ActiveEnterTimestampMonotonic': 0,
+        }
+        baseline = {'active_enter_timestamp_monotonic': 0, 'main_pid': 0}
+        assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'unconfirmed'
+
+    def test_unconfirmed_with_empty_baseline_when_active_state_transient(self) -> None:
+        """Amendment (task 2611 review): a mid-transition ActiveState
+        ('activating') with an advanced monotonic must not read 'healthy' —
+        wiring-level guard that the classifier really delegates to
+        _empty_baseline_fresh's allowlist rather than a wider blocklist."""
+        result = {
+            'MainPID': 0, 'ActiveState': 'activating',
+            'ActiveEnterTimestampMonotonic': 500,
+        }
+        baseline = {'active_enter_timestamp_monotonic': 0, 'main_pid': 0}
+        assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'unconfirmed'
+
+    def test_unconfirmed_with_empty_baseline_when_active_state_missing(self) -> None:
+        """Amendment (task 2611 review): a malformed/partial inspect result
+        missing the ActiveState key entirely must read 'unconfirmed', not
+        slip through a `None not in (...)` blocklist gap."""
+        result = {
+            'MainPID': 0,
+            'ActiveEnterTimestampMonotonic': 500,
         }
         baseline = {'active_enter_timestamp_monotonic': 0, 'main_pid': 0}
         assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'unconfirmed'
