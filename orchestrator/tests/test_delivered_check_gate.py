@@ -826,6 +826,40 @@ class TestComputeDeliveredCheckCache:
         assert ('20', 'sha1') not in scheduler._delivered_check_cache
         assert ('20', 'sha2') in scheduler._delivered_check_cache
 
+    # --- (h) cached-False dep still holds + emits detail on every sweep ----
+
+    @pytest.mark.asyncio
+    async def test_cached_false_dep_emits_hold_on_every_sweep(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Mirrors (f) ``test_cache_hit_does_not_reinvoke_runner`` but with a
+        FAILED check: a dep that failed on a prior tick and is now served
+        from the ``(dep, sha)`` cache-hit branch must STILL emit a hold
+        event with a meaningful (non-``None``) detail on every held tick —
+        not just the first, uncached tick."""
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert first == {'20': False}
+        assert second == {'20': False}
+        assert calls == ['cap-one'], 'only ONE invocation total — the 2nd sweep is a cache hit'
+        held = self._held_events(scheduler)
+        assert len(held) == 2, 'delivered_check_gate_held must fire on EVERY held tick'
+        assert scheduler._streak_delivered_hold.value('10') == 2
+        for _evt, data in held:
+            assert data['task_id'] == '10'
+            assert data['data']['detail'] == {
+                'name': 'cap-one', 'dep_id': '20', 'main_sha': 'sha1', 'kind': 'grep',
+            }
+
 
 # ---------------------------------------------------------------------------
 # TestAcquireNextDeliveredGate (task 2580 — step-17 RED / step-18 GREEN)
