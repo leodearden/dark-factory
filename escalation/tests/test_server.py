@@ -3640,7 +3640,7 @@ class TestMergeStatus:
                 base_sha='base', speculative=False,
             )
             if verify_phase in ('merging',):
-                worker._inflight_req = req
+                worker._register_item(req, initial=ItemLifecycleState.MERGING)
             elif verify_phase == 'awaiting_verify':
                 await worker._verifier_queue.put(item)
             else:
