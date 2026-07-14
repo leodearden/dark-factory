@@ -292,8 +292,9 @@ class TestProbeModelsTargetSet:
 class TestProbeModelsStatusMappingAndDispatch:
     """Per-account x per-model status uses classify_invocation's outcome --
     OK->available, ModelNotFound->unavailable, AuthFailed->auth_error,
-    CapHit->capped -- and invoke_fn is dispatched accounts x models times
-    with the right model and resolved token."""
+    CapHit->capped, else (a classified but otherwise-unrecognized Failure)
+    ->error -- and invoke_fn is dispatched accounts x models times with the
+    right model and resolved token."""
 
     def test_status_mapping_and_call_count_and_arguments(self):
         accounts = [
@@ -316,6 +317,13 @@ class TestProbeModelsStatusMappingAndDispatch:
                 success=False,
                 output="You've hit your usage limit. Your plan resets in 3h.",
             ),
+            # Classifies to Failure(kind='unclassified') -- not auth, not a
+            # 404/marker model-not-found, not a cap/near-cap prefix, not a
+            # CliLocalError marker, not a timed-out wedge -- so it exercises
+            # classify_probe_outcome's generic 'error' catch-all branch.
+            (FABLE_CANDIDATE_MODEL, 'tok-y'): AgentResult(
+                success=False, output='something unexpected went wrong',
+            ),
         }
         cli = _ScriptedProbeCli(overrides)
 
@@ -330,7 +338,7 @@ class TestProbeModelsStatusMappingAndDispatch:
         assert report.accounts['max-x'][FABLE_CANDIDATE_MODEL] == 'available'
         assert report.accounts['max-y']['haiku'] == 'auth_error'
         assert report.accounts['max-y']['sonnet'] == 'capped'
-        assert report.accounts['max-y'][FABLE_CANDIDATE_MODEL] == 'available'
+        assert report.accounts['max-y'][FABLE_CANDIDATE_MODEL] == 'error'
 
         # accounts (2) x models (haiku, sonnet, claude-fable-5 = 3) == 6.
         assert len(cli.calls) == 6
