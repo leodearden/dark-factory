@@ -27,10 +27,12 @@ from fused_memory.reconciliation.flag_dedup import (
     compute_content_fingerprint_signature,
     compute_flag_signature,
     dedup_flags,
+    filter_already_tracked_systemic_patterns,
     filter_false_absence_flags,
     filter_stale_count_snapshot_corrections,
     filter_terminal_metadata_flags,
 )
+from fused_memory.reconciliation.policies import DARK_FACTORY_PROJECT_ID
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_pool_map import (
@@ -250,6 +252,29 @@ class MemoryConsolidator(BaseStage):
                 project_root=self.project_root,
                 flags=report.items_flagged,
             )
+            # ── Already-tracked systemic-pattern guard (task-2416): drop ──────────
+            # systemic_pattern "never tracked" findings BEFORE dedup_flags so a
+            # dropped finding never writes a stage1 flag marker.  Hardens against
+            # the e61b38f9/1938 false-positive incident: Stage 1 asserted an idea
+            # was never converted to a tracked task despite a done dark_factory
+            # task already implementing it (which spawned duplicate task 2412).
+            # dark_factory's project_root is resolved from known_projects (the
+            # harness cross-project routing map) rather than a hardcoded path, so
+            # this naturally no-ops when dark_factory is not a registered project.
+            # Uses get_tasks(statuses=['done']) rather than the semantic
+            # search_tasks named in the task description: search_tasks lives only
+            # on TaskInterceptor/the MCP wrapper, not on TaskBackendProtocol, so it
+            # is unreachable from self.taskmaster (a raw SqliteTaskBackend) here —
+            # see design_decisions in .task/plan.json for the full rationale.
+            _before_already_tracked_filter = len(report.items_flagged)
+            report.items_flagged = await filter_already_tracked_systemic_patterns(
+                taskmaster=self.taskmaster,
+                dark_factory_root=self.known_projects.get(DARK_FACTORY_PROJECT_ID),
+                flags=report.items_flagged,
+            )
+            report.stats['systemic_pattern_already_tracked_dropped'] = (
+                _before_already_tracked_filter - len(report.items_flagged)
+            )
             # Snapshot immediately before dedup_flags, which internally applies the
             # suppression gate (filter_suppressed) as its first step, so suppression
             # drops can be isolated below and excluded from acknowledgment.
@@ -294,8 +319,9 @@ class MemoryConsolidator(BaseStage):
 
             # ── Flag-marker acknowledgment (task-2029 scenario a) ──────────────────
             # Flags DROPPED anywhere in the chain above (terminal task, false-absence,
-            # or stale-snapshot correction) have a moot requested action; reclaim any
-            # persisted stage1_flag_marker for them best-effort.  Computed as a
+            # stale-snapshot correction, or already-tracked systemic-pattern) have a
+            # moot requested action; reclaim any persisted stage1_flag_marker for them
+            # best-effort.  Computed as a
             # signature diff against the survivors rather than threading a "dropped"
             # list through each filter, so none of the filters' contracts change.
             # suppressed_signatures (computed above) is explicitly subtracted out —

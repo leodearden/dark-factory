@@ -2590,3 +2590,153 @@ class TestDegenerateTaskNodeSweepGuards:
 # TestMemoryConsolidatorDeterministicCycleSummaryWrite above, which covers the
 # replacement behavior (including the remediation-skip case).
 # ---------------------------------------------------------------------------
+
+
+class TestAlreadyTrackedSystemicPatternWiring:
+    """MemoryConsolidator.run() must apply filter_already_tracked_systemic_patterns
+    to items_flagged (task 2416), dropping a systemic_pattern 'never tracked'
+    finding when a done dark_factory task already covers the idea, and
+    surfacing report.stats['systemic_pattern_already_tracked_dropped'].
+
+    Hardens against the e61b38f9/1938 false-positive incident: a finding
+    claimed the 'diff project_status_correction cache vs live get_statuses
+    every cycle' idea was never tracked, despite dark_factory task 1938
+    (done, merged 2026-07-01) already implementing it — spawning duplicate
+    dark_factory task 2412.
+
+    RED until step-10 wires filter_already_tracked_systemic_patterns into
+    run() and sets the stat.
+    """
+
+    def _make_never_tracked_flag(self) -> dict:
+        return {
+            'task_id': None,
+            'category': 'systemic_pattern',
+            'flag_type': 'systemic_pattern',
+            'description': (
+                'This systemic pattern was never converted to a tracked task: diff '
+                'the project_status_correction cache against live get_statuses every '
+                'cycle to catch drift.'
+            ),
+            'suggested_action': (
+                'File a task to diff the cache against live status each cycle.'
+            ),
+        }
+
+    def _make_matching_done_task(self) -> dict:
+        return {
+            'id': '1938',
+            'status': 'done',
+            'title': (
+                'Diff project_status_correction cache against live get_statuses '
+                'every cycle'
+            ),
+            'description': (
+                'Implemented a periodic diff of the cached project_status_correction '
+                'value against a live get_statuses call each cycle to catch drift and '
+                'correct stale cache entries before they propagate.'
+            ),
+        }
+
+    @pytest.mark.asyncio
+    async def test_already_tracked_finding_dropped_and_benign_survives(self):
+        """The e61b38f9/1938 false finding is dropped; benign finding survives."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.known_projects = {'dark_factory': '/df'}
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        stage.taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [self._make_matching_done_task()],
+        })
+
+        never_tracked_flag = self._make_never_tracked_flag()
+        benign_flag = {
+            'task_id': '100',
+            'flag_type': 'missing_deliverable',
+            'description': 'Task 100 has no deliverable',
+        }
+        all_flags = [never_tracked_flag, benign_flag]
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=list(all_flags),
+            stats={},
+        )
+        # dedup_flags passes all flags through unchanged so we can inspect
+        # the already-tracked filter's effect directly.
+        dedup_mock = AsyncMock(side_effect=lambda **kw: kw['flags'])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-2416-step9',
+            )
+
+        assert never_tracked_flag not in report.items_flagged, (
+            'systemic_pattern never-tracked finding must be DROPPED when done '
+            "dark_factory task 1938 already covers the idea; got "
+            f'items_flagged={report.items_flagged!r}. '
+            'RED: filter_already_tracked_systemic_patterns is not yet wired into run().'
+        )
+        assert benign_flag in report.items_flagged, (
+            f'Benign missing_deliverable flag must survive; got {report.items_flagged!r}'
+        )
+        assert report.stats.get('systemic_pattern_already_tracked_dropped') == 1, (
+            "run() must set report.stats['systemic_pattern_already_tracked_dropped'] = 1 "
+            f'when one already-tracked finding is dropped; got stats={report.stats!r}. '
+            'RED: stat not yet surfaced.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_finding_kept_when_dark_factory_not_a_known_project(self):
+        """No-op guard: finding survives when known_projects lacks 'dark_factory'.
+
+        Exercises the fail-open path when the harness never registers
+        dark_factory (e.g. a single-project test/deployment harness) — the
+        resolved dark_factory_root is None, so the filter must degrade to a
+        pass-through rather than erroring or dropping anything.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.known_projects = {}  # dark_factory not registered
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        stage.taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [self._make_matching_done_task()],
+        })
+
+        never_tracked_flag = self._make_never_tracked_flag()
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[never_tracked_flag],
+            stats={},
+        )
+        dedup_mock = AsyncMock(side_effect=lambda **kw: kw['flags'])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-2416-step9-noop',
+            )
+
+        assert never_tracked_flag in report.items_flagged, (
+            'Finding must be KEPT when dark_factory is not in known_projects '
+            f'(no-op guard); got items_flagged={report.items_flagged!r}'
+        )

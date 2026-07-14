@@ -1571,6 +1571,266 @@ def confirm_task_absent(get_task_result: object) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Already-tracked systemic-pattern guard (task-2416)
+# --------------------------------------------------------------------------- #
+
+#: Fixed lexicon of phrases that assert an idea/pattern was never converted
+#: into a tracked task.  Case-insensitive substring match, mirroring
+#: _CORRECTION_LANGUAGE_SUBSTRINGS' fixed-lexicon approach.
+_NEVER_TRACKED_PHRASES: frozenset[str] = frozenset({
+    'never converted to a tracked task',
+    'was never converted to a task',
+    'never tracked',
+    'never filed as a task',
+    'no tracked task',
+})
+
+#: Small English + domain stopword set for _significant_terms.  The domain
+#: words (e.g. 'never', 'tracked', 'task', 'idea') are deliberately excluded
+#: from the key-term set because they are boilerplate from the never-tracked
+#: assertion wrapper itself, not part of the distinctive idea a candidate
+#: finding is about — keeping them would dilute coverage matching against an
+#: unrelated done task that happens to also mention "task".
+_STOPWORDS: frozenset[str] = frozenset({
+    # Common English stopwords.
+    'the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'on', 'at', 'for',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'this', 'that',
+    'these', 'those', 'with', 'as', 'by', 'from', 'it', 'its', 'into',
+    'over', 'than', 'then', 'not', 'no', 'but', 'if', 'so', 'do', 'does',
+    'has', 'have', 'had', 'will', 'would', 'should', 'could', 'can', 'may',
+    'about', 'each', 'every', 'any', 'all', 'more', 'most', 'such', 'via',
+    'once', 'again', 'also', 'out', 'up', 'down',
+    # Domain / boilerplate words from the never-tracked assertion wrapper.
+    'never', 'tracked', 'track', 'task', 'tasks', 'converted', 'convert',
+    'idea', 'pattern', 'systemic', 'filed', 'file', 'finding', 'findings',
+})
+
+#: Splits on runs of non-alphanumeric characters — underscore and punctuation
+#: are both treated as separators so identifier-style terms like
+#: 'project_status_correction' or 'get_statuses' split into their component
+#: words, which is what lets them overlap with a done task's prose title/
+#: description.
+_TERM_SPLIT_RE: re.Pattern[str] = re.compile(r'[^a-z0-9]+')
+
+
+def _asserts_never_tracked(text: str) -> bool:
+    """Return True iff *text* asserts that an idea/pattern was never tracked as a task.
+
+    Case-insensitive substring match against the fixed lexicon
+    :data:`_NEVER_TRACKED_PHRASES`, mirroring :func:`_has_correction_language`'s
+    fixed-lexicon substring approach.
+
+    Pure, sync, no I/O.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _NEVER_TRACKED_PHRASES)
+
+
+def _significant_terms(text: str) -> set[str]:
+    """Extract the distinctive lowercase key terms from *text*.
+
+    Lowercases *text*, splits on runs of non-alphanumeric characters (see
+    :data:`_TERM_SPLIT_RE`), then drops stopwords (:data:`_STOPWORDS`) and
+    tokens shorter than 3 characters.  Returns a deduped set — callers only
+    ever measure set overlap (coverage), never sequence.
+
+    Pure, sync, no I/O.
+    """
+    if not text:
+        return set()
+    tokens = _TERM_SPLIT_RE.split(text.lower())
+    return {t for t in tokens if len(t) >= 3 and t not in _STOPWORDS}
+
+
+def _is_systemic_pattern_candidate(flag: dict[str, Any]) -> bool:
+    """Return True iff *flag* is a never-tracked systemic_pattern candidate.
+
+    A flag qualifies iff its ``category`` OR ``flag_type`` is
+    ``'systemic_pattern'`` (LLM-authored flags may carry the finding kind
+    under either field — checking both is robust to shaping/naming drift,
+    mirroring ``STALE_METADATA_FLAG_TYPES``' both-spellings robustness) AND
+    its ``description`` asserts never-tracked language per
+    :func:`_asserts_never_tracked`.
+
+    Pure, sync, no I/O.
+    """
+    category = flag.get('category')
+    flag_type = flag.get('flag_type')
+    if category != 'systemic_pattern' and flag_type != 'systemic_pattern':
+        return False
+    return _asserts_never_tracked(flag.get('description') or '')
+
+
+async def filter_already_tracked_systemic_patterns(
+    taskmaster: Any,
+    dark_factory_root: str | None,
+    flags: list[dict[str, Any]],
+    *,
+    min_key_terms: int = 4,
+    match_coverage: float = 0.75,
+    min_task_term_precision: float = 0.2,
+) -> list[dict[str, Any]]:
+    """Drop systemic_pattern 'never tracked' findings already implemented by a done task.
+
+    Hardens against the e61b38f9/1938 false-positive incident: Stage 1 asserted
+    an idea ("diff project_status_correction cache vs live get_statuses every
+    cycle") was never converted to a tracked task, despite dark_factory task
+    1938 (done, merged 2026-07-01) already implementing it — the false finding
+    spawned duplicate dark_factory task 2412.
+
+    A flag is a CANDIDATE iff :func:`_is_systemic_pattern_candidate` returns
+    True for it.  Non-candidate flags always pass through unchanged, and when
+    there are ZERO candidates in the batch this returns immediately WITHOUT
+    issuing any ``get_tasks`` call at all.
+
+    A candidate whose :func:`_significant_terms` count is below
+    ``min_key_terms`` is KEPT unconditionally, with no match attempted —
+    too few distinctive terms to trust a coverage match.  Otherwise, fetches
+    done dark_factory tasks ONCE via ``taskmaster.get_tasks(dark_factory_root,
+    statuses=['done'])`` and precomputes each done task's key terms from
+    ``title`` + ``description`` (:func:`_significant_terms`).  A candidate is
+    DROPPED iff some done task's key terms cover at least ``match_coverage``
+    (fraction) of the candidate's own key terms (extracted from its
+    ``description``): ``|finding_terms ∩ task_terms| / |finding_terms|``,
+    AND that same task's own terms are not so broad that the overlap is
+    incidental — ``|finding_terms ∩ task_terms| / |task_terms|`` must also be
+    at least ``min_task_term_precision`` (default 0.2).  This precision floor
+    guards against a verbose, unrelated done task whose large title+
+    description happens to sweep up most of a narrow finding's key terms by
+    coincidence (reviewer_comprehensive, task 2416 amendment pass): such a
+    task's own term set is large relative to the overlap, so its precision is
+    low even when its coverage of the finding clears ``match_coverage``. Both
+    thresholds are evaluated per done task and maximised (by coverage) over
+    all *qualifying* done tasks.  Order-preserving: surviving flags keep their
+    original relative order.
+
+    **Done-only** (task 2412 cannot self-suppress its own duplicate finding):
+    ``statuses=['done']`` is passed explicitly, so a PENDING duplicate task
+    can never suppress the finding that motivated filing it — only already
+    *merged* work counts as "already tracked".
+
+    **Fail-open** in every direction, mirroring
+    :func:`filter_terminal_metadata_flags`'s drop-only-on-positive-
+    confirmation posture (losing a genuine systemic-pattern signal is worse
+    than one extra dedup cycle):
+
+    * A falsy ``taskmaster`` or ``dark_factory_root`` degrades to a no-op
+      ``list(flags)`` pass-through with no ``get_tasks`` call — e.g. a
+      harness/test that never registers dark_factory in ``known_projects``.
+    * A ``get_tasks`` exception (other than ``asyncio.CancelledError`` /
+      ``KeyboardInterrupt`` / ``SystemExit``, which re-raise) is logged and
+      treated as KEEP-all for this cycle.
+    * A malformed result (not a dict, or missing/empty ``'tasks'``) is
+      treated as zero done tasks — every candidate survives the matching
+      loop with coverage 0.
+
+    A structured ``logger.info('reconciliation.systemic_pattern_already_tracked_dropped',
+    ...)`` is emitted per dropped flag with the matched done task id and the
+    finding's key terms, mirroring the sibling filters' drop observability.
+
+    Args:
+        taskmaster: Object with an async ``get_tasks(project_root, *,
+            statuses=[...])`` method, typically ``self.taskmaster`` in
+            MemoryConsolidator.
+        dark_factory_root: dark_factory's project_root (resolved by the
+            caller from ``self.known_projects[DARK_FACTORY_PROJECT_ID]``).
+        flags: List of flag dicts from Stage 1 ``items_flagged``.
+        min_key_terms: Minimum distinct key terms a candidate must have
+            before a match is even attempted (default 4).
+        match_coverage: Minimum key-term coverage fraction required to drop a
+            candidate (default 0.75).
+        min_task_term_precision: Minimum fraction of a qualifying done task's
+            OWN key terms that must be part of the overlap (default 0.2) —
+            a precision floor that keeps a large, generic done-task
+            description from coincidentally outweighing a narrow finding's
+            coverage match.
+
+    Returns:
+        Filtered list with already-tracked systemic_pattern flags removed.
+    """
+    if not taskmaster or not dark_factory_root:
+        # Degrade to a no-op pass-through — mirrors filter_terminal_metadata_flags
+        # / filter_false_absence_flags (task 2416 step-8).
+        return list(flags)
+
+    candidate_positions: list[int] = []
+    candidate_terms: list[set[str]] = []
+    for i, flag in enumerate(flags):
+        if _is_systemic_pattern_candidate(flag):
+            candidate_positions.append(i)
+            candidate_terms.append(_significant_terms(flag.get('description') or ''))
+
+    if not candidate_positions:
+        # No candidates at all — skip the get_tasks call entirely, not just
+        # the matching loop below (scope guard, task 2416 step-6).
+        return list(flags)
+
+    try:
+        result = await taskmaster.get_tasks(dark_factory_root, statuses=['done'])
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        logger.info(
+            'reconciliation.systemic_pattern_already_tracked_get_tasks_error error=%s',
+            exc,
+        )
+        return list(flags)  # fail-open: KEEP all on lookup error
+
+    # Tolerate a malformed result (not a dict, or missing/empty 'tasks') —
+    # degrades to "zero done tasks", so every candidate KEEPS below.
+    done_tasks = result.get('tasks') if isinstance(result, dict) else None
+    done_tasks = done_tasks or []
+    done_tasks_with_terms = [
+        (
+            task,
+            _significant_terms(f"{task.get('title') or ''} {task.get('description') or ''}"),
+        )
+        for task in done_tasks
+    ]
+
+    drop_positions: set[int] = set()
+    for pos, finding_terms in zip(candidate_positions, candidate_terms, strict=True):
+        if len(finding_terms) < min_key_terms:
+            # Too few distinctive terms to trust a coverage match — KEEP
+            # without attempting a match (task 2416 step-6 min-term floor).
+            continue
+        matched = False
+        best_coverage = 0.0
+        best_task_id: Any = None
+        for task, task_terms in done_tasks_with_terms:
+            if not task_terms:
+                continue
+            overlap = len(finding_terms & task_terms)
+            coverage = overlap / len(finding_terms)
+            if coverage < match_coverage:
+                continue
+            # Precision floor: an overlap that clears match_coverage can still
+            # be incidental if the done task's own description is large and
+            # generic (reviewer_comprehensive, task 2416 amendment pass) — a
+            # qualifying task must also derive a meaningful share of its own
+            # terms from the overlap, not just happen to contain it somewhere
+            # in a much larger, unrelated body of text.
+            precision = overlap / len(task_terms)
+            if precision < min_task_term_precision:
+                continue
+            if not matched or coverage > best_coverage:
+                matched = True
+                best_coverage = coverage
+                best_task_id = task.get('id')
+        if matched:
+            drop_positions.add(pos)
+            logger.info(
+                'reconciliation.systemic_pattern_already_tracked_dropped '
+                'matched_task_id=%s coverage=%.2f finding_terms=%s',
+                best_task_id, best_coverage, sorted(finding_terms),
+            )
+
+    return [flag for i, flag in enumerate(flags) if i not in drop_positions]
+
+
+# --------------------------------------------------------------------------- #
 # Blocked-snapshot finding filter for Stage 3 (task-1840)
 # --------------------------------------------------------------------------- #
 
