@@ -318,6 +318,21 @@ class TestLoadWindowRows:
         metrics = compute_window_metrics(rows)
         assert metrics.cost_per_done_task == pytest.approx(0.0)
 
+    def test_missing_db_path_raises_instead_of_silently_creating(self, tmp_path: Path) -> None:
+        """load_window_rows must not silently CREATE an empty runs.db when
+        called directly on a nonexistent path (e.g. a library caller that
+        bypasses the CLI's `runs_db.is_file()` pre-flight check) -- that
+        would mask a misconfigured --runs-db/PROMPT_OPT_RUNS_DB path as an
+        innocuous empty-window result instead of failing loud. Opening
+        read-only (mode=ro) makes sqlite3 raise instead of auto-vivifying
+        the file (round-2 review finding #2)."""
+        missing_path = tmp_path / 'does-not-exist.db'
+        with pytest.raises(sqlite3.OperationalError):
+            load_window_rows(
+                missing_path, '2026-06-10T00:00:00+00:00', '2026-06-25T00:00:00+00:00', 'dark_factory',
+            )
+        assert not missing_path.exists(), 'read-only open must not auto-create the db file'
+
 
 class TestCompareWindows:
     def test_pass_when_all_metrics_within_tolerance(self) -> None:
@@ -497,11 +512,16 @@ class TestZeroDoneRowsVisibility:
     checks TOTAL row count, so a window can clear it while carrying ZERO
     done rows -- the three done-derived metrics then carry no real signal
     (cost_per_done_task incomparable; the cycle/attempt means fall back to
-    0.0) and the comparison quietly reduces to requeue_rate alone. This
-    does not itself change the pass/regress/insufficient_data verdict --
-    baseline_n_done/post_n_done are what let a caller (the CLI prints an
-    explicit NOTE) detect and flag the reduced-signal case instead of it
-    passing silently."""
+    0.0) and the per-metric comparison quietly reduces to requeue_rate
+    alone. Round-1 review left that case silently reachable as 'pass'
+    (mitigated only by a CLI-printed NOTE, invisible to an exit-code-driven
+    caller); round-2 review (finding #1) tightened this: compare_windows
+    now forces verdict=='regress' whenever the BASELINE had done rows but
+    post has NONE -- the worst-case deploy outcome (shipped and completed
+    nothing) must not read as a clean pass. baseline_n_done/post_n_done
+    still carry each window's done-row count through for display (the CLI
+    prints an explicit NOTE) even though the verdict itself is no longer
+    silent about this case."""
 
     def test_verdict_carries_done_counts_for_both_windows(self) -> None:
         baseline = WindowMetrics(
@@ -516,14 +536,14 @@ class TestZeroDoneRowsVisibility:
         assert verdict.baseline_n_done == 4
         assert verdict.post_n_done == 6
 
-    def test_enough_rows_zero_done_does_not_trip_insufficient_data_guard(self) -> None:
-        """Documents the current, deliberate scope of the min_samples
-        guard: it is row-count-only. A post window with >= min_samples
-        rows but 0 done rows (every task failed/requeued -- the deploy
-        completed NOTHING) still produces a verdict from requeue_rate
-        alone rather than 'insufficient_data', and can even read 'pass'
-        -- exactly the silent-masking risk baseline_n_done/post_n_done
-        exist to make visible."""
+    def test_enough_rows_zero_done_forces_regress_not_pass(self) -> None:
+        """A post window with >= min_samples rows but 0 done rows (every
+        task failed/requeued/blocked -- the deploy completed NOTHING)
+        must NOT read as 'pass' just because requeue_rate alone stayed
+        within tolerance: compare_windows forces 'regress' whenever the
+        baseline had done rows but post has none (round-2 review finding
+        #1) -- the CLI's exit code (and any automation keying on it) must
+        see this as a failure, not a silent success."""
         thresholds = _explicit_thresholds(min_samples=5)
         baseline = WindowMetrics(
             n_rows=10, n_done=10, cost_per_done_task=10.0, requeue_rate=0.1,
@@ -537,9 +557,93 @@ class TestZeroDoneRowsVisibility:
 
         assert verdict.post_n == 5  # clears the min_samples row-count guard
         assert verdict.post_n_done == 0  # ...but did zero real work
-        assert verdict.verdict == 'pass'  # the silent-masking risk, made visible via post_n_done
+        assert verdict.verdict == 'regress'  # forced -- no longer silently 'pass'
         cost_comparison = next(c for c in verdict.comparisons if c.metric == 'cost_per_done_task')
-        assert cost_comparison.regressed is False  # incomparable, never flagged
+        assert cost_comparison.regressed is False  # still incomparable at the per-metric level
+
+    def test_both_windows_zero_done_does_not_force_regress(self) -> None:
+        """The forced-regress rule (test above) is scoped to "baseline HAD
+        done rows but post has none" -- it must not fire when baseline
+        ALSO has zero done rows (e.g. a project that has never completed
+        anything): there is no established "used to complete tasks" signal
+        for post to have regressed away from, so the ordinary
+        per-metric-driven verdict applies unchanged."""
+        thresholds = _explicit_thresholds(min_samples=5)
+        baseline = WindowMetrics(
+            n_rows=5, n_done=0, cost_per_done_task=None, requeue_rate=0.0,
+            mean_review_cycles=0.0, mean_verify_attempts=0.0,
+        )
+        post = WindowMetrics(
+            n_rows=5, n_done=0, cost_per_done_task=None, requeue_rate=0.0,
+            mean_review_cycles=0.0, mean_verify_attempts=0.0,
+        )
+        verdict = compare_windows(baseline, post, thresholds)
+        assert verdict.verdict == 'pass'
+
+
+# Shared synthetic fixture dates + row-set builders -- used by BOTH
+# TestRunCanary (exercises run_canary end-to-end) and TestCanaryCLI
+# (exercises the same scenarios through the CLI). Factored to module level
+# (round-2 review finding #3) so the two layers can never drift apart by a
+# hand-copied date or cost value.
+_BASELINE_DATES = [
+    '2026-06-09T00:00:00+00:00', '2026-06-10T00:00:00+00:00',
+    '2026-06-11T00:00:00+00:00', '2026-06-12T00:00:00+00:00',
+    '2026-06-13T00:00:00+00:00',
+]
+_POST_DATES_4 = [
+    '2026-06-15T00:00:00+00:00', '2026-06-16T00:00:00+00:00',
+    '2026-06-17T00:00:00+00:00', '2026-06-18T00:00:00+00:00',
+]
+_POST_DATES_5 = [*_POST_DATES_4, '2026-06-19T00:00:00+00:00']
+
+
+def _clean_rows(task_prefix: str, dates: list[str]) -> list[dict]:
+    """Uniform 'done' rows: cost_usd=1.0, steward_cost_usd=0.0,
+    review_cycles=1, verify_attempts=1 — the "steady" fixture shape shared
+    by the regress/steady scenario builders below."""
+    return [
+        {
+            'task_id': f'{task_prefix}-{i}', 'project_id': 'dark_factory', 'outcome': 'done',
+            'cost_usd': 1.0, 'steward_cost_usd': 0.0, 'review_cycles': 1, 'verify_attempts': 1,
+            'completed_at': date,
+        }
+        for i, date in enumerate(dates)
+    ]
+
+
+def _regressed_rows() -> list[dict]:
+    """Shared 'regress' scenario: baseline window (5 clean rows) vs a post
+    window of 4 identical rows + 1 sharply more expensive requeued row.
+
+    - cost_per_done_task: baseline (1.0*5)/5=1.0; post
+      (1+1+1+1+21)/4=6.25 — well past baseline*(1+0.2)=1.2 -> regressed.
+    - requeue_rate: baseline 0/5=0.0; post 1/5=0.2 — past the abs_floor
+      (0.05) baseline==0 branch -> regressed.
+    - mean_review_cycles / mean_verify_attempts: the 4 done post rows
+      match the baseline's done rows exactly (1.0 each) -> NOT regressed,
+      proving a partial regression doesn't flag every metric.
+    """
+    return [
+        *_clean_rows('b', _BASELINE_DATES),
+        *_clean_rows('p', _POST_DATES_4),
+        {
+            'task_id': 'p-requeued', 'project_id': 'dark_factory', 'outcome': 'requeued',
+            'cost_usd': 21.0, 'steward_cost_usd': 0.0, 'review_cycles': 0, 'verify_attempts': 0,
+            'completed_at': '2026-06-19T00:00:00+00:00',
+        },
+    ]
+
+
+def _steady_rows() -> list[dict]:
+    """Shared 'steady/pass' scenario: baseline and post windows carry the
+    same steady shape (post cost_usd nudged to 1.05, +5% -- within the 20%
+    relative tolerance) -> no metric regresses."""
+    baseline_rows = _clean_rows('b', _BASELINE_DATES)
+    post_rows = _clean_rows('p', _POST_DATES_5)
+    for row in post_rows:
+        row['cost_usd'] = 1.05
+    return [*baseline_rows, *post_rows]
 
 
 class TestRunCanary:
@@ -549,49 +653,10 @@ class TestRunCanary:
     caller ever touching load_window_rows/compute_window_metrics/
     compare_windows directly."""
 
-    def _clean_rows(self, task_prefix: str, dates: list[str]) -> list[dict]:
-        """5 uniform 'done' rows: cost_usd=1.0, steward_cost_usd=0.0,
-        review_cycles=1, verify_attempts=1 — the "steady" fixture shape
-        both scenarios' baseline windows share."""
-        return [
-            {
-                'task_id': f'{task_prefix}-{i}', 'project_id': 'dark_factory', 'outcome': 'done',
-                'cost_usd': 1.0, 'steward_cost_usd': 0.0, 'review_cycles': 1, 'verify_attempts': 1,
-                'completed_at': date,
-            }
-            for i, date in enumerate(dates)
-        ]
-
     def test_regress_scenario_flags_regressed_metrics(self, tmp_path: Path) -> None:
-        """Baseline window (5 clean rows) vs a post window of 4 identical
-        rows + 1 sharply more expensive requeued row:
-
-        - cost_per_done_task: baseline (1.0*5)/5=1.0; post
-          (1+1+1+1+21)/4=6.25 — well past baseline*(1+0.2)=1.2 -> regressed.
-        - requeue_rate: baseline 0/5=0.0; post 1/5=0.2 — past the
-          abs_floor (0.05) baseline==0 branch -> regressed.
-        - mean_review_cycles / mean_verify_attempts: the 4 done post rows
-          match the baseline's done rows exactly (1.0 each) -> NOT
-          regressed, proving a partial regression doesn't flag every
-          metric.
-        """
+        """See _regressed_rows for the hand-computed per-metric math."""
         db_path = tmp_path / 'runs.db'
-        _make_runs_db(db_path, [
-            *self._clean_rows('b', [
-                '2026-06-09T00:00:00+00:00', '2026-06-10T00:00:00+00:00',
-                '2026-06-11T00:00:00+00:00', '2026-06-12T00:00:00+00:00',
-                '2026-06-13T00:00:00+00:00',
-            ]),
-            *self._clean_rows('p', [
-                '2026-06-15T00:00:00+00:00', '2026-06-16T00:00:00+00:00',
-                '2026-06-17T00:00:00+00:00', '2026-06-18T00:00:00+00:00',
-            ]),
-            {
-                'task_id': 'p-requeued', 'project_id': 'dark_factory', 'outcome': 'requeued',
-                'cost_usd': 21.0, 'steward_cost_usd': 0.0, 'review_cycles': 0, 'verify_attempts': 0,
-                'completed_at': '2026-06-19T00:00:00+00:00',
-            },
-        ])
+        _make_runs_db(db_path, _regressed_rows())
 
         verdict = run_canary(
             db_path, '2026-06-15T00:00:00+00:00',
@@ -609,23 +674,9 @@ class TestRunCanary:
         assert 'mean_verify_attempts' not in verdict.regressed_metrics
 
     def test_steady_scenario_returns_pass(self, tmp_path: Path) -> None:
-        """Baseline and post windows both carry the same steady shape (post
-        cost_usd nudged to 1.05, +5% -- within the 20% relative
-        tolerance) -> no metric regresses."""
+        """See _steady_rows for the +5% cost nudge that stays in tolerance."""
         db_path = tmp_path / 'runs.db'
-        baseline_rows = self._clean_rows('b', [
-            '2026-06-09T00:00:00+00:00', '2026-06-10T00:00:00+00:00',
-            '2026-06-11T00:00:00+00:00', '2026-06-12T00:00:00+00:00',
-            '2026-06-13T00:00:00+00:00',
-        ])
-        post_rows = self._clean_rows('p', [
-            '2026-06-15T00:00:00+00:00', '2026-06-16T00:00:00+00:00',
-            '2026-06-17T00:00:00+00:00', '2026-06-18T00:00:00+00:00',
-            '2026-06-19T00:00:00+00:00',
-        ])
-        for row in post_rows:
-            row['cost_usd'] = 1.05
-        _make_runs_db(db_path, [*baseline_rows, *post_rows])
+        _make_runs_db(db_path, _steady_rows())
 
         verdict = run_canary(
             db_path, '2026-06-15T00:00:00+00:00',
@@ -705,69 +756,20 @@ _CLI_METRICS = ('cost_per_done_task', 'requeue_rate', 'mean_review_cycles', 'mea
 
 
 def _make_cli_regressed_db(tmp_path: Path) -> Path:
-    """Same shape as TestRunCanary's regress scenario: 5 clean baseline
-    rows vs 4 identical post rows + 1 sharply pricier requeued row."""
+    """Same shape as TestRunCanary's regress scenario (`_regressed_rows`):
+    5 clean baseline rows vs 4 identical post rows + 1 sharply pricier
+    requeued row."""
     db_path = tmp_path / 'runs.db'
-    rows = [
-        {
-            'task_id': f'b-{i}', 'project_id': 'dark_factory', 'outcome': 'done',
-            'cost_usd': 1.0, 'steward_cost_usd': 0.0, 'review_cycles': 1, 'verify_attempts': 1,
-            'completed_at': date,
-        }
-        for i, date in enumerate([
-            '2026-06-09T00:00:00+00:00', '2026-06-10T00:00:00+00:00',
-            '2026-06-11T00:00:00+00:00', '2026-06-12T00:00:00+00:00',
-            '2026-06-13T00:00:00+00:00',
-        ])
-    ] + [
-        {
-            'task_id': f'p-{i}', 'project_id': 'dark_factory', 'outcome': 'done',
-            'cost_usd': 1.0, 'steward_cost_usd': 0.0, 'review_cycles': 1, 'verify_attempts': 1,
-            'completed_at': date,
-        }
-        for i, date in enumerate([
-            '2026-06-15T00:00:00+00:00', '2026-06-16T00:00:00+00:00',
-            '2026-06-17T00:00:00+00:00', '2026-06-18T00:00:00+00:00',
-        ])
-    ] + [
-        {
-            'task_id': 'p-requeued', 'project_id': 'dark_factory', 'outcome': 'requeued',
-            'cost_usd': 21.0, 'steward_cost_usd': 0.0, 'review_cycles': 0, 'verify_attempts': 0,
-            'completed_at': '2026-06-19T00:00:00+00:00',
-        },
-    ]
-    _make_runs_db(db_path, rows)
+    _make_runs_db(db_path, _regressed_rows())
     return db_path
 
 
 def _make_cli_steady_db(tmp_path: Path) -> Path:
-    """Same shape as TestRunCanary's steady scenario: post cost_usd nudged
-    +5%, within the 20% default relative tolerance -> nothing regresses."""
+    """Same shape as TestRunCanary's steady scenario (`_steady_rows`):
+    post cost_usd nudged +5%, within the 20% default relative tolerance ->
+    nothing regresses."""
     db_path = tmp_path / 'runs.db'
-    rows = [
-        {
-            'task_id': f'b-{i}', 'project_id': 'dark_factory', 'outcome': 'done',
-            'cost_usd': 1.0, 'steward_cost_usd': 0.0, 'review_cycles': 1, 'verify_attempts': 1,
-            'completed_at': date,
-        }
-        for i, date in enumerate([
-            '2026-06-09T00:00:00+00:00', '2026-06-10T00:00:00+00:00',
-            '2026-06-11T00:00:00+00:00', '2026-06-12T00:00:00+00:00',
-            '2026-06-13T00:00:00+00:00',
-        ])
-    ] + [
-        {
-            'task_id': f'p-{i}', 'project_id': 'dark_factory', 'outcome': 'done',
-            'cost_usd': 1.05, 'steward_cost_usd': 0.0, 'review_cycles': 1, 'verify_attempts': 1,
-            'completed_at': date,
-        }
-        for i, date in enumerate([
-            '2026-06-15T00:00:00+00:00', '2026-06-16T00:00:00+00:00',
-            '2026-06-17T00:00:00+00:00', '2026-06-18T00:00:00+00:00',
-            '2026-06-19T00:00:00+00:00',
-        ])
-    ]
-    _make_runs_db(db_path, rows)
+    _make_runs_db(db_path, _steady_rows())
     return db_path
 
 
@@ -841,37 +843,26 @@ class TestCanaryCLI:
         )
         assert 'Traceback' not in result.output
 
-    def test_zero_done_post_window_prints_note(self, tmp_path: Path) -> None:
+    def test_zero_done_post_window_prints_note_and_exits_regress(self, tmp_path: Path) -> None:
         """Every post-window row is 'blocked' (zero done) while still
         clearing min_samples on row count -- the deploy completed
-        nothing, but every done-derived metric degrades to
-        incomparable/0.0, so the verdict alone would read as a clean
-        'pass'. The CLI must print an explicit NOTE flagging the
-        reduced-signal window instead of letting that pass silently."""
+        nothing. Round-2 review (finding #1): compare_windows now forces
+        'regress' for this baseline-had-done/post-has-none case (see
+        TestZeroDoneRowsVisibility.test_enough_rows_zero_done_forces_regress_not_pass
+        in this module), so the CLI must exit nonzero -- not the 'pass'
+        exit 0 a purely stdout-printed NOTE would leave an
+        exit-code-driven caller to silently miss. The NOTE itself must
+        still print, flagging exactly which window lost its done-row
+        signal."""
         db_path = tmp_path / 'runs.db'
-        baseline_rows = [
-            {
-                'task_id': f'b-{i}', 'project_id': 'dark_factory', 'outcome': 'done',
-                'cost_usd': 1.0, 'steward_cost_usd': 0.0, 'review_cycles': 1, 'verify_attempts': 1,
-                'completed_at': date,
-            }
-            for i, date in enumerate([
-                '2026-06-09T00:00:00+00:00', '2026-06-10T00:00:00+00:00',
-                '2026-06-11T00:00:00+00:00', '2026-06-12T00:00:00+00:00',
-                '2026-06-13T00:00:00+00:00',
-            ])
-        ]
+        baseline_rows = _clean_rows('b', _BASELINE_DATES)
         post_rows = [
             {
                 'task_id': f'p-{i}', 'project_id': 'dark_factory', 'outcome': 'blocked',
                 'cost_usd': 1.0, 'steward_cost_usd': 0.0, 'review_cycles': 0, 'verify_attempts': 0,
                 'completed_at': date,
             }
-            for i, date in enumerate([
-                '2026-06-15T00:00:00+00:00', '2026-06-16T00:00:00+00:00',
-                '2026-06-17T00:00:00+00:00', '2026-06-18T00:00:00+00:00',
-                '2026-06-19T00:00:00+00:00',
-            ])
+            for i, date in enumerate(_POST_DATES_5)
         ]
         _make_runs_db(db_path, [*baseline_rows, *post_rows])
 
@@ -885,9 +876,11 @@ class TestCanaryCLI:
             '--post-days', '7',
         ])
 
-        assert result.exit_code == 0, (
-            f'Expected exit 0 (verdict pass) despite zero done post rows.\nOutput:\n{result.output}'
+        assert result.exit_code == 1, (
+            f'Expected exit 1 (verdict regress) for a fully-failed post window '
+            f'(zero done rows).\nOutput:\n{result.output}'
             + (f'\nException: {result.exception!r}' if result.exception else '')
         )
         assert 'NOTE' in result.output, f'Missing zero-done NOTE.\nOutput:\n{result.output}'
         assert 'post' in result.output
+        assert 'REGRESS' in result.output.upper()
