@@ -369,3 +369,32 @@ class TestPlanGoldenConftest:
 
         # D3: VerifyPlan.to_dict() is a plain JSON-native structure.
         json.dumps(plan.to_dict())
+
+
+# ── step-5/6: Scenario 4 — plan golden: lone data module -> SKIPPED-with-
+#              reason (task-1852); Boundary-test sketch row 4 ───────────────
+
+# task-1852 (git-verified fix commits 4fbed6c4fb + 7c9b316260): a non-test
+# data module under tests/ is test-tree but NOT pytest-collectable (passing
+# it to pytest produces rc=5 "no tests ran"). Reconstructed verbatim from
+# test_verify_plan.py's own golden fixture.
+DATA_MODULE_DIFF: list[str] = ['shared/tests/silent_fallthrough_allowlist.py']
+
+
+class TestPlanGoldenDataModule:
+    """Scenario 4 — GOLDEN task-1852: a lone data module, driven through the
+
+    FALLBACK path (module_configs=[]) against the bare 'pytest' default,
+    degrades to an explicit reasoned SKIPPED — never a silent None and never
+    a fabricated run that would rc=5.
+    """
+
+    def test_data_module_bare_pytest_default_skips_with_reason(self):
+        config = OrchestratorConfig(project_root=Path('/fake'), test_command='pytest')
+        plan = derive_verify_plan(DATA_MODULE_DIFF, [], config, fake_worktree_reader)
+        run = _run_for(plan, '__fallback__', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.SKIPPED
+        assert run.reason
+        assert DATA_MODULE_DIFF[0] in run.reason
+        assert '1852' in run.reason
