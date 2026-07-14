@@ -363,6 +363,11 @@ Conventions:
 - Always include project_id on every call (scopes data isolation).
 - Include agent_id for attribution (e.g. "claude-interactive", "claude-task-7").
 - Prefer add_memory over add_episode for discrete, pre-distilled facts (lower cost: 0-3 vs 5-15 LLM calls).
+- Before writing a procedural_knowledge memory, search first for an existing entry on the same
+  workflow/gotcha and update or skip instead of writing a near-duplicate. add_memory enforces this
+  at write time: a procedural_knowledge write that matches an existing entry at high similarity is
+  soft-blocked (error_type=ProceduralKnowledgeNearDuplicateWriteRejected); override with
+  metadata={'allow_near_duplicate': True} only when the content is genuinely distinct.
 - Tasks may carry memory_hints in metadata — structured pointers (search queries + entity names)
   that help future agents prefetch relevant context. Execute hint queries via search, look up
   hint entities via get_entity.
@@ -872,6 +877,14 @@ def create_mcp_server(
         """Add a classified memory directly. Skips the extraction pipeline.
         Use when the agent has already identified a specific, discrete memory.
 
+        Before writing a procedural_knowledge memory, search first for an
+        existing entry covering the same workflow/gotcha and update or skip
+        instead of writing a near-duplicate. procedural_knowledge writes are
+        soft-blocked at write time when they match an existing entry at high
+        similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected);
+        override with metadata={'allow_near_duplicate': True} only when the
+        content is genuinely distinct.
+
         Args:
             content: The memory itself (a fact, preference, procedure, etc.)
             project_id: Project scope (required)
@@ -880,7 +893,9 @@ def create_mcp_server(
                       If omitted, the system classifies automatically.
             agent_id: Which agent is writing (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
-            metadata: Arbitrary key-value pairs (optional)
+            metadata: Arbitrary key-value pairs (optional). For procedural_knowledge,
+                      set {'allow_near_duplicate': True} to bypass the near-duplicate
+                      write guard when the content is genuinely distinct.
             dual_write: Force write to both stores (default: false)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
