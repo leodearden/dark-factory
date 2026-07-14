@@ -715,6 +715,15 @@ def _parse_pi_output(
         cost = usage.get('cost') or {}
         native_cost += cost.get('total') or 0.0
 
+    # spike Q2: pi reports native per-message USD cost, unlike codex/gemini
+    # (tokens-only). Use it directly; fall back to the config price table
+    # (_estimate_cost, task 2459) only for the exotic custom-provider/
+    # base-url case where pi has no price data of its own (native cost
+    # absent or reported as exactly 0.0).
+    cost_usd = native_cost if native_cost else _estimate_cost(
+        model, total_input_tokens, total_output_tokens, prices,
+    )
+
     terminal = assistant_messages[-1] if assistant_messages else None
     if terminal is not None:
         content = terminal.get('content') or []
@@ -742,7 +751,7 @@ def _parse_pi_output(
         return AgentResult(
             success=True,
             output=output_text,
-            cost_usd=native_cost,
+            cost_usd=cost_usd,
             duration_ms=result.duration_ms,
             turns=turns,
             session_id=session_id,
@@ -756,7 +765,7 @@ def _parse_pi_output(
     return AgentResult(
         success=False,
         output=error_message or output_text or 'pi agent reported an error',
-        cost_usd=native_cost,
+        cost_usd=cost_usd,
         duration_ms=result.duration_ms,
         turns=turns,
         session_id=session_id,
