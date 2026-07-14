@@ -4,24 +4,36 @@ Lives outside conftest.py to avoid the `sys.modules['conftest']` collision
 that arises when root-level pytest loads multiple subprojects' conftests in
 the same process under --import-mode=importlib. See task 977 for convention
 rationale.
+
+One exception to "non-fixture": `_derive_meta_root_like_production` (Group D,
+task 2610) is an autouse pytest fixture, moved here anyway because it is
+cross-imported and semantically paired with `AgentStub` — see its own
+docstring. Like every other factory in this module, importing it by name is
+required to activate it (see that docstring for the activation mechanics).
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
 from escalation.queue import EscalationQueue
 
+from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
-from orchestrator.git_ops import _run
+from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.scheduler import TaskAssignment
+from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import StewardResolved
 
@@ -482,6 +494,391 @@ async def _init_git_repo(repo: Path) -> None:
     (repo / 'README.md').write_text('# Test\n')
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'init'], cwd=repo)
+
+
+# ---------------------------------------------------------------------------
+# e2e factories (moved from test_workflow_e2e.py — task 2610, Group D, final
+# decoupling): PLAN, _make_review, AgentStub, _build_workflow,
+# _build_workflow_with_escalation, _init_repo, and the autouse fixture
+# _derive_meta_root_like_production.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _derive_meta_root_like_production(monkeypatch):
+    """Mirror ε1 (task 2258) meta_root derivation in the agent-side doubles.
+
+    In production the workflow's ``self.artifacts`` is constructed with the
+    derived sibling ``.task-meta/<name>`` root
+    (``TaskArtifacts(worktree, _meta_root_for_worktree(worktree))``) and the
+    real ``plan_tools.py`` MCP writer is launched with the *same* ``--meta-root``
+    — so every reader/writer for a worktree resolves through one consistent
+    ``meta_root``.
+
+    These e2e doubles (``AgentStub._architect`` / ``_implementer`` and ~50
+    other call sites) bypass the real ``plan_tools.py`` subprocess and emulate
+    agent-side writes by hand-constructing ``TaskArtifacts(worktree)`` with no
+    ``meta_root`` (legacy-only, ``root == worktree/'.task'``). After the
+    workflow's migrate-on-write methods (``stamp_plan_provenance``/``lock_plan``)
+    establish the NEW copy, those legacy-only doubles write step status only to
+    the legacy copy — invisible to the workflow's relocated ``self.artifacts``
+    — so ``get_pending_steps()`` never observes completion and the task blocks
+    with "Execution iterations exhausted".
+
+    Rather than thread the derived root through every call site, patch the
+    constructor to default ``meta_root`` to the same sibling root production
+    derives whenever it is omitted. Explicit ``meta_root`` args (the workflow's
+    own and ``plan_tools.py``'s) are untouched.
+    """
+    orig_init = TaskArtifacts.__init__
+
+    def _init(self, worktree, meta_root=None):
+        if meta_root is None:
+            meta_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+        orig_init(self, worktree, meta_root)
+
+    monkeypatch.setattr(TaskArtifacts, '__init__', _init)
+
+
+async def _init_repo(repo: Path):
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    # Seed with a simple Python file so the repo isn't empty
+    (repo / 'lib.py').write_text('def greet(name: str) -> str:\n    return f"Hello, {name}"\n')
+    (repo / 'test_lib.py').write_text(
+        'from lib import greet\n\ndef test_greet():\n    assert greet("world") == "Hello, world"\n'
+    )
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+PLAN = {
+    'task_id': '42',
+    'title': 'Add farewell function',
+    'files': ['lib.py', 'test_lib.py'],
+    'analysis': 'Simple function addition with TDD',
+    'prerequisites': [],
+    'steps': [
+        {
+            'id': 'step-1',
+            'type': 'test',
+            'description': 'Write failing test for farewell()',
+            'status': 'pending',
+            'commit': None,
+        },
+        {
+            'id': 'step-2',
+            'type': 'impl',
+            'description': 'Implement farewell() to pass test',
+            'status': 'pending',
+            'commit': None,
+        },
+    ],
+    'design_decisions': [
+        {'decision': 'Mirror greet() signature', 'rationale': 'Consistency'},
+    ],
+    'reuse': [],
+    # Models a successful architect run: the agent called confirm_plan, so the
+    # plan carries the completeness marker the workflow now gates on.
+    '_finalized_at': '2026-01-01T00:00:00+00:00',
+}
+
+
+def _make_review(reviewer: str, verdict: str = 'PASS', issues: list | None = None):
+    return {
+        'reviewer': reviewer,
+        'verdict': verdict,
+        'issues': issues or [],
+        'summary': f'{reviewer} review: {verdict}',
+    }
+
+
+class AgentStub:
+    """Deterministic agent stub that performs real file operations.
+
+    Tracks which roles have been invoked and their order.
+    """
+
+    def __init__(
+        self,
+        verify_results: list[VerifyResult] | None = None,
+        judge_verdicts: list | None = None,
+    ):
+        self.calls: list[str] = []
+        # Last env_overrides seen per role — set by invoke_agent before dispatch.
+        self.env_overrides_by_role: dict[str, dict[str, str] | None] = {}
+        self._impl_iteration = 0
+        # Sequence of verify results to return (pops from front)
+        self._verify_results = list(verify_results or [VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed',
+        )])
+        # Sequence of judge verdicts to return (pops from front; last persists).
+        # Each entry may be a dict (structured verdict), an Exception to raise,
+        # None (to simulate structured_output=None), or the string 'SUCCESS_FALSE'
+        # to simulate result.success=False.
+        self._judge_verdicts = list(judge_verdicts or [])
+
+    async def invoke_agent(
+        self,
+        prompt: str,
+        system_prompt: str,
+        cwd: Path,
+        model: str = 'opus',
+        max_turns: int = 50,
+        max_budget_usd: float = 5.0,
+        allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
+        mcp_config: dict | None = None,
+        output_schema: dict | None = None,
+        permission_mode: str = 'bypassPermissions',
+        sandbox_modules: list[str] | None = None,
+        effort: str | None = None,
+        backend: str = 'claude',
+        oauth_token: str | None = None,
+        resume_session_id: str | None = None,
+        session_id: str | None = None,
+        timeout_seconds: float | None = None,
+        config_dir: Path | None = None,
+        env_overrides: dict[str, str] | None = None,
+        startup_grace_secs: float = 120.0,
+        working_idle_secs: float | None = None,
+        absolute_cap_secs: float | None = None,
+    ) -> AgentResult:
+        """Determine role from system_prompt content, perform side effects."""
+        role = self._detect_role(system_prompt)
+        self.calls.append(role)
+        self.env_overrides_by_role[role] = env_overrides
+
+        if role == 'architect':
+            return await self._architect(cwd)
+        elif role == 'implementer':
+            return await self._implementer(cwd)
+        elif role == 'debugger':
+            return await self._debugger(cwd)
+        elif role.startswith('reviewer'):
+            return self._reviewer(role, output_schema)
+        elif role == 'merger':
+            return self._merger()
+        elif role == 'judge':
+            return self._judge()
+        else:
+            return AgentResult(success=True, output='OK')
+
+    def _detect_role(self, system_prompt: str) -> str:
+        # Judge check goes first — its system prompt does not contain
+        # architect/implementer/reviewer substrings so ordering is safe.
+        if 'completion judge' in system_prompt.lower():
+            return 'judge'
+        if 'TDD architect' in system_prompt:
+            return 'architect'
+        if 'TDD implementer' in system_prompt:
+            return 'implementer'
+        if 'debugger' in system_prompt.lower() and 'You are a debugger' in system_prompt:
+            return 'debugger'
+        if 'code reviewer' in system_prompt.lower():
+            return 'reviewer_comprehensive'
+        if 'merge conflict resolver' in system_prompt.lower():
+            return 'merger'
+        # If re-planning (architect called with review feedback)
+        if 'blocking issues were found' in system_prompt or 'Update the plan' in system_prompt:
+            return 'architect'
+        return 'unknown'
+
+    async def _architect(self, cwd: Path) -> AgentResult:
+        """Write plan.json to the task's meta_root.
+
+        The workflow constructs its TaskArtifacts with the relocated
+        ``.task-meta`` sibling root (task 2258 W11-ε1) and reads plan.json from
+        there — NOT the legacy ``<worktree>/.task``. The real agent-side
+        plan-tools MCP writes to the same root via ``--meta-root``; this stub
+        must mirror that or the workflow sees "no plan.json produced".
+        """
+        artifacts = TaskArtifacts(
+            cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
+        )
+        artifacts.root.mkdir(parents=True, exist_ok=True)
+        plan = dict(PLAN)
+        plan['_schema_version'] = 1
+        (artifacts.root / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+        return AgentResult(success=True, output='Plan created', cost_usd=0.50)
+
+    async def _implementer(self, cwd: Path) -> AgentResult:
+        """Create code files and update plan.json step statuses."""
+        self._impl_iteration += 1
+        artifacts = TaskArtifacts(
+            cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
+        )
+        pending = artifacts.get_pending_steps()
+
+        if not pending:
+            return AgentResult(success=True, output='Nothing to do')
+
+        completed_ids = []
+        for step in pending:
+            step_id = step['id']
+            if step['type'] == 'test':
+                # Write failing test
+                (cwd / 'test_lib.py').write_text(
+                    'from lib import greet, farewell\n\n'
+                    'def test_greet():\n'
+                    '    assert greet("world") == "Hello, world"\n\n'
+                    'def test_farewell():\n'
+                    '    assert farewell("world") == "Goodbye, world"\n'
+                )
+            elif step['type'] == 'impl':
+                # Implement
+                (cwd / 'lib.py').write_text(
+                    'def greet(name: str) -> str:\n'
+                    '    return f"Hello, {name}"\n\n'
+                    'def farewell(name: str) -> str:\n'
+                    '    return f"Goodbye, {name}"\n'
+                )
+
+            # Git commit
+            await _run(['git', 'add', '-A'], cwd=cwd)
+            await _run(['git', 'commit', '-m', f'Complete {step_id}'], cwd=cwd)
+            _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=cwd)
+
+            artifacts.update_step_status(step_id, 'done', commit=sha)
+            completed_ids.append(step_id)
+
+        return AgentResult(
+            success=True, output=f'Completed {completed_ids}', cost_usd=1.00
+        )
+
+    async def _debugger(self, cwd: Path) -> AgentResult:
+        """Fix whatever is broken. For our stub, ensure files are correct."""
+        (cwd / 'lib.py').write_text(
+            'def greet(name: str) -> str:\n'
+            '    return f"Hello, {name}"\n\n'
+            'def farewell(name: str) -> str:\n'
+            '    return f"Goodbye, {name}"\n'
+        )
+        await _run(['git', 'add', '-A'], cwd=cwd)
+        await _run(['git', 'commit', '-m', 'fix: correct implementation'], cwd=cwd)
+        return AgentResult(success=True, output='Fixed', cost_usd=0.30)
+
+    def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+        """Return PASS review."""
+        review = _make_review(role)
+        return AgentResult(
+            success=True,
+            output=json.dumps(review),
+            structured_output=review,
+            cost_usd=0.10,
+        )
+
+    def _merger(self) -> AgentResult:
+        return AgentResult(success=True, output='Merged', cost_usd=0.20)
+
+    def _judge(self) -> AgentResult:
+        """Return the next queued judge verdict.
+
+        If the entry is an Exception, raise it (simulates invoke failure).
+        If the entry is 'SUCCESS_FALSE', return success=False.
+        If the entry is None, return success=True with structured_output=None.
+        Otherwise treat the entry as a verdict dict.
+        """
+        if not self._judge_verdicts:
+            # No verdicts queued — default: incomplete
+            verdict = {
+                'complete': False,
+                'reasoning': 'default stub verdict',
+                'uncovered_plan_steps': [],
+                'substantive_work': False,
+            }
+        elif len(self._judge_verdicts) > 1:
+            verdict = self._judge_verdicts.pop(0)
+        else:
+            verdict = self._judge_verdicts[0]
+
+        if isinstance(verdict, Exception):
+            raise verdict
+        if verdict == 'SUCCESS_FALSE':
+            return AgentResult(success=False, output='', cost_usd=0.05)
+        if verdict is None:
+            return AgentResult(success=True, output='', structured_output=None, cost_usd=0.05)
+        return AgentResult(
+            success=True,
+            output=json.dumps(verdict),
+            structured_output=verdict,
+            cost_usd=0.05,
+        )
+
+    def next_verify_result(self) -> VerifyResult:
+        """Pop the next verify result, or return the last one forever."""
+        if len(self._verify_results) > 1:
+            return self._verify_results.pop(0)
+        return self._verify_results[0]
+
+
+def _build_workflow(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    assignment: TaskAssignment,
+    agent_stub: AgentStub,
+) -> tuple[TaskWorkflow, FakeScheduler]:
+    """Wire up a TaskWorkflow with all fakes injected."""
+    from _serial_merge_worker import MergeWorker
+
+    scheduler = FakeScheduler()
+    merge_queue: asyncio.Queue = asyncio.Queue()
+    worker = MergeWorker(git_ops, merge_queue)
+    # Start merge worker — cleaned up when event loop tears down after test
+    asyncio.create_task(worker.run(), name='test-merge-worker')
+    workflow = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,  # type: ignore[arg-type]
+        briefing=FakeBriefing(),  # type: ignore[arg-type]
+        mcp=FakeMcp(),  # type: ignore[arg-type]
+        merge_queue=merge_queue,
+    )
+    return workflow, scheduler
+
+
+def _build_workflow_with_escalation(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    assignment: TaskAssignment,
+    agent_stub: AgentStub,
+    tmp_path: Path,
+    *,
+    spawn_merge_worker: bool = True,
+) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
+    """Wire up a TaskWorkflow with an EscalationQueue attached.
+
+    When ``spawn_merge_worker=False``, skips the MergeWorker/asyncio.create_task
+    setup — use for tests that exercise _mark_blocked directly and never enqueue
+    merge work; omitting create_task avoids the 'Task was destroyed but it is
+    pending!' warning in pytest teardown.
+    """
+    from _serial_merge_worker import MergeWorker
+
+    scheduler = FakeScheduler()
+    queue_dir = tmp_path / 'escalation_queue'
+    queue = EscalationQueue(queue_dir)
+    merge_queue: asyncio.Queue = asyncio.Queue()
+    if spawn_merge_worker:
+        worker = MergeWorker(git_ops, merge_queue)
+        asyncio.create_task(worker.run(), name='test-merge-worker')
+    else:
+        worker = None
+    workflow = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,  # type: ignore[arg-type]
+        briefing=FakeBriefing(),  # type: ignore[arg-type]
+        mcp=FakeMcp(),  # type: ignore[arg-type]
+        escalation_queue=queue,
+        merge_queue=merge_queue,
+        merge_worker=worker,
+    )
+    return workflow, scheduler, queue
 
 
 # ---------------------------------------------------------------------------
