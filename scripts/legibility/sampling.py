@@ -239,3 +239,82 @@ def score_signals(path: Path) -> SignalCounts:
         df_guard=df_guard,
         interrupt=interrupt,
     )
+
+
+# ---------------------------------------------------------------------------
+# classify_agent_class — 5-stratum classifier (PRD §5.2 point 2)
+# ---------------------------------------------------------------------------
+
+STRATA: tuple[str, ...] = (
+    'recon', 'curator-classifier', 'watcher', 'orchestrated-task', 'interactive',
+)
+"""The 5 agent-class strata the sampler groups by."""
+
+_WORKTREE_DIR_MARKERS: tuple[str, ...] = ('--worktrees-', '--claude-worktrees-')
+
+_RECON_HEADER_PREFIXES: tuple[str, ...] = (
+    '## Reconciliation Run',
+    '## Stage 2: Task-Knowledge Sync',
+)
+_RECON_SUBSTRING_MARKERS: tuple[str, ...] = ('memory_consolidator',)
+
+_WATCHER_SUBSTRING_MARKERS: tuple[str, ...] = ('recon-escalation-watcher',)
+"""skills/recon-escalation-watcher — a real dark_factory skill/slash-command."""
+
+_CURATOR_CLASSIFIER_SUBSTRING_MARKERS: tuple[str, ...] = ('review suggestion classifier',)
+"""Verbatim opening of TRIAGE_SYSTEM_PROMPT
+(orchestrator/src/orchestrator/agents/triage.py:131), matched
+case-insensitively."""
+
+
+def _first_user_turn_text(record: dict[str, Any] | None) -> str:
+    """Flatten a first-non-sidechain-user-turn record's text content to a string.
+
+    *record* is the RAW transcript-line dict the caller already located
+    (this function does no file I/O); returns '' when *record* is None
+    (no such turn found) or carries no text content.
+    """
+    if record is None:
+        return ''
+    content = _message_content(record)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            block.get('text') for block in content
+            if isinstance(block, dict) and block.get('type') == 'text'
+            and isinstance(block.get('text'), str)
+        ]
+        return '\n'.join(parts)
+    return ''
+
+
+def classify_agent_class(record: dict[str, Any] | None, path: Path) -> str:
+    """Classify a session's agent class (one of :data:`STRATA`).
+
+    Priority: *path*'s encoded-dir SHAPE is checked first — only its
+    parent directory's name is inspected, never any file content — a
+    ``--worktrees-``/``--claude-worktrees-`` marker means
+    ``'orchestrated-task'`` and wins even over a recon-marker turn.
+    Otherwise, cheap content markers in *record* (the session's
+    already-located first non-sidechain, non-meta user turn) decide:
+    recon header / ``memory_consolidator`` -> ``'recon'``;
+    ``recon-escalation-watcher`` -> ``'watcher'``; the triage classifier's
+    system-prompt opening -> ``'curator-classifier'``. Falls back to
+    ``'interactive'`` — a main-dir freeform human turn, or no matching
+    user turn at all (*record* is None).
+    """
+    encoded_dir = path.parent.name
+    if any(marker in encoded_dir for marker in _WORKTREE_DIR_MARKERS):
+        return 'orchestrated-task'
+
+    text = _first_user_turn_text(record)
+    if text.startswith(_RECON_HEADER_PREFIXES) or any(
+        marker in text for marker in _RECON_SUBSTRING_MARKERS
+    ):
+        return 'recon'
+    if any(marker in text for marker in _WATCHER_SUBSTRING_MARKERS):
+        return 'watcher'
+    if any(marker in text.lower() for marker in _CURATOR_CLASSIFIER_SUBSTRING_MARKERS):
+        return 'curator-classifier'
+    return 'interactive'
