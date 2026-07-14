@@ -26,14 +26,13 @@ import pytest
 # get_pending_steps() never observes completion and any full-execute-loop
 # test (e.g. the clean-DONE case below) spuriously blocks with "Execution
 # iterations exhausted" instead of reaching DONE.
-from test_harness_warm_lane_wiring import _build_harness, _init_git_repo
 from test_workflow_e2e import (
     AgentStub,
     _build_workflow,
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see above
     _init_repo,
 )
-from _workflow_helpers import _make_warmlane_workflow
+from _workflow_helpers import _build_harness, _init_git_repo, _make_warmlane_workflow
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps

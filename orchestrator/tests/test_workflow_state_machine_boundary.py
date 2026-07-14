@@ -63,14 +63,19 @@ from shared.task_transitions import ActorClass, is_legal_transition, outcome_all
 # AgentStub's legacy-only TaskArtifacts writes are invisible to the
 # workflow's relocated meta_root, so a real run() never reaches DONE (rows
 # 5-6).
-from test_harness_warm_lane_wiring import _build_harness, _init_git_repo
 from test_workflow_e2e import (
     AgentStub,
     _build_workflow,
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see above
     _init_repo,
 )
-from _workflow_helpers import _bind_landed_row, _make, _make_warmlane_workflow
+from _workflow_helpers import (
+    _bind_landed_row,
+    _build_harness,
+    _init_git_repo,
+    _make,
+    _make_warmlane_workflow,
+)
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import _FAMILY_TOOL_PREFIXES, ROLES, AgentRole

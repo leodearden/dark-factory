@@ -12,13 +12,15 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from _orch_helpers import pydantic_spec
+from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
+from orchestrator.git_ops import _run
+from orchestrator.harness import Harness
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import StewardResolved
@@ -448,6 +450,38 @@ def _make_warmlane_workflow(*, tmp_path: Path, task_id: str = '1859') -> TaskWor
     )
     # Do NOT set wf.worktree — keep it None so run() calls create_worktree.
     return wf
+
+
+# ---------------------------------------------------------------------------
+# Harness factories (moved from test_harness_warm_lane_wiring.py —
+# task 2610, Group C).
+# ---------------------------------------------------------------------------
+
+
+def _build_harness(config: OrchestratorConfig) -> Harness:
+    """Construct a Harness with heavy constructors patched out."""
+    with patch('orchestrator.harness.McpLifecycle'), \
+         patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.BriefingAssembler'):
+        harness = Harness(config)
+    # `Scheduler` is patched to a bare MagicMock; wire real (non-auto-mock)
+    # liveness-accessor behaviour (task 2235: harness.py now calls
+    # scheduler.is_dispatched()/.is_actively_held()/.workflow_cancel_recent()
+    # instead of reaching into _dispatched/lock_table._held directly) so
+    # tests below that set harness.scheduler._dispatched (or .lock_table)
+    # exercise real semantics instead of an auto-mocked (always-truthy) stub.
+    wire_scheduler_liveness_mock(harness.scheduler)  # type: ignore[arg-type]
+    return harness
+
+
+async def _init_git_repo(repo: Path) -> None:
+    from orchestrator.git_ops import _run
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'init'], cwd=repo)
 
 
 # ---------------------------------------------------------------------------
