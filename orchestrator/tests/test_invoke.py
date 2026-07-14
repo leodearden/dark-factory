@@ -613,6 +613,93 @@ class TestInvokePiCore:
 
 
 @pytest.mark.asyncio
+class TestInvokePiFlags:
+    """`_invoke_pi` flag construction beyond the core template (deliverable
+    #3): --thinking (effort), ANTHROPIC_OAUTH_TOKEN env, --session/
+    --session-id, --exclude-tools (disallowed_tools), --no-context-files,
+    and the no-silent-cap warning when a spec is unmappable (wildcard)."""
+
+    async def _invoke(self, tmp_path, **overrides):
+        """Invoke _invoke_pi with sensible defaults, patched _run_subprocess_local,
+        returning the mock so callers can inspect argv/env via call_args."""
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        kwargs = dict(
+            prompt='hello', system_prompt='sys', cwd=tmp_path,
+            model='anthropic/claude-haiku-4-5', max_budget_usd=1.0,
+            allowed_tools=None, disallowed_tools=None, mcp_config=None,
+            sandbox_modules=None, effort=None, oauth_token=None,
+            resume_session_id=None, session_id=None, timeout_seconds=30.0,
+            prices=None,
+        )
+        kwargs.update(overrides)
+        prompt = kwargs.pop('prompt')
+        system_prompt = kwargs.pop('system_prompt')
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=pi_result) as mock_run:
+            await _invoke_pi(prompt, system_prompt, **kwargs)
+        return mock_run
+
+    async def test_effort_maps_to_thinking_flag(self, tmp_path):
+        mock_run = await self._invoke(tmp_path, effort='high')
+        cmd = mock_run.call_args.args[0]
+        assert '--thinking' in cmd
+        assert cmd[cmd.index('--thinking') + 1] == 'high'
+
+    async def test_no_effort_omits_thinking_flag(self, tmp_path):
+        mock_run = await self._invoke(tmp_path, effort=None)
+        cmd = mock_run.call_args.args[0]
+        assert '--thinking' not in cmd
+
+    async def test_oauth_token_sets_anthropic_oauth_token_env(self, tmp_path):
+        mock_run = await self._invoke(tmp_path, oauth_token='tok')
+        env = mock_run.call_args.args[2]
+        assert env.get('ANTHROPIC_OAUTH_TOKEN') == 'tok'
+
+    async def test_resume_session_id_uses_session_flag(self, tmp_path):
+        mock_run = await self._invoke(tmp_path, resume_session_id='r1')
+        cmd = mock_run.call_args.args[0]
+        assert '--session' in cmd
+        assert cmd[cmd.index('--session') + 1] == 'r1'
+        assert '--session-id' not in cmd
+
+    async def test_session_id_without_resume_uses_session_id_flag(self, tmp_path):
+        mock_run = await self._invoke(tmp_path, session_id='s1')
+        cmd = mock_run.call_args.args[0]
+        assert '--session-id' in cmd
+        assert cmd[cmd.index('--session-id') + 1] == 's1'
+
+    async def test_disallowed_tools_maps_to_exclude_tools_flag(self, tmp_path):
+        mock_run = await self._invoke(
+            tmp_path, disallowed_tools=['mcp__fused-memory__set_task_status'],
+        )
+        cmd = mock_run.call_args.args[0]
+        assert '--exclude-tools' in cmd
+        csv = cmd[cmd.index('--exclude-tools') + 1]
+        assert 'fused_memory_set_task_status' in csv.split(',')
+
+    async def test_argv_contains_no_context_files(self, tmp_path):
+        mock_run = await self._invoke(tmp_path)
+        cmd = mock_run.call_args.args[0]
+        assert '--no-context-files' in cmd
+
+    async def test_wildcard_spec_is_dropped_and_logged(self, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING):
+            mock_run = await self._invoke(
+                tmp_path, allowed_tools=['mcp__jcodemunch__*', 'Read'],
+            )
+        cmd = mock_run.call_args.args[0]
+        tools_csv = cmd[cmd.index('--tools') + 1]
+        assert 'read' in tools_csv.split(',')
+        assert 'jcodemunch' not in tools_csv
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('mcp__jcodemunch__*' in r.getMessage() for r in warning_records), (
+            f'expected a WARNING naming the dropped spec; got: {[r.getMessage() for r in warning_records]}'
+        )
+
+
+@pytest.mark.asyncio
 class TestSandboxPathForwardsSessionConfig:
     """_invoke_claude_with_sandbox sandbox path must forward session_id + config_dir to _run_subprocess.
 
