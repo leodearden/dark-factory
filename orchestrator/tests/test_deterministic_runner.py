@@ -813,6 +813,69 @@ class TestBeforeDoneCrossUnitDeploy:
         pending = queue.get_by_task('200', status='pending')
         assert len(pending) == 0, f'No escalation should be filed on success; got {pending}'
 
+    async def test_b6_stamps_deploy_state_phase_ran_atomically_with_before_done_ran_at(
+        self, tmp_path: Path
+    ):
+        """ζ DS-1: the SAME update_task call that stamps before_done_ran_at
+        also carries deploy_state.phase=='ran' (one atomic merge write)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='200')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert stamp_calls, 'update_task must be called with a truthy before_done_ran_at stamp'
+        payload = stamp_calls[0].args[1]
+        assert payload.get('deploy_state', {}).get('phase') == 'ran'
+
+    async def test_b6_persists_verify_baseline_from_captured_baseline(self, tmp_path: Path):
+        """ζ DS-3: deploy_state.verify_baseline is persisted from the captured
+        pre-deploy baseline (monotonic + MainPID) once it has been inspected."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='200')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        baseline_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('verify_baseline')
+        ]
+        assert baseline_calls, 'deploy_state.verify_baseline must be persisted somewhere in the call chain'
+        vb = baseline_calls[0].args[1]['deploy_state']['verify_baseline']
+        assert vb['main_pid'] == _BASELINE_UNIT_STATE['MainPID']
+        assert vb['active_enter_timestamp_monotonic'] == (
+            _BASELINE_UNIT_STATE['ActiveEnterTimestampMonotonic']
+        )
+
 
 # ---------------------------------------------------------------------------
 # Task 2238 (W10-δ), step-3: run()'s cross-unit `if not self_target:` branch
@@ -1032,6 +1095,28 @@ class TestCrossUnitDeployDelegatesToRestartPlan:
         pending = queue.get_by_task('965', status='pending')
         assert len(pending) == 1
         assert pending[0].summary.startswith('Deploy run+verify exceeded outer guard')
+
+    async def test_deployed_and_verified_still_stamps_deploy_state_phase_ran(self, tmp_path: Path):
+        """Even routed through the REAL RestartPlan.execute() delegation, the
+        shared before_done_ran_at write still carries deploy_state.phase=='ran'
+        (ζ DS-1 — the phase write happens before the self/cross split, not
+        inside the delegated execute() call)."""
+        task = _deploy_task(task_id='966', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner, queue, scheduler = self._make_runner(
+            tmp_path, task, unit_inspector=unit_inspector, script_runner=script_runner,
+        )
+
+        await runner.run(assignment)
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert stamp_calls, 'update_task must be called with a truthy before_done_ran_at stamp'
+        assert stamp_calls[0].args[1]['deploy_state']['phase'] == 'ran'
 
 
 # ---------------------------------------------------------------------------
