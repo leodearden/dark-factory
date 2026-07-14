@@ -336,3 +336,112 @@ class TestBackgroundServiceStop:
         await asyncio.wait_for(svc.stop(), timeout=1)
 
         assert svc._task is None
+
+
+class _RecordingService:
+    """Fake lifecycle service recording start()/stop() calls into a shared
+    list, in call order.
+
+    Duck-types the eventual ``LifecycleService`` Protocol (name, async
+    start(), async stop(), stop_timeout_secs — see step-14) without
+    depending on it, so LifecycleRegistry can be tested before
+    ManagedService/LifecycleService exist.
+    """
+
+    def __init__(self, name: str, calls: list[str], stop_timeout_secs: float = 1.0) -> None:
+        self.name = name
+        self._calls = calls
+        self.stop_timeout_secs = stop_timeout_secs
+
+    async def start(self) -> None:
+        self._calls.append(f'{self.name}:start')
+
+    async def stop(self) -> None:
+        self._calls.append(f'{self.name}:stop')
+
+
+class TestLifecycleRegistryRegister:
+    """step-9: LifecycleRegistry.register() preserves declared order (LR-3)."""
+
+    def test_register_preserves_declared_order(self) -> None:
+        from orchestrator.background_service import LifecycleRegistry
+
+        calls: list[str] = []
+        registry = LifecycleRegistry()
+        svc_a = _RecordingService('a', calls)
+        svc_b = _RecordingService('b', calls)
+        svc_c = _RecordingService('c', calls)
+
+        registry.register(svc_a)
+        registry.register(svc_b)
+        registry.register(svc_c)
+
+        assert [s.name for s in registry.services] == ['a', 'b', 'c']
+
+    def test_services_reflects_registration_order_not_name_order(self) -> None:
+        """register() order is preserved regardless of name — `services` is
+        a plain ordered sequence, not something that re-sorts."""
+        from orchestrator.background_service import LifecycleRegistry
+
+        calls: list[str] = []
+        registry = LifecycleRegistry()
+        for name in ['zebra', 'apple', 'mango']:
+            registry.register(_RecordingService(name, calls))
+
+        assert [s.name for s in registry.services] == ['zebra', 'apple', 'mango']
+
+
+class TestLifecycleRegistryStartAll:
+    """step-9: LifecycleRegistry.start_all() awaits start() in order (LR-3)."""
+
+    @pytest.mark.asyncio
+    async def test_start_all_awaits_each_start_in_registration_order(self) -> None:
+        from orchestrator.background_service import LifecycleRegistry
+
+        calls: list[str] = []
+        registry = LifecycleRegistry()
+        for name in ['a', 'b', 'c']:
+            registry.register(_RecordingService(name, calls))
+
+        await registry.start_all()
+
+        assert calls == ['a:start', 'b:start', 'c:start']
+
+    @pytest.mark.asyncio
+    async def test_start_all_awaits_sequentially_not_concurrently(self) -> None:
+        """A slow first service's start() fully completes before the next
+        service's start() begins — proves start_all() awaits each start()
+        in turn rather than firing them concurrently (asyncio.gather would
+        let the fast second service finish first)."""
+        from orchestrator.background_service import LifecycleRegistry
+
+        calls: list[str] = []
+        registry = LifecycleRegistry()
+
+        class _SlowStart:
+            name = 'slow'
+            stop_timeout_secs = 1.0
+
+            async def start(self) -> None:
+                await asyncio.sleep(0.05)
+                calls.append('slow:start-done')
+
+            async def stop(self) -> None:
+                calls.append('slow:stop')
+
+        class _FastStart:
+            name = 'fast'
+            stop_timeout_secs = 1.0
+
+            async def start(self) -> None:
+                calls.append('fast:start-done')
+
+            async def stop(self) -> None:
+                calls.append('fast:stop')
+
+        registry.register(_SlowStart())
+        registry.register(_FastStart())
+
+        await registry.start_all()
+
+        assert calls == ['slow:start-done', 'fast:start-done']
