@@ -98,10 +98,11 @@ def _reset_merge_provenance():
 
 def test_merge_provenance_factories_smoke(tmp_path) -> None:
     """_make builds a real TaskWorkflow+TaskArtifacts fixture; _bind_landed_row is lookup-able."""
+    from _workflow_helpers import _bind_landed_row, _Fixture, _make  # noqa: PLC0415
+
     from orchestrator.artifacts import TaskArtifacts  # noqa: PLC0415
     from orchestrator.landed_outbox import MergeProvenance  # noqa: PLC0415
     from orchestrator.workflow import TaskWorkflow  # noqa: PLC0415
-    from _workflow_helpers import _Fixture, _bind_landed_row, _make  # noqa: PLC0415
 
     fixture = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'pr')
     assert isinstance(fixture, _Fixture)
@@ -117,7 +118,7 @@ def test_merge_provenance_factories_smoke(tmp_path) -> None:
 def test_merge_provenance_factories_identity() -> None:
     """Anti-duplication guard: the producer re-exports the SAME objects as the shared module."""
     import test_workflow_merge_provenance as mp  # noqa: PLC0415
-    from _workflow_helpers import _Fixture, _bind_landed_row, _make  # noqa: PLC0415
+    from _workflow_helpers import _bind_landed_row, _Fixture, _make  # noqa: PLC0415
 
     assert mp._make is _make
     assert mp._bind_landed_row is _bind_landed_row
@@ -131,8 +132,9 @@ def test_merge_provenance_factories_identity() -> None:
 
 def test_warmlane_workflow_factory_smoke(tmp_path) -> None:
     """_make_warmlane_workflow builds a TaskWorkflow with worktree deliberately unset."""
-    from orchestrator.workflow import TaskWorkflow  # noqa: PLC0415
     from _workflow_helpers import _make_warmlane_workflow  # noqa: PLC0415
+
+    from orchestrator.workflow import TaskWorkflow  # noqa: PLC0415
 
     wf = _make_warmlane_workflow(tmp_path=tmp_path)
     assert isinstance(wf, TaskWorkflow)

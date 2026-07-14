@@ -28,6 +28,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import mock_lock_table, wire_scheduler_liveness_mock
+from _workflow_helpers import (
+    PLAN,
+    AgentStub,
+    _build_workflow_with_escalation,
+    _init_repo,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -45,12 +51,6 @@ from test_harness_reblock_signature_guard import (
     _make_mock_queue,
 )
 from test_stranded_blocked_sweep import _make_pending_l1, _make_resolved_l1
-from _workflow_helpers import (
-    PLAN,
-    AgentStub,
-    _build_workflow_with_escalation,
-    _init_repo,
-)
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
