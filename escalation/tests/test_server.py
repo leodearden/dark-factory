@@ -2130,6 +2130,77 @@ class TestMergeRequestDedup:
         # Cleanup
         never_future.cancel()
 
+    async def test_already_merged_fast_path_dedups_prefixed_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """merge_request already_merged fast-path resolves the SAME ref for a
+        bare and a pre-prefixed branch — regression guard for the
+        double-prefix bug (PRD I4 fast-path used to build the full ref via a
+        raw f-string concat with no startswith guard, so an already-prefixed
+        branch like 'task/123' became 'task/task/123' and missed the
+        git_ops lookup, falling through to a normal enqueue instead of the
+        already_merged short-circuit).
+        """
+        from unittest.mock import AsyncMock
+
+        tip = 't' * 40
+        resolve_branch_sha = AsyncMock(
+            side_effect=lambda b: tip if b == 'task/123' else None
+        )
+        is_ancestor = AsyncMock(return_value=True)
+        stub_git = types.SimpleNamespace(
+            resolve_branch_sha=resolve_branch_sha,
+            is_ancestor=is_ancestor,
+            # Only exercised today (RED) when the double-prefix bug causes the
+            # pre-prefixed call to miss the fast-path and fall through to the
+            # coalesce/enqueue disk-scan; stubbed so that fallthrough resolves
+            # cleanly to 'queued' (a clean assertion mismatch) instead of an
+            # unrelated AttributeError.
+            find_inflight_merge_worktree=AsyncMock(return_value=None),
+        )
+        stub_harness = types.SimpleNamespace(
+            git_ops=stub_git, _merge_worker=None, _terminal_retention=None
+        )
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+
+        server = create_server(
+            esc_queue,
+            harness=stub_harness,
+            orch_config=orch_config,
+            merge_queue=asyncio.Queue(),
+        )
+
+        bare_result = await _call_merge_request(
+            server,
+            task_id='123',
+            branch='123',
+            worktree=str(tmp_path / 'wt-bare'),
+            description='',
+        )
+        prefixed_result = await _call_merge_request(
+            server,
+            task_id='123',
+            branch='task/123',
+            worktree=str(tmp_path / 'wt-prefixed'),
+            description='',
+        )
+
+        assert bare_result.get('status') == 'already_merged', (
+            f'Expected status already_merged for bare branch, got: {bare_result}'
+        )
+        assert bare_result.get('commit') == tip
+        assert prefixed_result.get('status') == 'already_merged', (
+            f'Expected status already_merged for pre-prefixed branch, got: {prefixed_result}'
+        )
+        assert prefixed_result.get('commit') == tip
+
+        called_with = [call.args[0] for call in resolve_branch_sha.call_args_list]
+        assert called_with == ['task/123', 'task/123'], (
+            "Expected both calls to resolve the same ref 'task/123' "
+            f"(never a double-prefixed 'task/task/123'), got: {called_with}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestGetMergeQueue — live merge-queue snapshot via get_merge_queue MCP tool
