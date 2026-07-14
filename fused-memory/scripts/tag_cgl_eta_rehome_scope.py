@@ -232,6 +232,75 @@ def select_projects(
 
 
 # ---------------------------------------------------------------------------
+# Live shell: apply_tags
+# ---------------------------------------------------------------------------
+
+async def apply_tags(
+    memory: Any,
+    decisions_by_project: dict[str, list[dict[str, Any]]],
+    records_by_project: dict[str, list[dict[str, Any]]],
+) -> set[str]:
+    """Apply every ``'tag'`` decision via ``memory.mem0.update``, best-effort.
+
+    For each project's decisions with ``action == 'tag'``, calls
+    ``memory.mem0.update(record_id, new_content, scope,
+    metadata=record['metadata'])`` -- passing the FULL scrolled payload back
+    so mem0's payload-overwriting ``_update_memory`` preserves the custom
+    provenance keys (``src_project``/``dst_project``/``kind``/
+    ``source_migration``/...) instead of wiping them; ``created_at`` is
+    preserved by mem0 regardless.
+
+    Mirrors ``prune_recon_cycle_summaries.apply_prune``'s best-effort
+    posture: each update is individually guarded by try/except so one bad
+    entry cannot abort the batch -- a failure is logged (WARNING) and its id
+    excluded from the returned applied set.
+
+    Records classified ``'skip:*'`` (and any decision whose id has no
+    matching scrolled record) are never touched.
+
+    Parameters
+    ----------
+    memory:
+        Live (or mock) MemoryService instance.
+    decisions_by_project:
+        ``{project_id: [classify_rehome_record(...), ...]}``.
+    records_by_project:
+        ``{project_id: [scrolled record, ...]}`` -- the raw
+        ``scroll_by_metadata`` results the decisions were derived from, in
+        the same order; used to recover each ``'tag'`` decision's full
+        original metadata payload.
+
+    Returns
+    -------
+    Set of memory ids actually updated.
+    """
+    applied: set[str] = set()
+    for pid, decisions in decisions_by_project.items():
+        scope = Scope(project_id=pid)
+        records_by_id = {r['id']: r for r in records_by_project.get(pid, [])}
+        for decision in decisions:
+            if decision['action'] != 'tag':
+                continue
+            record = records_by_id.get(decision['id'])
+            if record is None:
+                continue
+            try:
+                await memory.mem0.update(
+                    decision['id'], decision['new_content'], scope,
+                    metadata=record['metadata'],
+                )
+            except Exception as exc:  # noqa: BLE001 -- best-effort, mirrors apply_prune
+                logger.warning(
+                    'tag_cgl_eta_rehome_scope: failed to update memory %s '
+                    '(project %s): %s',
+                    decision['id'], pid, exc,
+                )
+            else:
+                applied.add(decision['id'])
+    return applied
+
+
+# ---------------------------------------------------------------------------
 # Live shell: run
 # ---------------------------------------------------------------------------
 
@@ -305,6 +374,7 @@ async def run(
 
     # Scan + classify every selected project.
     decisions_by_project: dict[str, list[dict[str, Any]]] = {}
+    records_by_project: dict[str, list[dict[str, Any]]] = {}
     for pid in project_ids:
         scope = Scope(project_id=pid)
         scrolled = await memory.mem0.scroll_by_metadata(
@@ -318,10 +388,13 @@ async def run(
             )
             scrolled = []
 
+        records_by_project[pid] = scrolled
         decisions_by_project[pid] = [classify_rehome_record(r) for r in scrolled]
 
     # Apply or dry-run.
     applied_ids: set[str] = set()
+    if args.apply:
+        applied_ids = await apply_tags(memory, decisions_by_project, records_by_project)
 
     report = build_tag_report(
         decisions_by_project=decisions_by_project,
