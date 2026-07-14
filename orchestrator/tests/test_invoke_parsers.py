@@ -273,3 +273,70 @@ class TestParsePiEmptyOutput:
         )
         agent_result = _parse_pi_output(result, 'anthropic/claude-haiku-4-5')
         assert agent_result.timed_out is True
+
+
+# Two assistant `turn_end`/`agent_end` messages, per the spike's observed
+# per-message usage/cost shape (plans/pi-spike-findings.md Q2): 2-turn run,
+# turn1 cost.total=0.0009355 + turn2 cost.total=0.000887 == 0.0018225.
+_PI_ASSISTANT_MSG_1 = {
+    'role': 'assistant',
+    'stopReason': 'stop',
+    'usage': {'input': 600, 'output': 30, 'totalTokens': 663, 'cost': {'total': 0.0009355}},
+    'content': [{'type': 'text', 'text': 'part1'}],
+}
+_PI_ASSISTANT_MSG_2 = {
+    'role': 'assistant',
+    'stopReason': 'stop',
+    'usage': {'input': 500, 'output': 20, 'totalTokens': 520, 'cost': {'total': 0.000887}},
+    'content': [{'type': 'text', 'text': 'part2'}],
+}
+
+
+class TestParsePiSuccess:
+    """`_parse_pi_output` happy-path JSONL parse (deliverable #1): native
+    per-message cost (NOT the price table), turns = count of `turn_end`
+    events, session_id from the `session` event, output = the terminal
+    assistant message's joined text."""
+
+    def _build_stdout(self, *, with_deltas: bool = False) -> str:
+        events = [
+            {'type': 'session', 'id': 'sess-abc'},
+            {'type': 'agent_start'},
+            {'type': 'turn_start'},
+        ]
+        if with_deltas:
+            events.append({'type': 'message_update', 'delta': {'type': 'text_delta', 'text': 'par'}})
+        events.append({'type': 'turn_end', 'message': _PI_ASSISTANT_MSG_1})
+        events.append({'type': 'turn_start'})
+        if with_deltas:
+            events.append({'type': 'tool_execution_update', 'toolName': 'bash', 'delta': 'chunk'})
+        events.append({'type': 'turn_end', 'message': _PI_ASSISTANT_MSG_2})
+        events.append({
+            'type': 'agent_end',
+            'messages': [_PI_ASSISTANT_MSG_1, _PI_ASSISTANT_MSG_2],
+            'willRetry': False,
+        })
+        events.append({'type': 'agent_settled'})
+        return '\n'.join(json.dumps(e) for e in events)
+
+    def test_success_parses_session_turns_cost_and_output(self):
+        result = _make_subprocess_result(stdout=self._build_stdout(), returncode=0)
+        agent_result = _parse_pi_output(result, 'anthropic/claude-haiku-4-5')
+        assert agent_result.success is True
+        assert agent_result.session_id == 'sess-abc'
+        assert agent_result.turns == 2
+        # NATIVE per-message cost (sum over agent_end.messages[] assistant
+        # cost.total), NOT the price table.
+        assert agent_result.cost_usd == pytest.approx(0.0018225)
+        # output = joined content[type=="text"].text of the *terminal*
+        # assistant message (agent_end.messages[-1]) — assert it contains
+        # that text rather than pinning a cross-turn join.
+        assert 'part2' in agent_result.output
+
+    def test_message_update_and_tool_execution_update_are_ignored(self):
+        """Streaming delta events (message_update / tool_execution_update)
+        must not affect cost/turns accounting."""
+        result = _make_subprocess_result(stdout=self._build_stdout(with_deltas=True), returncode=0)
+        agent_result = _parse_pi_output(result, 'anthropic/claude-haiku-4-5')
+        assert agent_result.turns == 2
+        assert agent_result.cost_usd == pytest.approx(0.0018225)
