@@ -1185,16 +1185,33 @@ class GitOps:
             The minted worktree path, already checked out at *sha*.
 
         Raises:
-            EphemeralWorktreeError: ``git worktree add`` failed on all 3
-                attempts.  Raised BEFORE the yield, so the caller's
-                ``async with`` body never runs.  Because the add never
-                succeeded, no cleanup ``git worktree remove`` is issued
-                (there is nothing registered to remove) — but a belt-and-
-                suspenders ``shutil.rmtree`` of *tmp_path* still runs before
-                the exception propagates, in case a failed add left a
-                partial/empty directory behind (this prefix is
-                :data:`PROTECTED_PREFIXES`-registered, so the reaper would
-                never reclaim a leaked directory itself).
+            EphemeralWorktreeError: either (a) the sibling ``<name>.lock``
+                flock (task 2507 — see below) was already held by another
+                consumer (``fcntl.flock(LOCK_EX|LOCK_NB)`` denied) — raised
+                BEFORE ``git worktree add`` is even attempted, so no
+                worktree is minted and no add argv is issued; or (b)
+                ``git worktree add`` itself failed on all 3 attempts.  In
+                both cases the caller's ``async with`` body never runs.
+                For (b), because the add never succeeded, no cleanup ``git
+                worktree remove`` is issued (there is nothing registered to
+                remove) — but a belt-and-suspenders ``shutil.rmtree`` of
+                *tmp_path* still runs before the exception propagates, in
+                case a failed add left a partial/empty directory behind
+                (this prefix is :data:`PROTECTED_PREFIXES`-registered, so
+                the reaper would never reclaim a leaked directory itself).
+
+        Note:
+            Acquires an exclusive, non-blocking ``fcntl.flock`` on a
+            sibling ``<worktree_base>/<kind.value><hex>.lock`` file BEFORE
+            minting the worktree, and holds it for the CM's entire
+            lifetime (task 2507). This is the exact lock path reify
+            warm-lane-gc.sh derives (``${WORKTREES_DIR}/${name}.lock``,
+            gc.sh:488/564) for its own ``flock -n`` orphan-removal
+            contender, so a live probe/sweep here is correctly seen as a
+            "live consumer" by gc.sh and preserved rather than force-
+            removed mid-verify. The lock file is unlinked on exit ONLY
+            when this call was the one that acquired it (never a foreign
+            holder's lock) — see the ``EphemeralWorktreeError`` case above.
         """
         base = self.worktree_base
         base.mkdir(parents=True, exist_ok=True)
@@ -1214,8 +1231,19 @@ class GitOps:
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
         acquired = False
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            acquired = True
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except (BlockingIOError, OSError) as e:
+                # Someone else already holds this lock — should never
+                # happen in practice (tmp_path's hex is a fresh uuid4 per
+                # call), but fail safe rather than proceed unprotected.
+                # `acquired` stays False, so the outer finally below closes
+                # our fd WITHOUT unlinking the foreign holder's lock file.
+                raise EphemeralWorktreeError(
+                    f'ephemeral_worktree({kind.name}): flock LOCK_NB denied on '
+                    f'{lock_path} — live consumer holds it; skipping'
+                ) from e
 
             try:
                 for attempt in range(_MAX_ADD_RETRIES):
