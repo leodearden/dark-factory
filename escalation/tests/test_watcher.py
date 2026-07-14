@@ -834,3 +834,83 @@ class TestExcludeFile:
             '  esc-3-1  \n'
         )
         assert _read_exclude_file(exclude_file) == frozenset({'esc-1-1', 'esc-2-1', 'esc-3-1'})
+
+    def test_exclude_file_honored_in_initial_scan(self, tmp_path, capsys):
+        """Sole pending escalation's id listed in --exclude-file -> initial
+        scan excludes it, event loop entered (no inotify event needed)."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc = Escalation(
+            id='esc-23-1', task_id='23', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='pending',
+        )
+        _write_esc(queue_dir, esc)
+
+        exclude_file = tmp_path / 'excludes.txt'
+        exclude_file.write_text(f'{esc.id}\n')
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir),
+                '--exclude-file', str(exclude_file),
+            ]),
+        ):
+            mock_inotify = MockINotify.return_value
+            mock_inotify.read.side_effect = KeyboardInterrupt
+
+            from escalation.watcher import main
+
+            with contextlib.suppress(KeyboardInterrupt):
+                main()
+
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        mock_inotify.read.assert_called_once()
+
+    def test_exclude_file_reread_each_poll(self, tmp_path, capsys):
+        """The exclude-file is re-read on every poll: a loop caller can
+        append a deliberately-pending id mid-wait without restarting the
+        watcher, and the very next event for it is suppressed."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc = Escalation(
+            id='esc-24-1', task_id='24', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='deliberately-pending',
+        )
+        _write_esc(queue_dir, esc)
+
+        exclude_file = tmp_path / 'excludes.txt'
+        exclude_file.write_text('')  # empty at launch
+
+        mock_event = MagicMock()
+        mock_event.name = f'{esc.id}.json'
+
+        def _read_side_effect(*args, **kwargs):
+            if not hasattr(_read_side_effect, 'called'):
+                _read_side_effect.called = True
+                # Append the id to the exclude-file BETWEEN polls, then
+                # return an event for it on this same poll.
+                exclude_file.write_text(f'{esc.id}\n')
+                return [mock_event]
+            raise KeyboardInterrupt
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.exit') as mock_exit,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir),
+                '--exclude-file', str(exclude_file),
+            ]),
+            patch('escalation.watcher._initial_scan', return_value=None),
+        ):
+            mock_inotify = MockINotify.return_value
+            mock_inotify.read.side_effect = _read_side_effect
+
+            from escalation.watcher import main
+
+            with contextlib.suppress(KeyboardInterrupt):
+                main()
+
+        mock_exit.assert_not_called()
+        assert capsys.readouterr().out == ''
