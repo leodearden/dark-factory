@@ -781,3 +781,171 @@ def test_run_census_defers_on_headroom_banner(tmp_path, caplog):
     assert not kwargs["codebook_path"].exists()
     assert not kwargs["census_state_path"].exists()
     assert not kwargs["report_path"].exists()
+
+
+# ---------------------------------------------------------------------------
+# step-19: RED — run_census() HAPPY path, full seam wiring + static routing
+# ---------------------------------------------------------------------------
+
+def _make_fake_verify_fn(*, verified_titles=(), rejected_titles=(), fixed_entry_ids=()):
+    """Fake Sonnet `verify_fn(clusters, *, model)` seam. Splits the input
+    clusters by title into verified/rejected per the given title sets;
+    `fixed_entry_ids` is returned verbatim so a test can exercise the
+    retire_entry path independently of any particular cluster. Records
+    every call's (clusters, model) in `.calls`."""
+    calls = []
+
+    def fake_verify_fn(clusters, *, model):
+        calls.append({"clusters": clusters, "model": model})
+        return {
+            "verified": [c for c in clusters if c.get("title") in verified_titles],
+            "rejected": [c for c in clusters if c.get("title") in rejected_titles],
+            "fixed": list(fixed_entry_ids),
+        }
+
+    fake_verify_fn.calls = calls
+    return fake_verify_fn
+
+
+def _make_fake_synthesize_fn(text="Fable synthesis prose."):
+    """Fake Fable `synthesize_fn(verified, *, model)` seam. Always returns
+    `text`; records every call's (verified, model) in `.calls`."""
+    calls = []
+
+    def fake_synthesize_fn(verified, *, model):
+        calls.append({"verified": verified, "model": model})
+        return text
+
+    fake_synthesize_fn.calls = calls
+    return fake_synthesize_fn
+
+
+def _make_fake_commit():
+    """Fake best-effort git `commit(paths=, message=)` seam. Records every
+    call's kwargs in `.calls`."""
+    calls = []
+
+    def fake_commit(**kwargs):
+        calls.append(kwargs)
+        return None
+
+    fake_commit.calls = calls
+    return fake_commit
+
+
+def _happy_invoke_response(prompt, model):
+    """Fake coder-LLM reply chooser for the run_census happy-path test: the
+    "novel-verified" digest gets a one-candidate judgment whose cluster
+    `verify_fn` will mark verified (-> promoted); "novel-rejected" gets a
+    one-candidate judgment `verify_fn` will mark rejected; every other
+    prompt (including the tiny headroom probe, which never mentions either
+    marker) gets a matches-only (duplicate) judgment carrying no banner
+    marker, so the preflight passes."""
+    if "novel-verified" in prompt:
+        return json.dumps(
+            {
+                "matches": [],
+                "candidates": [
+                    {
+                        "title": "Silent no-op subagent contract",
+                        "cause": "Agents were given contracts their runtime could not honor.",
+                        "area": "orchestrator",
+                        "origin_phase": "implement",
+                        "manifested_phase": "verify",
+                        "evidence_quote": "the subagent silently no-oped",
+                    }
+                ],
+            }
+        )
+    if "novel-rejected" in prompt:
+        return json.dumps(
+            {
+                "matches": [],
+                "candidates": [
+                    {
+                        "title": "Spurious pattern",
+                        "origin_phase": "review",
+                        "manifested_phase": "merge",
+                    }
+                ],
+            }
+        )
+    return json.dumps({"matches": [{"entry_id": "entry-a"}], "candidates": []})
+
+
+def test_run_census_happy_path_full_seam_wiring(tmp_path):
+    batch = [
+        _hand_digest("dup-1", "nothing new here"),
+        _hand_digest("novel-verified", "a genuinely new confusion shape"),
+        _hand_digest("novel-rejected", "a spurious one-off"),
+    ]
+    fake_invoke = _make_fake_invoke(_happy_invoke_response)
+    fake_verify_fn = _make_fake_verify_fn(
+        verified_titles={"Silent no-op subagent contract"},
+        rejected_titles={"Spurious pattern"},
+    )
+    fake_synthesize_fn = _make_fake_synthesize_fn()
+    fake_submit_fn = _make_fake_submit_fn()
+    fake_commit = _make_fake_commit()
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        batch_source=[batch],
+        verify_fn=fake_verify_fn,
+        synthesize_fn=fake_synthesize_fn,
+        submit_fn=fake_submit_fn,
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(3),
+        commit=fake_commit,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    # --- static model routing (ratified policy, PRD §5/§12) ---
+    assert any(c["model"] == "sonnet" for c in fake_invoke.calls), "miners routed to census_miner"
+    assert len(fake_verify_fn.calls) == 1
+    assert fake_verify_fn.calls[0]["model"] == "sonnet", "verify routed to census_verify"
+    assert len(fake_synthesize_fn.calls) == 1
+    assert fake_synthesize_fn.calls[0]["model"] == "fable", "synthesis routed to census_synthesis"
+    verified_titles_seen = {c["title"] for c in fake_synthesize_fn.calls[0]["verified"]}
+    assert verified_titles_seen == {"Silent no-op subagent contract"}
+
+    # --- remediation filing: curator path, never planning_mode ---
+    assert len(fake_submit_fn.calls) == 1, "only the verified cluster is filed"
+    filed_kwargs = fake_submit_fn.calls[0]
+    assert "planning_mode" not in filed_kwargs
+    assert "Silent no-op subagent contract" in filed_kwargs["title"]
+
+    # --- codebook persisted: merge + promote + reject, never-delete ---
+    assert kwargs["codebook_path"].exists()
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    promoted_entry = next(
+        (e for e in persisted["entries"] if e["title"] == "Silent no-op subagent contract"), None
+    )
+    assert promoted_entry is not None, "verified candidate must be promoted to an entry"
+    rejected_candidate = next(
+        c for c in persisted["candidates"] if c["title"] == "Spurious pattern"
+    )
+    assert rejected_candidate["disposition"] == "rejected", "rejected candidate RETAINED, marked"
+
+    # --- census state advanced with status_fetcher's done-count baseline ---
+    assert kwargs["census_state_path"].exists()
+    state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
+    assert state["last_census_done_count"] == 3
+
+    # --- report written to the plans/ path ---
+    assert kwargs["report_path"].exists()
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "# confusion census 2026-07-14" in report_text
+    assert "Fable synthesis prose." in report_text
+
+    # --- best-effort commit of report + codebook + state ---
+    assert len(fake_commit.calls) == 1
+
+    # --- outcome: filed task ids + report path + saturation stop_reason ---
+    assert outcome.status == "done"
+    assert outcome.report_path == str(kwargs["report_path"])
+    assert outcome.filed_task_ids == ["task-1"]
+    assert outcome.stop_reason == "exhausted"
