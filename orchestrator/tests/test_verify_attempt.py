@@ -112,3 +112,91 @@ class TestCheckRun:
             'started_at': 'ts',
             'duration_secs': 3.25,
         }
+
+
+def _run(label, rc=0, timed_out=False, cmd='cmd', output='', started_at='ts', duration_secs=1.0):
+    """Build a CheckRun with sane defaults, overriding only what a case cares about."""
+    from orchestrator.verify import CheckRun  # noqa: PLC0415
+
+    return CheckRun(
+        label=label, cmd=cmd, rc=rc, output=output, timed_out=timed_out,
+        started_at=started_at, duration_secs=duration_secs,
+    )
+
+
+class TestVerifyAttempt:
+    """step-3: VerifyAttempt derives passed/any_timed_out/pure_timeout_failure
+    ONCE, generically over `checks` — the single source of truth that
+    replaces the two hand-duplicated 6-clause formula copies in
+    run_verification (first-pass retry loop verify.py:3009-3020 and the
+    env-recovery branch verify.py:3105-3113, added by task 2048's drift fix).
+
+    RED today: ``from orchestrator.verify import VerifyAttempt`` raises ImportError.
+    """
+
+    def test_all_passing_including_a_skipped_check(self):
+        """(a) Three rc=0 legs, one of them skipped -> clean pass, no timeout signal."""
+        from orchestrator.verify import CheckRun, VerifyAttempt  # noqa: PLC0415
+
+        attempt = VerifyAttempt(checks=[
+            _run('test', rc=0),
+            _run('lint', rc=0),
+            CheckRun.skipped('type'),
+        ])
+        assert attempt.passed is True
+        assert attempt.any_timed_out is False
+        assert attempt.pure_timeout_failure is False
+
+    def test_single_timed_out_leg_is_a_pure_timeout_failure(self):
+        """(b) test times out; lint/type clean -> the env-recovery-wall-clock
+        invariant at the single-source seam: a pure timeout computed ONCE
+        means `timed_out=(not passed and pure_timeout_failure)` can never be
+        False while this is classified as a pure timeout (the 2048 drift
+        this task removes structurally)."""
+        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+
+        attempt = VerifyAttempt(checks=[
+            _run('test', rc=1, timed_out=True),
+            _run('lint', rc=0),
+            _run('type', rc=0),
+        ])
+        assert attempt.passed is False
+        assert attempt.any_timed_out is True
+        assert attempt.pure_timeout_failure is True
+
+    def test_real_failure_alongside_a_timeout_poisons_pure_timeout(self):
+        """(c) test has a REAL (non-timeout) failure; type times out ->
+        pure_timeout_failure must be False, since not every non-zero rc is
+        attributable to a timeout."""
+        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+
+        attempt = VerifyAttempt(checks=[
+            _run('test', rc=1, timed_out=False),
+            _run('type', rc=1, timed_out=True),
+        ])
+        assert attempt.passed is False
+        assert attempt.any_timed_out is True
+        assert attempt.pure_timeout_failure is False
+
+    def test_lint_only_pure_timeout(self):
+        """(d) A single-check attempt where that lone check timed out is
+        still a pure timeout."""
+        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+
+        attempt = VerifyAttempt(checks=[_run('lint', rc=1, timed_out=True)])
+        assert attempt.pure_timeout_failure is True
+
+    def test_label_accessors_return_matching_check(self):
+        """.test/.lint/.type return the CheckRun with the matching label —
+        the per-leg consumer sites (env-recovery, _summarize_checks call
+        sites, xdist gate, VerifyResult construction) read through these
+        instead of the old parallel scalar locals."""
+        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+
+        test_run = _run('test', cmd='uv run pytest')
+        lint_run = _run('lint', cmd='uv run ruff')
+        type_run = _run('type', cmd='uv run pyright')
+        attempt = VerifyAttempt(checks=[test_run, lint_run, type_run])
+        assert attempt.test is test_run
+        assert attempt.lint is lint_run
+        assert attempt.type is type_run
