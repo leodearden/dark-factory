@@ -120,6 +120,52 @@ def test_hook_session_slug_uses_cwd_fallback_when_absent(
 
 
 # ---------------------------------------------------------------------------
+# Task 2511 step-3: CLAUDE_SPAWN_SESSION_ID convergence (dual-record fix)
+# ---------------------------------------------------------------------------
+
+
+def test_hook_session_slug_prefers_claude_spawn_session_id_when_present() -> None:
+    # The env token wins outright -- session_id/role/project/task_id are all
+    # ignored -- because it is already spawn-claude.sh's own launching-record
+    # slug; recomposing it through build_session_slug would double-prefix.
+    hook_input = {'session_id': 'uuid-x', 'cwd': '/home/leo/src/dark-factory'}
+    env = {
+        'CLAUDE_SPAWN_SESSION_ID': 'session-cockpit-3215033',
+        'CLAUDE_SPAWN_ROLE': 'unblock',
+        'CLAUDE_SPAWN_PROJECT': 'df',
+        'CLAUDE_SPAWN_TASK_ID': '2085',
+    }
+    assert sh.hook_session_slug(hook_input, env=env) == 'session-cockpit-3215033'
+
+
+@pytest.mark.parametrize('spawn_session_id', [None, '', '   '])
+def test_hook_session_slug_falls_back_when_claude_spawn_session_id_absent(
+    spawn_session_id: str | None,
+) -> None:
+    # Missing/blank/whitespace-only CLAUDE_SPAWN_SESSION_ID must not clobber
+    # the hand-launched session_id-derived fallback slug.
+    hook_input = {'session_id': 'abc-123', 'cwd': '/home/leo/src/dark-factory'}
+    env: dict[str, str] = {}
+    if spawn_session_id is not None:
+        env['CLAUDE_SPAWN_SESSION_ID'] = spawn_session_id
+    slug = sh.hook_session_slug(hook_input, env=env)
+    assert slug == sr.build_session_slug(
+        'session',
+        'dark-factory',
+        None,
+        'abc-123',  # type: ignore[arg-type]
+    )
+
+
+def test_hook_session_slug_sanitizes_malformed_claude_spawn_session_id() -> None:
+    hook_input = {'session_id': 'uuid-x', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': 'bad/id#x'}
+    slug = sh.hook_session_slug(hook_input, env=env)
+    assert slug == sr.sanitize_slug('bad/id#x')
+    assert slug == 'bad-id-x'
+
+
+# ---------------------------------------------------------------------------
 # Step-3: pure OSC-retitle + display-title helpers
 # ---------------------------------------------------------------------------
 
@@ -329,6 +375,103 @@ def test_run_session_start_no_parent_id_env_leaves_parent_session_id_none(tmp_pa
     slug = sh.hook_session_slug(hook_input, env)
     record = sr.read_record(slug, root=tmp_path)
     assert record.parent_session_id is None
+
+
+# ---------------------------------------------------------------------------
+# Task 2511 step-3: run_session_start/run_notification/run_stop convergence
+# ---------------------------------------------------------------------------
+
+
+def test_run_session_start_converges_onto_spawn_claude_launching_record(
+    tmp_path: Path,
+) -> None:
+    # A rich LAUNCHING record, as spawn-claude.sh's `launching` write would
+    # produce, pre-exists at slug S. SessionStart (with a DIFFERENT Claude
+    # Code session_id, but CLAUDE_SPAWN_SESSION_ID=S) must advance that SAME
+    # record rather than creating a second, uuid-keyed one.
+    slug = 'session-cockpit-3215033'
+    result_file = str(sr.record_path_for_slug(slug, root=tmp_path).parent / 'result.md')
+    launching = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.LAUNCHING,
+        role='session',
+        project='cockpit',
+        task_id=None,
+        prompt='/spawn cockpit',
+        cwd='/home/leo/src/dark-factory',
+        launcher_pid=3215033,
+        result_file=result_file,
+    )
+    sr.write_record(launching, root=tmp_path)
+
+    hook_input = {'session_id': 'uuid-x', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+    # Rich pre-existing fields survive the convergence refresh untouched.
+    assert record.role == 'session'
+    assert record.project == 'cockpit'
+    assert record.prompt == '/spawn cockpit'
+    assert record.launcher_pid == 3215033
+    assert record.result_file == result_file
+    # No separate uuid-keyed duplicate: exactly one dir in sessions_dir.
+    dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
+    assert len(dirs) == 1
+    assert dirs[0].name == slug
+
+
+def test_full_lifecycle_converges_on_one_slug_through_exit(tmp_path: Path) -> None:
+    slug = 'session-cockpit-3215034'
+    sr.write_record(
+        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215034),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-y', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+
+    sh.run_notification(hook_input, env, root=tmp_path)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.AWAITING_INPUT
+
+    sh.run_stop(hook_input, env, root=tmp_path)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+
+    sr.update_status(slug, root=tmp_path, status=sr.Status.EXITED, exit_code=0)
+    final = sr.read_record(slug, root=tmp_path)
+    assert final.status == sr.Status.EXITED
+    assert final.exit_code == 0
+
+    # One record dir throughout the whole lifecycle -- never a second one.
+    dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
+    assert len(dirs) == 1
+    assert dirs[0].name == slug
+
+
+def test_run_notification_and_stop_converge_onto_spawn_claude_slug_not_uuid(
+    tmp_path: Path,
+) -> None:
+    slug = 'session-cockpit-3215035'
+    sr.write_record(
+        sr.SessionRecord(session_slug=slug, status=sr.Status.RUNNING, launcher_pid=3215035),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-z', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_notification(hook_input, env, root=tmp_path)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.AWAITING_INPUT
+
+    sh.run_stop(hook_input, env, root=tmp_path)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+
+    uuid_slug = sh.hook_session_slug({'session_id': 'uuid-z', 'cwd': hook_input['cwd']}, env={})
+    assert uuid_slug != slug
+    assert not sr.record_path_for_slug(uuid_slug, root=tmp_path).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1443,9 +1586,13 @@ def _run_hook_script(
     script_name: str,
     hook_input: Mapping[str, object],
     root: Path,
+    *,
+    extra_env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     env = dict(os.environ)
     env['CLAUDE_FLEET_ROOT'] = str(root)
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [str(_HOOKS_DIR / script_name)],
         input=json.dumps(hook_input).encode(),
@@ -1472,3 +1619,38 @@ def test_session_start_sh_then_notification_sh_flip_status(tmp_path: Path) -> No
 
     record = sr.read_record(slug, root=tmp_path)
     assert record.status == sr.Status.AWAITING_INPUT
+
+
+# ---------------------------------------------------------------------------
+# Task 2511 step-3: bash-level CLAUDE_SPAWN_SESSION_ID convergence
+# ---------------------------------------------------------------------------
+
+
+def test_session_start_sh_converges_onto_pre_written_launching_record(tmp_path: Path) -> None:
+    # Proves CLAUDE_SPAWN_SESSION_ID propagates through the real .sh -> python
+    # wiring (not just the pure-python run_session_start path exercised
+    # above): a pre-written LAUNCHING record at slug S, keyed the way
+    # spawn-claude.sh's own `launching` write keys it, must advance to
+    # RUNNING via the real session-start.sh entrypoint -- with a DIFFERENT
+    # Claude Code session_id -- when CLAUDE_SPAWN_SESSION_ID=S is in env.
+    slug = 'session-cockpit-3215099'
+    sr.write_record(
+        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215099),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-bash-convergence', 'cwd': '/home/leo/src/dark-factory'}
+
+    result = _run_hook_script(
+        'session-start.sh',
+        hook_input,
+        tmp_path,
+        extra_env={'CLAUDE_SPAWN_SESSION_ID': slug},
+    )
+
+    assert result.returncode == 0
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+    # No separate uuid-keyed duplicate.
+    dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
+    assert len(dirs) == 1
+    assert dirs[0].name == slug

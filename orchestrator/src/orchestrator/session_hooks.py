@@ -10,15 +10,24 @@ captured into the session registry.
 
 This module imports ``orchestrator.session_registry`` read-only (PRD §6 G5:
 consumers import the shared record contract, they never re-derive it). All
-three hook handlers key their registry record on the Claude Code
-``session_id`` delivered on each hook's stdin JSON — the only identity that
-is present in, and stable across, all three events for one session.
+three hook handlers key their registry record on ``CLAUDE_SPAWN_SESSION_ID``
+(env) when present — spawn-claude.sh's own ``launching``-record slug for a
+spawned session — falling back to the Claude Code ``session_id`` delivered
+on each hook's stdin JSON for a hand-launched session (see
+``hook_session_slug``).
 
-KNOWN LIMITATION for spawned sessions: this trio's records are keyed on
-``session_id``, while ``spawn-claude.sh``'s own ``launching`` write keys its
-record on the integer ``launcher_pid`` — a different uniqueness token that
-can never converge with ``session_id`` (see ``run_session_start``'s
-docstring). Reconciling the two is deferred to a future task.
+RESOLVED (task 2511): spawned sessions used to get TWO registry records —
+this trio's session_id-keyed one and spawn-claude.sh's pid-keyed
+``launching``/``exited`` one — because ``session_id`` and ``launcher_pid``
+are different uniqueness tokens that can never converge (see
+``run_session_start``'s docstring). Now that spawn-claude.sh exports
+``CLAUDE_SPAWN_SESSION_ID`` (its own launching record's slug) into the
+spawned session's environment, ``hook_session_slug`` adopts it directly, so
+all three hooks — plus spawn-claude.sh's own ``launching``/``exit`` writes —
+target the SAME record: one record advances
+launching -> running -> idle/awaiting-input -> exited (exited is still
+written by spawn-claude.sh's ``finish()``). Hand-launched sessions (no
+CLAUDE_SPAWN_SESSION_ID) still key on session_id, exactly as before.
 """
 
 from __future__ import annotations
@@ -93,12 +102,29 @@ def hook_session_slug(
 ) -> str:
     """Build the record-identity slug for one hook event.
 
-    Reuses ``session_registry.build_session_slug`` with the hook's
-    ``session_id`` as the uniqueness token in place of ``launcher_pid`` --
-    ``session_id`` is stable across the SessionStart/Notification/Stop
-    events of one Claude Code session, so all three deterministically
-    resolve to the same ``record.json``.
+    Prefers ``CLAUDE_SPAWN_SESSION_ID`` (env) when present: that value is
+    already spawn-claude.sh's own ``launching``-record slug, so it is
+    returned DIRECTLY (sanitized via ``session_registry.sanitize_slug``),
+    NOT fed back through ``build_session_slug`` -- doing so would
+    double-prefix it (e.g. ``'session-cockpit-session-cockpit-3215033'``)
+    and miss the pre-existing launching record. This is what lets all three
+    hook events converge on the SAME pid-keyed record spawn-claude.sh
+    created (module docstring). A missing, empty, or whitespace-only value
+    is treated as absent (mirrors ``_resolve_parent_session_id``'s
+    ``env.get(...) or None`` idiom, extended with a ``.strip()`` so a
+    blank-but-non-empty token also falls through).
+
+    Otherwise reuses ``session_registry.build_session_slug`` with the
+    hook's ``session_id`` as the uniqueness token in place of
+    ``launcher_pid`` -- ``session_id`` is stable across the
+    SessionStart/Notification/Stop events of one Claude Code session, so
+    all three deterministically resolve to the same ``record.json`` (the
+    hand-launched fallback).
     """
+    spawn_session_id = (env.get('CLAUDE_SPAWN_SESSION_ID') or '').strip() or None
+    if spawn_session_id is not None:
+        return session_registry.sanitize_slug(spawn_session_id)
+
     identity = resolve_hook_identity(hook_input, env)
     session_id = str(hook_input.get('session_id') or 'unknown')
     # session_id (str) deliberately fills the launcher_pid slot as the
@@ -358,21 +384,24 @@ def run_session_start(
     from ``TMUX``/``WINDOWID``, see ``_resolve_display``) before a single
     ``write_record`` call, which bumps the record's mtime heartbeat.
 
-    KNOWN dual-record split for SPAWNED sessions: this slug is keyed on the
-    Claude Code ``session_id`` (module docstring), while spawn-claude.sh's
-    own ``launching`` write keys ITS record on the integer ``launcher_pid`` --
-    a different uniqueness token that ``session_id`` can never converge with,
-    since spawn-claude.sh cannot know the session_id Claude Code will assign
-    at launch time. A spawned session therefore gets TWO registry records
-    today: spawn-claude.sh's pid-keyed LAUNCHING/RUNNING/EXITED record, and
-    this hook trio's session_id-keyed RUNNING/AWAITING_INPUT/IDLE record --
-    they do NOT merge into one, regardless of hook-vs-spawn-claude.sh timing.
-    Per the PRD addendum, reconciling the two is DEFERRED to a future task
-    that exports a shared identity token (e.g. CLAUDE_SPAWN_SESSION_ID or
-    CLAUDE_SPAWN_LAUNCHER_PID) into the spawned session's own environment;
-    until then, a downstream consumer (e.g. a future fleet-cockpit renderer)
-    must correlate/dedupe the two records itself (e.g. by matching cwd and
-    task_id) rather than assuming one record per session.
+    RESOLVED dual-record split for SPAWNED sessions (task 2511): this slug
+    used to be keyed on the Claude Code ``session_id`` (module docstring),
+    while spawn-claude.sh's own ``launching`` write keys ITS record on the
+    integer ``launcher_pid`` -- a different uniqueness token that
+    ``session_id`` could never converge with, since spawn-claude.sh cannot
+    know the session_id Claude Code will assign at launch time. A spawned
+    session used to get TWO registry records: spawn-claude.sh's pid-keyed
+    LAUNCHING/RUNNING/EXITED record, and this hook trio's session_id-keyed
+    RUNNING/AWAITING_INPUT/IDLE record -- they did not merge into one,
+    regardless of hook-vs-spawn-claude.sh timing. Per the PRD addendum, this
+    is now fixed: spawn-claude.sh exports ``CLAUDE_SPAWN_SESSION_ID`` (its
+    own launching record's slug) into the spawned session's own
+    environment, and ``hook_session_slug`` adopts that token directly (see
+    its docstring) -- so this handler's read/refresh/write all target
+    spawn-claude.sh's pre-existing record, converging launching -> running
+    -> idle/awaiting-input -> exited onto ONE record. Hand-launched sessions
+    (no CLAUDE_SPAWN_SESSION_ID) are unaffected -- they still key on
+    session_id exactly as before.
     """
     identity = resolve_hook_identity(hook_input, env)
     slug = hook_session_slug(hook_input, env)

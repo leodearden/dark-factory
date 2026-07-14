@@ -108,6 +108,15 @@ trap _cleanup EXIT
 # script's own stderr for loud, caller-visible diagnostics. CLAUDE_SPAWN_ROLE/
 # PROJECT/TASK_ID/ESCALATION_ID pass through from this process's own
 # environment when a caller already set them.
+#
+# Task 2511: the `launching` subcommand also opportunistically drives
+# session_registry's liveness sweep (mark_orphaned_sessions_exited) after it
+# writes this record -- fail-soft, and it never touches this call's stdout,
+# so the record dir captured into SESSION_RECORD_DIR below is unaffected.
+# reap_stale_records/that sweep have no periodic production driver of their
+# own (CLI-only), so every spawn is what drains prior orphaned
+# (unclean-death) records to `exited`; see session_registry._run_launching's
+# docstring.
 SESSION_RECORD_DIR=""
 if command -v python3 >/dev/null 2>&1; then
   SESSION_RECORD_DIR=$(
@@ -157,6 +166,34 @@ fi
 # byte-identical to record.session_slug (_run_launching prints
 # <root>/sessions/<slug>), exactly how CLAUDE_SPAWN_RESULT_FILE is derived
 # above.
+#
+# Task 2511: this CLAUDE_SPAWN_SESSION_ID export is what the spawned child's
+# own C2 rail hooks (orchestrator.session_hooks, SessionStart/Notification/
+# Stop -- see hook_session_slug) now CONSUME as their session-registry
+# record slug, in preference to the Claude Code session_id delivered on
+# each hook's stdin JSON. That resolves the former dual-record split: the
+# hooks' running/idle/awaiting-input writes and finish()'s exited write
+# (below) all converge on this SAME pid-keyed LAUNCHING record instead of
+# forking off a second, never-terminal, session_id-keyed one. Hand-launched
+# sessions (no CLAUDE_SPAWN_SESSION_ID in the environment) are unaffected --
+# their hooks still key on session_id, exactly as before.
+#
+# Caveat (reviewer-flagged): once exported, CLAUDE_SPAWN_SESSION_ID is
+# inherited by EVERY descendant process of the spawned session, not only its
+# top-level claude -- including a nested `claude` the spawned agent starts
+# directly by some OTHER means than this script (e.g. its own Bash tool). A
+# nested claude started THROUGH this script gets its own fresh value
+# (recomputed below from ITS OWN launcher_pid), so it is unaffected; a
+# nested claude NOT started through this script instead inherits this
+# value, and its SessionStart/Notification/Stop hooks then adopt it too --
+# collapsing that child's lifecycle writes onto THIS spawn's record instead
+# of getting a record of its own. This is a behavioral regression vs the
+# prior session_id-only keying, where every nested claude naturally got its
+# own record. Fixing it behaviorally belongs in hook_session_slug
+# (orchestrator/session_hooks.py, out of this task's module scope --
+# distinguishing a slug's first SessionStart from a later, different
+# session_id reusing the same inherited env var); documented here as a
+# known limitation rather than worked around in this script.
 spawn_id_export=""
 parent_id_export=""
 if [ -n "$SESSION_RECORD_DIR" ]; then

@@ -378,6 +378,34 @@ def test_build_session_slug_sanitizes_special_chars() -> None:
     assert re.fullmatch(r'[A-Za-z0-9._-]+', slug)
 
 
+# ---------------------------------------------------------------------------
+# Task 2511 step-1: sanitize_slug (shared filesystem-safe-slug normalizer)
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_slug_leaves_already_safe_slug_unchanged() -> None:
+    assert sr.sanitize_slug('session-cockpit-3215033') == 'session-cockpit-3215033'
+
+
+def test_sanitize_slug_maps_unsafe_chars_to_dash() -> None:
+    # '/' and '#' fall outside [A-Za-z0-9._-] (record_path_for_slug's
+    # path-escape guard) and are mapped to '-'; '.' is itself in the allowed
+    # set (mirrors _SLUG_SANITIZE_RE, the idiom this delegates to), so a
+    # path separator can never escape sessions_dir via record_path_for_slug.
+    slug = sr.sanitize_slug('weird/id#x.y')
+    assert slug == 'weird-id-x.y'
+    assert re.fullmatch(r'[A-Za-z0-9._-]+', slug)
+
+
+def test_sanitize_slug_matches_build_session_slug_regression() -> None:
+    # Pins build_session_slug's output as byte-identical to today once it
+    # delegates to sanitize_slug (step-2's behavior-preserving refactor).
+    assert sr.build_session_slug('unblock', 'df', '2085', 4242) == 'unblock-df-2085-4242'
+    slug = sr.build_session_slug('un block', 'df/prod', '20#85', 4242)
+    assert slug == 'un-block-df-prod-20-85-4242'
+    assert slug == sr.sanitize_slug('un block-df/prod-20#85-4242')
+
+
 def test_fleet_root_defaults_to_dot_claude_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv('CLAUDE_FLEET_ROOT', raising=False)
     monkeypatch.setenv('HOME', '/home/fakeuser')
@@ -984,6 +1012,152 @@ def test_reap_continues_sweep_when_one_directory_fails_to_remove(
 
 
 # ---------------------------------------------------------------------------
+# Task 2511 step-5: mark_orphaned_sessions_exited (liveness sweep, Part 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'status',
+    [sr.Status.LAUNCHING, sr.Status.RUNNING, sr.Status.IDLE, sr.Status.AWAITING_INPUT],
+)
+def test_mark_orphaned_marks_non_terminal_dead_pid_past_heartbeat_ttl(
+    status: sr.Status, tmp_path: Path
+) -> None:
+    r = _make_record(session_slug='orphan-1', status=status, launcher_pid=_DEAD_PID, exit_code=None)
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+    assert {m.session_slug for m in marked} == {'orphan-1'}
+    assert record_path.parent.is_dir()  # marked, NOT deleted (reap_stale_records' job)
+    assert record_path.is_file()
+    reloaded = sr.read_record('orphan-1', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+
+
+def test_mark_orphaned_keeps_non_terminal_live_pid_regardless_of_age(tmp_path: Path) -> None:
+    r = _make_record(session_slug='kept-live', status=sr.Status.RUNNING, launcher_pid=os.getpid())
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, timedelta(days=30))  # past both TTLs
+
+    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+    assert marked == []
+    assert sr.read_record('kept-live', root=tmp_path).status == sr.Status.RUNNING
+
+
+def test_mark_orphaned_keeps_non_terminal_dead_pid_within_heartbeat_ttl(tmp_path: Path) -> None:
+    r = _make_record(session_slug='kept-recent', status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID)
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL - timedelta(minutes=1))
+
+    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+    assert marked == []
+    assert sr.read_record('kept-recent', root=tmp_path).status == sr.Status.LAUNCHING
+
+
+def test_mark_orphaned_leaves_already_terminal_record_untouched(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='already-exited', status=sr.Status.EXITED, exit_code=0, launcher_pid=_DEAD_PID
+    )
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(days=2))
+
+    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+    assert marked == []
+    reloaded = sr.read_record('already-exited', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == 0  # NOT re-stamped with ORPHAN_EXIT_CODE
+
+
+def test_mark_orphaned_preserves_all_other_fields(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='orphan-fields',
+        status=sr.Status.RUNNING,
+        launcher_pid=_DEAD_PID,
+        role='unblock',
+        project='df',
+        task_id='2085',
+        result_file='/tmp/whatever/result.md',
+        start_ts='2026-07-07T00:00:00+00:00',
+    )
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+    reloaded = sr.read_record('orphan-fields', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+    assert reloaded.role == 'unblock'
+    assert reloaded.project == 'df'
+    assert reloaded.task_id == '2085'
+    assert reloaded.result_file == '/tmp/whatever/result.md'
+    assert reloaded.launcher_pid == _DEAD_PID
+    assert reloaded.start_ts == '2026-07-07T00:00:00+00:00'
+
+
+def test_mark_orphaned_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
+    marked_orphan = _make_record(
+        session_slug='will-be-marked', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID
+    )
+    kept_live = _make_record(
+        session_slug='kept-live-mix', status=sr.Status.RUNNING, launcher_pid=os.getpid()
+    )
+    kept_recent = _make_record(
+        session_slug='kept-recent-mix', status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID
+    )
+    kept_terminal = _make_record(
+        session_slug='kept-terminal-mix',
+        status=sr.Status.EXITED,
+        exit_code=0,
+        launcher_pid=_DEAD_PID,
+    )
+    for r in (marked_orphan, kept_live, kept_recent, kept_terminal):
+        sr.write_record(r, root=tmp_path)
+
+    _set_mtime(
+        sr.record_path_for_slug('will-be-marked', root=tmp_path),
+        _NOW,
+        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+    )
+    _set_mtime(
+        sr.record_path_for_slug('kept-live-mix', root=tmp_path),
+        _NOW,
+        timedelta(days=30),
+    )
+    _set_mtime(
+        sr.record_path_for_slug('kept-recent-mix', root=tmp_path),
+        _NOW,
+        sr.NON_TERMINAL_HEARTBEAT_TTL - timedelta(minutes=1),
+    )
+    _set_mtime(
+        sr.record_path_for_slug('kept-terminal-mix', root=tmp_path),
+        _NOW,
+        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(days=2),
+    )
+
+    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+    assert {m.session_slug for m in marked} == {'will-be-marked'}
+    assert sr.read_record('will-be-marked', root=tmp_path).status == sr.Status.EXITED
+    assert sr.read_record('kept-live-mix', root=tmp_path).status == sr.Status.RUNNING
+    assert sr.read_record('kept-recent-mix', root=tmp_path).status == sr.Status.LAUNCHING
+    reloaded_terminal = sr.read_record('kept-terminal-mix', root=tmp_path)
+    assert reloaded_terminal.status == sr.Status.EXITED
+    assert reloaded_terminal.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
 # Step-9: CLI + fail-soft
 # ---------------------------------------------------------------------------
 
@@ -1306,6 +1480,115 @@ def test_main_launching_fail_soft_when_launcher_pid_not_numeric(
     assert capsys.readouterr().out.strip() == ''
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
     assert not sr.sessions_dir(root=tmp_path).exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 2511 step-7: driving the liveness sweep from `launching`/`reap`
+# ---------------------------------------------------------------------------
+
+
+def test_main_launching_drains_prior_orphan_via_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A stale orphan O (non-terminal, dead pid, aged past the heartbeat TTL)
+    # pre-exists in the same sessions dir BEFORE this spawn's own `launching`
+    # write -- every spawn should opportunistically drain prior orphans.
+    orphan = _make_record(session_slug='orphan-o', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID)
+    sr.write_record(orphan, root=tmp_path)
+    _set_mtime(
+        sr.record_path_for_slug('orphan-o', root=tmp_path),
+        datetime.now(UTC),
+        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+    )
+
+    _set_env(monkeypatch, _launching_env(tmp_path))
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    # (i) the NEW launching record's dir is printed unchanged.
+    assert capsys.readouterr().out.strip() == str(expected_dir)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
+
+    # (ii) the pre-existing orphan is now marked exited.
+    orphan_reloaded = sr.read_record('orphan-o', root=tmp_path)
+    assert orphan_reloaded.status == sr.Status.EXITED
+    assert orphan_reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+
+
+def test_main_launching_fail_soft_when_sweep_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_env(monkeypatch, _launching_env(tmp_path))
+
+    calls: list[None] = []
+
+    def _boom(*_args: object, **_kwargs: object) -> list[sr.SessionRecord]:
+        calls.append(None)
+        raise OSError('sweep on fire')
+
+    monkeypatch.setattr(sr, 'mark_orphaned_sessions_exited', _boom)
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    assert calls  # the sweep really was invoked (and really did raise)
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    # The sweep fault is swallowed INSIDE _run_launching -- the printed dir
+    # (what spawn-claude.sh captures into SESSION_RECORD_DIR) stays exactly
+    # the new record's dir, never corrupted or suppressed by the fault.
+    assert capsys.readouterr().out.strip() == str(expected_dir)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
+
+
+def test_main_reap_marks_then_deletes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    # A fresh stale orphan: non-terminal, dead pid, past the heartbeat TTL --
+    # this pass must MARK it exited (its mtime is bumped by the mark, so it
+    # is not also independently terminal_ttl-stale in this SAME pass).
+    fresh_orphan = _make_record(
+        session_slug='fresh-orphan', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID
+    )
+    sr.write_record(fresh_orphan, root=tmp_path)
+    _set_mtime(
+        sr.record_path_for_slug('fresh-orphan', root=tmp_path),
+        datetime.now(UTC),
+        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+    )
+
+    # A separately-aged terminal record, well past TERMINAL_TTL -- this pass
+    # must DELETE it (reason='terminal_ttl'), unchanged from today.
+    old_terminal = _make_record(
+        session_slug='old-terminal', status=sr.Status.EXITED, exit_code=0, launcher_pid=os.getpid()
+    )
+    sr.write_record(old_terminal, root=tmp_path)
+    _set_mtime(
+        sr.record_path_for_slug('old-terminal', root=tmp_path),
+        datetime.now(UTC),
+        sr.TERMINAL_TTL + timedelta(hours=1),
+    )
+
+    rc = sr.main(['reap'])
+
+    assert rc == 0
+    fresh_dir = sr.record_path_for_slug('fresh-orphan', root=tmp_path).parent
+    assert fresh_dir.is_dir()  # marked, NOT deleted, this pass
+    fresh_reloaded = sr.read_record('fresh-orphan', root=tmp_path)
+    assert fresh_reloaded.status == sr.Status.EXITED
+    assert fresh_reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+
+    assert not sr.record_path_for_slug('old-terminal', root=tmp_path).parent.exists()
 
 
 # ---------------------------------------------------------------------------

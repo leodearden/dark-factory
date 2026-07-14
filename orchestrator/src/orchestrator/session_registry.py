@@ -411,6 +411,36 @@ class DecisionRecord:
 # ---------------------------------------------------------------------------
 
 _SLUG_SANITIZE_RE = re.compile(r'[^A-Za-z0-9._-]')
+_ALL_DOTS_RE = re.compile(r'^\.+$')
+
+
+def sanitize_slug(raw: str) -> str:
+    """Map any character outside ``[A-Za-z0-9._-]`` in *raw* to ``'-'``.
+
+    The shared filesystem-safe-slug normalizer: ``build_session_slug`` calls
+    this on its joined segments, and ``session_hooks.hook_session_slug``
+    applies it to an externally-supplied slug token (``CLAUDE_SPAWN_SESSION_ID``)
+    so that value is always safe to use as a ``record_path_for_slug`` directory
+    name -- e.g. a stray ``/`` in an adversarial/malformed token can never
+    resolve outside ``sessions_dir`` as a path separator.
+
+    ``'.'`` is itself in the allowed set (kept for ordinary slugs), so the
+    character-class substitution alone does not stop a result that is
+    *entirely* dots (``'.'`` or ``'..'``): unlike any other sanitized value,
+    that would be handed to ``record_path_for_slug`` as a filesystem
+    traversal segment ("this directory" / "the parent directory") rather
+    than a literal directory name. Such an all-dots result is therefore
+    additionally collapsed (every ``'.'`` mapped to ``'-'``) so a ``'..'``
+    (or ``'.'``) token can never escape ``sessions_dir`` either -- closing
+    the one path-escape the regex substitution by itself cannot block. A
+    string that merely *contains* dots alongside other characters (e.g.
+    ``'..foo'``) is a literal, non-traversing directory name and is left
+    untouched.
+    """
+    cleaned = _SLUG_SANITIZE_RE.sub('-', raw)
+    if _ALL_DOTS_RE.match(cleaned):
+        cleaned = cleaned.replace('.', '-')
+    return cleaned
 
 
 def build_session_slug(
@@ -425,14 +455,15 @@ def build_session_slug(
     share role+project+task (PRD §4 decision 2); single-ownership is a
     separate concern (T7 leases), not encoded in the key. Any character
     outside ``[A-Za-z0-9._-]`` in any segment (or the joined whole) is
-    sanitized to ``'-'`` so the slug is always filesystem-safe.
+    sanitized to ``'-'`` (see ``sanitize_slug``) so the slug is always
+    filesystem-safe.
     """
     segments = [role, project]
     if task_id:
         segments.append(task_id)
     segments.append(str(launcher_pid))
     raw = '-'.join(segments)
-    return _SLUG_SANITIZE_RE.sub('-', raw)
+    return sanitize_slug(raw)
 
 
 def fleet_root(root: Path | str | None = None) -> Path:
@@ -923,6 +954,172 @@ def reap_stale_records(
     return reaped
 
 
+ORPHAN_EXIT_CODE: int = 200
+"""Synthetic exit code stamped by ``mark_orphaned_sessions_exited`` when a
+non-terminal session's ``launcher_pid`` is provably dead but no real exit
+code was ever recorded -- ``finish()`` never ran (SIGKILL, force-closed
+terminal, crash, reboot). Distinct from every real/sentinel code
+spawn-claude.sh can record (0-125 claude exit codes; 126/127/129/143/144
+spawn-claude.sh sentinels; 145-199 called out as reserved-free by
+spawn-claude.sh's own exit-codes comment) and from ``None`` (no exit_code
+recorded yet), so a downstream consumer can tell an orphan-reaped record
+from a cleanly-exited one. Deliberately a POSITIVE value at/past 200, not
+-1: by POSIX/subprocess convention a NEGATIVE returncode means "killed by
+signal N" (``returncode == -N``), so -1 could be misread by a consumer
+applying that convention as "killed by SIGHUP". A positive sentinel clear
+of every reserved range avoids that ambiguity."""
+
+
+def _mark_exited_if_still_non_terminal(
+    slug: str, root: Path | str | None, *, exit_code: int
+) -> SessionRecord | None:
+    """TOCTOU-safe terminal stamp used only by the liveness sweep.
+
+    Re-reads *slug* itself -- a second, fresher read than the sweep's own
+    caller-side liveness check -- and, ONLY if status is still non-terminal
+    on THIS read, stamps status=EXITED/exit_code=*exit_code* and writes.
+    Returns the marked record, or ``None`` if a concurrent writer (most
+    plausibly spawn-claude.sh's own ``finish()``) already made the record
+    terminal in the narrow window between the sweep's own liveness check
+    and this call -- in which case nothing is written, so that writer's
+    real exit_code is never clobbered by the orphan sentinel.
+
+    Deliberately a narrow variant rather than a change to ``update_status``
+    itself: ``update_status``'s own ``exit`` CLI subcommand caller is an
+    authoritative, unconditional final report from the exiting process and
+    must stay unconditional; only this sweep's best-effort guess needs to
+    defer to a fresher real write.
+    """
+    record = read_record(slug, root=root)
+    if record.status in TERMINAL_STATUSES:
+        return None
+    record.status = Status.EXITED
+    record.exit_code = exit_code
+    write_record(record, root=root)
+    return record
+
+
+def mark_orphaned_sessions_exited(
+    root: Path | str | None = None,
+    *,
+    now: datetime | None = None,
+) -> list[SessionRecord]:
+    """Sweep ``<root>/sessions/*/`` and mark provably-orphaned records EXITED.
+
+    This is the liveness sweep that fixes the F2 staleness backlog: record
+    CONVERGENCE (session_hooks' CLAUDE_SPAWN_SESSION_ID adoption) only
+    advances CLEANLY-exiting spawned sessions through their hook-driven
+    launching -> running -> idle/awaiting-input -> exited lifecycle. The
+    backlog is overwhelmingly UNCLEAN deaths (SIGKILL, a force-closed
+    terminal, a crash, a reboot) where spawn-claude.sh's own ``finish()``
+    never runs, so ``exited`` is never written -- only this sweep ever marks
+    those records terminal.
+
+    Mirrors ``reap_stale_records``'s ``stale_pid`` predicate EXACTLY --
+    status is non-terminal (not in TERMINAL_STATUSES), ``launcher_pid`` is
+    dead (``_pid_alive``), and age (record.json's mtime vs *now*) exceeds
+    ``NON_TERMINAL_HEARTBEAT_TTL`` -- the same false-positive guard that
+    rule already trusts: a genuinely-live session (including a
+    detached/tmux one) keeps bumping its record's mtime via its own hooks,
+    so it is never swept regardless of how long it has been non-terminal.
+
+    Known trade-off for DETACHED spawns (reviewer-flagged): spawn-claude.sh
+    itself exits once it hands off (its ``launcher_pid`` dies) while claude
+    keeps running standalone, so for the entire remaining life of a
+    detached session ``_pid_alive`` is already False -- the heartbeat
+    (record.json's mtime, bumped only by that session's own
+    Notification/Stop hooks after convergence) is the SOLE thing keeping it
+    unswept. A detached session that goes quieter than
+    ``NON_TERMINAL_HEARTBEAT_TTL`` (1h) between hook events -- e.g. one long
+    tool-heavy turn with no intervening Notification/Stop -- can therefore
+    be marked EXITED while genuinely still running, driven opportunistically
+    from every other spawn's ``_run_launching``/from ``reap`` (not just an
+    explicit CLI ``reap``, unlike before this task). This is self-correcting
+    -- its next hook event calls ``refresh_record`` and flips status back --
+    but there is a real window of an incorrectly-EXITED cockpit row. Reusing
+    the pre-existing ``NON_TERMINAL_HEARTBEAT_TTL`` (rather than introducing
+    a second, sweep-specific threshold) keeps this sweep's semantics
+    identical to the reaper's already-trusted ``stale_pid`` rule; widening
+    the TTL or tracking a detached session's actual claude pid instead of
+    its exited launcher would be a separate, broader design change (touching
+    session_hooks.py/spawn-claude.sh's pid bookkeeping) and is left as a
+    follow-up rather than folded into this sweep.
+
+    Unlike ``reap_stale_records``, this does NOT delete anything -- it marks
+    a matching record EXITED (exit_code=``ORPHAN_EXIT_CODE``), preserving
+    every other field, and leaves its directory in place.
+    ``reap_stale_records``'s existing ``terminal_ttl`` rule reclaims it
+    later, unchanged. An already-terminal record is left fully untouched
+    (idempotent -- never re-stamped with the sentinel), and a record whose
+    body is missing or corrupt is skipped here -- that is
+    ``reap_stale_records``'s own ``'corrupt'`` rule's concern, not this
+    sweep's.
+
+    The final stamp itself goes through ``_mark_exited_if_still_non_terminal``,
+    which re-reads the record ONE more time immediately before writing: if a
+    concurrent writer (most plausibly ``finish()``) already made it terminal
+    in the window since this sweep's own liveness check above, the sweep
+    backs off instead of clobbering that writer's real exit_code with the
+    orphan sentinel.
+
+    A per-record try/except means one bad record (a corrupt body, a
+    concurrent-reap race vanishing the file mid-sweep, an unwritable
+    record) never aborts the sweep -- it is logged and skipped, exactly
+    like ``reap_stale_records``'s own fault handling.
+
+    *now* is injectable for deterministic tests; defaults to the real UTC
+    clock. Returns the list of records this call marked (their post-mark,
+    now-EXITED state).
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    base = sessions_dir(root)
+    marked: list[SessionRecord] = []
+    if not base.is_dir():
+        return marked
+
+    for slug_dir in sorted(base.iterdir()):
+        if not slug_dir.is_dir():
+            continue
+        slug = slug_dir.name
+
+        try:
+            record = read_record(slug, root=root)
+        except (FileNotFoundError, CorruptSessionRecord):
+            continue  # missing/corrupt body -- reap_stale_records' 'corrupt' rule's job
+        if record.status in TERMINAL_STATUSES:
+            continue  # already terminal -- idempotent, never re-stamped
+        if _pid_alive(record.launcher_pid):
+            continue  # a live launcher_pid is never swept, regardless of age
+
+        record_path = slug_dir / 'record.json'
+        try:
+            mtime = record_path.stat().st_mtime
+        except OSError:
+            continue  # vanished mid-sweep (e.g. concurrent reap) -- skip it
+        age = now - datetime.fromtimestamp(mtime, tz=UTC)
+        if age <= NON_TERMINAL_HEARTBEAT_TTL:
+            continue  # heartbeat grace -- not stale enough yet
+
+        try:
+            marked_record = _mark_exited_if_still_non_terminal(
+                slug, root, exit_code=ORPHAN_EXIT_CODE
+            )
+        except (FileNotFoundError, CorruptSessionRecord, OSError):
+            # A single unmarkable record (a concurrent-reap race, an
+            # unwritable record) must not abort the sweep -- log and move on
+            # to the next candidate.
+            logger.error(
+                'mark_orphaned_sessions_exited: failed to mark %s', slug, exc_info=True
+            )
+            continue
+        if marked_record is None:
+            continue  # lost the race: a concurrent writer already made this terminal
+        marked.append(marked_record)
+
+    return marked
+
+
 # ---------------------------------------------------------------------------
 # Role leases: single-owner-per-role (Attention Rail T7; PRD T7 §4.1-4.2, §6 G5)
 # ---------------------------------------------------------------------------
@@ -1380,7 +1577,29 @@ def parse_spawn_identity(
 
 
 def _run_launching(env: Mapping[str, str]) -> str:
-    """Build + write a LAUNCHING record from CLAUDE_SPAWN_* env; return its dir."""
+    """Build + write a LAUNCHING record from CLAUDE_SPAWN_* env; return its dir.
+
+    Also opportunistically drives the liveness sweep
+    (``mark_orphaned_sessions_exited``): ``reap_stale_records``/this sweep
+    have no periodic production driver of their own (CLI-only), so every
+    spawn is what drains prior orphaned (unclean-death) records to
+    ``exited`` -- the backlog is bounded by spawn rate and self-limits as it
+    drains. Wrapped in a fail-soft guard: a sweep fault must never raise
+    here and must never write to stdout, or it would corrupt the printed
+    record dir spawn-claude.sh captures into ``SESSION_RECORD_DIR``.
+
+    Cost model (reviewer-flagged): the sweep is O(N) in the number of
+    session directories -- one ``iterdir`` + one ``record.json`` parse per
+    peer, plus a second read+write for each record it actually marks -- and
+    runs synchronously in this call, so every spawn pays for scanning all
+    of its peers, not just its own write. This is a deliberate trade-off
+    given the sweep has no periodic/out-of-band driver to run on instead
+    (see above); it is bounded and self-limiting (the backlog this drains
+    only shrinks the cost over time), acceptable at today's fleet sizes, and
+    the right place to revisit if spawn latency ever becomes a problem is a
+    dedicated periodic timer (systemd/cron) rather than this synchronous
+    call -- out of this task's module scope (would touch harness/systemd).
+    """
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
     prompt = env.get('CLAUDE_SPAWN_PROMPT', '') or ''
     cwd = env.get('CLAUDE_SPAWN_CWD') or os.getcwd()
@@ -1407,6 +1626,8 @@ def _run_launching(env: Mapping[str, str]) -> str:
         transcript_path=transcript_path_for_cwd(cwd),
     )
     write_record(record)
+    with contextlib.suppress(Exception):
+        mark_orphaned_sessions_exited()
     return str(record_dir)
 
 
@@ -1451,6 +1672,16 @@ def _run_set_display(
 
 
 def _run_reap() -> list[ReapedSessionRecord]:
+    """Run the canonical ``reap`` verb: mark orphans exited, THEN delete stale dirs.
+
+    Mark-then-delete keeps `reap` complete: a record the liveness sweep
+    would mark exited this same pass must not simultaneously be eligible
+    for stale_pid deletion (marking bumps its mtime, so it lands back
+    within reap_stale_records' NON_TERMINAL_HEARTBEAT_TTL heartbeat grace) --
+    it only becomes reapable later, once it ages past TERMINAL_TTL as any
+    other terminal record does.
+    """
+    mark_orphaned_sessions_exited()
     return reap_stale_records()
 
 
