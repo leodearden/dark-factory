@@ -1875,6 +1875,131 @@ def _verify_duration_secs(runs: list[dict]) -> float:
 
 
 @dataclass
+class CheckRun:
+    """The execution outcome of a single check (test/lint/type).
+
+    Introduced (task 2133) to collapse ``run_verification``'s 15 parallel
+    per-check scalar locals (``{test,lint,type}_{rc,out,timed_out,
+    started_at,duration}``) into one object per check, and — paired with
+    :class:`VerifyAttempt` — to compute the pure-timeout-consistency formula
+    in exactly one place instead of two hand-duplicated copies.
+    """
+
+    label: str
+    cmd: 'str | None'
+    rc: int
+    output: str
+    timed_out: bool
+    started_at: 'str | None'
+    duration_secs: float
+
+    @classmethod
+    def skipped(cls, label: str) -> 'CheckRun':
+        """Build the CheckRun for a check whose command is ``None`` (module_config skip).
+
+        Matches ``_run_or_skip_timed``'s early return for ``cmd is None``:
+        vacuously passing (``rc=0``), no output, never timed out, no start
+        time, zero duration.
+        """
+        return cls(
+            label=label, cmd=None, rc=0, output='', timed_out=False,
+            started_at=None, duration_secs=0.0,
+        )
+
+    def to_dict(self) -> dict:
+        """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
+        ``_build_summary_payload``/``_verify_duration_secs``/``_archive_merge_verify_logs``
+        (all take ``list[dict]``) — the exact 7-key shape previously hand-built
+        inline in ``run_verification`` (label/cmd/rc/output/timed_out/
+        started_at/duration_secs).
+
+        ``started_at`` is normalised via ``or ''``: a skipped check's
+        ``None`` serialises as ``''``, matching the pre-refactor
+        ``test_started_at or ''`` pattern so downstream JSON consumers see
+        the same shape as before.
+        """
+        return {
+            'label': self.label,
+            'cmd': self.cmd,
+            'rc': self.rc,
+            'output': self.output,
+            'timed_out': self.timed_out,
+            'started_at': self.started_at or '',
+            'duration_secs': self.duration_secs,
+        }
+
+
+@dataclass
+class VerifyAttempt:
+    """The CheckRun results (test/lint/type) for one full verification attempt.
+
+    Introduced (task 2133) so ``run_verification`` carries ONE object
+    through its retry loop instead of 15 parallel scalar locals
+    (``{test,lint,type}_{rc,out,timed_out,started_at,duration}``), and so
+    ``passed``/``any_timed_out``/``pure_timeout_failure`` are each computed
+    exactly ONCE. Previously this 6-clause formula was hand-duplicated at
+    two call sites — the first-pass retry loop and the env-recovery branch
+    (task 2048 added the second copy) — which is the exact drift surface
+    that once let a recovery run's wall-clock timeout leave a stale
+    ``timed_out=False`` while ``category`` flipped to ``infra_timeout``.
+    With a single property definition read from every call site, first-pass
+    and env-recovery are now structurally incapable of disagreeing.
+    """
+
+    checks: list[CheckRun]
+
+    @property
+    def passed(self) -> bool:
+        return all(c.rc == 0 for c in self.checks)
+
+    @property
+    def any_timed_out(self) -> bool:
+        return any(c.timed_out for c in self.checks)
+
+    @property
+    def pure_timeout_failure(self) -> bool:
+        """True when the attempt failed and every failing check is a timeout.
+
+        The generic (list-over-``checks``) form of the two hand-duplicated
+        formulas this task collapses: ``not passed`` rules out a clean
+        pass, ``any_timed_out`` requires at least one check to have hit the
+        wall clock, and the trailing ``all(...)`` requires every OTHER
+        failing check to also be a timeout — so a genuine non-timeout
+        failure (e.g. a real lint error) alongside a timeout is never
+        misclassified as a pure, retryable timeout.
+        """
+        return (
+            not self.passed
+            and self.any_timed_out
+            and all(c.rc == 0 or c.timed_out for c in self.checks)
+        )
+
+    def _by_label(self, label: str) -> CheckRun:
+        found = next((c for c in self.checks if c.label == label), None)
+        if found is None:
+            raise KeyError(
+                f'no check labeled {label!r} in {[c.label for c in self.checks]}'
+            )
+        return found
+
+    @property
+    def test(self) -> CheckRun:
+        return self._by_label('test')
+
+    @property
+    def lint(self) -> CheckRun:
+        return self._by_label('lint')
+
+    @property
+    def type(self) -> CheckRun:
+        # Shadows the `type` builtin, but this project's ruff config selects
+        # ["E", "F", "UP", "B", "SIM", "I"] — flake8-builtins ("A") is not
+        # enabled — so this is lint-safe; matches the CheckRun.label vocabulary
+        # ('test'/'lint'/'type') used throughout verify.py.
+        return self._by_label('type')
+
+
+@dataclass
 class VerifyResult:
     passed: bool
     test_output: str
@@ -2910,13 +3035,20 @@ async def run_verification(
         *,
         label: str,
         current_attempt: int,
-    ) -> tuple[int, str, bool, str | None, float]:
-        """Like _run_cmd but returns (rc, out, timed_out, started_at_iso, duration_secs).
+    ) -> CheckRun:
+        """Like _run_cmd but returns a CheckRun capturing (rc, output, timed_out,
+        started_at, duration_secs) for this check.
 
-        When *cmd* is None (skipped check), returns (0, '', False, None, 0.0).
+        When *cmd* is None (skipped check), returns ``CheckRun.skipped(label)``.
         """
         if cmd is None:
-            return 0, '', False, None, 0.0
+            return CheckRun.skipped(label)
+        # Capture the un-governed config command before _govern_cpu_str/the
+        # nice-wrap below reassign the local `cmd` — CheckRun.cmd must reflect
+        # what the caller configured, not the governed/wrapped string handed
+        # to _run_cmd, so persisted logs and _summarize_checks see the same
+        # command they always have.
+        config_cmd = cmd
         # Wrap the command in cpu-governed-exec.sh when role=='merge' and
         # cpu_governance is enabled + exec resolves.  Fail-open: returns cmd
         # unchanged when governance is disabled or the path is non-executable,
@@ -2963,88 +3095,60 @@ async def run_verification(
                 **_scope_kw,
                 **_clock_kw,
             )
-        return rc, out, timed_out_flag, started_at, time.monotonic() - t0
+        return CheckRun(
+            label=label,
+            cmd=config_cmd,
+            rc=rc,
+            output=out,
+            timed_out=timed_out_flag,
+            started_at=started_at,
+            duration_secs=time.monotonic() - t0,
+        )
 
-    # Pre-loop initialisation satisfies static analysis: mypy cannot prove that
-    # `while True:` executes the body at least once before a break, so it
-    # requires these to be assigned before their first use after the loop.
-    # In practice the loop body always overwrites them on the first iteration;
-    # these sentinel values are never read by any caller.
-    test_started_at: str | None = None
-    test_duration: float = 0.0
-    lint_started_at: str | None = None
-    lint_duration: float = 0.0
-    type_started_at: str | None = None
-    type_duration: float = 0.0
-
-    attempt = 0
+    retries = 0
     while True:
         # attempt_id is the persistence ID handed in by the caller (or None for
         # callers that don't persist).  We use it directly as the streaming
         # attempt index so the streamed log path lines up with the path
         # ``_persist_attempt_logs`` computes below; this loop's local
-        # ``attempt`` counter is for retry bookkeeping only.
+        # ``retries`` counter is for retry bookkeeping only.
         current_attempt_id = attempt_id if attempt_id is not None else 0
+        # `attempt` is assigned unconditionally here, before the loop's only
+        # `break` below, so it is always bound whenever the loop exits — no
+        # pre-loop sentinel scaffolding needed.
         if concurrent:
-            (
-                (test_rc, test_out, test_timed_out, test_started_at, test_duration),
-                (lint_rc, lint_out, lint_timed_out, lint_started_at, lint_duration),
-                (type_rc, type_out, type_timed_out, type_started_at, type_duration),
-            ) = await asyncio.gather(
+            attempt = VerifyAttempt(list(await asyncio.gather(
                 _run_or_skip_timed(test_cmd, label='test', current_attempt=current_attempt_id),
                 _run_or_skip_timed(lint_cmd, label='lint', current_attempt=current_attempt_id),
                 _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id),
-            )
+            )))
         else:
-            test_rc, test_out, test_timed_out, test_started_at, test_duration = await _run_or_skip_timed(
-                test_cmd, label='test', current_attempt=current_attempt_id,
-            )
-            lint_rc, lint_out, lint_timed_out, lint_started_at, lint_duration = await _run_or_skip_timed(
-                lint_cmd, label='lint', current_attempt=current_attempt_id,
-            )
-            type_rc, type_out, type_timed_out, type_started_at, type_duration = await _run_or_skip_timed(
-                type_cmd, label='type', current_attempt=current_attempt_id,
-            )
+            attempt = VerifyAttempt([
+                await _run_or_skip_timed(test_cmd, label='test', current_attempt=current_attempt_id),
+                await _run_or_skip_timed(lint_cmd, label='lint', current_attempt=current_attempt_id),
+                await _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id),
+            ])
 
-        passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
-        any_timed_out = test_timed_out or lint_timed_out or type_timed_out
-
-        # Check whether every failure is a timeout (no real rc!=0 without
-        # timeout).  If so, the failure is a pure timeout and is retryable.
-        pure_timeout_failure = (
-            not passed
-            and any_timed_out
-            and (test_rc == 0 or test_timed_out)
-            and (lint_rc == 0 or lint_timed_out)
-            and (type_rc == 0 or type_timed_out)
-        )
-
-        if passed or not pure_timeout_failure or attempt >= max_retries:
+        if attempt.passed or not attempt.pure_timeout_failure or retries >= max_retries:
             break
 
-        attempt += 1
-        timed_out_names = []
-        if test_timed_out:
-            timed_out_names.append('test')
-        if lint_timed_out:
-            timed_out_names.append('lint')
-        if type_timed_out:
-            timed_out_names.append('type')
+        retries += 1
+        timed_out_names = [c.label for c in attempt.checks if c.timed_out]
         logger.warning(
             'Verification hit timeout on %s; retry %d/%d',
-            ','.join(timed_out_names), attempt, max_retries,
+            ','.join(timed_out_names), retries, max_retries,
         )
 
     # Classify timed_out: true only when the final failure was a pure timeout
     # (no real non-timeout failure mixed in).
-    timed_out = (not passed) and pure_timeout_failure
+    timed_out = (not attempt.passed) and attempt.pure_timeout_failure
 
     # Build summary/category/cause_hint (shared with the env-recovery retry
     # below via _summarize_checks — see task 2048 code_duplication fix).
     passed, category, cause_hint, summary = _summarize_checks(
-        test_rc, test_out, test_timed_out, test_cmd,
-        lint_rc, lint_out, lint_timed_out, lint_cmd,
-        type_rc, type_out, type_timed_out, type_cmd,
+        attempt.test.rc, attempt.test.output, attempt.test.timed_out, attempt.test.cmd,
+        attempt.lint.rc, attempt.lint.output, attempt.lint.timed_out, attempt.lint.cmd,
+        attempt.type.rc, attempt.type.output, attempt.type.timed_out, attempt.type.cmd,
     )
     if timed_out:
         summary = f'Verification timed out after {max_retries} retries' if max_retries > 0 else 'Verification timed out'
@@ -3077,46 +3181,36 @@ async def run_verification(
     # ruff/pyright would not emit, and this retry only ever re-runs the test
     # command regardless (lint/type don't exercise xdist/pip — see above),
     # so there is no observable behavior change from this narrowing.
-    if category == FailureCategory.ENV_TRANSIENT and test_cmd is not None:
+    if category == FailureCategory.ENV_TRANSIENT and attempt.test.cmd is not None:
         logger.warning(
             'Verification hit an environmental shared-venv transient '
             '(vanished xdist/pip); retrying test command once, forced serial '
             '(this clears all pyproject addopts, including any marker '
             'filters, for the recovery run — see serial_pytest)'
         )
-        recovered_test_cmd = _serial_pytest_str(test_cmd)
-        (
-            test_rc, test_out, test_timed_out, test_started_at, test_duration,
-        ) = await _run_or_skip_timed(
+        recovered_test_cmd = _serial_pytest_str(attempt.test.cmd)
+        new_test = await _run_or_skip_timed(
             recovered_test_cmd, label='test', current_attempt=current_attempt_id,
         )
-        test_cmd = recovered_test_cmd
 
-        # Recompute pure-timeout consistency for the recovery run: lint/type
-        # are unchanged from the first pass (only the test leg was re-run),
-        # so this mirrors the loop's pure_timeout_failure formula above with
-        # the refreshed test_rc/test_timed_out.  Without this, a recovery run
+        # Recompute pure-timeout consistency for the recovery run via a fresh
+        # VerifyAttempt: lint/type are unchanged from the first pass (only
+        # the test leg was re-run), so this reads the SAME
+        # VerifyAttempt.pure_timeout_failure property the loop above used —
+        # not a second hand-copied formula.  Without this, a recovery run
         # that itself hits the wall-clock timeout would leave the stale
         # timed_out=False from the first pass while category flips to
         # 'infra_timeout' — an inconsistent VerifyResult that both wrongly
         # marks the worktree warm (the "not result.timed_out" check below)
         # and hides the timeout from callers that special-case
         # result.timed_out (merge_queue.py, workflow.py).
-        passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
-        any_timed_out = test_timed_out or lint_timed_out or type_timed_out
-        pure_timeout_failure = (
-            not passed
-            and any_timed_out
-            and (test_rc == 0 or test_timed_out)
-            and (lint_rc == 0 or lint_timed_out)
-            and (type_rc == 0 or type_timed_out)
-        )
-        timed_out = (not passed) and pure_timeout_failure
+        attempt = VerifyAttempt([new_test, attempt.lint, attempt.type])
+        timed_out = (not attempt.passed) and attempt.pure_timeout_failure
 
         passed, category, cause_hint, summary = _summarize_checks(
-            test_rc, test_out, test_timed_out, test_cmd,
-            lint_rc, lint_out, lint_timed_out, lint_cmd,
-            type_rc, type_out, type_timed_out, type_cmd,
+            attempt.test.rc, attempt.test.output, attempt.test.timed_out, attempt.test.cmd,
+            attempt.lint.rc, attempt.lint.output, attempt.lint.timed_out, attempt.lint.cmd,
+            attempt.type.rc, attempt.type.output, attempt.type.timed_out, attempt.type.cmd,
         )
         if timed_out:
             # Distinct wording from the first-pass timeout summary: this
@@ -3164,10 +3258,10 @@ async def run_verification(
     # iterations on non-reproducible overload flakes.
     if (
         not is_merge_verify
-        and test_rc != 0
-        and lint_rc == 0
-        and type_rc == 0
-        and _is_bare_xdist_worker_crash(test_out)
+        and attempt.test.rc != 0
+        and attempt.lint.rc == 0
+        and attempt.type.rc == 0
+        and _is_bare_xdist_worker_crash(attempt.test.output)
     ):
         logger.warning(
             'Task %s: bare pytest-xdist worker crash detected (module_prefix=%r) '
@@ -3179,35 +3273,7 @@ async def run_verification(
         raise VerifyInfraError(phase='xdist_worker_crash', errno=None)
 
     # Hoist runs list so both the merge-path and task-path branches can use it.
-    runs = [
-        {
-            'label': 'test',
-            'cmd': test_cmd,
-            'rc': test_rc,
-            'output': test_out,
-            'timed_out': test_timed_out,
-            'started_at': test_started_at or '',
-            'duration_secs': test_duration,
-        },
-        {
-            'label': 'lint',
-            'cmd': lint_cmd,
-            'rc': lint_rc,
-            'output': lint_out,
-            'timed_out': lint_timed_out,
-            'started_at': lint_started_at or '',
-            'duration_secs': lint_duration,
-        },
-        {
-            'label': 'type',
-            'cmd': type_cmd,
-            'rc': type_rc,
-            'output': type_out,
-            'timed_out': type_timed_out,
-            'started_at': type_started_at or '',
-            'duration_secs': type_duration,
-        },
-    ]
+    runs = [c.to_dict() for c in attempt.checks]
 
     worktree_log_paths: list[str] = []
     archive_log_paths: list[str] = []
@@ -3251,15 +3317,15 @@ async def run_verification(
     # true wall-clock cost is the longest single command, not their sum.
     # Serial mode is rare (legacy / explicit opt-out) and sums correctly.
     if concurrent:
-        _wall_secs = max(test_duration, lint_duration, type_duration)
+        _wall_secs = max(c.duration_secs for c in attempt.checks)
     else:
         _wall_secs = _verify_duration_secs(runs)
 
     result = VerifyResult(
-        passed=passed,
-        test_output=test_out,
-        lint_output=lint_out if lint_rc != 0 else '',
-        type_output=type_out if type_rc != 0 else '',
+        passed=attempt.passed,
+        test_output=attempt.test.output,
+        lint_output=attempt.lint.output if attempt.lint.rc != 0 else '',
+        type_output=attempt.type.output if attempt.type.rc != 0 else '',
         summary=summary,
         timed_out=timed_out,
         cause_hint=cause_hint,

@@ -30,6 +30,7 @@ Test coverage:
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -349,6 +350,63 @@ class TestRunVerificationEnvRecovery:
             f'Expected exactly 2 pytest invocations (original + one bounded '
             f'recovery retry), got {len(pytest_invocations)}: {pytest_invocations!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_env_recovery_wall_clock_persists_consistent_timeout(
+        self, tmp_path: Path,
+    ):
+        """Characterization guard (task 2133): identical scenario to Case C
+        above, but with ``attempt_id``/``task_id`` passed so persistence
+        actually runs — exercising ``runs=[c.to_dict() for c in
+        attempt.checks]`` -> ``_persist_attempt_logs`` ->
+        ``_build_summary_payload`` end-to-end, which Case C (:306) does not
+        (it passes neither, so persistence is a no-op there). Expected GREEN
+        both before and after the CheckRun/VerifyAttempt refactor — this is
+        behavior-preserving; the persisted summary.json must show the SAME
+        category='infra_timeout' / timed_out=True consistency that Case C
+        pins on the returned VerifyResult, proving the single-source
+        VerifyAttempt formula reaches the on-disk artifact too.
+        """
+        (tmp_path / '.task').mkdir()
+        config = self._make_config(tmp_path)
+        invoked_cmds: list[str] = []
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            invoked_cmds.append(cmd)
+            if '-o addopts=' in cmd:
+                return 1, f'Command timed out after {timeout}s: {cmd}', True
+            if 'pytest' in cmd:
+                return 4, _XDIST_VANISHED_OUTPUT, False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(
+                tmp_path, config, attempt_id=1, task_id='t2133',
+            )
+
+        assert result.passed is False
+        assert result.category == 'infra_timeout'
+        assert result.timed_out is True
+        assert not (tmp_path / '.task' / 'verify_warmed').exists(), (
+            'A recovery run that times out must not mark the worktree warm'
+        )
+        pytest_invocations = [c for c in invoked_cmds if 'pytest' in c]
+        assert len(pytest_invocations) == 2, (
+            f'Expected exactly 2 pytest invocations (original + one bounded '
+            f'recovery retry), got {len(pytest_invocations)}: {pytest_invocations!r}'
+        )
+
+        summary_path = tmp_path / '.task' / 'verify' / 'attempt-1.summary.json'
+        payload = json.loads(summary_path.read_text(encoding='utf-8'))
+        assert payload['category'] == 'infra_timeout'
+        assert payload['timed_out'] is True, (
+            f'Expected the persisted summary.json to carry the same '
+            f'timed_out=True consistency as the returned VerifyResult, got '
+            f'payload={payload!r}'
+        )
+        test_command_entry = next(c for c in payload['commands'] if c['label'] == 'test')
+        assert test_command_entry['timed_out'] is True
+        assert test_command_entry['cmd'] == self.RECOVERED_TEST_COMMAND
 
 
 class TestRunMainTipSweepEnvTransient:
