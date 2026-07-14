@@ -145,7 +145,11 @@ Public API
   are instead treated as one-time completion markers (see above).
 - ``write_suppression_record(memory_service, *, project_id, task_id,
   flag_types=None, causation_id=None)`` — async, upserts
-  ``stage1_flag_suppression`` ledger row(s) for *task_id*.
+  ``stage1_flag_suppression`` ledger row(s) for *task_id*.  Runs a pre-write
+  coverage check first (task 2503): a requested flag_type already covered by
+  an existing wildcard/family-matching row is skipped for BOTH the ledger
+  upsert and the Mem0 mirror; fails open (writes normally) on a ledger read
+  failure or absent ledger.
 - ``acknowledge_flag_marker(memory_service, *, project_id, run_id, task_id,
   flag_type, mode, log)`` — async, marks the ``stage1_flag_marker`` row for
   one (task_id, flag_type) signature ``state='addressed'``; never raises;
@@ -884,12 +888,28 @@ async def _existing_suppression_coverage(
 
     Returns ``(False, set())`` -- no coverage -- when *ledger* is None.
 
-    Pure w.r.t. its inputs beyond the single ``list_suppressions`` read; never
-    raises (task 2503 step-10 adds the fail-open try/except around the read).
+    Never raises: a ``list_suppressions`` failure is caught and degrades to
+    ``(False, set())`` with a WARNING logged -- the caller must never wrongly
+    skip a suppression write on a transient ledger read error (mirrors
+    :func:`filter_suppressed`'s conservative pass-through on a ledger read
+    failure).
     """
     if ledger is None:
         return False, set()
-    rows = await ledger.list_suppressions(project_id)
+    try:
+        rows = await ledger.list_suppressions(project_id)
+    except Exception as e:
+        logger.warning(
+            'write_suppression_record: recon_ledger.list_suppressions failed for'
+            ' project %s task_id=%s: %s (best-effort — treating as no existing'
+            ' suppression coverage; the write proceeds normally rather than'
+            ' being wrongly skipped)',
+            project_id,
+            tid,
+            e,
+            exc_info=True,
+        )
+        return False, set()
     wildcard = False
     families: set[str] = set()
     for row in rows:
@@ -914,28 +934,56 @@ async def write_suppression_record(
 
     Builds the canonical payload via :func:`build_suppression_payload` (which
     validates *task_id* is numeric and canonicalizes it to ``str``, and pins
-    ``metadata.kind``/``content``) then upserts one ``recon_ledger`` row per entry in
-    ``(flag_types or [''])`` to ``memory_service.recon_ledger`` — ``''`` is
-    the blanket/wildcard ``flag_type`` (suppresses every flag_type for
-    *task_id*); a non-empty ``flag_types`` list upserts one SCOPED row per
-    flag_type. Each row's identity is ``(project_id,
-    'stage1_flag_suppression', task_id, flag_type, run_id='')``, so a
-    repeated call with the same arguments UPSERTs the same row(s) — the
-    suppression row count never grows on recurrence. ``expires_at=None``:
-    suppressions are operator-managed and never expire via TTL.
+    ``metadata.kind``/``content``) to derive the canonicalized *tid*, then --
+    before writing anything -- runs a PRE-WRITE COVERAGE CHECK (task 2503):
+    :func:`_existing_suppression_coverage` is queried for *tid*, and the
+    requested ``(flag_types or [''])`` is filtered down to the subset NOT
+    already covered by an existing active row -- covered by either an
+    existing wildcard row for *tid*, or an existing scoped row whose
+    :func:`canonical_flag_type_family` matches. This is the writer-side fix
+    for the stage1_flag_suppression companion-record sprawl (task 544): the
+    ``recon_ledger`` UPSERT below already self-collapses EXACT (task_id,
+    flag_type) identity, but the Mem0 mirror's ``add_memory`` NEVER upserts,
+    so a flag_type wording variant previously minted a fresh Mem0 companion
+    on every write.
 
-    ``memory_service.recon_ledger`` being unset/``None`` (ledger disabled or
-    not yet wired) skips the ledger write entirely — this degrades to a
-    Mem0-only mirror write, matching :func:`filter_suppressed`'s
-    pass-through contract when it finds no ledger to read.
+    - If EVERY requested flag_type is already covered, BOTH the ledger
+      upsert(s) AND the Mem0 mirror are skipped entirely: a structured
+      ``reconciliation.suppression_companion_skip`` INFO log is emitted and
+      an empty :class:`AddMemoryResponse` (``memory_ids=[]``) is returned
+      immediately -- no I/O beyond the coverage read itself.
+    - If only SOME requested flag_types are covered, only the not-yet-covered
+      subset is upserted to the ledger AND mirrored to Mem0 (the mirror
+      payload's ``metadata.flag_types`` reflects the subset, not the full
+      original request).
+    - If NOTHING is covered (the common case: no pre-existing rows, or a
+      genuinely new flag_type), behavior is unchanged from before task 2503
+      -- the full requested set is written and mirrored.
 
-    After the ledger write(s), best-effort mirrors the same payload to Mem0
-    via ``memory_service.add_memory`` (PRD decision #4/#6 write-both/
-    read-new) — wrapped in try/except so a Mem0 failure never raises past
-    this function; reads never consult Mem0. On a mirror failure (or when
-    the ledger write happened but the mirror wasn't attempted for another
-    reason) an empty :class:`AddMemoryResponse` is synthesized so the return
-    type stays uniform.
+    Each written row's identity is ``(project_id, 'stage1_flag_suppression',
+    task_id, flag_type, run_id='')``, so a repeated call with the same
+    arguments UPSERTs the same row(s) — the suppression row count never
+    grows on exact recurrence (and, as of task 2503, never grows on a
+    flag_type-family or wildcard-covered recurrence either). ``expires_at
+    =None``: suppressions are operator-managed and never expire via TTL.
+
+    FAIL-OPEN contract for the coverage query itself: ``memory_service.
+    recon_ledger`` being unset/``None`` skips the coverage query AND the
+    ledger write entirely — this degrades to a Mem0-only mirror write,
+    matching :func:`filter_suppressed`'s pass-through contract when it finds
+    no ledger to read. A raising ``list_suppressions`` degrades to
+    "no coverage found" (logged at WARNING) rather than aborting the write —
+    a skipped suppression write would be a silent loss of an
+    operator-authored gate, which is strictly worse than one extra
+    (self-healing) companion record on a transient ledger error.
+
+    After the ledger write(s) (if any), best-effort mirrors the (possibly
+    subset) payload to Mem0 via ``memory_service.add_memory`` (PRD decision
+    #4/#6 write-both/read-new) — wrapped in try/except so a Mem0 failure
+    never raises past this function; reads never consult Mem0. On a mirror
+    failure (or when the ledger write happened but the mirror wasn't
+    attempted for another reason) an empty :class:`AddMemoryResponse` is
+    synthesized so the return type stays uniform.
 
     The ``_source='stage1_flag_suppression'`` sentinel distinguishes these
     mirror writes from ``'targeted_recon'`` writes in the audit journal,
