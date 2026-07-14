@@ -3772,6 +3772,16 @@ class TaskInterceptor:
                     tm.remove_tasks(list(ids), project_root, tag),
                 )
             )
+            # Layer A witness-eviction (curator corpus RC1 — task 2520):
+            # evict each removed task's vector from the curator corpus so it
+            # never lingers as a stale duplicate-detection neighbour.
+            # Best-effort, and still inside the curator lock so the next
+            # curator waiter sees row-gone AND vector-gone together.
+            removed = result.get('removed_ids') or ids
+            curator = await self._get_curator()
+            if curator is not None:
+                for tid in removed:
+                    await curator.evict_task(project_id, str(tid))
         # One task_deleted event per requested id — clearer reconciliation
         # signal than a single batched event, and matches the existing
         # per-id semantics elsewhere in the journal.
