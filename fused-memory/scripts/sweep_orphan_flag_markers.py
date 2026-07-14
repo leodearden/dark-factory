@@ -282,7 +282,9 @@ def find_terminal_task_markers(
         if bucket == 'numeric':
             if tid in terminal_task_ids:
                 result.append(m)
-        elif bucket == 'comma_joined':
+        elif bucket == 'comma_joined' and isinstance(tid, str):
+            # isinstance narrows for pyright; classify_marker_task_id only
+            # returns 'comma_joined' for str values, so this is always True.
             components = [part.strip() for part in tid.split(',')]
             if all(part in terminal_task_ids for part in components):
                 result.append(m)
