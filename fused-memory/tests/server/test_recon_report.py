@@ -254,6 +254,108 @@ class TestReconReportInRunDedup:
 
 
 # ---------------------------------------------------------------------------
+# task-2432 step-1/2 (bullet 1a, state level): actionable computed default —
+# RED until step-2 changes ReconReportState.add_finding's `actionable`
+# parameter from `bool = True` to a `bool | None = None` sentinel and
+# resolves it in the body when omitted:
+# `not (task_id is None or category.startswith('cross_project'))`.
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportActionableComputedDefault:
+    """Verify add_finding's *actionable* default is computed (not a static
+    True) when the caller omits it, and that an explicit True/False from the
+    caller is always honored regardless of task_id/category."""
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        return state
+
+    def _actionable_for(self, state, finding_id):
+        report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report is not None
+        matches = [item for item in report['flagged_items'] if item['finding_id'] == finding_id]
+        assert len(matches) == 1, f'expected exactly one flagged item for {finding_id!r}, got {matches}'
+        return matches[0]['actionable']
+
+    def test_null_task_id_omitted_actionable_defaults_false(self):
+        state = self._make_state()
+        result = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='memory_stale',
+            description='a null-task finding',
+            suggested_action='investigate',
+            task_id=None,
+            flag_type='orphaned_knowledge',
+        )
+        assert 'finding_id' in result, result
+        assert self._actionable_for(state, result['finding_id']) is False
+
+    def test_cross_project_category_omitted_actionable_defaults_false(self):
+        state = self._make_state()
+        result = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='cross_project_routing',
+            description='a cross-project finding',
+            suggested_action='investigate',
+            task_id='123',
+            flag_type='cross_project',
+        )
+        assert 'finding_id' in result, result
+        assert self._actionable_for(state, result['finding_id']) is False
+
+    def test_normal_finding_omitted_actionable_defaults_true(self):
+        state = self._make_state()
+        result = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='memory_stale',
+            description='a normal finding',
+            suggested_action='investigate',
+            task_id='123',
+            flag_type='orphaned_knowledge',
+        )
+        assert 'finding_id' in result, result
+        assert self._actionable_for(state, result['finding_id']) is True
+
+    def test_explicit_true_with_null_task_id_stays_true(self):
+        state = self._make_state()
+        result = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='memory_stale',
+            description='explicit true override',
+            suggested_action='investigate',
+            actionable=True,
+            task_id=None,
+            flag_type='orphaned_knowledge',
+        )
+        assert 'finding_id' in result, result
+        assert self._actionable_for(state, result['finding_id']) is True
+
+    def test_explicit_false_with_normal_task_id_stays_false(self):
+        state = self._make_state()
+        result = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='memory_stale',
+            description='explicit false override',
+            suggested_action='investigate',
+            actionable=False,
+            task_id='456',
+            flag_type='orphaned_knowledge',
+        )
+        assert 'finding_id' in result, result
+        assert self._actionable_for(state, result['finding_id']) is False
+
+
+# ---------------------------------------------------------------------------
 # step-7: complete() idempotence — RED until step-8 implements it
 # ---------------------------------------------------------------------------
 
