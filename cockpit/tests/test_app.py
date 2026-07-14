@@ -1233,6 +1233,80 @@ class TestSpawnBar:
         assert len(spawned) == 1
         assert spawned[0][2] == 'false'
 
+    @pytest.mark.timeout(10)
+    async def test_spawn_screen_checkbox_seeded_from_true_default_and_submitted(self, tmp_path):
+        """SpawnScreen's skip-perms Checkbox (F9 fix, task 2518) is seeded
+        from the injected default_skip_perms ctor param, and submitting
+        passes the checkbox's value through as the on_submit callback's
+        4th arg."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_bar import SpawnScreen
+        from textual.widgets import Checkbox
+
+        calls: list[tuple[str, str, str, bool]] = []
+
+        def on_submit(project_root: str, role: str, prompt: str, skip_perms: bool) -> None:
+            calls.append((project_root, role, prompt, skip_perms))
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05, spawn_runner=lambda argv: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            app.push_screen(
+                SpawnScreen(
+                    ['/home/leo/src/dark-factory'],
+                    on_submit,
+                    default_skip_perms=True,
+                )
+            )
+            await pilot.pause()
+
+            checkbox = app.screen.query_one('#spawn-skip-perms', Checkbox)
+            assert checkbox.value is True
+
+            await pilot.click('#spawn-submit')
+            await pilot.pause()
+
+        assert calls == [('/home/leo/src/dark-factory', 'unblock', '', True)]
+
+    @pytest.mark.timeout(10)
+    async def test_spawn_screen_checkbox_toggled_on_overrides_false_default(self, tmp_path):
+        """Toggling SpawnScreen's skip-perms Checkbox on overrides a False
+        injected default -- the per-spawn toggle wins over the operator's
+        env-configured default (F9 fix, task 2518)."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_bar import SpawnScreen
+        from textual.widgets import Checkbox
+
+        calls: list[tuple[str, str, str, bool]] = []
+
+        def on_submit(project_root: str, role: str, prompt: str, skip_perms: bool) -> None:
+            calls.append((project_root, role, prompt, skip_perms))
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05, spawn_runner=lambda argv: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            app.push_screen(
+                SpawnScreen(
+                    ['/home/leo/src/dark-factory'],
+                    on_submit,
+                    default_skip_perms=False,
+                )
+            )
+            await pilot.pause()
+
+            checkbox = app.screen.query_one('#spawn-skip-perms', Checkbox)
+            assert checkbox.value is False
+            checkbox.value = True
+            await pilot.pause()
+
+            await pilot.click('#spawn-submit')
+            await pilot.pause()
+
+        assert len(calls) == 1
+        assert calls[0][3] is True
+
 
 class TestSpawnTree:
     @pytest.mark.timeout(10)
