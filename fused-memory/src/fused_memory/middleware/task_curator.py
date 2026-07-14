@@ -1570,18 +1570,23 @@ class TaskCurator:
         that record_task/backfill_corpus wrote. Best-effort — degrades to a
         logged warning on any error (see caller wrapping).
         """
-        client = await self._get_qdrant()
-        collection = self._collection_name(project_id)
-        if not await client.collection_exists(collection):
-            return
+        try:
+            client = await self._get_qdrant()
+            collection = self._collection_name(project_id)
+            if not await client.collection_exists(collection):
+                return
 
-        from qdrant_client.models import PointIdsList
+            from qdrant_client.models import PointIdsList
 
-        point_id = self._point_id(project_id, task_id)
-        await client.delete(
-            collection_name=collection,
-            points_selector=PointIdsList(points=[point_id]),
-        )
+            point_id = self._point_id(project_id, task_id)
+            await client.delete(
+                collection_name=collection,
+                points_selector=PointIdsList(points=[point_id]),
+            )
+        except Exception:
+            logger.warning(
+                'task_curator: evict_task failed for %s', task_id, exc_info=True,
+            )
 
     @staticmethod
     def _point_id(project_id: str, task_id: str) -> str:
