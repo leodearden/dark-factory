@@ -21,6 +21,7 @@ import argparse
 import os
 import sys
 from collections.abc import Sequence
+from datetime import date
 from pathlib import Path
 
 # Self-bootstrap for standalone `python scripts/legibility/nightly.py` runs
@@ -32,7 +33,8 @@ from pathlib import Path
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility.config import load_config  # noqa: E402
+from legibility import inventory, sampling  # noqa: E402
+from legibility.config import LegibilityConfig, load_config  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # resolve_config_path — map a bare project_id to its legibility.yaml
@@ -93,6 +95,50 @@ def resolve_config_path(
         f'no legibility.yaml found for project_id={project_id!r} under '
         f'search roots {[str(r) for r in roots]!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# select_scored_records / select_digest_sessions — inventory -> score ->
+# classify -> stratified sample
+# ---------------------------------------------------------------------------
+
+def select_scored_records(
+    cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
+) -> list[sampling.ScoredRecord]:
+    """Enumerate *target_date*'s sessions for *cfg* and assemble a
+    :class:`~legibility.sampling.ScoredRecord` per session.
+
+    Reuses ``inventory.enumerate_sessions`` plus sampling's own private
+    one-pass helpers (``_score_and_find_first_turn`` /
+    ``_first_user_turn_text``) -- the EXACT loop ``sampling.main`` uses --
+    rather than duplicating the score+first-turn pass or adding a new public
+    function to the already-landed β module.
+    """
+    sessions = inventory.enumerate_sessions(projects_root, cfg.cwd_prefixes, target_date)
+
+    scored: list[sampling.ScoredRecord] = []
+    for session in sessions:
+        counts, first_turn = sampling._score_and_find_first_turn(session.path)
+        stratum = sampling.classify_agent_class(first_turn, session.path)
+        scored.append(
+            sampling.ScoredRecord(
+                session=session,
+                stratum=stratum,
+                counts=counts,
+                first_turn_text=sampling._first_user_turn_text(first_turn),
+            )
+        )
+    return scored
+
+
+def select_digest_sessions(
+    cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
+) -> list[sampling.ScoredRecord]:
+    """The budget-bounded, stratified subset of *target_date*'s sessions to
+    digest -- :func:`select_scored_records` narrowed by
+    ``sampling.stratified_sample``."""
+    scored = select_scored_records(cfg, projects_root, target_date)
+    return sampling.stratified_sample(scored, cfg).selected
 
 
 if __name__ == '__main__':
