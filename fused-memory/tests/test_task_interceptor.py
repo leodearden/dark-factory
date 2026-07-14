@@ -1609,6 +1609,35 @@ async def test_remove_tasks_multi_id_emits_one_event_per_id(
 
 
 @pytest.mark.asyncio
+async def test_remove_tasks_evicts_curator_vectors(interceptor, taskmaster):
+    """remove_tasks() evicts each removed task's vector from the curator
+    corpus (Layer A witness-eviction — curator corpus RC1, task 2520)."""
+    taskmaster.remove_tasks = AsyncMock(
+        return_value={
+            'successful': 2,
+            'failed': 0,
+            'removed_ids': ['5', '6'],
+            'message': 'ok',
+        }
+    )
+    mock_curator = AsyncMock()
+    mock_curator.evict_task = AsyncMock()
+    interceptor._get_curator = AsyncMock(return_value=mock_curator)
+
+    result = await interceptor.remove_tasks(['5', '6'], '/project')
+
+    assert mock_curator.evict_task.await_count == 2
+    mock_curator.evict_task.assert_any_await('project', '5')
+    mock_curator.evict_task.assert_any_await('project', '6')
+    assert result == {
+        'successful': 2,
+        'failed': 0,
+        'removed_ids': ['5', '6'],
+        'message': 'ok',
+    }
+
+
+@pytest.mark.asyncio
 async def test_dependency_operations_emit_events(interceptor, event_buffer):
     await interceptor.add_dependency('2', '1', '/project')
     await interceptor.remove_dependency('2', '1', '/project')
