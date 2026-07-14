@@ -685,11 +685,14 @@ def build_suppression_payload(
     Returns a :class:`SuppressionPayload` with ``content``, ``category``, and
     ``metadata`` fields matching the canonical schema documented in the
     ``## Flag Suppression Check`` section of ``STAGE1_SYSTEM_PROMPT``.
-    ``task_id`` is validated as numeric (via an ``int()`` fast-path) then
-    canonicalized to ``str`` (task 2454) so the producer always pins a
-    string type regardless of how the caller obtained the id — this keeps
-    the Mem0 mirror queryable via ``count_memories_by_metadata`` with a
-    string filter.
+    ``task_id`` accepts either a single numeric id (``int`` or numeric
+    ``str``) OR a comma-joined composite of numeric ids (e.g.
+    ``'2405,540,544'``, mixing ids across projects) — both are canonicalized
+    to a ``str`` (task 2454) so the producer always pins a string type
+    regardless of how the caller obtained the id.  A composite's components
+    are stripped of surrounding whitespace (``'2405, 540'`` canonicalizes to
+    ``'2405,540'``). String canonicalization keeps the Mem0 mirror queryable
+    via ``count_memories_by_metadata`` with a string filter.
 
     ``project_id`` is intentionally absent — it is a write-time concern that
     must be passed separately to ``memory_service.add_memory``, keeping this
@@ -706,17 +709,27 @@ def build_suppression_payload(
 
     Canonical schema (Mem0, observations_and_summaries category):
       - ``metadata.kind = "stage1_flag_suppression"``
-      - ``metadata.task_id = "<N>"`` (str — canonicalized by this function)
+      - ``metadata.task_id = "<N>"`` or ``"<N>,<N>,..."`` (str — canonicalized
+        by this function)
       - ``metadata.flag_types = [<str>, ...]`` (optional; sorted-unique)
       - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
     """
     try:
         tid = str(int(task_id))
     except (TypeError, ValueError) as e:
-        raise ValueError(
-            f'build_suppression_payload: task_id must be an int or numeric '
-            f'string, got {task_id!r}'
-        ) from e
+        # Composite fallback: a comma-joined list of numeric ids (e.g. a
+        # cross-project signature like '2405,540,544'). Mirrors the
+        # numeric/comma-joined validation convention in
+        # _is_valid_marker_task_id. Only reached when the single-id int()
+        # fast-path above fails.
+        components = [c.strip() for c in task_id.split(',')] if isinstance(task_id, str) else []
+        if len(components) >= 2 and all(c.isdigit() for c in components):
+            tid = ','.join(components)
+        else:
+            raise ValueError(
+                f'build_suppression_payload: task_id must be an int or numeric '
+                f'string, got {task_id!r}'
+            ) from e
     metadata: _SuppressionMetadata = {
         'kind': 'stage1_flag_suppression',
         'task_id': tid,
