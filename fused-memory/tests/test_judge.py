@@ -97,6 +97,29 @@ def mock_journal():
     return journal
 
 
+# --- Judge._parse_verdict tests ---
+
+
+def test_parse_verdict_unparseable_response_is_loud_not_fabricated(mock_journal):
+    """Unparseable judge output must produce a loud, honest verdict, not a
+    fabricated fail-soft neutral one.
+
+    A systemic judge/CLI outage should not hide behind a default 'minor'
+    verdict with a generic 'Manual review recommended' recommendation —
+    that lets the outage silently degrade review quality. It must surface
+    as severity=serious (routing through the existing halt path) with a
+    finding that honestly names the parse failure.
+    """
+    judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+    verdict = judge._parse_verdict('not valid json at all {{{', 'run-unparseable')
+
+    assert verdict.severity == VerdictSeverity.serious
+    assert len(verdict.findings) == 1
+    assert verdict.findings[0].get('recommendation') != 'Manual review recommended'
+    assert 'Judge response could not be parsed' in verdict.findings[0].get('issue', '')
+
+
 # --- Judge._call_llm anthropic branch tests ---
 
 
