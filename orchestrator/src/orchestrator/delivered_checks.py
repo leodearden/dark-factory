@@ -139,9 +139,10 @@ async def _run_script_check(
     propagates to :func:`run_delivered_check`'s catch-all, which maps it to
     :attr:`DeliveredCheckResult.ERRORED`.
     """
+    assert meta.script is not None  # enforced by the script cross-field validator
+    assert meta.timeout_secs is not None  # enforced by the script cross-field validator
     script_path = str(Path(project_root) / meta.script)
     argv = [script_path, *meta.args]
-    assert meta.timeout_secs is not None  # enforced by the script cross-field validator
     rc, _out, _err = await asyncio.wait_for(
         runner(argv, cwd=Path(project_root)), timeout=meta.timeout_secs
     )
