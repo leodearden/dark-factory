@@ -96,6 +96,10 @@ def find_near_duplicate_memory_groups(
     Complexity:
         O(n^2) pairs x O(L) per ``SequenceMatcher.ratio()`` call (L = content
         length) — mirrors ``audit_duplicate_tasks.find_near_duplicate_groups``.
+        Each pair is pre-filtered through ``quick_ratio()``, a documented
+        upper bound on ``ratio()`` that is much cheaper to compute, so
+        obviously-dissimilar pairs skip the expensive exact comparison
+        without changing which pairs end up >= threshold.
     """
     n = len(memories)
     if n < 2:
@@ -125,11 +129,22 @@ def find_near_duplicate_memory_groups(
         # not be extracted. See the docstring safety carve-out.
         if not normalized[i]:
             continue
+        # Reuse one SequenceMatcher across the inner loop instead of
+        # constructing a fresh one per pair (set_seq1 is fixed per i;
+        # set_seq2 varies per j — identical argument order to the original
+        # difflib.SequenceMatcher(None, normalized[i], normalized[j])).
+        matcher = difflib.SequenceMatcher()
+        matcher.set_seq1(normalized[i])
         for j in range(i + 1, n):
             if not normalized[j]:
                 continue
-            ratio = difflib.SequenceMatcher(None, normalized[i], normalized[j]).ratio()
-            if ratio >= threshold:
+            matcher.set_seq2(normalized[j])
+            # quick_ratio()/real_quick_ratio() are documented upper bounds on
+            # ratio(), so skipping pairs below threshold here never changes
+            # which pairs end up unioned — only cheaper on obvious misses.
+            if matcher.real_quick_ratio() < threshold or matcher.quick_ratio() < threshold:
+                continue
+            if matcher.ratio() >= threshold:
                 union(i, j)
 
     # Materialise groups: collect memory lists per root, drop singletons.
