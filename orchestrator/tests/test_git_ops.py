@@ -9772,3 +9772,94 @@ class TestSeedWarmLaneTakesLaneLock:
             if lock_held:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 os.close(lock_fd)
+
+
+# ---------------------------------------------------------------------------
+# Task 2599 (step-3) — end-to-end guard: _seed_warm_lane's new <lane_dir>.lock
+# and _run_thin_warm_lane's real script both agree on the SAME inode, so a
+# genuine concurrent seed really does make a racing thin exit 75 (benign
+# skip) — not just each side's lock behavior proven in isolation above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSeedAndThinMutualExclusion:
+    """End-to-end: a live ``_seed_warm_lane`` holding ``<lane_dir>.lock``
+    makes a concurrent ``_run_thin_warm_lane``'s real ``flock -n`` gate exit
+    75.
+
+    ``TestSeedWarmLaneTakesLaneLock`` proves ``_seed_warm_lane`` blocks
+    against an externally-held lock; ``TestRunThinWarmLaneFlockContention``
+    proves ``_run_thin_warm_lane``'s real script surfaces rc=75 against an
+    externally-held lock. Neither, alone, proves the two sides actually
+    contend with EACH OTHER on the same file. This test drives both real
+    code paths at once — a genuine ``_seed_warm_lane`` in flight, and a
+    genuine ``_run_thin_warm_lane`` racing it — closing that last gap.
+    """
+
+    async def test_seed_holding_lane_lock_makes_concurrent_thin_skip(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        lane = git_repo / '_lane-0'
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True)
+        seed_started = lane / 'seed_started'
+        seed_release = lane / 'seed_release'
+        seed_script = scripts_dir / 'seed-warm-lane.sh'
+        seed_script.write_text(
+            '#!/usr/bin/env bash\n'
+            'set -euo pipefail\n'
+            f'touch {seed_started}\n'
+            f'while [ ! -e {seed_release} ]; do\n'
+            '    sleep 0.02\n'
+            'done\n'
+            'exit 0\n'
+        )
+        seed_script.chmod(0o755)
+
+        # Real-T3 thin stub — the SAME stub TestRunThinWarmLaneFlockContention
+        # uses — so this exercises the genuine flock -n gate, not a scripted rc.
+        thin_scripts_dir = git_repo / 'scripts'
+        thin_scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_thin_warm_lane_flock_stub(thin_scripts_dir)
+
+        seed_task = asyncio.create_task(
+            git_ops._seed_warm_lane(lane, '--fresh-checkout')
+        )
+        try:
+            async def _wait_for_seed_started():
+                while not seed_started.exists():
+                    await asyncio.sleep(0.01)
+
+            try:
+                await asyncio.wait_for(_wait_for_seed_started(), 10)
+            except asyncio.TimeoutError:
+                raise AssertionError(
+                    'seed-warm-lane.sh stub never started — _seed_warm_lane '
+                    'did not acquire <lane_dir>.lock and run the script'
+                )
+
+            # seed_started existing proves _seed_warm_lane has acquired the
+            # outer flock -x <lane_dir>.lock and is now blocking on release.
+            thin_rc = await git_ops._run_thin_warm_lane(lane)
+
+            assert thin_rc == 75, (
+                'a concurrent _run_thin_warm_lane must exit 75 (benign skip) '
+                'while _seed_warm_lane genuinely holds <lane_dir>.lock — the '
+                'two sides must contend on the SAME lock file'
+            )
+
+            seed_release.touch()
+
+            seed_rc = await asyncio.wait_for(seed_task, 10)
+            assert seed_rc == 0, (
+                f'_seed_warm_lane must complete successfully once released, '
+                f'got rc={seed_rc!r}'
+            )
+        finally:
+            seed_release.touch()  # idempotent unblock in case of failure above
+            if not seed_task.done():
+                try:
+                    await asyncio.wait_for(seed_task, 10)
+                except Exception:
+                    pass
