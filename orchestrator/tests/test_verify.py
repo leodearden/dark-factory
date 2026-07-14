@@ -7592,3 +7592,71 @@ class TestFailureAnchoredExcerpt:
         excerpt = _failure_anchored_excerpt(output, cap=3000)
 
         assert needle in excerpt
+
+
+class TestFailureReportUsesAnchoredExcerpt:
+    """``VerifyResult.failure_report()``'s "## Test Failures" section must use
+    ``_failure_anchored_excerpt`` instead of a fixed ``test_output[-3000:]``
+    tail (PART 1, task 2549), so a failing test buried in a long PASS-wall
+    survives into the report instead of being elided by the tail slice.
+
+    RED today: failure_report() still slices ``test_output[-3000:]`` directly
+    — (a)/(b) fail because the buried/real failure names sit outside the last
+    3000 characters of the (deliberately long) synthetic test_output.
+    """
+
+    # (a) a failure buried early in a long PASS-wall must survive the report.
+    def test_buried_failure_survives_the_report(self):
+        pass_lines = [f'tests/test_mod.py::test_pass_{i} PASSED' for i in range(200)]
+        buried = 'FAILED tests/pkg/test_mod.py::test_buried - AssertionError'
+        lines = pass_lines[:20] + [buried] + pass_lines[20:]
+        test_output = '\n'.join(lines)
+
+        vr = VerifyResult(
+            passed=False,
+            test_output=test_output,
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+        )
+        report = vr.failure_report()
+
+        assert '## Test Failures' in report
+        assert 'test_buried' in report, (
+            f'buried failure name elided from the report — still tail-slicing?\n{report[:300]!r}'
+        )
+
+    # (b) decoy suppression best-effort: a fixture-emitted 'FAIL:' line must
+    # not shadow a real, later FAILED marker out of the report.
+    def test_decoy_fail_colon_does_not_shadow_real_failure(self):
+        pad = [f'tests/test_mod.py::test_pass_{i} PASSED' for i in range(200)]
+        decoy = 'FAIL: this is fixture data, not a real failure'
+        real = 'FAILED tests/pkg/test_mod.py::test_real - AssertionError'
+        lines = pad[:20] + [decoy] + pad[20:40] + [real] + pad[40:]
+        test_output = '\n'.join(lines)
+
+        vr = VerifyResult(
+            passed=False,
+            test_output=test_output,
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+        )
+        report = vr.failure_report()
+
+        assert 'test_real' in report, (
+            f'real failure elided from the report:\n{report[:300]!r}'
+        )
+
+    # (c) regression: short output with a FAILED marker still emits the section.
+    def test_short_output_with_failed_marker_still_emits_section(self):
+        vr = VerifyResult(
+            passed=False,
+            test_output='test my::mod::it FAILED\n',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+        )
+        report = vr.failure_report()
+
+        assert '## Test Failures' in report
