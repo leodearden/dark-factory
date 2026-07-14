@@ -542,12 +542,23 @@ _WEAK_FAILURE_MARKER_RE = re.compile(
     re.MULTILINE,
 )
 
-# Union of strong+weak — used by failure_report() as the emit-gate for the
-# ## Test Failures section (broadened from the legacy `'FAILED' in
-# test_output` substring check to "any failure marker present" — a superset,
-# so existing FAILED-anchored tests stay green).
+# Union of strong+weak, plus a trailing bare "FAILED" substring alternative —
+# used by failure_report() as the emit-gate for the ## Test Failures section
+# (broadened from the legacy `'FAILED' in test_output` substring check to
+# "any failure marker present, OR that legacy substring itself"). The
+# trailing `FAILED` alternative is what makes this a *genuine* superset: a
+# structurally-anchored marker alone is NOT one, since e.g. a cargo summary
+# line like "test result: FAILED. 3 passed; 1 failed" has no line-start/
+# line-end FAILED (see _PYTEST_FAILED_LINE_RE / _TRAILING_FAILED_RE) and no
+# strong/weak marker at all, yet still contains the old substring — without
+# this alternative such output would silently stop emitting the section.
+# Note this union is the emit *gate* only; _failure_anchored_excerpt anchors
+# windows using _STRONG_FAILURE_MARKER_RE/_WEAK_FAILURE_MARKER_RE directly
+# (not this pattern), so a gate-only match like the cargo line above falls
+# back to _failure_anchored_excerpt's tail slice — identical to pre-anchoring
+# (legacy) behavior for that case, i.e. no regression there either.
 _FAILURE_MARKER_RE = re.compile(
-    _STRONG_FAILURE_MARKER_RE.pattern + '|' + _WEAK_FAILURE_MARKER_RE.pattern,
+    _STRONG_FAILURE_MARKER_RE.pattern + '|' + _WEAK_FAILURE_MARKER_RE.pattern + '|FAILED',
     re.MULTILINE,
 )
 
