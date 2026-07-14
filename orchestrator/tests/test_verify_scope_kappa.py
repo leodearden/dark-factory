@@ -868,10 +868,10 @@ class TestFallbackPlanAuthorityGoldens:
         assert executed[0].test_command == _FLEET_TEST_COMMAND
         # LINT/TYPE scope to the first clause, dropping the rest of the chain.
         assert executed[0].lint_command == f'uv run --project shared ruff check {test_path}'
-        assert 'check_bare_magicmock_config' not in executed[0].lint_command
+        assert 'check_bare_magicmock_config' not in (executed[0].lint_command or '')
         assert executed[0].type_check_command == f'npx pyright {test_path}'
-        assert 'orchestrator' not in executed[0].type_check_command
-        assert 'dashboard' not in executed[0].type_check_command
+        assert 'orchestrator' not in (executed[0].type_check_command or '')
+        assert 'dashboard' not in (executed[0].type_check_command or '')
 
         assert result.plan is not None
         for prefix, cmd in (

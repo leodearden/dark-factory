@@ -39,6 +39,7 @@ from orchestrator.verify_categories import (
 from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import (
     ToolKind,
+    VerifyCmd,
     cargo_scope,
     govern_cpu,
     parse_config_command,
@@ -3687,6 +3688,73 @@ def _executed_module_configs_from_plan(
     return executed
 
 
+# Maps a fallback PlannedRun's ModuleConfig attribute (as resolved by
+# _mc_attr_for_run, reused here) to the ToolKind its raw-wrapped executed
+# VerifyCmd should carry in _executed_fallback_plan. Fixed rather than
+# derived from the DECISION run's own `cmd.tool` because a SKIPPED decision
+# run's `cmd` is None — there is no tool to read off it — yet the tool
+# identity is still needed to wrap an execution-time value that turned out
+# non-None (e.g. the decision skipped pytest for lack of a real suite, but a
+# subproject rescoping might yet resolve one).
+_FALLBACK_TOOLKIND_BY_ATTR: dict[str, ToolKind] = {
+    'test_command': ToolKind.PYTEST,
+    'lint_command': ToolKind.RUFF,
+    'type_check_command': ToolKind.PYRIGHT,
+}
+
+
+def _executed_fallback_plan(
+    plan: verify_plan.VerifyPlan,
+    fallback: ModuleConfig,
+) -> verify_plan.VerifyPlan:
+    """Rebuild *plan* (``derive_verify_plan``'s fallback-branch DECISION record)
+    into the EXECUTED plan, using *fallback* — the ``ModuleConfig``
+    :func:`_build_fallback_config` (plus :func:`_apply_cargo_scope`) actually
+    produced — as the ground truth for WHAT ran.
+
+    The plan->execution bridge for the fallback branch (task κ,
+    verify-scope-inversion-prd.md), mirroring
+    :func:`_executed_module_configs_from_plan`'s role for the module-config
+    branch but in the OPPOSITE direction: rather than building an executed
+    ``ModuleConfig`` FROM the plan, this rebuilds the EXECUTED PLAN from the
+    already-executed ``ModuleConfig``, since ``_build_fallback_config``'s
+    filesystem-dependent rendering (subproject cd-scoping, mixed
+    root+subproject scoping, TYPE/LINT uv-context rescoping, OPAQUE
+    fleet-chain first-clause scoping — see its own docstring) is retained
+    unchanged as the fallback's execution-layer renderer rather than being
+    reimplemented here (or threaded a `plan` parameter to consume directly:
+    :func:`_build_fallback_config`'s call site must keep its exact current
+    arguments — ``TestRunScopedVerificationForwardsWorktreeToFallback``
+    replaces it with a fixed ``(task_files, config=None, worktree=None)``
+    fake with no ``**kwargs`` catch-all, so any new call-site keyword breaks
+    it, the same constraint the "NOTE (task γ amendment)" comment at that
+    call site already documents for ``content_cache``).
+
+    Each of *plan*'s runs (keyed by the same tool-prefixed *reason*
+    convention :func:`_mc_attr_for_run` relies on) is replaced by a new
+    ``PlannedRun`` whose ``module_prefix`` is *fallback*.prefix (the ACTUAL
+    subproject/fallback identity that ran — e.g. ``'cockpit'``, not the
+    idealized flat ``'__fallback__'``) and whose ``cmd`` is a raw
+    pass-through ``VerifyCmd`` wrapping *fallback*'s corresponding field
+    verbatim (``None`` when that field is ``None`` — an execution-time skip,
+    which may not match the decision's own ``scope_kind``, e.g. a subproject
+    diff with no derivable pytest target). ``scope_kind``/``reason`` carry
+    over from the decision unchanged: they answer WHY a tool slot was scoped
+    a given way, not WHERE/HOW it actually ran.
+    """
+    executed_runs = []
+    for run in plan.runs:
+        attr = _mc_attr_for_run(run)
+        executed_cmd_str = getattr(fallback, attr)
+        cmd = (
+            VerifyCmd(tool=_FALLBACK_TOOLKIND_BY_ATTR[attr], raw=executed_cmd_str)
+            if executed_cmd_str is not None
+            else None
+        )
+        executed_runs.append(replace(run, module_prefix=fallback.prefix, cmd=cmd))
+    return replace(plan, runs=tuple(executed_runs))
+
+
 def _safe_derive_verify_plan_dict(
     existing_files: list[str],
     module_configs: list[ModuleConfig],
@@ -3694,25 +3762,35 @@ def _safe_derive_verify_plan_dict(
     worktree_reader: Callable[[str], str | None],
     *,
     role: Literal['merge', 'task'],
+    executed_fallback: ModuleConfig | None = None,
 ) -> dict | None:
-    """Best-effort ``derive_verify_plan(...).to_dict()`` for ``VerifyResult.plan``.
+    """Best-effort executed-plan dict for ``VerifyResult.plan``.
 
     Used by the fallback (no-``module_configs``) branch of
     :func:`run_scoped_verification` — the module-config branch derives its
     plan directly and executes it (see
-    :func:`_executed_module_configs_from_plan`), so this helper's only
-    remaining job is giving the fallback branch the same ``VerifyResult.plan``
-    record without re-deriving it inline. A bug in the pure decision layer —
-    an unforeseen ``VerifyCmd``/dataclass edge, or a future change to
-    ``_verify_cmd_to_dict``/``to_dict`` — must never fail an otherwise-passing
-    verify attempt just because its plan record couldn't be built.  Catches
-    broadly and logs a warning, returning ``None`` (``VerifyResult.plan``'s
-    own default) on any failure instead of propagating and failing the gate.
+    :func:`_executed_module_configs_from_plan`), so this helper's job is
+    giving the fallback branch the same ``VerifyResult.plan`` treatment: it
+    best-effort-builds the EXECUTED plan record without re-deriving it
+    inline. When *executed_fallback* is given (the fallback branch's own
+    already-executed ``ModuleConfig``), the derived DECISION plan is folded
+    through :func:`_executed_fallback_plan` first, so the returned dict
+    records what actually ran (module_prefix + rendered command) rather than
+    the idealized flat ``'__fallback__'`` decision alone. A bug in the
+    decision layer or this reconciliation — an unforeseen ``VerifyCmd``/
+    dataclass edge, or a future change to ``_verify_cmd_to_dict``/``to_dict``
+    — must never fail an otherwise-passing verify attempt just because its
+    plan record couldn't be built. Catches broadly and logs a warning,
+    returning ``None`` (``VerifyResult.plan``'s own default) on any failure
+    instead of propagating and failing the gate.
     """
     try:
-        return verify_plan.derive_verify_plan(
+        plan = verify_plan.derive_verify_plan(
             existing_files, module_configs, config, worktree_reader, role=role,
-        ).to_dict()
+        )
+        if executed_fallback is not None:
+            plan = _executed_fallback_plan(plan, executed_fallback)
+        return plan.to_dict()
     except Exception as exc:  # noqa: BLE001 — best-effort; must never fail the verify gate
         logger.warning(
             'derive_verify_plan failed — omitting VerifyResult.plan for this attempt: %s',
@@ -3974,29 +4052,28 @@ async def run_scoped_verification(
                     fallback, existing_files, worktree, scope_cargo_enabled,
                 )
                 logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
-                # Declarative decision record (task γ) — unlike the
-                # module_configs branch above (task κ: the plan executes
-                # directly there), this fallback branch is NOT yet
-                # plan-driven: module_configs is [] here by construction
-                # (we're past the `if module_configs:` branch above), which
-                # selects derive_verify_plan's fallback branch, but
-                # _build_fallback_config (above) still independently decides
-                # scope.
-                #
-                # Fidelity note (see _derive_fallback_runs's docstring for
-                # detail): this fallback plan does NOT model the
-                # subproject/mixed-root+subproject rescoping (tasks 2344/
-                # 2368) that _build_fallback_config (above) actually applies
-                # to `fallback`. When the diff lands in a real subproject,
-                # execution runs `cd <sub> && uv run pytest ...` while this
-                # plan still records a flat `'__fallback__'` run against
-                # *existing_files* — the D1/D2 scope_kind decision itself is
-                # unaffected, but the recorded module_prefix/targets/cwd can
-                # diverge from what actually ran. Its structural-content read
-                # is NOT deduped against _build_fallback_config's own read
-                # above (see the NOTE at the _build_fallback_config call site).
+                # Plan-authoritative execution (task κ,
+                # verify-scope-inversion-prd.md): derive_verify_plan's
+                # fallback branch supplies the D1/D2 scope_kind DECISION (why
+                # a tool slot is FULL_SUITE/FILE_SCOPED/SKIPPED);
+                # _build_fallback_config (above) still owns the
+                # filesystem-dependent RENDERING (subproject cd-scoping,
+                # mixed root+subproject scoping, TYPE/LINT uv-context
+                # rescoping, OPAQUE fleet-chain first-clause scoping — see
+                # its own docstring) exactly as before this task. Passing
+                # `fallback` (the already-executed, already-cargo-scoped
+                # ModuleConfig) as `executed_fallback` below folds that
+                # rendering back onto the plan via _executed_fallback_plan,
+                # so VerifyResult.plan records the EXECUTED command
+                # (module_prefix + cmd) rather than an idealized flat
+                # '__fallback__' guess that ignores subproject rescoping. Its
+                # structural-content read is still NOT deduped against
+                # _build_fallback_config's own read above (see the NOTE at
+                # the _build_fallback_config call site) — unchanged from
+                # before this task.
                 plan_dict = _safe_derive_verify_plan_dict(
                     existing_files, module_configs, config, _worktree_reader(worktree), role=role,
+                    executed_fallback=fallback,
                 )
                 if plan_dict is not None:
                     logger.info('Verify plan: %s', plan_dict)
