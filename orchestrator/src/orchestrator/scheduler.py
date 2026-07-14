@@ -2698,7 +2698,19 @@ class Scheduler:
         operator action). A per-tick budget
         (``config.delivered_checks.max_checks_per_tick``) bounds worst-case
         runner fan-out: a dep whose checks don't all complete within budget
-        is left uncached (fail-safe wait, retried next tick).
+        is left uncached (fail-safe wait, retried next tick) — EXCEPT the
+        first dep this sweep actually evaluates (i.e. not served from
+        cache), which always runs ALL of its checks to completion
+        regardless of budget (reviewer_comprehensive amendment). Without
+        this guarantee, a dep whose OWN check count is >= budget would hit
+        the cap at the same relative position on every single sweep (since
+        ``used`` resets to 0 each tick and dict iteration order is stable)
+        and could never resolve — permanently starving its dependent even
+        though nothing is actually wrong with the check (the config allows
+        ``max_checks_per_tick=1``, making this easy to trigger). Exceeding
+        the budget this way logs a bounded WARNING so a mis-sized budget is
+        operator-visible; a later (non-first) dep in the same sweep is
+        still deferred exactly as before once the budget is spent.
 
         Also drives ``_note_delivered_hold`` / ``_streak_delivered_hold``
         visibility, decided from THIS tick's projection: a dependent with a
@@ -2771,6 +2783,11 @@ class Scheduler:
 
         budget = self.config.delivered_checks.max_checks_per_tick
         used = 0
+        # Forward-progress guarantee (reviewer_comprehensive amendment):
+        # the first dep this sweep actually evaluates (below) is allowed to
+        # exceed the per-tick budget on its own checks — see the docstring
+        # above. Sticky for the rest of this sweep once consumed.
+        first_dep_this_sweep = True
         projection: dict[str, bool] = {}
         # Value is `dict | None`: the cache-hit replay path (below) can find
         # no persisted detail for a cache entry predating this amendment
@@ -2805,8 +2822,13 @@ class Scheduler:
             checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
             results: list[tuple[dict, DeliveredCheckResult]] = []
             over_budget = False
+            # Only the first dep this sweep actually evaluates gets the
+            # forward-progress guarantee; every later dep still respects
+            # the budget exactly as before.
+            guaranteed_dep = first_dep_this_sweep
+            first_dep_this_sweep = False
             for check in checks:
-                if used >= budget:
+                if used >= budget and not guaranteed_dep:
                     over_budget = True
                     break
                 used += 1
@@ -2822,6 +2844,16 @@ class Scheduler:
                     dep_id, budget, len(checks),
                 )
                 continue
+
+            if guaranteed_dep and len(checks) > budget:
+                logger.warning(
+                    'Delivered-check sweep: dep %s has %d checks, exceeding '
+                    'max_checks_per_tick (%d) — ran all of them anyway to '
+                    'guarantee per-tick forward progress since it was the '
+                    'first uncached dep this sweep. Consider raising '
+                    'delivered_checks.max_checks_per_tick.',
+                    dep_id, len(checks), budget,
+                )
 
             if all(r is DeliveredCheckResult.DELIVERED for _c, r in results):
                 self._delivered_check_cache[cache_key] = True
