@@ -21,11 +21,13 @@ from orchestrator.evals.prompt_opt.curator_corpus import (
     FrontierLabel,
     RecordedDecision,
     _parse_frontier_label,
+    audit_curator_corpus,
     build_curator_corpus,
     read_curator_decisions,
     recover_recorded_action,
     select_spot_check_subset,
 )
+from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
 from orchestrator.evals.reviewer_trial.mining import assign_split
 
 
@@ -470,3 +472,108 @@ class TestBuildCuratorCorpus:
         )
 
         assert len(calls) == len(manifest.items) == 1
+
+
+class TestAuditCuratorCorpus:
+    """audit_curator_corpus(manifest, adjudication_log, min_items) reports
+    ok=True only when every corpus-integrity signal holds, naming which
+    check(s) failed otherwise (mirrors reviewer_trial.mining.audit_corpus)."""
+
+    @staticmethod
+    def _make_item(ticket_id: str, split: str | None, gold_action: str | None) -> CuratorReplayItem:
+        return CuratorReplayItem(
+            ticket_id=ticket_id,
+            candidate={'title': f'Candidate {ticket_id}'},
+            recorded_action='create',
+            recorded_target_fingerprint=None,
+            recorded_target_id=None,
+            gold_action=gold_action,  # type: ignore[arg-type]
+            gold_target_fingerprint=None,
+            gold_target_id=None,
+            split=split,
+        )
+
+    @classmethod
+    def _passing_manifest_and_log(cls, n: int = 30) -> tuple[CuratorCorpusManifest, AdjudicationLog]:
+        ticket_ids = [f't{i}' for i in range(n)]
+        splits = assign_split(ticket_ids, seed='curator-audit-test')
+
+        items = [cls._make_item(tid, splits[tid], 'create') for tid in ticket_ids]
+        manifest = CuratorCorpusManifest(items=items, split_seed=None)
+
+        log = AdjudicationLog()
+        for i, tid in enumerate(ticket_ids):
+            log.append(tid, frontier_proposal=[{'action': 'create'}], in_spot_check_subset=(i == 0))
+
+        return manifest, log
+
+    def test_passes_when_all_signals_hold(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=30)
+
+        report = audit_curator_corpus(manifest, log, min_items=30)
+
+        assert report.ok is True
+        assert report.failures == []
+        assert report.item_count == 30
+
+    def test_fails_when_below_min_items(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=10)
+
+        report = audit_curator_corpus(manifest, log, min_items=50)
+
+        assert report.ok is False
+        assert 'item_count' in report.failures
+
+    def test_fails_when_split_missing(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=30)
+        manifest.items[0].split = None
+
+        report = audit_curator_corpus(manifest, log, min_items=30)
+
+        assert report.ok is False
+        assert 'missing_split' in report.failures
+
+    def test_fails_when_split_ratio_off(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=30)
+        for item in manifest.items:
+            item.split = 'train'  # every item in one bucket -> ratio way off 2:1:7
+
+        report = audit_curator_corpus(manifest, log, min_items=30)
+
+        assert report.ok is False
+        assert 'split_ratio' in report.failures
+
+    def test_fails_when_gold_label_missing(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=30)
+        manifest.items[0].gold_action = None
+
+        report = audit_curator_corpus(manifest, log, min_items=30)
+
+        assert report.ok is False
+        assert 'missing_gold_label' in report.failures
+
+    def test_fails_when_adjudication_coverage_incomplete(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=30)
+        log.entries.pop()  # last ticket_id now has no adjudication entry
+
+        report = audit_curator_corpus(manifest, log, min_items=30)
+
+        assert report.ok is False
+        assert 'adjudication_coverage' in report.failures
+
+    def test_fails_when_spot_check_subset_empty(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=30)
+        for entry in log.entries:
+            entry.in_spot_check_subset = False
+
+        report = audit_curator_corpus(manifest, log, min_items=30)
+
+        assert report.ok is False
+        assert 'spot_check_subset_empty' in report.failures
+
+    def test_never_raises_on_empty_manifest(self) -> None:
+        report = audit_curator_corpus(CuratorCorpusManifest(items=[]), AdjudicationLog(), min_items=50)
+
+        assert report.ok is False
+        assert report.item_count == 0
+        assert 'item_count' in report.failures
