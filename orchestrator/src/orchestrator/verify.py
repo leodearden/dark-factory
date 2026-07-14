@@ -3697,6 +3697,100 @@ def _worktree_reader(
     return _read
 
 
+# Maps a VerifyCmd's tool identity to the ModuleConfig attribute it renders
+# into. Used by _executed_module_configs_from_plan to recover which of
+# test_command/lint_command/type_check_command a PlannedRun belongs to, from
+# its cmd.tool — a SKIPPED run's cmd is None and needs no attribution, since
+# the corresponding ModuleConfig field is simply left unset (None) there.
+_MC_ATTR_BY_TOOL: dict[ToolKind, str] = {
+    ToolKind.PYTEST: 'test_command',
+    ToolKind.RUFF: 'lint_command',
+    ToolKind.PYRIGHT: 'type_check_command',
+}
+
+
+def _executed_module_configs_from_plan(
+    module_configs: list[ModuleConfig],
+    plan: verify_plan.VerifyPlan,
+) -> list[ModuleConfig]:
+    """Build the ModuleConfig(s) *plan* prescribes running, for the module-config branch.
+
+    The plan->execution bridge (task κ, verify-scope-inversion-prd.md):
+    groups *plan*.runs by module_prefix and, for each *mc* in
+    *module_configs*, rebuilds its three commands from the corresponding
+    PlannedRun's scope_kind:
+
+    - SKIPPED -> ``None`` (that check does not run).
+    - FULL_SUITE -> *mc*'s OWN verbatim command (preserves e.g.
+      ``--directory``, matching ``scope_module_config``'s has_conftest/
+      has_test_data/has_structural branches, which reuse
+      ``mc.test_command``/``mc.type_check_command`` unmodified).
+    - FILE_SCOPED -> ``render(run.cmd)`` (identical to ``_scope_to_keyword``'s
+      output, which itself renders a VerifyCmd — see ``verify_cmd.render``).
+
+    A module whose ONLY run is the "no files under prefix" SKIPPED emitted by
+    ``verify_plan._derive_module_runs`` (a single-element runs list — the
+    normal 3-run-per-module shape never collapses to one) is dropped from the
+    returned list entirely, mirroring ``scope_module_config`` returning
+    ``None`` for a subproject with zero matching files: the caller must skip
+    that subproject rather than run its full unscoped suite.
+
+    Uses ``dataclasses.replace`` (imported as ``replace``) rather than a
+    hand-listed ``ModuleConfig(...)`` reconstruction, so every other
+    ModuleConfig field — lock_depth, max_per_module, module_overrides,
+    verify_command_timeout_secs, verify_cold_command_timeout_secs,
+    concurrent_verify, verify_env, scope_cargo — survives onto the executed
+    config unchanged (the same pattern :func:`_apply_cargo_scope` already
+    uses), so ``run_verification``'s resolvers see identical per-module
+    overrides to what they'd have seen from *mc* directly.
+
+    Guard: a TRIVIAL *plan* (``derive_verify_plan``'s top-level "no
+    .py/.rs file at all" short-circuit — a single run with
+    ``module_prefix=''``, which matches no real ``mc.prefix``) means every
+    module has zero matching ``.py`` files by construction, so this returns
+    ``[]`` immediately rather than mis-reading the absent per-module lookup
+    as "no commands configured" and emitting a vacuous ModuleConfig per
+    module (``scope_module_config`` returns ``None`` — excluded — for every
+    *mc* in this case too).
+    """
+    if len(plan.runs) == 1 and plan.runs[0].scope_kind is verify_plan.ScopeKind.TRIVIAL:
+        return []
+
+    runs_by_prefix: dict[str, list[verify_plan.PlannedRun]] = {}
+    for run in plan.runs:
+        runs_by_prefix.setdefault(run.module_prefix, []).append(run)
+
+    executed: list[ModuleConfig] = []
+    for mc in module_configs:
+        runs = runs_by_prefix.get(mc.prefix, [])
+        only_run = runs[0] if len(runs) == 1 else None
+        if (
+            only_run is not None
+            and only_run.cmd is None
+            and only_run.scope_kind is verify_plan.ScopeKind.SKIPPED
+        ):
+            continue
+
+        commands: dict[str, str | None] = {}
+        for run in runs:
+            if run.cmd is None:
+                continue  # SKIPPED slot — the matching field stays unset (None) below
+            attr = _MC_ATTR_BY_TOOL[run.cmd.tool]
+            commands[attr] = (
+                getattr(mc, attr)
+                if run.scope_kind is verify_plan.ScopeKind.FULL_SUITE
+                else render(run.cmd)
+            )
+
+        executed.append(replace(
+            mc,
+            test_command=commands.get('test_command'),
+            lint_command=commands.get('lint_command'),
+            type_check_command=commands.get('type_check_command'),
+        ))
+    return executed
+
+
 def _safe_derive_verify_plan_dict(
     existing_files: list[str],
     module_configs: list[ModuleConfig],
@@ -3844,24 +3938,27 @@ async def run_scoped_verification(
                 # Filter to files that still exist — tasks may delete files as part of their work
                 existing_files = [f for f in task_files if (worktree / f).exists()]
                 # Shared structural-content cache (task γ amendment): threaded
-                # through every scope_module_config call below AND into
-                # derive_verify_plan's worktree_reader further down, so a
+                # into derive_verify_plan's worktree_reader below, so a
                 # touched file is read from disk at most once per attempt
                 # instead of once per (module, observability) consumer.
                 _content_cache: dict[str, str | None] = {}
-                # scope_module_config returns None when no files touch the subproject;
-                # those subprojects are skipped rather than running their full suite.
-                per_module = [
-                    (
-                        mc.prefix,
-                        scope_module_config(
-                            mc, existing_files, worktree=worktree, content_cache=_content_cache,
-                        ),
-                    )
-                    for mc in module_configs
-                ]
-                skipped = [prefix for prefix, scoped_mc in per_module if scoped_mc is None]
-                scoped = [scoped_mc for _prefix, scoped_mc in per_module if scoped_mc is not None]
+                # Plan-authoritative execution (task κ,
+                # verify-scope-inversion-prd.md): derive_verify_plan is the
+                # SOLE decision tree for module scope now — classify_file
+                # runs exactly once per touched file here, not a second time
+                # in a hand-mirrored scope_module_config tree.
+                # _executed_module_configs_from_plan renders each module's
+                # PlannedRuns into the ModuleConfig run_verification actually
+                # executes; a module whose only run is "no files under
+                # prefix" is dropped entirely (mirrors scope_module_config's
+                # `return None` "caller must skip this subproject" contract).
+                plan = verify_plan.derive_verify_plan(
+                    existing_files, module_configs, config,
+                    _worktree_reader(worktree, cache=_content_cache), role=role,
+                )
+                scoped = _executed_module_configs_from_plan(module_configs, plan)
+                scoped_prefixes = {mc.prefix for mc in scoped}
+                skipped = [mc.prefix for mc in module_configs if mc.prefix not in scoped_prefixes]
                 if skipped:
                     logger.info(
                         'Verification scope: skipping %d subproject(s) with no matching files: %s',
@@ -3917,34 +4014,12 @@ async def run_scoped_verification(
                 n_files = len(existing_files)
                 n_mods = len(scoped)
                 logger.info('Verification mode: file-scoped (%d files across %d subprojects)', n_files, n_mods)
-                # Declarative decision record (task γ, verify_plan.py) — NOT
-                # the execution driver: scope_module_config (above) already
-                # built `scoped`, preserving its subproject-narrowing/cargo
-                # logic byte-for-byte. derive_verify_plan is attached to the
-                # aggregated result (VerifyResult.plan) and logged per
-                # attempt for observability/diagnosis.
-                #
-                # Fidelity note: this plan is derived from the pre-scope
-                # `module_configs` + `existing_files` via derive_verify_plan's
-                # OWN independent per-tool scope_kind decision (the same
-                # classify_file predicates as scope_module_config, but not
-                # literally read back from the `scoped` ModuleConfigs above)
-                # — it is not reconciled against `scoped`/`skipped` line for
-                # line. A module scope_module_config skips for lack of
-                # matching files is recorded the same way here (a single
-                # SKIPPED PlannedRun, from the identical prefix filter), but
-                # if scope_module_config's decision tree ever grows a new
-                # narrowing branch, _derive_module_runs must be updated in
-                # parallel to keep this record accurate (see
-                # derive_verify_plan's "Fidelity" docstring paragraph).
-                # Reuses `_content_cache` (built above for scope_module_config)
-                # so the structural-content probe reads each file once.
-                plan_dict = _safe_derive_verify_plan_dict(
-                    existing_files, module_configs, config,
-                    _worktree_reader(worktree, cache=_content_cache), role=role,
-                )
-                if plan_dict is not None:
-                    logger.info('Verify plan: %s', plan_dict)
+                # `plan` (derived once, above) IS the execution driver for
+                # this branch — `scoped` was built from it by
+                # _executed_module_configs_from_plan. Reuse the same object
+                # for VerifyResult.plan rather than deriving a second time.
+                plan_dict = plan.to_dict()
+                logger.info('Verify plan: %s', plan_dict)
             else:
                 scoped = module_configs
                 plan_dict = None
