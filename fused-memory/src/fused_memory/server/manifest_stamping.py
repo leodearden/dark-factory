@@ -96,6 +96,85 @@ async def stamp_capability_manifests(
     if not existing_rel_paths:
         return None
 
-    # TODO(step-4): load/validate the sidecar, stamp task_ids, write it back,
-    # and copy mechanical delivered_checks into producer metadata.
-    return None
+    # One-sidecar-per-batch is the normal contract. An unexpected second
+    # distinct sidecar path is processed as the lexicographically-first
+    # (deterministic), with the rest named loudly in errors rather than
+    # silently dropped.
+    sidecar_rel = existing_rel_paths[0]
+    report: dict[str, Any] = {
+        'path': sidecar_rel,
+        'stamped': [],
+        'missing_labels': [],
+        'errors': [],
+    }
+    if len(existing_rel_paths) > 1:
+        extra = ', '.join(existing_rel_paths[1:])
+        report['errors'].append(
+            f'multiple capability-manifest sidecars matched this batch; '
+            f'processing {sidecar_rel!r}, ignoring: {extra}'
+        )
+
+    # 3. Read + validate the sidecar via the shared α-loader.
+    sidecar_abs = root / sidecar_rel
+    raw_text = sidecar_abs.read_text(encoding='utf-8')
+    raw = yaml.safe_load(raw_text)
+    doc = parse_capability_manifest(raw)
+
+    # 4. Stamp task_id onto each matching label entry and write back to disk.
+    #    Scoped to batch tasks whose OWN derived rel path is this sidecar
+    #    (relevant only for the unexpected multi-sidecar case above).
+    label_to_task_id: dict[str, str] = {
+        label: tid for tid, label, rel in manifest_tasks if rel == sidecar_rel
+    }
+    stamped_labels: list[str] = []
+    for entry in raw.get('tasks', []):
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get('label')
+        if label in label_to_task_id:
+            entry['task_id'] = int(label_to_task_id[label])
+            stamped_labels.append(label)
+
+    if stamped_labels:
+        sidecar_abs.write_text(
+            yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+            encoding='utf-8',
+        )
+    report['stamped'] = stamped_labels
+
+    # 5. For each stamped label, copy only MECHANICAL (grep/script)
+    #    delivered_checks into that producer's metadata.delivered_checks —
+    #    a manual-only (or checkless) label collects an empty list and is
+    #    skipped, leaving the δ gate a status-only no-op for it.
+    stamped_label_set = set(stamped_labels)
+    for task in doc.tasks:
+        if task.label not in stamped_label_set:
+            continue
+        mechanical: list[dict[str, Any]] = []
+        for cap in task.capabilities:
+            check = cap.delivered_check
+            if check is None or check.kind not in ('grep', 'script'):
+                continue
+            mechanical.append(
+                DeliveredCheckMeta(
+                    name=cap.name,
+                    kind=check.kind,
+                    pattern=check.pattern,
+                    expect=check.expect,
+                    paths=check.paths,
+                    script=check.script,
+                    args=check.args,
+                    timeout_secs=check.timeout_secs,
+                ).model_dump()
+            )
+        if not mechanical:
+            continue
+        tid = label_to_task_id[task.label]
+        await task_interceptor.update_task(
+            tid,
+            project_root,
+            metadata=json.dumps({'delivered_checks': mechanical}),
+            agent_id=agent_id,
+        )
+
+    return report
