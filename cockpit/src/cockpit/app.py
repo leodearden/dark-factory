@@ -711,7 +711,7 @@ class CockpitApp(App):
         """
         self.push_screen(SpawnScreen(known_project_roots(self._records), self.spawn_session))
 
-    def spawn_session(self, project_root: str, role: str, prompt: str) -> None:
+    def spawn_session(self, project_root: str, role: str, prompt: str, skip_perms: bool = False) -> None:
         """Spawn a new Claude session (PRD §9 C5b spawn bar) -- the `n` action's leaf signal.
 
         Builds spawn-claude.sh's exact positional argv (build_spawn_argv)
@@ -720,17 +720,21 @@ class CockpitApp(App):
         segment a not-yet-spawned session doesn't have), and the prompt --
         then hands it to the injected spawn_runner (default:
         _default_spawn_runner, a fail-soft subprocess.Popen wrapper).
-        Fail-soft (PRD §2): with no resolvable spawn_script (no injected
-        path, no $CLAUDE_SPAWN_SCRIPT, and the repo-relative default not
-        found), this simply no-ops -- a view/action is never a hard
-        dependency, never an exception.
+        *skip_perms* threads straight through to build_spawn_argv, which
+        renders it into spawn-claude.sh's positional
+        --dangerously-skip-permissions contract (arg #2, 'true'/'false');
+        it defaults to False so callers that omit it keep today's
+        behavior. Fail-soft (PRD §2): with no resolvable spawn_script (no
+        injected path, no $CLAUDE_SPAWN_SCRIPT, and the repo-relative
+        default not found), this simply no-ops -- a view/action is never a
+        hard dependency, never an exception.
         """
         script = self._spawn_script
         if script is None:
             _log.warning('spawn_session: no spawn_script resolved, dropping spawn request')
             return
         title = f'{role}:{Path(project_root).name}'
-        argv = build_spawn_argv(script, project_root, title, prompt)
+        argv = build_spawn_argv(script, project_root, title, prompt, skip_perms=skip_perms)
         self._spawn_runner(argv)
 
     def action_toggle_tree(self) -> None:
