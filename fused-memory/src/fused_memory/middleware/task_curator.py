@@ -46,6 +46,7 @@ from shared.cli_invoke import (
 )
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
+from shared.prompt_artifact import PromptSpec
 
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.middleware.candidate_key import compute_candidate_key
@@ -360,7 +361,27 @@ class _PoolEntry:
         )
 
 
-_SYSTEM_PROMPT = """\
+# ----------------------------------------------------------------------
+# Prompt CONTRACT / HEURISTICS split (task 2494, PRD tier1-prompt-optimization T3)
+#
+# _CURATOR_CONTRACT / _BATCH_CONTRACT are the FROZEN machine contract: the
+# drop/combine/create action semantics, the output JSON-schema instructions,
+# target_fingerprint semantics, and (batch-only) batch_target_index rules —
+# everything the submit_task pipeline parses or verifies. It is un-editable
+# by construction: a pinned artifact only ever supplies the heuristics
+# argument to compose_prompt, never the contract (see PromptArtifactStore.resolve).
+#
+# _CURATOR_HEURISTICS is the EDITABLE combine guidance (the combine rules,
+# the positive-signals bias-toward-combining list, and the rewrite-quality
+# guidance) that a pinned artifact may override. Both specs share this same
+# baseline block; only their contracts differ (batch adds the within-batch
+# duplicate rules).
+#
+# Every section below is copied VERBATIM from the pre-split prompts, only
+# relocated so the contract is contiguous.
+# ----------------------------------------------------------------------
+
+_CURATOR_CONTRACT = """\
 You are the task curator for the dark-factory orchestrator. For each candidate \
 task a reviewer or agent wants to create, you decide ONE of three actions:
 
@@ -378,6 +399,27 @@ task a reviewer or agent wants to create, you decide ONE of three actions:
 - "create": genuinely new work that cannot be merged without loss. Default to \
   "create" when in doubt — a duplicated task is cheaper than a lost or garbled one.
 
+## Output format
+
+Return a single JSON object matching the provided schema. The `justification` field \
+should briefly explain which rule triggered the decision. For "drop" and "combine", \
+set `target_id` to the id of the matched pool task. For "combine", set \
+`rewritten_task` to the full rewritten task fields. For "create", leave `target_id` \
+and `rewritten_task` as null.
+
+## Combine safety: target_fingerprint (required for combine)
+
+When you choose "combine", you MUST also populate `target_fingerprint` with the \
+VERBATIM title of the pool task you are targeting — copy the exact string \
+immediately following `title:` from the pool entry whose id matches `target_id`. \
+This fingerprint is verified against the live task before the rewrite is applied; \
+if it does not match, the combine is refused and the candidate is created fresh \
+instead of silently clobbering an unrelated task. Copy the title character-for-\
+character — do not shorten, summarize, or reformat it. For "drop" and "create", \
+leave `target_fingerprint` null.
+"""
+
+_CURATOR_HEURISTICS = """\
 ## Combine rules (ALL must hold)
 
 1. Coherence. The rewritten task can be described in one sentence without the word \
@@ -417,28 +459,9 @@ When you combine, the rewritten task must be a single coherent rewrite:
 
 If you cannot produce a coherent rewrite that satisfies the hard constraints above, \
 the answer is "create", not a half-hearted combine.
-
-## Output format
-
-Return a single JSON object matching the provided schema. The `justification` field \
-should briefly explain which rule triggered the decision. For "drop" and "combine", \
-set `target_id` to the id of the matched pool task. For "combine", set \
-`rewritten_task` to the full rewritten task fields. For "create", leave `target_id` \
-and `rewritten_task` as null.
-
-## Combine safety: target_fingerprint (required for combine)
-
-When you choose "combine", you MUST also populate `target_fingerprint` with the \
-VERBATIM title of the pool task you are targeting — copy the exact string \
-immediately following `title:` from the pool entry whose id matches `target_id`. \
-This fingerprint is verified against the live task before the rewrite is applied; \
-if it does not match, the combine is refused and the candidate is created fresh \
-instead of silently clobbering an unrelated task. Copy the title character-for-\
-character — do not shorten, summarize, or reformat it. For "drop" and "create", \
-leave `target_fingerprint` null.
 """
 
-_BATCH_SYSTEM_PROMPT = _SYSTEM_PROMPT + """
+_BATCH_CONTRACT = _CURATOR_CONTRACT + """
 
 ## Within-batch duplicates
 
@@ -462,6 +485,27 @@ additional rules for duplicates that exist WITHIN the batch:
 
 4. For non-duplicate candidates, batch_target_index MUST be null.
 """
+
+# Bumped whenever _CURATOR_CONTRACT/_BATCH_CONTRACT change materially, so a
+# stale per-(prompt, model, harness) pinned artifact stops resolving and
+# falls back to the (new) in-code baseline instead of pairing new heuristics
+# with an outdated contract assumption.
+_CURATOR_PROMPT_HARNESS_VERSION = 'curator-v1'
+
+CURATOR_SINGLE_SPEC = PromptSpec(
+    prompt_id='curator_single', contract=_CURATOR_CONTRACT, baseline_heuristics=_CURATOR_HEURISTICS,
+)
+CURATOR_BATCH_SPEC = PromptSpec(
+    prompt_id='curator_batch', contract=_BATCH_CONTRACT, baseline_heuristics=_CURATOR_HEURISTICS,
+)
+
+# TODO(task 2494 step-4/step-6): these two module constants are a temporary
+# bridge so the existing _call_llm/_call_llm_batch call sites keep compiling
+# unchanged until the loader is wired in. They will be replaced by
+# self._resolve_curator_prompt(CURATOR_SINGLE_SPEC/CURATOR_BATCH_SPEC) and
+# then removed entirely.
+_SYSTEM_PROMPT = CURATOR_SINGLE_SPEC.in_code_constant
+_BATCH_SYSTEM_PROMPT = CURATOR_BATCH_SPEC.in_code_constant
 
 
 def normalize_title(title: str | None) -> str:
