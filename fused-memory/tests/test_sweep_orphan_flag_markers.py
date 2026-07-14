@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -300,6 +301,86 @@ class TestClassifyMarkerTaskId:
         """
         assert '1944,2408'.isdigit() is False, 'sanity: whole-string isdigit is False'
         assert _mod.classify_marker_task_id('1944,2408') == 'comma_joined'
+
+
+# ===========================================================================
+# Tests: find_stale_markers
+# ===========================================================================
+
+class TestFindStaleMarkers:
+    """Tests for the pure function find_stale_markers(members, now, max_age_days=14)
+    (task 2596 — restores the age-drain semantics of the retired
+    _sweep_stale_flag_markers, task 1944).
+    """
+
+    _NOW = datetime(2026, 7, 14, tzinfo=UTC)
+
+    @staticmethod
+    def _dated(id: str, created_at: str | None) -> dict:
+        """Build a minimal member dict with an explicit (or missing) created_at."""
+        member: dict = {'id': id, 'metadata': {'source': 'stage1_flag_marker'}}
+        if created_at is not None:
+            member['created_at'] = created_at
+        return member
+
+    def test_old_marker_is_stale(self):
+        """A marker created well before the max_age_days cutoff is returned."""
+        old = self._dated('old1', '2026-01-01T00:00:00+00:00')
+        result = _mod.find_stale_markers([old], self._NOW, max_age_days=14)
+        assert result == [old], f'Expected [old1], got: {result!r}'
+
+    def test_fresh_marker_is_kept(self):
+        """A marker created within the max_age_days window is NOT returned."""
+        fresh = self._dated('fresh1', '2026-07-10T00:00:00+00:00')
+        result = _mod.find_stale_markers([fresh], self._NOW, max_age_days=14)
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_missing_created_at_is_kept_fail_safe(self):
+        """A marker with no created_at key is KEPT (never returned) — fail-safe."""
+        missing = self._dated('missing1', None)
+        result = _mod.find_stale_markers([missing], self._NOW, max_age_days=14)
+        assert result == [], f'Expected [] (kept), got: {result!r}'
+
+    def test_none_created_at_is_kept_fail_safe(self):
+        """A marker with created_at explicitly None is KEPT — fail-safe."""
+        member = {'id': 'none1', 'created_at': None, 'metadata': {}}
+        result = _mod.find_stale_markers([member], self._NOW, max_age_days=14)
+        assert result == [], f'Expected [] (kept), got: {result!r}'
+
+    def test_unparseable_created_at_is_kept_fail_safe(self):
+        """A marker with an unparseable created_at string is KEPT — fail-safe."""
+        member = {'id': 'bad1', 'created_at': 'not-a-date', 'metadata': {}}
+        result = _mod.find_stale_markers([member], self._NOW, max_age_days=14)
+        assert result == [], f'Expected [] (kept), got: {result!r}'
+
+    def test_max_age_days_zero_drains_all_dated_members(self):
+        """max_age_days=0 sets the cutoff to `now` itself, draining every
+        dated member strictly older than `now` — including the marker that
+        was fresh (kept) under the default 14-day window. The missing-
+        created_at member is still kept regardless.
+        """
+        old = self._dated('old1', '2026-01-01T00:00:00+00:00')
+        fresh = self._dated('fresh1', '2026-07-10T00:00:00+00:00')
+        missing = self._dated('missing1', None)
+        members = [old, fresh, missing]
+        result = _mod.find_stale_markers(members, self._NOW, max_age_days=0)
+        assert result == [old, fresh], f'Expected [old1, fresh1], got: {result!r}'
+
+    def test_preserves_order_and_identity(self):
+        """Returned dicts are the same objects, in input order."""
+        old_a = self._dated('old_a', '2026-01-01T00:00:00+00:00')
+        fresh = self._dated('fresh1', '2026-07-10T00:00:00+00:00')
+        old_b = self._dated('old_b', '2026-02-01T00:00:00+00:00')
+        members = [old_a, fresh, old_b]
+        result = _mod.find_stale_markers(members, self._NOW, max_age_days=14)
+        assert result == [old_a, old_b], f'Expected [old_a, old_b], got: {result!r}'
+        assert result[0] is old_a, 'Expected same object identity'
+        assert result[1] is old_b, 'Expected same object identity'
+
+    def test_empty_input_returns_empty(self):
+        """Empty input list returns empty list."""
+        result = _mod.find_stale_markers([], self._NOW, max_age_days=14)
+        assert result == []
 
 
 # ===========================================================================
