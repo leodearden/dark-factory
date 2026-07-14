@@ -7,6 +7,15 @@ Boundary rows as tests:
   I4 surfacing (steps 3-4): _render_skew_surfaces pure helper.
   rows 2/3/4 (steps 5-6):   _classify_disposition_for_outcome async wrapper.
   I4 on the real outcome (steps 7-8): _run_post_merge_verify wiring.
+
+This file stays at the merge_queue.py unit layer and does not touch
+TaskWorkflow. The workflow-layer INTEGRATION_SKEW routing contract
+(_submit_to_merge_queue -> _mark_blocked(category='integration_skew',
+suggested_action='port_landed_change', escalate_to_human=True), steps 13-14)
+is asserted directly — on the exact _mark_blocked kwargs — in
+test_workflow_skew_surfacing.py::TestSubmitToMergeQueueIntegrationSkewRouting,
+and end-to-end through the real merge worker in
+test_merge_skew_end_to_end.py::TestFirstAttemptSkewL1Escalation.
 """
 from __future__ import annotations
 

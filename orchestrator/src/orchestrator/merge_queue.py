@@ -11668,6 +11668,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # outcome was built (see _classify_main_health_red, above), and
                 # INDETERMINATE (fail-open default, I3) stays byte-identical
                 # with no emit at all.
+                #
+                # Amendment (reviewer_comprehensive, round 2): this is a
+                # deliberate choice, not an oversight — INDETERMINATE verify
+                # failures (the common fail-open default on non-orchestrator
+                # submit paths and on any classifier degradation) are
+                # intentionally UNCOUNTED here rather than emitted as a
+                # 'verify_failed' row with disposition=indeterminate. 2384's
+                # digest.merge_disposition_counts therefore has no
+                # denominator signal for that bucket and must compute rates
+                # only over {integration_skew, branch_bug}; it cannot
+                # distinguish "zero INDETERMINATE failures" from
+                # "INDETERMINATE failures not recorded" from this event
+                # alone. I3 requires the fail-open default to stay
+                # byte-identical (no emit) rather than manufacture a new kind
+                # of row, and
+                # test_indeterminate_first_attempt_emits_no_disposition_key
+                # (test_merge_skew_end_to_end.py) pins that contract — widening
+                # this guard to include INDETERMINATE is a deliberate,
+                # separately-reviewed semantics change, not a drive-by fix.
                 if vr.outcome.disposition in (
                     MergeFailureDisposition.INTEGRATION_SKEW,
                     MergeFailureDisposition.BRANCH_BUG,
