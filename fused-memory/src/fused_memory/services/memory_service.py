@@ -2854,6 +2854,63 @@ class MemoryService:
         return await self.mem0.scroll_by_metadata(scope, filters, limit)
 
     # ------------------------------------------------------------------
+    # Read: cycle_summary ledger presence (task 2436, τ1)
+    # ------------------------------------------------------------------
+
+    async def get_cycle_summary_presence(
+        self,
+        project_id: str,
+        run_id: str,
+        stage: str,
+    ) -> dict[str, Any]:
+        """Report whether the AUTHORITATIVE cycle_summary ReconLedgerStore row exists.
+
+        Thin read against ``ReconLedgerStore.get_by_identity``, mapping
+        ``stage`` to the ledger's ``flag_type`` column to disambiguate the
+        Stage 1 (``memory_consolidator``) vs Stage 2 (``task_knowledge_sync``)
+        rows written under the same ``run_id`` (see
+        ``summary_pool.write_cycle_summary``). This is the definitive presence
+        check Stage 3 uses instead of relying solely on the best-effort Mem0
+        mirror.
+
+        Returns an INCONCLUSIVE ``{'present': False, 'ledger_available':
+        False, ...}`` when no ledger is wired — mirrors
+        ``write_cycle_summary`` returning ``False`` when unwired. Callers
+        must not read that as a definitive absence.
+        """
+        ledger = getattr(self, 'recon_ledger', None)
+        if ledger is None:
+            return {
+                'present': False,
+                'ledger_available': False,
+                'project_id': project_id,
+                'run_id': run_id,
+                'stage': stage,
+            }
+        # Presence is intentionally state-agnostic here: any row matching the
+        # five-part identity counts as present, regardless of `record.state`.
+        # This is safe because cycle_summary rows are always upserted with a
+        # fixed state='active' by write_cycle_summary — no writer ever flips
+        # a cycle_summary row to a different state — and expiry is a hard
+        # DELETE via ReconLedgerStore.gc(), not a soft-delete/supersede. If a
+        # future writer introduces a non-active cycle_summary state, revisit
+        # this to filter on `record.state == 'active'`.
+        record = await ledger.get_by_identity(
+            project_id,
+            record_kind='cycle_summary',
+            task_id='',
+            flag_type=stage,
+            run_id=run_id,
+        )
+        return {
+            'present': record is not None,
+            'ledger_available': True,
+            'project_id': project_id,
+            'run_id': run_id,
+            'stage': stage,
+        }
+
+    # ------------------------------------------------------------------
     # Delete
     # ------------------------------------------------------------------
 
