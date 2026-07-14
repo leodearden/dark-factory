@@ -1830,6 +1830,46 @@ class TestParseDecisionDict:
         assert result.action == 'create'
         assert 'unknown' in result.justification
 
+    def test_combine_against_unknown_status_degrades_to_create(self):
+        """RC3 defense-in-depth: even if an unknown-status entry were ever
+        wrongly marked combine_eligible=True (otherwise impossible via
+        _to_pool_entry/_fetch_entry_for_neighbor, both of which force
+        combine_eligible=False for status='unknown'), the unknown-status
+        guard must still block the combine — authoritative independent of
+        combine_eligible.
+        """
+        entry = _PoolEntry(
+            task_id='11',
+            title='Mystery task',
+            description='',
+            details='',
+            files_to_modify=[],
+            module_keys=[],
+            status='unknown',
+            priority='medium',
+            source='module',
+            combine_eligible=True,
+        )
+        result = self._call(
+            {
+                'action': 'combine',
+                'target_id': '11',
+                'target_fingerprint': 'Mystery task',
+                'justification': 'looks like a dup of 11',
+                'rewritten_task': {
+                    'title': 'X',
+                    'description': '',
+                    'details': 'd',
+                    'files_to_modify': [],
+                    'priority': 'medium',
+                },
+            },
+            [entry],
+        )
+        assert result.action == 'create'
+        assert 'unknown' in result.justification
+        assert 'invalid-combine-target' not in result.justification
+
 
 # ----------------------------------------------------------------------
 # _parse_batch_decisions
