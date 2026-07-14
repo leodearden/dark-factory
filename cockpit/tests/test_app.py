@@ -110,6 +110,33 @@ class TestInitialRender:
             assert 'unblock:df#2085' in row
 
 
+class TestSessionTableDefaultFilter:
+    @pytest.mark.timeout(10)
+    async def test_terminal_sessions_are_hidden_by_default_on_mount(self, tmp_path):
+        """FINDING F2 (C10 tour, esc-2303-1): the default session-table view
+        hides terminal (exited/failed-to-start) sessions on launch, so
+        "tens, not 10k" holds even when the registry carries stale history."""
+        from textual.widgets.data_table import RowDoesNotExist
+
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
+        dead = _make_record(session_slug='dead-1', status=sr.Status.EXITED)
+        for r in (live, dead):
+            sr.write_record(r, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            table = app.query_one(SessionTable)
+            assert table.get_row('live-1')
+            with pytest.raises(RowDoesNotExist):
+                table.get_row('dead-1')
+            assert table.row_count == 1
+
+
 class TestPollRefresh:
     @pytest.mark.timeout(10)
     async def test_new_record_appears_and_orders_blocked_first(self, tmp_path):
