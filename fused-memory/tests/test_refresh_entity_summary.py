@@ -967,6 +967,60 @@ class TestRefreshEntitySummaryMcpTool:
         assert call_kwargs.get('entity_name') == 'Alice'
         assert call_kwargs.get('entity_uuid') is None
 
+    # -- step-3 (task-2559): `name` alias for entity_name --
+
+    @pytest.mark.asyncio
+    async def test_name_alias_delegates_with_entity_name(self, mcp_server, mock_service):
+        """Calling with `name` delegates to memory_service.refresh_entity_summary(entity_name=...)."""
+        await mcp_server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'name': 'Alice', 'project_id': 'dark_factory'},
+        )
+        mock_service.refresh_entity_summary.assert_awaited_once()
+        call_kwargs = mock_service.refresh_entity_summary.call_args[1]
+        assert call_kwargs.get('entity_name') == 'Alice'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_canonical_entity_name_still_works(self, mcp_server, mock_service):
+        """Backward compat: entity_name alone still calls the service correctly."""
+        await mcp_server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'entity_name': 'Alice', 'project_id': 'dark_factory'},
+        )
+        mock_service.refresh_entity_summary.assert_awaited_once()
+        call_kwargs = mock_service.refresh_entity_summary.call_args[1]
+        assert call_kwargs.get('entity_name') == 'Alice'
+
+    @pytest.mark.asyncio
+    async def test_entity_uuid_takes_precedence_over_name_alias(self, mcp_server, mock_service):
+        """entity_uuid + name (alias) together: entity_uuid still drives resolution."""
+        await mcp_server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'entity_uuid': 'node-1', 'name': 'Alice', 'project_id': 'dark_factory'},
+        )
+        mock_service.refresh_entity_summary.assert_awaited_once()
+        call_kwargs = mock_service.refresh_entity_summary.call_args[1]
+        assert call_kwargs.get('entity_uuid') == 'node-1'
+        assert call_kwargs.get('entity_name') == 'Alice'
+
+    @pytest.mark.asyncio
+    async def test_conflicting_entity_name_and_name_returns_validation_error(self, mcp_server, mock_service):
+        """Returns a ValidationError dict when entity_name and name disagree."""
+        import json
+        result = await mcp_server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'entity_name': 'Alice', 'name': 'Bob', 'project_id': 'dark_factory'},
+        )
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            parsed = json.loads(content)
+        else:
+            parsed = result
+        assert 'error' in parsed
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.refresh_entity_summary.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # step-7 (task-309): FUSED_MEMORY_INSTRUCTIONS and tool docstring
