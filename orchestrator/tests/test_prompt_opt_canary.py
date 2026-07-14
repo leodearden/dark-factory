@@ -15,7 +15,9 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
+from orchestrator.evals.prompt_opt.__main__ import cli
 from orchestrator.evals.prompt_opt.canary import (
     CanaryThresholds,
     CanaryVerdict,
