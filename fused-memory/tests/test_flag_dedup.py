@@ -1200,6 +1200,61 @@ class TestBuildSuppressionPayloadFlagTypes:
 
 
 # ---------------------------------------------------------------------------
+# RED (task 2454 step-1): metadata.task_id must be STRING-typed, not int.
+#
+# build_suppression_payload currently coerces task_id to int (and
+# _SuppressionMetadata.task_id is pinned to int), so the Mem0 mirror written
+# by write_suppression_record carries an INTEGER metadata.task_id. An
+# external count_memories_by_metadata(filters={'task_id': '544'}) (string)
+# false-negatives against that int-typed record. This class pins the fixed
+# contract: metadata.task_id is a str, identically for int and str input.
+# ---------------------------------------------------------------------------
+
+
+class TestSuppressionTaskIdStringType:
+    """build_suppression_payload / write_suppression_record must produce a
+    STRING-typed metadata.task_id, identically for int and str input
+    (int-vs-string write parity)."""
+
+    def test_int_input_produces_str_task_id(self):
+        """build_suppression_payload(544) yields a str-typed metadata.task_id == '544'."""
+        result = build_suppression_payload(544)
+        assert result['metadata']['task_id'] == '544'
+        assert isinstance(result['metadata']['task_id'], str)
+
+    def test_str_input_produces_str_task_id(self):
+        """build_suppression_payload('544') yields the identical str-typed task_id."""
+        result = build_suppression_payload('544')
+        assert result['metadata']['task_id'] == '544'
+        assert isinstance(result['metadata']['task_id'], str)
+
+    def test_content_string_unchanged_for_int_and_str_input(self):
+        """content renders identically for int and str input — the str flip
+        must not change the human-readable content string."""
+        assert (
+            build_suppression_payload(544)['content']
+            == 'STAGE 1 FLAG SUPPRESSION task_id=544'
+        )
+        assert (
+            build_suppression_payload('544')['content']
+            == 'STAGE 1 FLAG SUPPRESSION task_id=544'
+        )
+
+    @pytest.mark.asyncio
+    async def test_producer_mirror_metadata_task_id_is_str(self, ledger_memory_service):
+        """write_suppression_record's add_memory mirror kwargs carry a
+        str-typed metadata.task_id for int task_id input (producer-path
+        parity) -- closes the count_memories_by_metadata false-negative gap."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(ledger_memory_service, project_id='p', task_id=42)
+
+        kwargs = ledger_memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['task_id'] == '42'
+        assert isinstance(kwargs['metadata']['task_id'], str)
+
+
+# ---------------------------------------------------------------------------
 # Round-trip schema validation tests (task-1185 step-5)
 #
 # FakeMemoryService: in-test stub generalising the FakeMem0 pattern already
