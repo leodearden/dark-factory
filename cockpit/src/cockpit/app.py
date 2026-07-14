@@ -56,7 +56,7 @@ from cockpit.panes.decision_queue import (
 )
 from cockpit.panes.detail_pane import DetailPane
 from cockpit.panes.session_table import SessionTable, filter_live_sessions, order_sessions
-from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv
+from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv, default_skip_perms
 from cockpit.panes.spawn_tree import SpawnTreeScreen
 from cockpit.priority import Priorities, load_priorities
 from cockpit.registry_reader import (
@@ -705,13 +705,24 @@ class CockpitApp(App):
 
         Seeds the picker's project-root field from known_project_roots over
         the most recently scanned session records (self._records) -- a
-        picker source, not a queue filter. Submitting the screen calls back
-        into spawn_session, this task's leaf signal; the screen itself never
+        picker source, not a queue filter. Also seeds the picker's
+        skip-perms toggle from default_skip_perms() (F9 fix, task 2518):
+        the operator's env-configured bypass-perms default, so a
+        cockpit-spawned session in an AFK window inherits bypass-perms
+        instead of hardcoding it off and blocking on an unanswered
+        permission prompt. Submitting the screen calls back into
+        spawn_session, this task's leaf signal; the screen itself never
         builds argv or launches a process.
         """
-        self.push_screen(SpawnScreen(known_project_roots(self._records), self.spawn_session))
+        self.push_screen(
+            SpawnScreen(
+                known_project_roots(self._records),
+                self.spawn_session,
+                default_skip_perms=default_skip_perms(),
+            )
+        )
 
-    def spawn_session(self, project_root: str, role: str, prompt: str) -> None:
+    def spawn_session(self, project_root: str, role: str, prompt: str, skip_perms: bool = False) -> None:
         """Spawn a new Claude session (PRD §9 C5b spawn bar) -- the `n` action's leaf signal.
 
         Builds spawn-claude.sh's exact positional argv (build_spawn_argv)
@@ -720,17 +731,21 @@ class CockpitApp(App):
         segment a not-yet-spawned session doesn't have), and the prompt --
         then hands it to the injected spawn_runner (default:
         _default_spawn_runner, a fail-soft subprocess.Popen wrapper).
-        Fail-soft (PRD §2): with no resolvable spawn_script (no injected
-        path, no $CLAUDE_SPAWN_SCRIPT, and the repo-relative default not
-        found), this simply no-ops -- a view/action is never a hard
-        dependency, never an exception.
+        *skip_perms* threads straight through to build_spawn_argv, which
+        renders it into spawn-claude.sh's positional
+        --dangerously-skip-permissions contract (arg #2, 'true'/'false');
+        it defaults to False so callers that omit it keep today's
+        behavior. Fail-soft (PRD §2): with no resolvable spawn_script (no
+        injected path, no $CLAUDE_SPAWN_SCRIPT, and the repo-relative
+        default not found), this simply no-ops -- a view/action is never a
+        hard dependency, never an exception.
         """
         script = self._spawn_script
         if script is None:
             _log.warning('spawn_session: no spawn_script resolved, dropping spawn request')
             return
         title = f'{role}:{Path(project_root).name}'
-        argv = build_spawn_argv(script, project_root, title, prompt)
+        argv = build_spawn_argv(script, project_root, title, prompt, skip_perms=skip_perms)
         self._spawn_runner(argv)
 
     def action_toggle_tree(self) -> None:

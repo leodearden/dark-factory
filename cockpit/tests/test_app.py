@@ -1184,6 +1184,199 @@ class TestSpawnBar:
         expected_title = f'{role}:{Path(project_root).name}'
         assert spawned[0] == build_spawn_argv(spawn_script, project_root, expected_title, prompt)
 
+    @pytest.mark.timeout(10)
+    async def test_spawn_session_forwards_skip_perms_true(self, tmp_path):
+        """spawn_session(..., skip_perms=True) (F9 fix, task 2518) threads
+        through to build_spawn_argv, so argv[2] is the 'true' literal
+        spawn-claude.sh's positional contract expects."""
+        from cockpit.app import CockpitApp
+
+        spawned: list[list[str]] = []
+        spawn_script = '/repo/skills/spawn/spawn-claude.sh'
+
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            poll_interval=0.05,
+            spawn_runner=spawned.append,
+            spawn_script=spawn_script,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            app.spawn_session('/home/leo/src/dark-factory', 'unblock', 'Please look at this', skip_perms=True)
+            await pilot.pause()
+
+        assert len(spawned) == 1
+        assert spawned[0][2] == 'true'
+
+    @pytest.mark.timeout(10)
+    async def test_spawn_session_forwards_skip_perms_false(self, tmp_path):
+        """spawn_session(..., skip_perms=False) (F9 fix, task 2518) threads
+        through to build_spawn_argv, so argv[2] is the 'false' literal."""
+        from cockpit.app import CockpitApp
+
+        spawned: list[list[str]] = []
+        spawn_script = '/repo/skills/spawn/spawn-claude.sh'
+
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            poll_interval=0.05,
+            spawn_runner=spawned.append,
+            spawn_script=spawn_script,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            app.spawn_session('/home/leo/src/dark-factory', 'unblock', 'Please look at this', skip_perms=False)
+            await pilot.pause()
+
+        assert len(spawned) == 1
+        assert spawned[0][2] == 'false'
+
+    @pytest.mark.timeout(10)
+    async def test_spawn_screen_checkbox_seeded_from_true_default_and_submitted(self, tmp_path):
+        """SpawnScreen's skip-perms Checkbox (F9 fix, task 2518) is seeded
+        from the injected default_skip_perms ctor param, and submitting
+        passes the checkbox's value through as the on_submit callback's
+        4th arg."""
+        from textual.widgets import Checkbox
+
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_bar import SpawnScreen
+
+        calls: list[tuple[str, str, str, bool]] = []
+
+        def on_submit(project_root: str, role: str, prompt: str, skip_perms: bool) -> None:
+            calls.append((project_root, role, prompt, skip_perms))
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05, spawn_runner=lambda argv: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            app.push_screen(
+                SpawnScreen(
+                    ['/home/leo/src/dark-factory'],
+                    on_submit,
+                    default_skip_perms=True,
+                )
+            )
+            await pilot.pause()
+
+            checkbox = app.screen.query_one('#spawn-skip-perms', Checkbox)
+            assert checkbox.value is True
+
+            await pilot.click('#spawn-submit')
+            await pilot.pause()
+
+        assert calls == [('/home/leo/src/dark-factory', 'unblock', '', True)]
+
+    @pytest.mark.timeout(10)
+    async def test_spawn_screen_checkbox_toggled_on_overrides_false_default(self, tmp_path):
+        """Toggling SpawnScreen's skip-perms Checkbox on overrides a False
+        injected default -- the per-spawn toggle wins over the operator's
+        env-configured default (F9 fix, task 2518)."""
+        from textual.widgets import Checkbox
+
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_bar import SpawnScreen
+
+        calls: list[tuple[str, str, str, bool]] = []
+
+        def on_submit(project_root: str, role: str, prompt: str, skip_perms: bool) -> None:
+            calls.append((project_root, role, prompt, skip_perms))
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05, spawn_runner=lambda argv: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            app.push_screen(
+                SpawnScreen(
+                    ['/home/leo/src/dark-factory'],
+                    on_submit,
+                    default_skip_perms=False,
+                )
+            )
+            await pilot.pause()
+
+            checkbox = app.screen.query_one('#spawn-skip-perms', Checkbox)
+            assert checkbox.value is False
+            checkbox.value = True
+            await pilot.pause()
+
+            await pilot.click('#spawn-submit')
+            await pilot.pause()
+
+        assert len(calls) == 1
+        assert calls[0][3] is True
+
+    @pytest.mark.timeout(10)
+    async def test_action_new_session_seeds_skip_perms_checkbox_from_env_true(self, tmp_path, monkeypatch):
+        """End-to-end F9 fix (task 2518): with $CLAUDE_SPAWN_SKIP_PERMS set,
+        'n' (action_new_session) pushes a SpawnScreen whose skip-perms
+        Checkbox is already True, and submitting drives
+        env -> screen -> spawn_session -> build_spawn_argv -> runner,
+        landing the 'true' literal spawn-claude.sh's positional contract
+        expects at argv[2]."""
+        from textual.widgets import Checkbox, Input
+
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_bar import SpawnScreen
+
+        monkeypatch.setenv('CLAUDE_SPAWN_SKIP_PERMS', 'true')
+
+        spawned: list[list[str]] = []
+        spawn_script = '/repo/skills/spawn/spawn-claude.sh'
+
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            poll_interval=0.05,
+            spawn_runner=spawned.append,
+            spawn_script=spawn_script,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('n')
+            await pilot.pause()
+
+            assert isinstance(app.screen, SpawnScreen)
+            checkbox = app.screen.query_one('#spawn-skip-perms', Checkbox)
+            assert checkbox.value is True
+
+            app.screen.query_one('#spawn-project', Input).value = '/home/leo/src/dark-factory'
+            app.screen.query_one('#spawn-role', Input).value = 'unblock'
+            app.screen.query_one('#spawn-prompt', Input).value = 'Please look at this'
+            await pilot.pause()
+
+            await pilot.click('#spawn-submit')
+            await pilot.pause()
+
+        assert len(spawned) == 1
+        assert spawned[0][2] == 'true'
+
+    @pytest.mark.timeout(10)
+    async def test_action_new_session_seeds_skip_perms_checkbox_false_when_env_unset(self, tmp_path, monkeypatch):
+        """Complementary env-unset case (F9 fix, task 2518): with
+        $CLAUDE_SPAWN_SKIP_PERMS unset, 'n' pushes a SpawnScreen whose
+        skip-perms Checkbox is seeded False -- the safe default."""
+        from textual.widgets import Checkbox
+
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_bar import SpawnScreen
+
+        monkeypatch.delenv('CLAUDE_SPAWN_SKIP_PERMS', raising=False)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05, spawn_runner=lambda argv: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('n')
+            await pilot.pause()
+
+            assert isinstance(app.screen, SpawnScreen)
+            checkbox = app.screen.query_one('#spawn-skip-perms', Checkbox)
+            assert checkbox.value is False
+
 
 class TestSpawnTree:
     @pytest.mark.timeout(10)
