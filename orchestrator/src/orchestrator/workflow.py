@@ -2293,73 +2293,138 @@ class TaskWorkflow:
             )
             return WorkflowOutcome.REQUEUED
 
-        except VerifyInfraError as e:
-            # Infra-typed exception from the verify path that escaped the
-            # in-process retry wrapper (e.g. raised outside
-            # _run_scoped_verification_with_infra_retry).  Route to
-            # infra_issue with escalate_to_human rather than the generic
-            # 'Workflow error:' task_failure block below.
-            logger.warning(
-                'Task %s: VerifyInfraError escaped run() (phase=%r errno=%r) '
-                '— routing to infra_issue',
-                self.task_id, e.phase, e.errno,
-            )
-            reason = (
-                f'Verify infra failure (phase={e.phase!r} errno={e.errno}): {e}'
-            )
-            return await self._mark_blocked(
-                reason,
-                category='infra_issue',
-                escalate_to_human=True,
-            )
+        except Exception as e:
+            # W9-ε: every remaining block-kind failure (cap/budget/verify-
+            # infra/OSError/worktree-conflict/generic) is now classified by
+            # ONE classify_failure(e) -> BlockDisposition TABLE lookup
+            # instead of a per-exception-type except clause.  Each branch
+            # below still assembles its own reason/detail text — the table
+            # doesn't carry instance-specific data (retries/elapsed/label,
+            # phase/errno, cumulative_cost, ...) — but escalate_to_human and
+            # the BlockDisposition threaded into _mark_blocked are now
+            # single-sourced from disp.  Every disp.reason_prefix below is
+            # the SAME leading text the pre-W9-ε ladder hard-coded per
+            # exception, so the emitted reason strings stay byte-identical
+            # (behavior-preserving).  Branch order mirrors the pre-W9-ε
+            # ladder's except-clause order (most-specific first).
+            disp = classify_failure(e)
 
-        except OSError as e:
-            # Bare infra-class OSError (ENOSPC/EDQUOT/EROFS/EIO/EMFILE/ENFILE)
-            # escaping the verify path outside the VerifyInfraError wrapper
-            # (e.g. a log or marker write).  Route to infra_issue.
-            # Non-infra OSErrors (EACCES, ENOENT, etc.) fall through to the
-            # same generic handler as except Exception below — Python's
-            # exception model does not allow re-raise into a sibling except
-            # clause, so we duplicate the generic path here.
-            if _is_infra_oserror(e):
+            if isinstance(e, AllAccountsCappedException):
+                logger.warning(
+                    f'Task {self.task_id}: all accounts capped — '
+                    f'{e.retries} retries in {e.elapsed_secs:.1f}s (label={e.label!r})'
+                )
+                return await self._mark_blocked(
+                    f'{disp.reason_prefix}: {e.label} — {e.retries} retries in {e.elapsed_secs:.1f}s',
+                    suggested_action='cap_wait_exceeded_sanity_bound',
+                    escalate_to_human=disp.escalate_to_human,
+                    disposition=disp,
+                )
+
+            if isinstance(e, _SessionBudgetExhausted):
+                last_role = self._last_completed_role or 'n/a'
+                budget_limit = self.config.usage_cap.session_budget_usd
+                # Use the gate's own cumulative figure for the summary — it is
+                # the value that actually exceeded the budget, whereas
+                # self.metrics.total_cost_usd only advances on successful
+                # returns and may lag the gate's running tally if a cap-retry
+                # or partial invocation contributed cost without completing.
+                reason = (
+                    f'{disp.reason_prefix}: ${e.cumulative_cost:.2f} spent of '
+                    f'${budget_limit:.2f} budget (last completed role: {last_role})'
+                )
+                detail = (
+                    f'budget_limit=${budget_limit:.2f}\n'
+                    f'total_cost_usd=${self.metrics.total_cost_usd:.2f}\n'
+                    f'cumulative_cost (gate)=${e.cumulative_cost:.2f}\n'
+                    f'agent_invocations={self.metrics.agent_invocations}\n'
+                    f'total_turns={self.metrics.total_turns}\n'
+                    f'last_completed_role={last_role}'
+                )
+                # _mark_blocked logs "Task %s BLOCKED: %s" — only log the
+                # gate-specific cross-check figure that's unique to this call
+                # site.
+                logger.info(
+                    'Task %s: session budget exhausted (gate cumulative $%.2f)',
+                    self.task_id, e.cumulative_cost,
+                )
+                return await self._mark_blocked(
+                    reason, detail=detail,
+                    escalate_to_human=disp.escalate_to_human,
+                    disposition=disp,
+                )
+
+            if isinstance(e, VerifyInfraError):
+                # Infra-typed exception from the verify path that escaped the
+                # in-process retry wrapper (e.g. raised outside
+                # _run_scoped_verification_with_infra_retry).  Route to
+                # infra_issue with escalate_to_human rather than the generic
+                # 'Workflow error:' task_failure block below.
+                logger.warning(
+                    'Task %s: VerifyInfraError escaped run() (phase=%r errno=%r) '
+                    '— routing to infra_issue',
+                    self.task_id, e.phase, e.errno,
+                )
+                reason = f'{disp.reason_prefix} (phase={e.phase!r} errno={e.errno}): {e}'
+                return await self._mark_blocked(
+                    reason,
+                    category='infra_issue',
+                    escalate_to_human=disp.escalate_to_human,
+                    disposition=disp,
+                )
+
+            if isinstance(e, OSError) and _is_infra_oserror(e):
+                # Bare infra-class OSError (ENOSPC/EDQUOT/EROFS/EIO/EMFILE/
+                # ENFILE) escaping the verify path outside the
+                # VerifyInfraError wrapper (e.g. a log or marker write).
+                # Route to infra_issue.  Non-infra OSErrors (EACCES, ENOENT,
+                # etc.) fall through to the generic branch below — same as
+                # every other unclassified exception.
                 logger.warning(
                     'Task %s: bare infra OSError escaped run() (errno=%r) '
                     '— routing to infra_issue',
                     self.task_id, e.errno,
                 )
-                reason = f'Verify infra OSError (errno={e.errno}): {e}'
+                reason = f'{disp.reason_prefix} (errno={e.errno}): {e}'
                 return await self._mark_blocked(
                     reason,
                     category='infra_issue',
-                    escalate_to_human=True,
+                    escalate_to_human=disp.escalate_to_human,
+                    disposition=disp,
                 )
-            # Non-infra OSError — treat the same as the broad except below.
-            logger.exception(f'Task {self.task_id} workflow error: {e}')
-            return await self._mark_blocked(f'Workflow error: {e}')
 
-        except WorktreeConflictError as e:
-            # esc-2128-8: a WIP-save commit() (inter-iteration rebase, or the
-            # requeue-rebase reuse path) hit a worktree with unresolved
-            # (unmerged-index) conflicts and refused to stage/commit rather
-            # than snapshotting conflict markers verbatim.  Route to a
-            # targeted per-task BLOCKED + human L1 — the steward corrective
-            # loop cannot resolve a conflicted worktree, so skip it entirely
-            # (mirrors the VerifyInfraError/infra_issue handling above, not
-            # _submit_halt_escalation_and_wait, which is merge-queue-halt
-            # ownership and irrelevant to a task-worktree rebase).
-            logger.warning(
-                'Task %s: WorktreeConflictError escaped run() — %s',
-                self.task_id, e,
-            )
+            if isinstance(e, WorktreeConflictError):
+                # esc-2128-8: a WIP-save commit() (inter-iteration rebase, or the
+                # requeue-rebase reuse path) hit a worktree with unresolved
+                # (unmerged-index) conflicts and refused to stage/commit rather
+                # than snapshotting conflict markers verbatim.  Route to a
+                # targeted per-task BLOCKED + human L1 — the steward corrective
+                # loop cannot resolve a conflicted worktree, so skip it entirely
+                # (mirrors the VerifyInfraError/infra_issue handling above, not
+                # _submit_halt_escalation_and_wait, which is merge-queue-halt
+                # ownership and irrelevant to a task-worktree rebase).
+                logger.warning(
+                    'Task %s: WorktreeConflictError escaped run() — %s',
+                    self.task_id, e,
+                )
+                return await self._mark_blocked(
+                    f'{disp.reason_prefix} ({e})',
+                    category='wip_conflict',
+                    escalate_to_human=disp.escalate_to_human,
+                    disposition=disp,
+                )
+
+            # Generic fallback — every other exception, including a
+            # non-infra OSError (Python's exception model has no re-raise-
+            # into-a-sibling-clause, and classify_failure's OSError branch
+            # already returns the same _DEFAULT_BLOCK disposition for it as
+            # for a bare Exception, so one shared branch is correct here).
+            logger.exception(f'Task {self.task_id} workflow error: {e}')
             return await self._mark_blocked(
-                f'WIP-save aborted: unresolved conflict in worktree ({e})',
-                category='wip_conflict',
-                escalate_to_human=True,
+                f'{disp.reason_prefix}: {e}',
+                escalate_to_human=disp.escalate_to_human,
+                disposition=disp,
             )
-
-        except Exception as e:
-            logger.exception(f'Task {self.task_id} workflow error: {e}')
-            return await self._mark_blocked(f'Workflow error: {e}')
 
         finally:
             # Stop the claimant heartbeat loop FIRST — before any other
@@ -8376,6 +8441,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         dedupe_fingerprint: str | None = None,
         spawn_dry_run: bool = False,
         root_cause: str = '',
+        disposition: BlockDisposition | None = None,
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -8437,13 +8503,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             Captures ``self.machine.state`` AT CALL TIME — BLOCKED after
             ``_enter_phase(BLOCKED)`` for the block-return paths below, or
             DONE/etc. for the bypass/steward-resolved paths that never enter
-            BLOCKED.  W9-γ: TerminalReport.category stays None throughout
-            this task (see design decisions) — _mark_blocked's category=
-            parameter is an ESCALATION taxonomy, not FailureCategory.
+            BLOCKED.  W9-ε: TerminalReport.category is sourced from
+            *disposition*.category (a :class:`FailureCategory`) when the
+            caller supplied a :class:`BlockDisposition`; back-compat callers
+            with no disposition keep the pre-W9-ε hard ``None`` (see design
+            decisions) — _mark_blocked's category= parameter remains a
+            SEPARATE, caller-supplied ESCALATION taxonomy, not FailureCategory.
             """
             self._terminal_report = TerminalReport(
                 outcome=outcome, reason=reason, phase=self.machine.state,
-                detail=(detail or reason), category=None,
+                detail=(detail or reason),
+                category=(disposition.category if disposition is not None else None),
                 blocked_from_phase=pre_block_state,
             )
             return outcome
