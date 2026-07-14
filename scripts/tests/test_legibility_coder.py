@@ -399,6 +399,48 @@ def test_code_digest_schema_invalid_record_is_failure_not_fabricated():
     assert result.session == _SESSION_ID
 
 
+def test_code_digest_invocation_error_is_failure_not_fabricated():
+    digest_text = _hand_digest(_SESSION_ID, "a confusing correction happened here")
+    codebook = _tiny_codebook()
+
+    def fake_invoke(prompt, model):
+        raise mod.CoderInvocationError(
+            "claude CLI exited 1 (model='haiku'): simulated backend outage"
+        )
+
+    result = mod.code_digest(
+        digest_text, codebook, project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+
+    assert result.ok is False
+    assert result.record is None
+    assert result.reason, "a failure reason must be recorded"
+    assert result.session == _SESSION_ID
+
+
+def test_code_digest_malformed_frontmatter_is_failure_not_raised():
+    # code_digest itself must never let a CoderParseError from
+    # parse_frontmatter propagate uncaught -- a direct caller (not just
+    # code_digests' batch-level try/except) must get a clean per-digest
+    # failure result, per the function's own never-fabricate docstring.
+    digest_text = "no frontmatter here, just prose"
+    codebook = _tiny_codebook()
+
+    def fake_invoke(prompt, model):
+        raise AssertionError("invoke must never be reached when frontmatter is unparseable")
+
+    result = mod.code_digest(
+        digest_text, codebook, project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+
+    assert result.ok is False
+    assert result.record is None
+    assert result.reason, "a failure reason must be recorded"
+    assert result.session is None
+
+
 def test_code_digest_empty_judgment_is_success_not_failure():
     digest_text = _hand_digest(_SESSION_ID, "nothing confusing happened this session")
     codebook = _tiny_codebook()
@@ -531,6 +573,19 @@ def _write_fake_claude_failing(bin_dir, *, exit_code=1, stderr_text="simulated f
     p.chmod(0o755)
 
 
+def _write_fake_claude_sleeping(bin_dir, *, sleep_secs):
+    """Fake `claude` binary: sleeps past any reasonable test timeout before
+    ever producing output, to exercise _invoke_cli's
+    subprocess.TimeoutExpired -> CoderInvocationError path."""
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        f"sleep {sleep_secs}\n"
+        'printf \'{"matches": [], "candidates": []}\'\n'
+    )
+    p.chmod(0o755)
+
+
 def test_invoke_cli_argv_and_prompt_delivery(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -569,6 +624,18 @@ def test_invoke_cli_nonzero_exit_raises_invocation_error(tmp_path):
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=10,
+        )
+
+
+def test_invoke_cli_timeout_raises_invocation_error(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_sleeping(bin_dir, sleep_secs=2)
+
+    with pytest.raises(mod.CoderInvocationError):
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=0.2,
         )
 
 
@@ -652,3 +719,86 @@ def test_main_storm_writes_zero_records_and_returns_nonzero(tmp_path, monkeypatc
     captured = capsys.readouterr()
     assert captured.err, "expected a failure summary on stderr"
     assert "3/3" in captured.err or "failed=3" in captured.err
+
+
+def test_main_storm_truncates_stale_out_from_prior_run(tmp_path, monkeypatch, capsys):
+    # A storm must never leave a --out from a PRIOR successful run lying
+    # around looking like this run's (empty) output -- a downstream
+    # consumer that reads the file instead of gating on the exit code
+    # must see the current run's true outcome.
+    digests = [
+        _write_main_digest(tmp_path, f"main-stale-{i}", f"session {i} confusion", f"stale{i}")
+        for i in range(3)
+    ]
+
+    codebook_path = tmp_path / "codebook.yaml"
+    codebook_mod.dump(_tiny_codebook(), codebook_path)
+
+    out_path = tmp_path / "out.jsonl"
+    out_path.write_text(
+        json.dumps({
+            "session": "prior-run-session", "date": "2026-07-01",
+            "project": "dark_factory", "agent_class": "interactive",
+            "matches": [], "candidates": [],
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    def fake_invoke_cli(prompt, model, **kwargs):
+        return "not parseable as json, sorry"
+
+    monkeypatch.setattr(mod, "_invoke_cli", fake_invoke_cli)
+
+    rc = mod.main([
+        *[str(d) for d in digests],
+        "--codebook", str(codebook_path),
+        "--project", "dark_factory",
+        "--out", str(out_path),
+    ])
+
+    assert rc != 0
+    assert out_path.read_text(encoding="utf-8") == "", (
+        "a stale --out from a prior run must be truncated on a storm, "
+        "never left holding a previous run's records"
+    )
+
+
+# ---------------------------------------------------------------------------
+# main(--digests DIR) -- amendment: iterdir() must skip subdirectories and
+# other non-file entries rather than crash on read_text(IsADirectoryError)
+# ---------------------------------------------------------------------------
+
+def test_main_digests_dir_skips_subdirectories(tmp_path, monkeypatch, capsys):
+    digests_dir = tmp_path / "digests"
+    digests_dir.mkdir()
+
+    records = [_user_text("a confusing correction", session_id="dir-sess-1")]
+    transcript_path = _write_jsonl(tmp_path, records, name="dir.transcript.jsonl")
+    text = digest_mod.build_digest(transcript_path, agent_class_override="interactive")
+    (digests_dir / "d1.md").write_text(text, encoding="utf-8")
+
+    # A stray subdirectory alongside the real digest file -- iterdir()
+    # yields it too; read_text() on a directory raises IsADirectoryError
+    # if it isn't filtered out first.
+    (digests_dir / "a_subdir").mkdir()
+
+    codebook_path = tmp_path / "codebook.yaml"
+    codebook_mod.dump(_tiny_codebook(), codebook_path)
+
+    def fake_invoke_cli(prompt, model, **kwargs):
+        return json.dumps({"matches": [], "candidates": []})
+
+    monkeypatch.setattr(mod, "_invoke_cli", fake_invoke_cli)
+
+    out_path = tmp_path / "out.jsonl"
+    rc = mod.main([
+        "--digests", str(digests_dir),
+        "--codebook", str(codebook_path),
+        "--project", "dark_factory",
+        "--out", str(out_path),
+    ])
+
+    assert rc == 0
+    lines = [line for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert json.loads(lines[0])["session"] == "dir-sess-1"

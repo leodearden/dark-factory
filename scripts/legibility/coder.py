@@ -329,16 +329,19 @@ def code_digest(
     from *project* — the LLM never supplies the header) -> schema-gate it
     via codebook.validate_coding_record.
 
-    Never-fabricate contract: an invocation error, unparseable LLM output,
-    or a schema-invalid assembled record comes back as ``ok=False`` with
-    ``record=None`` and ``reason`` set — never partially applied, never
-    fabricated. A legitimately empty judgment
-    (``{"matches": [], "candidates": []}``) that passes schema validation
-    is a genuine ``ok=True`` success: "coded fine, found nothing" is never
-    conflated with "coding failed" (codebook lesson
-    one-shot-subagent-contract).
+    Never-fabricate contract: unparseable/malformed digest frontmatter, an
+    invocation error, unparseable LLM output, or a schema-invalid assembled
+    record all come back as ``ok=False`` with ``record=None`` and
+    ``reason`` set — never partially applied, never fabricated. A
+    legitimately empty judgment (``{"matches": [], "candidates": []}``)
+    that passes schema validation is a genuine ``ok=True`` success: "coded
+    fine, found nothing" is never conflated with "coding failed" (codebook
+    lesson one-shot-subagent-contract).
     """
-    meta = parse_frontmatter(digest_text)
+    try:
+        meta = parse_frontmatter(digest_text)
+    except CoderParseError as exc:
+        return CodingResult(ok=False, record=None, reason=str(exc), session=None)
     session = meta.get("session")
 
     index = build_codebook_index(codebook)
@@ -472,10 +475,12 @@ def main(argv: list[str] | None = None) -> int:
     and calls ``code_digests``. On a run-level ``"ok"`` status, writes
     every successful record as a JSONL line to ``--out`` (or stdout) and
     returns 0. On a run-level ``"failure"`` status (storm, PRD §8.6),
-    writes ZERO coding records — ``--out`` is left untouched — prints a
-    failure summary to stderr, and returns 1 (fail-loud), so a driving
-    script (epsilon) can escalate and skip the merge. Either way, a
-    one-line status summary is printed to stderr.
+    writes ZERO coding records — if ``--out`` is given, it is truncated to
+    empty so a stale file from a prior successful run is never left
+    looking like this run's output — prints a failure summary to stderr,
+    and returns 1 (fail-loud), so a driving script (epsilon) can escalate
+    and skip the merge. Either way, a one-line status summary is printed
+    to stderr.
     """
     parser = argparse.ArgumentParser(
         prog="coder",
@@ -511,7 +516,13 @@ def main(argv: list[str] | None = None) -> int:
 
     digest_paths = [Path(p) for p in args.digest_files]
     if args.digests_dir:
-        digest_paths.extend(sorted(Path(args.digests_dir).iterdir()))
+        # Regular files only -- a bare iterdir() also yields subdirectories
+        # and stray non-digest entries (e.g. a nested dir or a .DS_Store),
+        # and read_text() on a directory raises IsADirectoryError, aborting
+        # the whole run before the storm logic can even run.
+        digest_paths.extend(
+            sorted(p for p in Path(args.digests_dir).iterdir() if p.is_file())
+        )
 
     if not digest_paths:
         print(
@@ -536,6 +547,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         for session, reason in result.failures:
             print(f"  session={session!r}: {reason}", file=sys.stderr)
+        if args.out:
+            # Never leave a stale --out from a prior successful run lying
+            # around on a storm: a downstream consumer that reads the file
+            # instead of gating on the exit code must see this run's true
+            # (empty) outcome, not a previous night's records.
+            Path(args.out).write_text("", encoding="utf-8")
         _print_summary(result, matched=matched, candidates=candidates, file=sys.stderr)
         return 1
 
