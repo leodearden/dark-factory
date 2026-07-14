@@ -1066,3 +1066,157 @@ class TestConfirmMainTipFailureIsReal:
             f'Expected an INFO log containing sha prefix {sha_prefix!r} and '
             f'"suppress"; got calls={mock_logger.info.call_args_list!r}'
         )
+
+    # -- step-5: ALARM / fail-safe paths ----------------------------------
+
+    def test_confirm_alarms_when_isolated_rerun_still_fails(self, tmp_path: Path) -> None:
+        """The isolated re-run fails on every attempt -> True (real drift,
+        file the alarm), and NO suppressed-flake record is appended."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT)
+
+        rv = AsyncMock(return_value=FAILING_RESULT)
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is True, f'Expected True (still failing -> alarm), got {result!r}'
+        assert rv.call_count == 2, (
+            f'Expected exactly 2 isolated-rerun attempts (_SWEEP_CONFIRM_MAX_ATTEMPTS), '
+            f'got {rv.call_count}'
+        )
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert new_records == [], f'Expected no new suppressed-flake record, got {new_records!r}'
+
+    def test_confirm_alarms_without_worktree_add_when_no_node_ids(self, tmp_path: Path) -> None:
+        """A failing_result with no parseable node-ids (lint/compile category)
+        -> True, WITHOUT issuing any git worktree add (cheap early-out)."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            return (0, '', '')
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_NO_NODEID_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is True, f'Expected True (unconfirmable -> alarm), got {result!r}'
+        assert not run_calls, (
+            f'Expected NO git worktree add (or any _run call) when there are no '
+            f'parseable node-ids, got {run_calls!r}'
+        )
+        rv.assert_not_called()
+
+    def test_confirm_alarms_when_worktree_add_fails(self, tmp_path: Path) -> None:
+        """git worktree add fails every retry -> True (fail-safe), and
+        run_verification is never called."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            if 'worktree' in cmd and 'add' in cmd:
+                return (1, '', 'lock contention')
+            return (0, '', '')
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is True, f'Expected True when worktree add fails, got {result!r}'
+        rv.assert_not_called()
+
+    def test_confirm_alarms_when_isolated_rerun_raises(self, tmp_path: Path) -> None:
+        """run_verification raising on every attempt -> True (never suppress
+        on an unconfirmable result), and no suppression record is appended."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT)
+
+        rv = AsyncMock(side_effect=RuntimeError('boom'))
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is True, f'Expected True when isolated re-run raises, got {result!r}'
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert new_records == [], f'Expected no new suppressed-flake record, got {new_records!r}'
+
+    def test_confirm_alarms_when_isolated_rerun_is_internalerror(self, tmp_path: Path) -> None:
+        """run_verification returning category='pytest_internalerror' on every
+        attempt -> True (infra-sentinel is never trusted as confirmation),
+        and no suppression record is appended."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT)
+
+        rv = AsyncMock(return_value=INTERNALERROR_RESULT)
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is True, (
+            f'Expected True on pytest_internalerror (unconfirmable), got {result!r}'
+        )
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert new_records == [], f'Expected no new suppressed-flake record, got {new_records!r}'
