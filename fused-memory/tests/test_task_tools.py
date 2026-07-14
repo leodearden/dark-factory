@@ -1,11 +1,14 @@
 """Tests for MCP task-tool behavior (update_task, set_task_status, etc.)."""
 
+import asyncio
+import contextlib
 import json
 import logging
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+import yaml
 
 from fused_memory.server.tools import create_mcp_server
 
@@ -50,21 +53,37 @@ async def real_task_stack(tmp_path):
     rejection tests need a real backend + interceptor + create_mcp_server
     stack instead. No git repo or created task is needed — the floor
     raises before the row SELECT.
+
+    Also wires a real ``TicketStore`` (mirrors test_task_interceptor.py's
+    ``ticket_store=`` fixtures) so ``submit_task`` works against this stack —
+    the interceptor's ``submit_task`` returns a ``ConfigError`` before even
+    checking ``planning_mode`` when ``ticket_store`` is ``None``. None of the
+    existing BT-C1 (``update_task``-only) tests touch ``submit_task``, so
+    this is purely additive for them.
     """
     from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
     from fused_memory.config.schema import TaskmasterConfig
     from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.event_buffer import EventBuffer
 
     backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
     await backend.start()
     event_buffer = EventBuffer(db_path=tmp_path / 'real_stack_eb.db', buffer_size_threshold=100)
     await event_buffer.initialize()
-    interceptor = TaskInterceptor(backend, None, event_buffer)
+    ticket_store = TicketStore(tmp_path / 'real_stack_tickets.db')
+    await ticket_store.initialize()
+    interceptor = TaskInterceptor(backend, None, event_buffer, ticket_store=ticket_store)
     server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
     try:
         yield server, interceptor
     finally:
+        await ticket_store.close()
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
         await event_buffer.close()
         await backend.close()
 
@@ -2161,3 +2180,156 @@ async def test_commit_planning_bad_task_id_returns_structured_error(
     assert 'error' in result
     assert result.get('error_type') == 'TaskmasterError'
     task_interceptor.set_task_status.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# commit_planning capability-manifest stamping (PRD γ, task 2578)
+# ---------------------------------------------------------------------------
+
+_FOO_PRD_SIDECAR_YAML = """\
+prd: plans/foo-prd.md
+schema_version: 1
+tasks:
+  - label: alpha
+    task_id: null
+    title: Producer alpha
+    capabilities:
+      - name: alpha_grep
+        binding: 'grep for alpha marker'
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'TODO(alpha)'
+          expect: absent
+          paths:
+            - src/alpha.py
+  - label: beta
+    task_id: null
+    title: Producer beta
+    capabilities:
+      - name: beta_script
+        binding: 'run beta checker'
+        verdict: PASS
+        delivered_check:
+          kind: script
+          script: scripts/check_beta.sh
+          args: []
+          timeout_secs: 15
+"""
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_stamps_manifest_and_copies_delivered_checks(
+    real_task_stack, tmp_path,
+):
+    """Boundary row 1: commit_planning stamps real task_ids into the
+    capability-manifest sidecar and copies each label's MECHANICAL
+    delivered_checks into the producer task's metadata.delivered_checks,
+    while sibling metadata keys survive the merge-safe write (1827/1828)."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    (plans_dir / 'foo-prd.md').write_text('# Foo PRD\n', encoding='utf-8')
+    sidecar_path = plans_dir / 'foo-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_FOO_PRD_SIDECAR_YAML, encoding='utf-8')
+
+    server, _interceptor = real_task_stack
+    root = str(tmp_path)
+
+    submit_alpha = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Producer alpha',
+            'planning_mode': True,
+            'metadata': {
+                'files': ['src/alpha.py'],
+                'prd_path': 'plans/foo-prd.md',
+                'prd_task_label': 'alpha',
+                'note': 'sibling-value-alpha',
+            },
+        },
+    )
+    submit_beta = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Producer beta',
+            'planning_mode': True,
+            'metadata': {
+                'files': ['scripts/check_beta.sh'],
+                'prd_path': 'plans/foo-prd.md',
+                'prd_task_label': 'beta',
+                'note': 'sibling-value-beta',
+            },
+        },
+    )
+    assert submit_alpha['status'] == 'deferred', f'got {submit_alpha!r}'
+    assert submit_beta['status'] == 'deferred', f'got {submit_beta!r}'
+    alpha_id = submit_alpha['task_id']
+    beta_id = submit_beta['task_id']
+
+    result = await server._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': root, 'task_ids': f'{alpha_id},{beta_id}'},
+    )
+
+    assert result['manifest_stamping'] == {
+        'path': 'plans/foo-prd.capability-manifest.yaml',
+        'stamped': ['alpha', 'beta'],
+        'missing_labels': [],
+        'errors': [],
+    }
+
+    alpha_task = await server._tool_manager.call_tool(
+        'get_task', {'id': alpha_id, 'project_root': root},
+    )
+    beta_task = await server._tool_manager.call_tool(
+        'get_task', {'id': beta_id, 'project_root': root},
+    )
+
+    # Mechanical checks copied into metadata.delivered_checks.
+    assert alpha_task['metadata']['delivered_checks'] == [
+        {
+            'name': 'alpha_grep',
+            'kind': 'grep',
+            'pattern': 'TODO(alpha)',
+            'expect': 'absent',
+            'paths': ['src/alpha.py'],
+            'script': None,
+            'args': [],
+            'timeout_secs': None,
+        },
+    ]
+    assert beta_task['metadata']['delivered_checks'] == [
+        {
+            'name': 'beta_script',
+            'kind': 'script',
+            'pattern': None,
+            'expect': None,
+            'paths': [],
+            'script': 'scripts/check_beta.sh',
+            'args': [],
+            'timeout_secs': 15,
+        },
+    ]
+
+    # Sibling metadata keys survive the merge-safe write.
+    assert alpha_task['metadata']['prd_path'] == 'plans/foo-prd.md'
+    assert alpha_task['metadata']['prd_task_label'] == 'alpha'
+    assert alpha_task['metadata']['files'] == ['src/alpha.py']
+    assert alpha_task['metadata']['human_decomposed'] is True
+    assert alpha_task['metadata']['note'] == 'sibling-value-alpha'
+    assert beta_task['metadata']['prd_path'] == 'plans/foo-prd.md'
+    assert beta_task['metadata']['prd_task_label'] == 'beta'
+    assert beta_task['metadata']['files'] == ['scripts/check_beta.sh']
+    assert beta_task['metadata']['human_decomposed'] is True
+    assert beta_task['metadata']['note'] == 'sibling-value-beta'
+
+    # The status flip landed too (target_status defaults to 'pending').
+    assert alpha_task['status'] == 'pending'
+    assert beta_task['status'] == 'pending'
+
+    # On-disk sidecar now carries the real int task_ids.
+    reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+    by_label = {t['label']: t['task_id'] for t in reloaded['tasks']}
+    assert by_label == {'alpha': int(alpha_id), 'beta': int(beta_id)}
