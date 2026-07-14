@@ -303,3 +303,35 @@ class TestFilterLiveSessions:
         from cockpit.panes.session_table import filter_live_sessions
 
         assert filter_live_sessions([]) == []
+
+    def test_default_visible_cap_is_a_positive_int(self):
+        from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP
+
+        assert isinstance(_DEFAULT_VISIBLE_CAP, int)
+        assert _DEFAULT_VISIBLE_CAP > 0
+
+    def test_explicit_cap_keeps_only_the_first_n_by_input_order(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        records = [
+            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(5)
+        ]
+
+        kept = filter_live_sessions(records, cap=3)
+
+        assert [r.session_slug for r in kept] == ['s-0', 's-1', 's-2']
+
+    def test_default_cap_limits_to_default_visible_cap(self):
+        from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP, filter_live_sessions
+
+        records = [
+            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING)
+            for i in range(_DEFAULT_VISIBLE_CAP + 10)
+        ]
+
+        kept = filter_live_sessions(records)
+
+        assert len(kept) == _DEFAULT_VISIBLE_CAP
+        assert [r.session_slug for r in kept] == [
+            f's-{i}' for i in range(_DEFAULT_VISIBLE_CAP)
+        ]
