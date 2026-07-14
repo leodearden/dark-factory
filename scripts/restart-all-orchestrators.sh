@@ -28,17 +28,50 @@ set -euo pipefail
 # Usage:
 #   restart-all-orchestrators.sh [--drain]
 #
-# --drain is accepted-and-ignored (generic-caller compatibility; see
-# restart-orchestrator.sh — orchestrator graceful drain is delegated to
-# SIGTERM via `systemctl restart`, bounded by TimeoutStopSec).
+# --drain enables the per-unit merge-drain gate (task 2397, γ of the
+# orchestrator fleet-redeploy PRD): before restarting each unit, its
+# α-produced (task 2395) merge-idle heartbeat
+# (orchestrator/src/orchestrator/fleet_heartbeat.py) is read via
+# scripts/drain_check.py. A unit whose heartbeat reads busy (mid-merge) has
+# its restart DEFERRED — rechecked every ORCH_DRAIN_POLL_INTERVAL_SECS —
+# until it drains (goes idle) or ORCH_RESTART_FORCE_FIRE_AFTER_SECS elapses,
+# at which point the restart is FORCED anyway (one re-verified merge
+# accepted; recover_pending_merges makes this crash-safe). A unit whose
+# heartbeat is missing or stale is given a shorter ORCH_DRAIN_UNKNOWN_GRACE_SECS
+# grace to start reporting before its restart proceeds anyway
+# (fail-toward-convergence — the opposite fail direction from a
+# confirmed-busy unit, which fails toward protecting the merge). Without
+# --drain, the script behaves exactly as before: an immediate, uncapped
+# restart-all with zero heartbeat reads.
+#
+# Env knobs (all optional, ${VAR:-default} style):
+#   ORCH_FLEET_DIR                       fleet-common heartbeat dir
+#                                         (default: /home/leo/src/dark-factory/data/fleet)
+#   ORCH_RESTART_FORCE_FIRE_AFTER_SECS    busy-grace before a forced restart
+#                                         (default: 4500 = 75m)
+#   ORCH_DRAIN_FRESH_WINDOW_SECS          heartbeat freshness window
+#                                         (default: 120 = 2x run-loop tick)
+#   ORCH_DRAIN_POLL_INTERVAL_SECS         re-check interval while deferring
+#                                         (default: 30)
+#   ORCH_DRAIN_UNKNOWN_GRACE_SECS         grace for a stale/absent heartbeat
+#                                         (default: 120)
 
 FIELDS="MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic"
 VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
 SELF_UNIT="${SELF_UNIT:-orchestrator-dark-factory.service}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FLEET_DIR="${ORCH_FLEET_DIR:-/home/leo/src/dark-factory/data/fleet}"
+FORCE_FIRE_AFTER_SECS="${ORCH_RESTART_FORCE_FIRE_AFTER_SECS:-4500}"
+DRAIN_FRESH_WINDOW_SECS="${ORCH_DRAIN_FRESH_WINDOW_SECS:-120}"
+DRAIN_POLL_INTERVAL_SECS="${ORCH_DRAIN_POLL_INTERVAL_SECS:-30}"
+DRAIN_UNKNOWN_GRACE_SECS="${ORCH_DRAIN_UNKNOWN_GRACE_SECS:-120}"
+
+DRAIN_ENABLED=0
 for arg in "$@"; do
     case "$arg" in
         --drain)
+            DRAIN_ENABLED=1
             ;;
         *)
             echo "ERROR: unexpected argument: $arg" >&2
@@ -89,6 +122,50 @@ restart_and_verify() {
     return 1
 }
 
+drain_check_verdict() {
+    # $1 = unit name.  Prints one of idle/busy/stale/absent to stdout.
+    python3 "$SCRIPT_DIR/drain_check.py" --unit "$1" --fleet-dir "$FLEET_DIR" \
+        --fresh-window "$DRAIN_FRESH_WINDOW_SECS"
+}
+
+drain_gate() {
+    # $1 = unit name.  Only called when --drain was passed.  Blocks
+    # (poll-and-recheck) until it is safe to restart $1: returns immediately
+    # for an idle unit (transparent); for a busy unit, defers with a
+    # journal line and polls every DRAIN_POLL_INTERVAL_SECS until the unit
+    # drains (idle) or FORCE_FIRE_AFTER_SECS elapses, at which point it
+    # force-proceeds anyway.
+    local unit="$1"
+    local verdict start_secs elapsed
+    verdict="$(drain_check_verdict "$unit")"
+
+    if [[ "$verdict" == "idle" ]]; then
+        return 0
+    fi
+
+    if [[ "$verdict" == "busy" ]]; then
+        echo "deferring restart of ${unit}: mid-merge (grace $((FORCE_FIRE_AFTER_SECS / 60))m)"
+        start_secs=$SECONDS
+        while true; do
+            elapsed=$((SECONDS - start_secs))
+            if [[ $elapsed -ge $FORCE_FIRE_AFTER_SECS ]]; then
+                echo "force-restarting ${unit}: mid-merge grace of ${FORCE_FIRE_AFTER_SECS}s exceeded"
+                return 0
+            fi
+            sleep "$DRAIN_POLL_INTERVAL_SECS"
+            verdict="$(drain_check_verdict "$unit")"
+            if [[ "$verdict" == "idle" ]]; then
+                echo "resuming restart of ${unit}: drained"
+                return 0
+            fi
+        done
+    fi
+
+    # stale/absent: placeholder fail-open (refined into a bounded
+    # unknown-grace wait by task 2397 step-10).
+    return 0
+}
+
 # Enumerate running orchestrator units at run time (robust to which projects
 # are enabled on this host), deferring SELF_UNIT to the end.
 mapfile -t running_units < <(
@@ -118,6 +195,9 @@ echo "Restarting ${#ordered_units[@]} orchestrator unit(s): ${ordered_units[*]}"
 
 failures=()
 for unit in "${ordered_units[@]}"; do
+    if [[ $DRAIN_ENABLED -eq 1 ]]; then
+        drain_gate "$unit"
+    fi
     if ! restart_and_verify "$unit"; then
         failures+=("$unit")
     fi
