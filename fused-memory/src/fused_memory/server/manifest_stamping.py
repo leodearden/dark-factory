@@ -30,6 +30,8 @@ import yaml
 from pydantic import ValidationError
 from shared.capability_manifest import DeliveredCheckMeta, parse_capability_manifest
 
+from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+
 logger = logging.getLogger(__name__)
 
 _SIDECAR_SUFFIX = '.capability-manifest.yaml'
@@ -57,7 +59,11 @@ async def stamp_capability_manifests(
         task_interceptor: The live ``TaskInterceptor`` — ``update_task`` is
             called per stamped label that carries mechanical checks.
         agent_id: Forwarded to ``task_interceptor.update_task`` for
-            provenance.
+            provenance. ``commit_planning`` (the sole caller) has no
+            ``agent_id``/``ctx`` parameter of its own — its ``set_task_status``
+            call earlier in the same handler is likewise un-attributed — so
+            that call site intentionally passes ``None`` here; that is
+            parity with the existing handler, not a missed wiring.
 
     Returns:
         ``None`` when no batch task carries both a non-empty ``prd_path``
@@ -65,6 +71,56 @@ async def stamp_capability_manifests(
         exist on disk — a complete no-op in both cases. Otherwise a
         structured report ``{path, stamped, missing_labels, errors}``
         (``path`` relative to ``project_root``).
+
+    This is a thin never-raising wrapper around
+    :func:`_stamp_capability_manifests_impl`. The implementation's steps
+    3/4/5 already convert their own anticipated failure modes into
+    ``report['errors']`` without raising, but ``commit_planning`` (the sole
+    caller) has no try/except of its own around this call — it relies
+    entirely on this function never raising. This top-level try/except is
+    the structural backstop that keeps that promise even for a failure mode
+    the implementation didn't anticipate, rather than relying on every
+    block inside it being audited by inspection.
+    """
+    try:
+        return await _stamp_capability_manifests_impl(
+            project_root=project_root,
+            ids=ids,
+            tasks_data=tasks_data,
+            task_interceptor=task_interceptor,
+            agent_id=agent_id,
+        )
+    except Exception as exc:  # pragma: no cover - structural backstop, see docstring above
+        logger.error(
+            'stamp_capability_manifests: unexpected error stamping batch ids=%r — '
+            'never propagating into commit_planning',
+            ids,
+            exc_info=True,
+        )
+        return {
+            'path': None,
+            'stamped': [],
+            'missing_labels': [],
+            'errors': [f'unexpected error in stamp_capability_manifests: {exc}'],
+        }
+
+
+async def _stamp_capability_manifests_impl(
+    *,
+    project_root: str,
+    ids: list[str],
+    tasks_data: list[Any],
+    task_interceptor: Any,
+    agent_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Implementation for :func:`stamp_capability_manifests` — see there for the contract.
+
+    Wrapped by the public function's top-level try/except backstop above.
+    Steps 3 (load/validate), 4 (stamp/write), and 5 (mechanical
+    delivered_checks copy) below each additionally guard their own unit of
+    work so anticipated failures are attributed precisely in
+    ``report['errors']`` rather than falling through to the generic
+    backstop message.
     """
     # 1. Build the manifest-bearing set: (task_id, prd_task_label, derived
     #    sidecar rel path) for batch tasks whose metadata carries BOTH a
@@ -88,21 +144,44 @@ async def stamp_capability_manifests(
     if not manifest_tasks:
         return None
 
-    # 2. Keep only distinct rel paths (insertion order) whose file actually
-    #    exists on disk under project_root.
-    root = Path(project_root)
+    # 2. Keep only distinct rel paths (insertion order) that stay CONTAINED
+    #    under project_root and whose file actually exists on disk.
+    #    prd_path is author-controlled task metadata (set by the /prd
+    #    decompose skill, read here without re-validation) — an absolute
+    #    path or one containing '../' would otherwise let both this read
+    #    and the step-4 write-back escape project_root, so every candidate
+    #    is resolved and containment-checked before it is ever stat-ed.
+    root = Path(project_root).resolve()
     seen_rel_paths: list[str] = []
     for _tid, _label, rel in manifest_tasks:
         if rel not in seen_rel_paths:
             seen_rel_paths.append(rel)
-    existing_rel_paths = sorted(rel for rel in seen_rel_paths if (root / rel).is_file())
+    unsafe_rel_paths: list[str] = []
+    existing_rel_paths: list[str] = []
+    for rel in seen_rel_paths:
+        resolved = (root / rel).resolve()
+        if not resolved.is_relative_to(root):
+            unsafe_rel_paths.append(rel)
+            continue
+        if resolved.is_file():
+            existing_rel_paths.append(rel)
+    existing_rel_paths.sort()
     if not existing_rel_paths:
+        if unsafe_rel_paths:
+            # Nothing safe to attach a report to (see the "no sidecar"
+            # no-op contract above), but a path-traversal attempt is worth
+            # a server-side signal even so.
+            logger.warning(
+                'stamp_capability_manifests: derived sidecar path(s) resolve '
+                'outside project_root, refusing to read/write: %r',
+                unsafe_rel_paths,
+            )
         return None
 
     # One-sidecar-per-batch is the normal contract. An unexpected second
     # distinct sidecar path is processed as the lexicographically-first
-    # (deterministic), with the rest named loudly in errors rather than
-    # silently dropped.
+    # (deterministic), with the rest — and any containment-rejected
+    # candidates — named loudly in errors rather than silently dropped.
     sidecar_rel = existing_rel_paths[0]
     report: dict[str, Any] = {
         'path': sidecar_rel,
@@ -115,6 +194,11 @@ async def stamp_capability_manifests(
         report['errors'].append(
             f'multiple capability-manifest sidecars matched this batch; '
             f'processing {sidecar_rel!r}, ignoring: {extra}'
+        )
+    if unsafe_rel_paths:
+        extra = ', '.join(unsafe_rel_paths)
+        report['errors'].append(
+            f'sidecar path(s) resolved outside project_root, refused: {extra}'
         )
 
     # 3. Read + validate the sidecar via the shared α-loader. Fail-soft/loud:
@@ -191,32 +275,36 @@ async def stamp_capability_manifests(
     for task in doc.tasks:
         if task.label not in stamped_label_set:
             continue
-        mechanical: list[dict[str, Any]] = []
-        for cap in task.capabilities:
-            check = cap.delivered_check
-            if check is None or check.kind not in ('grep', 'script'):
-                continue
-            mechanical.append(
-                DeliveredCheckMeta(
-                    name=cap.name,
-                    kind=check.kind,
-                    pattern=check.pattern,
-                    expect=check.expect,
-                    paths=check.paths,
-                    script=check.script,
-                    args=check.args,
-                    timeout_secs=check.timeout_secs,
-                ).model_dump()
-            )
-        if not mechanical:
-            continue
-        tid = label_to_task_id[task.label]
         # Independently guarded per label (mirrors index_committed_tasks'
-        # per-task record_task guard): one label's metadata-write failure
-        # is recorded and skipped without discarding the sidecar stamp
-        # already committed to disk above, nor blocking sibling labels.
+        # per-task record_task guard): the WHOLE per-label body — building
+        # the mechanical list, the label_to_task_id lookup, and the
+        # update_task call itself — is one unit of work, so a failure
+        # anywhere in it (including e.g. future schema drift making
+        # DeliveredCheckMeta re-validation fail) is recorded and skipped
+        # without discarding the sidecar stamp already committed to disk
+        # above, nor blocking sibling labels.
         try:
-            await task_interceptor.update_task(
+            mechanical: list[dict[str, Any]] = []
+            for cap in task.capabilities:
+                check = cap.delivered_check
+                if check is None or check.kind not in ('grep', 'script'):
+                    continue
+                mechanical.append(
+                    DeliveredCheckMeta(
+                        name=cap.name,
+                        kind=check.kind,
+                        pattern=check.pattern,
+                        expect=check.expect,
+                        paths=check.paths,
+                        script=check.script,
+                        args=check.args,
+                        timeout_secs=check.timeout_secs,
+                    ).model_dump()
+                )
+            if not mechanical:
+                continue
+            tid = label_to_task_id[task.label]
+            resp = await task_interceptor.update_task(
                 tid,
                 project_root,
                 metadata=json.dumps({'delivered_checks': mechanical}),
@@ -224,14 +312,34 @@ async def stamp_capability_manifests(
             )
         except Exception as exc:
             logger.warning(
-                'stamp_capability_manifests: update_task failed for label %s (task %s)',
+                'stamp_capability_manifests: failed to build/write delivered_checks '
+                'for label %s',
                 task.label,
-                tid,
                 exc_info=True,
             )
             report['errors'].append(
                 f'{sidecar_rel}: failed to write delivered_checks for label '
-                f'{task.label!r} (task {tid}) — {exc}'
+                f'{task.label!r} — {exc}'
+            )
+            continue
+
+        # update_task's own gates (write-authority floor, directory-lock
+        # charter, reconciliation backlog) reject by RETURNING a structured
+        # {'success': False, ...} / {'error': ...} dict — they do not raise,
+        # so the except above would never see a rejection. Classify
+        # explicitly (per update_task's own documented contract) so a
+        # rejected write is never silently dropped.
+        if not interceptor_write_succeeded(resp):
+            logger.warning(
+                'stamp_capability_manifests: update_task rejected delivered_checks '
+                'write for label %s (task %s): %r',
+                task.label,
+                tid,
+                resp,
+            )
+            report['errors'].append(
+                f'{sidecar_rel}: update_task rejected delivered_checks write for '
+                f'label {task.label!r} (task {tid}) — {resp!r}'
             )
 
     return report
