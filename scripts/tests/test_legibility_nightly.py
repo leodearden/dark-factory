@@ -650,6 +650,74 @@ def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# step-19/20: run_nightly -- fail-loud on commit failure (decision 8)
+# ---------------------------------------------------------------------------
+
+def _failing_committer(repo, paths, message):
+    """A fake committer simulating a persistent ref-lock/commit failure --
+    mirrors _git_commit_docs_only's own ok=False-after-final-attempt
+    contract without touching a real repo."""
+    return nightly.GitCommitResult(
+        ok=False, sha=None, stderr='fatal: cannot lock ref (simulated)', attempts=5,
+    )
+
+
+def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    escalation_calls = []
+
+    # A valid matching invoke -> the merge/dump genuinely happens; only the
+    # commit attempt itself fails (persistent ref-lock, simulated).
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_known_cause,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        committer=_failing_committer,
+    )
+
+    assert result.exit_code != 0
+    assert result.commit_made is False
+    assert result.escalated is True
+    assert result.applied == 1  # the merge/dump DID happen before the commit attempt
+
+    assert len(escalation_calls) == 1
+    url, envelope = escalation_calls[0]
+    arguments = envelope['params']['arguments']
+    assert arguments['category'] == 'infra_issue'
+    assert 'commit' in arguments['summary'].lower()
+
+    # No NEW commit exists -- the escalation + non-zero exit is the loud
+    # signal (the dump already landed in the working tree, uncommitted).
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log == before_log
+
+    status = subprocess.run(
+        ['git', 'status', '--porcelain'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout
+    assert 'confusion-codebook.yaml' in status
+
+
+# ---------------------------------------------------------------------------
 # step-17/18: run_nightly -- fail-loud on extractor crash (decision 8)
 # ---------------------------------------------------------------------------
 
