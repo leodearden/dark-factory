@@ -1372,6 +1372,9 @@ Usage pattern (per PRD §9.2):
                   across ALL stages of the same run_id).  Overlength
                   description/suggested_action are truncated with a
                   'warnings' entry on the response, never rejected.
+                  actionable defaults to False when task_id is None or
+                  category starts with 'cross_project'; True otherwise. An
+                  explicit actionable=True/False is always honored.
 3. set_stat / inc_stat — track numeric metrics during the run.
 4. complete — stamp the summary and close the report; idempotent.
 5. delete_finding(run_id, finding_id) — IRREVERSIBLE retraction of a
@@ -1412,7 +1415,7 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         category: str,
         description: str,
         suggested_action: str,
-        actionable: bool = True,
+        actionable: bool | None = None,
         task_id: str | None = None,
         flag_type: str | None = None,
     ) -> dict:
@@ -1425,6 +1428,12 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         of this run_id (and neither is None), returns
         {error: duplicate_finding, existing_finding_id}.  Attach citations to
         existing_finding_id instead of creating a redundant row.
+
+        actionable (task-2432 bullet 1a): when omitted, defaults to False for
+        a null task_id or a cross_project* category, True otherwise — see
+        ReconReportState.add_finding's docstring. The `None` sentinel is
+        passed through unchanged so the state method's computed default
+        applies; an explicit True/False is always honored.
         """
         return state.add_finding(
             run_id=run_id,
