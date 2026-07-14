@@ -433,7 +433,8 @@ below) will be dropped by the post-processor regardless.
 Producing a suppression record: operators and remediation hooks should call \
 `fused_memory.reconciliation.flag_dedup.write_suppression_record(memory_service, \
 project_id=..., task_id=N, flag_types=[...])` rather than constructing the \
-canonical schema by hand. The helper coerces `task_id` to int, sorts/dedupes \
+canonical schema by hand. The helper coerces `task_id` to a string (accepting a \
+single numeric id or a comma-joined composite signature), sorts/dedupes \
 `flag_types`, and pins the metadata.kind/content shape so future schema changes \
 touch one location. **Prefer a scoped record** (explicit `flag_types`) over the \
 legacy blanket form: scoping to the specific flag_type(s) you intend to suppress \
