@@ -23,7 +23,7 @@ import pytest
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
-from orchestrator.scheduler import Scheduler
+from orchestrator.scheduler import Scheduler, TickContext
 
 # ---------------------------------------------------------------------------
 # TestRunnerGrepKind (task 2580 — step-1 RED / step-2 GREEN)
@@ -355,3 +355,107 @@ class TestDepsSatisfiedDeliveredGate:
             )
             is True
         )
+
+
+# ---------------------------------------------------------------------------
+# TestEligibilityForwardsDeliveredCache (task 2580 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestEligibilityForwardsDeliveredCache:
+    """``Scheduler._eligible_for_dispatch`` must forward a
+    ``delivered_check_cache`` kwarg into ``_deps_satisfied`` — mirrors how
+    ``external_status_cache`` is already forwarded there.  Default (unset)
+    reproduces byte-identical legacy behaviour.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
+
+    _CHECKS = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+
+    def _dependent(self, dep_id: str = '20') -> dict:
+        return {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [{'id': dep_id}],
+            'metadata': {},
+        }
+
+    def _dep(self, dep_id: str = '20') -> dict:
+        return {
+            'id': dep_id,
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {'delivered_checks': self._CHECKS},
+        }
+
+    def test_ineligible_when_cache_maps_dep_to_false(self, scheduler: Scheduler):
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = scheduler._eligible_for_dispatch(
+            task, '10', status_map, tasks_by_id,
+            delivered_check_cache={'20': False},
+        )
+
+        assert result == (False, None)
+
+    def test_eligible_when_cache_maps_dep_to_true(self, scheduler: Scheduler):
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = scheduler._eligible_for_dispatch(
+            task, '10', status_map, tasks_by_id,
+            delivered_check_cache={'20': True},
+        )
+
+        assert result == (True, None)
+
+    def test_default_unset_byte_identical(self, scheduler: Scheduler):
+        """Without delivered_check_cache, a done dep carrying checks is
+        eligible purely off status — legacy behaviour, byte-identical."""
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = scheduler._eligible_for_dispatch(task, '10', status_map, tasks_by_id)
+
+        assert result == (True, None)
+
+
+# ---------------------------------------------------------------------------
+# TestTickContextField (task 2580 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestTickContextField:
+    """``TickContext`` must carry a ``delivered_check_cache`` field
+    defaulting to an empty dict, mirroring ``external_cache``."""
+
+    def test_delivered_check_cache_field_defaults_empty_dict(self):
+        ctx = TickContext(tasks=[], status_map={}, tasks_by_id={})
+        assert ctx.delivered_check_cache == {}
+
+    def test_delivered_check_cache_field_accepts_constructor_kwarg(self):
+        ctx = TickContext(
+            tasks=[], status_map={}, tasks_by_id={},
+            delivered_check_cache={'20': True},
+        )
+        assert ctx.delivered_check_cache == {'20': True}
+
+    def test_delivered_check_cache_default_not_shared_across_instances(self):
+        """Default factory must not share a mutable default across instances."""
+        ctx1 = TickContext(tasks=[], status_map={}, tasks_by_id={})
+        ctx2 = TickContext(tasks=[], status_map={}, tasks_by_id={})
+        ctx1.delivered_check_cache['x'] = True
+        assert ctx2.delivered_check_cache == {}
