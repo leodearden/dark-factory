@@ -14,8 +14,10 @@ import pytest
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
+    MERGE_PARK_REF,
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
     GitOps,
+    MergeParkContentionError,
     MergeResult,
     TrainStackResult,
     WorktreeConflictError,
@@ -2094,7 +2096,7 @@ class TestWorkingTreeSync:
         assert result.result == 'wip_overlap'
 
     async def test_pop_conflict_recovery_via_mock(self, git_ops: GitOps):
-        """When stash pop fails, advance_main creates recovery branch and returns 'pop_conflict'."""
+        """When stash apply fails, advance_main creates recovery branch and returns 'pop_conflict'."""
         # Create a merge commit
         worktree_info = await git_ops.create_worktree('pop-mock')
         (worktree_info.path / 'pop_file.py').write_text('x = 1\n')
@@ -2107,11 +2109,11 @@ class TestWorkingTreeSync:
         # Modify a tracked file (not overlapping merge diff) to trigger stash
         (git_ops.project_root / 'README.md').write_text('# WIP edit\n')
 
-        # Mock _run: stash push succeeds, stash pop fails (simulating conflict)
+        # Mock _run: park (stash create) succeeds, stash apply fails (simulating conflict)
         original_run = _run
 
         async def mock_run(cmd, cwd=None):
-            if cmd[:3] == ['git', 'stash', 'pop']:
+            if cmd[:3] == ['git', 'stash', 'apply']:
                 return (1, '', 'CONFLICT: merge conflict in README.md')
             return await original_run(cmd, cwd=cwd)
 
@@ -2138,12 +2140,12 @@ class TestWorkingTreeSync:
         assert merge1.merge_commit is not None
         assert merge1.merge_worktree is not None
 
-        # Modify a tracked file so stash is triggered, mock stash pop failure
+        # Modify a tracked file so a park is triggered, mock stash apply failure
         (git_ops.project_root / 'README.md').write_text('# WIP edit\n')
         original_run = _run
 
         async def mock_run(cmd, cwd=None):
-            if cmd[:3] == ['git', 'stash', 'pop']:
+            if cmd[:3] == ['git', 'stash', 'apply']:
                 return (1, '', 'CONFLICT: merge conflict')
             return await original_run(cmd, cwd=cwd)
 
@@ -2256,7 +2258,7 @@ class TestWorkingTreeSync:
         assert (git_ops.project_root / 'README.md').read_text() == marker_content
 
     async def test_stash_failure_returns_stash_failed(self, git_ops: GitOps):
-        """If git stash push fails, advance_main returns 'stash_failed' without moving the ref."""
+        """If git stash create fails, advance_main returns 'stash_failed' without moving the ref."""
         # Get current main SHA before the attempt
         _, main_before, _ = await _run(
             ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
@@ -2282,7 +2284,7 @@ class TestWorkingTreeSync:
         original_run = _run
 
         async def mock_run(cmd, cwd=None):
-            if cmd[:3] == ['git', 'stash', 'push']:
+            if cmd[:3] == ['git', 'stash', 'create']:
                 return (1, '', 'fatal: cannot stash changes')
             return await original_run(cmd, cwd=cwd)
 
@@ -2350,14 +2352,14 @@ class TestWorkingTreeSync:
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
 
-        # Dirty tracked file so stash is created
+        # Dirty tracked file so a park is created
         (git_ops.project_root / 'README.md').write_text('# WIP sync guard\n')
 
-        # Mock: stash pop returns failure (simulates sync-path pop conflict)
+        # Mock: stash apply returns failure (simulates sync-path restore conflict)
         original_run = _run
 
         async def mock_run(cmd, cwd=None):
-            if cmd[:3] == ['git', 'stash', 'pop']:
+            if cmd[:3] == ['git', 'stash', 'apply']:
                 return (1, '', 'CONFLICT: merge conflict in README.md')
             return await original_run(cmd, cwd=cwd)
 
@@ -2396,11 +2398,11 @@ class TestWorkingTreeSync:
             ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
         )
 
-        # Mock: stash pop returns failure (simulates pop conflict after CAS failure)
+        # Mock: stash apply returns failure (simulates restore conflict after CAS failure)
         original_run = _run
 
         async def mock_run(cmd, cwd=None):
-            if cmd[:3] == ['git', 'stash', 'pop']:
+            if cmd[:3] == ['git', 'stash', 'apply']:
                 return (1, '', 'CONFLICT: merge conflict in README.md')
             return await original_run(cmd, cwd=cwd)
 
@@ -2486,10 +2488,10 @@ class TestWorkingTreeSync:
 
         Uses the full merge_queue.py call shape (branch, expected_main) and dirties
         README.md so the working-tree protection block is armed.  Without the
-        unmerged-state guard, advance_main would reach the stash block and return
-        'stash_failed' (git stash push fails on a UU index with 'you have unmerged
-        paths') -- the guard must fire first so we see 'unmerged_state' instead,
-        and no stash entry is ever attempted.
+        unmerged-state guard, advance_main would reach the park block and return
+        'stash_failed' (the git-stash-create-based park fails on a UU index with
+        'you have unmerged paths') -- the guard must fire first so we see
+        'unmerged_state' instead, and no park attempt is ever made.
 
         Mirrors the real caller in merge_queue.py:265-270:
             result = await self._git_ops.advance_main(
@@ -2534,7 +2536,7 @@ class TestWorkingTreeSync:
         # the guard fires BEFORE the entire happy path, not just before CAS.
         #
         # Orthogonal probe: record every _run invocation during advance_main to
-        # assert that git stash push was never attempted (decisive narrowing that
+        # assert that git stash create was never attempted (decisive narrowing that
         # the unmerged-state guard short-circuited the working-tree protection block).
         original_run = _run
         recorded: list[list[str]] = []
@@ -2555,9 +2557,9 @@ class TestWorkingTreeSync:
         assert result.result == 'unmerged_state'
 
         # Decisive narrowing: the guard returned before the working-tree protection
-        # block had any chance to invoke git stash push.
-        assert not any(c[:3] == ['git', 'stash', 'push'] for c in recorded), (
-            f'guard should fire before stash push; recorded stash cmds: '
+        # block had any chance to invoke git stash create.
+        assert not any(c[:3] == ['git', 'stash', 'create'] for c in recorded), (
+            f'guard should fire before stash create; recorded stash cmds: '
             f'{[c for c in recorded if c[:2] == ["git", "stash"]]}'
         )
 
@@ -2594,7 +2596,7 @@ class TestWorkingTreeSync:
         1. CAS failure → stash pop conflicts → pop_conflict_no_advance returned.
         2. Second advance_main call (no mocks, no dirty WIP) must NOT return
            'stash_failed' or 'unmerged_state' — it must succeed normally.
-        This proves _safe_stash_pop_with_recovery fully cleans the tree.
+        This proves _safe_restore_park_with_recovery fully cleans the tree.
         """
         # Setup: create a merge commit
         wt = await git_ops.create_worktree('cascade-regr')
@@ -2608,11 +2610,11 @@ class TestWorkingTreeSync:
         # Dirty a tracked file so advance_main creates a stash
         (git_ops.project_root / 'README.md').write_text('# WIP cascade regression\n')
 
-        # First call: force CAS failure AND mock stash pop to conflict
+        # First call: force CAS failure AND mock stash apply to conflict
         original_run = _run
 
         async def mock_run_conflict(cmd, cwd=None):
-            if cmd[:3] == ['git', 'stash', 'pop']:
+            if cmd[:3] == ['git', 'stash', 'apply']:
                 return (1, '', 'CONFLICT: merge conflict in README.md')
             return await original_run(cmd, cwd=cwd)
 
@@ -2975,6 +2977,123 @@ class TestWorkingTreeSync:
             for c in recorded
         ), f'update-ref not called after failed mark; commands: {recorded}'
 
+    async def test_preexisting_user_stash_survives_advance(self, git_ops: GitOps):
+        """A pre-existing human stash entry survives a full merge+advance untouched.
+
+        The merge worker parks its own WIP on MERGE_PARK_REF, never the
+        shared refs/stash stack — a human's stash@{0} (created before the
+        worker ever runs) must be byte-identical before and after.
+        """
+        # Establish a second tracked file on main so the "human" stash and
+        # the "worker" WIP below can dirty two independent tracked files.
+        (git_ops.project_root / 'human_target.py').write_text('human = False\n')
+        await _run(['git', 'add', 'human_target.py'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Add human_target.py'], cwd=git_ops.project_root,
+        )
+
+        # Human stashes a change to human_target.py on the SHARED stash stack.
+        (git_ops.project_root / 'human_target.py').write_text('human = True\n')
+        await _run(['git', 'stash', 'push', '-m', 'human'], cwd=git_ops.project_root)
+        _, stash_before, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_before.strip(), 'expected the human stash entry to exist'
+
+        # The merge worker now dirties a DIFFERENT, non-overlapping tracked
+        # file (README.md) — this is the WIP the worker will park.
+        (git_ops.project_root / 'README.md').write_text('# worker WIP\n')
+
+        result = await self._merge_and_advance(
+            git_ops, 'human-stash-survives', 'disjoint_merge_file.py', 'merged = True\n',
+        )
+        assert result.result == 'advanced'
+
+        # Merged file landed on main
+        assert (git_ops.project_root / 'disjoint_merge_file.py').exists()
+
+        # Worker WIP restored
+        assert '# worker WIP' in (git_ops.project_root / 'README.md').read_text()
+
+        # The human's stash entry is byte-identical before/after — the
+        # worker never touched the shared stack.
+        _, stash_after, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_after.strip() == stash_before.strip(), (
+            'pre-existing human stash entry must survive the merge worker untouched'
+        )
+
+    async def test_worker_wip_roundtrips_via_private_ref(self, git_ops: GitOps):
+        """Worker WIP round-trips exactly via MERGE_PARK_REF, cleaned up afterward."""
+        wip_content = '# exact roundtrip content\n'
+        (git_ops.project_root / 'README.md').write_text(wip_content)
+
+        result = await self._merge_and_advance(
+            git_ops, 'wip-roundtrip', 'roundtrip_file.py', 'roundtrip = True\n',
+        )
+        assert result.result == 'advanced'
+
+        # WIP content restored EXACTLY
+        assert (git_ops.project_root / 'README.md').read_text() == wip_content
+
+        # MERGE_PARK_REF is gone after a successful round-trip
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', 'refs/dark-factory/merge-park'],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, 'expected refs/dark-factory/merge-park to be absent after advance'
+
+        # The shared stash stack was never touched
+        _, stash_list, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_list.strip() == ''
+
+    async def test_advance_stale_merge_park_ref_halts_without_overwrite(
+        self, git_ops: GitOps,
+    ):
+        """A stale MERGE_PARK_REF halts advance_main ('stash_failed') without being overwritten."""
+        _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root)
+        head_sha = head_sha.strip()
+
+        # Pre-create the private ref at a KNOWN sha (simulating a stale
+        # crash-leftover ref from a prior, unrecovered park).
+        await _run(
+            ['git', 'update-ref', 'refs/dark-factory/merge-park', head_sha],
+            cwd=git_ops.project_root,
+        )
+
+        _, main_before, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_ops.project_root)
+
+        # Create a valid merge commit that could be advanced.
+        wt = await git_ops.create_worktree('stale-park-halt')
+        (wt.path / 'stale_park.py').write_text('x = 1\n')
+        await git_ops.commit(wt.path, 'Add stale_park')
+        merge_result = await git_ops.merge_to_main(wt.path, 'stale-park-halt')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Dirty a tracked file so the working-tree protection block (and
+        # thus the park attempt) is armed.
+        (git_ops.project_root / 'README.md').write_text('# WIP racing a stale park ref\n')
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'stash_failed'
+
+        # The stale ref must be UNCHANGED — never overwritten.
+        _, ref_after, _ = await _run(
+            ['git', 'rev-parse', 'refs/dark-factory/merge-park'], cwd=git_ops.project_root,
+        )
+        assert ref_after.strip() == head_sha, 'stale merge-park ref must never be overwritten'
+
+        # Main ref must NOT have moved.
+        _, main_after, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_ops.project_root)
+        assert main_before.strip() == main_after.strip()
+
 
 @pytest.mark.asyncio
 class TestAdvanceMainConflictMarkerGate:
@@ -3165,29 +3284,162 @@ class TestUnmergedDetection:
 
 
 @pytest.mark.asyncio
-class TestSafeStashPopWithRecovery:
-    """Tests for the _safe_stash_pop_with_recovery helper."""
+class TestMergeParkRef:
+    """Tests for the _park_wip_on_private_ref helper (task 2556).
 
-    async def test_safe_stash_pop_success_returns_ok(self, git_ops: GitOps):
-        """_safe_stash_pop_with_recovery returns (True, None) on a clean pop.
+    Parks pre-advance WIP on a private ref (refs/dark-factory/merge-park)
+    the merge worker exclusively owns, never the shared stash stack — see
+    MERGE_PARK_REF's docstring in git_ops.py.
+    """
 
-        Dirty file content is restored, stash list is empty, no recovery
-        branch is created.
-        """
-        # Stash a dirty tracked file
-        (git_ops.project_root / 'README.md').write_text('# WIP content\n')
-        await _run(
-            ['git', 'stash', 'push', '-m', 'test stash'], cwd=git_ops.project_root,
+    async def test_park_wip_on_private_ref_uses_private_ref_not_stack(
+        self, git_ops: GitOps,
+    ):
+        """_park_wip_on_private_ref parks WIP on the private ref, not refs/stash."""
+        # Dirty a TRACKED file with known WIP content.
+        wip_content = '# WIP parked via private ref\n'
+        (git_ops.project_root / 'README.md').write_text(wip_content)
+
+        await git_ops._park_wip_on_private_ref('lbl')
+
+        # (1) The private ref was created.
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', 'refs/dark-factory/merge-park'],
+            cwd=git_ops.project_root,
         )
+        assert rc == 0, 'expected refs/dark-factory/merge-park to resolve after park'
 
-        # Verify stash was created
+        # (2) The parked commit's tree carries the WIP content.
+        _, shown, _ = await _run(
+            ['git', 'show', 'refs/dark-factory/merge-park:README.md'],
+            cwd=git_ops.project_root,
+        )
+        assert shown.strip() == wip_content.strip()
+
+        # (3) The shared stash stack was NOT touched.
         _, stash_list, _ = await _run(
             ['git', 'stash', 'list'], cwd=git_ops.project_root,
         )
-        assert stash_list.strip(), 'Stash should have an entry before pop'
+        assert stash_list.strip() == ''
+
+        # (4) The working tree is clean at HEAD after park (WIP moved off tree).
+        _, unstaged, _ = await _run(
+            ['git', 'diff', '--name-only'], cwd=git_ops.project_root,
+        )
+        _, staged, _ = await _run(
+            ['git', 'diff', '--name-only', '--cached'], cwd=git_ops.project_root,
+        )
+        assert not unstaged.strip(), f'expected clean working tree, unstaged: {unstaged}'
+        assert not staged.strip(), f'expected clean working tree, staged: {staged}'
+
+    async def test_park_wip_stale_ref_raises_and_does_not_overwrite(
+        self, git_ops: GitOps,
+    ):
+        """A pre-existing merge-park ref is never overwritten — raises instead."""
+        _, head_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root,
+        )
+        head_sha = head_sha.strip()
+
+        # Pre-create the private ref at a KNOWN sha (simulating a stale
+        # crash-leftover ref from a prior, unrecovered park).
+        await _run(
+            ['git', 'update-ref', 'refs/dark-factory/merge-park', head_sha],
+            cwd=git_ops.project_root,
+        )
+
+        # Dirty a tracked file so there is WIP to (attempt to) park.
+        (git_ops.project_root / 'README.md').write_text('# WIP racing a stale ref\n')
+
+        with pytest.raises(MergeParkContentionError):
+            await git_ops._park_wip_on_private_ref('lbl')
+
+        # The ref must be UNCHANGED — never overwritten.
+        _, ref_after, _ = await _run(
+            ['git', 'rev-parse', 'refs/dark-factory/merge-park'], cwd=git_ops.project_root,
+        )
+        assert ref_after.strip() == head_sha, (
+            'stale merge-park ref must never be overwritten'
+        )
+
+        # The shared stash stack must still be untouched.
+        _, stash_list, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_list.strip() == ''
+
+    async def test_park_wip_update_ref_race_raises_contention(
+        self, git_ops: GitOps,
+    ):
+        """The atomic create-only update-ref backstop raises when it loses a race.
+
+        Distinct from test_park_wip_stale_ref_raises_and_does_not_overwrite
+        above (which exercises the rev-parse pre-check guard): here the
+        rev-parse pre-check reports MERGE_PARK_REF absent, but the
+        create-only ``update-ref MERGE_PARK_REF <sha> 0…0`` still fails —
+        simulating the ref appearing in the TOCTOU window between the two
+        calls. This pins the belt-and-braces backstop itself, not just the
+        primary guard.
+        """
+        (git_ops.project_root / 'README.md').write_text('# WIP racing update-ref\n')
+
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None):
+            if cmd[:5] == ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF]:
+                return (1, '', '')
+            if (
+                cmd[:2] == ['git', 'update-ref']
+                and len(cmd) == 5
+                and cmd[2] == MERGE_PARK_REF
+                and cmd[4] == '0' * 40
+            ):
+                return (128, '', "fatal: cannot lock ref 'refs/dark-factory/merge-park'")
+            return await original_run(cmd, cwd=cwd)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=mock_run),
+            pytest.raises(MergeParkContentionError, match='appeared concurrently'),
+        ):
+            await git_ops._park_wip_on_private_ref('lbl')
+
+        # The failed create-only update-ref must not leave a ref behind.
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, 'ref must not exist after a failed create-only update-ref'
+
+        # The shared stash stack must still be untouched.
+        _, stash_list, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_list.strip() == ''
+
+
+@pytest.mark.asyncio
+class TestSafeStashPopWithRecovery:
+    """Tests for the _safe_restore_park_with_recovery helper."""
+
+    async def test_safe_stash_pop_success_returns_ok(self, git_ops: GitOps):
+        """_safe_restore_park_with_recovery returns (True, None) on a clean apply.
+
+        Dirty file content is restored, MERGE_PARK_REF is deleted, the shared
+        stash list stays empty, and no recovery branch is created.
+        """
+        # Park a dirty tracked file via the private ref (not the shared stack).
+        (git_ops.project_root / 'README.md').write_text('# WIP content\n')
+        await git_ops._park_wip_on_private_ref('label-1')
+
+        # Verify the private ref was created
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, 'expected MERGE_PARK_REF to resolve after park'
 
         # Call the helper — no conflict exists, should succeed
-        ok, recovery = await git_ops._safe_stash_pop_with_recovery('label-1')
+        ok, recovery = await git_ops._safe_restore_park_with_recovery('label-1')
 
         assert ok is True
         assert recovery is None
@@ -3199,7 +3451,14 @@ class TestSafeStashPopWithRecovery:
         _, branches, _ = await _run(['git', 'branch'], cwd=git_ops.project_root)
         assert 'wip/recovery' not in branches
 
-        # Stash list is now empty
+        # MERGE_PARK_REF must be deleted after a clean restore
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, 'expected MERGE_PARK_REF to be deleted after successful restore'
+
+        # The shared stash stack was never touched
         _, stash_after, _ = await _run(
             ['git', 'stash', 'list'], cwd=git_ops.project_root,
         )
@@ -3208,28 +3467,27 @@ class TestSafeStashPopWithRecovery:
     async def test_safe_stash_pop_conflict_creates_recovery_branch(
         self, git_ops: GitOps,
     ):
-        """_safe_stash_pop_with_recovery returns (False, branch) and cleans up on conflict.
+        """_safe_restore_park_with_recovery returns (False, branch) and cleans up on conflict.
 
-        The recovery branch points at the original stash tree, stash list is
-        empty, and project_root has no leftover unmerged paths afterward.
+        The recovery branch points at the parked commit's tree, MERGE_PARK_REF
+        is deleted, the shared stash list stays empty, and project_root has no
+        leftover unmerged paths afterward.
         """
-        # Write WIP content to README.md and stash it
+        # Write WIP content to README.md and park it via the private ref.
         (git_ops.project_root / 'README.md').write_text('# WIP content for conflict\n')
-        await _run(
-            ['git', 'stash', 'push', '-m', 'wip-for-conflict'],
-            cwd=git_ops.project_root,
+        await git_ops._park_wip_on_private_ref('label-2')
+
+        # Capture the parked commit's tree before the apply attempt (to verify
+        # the recovery branch later).
+        _, parked_tree, _ = await _run(
+            ['git', 'rev-parse', f'{MERGE_PARK_REF}^{{tree}}'], cwd=git_ops.project_root,
         )
 
-        # Capture stash tree before pop attempt (to verify recovery branch later)
-        _, stash_tree, _ = await _run(
-            ['git', 'rev-parse', 'stash@{0}^{tree}'], cwd=git_ops.project_root,
-        )
-
-        # Commit a DIFFERENT version of README.md on main so stash pop will conflict.
-        # Three-way merge scenario:
-        #   base (stash parent) : '# Test\n'
-        #   ours (HEAD)         : '# Main version…\n'
-        #   theirs (stash)      : '# WIP content for conflict\n'
+        # Commit a DIFFERENT version of README.md on main so stash apply will
+        # conflict.  Three-way merge scenario:
+        #   base (parked commit's parent) : '# Test\n'
+        #   ours (HEAD)                   : '# Main version…\n'
+        #   theirs (parked commit)        : '# WIP content for conflict\n'
         (git_ops.project_root / 'README.md').write_text('# Main version — conflicts with WIP\n')
         await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
         await _run(
@@ -3237,8 +3495,8 @@ class TestSafeStashPopWithRecovery:
             cwd=git_ops.project_root,
         )
 
-        # Call the helper — git stash pop will conflict (real git conflict)
-        ok, recovery = await git_ops._safe_stash_pop_with_recovery('label-2')
+        # Call the helper — git stash apply will conflict (real git conflict)
+        ok, recovery = await git_ops._safe_restore_park_with_recovery('label-2')
 
         assert ok is False
         assert recovery is not None
@@ -3246,15 +3504,22 @@ class TestSafeStashPopWithRecovery:
             f'Recovery branch name should start with wip/recovery-label-2-, got {recovery!r}'
         )
 
-        # Recovery branch tree must match the original stash tree
+        # Recovery branch tree must match the parked commit's tree
         _, branch_tree, _ = await _run(
             ['git', 'rev-parse', f'{recovery}^{{tree}}'], cwd=git_ops.project_root,
         )
-        assert stash_tree.strip() == branch_tree.strip(), (
-            'Recovery branch tree must equal original stash tree'
+        assert parked_tree.strip() == branch_tree.strip(), (
+            'Recovery branch tree must equal the parked commit tree'
         )
 
-        # Stash list must be empty (stash was dropped after branch creation)
+        # MERGE_PARK_REF must be deleted (WIP now reachable via the recovery branch)
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, 'expected MERGE_PARK_REF to be deleted after recovery'
+
+        # The shared stash stack was never touched
         _, stash_after, _ = await _run(
             ['git', 'stash', 'list'], cwd=git_ops.project_root,
         )
