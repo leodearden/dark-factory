@@ -1670,6 +1670,7 @@ async def filter_already_tracked_systemic_patterns(
     *,
     min_key_terms: int = 4,
     match_coverage: float = 0.75,
+    min_task_term_precision: float = 0.2,
 ) -> list[dict[str, Any]]:
     """Drop systemic_pattern 'never tracked' findings already implemented by a done task.
 
@@ -1693,8 +1694,17 @@ async def filter_already_tracked_systemic_patterns(
     DROPPED iff some done task's key terms cover at least ``match_coverage``
     (fraction) of the candidate's own key terms (extracted from its
     ``description``): ``|finding_terms ∩ task_terms| / |finding_terms|``,
-    maximised over all done tasks.  Order-preserving: surviving flags keep
-    their original relative order.
+    AND that same task's own terms are not so broad that the overlap is
+    incidental — ``|finding_terms ∩ task_terms| / |task_terms|`` must also be
+    at least ``min_task_term_precision`` (default 0.2).  This precision floor
+    guards against a verbose, unrelated done task whose large title+
+    description happens to sweep up most of a narrow finding's key terms by
+    coincidence (reviewer_comprehensive, task 2416 amendment pass): such a
+    task's own term set is large relative to the overlap, so its precision is
+    low even when its coverage of the finding clears ``match_coverage``. Both
+    thresholds are evaluated per done task and maximised (by coverage) over
+    all *qualifying* done tasks.  Order-preserving: surviving flags keep their
+    original relative order.
 
     **Done-only** (task 2412 cannot self-suppress its own duplicate finding):
     ``statuses=['done']`` is passed explicitly, so a PENDING duplicate task
@@ -1731,6 +1741,11 @@ async def filter_already_tracked_systemic_patterns(
             before a match is even attempted (default 4).
         match_coverage: Minimum key-term coverage fraction required to drop a
             candidate (default 0.75).
+        min_task_term_precision: Minimum fraction of a qualifying done task's
+            OWN key terms that must be part of the overlap (default 0.2) —
+            a precision floor that keeps a large, generic done-task
+            description from coincidentally outweighing a narrow finding's
+            coverage match.
 
     Returns:
         Filtered list with already-tracked systemic_pattern flags removed.
@@ -1781,16 +1796,30 @@ async def filter_already_tracked_systemic_patterns(
             # Too few distinctive terms to trust a coverage match — KEEP
             # without attempting a match (task 2416 step-6 min-term floor).
             continue
+        matched = False
         best_coverage = 0.0
         best_task_id: Any = None
         for task, task_terms in done_tasks_with_terms:
             if not task_terms:
                 continue
-            coverage = len(finding_terms & task_terms) / len(finding_terms)
-            if coverage > best_coverage:
+            overlap = len(finding_terms & task_terms)
+            coverage = overlap / len(finding_terms)
+            if coverage < match_coverage:
+                continue
+            # Precision floor: an overlap that clears match_coverage can still
+            # be incidental if the done task's own description is large and
+            # generic (reviewer_comprehensive, task 2416 amendment pass) — a
+            # qualifying task must also derive a meaningful share of its own
+            # terms from the overlap, not just happen to contain it somewhere
+            # in a much larger, unrelated body of text.
+            precision = overlap / len(task_terms)
+            if precision < min_task_term_precision:
+                continue
+            if not matched or coverage > best_coverage:
+                matched = True
                 best_coverage = coverage
                 best_task_id = task.get('id')
-        if best_coverage >= match_coverage:
+        if matched:
             drop_positions.add(pos)
             logger.info(
                 'reconciliation.systemic_pattern_already_tracked_dropped '

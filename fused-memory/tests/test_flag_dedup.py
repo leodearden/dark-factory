@@ -5141,3 +5141,242 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             f'get_tasks raising must fail-open to KEEP-all; got {result!r}'
         )
 
+    # ---- malformed get_tasks result edge cases (amendment pass) ------------
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_returning_bare_list_keeps_all_flags(self):
+        """A non-dict result (e.g. a bare list) degrades to zero done tasks."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value=[])
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            f'A non-dict get_tasks result must degrade to zero done tasks (KEEP-all); got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_result_missing_tasks_key_keeps_all_flags(self):
+        """A dict result without a 'tasks' key degrades to zero done tasks."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={})
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            f"A result missing 'tasks' must degrade to zero done tasks (KEEP-all); got {result!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_result_with_none_tasks_keeps_all_flags(self):
+        """A result of {'tasks': None} degrades to zero done tasks."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': None})
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            f"A result of {{'tasks': None}} must degrade to zero done tasks (KEEP-all); got {result!r}"
+        )
+
+    # ---- match-coverage boundary + order preservation (amendment pass) ----
+
+    @pytest.mark.asyncio
+    async def test_coverage_exactly_at_threshold_drops(self):
+        """A done task covering EXACTLY match_coverage (0.75) of a 4-term finding drops it.
+
+        finding key terms: {widget, gizmo, gadget, doohickey} (4 terms — right at
+        min_key_terms).  The done task's title+description covers 3 of the 4
+        (widget, gizmo, gadget), i.e. coverage == 0.75 exactly — this must DROP
+        under `>=`; an `>` regression would wrongly KEEP it.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = {
+            'task_id': None,
+            'category': 'systemic_pattern',
+            'flag_type': 'systemic_pattern',
+            'description': (
+                'This idea was never converted to a tracked task: widget gizmo '
+                'gadget doohickey.'
+            ),
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [
+                {
+                    'id': '501',
+                    'status': 'done',
+                    'title': 'Add widget gizmo gadget support',
+                    'description': (
+                        'Implemented support for widget gizmo and gadget in the '
+                        'module.'
+                    ),
+                },
+            ],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            f'A done task covering exactly the 0.75 threshold must DROP; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_coverage_just_below_threshold_keeps(self):
+        """A done task covering only 2 of 4 finding terms (0.5 < 0.75) keeps it."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = {
+            'task_id': None,
+            'category': 'systemic_pattern',
+            'flag_type': 'systemic_pattern',
+            'description': (
+                'This idea was never converted to a tracked task: widget gizmo '
+                'gadget doohickey.'
+            ),
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [
+                {
+                    'id': '502',
+                    'status': 'done',
+                    'title': 'Add widget gizmo support',
+                    'description': (
+                        'Implemented support for widget and gizmo in the module.'
+                    ),
+                },
+            ],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            f'A done task covering only 0.5 of the finding terms (below 0.75) must KEEP; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_verbose_unrelated_done_task_does_not_drop_real_finding(self):
+        """A large, unrelated done task that coincidentally covers a finding's
+        terms must NOT drop it — the task's own term set is dominated by
+        unrelated content, so its match precision is far below the
+        min_task_term_precision floor even though its coverage of the
+        finding hits 1.0 (reviewer_comprehensive: coverage alone is not
+        enough to trust a match).
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [
+                {
+                    'id': '999',
+                    'status': 'done',
+                    'title': 'Overhaul the onboarding wizard visual design system',
+                    'description': (
+                        'Redesigned button colors layout headers footers icons '
+                        'animations tooltips modals dialogs banners forms fields '
+                        'validators placeholders labels dropdowns checkboxes '
+                        'radios sliders toggles avatars badges chips cards '
+                        'panels tabs accordions carousels breadcrumbs paginators '
+                        'steppers loaders spinners skeletons toasts snackbars '
+                        'notifications alerts confirmations wizards onboarding '
+                        'flows screens views pages routes navigation menus '
+                        'sidebars themes palettes typography spacing margins '
+                        'paddings borders shadows gradients transitions '
+                        'animations incidentally also touched some diff project '
+                        'status correction cache against live get_statuses cycle '
+                        'catch drift related code paths while sweeping the whole '
+                        'repository for stray references.'
+                    ),
+                },
+            ],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            'A verbose, unrelated done task must not suppress a real systemic '
+            f'signal just because it coincidentally covers its terms; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_order_preserved_with_multiple_candidates_and_benign_flags(self):
+        """Surviving flag order is preserved with 2+ interleaved candidates.
+
+        Layout: [benign1, candidateA(dropped), benign2, candidateB(kept), benign3].
+        Only candidateA is covered by the one done task returned, so the
+        expected survivors are [benign1, benign2, candidateB, benign3] in
+        their original relative order.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        benign1 = {'task_id': '1', 'category': 'stale_metadata', 'flag_type': 'stale_metadata',
+                   'description': 'Unrelated benign flag one.'}
+        benign2 = {'task_id': '2', 'category': 'stale_metadata', 'flag_type': 'stale_metadata',
+                   'description': 'Unrelated benign flag two.'}
+        benign3 = {'task_id': '3', 'category': 'stale_metadata', 'flag_type': 'stale_metadata',
+                   'description': 'Unrelated benign flag three.'}
+        candidate_a = self._make_never_tracked_flag()
+        candidate_b = {
+            'task_id': None,
+            'category': 'systemic_pattern',
+            'flag_type': 'systemic_pattern',
+            'description': (
+                'This idea was never tracked: revamp the onboarding welcome '
+                'banner email template design.'
+            ),
+        }
+
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [
+                {
+                    'id': '1938',
+                    'status': 'done',
+                    'title': (
+                        'Diff project_status_correction cache against live '
+                        'get_statuses every cycle'
+                    ),
+                    'description': (
+                        'Implemented a periodic diff of the cached '
+                        'project_status_correction value against a live '
+                        'get_statuses call each cycle to catch drift and correct '
+                        'stale cache entries before they propagate.'
+                    ),
+                },
+            ],
+        })
+
+        flags = [benign1, candidate_a, benign2, candidate_b, benign3]
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', flags)
+
+        assert result == [benign1, benign2, candidate_b, benign3], (
+            f'Surviving flags must preserve original relative order; got {result!r}'
+        )
+
