@@ -1,0 +1,643 @@
+"""Tests for GitOps.ephemeral_worktree() — task θ (verify-plan PRD).
+
+GitOps.ephemeral_worktree(kind, sha) is the single extraction point for the
+two main-tip probes' (verify_failure_is_preexisting_on_main, run_main_tip_sweep
+in orchestrator/src/orchestrator/verify.py) copy-pasted worktree lifecycle:
+mint a path under worktree_base with a kind-specific prefix, retry
+`git worktree add --detach` on lock contention, and GUARANTEE scoped cleanup
+(`git worktree remove --force` + rmtree) with NO `git worktree prune` ever
+issued (DD5 — the comment-only invariant that failed in the 2026-07-04
+warm-lane broad-prune registration-wipe incident, df 2097-2100).
+
+Test coverage:
+  step-1: WorktreeKind enum + E2 PROTECTED_PREFIXES registration
+  step-3: GitOps.ephemeral_worktree CM behavior (naming, retry, cleanup,
+          raise-on-add-failure)
+  step-5: E1 — both probes route through the CM and NEVER issue
+          ['git', 'worktree', 'prune']
+  amend-1: no-leak-on-add-failure regression, both probes' fail-safe
+           `except EphemeralWorktreeError` handlers, and the
+           EphemeralWorktreeError -> BlockDisposition table row
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+from unittest.mock import AsyncMock, call, patch
+
+import pytest
+
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WorktreeKind
+from orchestrator.verify import VerifyResult
+
+# ---------------------------------------------------------------------------
+# step-1: WorktreeKind enum + E2 registration
+# ---------------------------------------------------------------------------
+
+
+class TestWorktreeKindRegistration:
+    """step-1: WorktreeKind enum exists, its values are the probe/sweep
+    prefixes, and both are registered in PROTECTED_PREFIXES /
+    GitOps.protected_prefixes() (E2) with a non-empty owner.
+
+    RED today: WorktreeKind does not exist yet, so every test here fails on
+    the (deliberately in-test, not module-level) import.
+    """
+
+    def test_worktree_kind_import_and_values(self) -> None:
+        from orchestrator.git_ops import WorktreeKind
+
+        assert WorktreeKind.MAIN_PROBE.value == '_mainprobe-'
+        assert WorktreeKind.MAIN_SWEEP.value == '_mainsweep-'
+
+    def test_worktree_kind_values_registered_in_module_prefixes(self) -> None:
+        from orchestrator.git_ops import WorktreeKind
+
+        for kind in (WorktreeKind.MAIN_PROBE, WorktreeKind.MAIN_SWEEP):
+            assert kind.value in PROTECTED_PREFIXES, (
+                f'expected {kind.value!r} to be a key in PROTECTED_PREFIXES; '
+                f'got keys={list(PROTECTED_PREFIXES)!r}'
+            )
+            owner = PROTECTED_PREFIXES[kind.value]
+            assert isinstance(owner, str) and owner, (
+                f'expected a non-empty owner tag for {kind.value!r}; got {owner!r}'
+            )
+
+    def test_worktree_kind_values_registered_in_instance_protected_prefixes(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.git_ops import WorktreeKind
+
+        git_ops = GitOps(GitConfig(), tmp_path)
+        registry = git_ops.protected_prefixes()
+
+        for kind in (WorktreeKind.MAIN_PROBE, WorktreeKind.MAIN_SWEEP):
+            assert kind.value in registry, (
+                f'expected {kind.value!r} in protected_prefixes(); '
+                f'got keys={list(registry)!r}'
+            )
+            assert registry[kind.value] == PROTECTED_PREFIXES[kind.value], (
+                f'expected protected_prefixes() owner for {kind.value!r} to '
+                f'match the module registry owner; got '
+                f'{registry[kind.value]!r} != {PROTECTED_PREFIXES[kind.value]!r}'
+            )
+
+
+# ---------------------------------------------------------------------------
+# step-3: GitOps.ephemeral_worktree CM behavior
+# ---------------------------------------------------------------------------
+
+MAIN_SHA = 'c' * 40
+
+
+def _make_fake_run(add_rcs: list[int], calls: list[list[str]]):
+    """Fake ``orchestrator.git_ops._run`` recording every argv into *calls*.
+
+    ``git worktree add`` return codes are consumed in order from *add_rcs*
+    (the last entry repeats once exhausted). A successful add mkdirs the
+    ``--detach`` target, mirroring what real ``git worktree add`` does, so
+    a later unconditional ``shutil.rmtree`` has something real on disk to
+    remove. Every other command (e.g. ``git worktree remove``) always
+    succeeds.
+    """
+    state = {'add_calls': 0}
+
+    async def _fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if 'worktree' in cmd and 'add' in cmd:
+            idx = state['add_calls']
+            rc = add_rcs[idx] if idx < len(add_rcs) else add_rcs[-1]
+            state['add_calls'] += 1
+            if rc == 0:
+                detach_idx = cmd.index('--detach')
+                Path(cmd[detach_idx + 1]).mkdir(parents=True, exist_ok=True)
+            return (rc, '', '' if rc == 0 else 'lock contention')
+        return (0, '', '')
+
+    return _fake_run
+
+
+class TestEphemeralWorktreeNamingAndAdd:
+    """step-3 (a)/(b): yielded path naming + ``git worktree add`` argv.
+
+    RED today: GitOps has no ``ephemeral_worktree`` method.
+    """
+
+    def test_yields_path_under_worktree_base_with_mainprobe_prefix(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+
+        async def _body() -> Path:
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA) as p:
+                return p
+
+        with patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)):
+            yielded = asyncio.run(_body())
+
+        assert yielded.parent == git_ops.worktree_base, (
+            f'expected {yielded!r} to be a direct child of worktree_base={git_ops.worktree_base}'
+        )
+        assert yielded.name.startswith('_mainprobe-'), (
+            f"expected name to start with '_mainprobe-'; got {yielded.name!r}"
+        )
+
+    def test_yields_path_under_worktree_base_with_mainsweep_prefix(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+
+        async def _body() -> Path:
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_SWEEP, MAIN_SHA) as p:
+                return p
+
+        with patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)):
+            yielded = asyncio.run(_body())
+
+        assert yielded.parent == git_ops.worktree_base, (
+            f'expected {yielded!r} to be a direct child of worktree_base={git_ops.worktree_base}'
+        )
+        assert yielded.name.startswith('_mainsweep-'), (
+            f"expected name to start with '_mainsweep-'; got {yielded.name!r}"
+        )
+
+    def test_issues_worktree_add_detach_with_sha(self, tmp_path: Path) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                pass
+
+        with patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)):
+            asyncio.run(_body())
+
+        add_calls = [c for c in calls if 'worktree' in c and 'add' in c]
+        assert len(add_calls) == 1, f'expected exactly 1 add call; got {add_calls}'
+        add_cmd = add_calls[0]
+        assert '--detach' in add_cmd, f'expected --detach in add argv: {add_cmd}'
+        assert MAIN_SHA in add_cmd, f'expected {MAIN_SHA!r} in add argv: {add_cmd}'
+
+
+class TestEphemeralWorktreeCleanup:
+    """step-3 (c)/(d): guaranteed scoped cleanup, no prune — on both normal
+    exit and a body-raised exception.
+
+    RED today: GitOps has no ``ephemeral_worktree`` method.
+    """
+
+    def test_normal_exit_removes_scoped_and_never_prunes(self, tmp_path: Path) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+
+        async def _body() -> Path:
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA) as p:
+                assert p.exists(), 'expected the minted path to exist inside the CM body'
+                return p
+
+        with patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)):
+            p = asyncio.run(_body())
+
+        remove_calls = [c for c in calls if 'worktree' in c and 'remove' in c]
+        assert len(remove_calls) == 1, f'expected exactly 1 remove call; got {remove_calls}'
+        assert '--force' in remove_calls[0], f'expected --force in remove argv: {remove_calls[0]}'
+        assert str(p) in remove_calls[0], f'expected {p} in remove argv: {remove_calls[0]}'
+        assert not any(
+            'git' in c and 'worktree' in c and 'prune' in c for c in calls
+        ), f'CM must NEVER issue a prune argv (DD5/E1); got calls={calls}'
+        assert not p.exists(), (
+            'expected the unconditional shutil.rmtree to remove the minted '
+            'directory after the CM exits'
+        )
+
+    def test_cleanup_runs_and_never_prunes_when_body_raises(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        captured: dict[str, Path] = {}
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA) as p:
+                captured['path'] = p
+                raise RuntimeError('simulated body crash')
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            pytest.raises(RuntimeError, match='simulated body crash'),
+        ):
+            asyncio.run(_body())
+
+        remove_calls = [c for c in calls if 'worktree' in c and 'remove' in c]
+        assert len(remove_calls) == 1, (
+            f'expected cleanup to still issue a remove when the body raises; got {remove_calls}'
+        )
+        assert not any(
+            'git' in c and 'worktree' in c and 'prune' in c for c in calls
+        ), f'CM must NEVER issue a prune argv (DD5/E1); got calls={calls}'
+        assert not captured['path'].exists(), (
+            'expected cleanup (rmtree) to still run when the body raises'
+        )
+
+
+class TestEphemeralWorktreeRetry:
+    """step-3 (e)/(f): retry-on-lock-contention + raise-after-exhaustion.
+
+    RED today: GitOps has no ``ephemeral_worktree`` method and
+    ``EphemeralWorktreeError`` does not exist.
+    """
+
+    def test_retries_add_and_enters_body_on_eventual_success(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        entered = False
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                entered = True
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([1, 1, 0], calls)),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+        ):
+            asyncio.run(_body())
+
+        add_calls = [c for c in calls if 'worktree' in c and 'add' in c]
+        assert len(add_calls) == 3, f'expected exactly 3 add attempts; got {len(add_calls)}'
+        # All 3 attempts must target the SAME minted path (retry reuses it;
+        # it does not mint a fresh path per attempt).
+        detach_targets = {c[c.index('--detach') + 1] for c in add_calls}
+        assert len(detach_targets) == 1, (
+            f'expected all retries to target the same path; got {detach_targets}'
+        )
+        assert entered, 'expected the CM body to run once add eventually succeeds'
+        # asyncio.sleep is patched so the 2 backoff waits between the 3
+        # attempts don't add real wall-clock time to the suite; still pin
+        # the linear-backoff durations (0.5 * (attempt + 1)) requested for
+        # the 2 failed attempts.
+        assert mock_sleep.await_args_list == [call(0.5), call(1.0)], (
+            f'expected backoff sleeps of 0.5s then 1.0s; got {mock_sleep.await_args_list}'
+        )
+
+    def test_raises_ephemeral_worktree_error_after_exhausting_retries(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.git_ops import EphemeralWorktreeError
+
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        entered = False
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                entered = True  # must never run
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([1, 1, 1], calls)),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+            pytest.raises(EphemeralWorktreeError),
+        ):
+            asyncio.run(_body())
+
+        add_calls = [c for c in calls if 'worktree' in c and 'add' in c]
+        assert len(add_calls) == 3, f'expected exactly 3 add attempts; got {len(add_calls)}'
+        assert not entered, 'expected the CM body to NEVER run when add exhausts retries'
+        remove_calls = [c for c in calls if 'worktree' in c and 'remove' in c]
+        assert not remove_calls, (
+            f'expected NO git worktree remove when add never succeeded; got {remove_calls}'
+        )
+        # asyncio.sleep is patched to avoid 1.5s of real backoff delay; the
+        # CM only sleeps BETWEEN attempts (2 sleeps for 3 attempts, none
+        # after the final exhausted attempt).
+        assert mock_sleep.await_args_list == [call(0.5), call(1.0)], (
+            f'expected backoff sleeps of 0.5s then 1.0s; got {mock_sleep.await_args_list}'
+        )
+
+    def test_add_failure_leaves_no_leaked_directory_under_worktree_base(
+        self, tmp_path: Path,
+    ) -> None:
+        """Amendment (reviewer_comprehensive robustness_resource_leak,
+        git_ops.py:1188): a failed ``git worktree add`` can still leave a
+        partial/empty directory at tmp_path — real git creates the target
+        directory early during add, before it can fail — and because this
+        prefix is PROTECTED_PREFIXES-registered, the reaper will NEVER
+        reclaim it. The CM must clean up tmp_path itself before raising, or
+        the directory leaks under worktree_base permanently. Restores the
+        pre-extraction probes' unconditional 'rmtree in case ... the
+        worktree add never ran' cleanup guarantee.
+        """
+        from orchestrator.git_ops import EphemeralWorktreeError
+
+        git_ops = GitOps(GitConfig(), tmp_path)
+        entered = False
+
+        async def _fake_run_leaves_partial_dir(cmd, **kwargs):
+            if 'worktree' in cmd and 'add' in cmd:
+                # Simulate real `git worktree add` creating its target
+                # directory before it fails on lock contention.
+                detach_idx = cmd.index('--detach')
+                Path(cmd[detach_idx + 1]).mkdir(parents=True, exist_ok=True)
+                return (1, '', 'lock contention')
+            return (0, '', '')  # pragma: no cover — no other command expected
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                entered = True  # must never run
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run_leaves_partial_dir),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+            pytest.raises(EphemeralWorktreeError),
+        ):
+            asyncio.run(_body())
+
+        assert not entered, 'expected the CM body to NEVER run when add exhausts retries'
+        leaked = list(git_ops.worktree_base.glob('_mainprobe-*'))
+        assert not leaked, (
+            f'expected no leaked _mainprobe-* directory under worktree_base '
+            f'after add exhausts retries; found {leaked}'
+        )
+        # asyncio.sleep is patched to avoid 1.5s of real backoff delay.
+        assert mock_sleep.await_args_list == [call(0.5), call(1.0)], (
+            f'expected backoff sleeps of 0.5s then 1.0s; got {mock_sleep.await_args_list}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-5: E1 — both probes route through the CM; the CM never prunes
+# ---------------------------------------------------------------------------
+
+
+def _make_config(tmp_path: Path) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        project_root=tmp_path,
+        max_concurrent_tasks=1,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+
+
+_PASSING_RESULT = VerifyResult(
+    passed=True, test_output='', lint_output='', type_output='',
+    summary='all checks passed',
+)
+
+
+class TestBothProbesRouteThroughEphemeralWorktree:
+    """step-5 (E1 — the hard-leaf, load-bearing incident-prevention signal
+    this task exists to add): both main-tip probes
+    (verify_failure_is_preexisting_on_main, run_main_tip_sweep — both in
+    verify.py) must build their throwaway worktree by calling
+    GitOps.ephemeral_worktree(), and neither may EVER issue
+    ``['git', 'worktree', 'prune']`` (DD5) — only a scoped
+    ``git worktree remove --force``.
+
+    RED today: both probes still build their own worktree inline (bespoke
+    path build + retry-add + finally-cleanup) and never call
+    ``git_ops.ephemeral_worktree`` — the spy sees 0 calls.
+    """
+
+    def test_verify_failure_is_preexisting_on_main_routes_through_cm(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        # A category/cause_hint combo unique to this test so its key can
+        # never collide with another test's entry in the process-wide
+        # (module-level) verify._PROBE_CACHE.
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='theta_e1_mainprobe_signal',
+            cause_hint='task theta E1 ephemeral_worktree routing signal (mainprobe)',
+            category='task_theta_e1_mainprobe',
+        )
+
+        calls: list[list[str]] = []
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification',
+                         new=AsyncMock(return_value=_PASSING_RESULT)),
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            patch.object(
+                git_ops, 'ephemeral_worktree', wraps=git_ops.ephemeral_worktree,
+            ) as spied_cm,
+        ):
+            asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], failing_result, git_ops,
+                )
+            )
+
+        assert spied_cm.call_count >= 1, (
+            'expected verify_failure_is_preexisting_on_main to build its probe '
+            'worktree via git_ops.ephemeral_worktree(); got 0 calls'
+        )
+        assert not any(
+            'worktree' in c and 'prune' in c for c in calls
+        ), f'probe must NEVER issue a prune argv (DD5/E1); got calls={calls}'
+        assert any(
+            'worktree' in c and 'remove' in c and '--force' in c for c in calls
+        ), f'expected a scoped "git worktree remove --force" argv; got calls={calls}'
+
+    def test_run_main_tip_sweep_routes_through_cm(self, tmp_path: Path) -> None:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        calls: list[list[str]] = []
+
+        async def _fake_full_verify(project_root, cfg, **kwargs) -> VerifyResult:
+            return _PASSING_RESULT
+
+        with (
+            patch.object(verify_module, 'run_full_verification', side_effect=_fake_full_verify),
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            patch.object(
+                git_ops, 'ephemeral_worktree', wraps=git_ops.ephemeral_worktree,
+            ) as spied_cm,
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is not None, f'expected a (sha, VerifyResult) tuple, got {result!r}'
+        assert spied_cm.call_count >= 1, (
+            'expected run_main_tip_sweep to build its sweep worktree via '
+            'git_ops.ephemeral_worktree(); got 0 calls'
+        )
+        assert not any(
+            'worktree' in c and 'prune' in c for c in calls
+        ), f'probe must NEVER issue a prune argv (DD5/E1); got calls={calls}'
+        assert any(
+            'worktree' in c and 'remove' in c and '--force' in c for c in calls
+        ), f'expected a scoped "git worktree remove --force" argv; got calls={calls}'
+
+
+# ---------------------------------------------------------------------------
+# amend-1: both probes' fail-safe `except EphemeralWorktreeError` handlers
+# ---------------------------------------------------------------------------
+
+
+class TestBothProbesFailSafeOnEphemeralWorktreeError:
+    """Amendment (reviewer_comprehensive test_coverage): the CM's raise is
+    covered by TestEphemeralWorktreeRetry, and CM-routing on the happy path
+    is covered by TestBothProbesRouteThroughEphemeralWorktree, but no test
+    previously drove an actual EphemeralWorktreeError THROUGH a probe
+    caller. This pins the fail-safe ``except EphemeralWorktreeError``
+    handler each probe carries — previously an inline early ``return``
+    before ``ephemeral_worktree`` existed — so a regression there (e.g. the
+    exception propagating uncaught) is caught here rather than in
+    production.
+    """
+
+    def test_verify_failure_is_preexisting_on_main_fails_safe_when_add_exhausts_retries(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        # A category/cause_hint combo unique to this test so its key can
+        # never collide with another test's entry in the process-wide
+        # (module-level) verify._PROBE_CACHE.
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='theta_amend_addfail_mainprobe_signal',
+            cause_hint='task theta amendment add-exhaustion fail-safe signal (mainprobe)',
+            category='task_theta_amend_addfail_mainprobe',
+        )
+
+        calls: list[list[str]] = []
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification',
+                         new=AsyncMock(return_value=_PASSING_RESULT)),
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([1, 1, 1], calls)),
+            caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], failing_result, git_ops,
+                )
+            )
+
+        assert result == (False, ''), (
+            f"expected the fail-safe sentinel (False, '') when "
+            f'ephemeral_worktree exhausts add retries; got {result!r}'
+        )
+        add_calls = [c for c in calls if 'worktree' in c and 'add' in c]
+        assert len(add_calls) == 3, f'expected 3 add attempts; got {len(add_calls)}'
+        assert not any(
+            'worktree' in c and 'remove' in c for c in calls
+        ), f'expected no remove call when add never succeeded; got {calls}'
+        assert any(
+            'contagion guard disabled' in r.getMessage() for r in caplog.records
+        ), (
+            f'expected a WARNING noting the contagion guard was disabled; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_run_main_tip_sweep_fails_safe_when_add_exhausts_retries(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        calls: list[list[str]] = []
+        full_verify_called = False
+
+        async def _fake_full_verify(project_root, cfg, **kwargs) -> VerifyResult:
+            nonlocal full_verify_called
+            full_verify_called = True  # must never run
+            return _PASSING_RESULT
+
+        with (
+            patch.object(verify_module, 'run_full_verification', side_effect=_fake_full_verify),
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([1, 1, 1], calls)),
+            caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is None, (
+            f'expected the fail-safe sentinel None when ephemeral_worktree '
+            f'exhausts add retries; got {result!r}'
+        )
+        assert not full_verify_called, (
+            'expected run_full_verification to NEVER run when add exhausts retries'
+        )
+        add_calls = [c for c in calls if 'worktree' in c and 'add' in c]
+        assert len(add_calls) == 3, f'expected 3 add attempts; got {len(add_calls)}'
+        assert not any(
+            'worktree' in c and 'remove' in c for c in calls
+        ), f'expected no remove call when add never succeeded; got {calls}'
+        assert any(
+            'sweep skipped for this tick' in r.getMessage() for r in caplog.records
+        ), (
+            f'expected a WARNING noting the sweep was skipped; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# amend-1: EphemeralWorktreeError -> BlockDisposition table row
+# ---------------------------------------------------------------------------
+
+
+class TestEphemeralWorktreeErrorDisposition:
+    """Amendment (reviewer_comprehensive test_coverage): EphemeralWorktreeError
+    gained an explicit ``workflow_types._disposition_table()`` row (BD-2
+    completeness — commit cced1c0adb, resolving esc-2147-3) but the row's
+    resolved BlockDisposition was untested. The canonical home for
+    classify_failure()-table pins is test_block_disposition.py's
+    TestClassifyFailureKnownRows, which sits outside this task's locked
+    module scope (git_ops.py/verify.py + the 4 verify/ephemeral-worktree
+    test files) — this is a scoped-in stand-in pinning the same contract
+    for the row this task added.
+    """
+
+    def test_classify_failure_resolves_the_expected_disposition(self) -> None:
+        from orchestrator.git_ops import EphemeralWorktreeError
+        from orchestrator.unblock_types import BlockClass
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+
+        disposition = classify_failure(EphemeralWorktreeError('add failed after retries'))
+
+        assert disposition.category is FailureCategory.NONE
+        assert disposition.escalate_to_human is True
+        assert disposition.requeue_kind is RequeueKind.BLOCK
+        assert disposition.counts_against_requeue_cap is True
+        assert disposition.block_class is BlockClass.AGENT_FAILURE
+        assert disposition.reason_prefix == 'Ephemeral probe worktree add failed after retries'

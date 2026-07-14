@@ -222,6 +222,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
     from shared.usage_gate import IllegalTransitionError, SessionBudgetExhausted
 
     from orchestrator.git_ops import (
+        EphemeralWorktreeError,
         InteractiveWorktreeLimitError,
         MergeParkContentionError,
         MergeParkError,
@@ -401,6 +402,21 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Stale merge-park ref: refusing to overwrite',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # BD-2-completeness-only row (task 2147/θ, verify-plan PRD). Raised by
+        # GitOps.ephemeral_worktree() when `git worktree add` fails on every
+        # retry — but both verify.py probe call sites
+        # (verify_failure_is_preexisting_on_main, run_main_tip_sweep) catch it
+        # locally and fail safe, so it never reaches _drive()/classify_failure().
+        # Mirrors MergeParkError's halt-and-escalate shape (both are
+        # safety/retry-exhaustion conditions caught close to their raise site).
+        EphemeralWorktreeError: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Ephemeral probe worktree add failed after retries',
             block_class=BlockClass.AGENT_FAILURE,
         ),
     }

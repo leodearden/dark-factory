@@ -7,7 +7,7 @@ detached worktree pinned at the current main SHA.  Returns (main_sha,
 VerifyResult) on success, or None on any infrastructure failure (fail-safe).
 
 Mirrors the mock strategy of test_verify_preexisting_main_break.py:
-  - MagicMock git_ops with get_main_sha (AsyncMock) and worktree_base
+  - Real GitOps with get_main_sha patched (AsyncMock) and worktree_base
   - monkeypatch orchestrator.git_ops._run to simulate worktree add/remove
   - monkeypatch orchestrator.verify.run_full_verification (AsyncMock)
 
@@ -27,9 +27,10 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps
 from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
@@ -83,14 +84,21 @@ def _make_config(tmp_path: Path) -> OrchestratorConfig:
     )
 
 
-def _make_git_ops(tmp_path: Path, main_sha: str = MAIN_SHA) -> MagicMock:
-    """Build a minimal MagicMock git_ops."""
-    mock = MagicMock()
-    mock.get_main_sha = AsyncMock(return_value=main_sha)
-    worktree_base = tmp_path / '.worktrees'
-    worktree_base.mkdir(parents=True, exist_ok=True)
-    mock.worktree_base = worktree_base
-    return mock
+def _make_git_ops(tmp_path: Path, main_sha: str = MAIN_SHA) -> GitOps:
+    """Build a real GitOps with get_main_sha patched.
+
+    Behavior-preserving swap from a MagicMock: run_main_tip_sweep only
+    touches git_ops.worktree_base, git_ops.get_main_sha(), and the
+    module-level orchestrator.git_ops._run (patched separately by each
+    test) — all present and correct on a real GitOps instance. A real
+    instance is required once the probe consumes
+    GitOps.ephemeral_worktree(), which a plain MagicMock cannot satisfy
+    as an async context manager.
+    """
+    git_ops = GitOps(_make_config(tmp_path).git, tmp_path)
+    git_ops.get_main_sha = AsyncMock(return_value=main_sha)  # type: ignore[method-assign]
+    git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+    return git_ops
 
 
 # ---------------------------------------------------------------------------
