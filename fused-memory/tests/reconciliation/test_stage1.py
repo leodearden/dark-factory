@@ -160,6 +160,54 @@ class TestStage1PayloadThreadsProjectRootAssembled:
 
 
 # ---------------------------------------------------------------------------
+# Task 2552: pin that _assemble_remediation_payload includes the project_root
+# directive — it was the third Stage-1 payload builder, missed when task 2150
+# hardened the other two. The legacy time-windowed assemble_payload branch and
+# the assembled-path _format_assembled_payload branch already have dedicated
+# coverage above (TestStage1PayloadThreadsProjectRootLegacy /
+# ...Assembled) — no need to duplicate those here (reviewer finding, amendment
+# pass round 1).
+# ---------------------------------------------------------------------------
+
+
+class TestStage1RemediationPayloadIncludesProjectRootDirective:
+    """_assemble_remediation_payload includes the project_root directive
+    emitted by ``_build_project_root_directive``.
+
+    Covers only the remediation payload (``_assemble_remediation_payload``,
+    reached via ``assemble_payload`` when ``remediation_findings`` is set) —
+    the gap task 2150 missed. The other two Stage-1 payload builders (legacy
+    ``assemble_payload`` and ``_format_assembled_payload``) are already
+    covered by ``TestStage1PayloadThreadsProjectRootLegacy`` and
+    ``TestStage1PayloadThreadsProjectRootAssembled`` above — task 2552.
+    """
+
+    _EXPECTED_ROOT = '/home/leo/src/test_proj'
+    _DIRECTIVE = f'Use project_root="{_EXPECTED_ROOT}" for tasks scoped to this project.'
+
+    @pytest.mark.asyncio
+    async def test_remediation_payload_includes_directive(self):
+        stage = _make_consolidator(project_root=self._EXPECTED_ROOT)
+        stage.remediation_findings = []
+        watermark = Watermark(project_id='test_project')
+
+        result = await stage.assemble_payload(
+            events=[], watermark=watermark, prior_reports=[]
+        )
+
+        assert self._DIRECTIVE in result, (
+            '_assemble_remediation_payload must include the project_root directive '
+            '(task 2552 regression: it was the third builder missed by task 2150)'
+        )
+        assert result.rstrip().endswith(self._DIRECTIVE), (
+            'project_root directive should be the last line of the remediation payload'
+        )
+        assert result.count('Use project_root=') == 1, (
+            'project_root directive should appear exactly once in the remediation payload'
+        )
+
+
+# ---------------------------------------------------------------------------
 # project_root omitted when empty — REMOVED (task 2146 / recon-project-scope PRD).
 #
 # The former class TestStage1PayloadOmitsProjectRootWhenUnset pinned a scenario
