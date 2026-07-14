@@ -3635,6 +3635,81 @@ class TestMergeStatus:
             f'Expected conflict from event-store fallback, got: {result}'
         )
 
+    # ── step-7 (2554): failure reason surfaces through both durable tiers ────
+
+    async def test_reason_surfaces_through_both_durable_tiers(
+        self, tmp_path: Path,
+    ) -> None:
+        """A terminal 'blocked' outcome's failure reason surfaces via merge_status.
+
+        (i) Ring survivor: a TerminalOutcomeRecord carrying reason= is served
+            directly from the retention ring (Tier 2).
+        (ii) Post-restart event-store: an empty ring + a merge_finalized event
+            carrying reason= in its data dict is served from the event-store
+            tier (Tier 3) — simulating a restart that dropped the ring.
+
+        RED: _OPTIONAL_TERMINAL_META_FIELDS omits 'reason' and the durable
+        resp builder has no reason plumbing, so resp['reason'] is absent in
+        both cases (the event-store tier additionally relies on step-6's
+        latest_merge_finalized row already carrying 'reason').
+        """
+        REASON = 'verify failed: gui_tsc'
+
+        # (i) Ring survivor
+        ring = TerminalOutcomeRetention()
+        ring.record(TerminalOutcomeRecord(
+            request_id='mr-reason-ring',
+            task_id='r1',
+            branch='r1',
+            state='blocked',
+            reason=REASON,
+        ))
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness)
+
+        result_ring = await _call_merge_status(server, request_id='mr-reason-ring')
+
+        assert result_ring.get('state') == 'blocked', (
+            f'Expected state=blocked from ring, got: {result_ring}'
+        )
+        assert result_ring.get('outcome') == 'blocked', (
+            f'Expected outcome=blocked from ring, got: {result_ring}'
+        )
+        assert result_ring.get('reason') == REASON, (
+            f'Expected reason={REASON!r} surfaced from ring tier, got: {result_ring}'
+        )
+
+        # (ii) Post-restart event-store: empty ring, same reason via event data.
+        event_store = EventStore(tmp_path / 'runs.db', 'run-reason-ev')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='r2',
+            data={
+                'request_id': 'mr-reason-ev',
+                'branch': 'r2',
+                'state': 'blocked',
+                'reason': REASON,
+            },
+        )
+        empty_ring = TerminalOutcomeRetention()
+        esc_queue2 = EscalationQueue(tmp_path / 'esc2')
+        stub_harness2 = types.SimpleNamespace(
+            _merge_worker=None, _terminal_retention=empty_ring
+        )
+        server2 = create_server(
+            esc_queue2, harness=stub_harness2, event_store=event_store
+        )
+
+        result_ev = await _call_merge_status(server2, request_id='mr-reason-ev')
+
+        assert result_ev.get('state') == 'blocked', (
+            f'Expected state=blocked from event store, got: {result_ev}'
+        )
+        assert result_ev.get('reason') == REASON, (
+            f'Expected reason={REASON!r} surfaced from event-store tier, got: {result_ev}'
+        )
+
     # ── step-9 (1749): ring tier branch/task_id/alias lookup ─────────────────
 
     async def test_ring_tier_returns_terminal_record_by_branch(
