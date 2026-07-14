@@ -41,6 +41,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import yaml
+
 logger = logging.getLogger("legibility.census_trigger")
 
 
@@ -253,3 +255,99 @@ def load_census_state(path: str | Path) -> tuple[str, dict | None]:
             return "malformed", None
 
     return "ok", data
+
+
+# ---------------------------------------------------------------------------
+# codebook_signal — extract the never-censused anchor + novelty-spike dates
+# from a task γ / codebook.load() dict (§7.3 candidates schema)
+# ---------------------------------------------------------------------------
+
+def _parse_date(value: object) -> datetime | None:
+    """Parse an ISO-ish date/datetime string; return None (never raise) for
+    anything unparseable or non-string, so one bad codebook record can't
+    take down the whole evaluation."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def codebook_signal(codebook: dict) -> tuple[datetime | None, list[datetime]]:
+    """Extract the census-trigger signal from a `codebook.load()`-shaped
+    dict (task γ / 2575's schema): the earliest structured sighting or
+    candidate `first_seen`/sighting date across the WHOLE codebook (used to
+    anchor condition (a) when `never_censused`), and every candidate's
+    `first_seen` date on its own (used for condition (c)'s novelty-spike
+    window count). Unparseable dates are skipped rather than raising.
+
+    Returns `(earliest_or_None, sorted_candidate_first_seens)`. An empty
+    codebook (`entries: []`, `candidates: []`) returns `(None, [])`.
+    """
+    all_dates: list[datetime] = []
+    candidate_first_seens: list[datetime] = []
+
+    for entry in codebook.get("entries") or []:
+        for sighting in entry.get("sightings") or []:
+            parsed = _parse_date(sighting.get("date"))
+            if parsed is not None:
+                all_dates.append(parsed)
+
+    for candidate in codebook.get("candidates") or []:
+        first_seen = _parse_date(candidate.get("first_seen"))
+        if first_seen is not None:
+            candidate_first_seens.append(first_seen)
+            all_dates.append(first_seen)
+        for sighting in candidate.get("sightings") or []:
+            parsed = _parse_date(sighting.get("date"))
+            if parsed is not None:
+                all_dates.append(parsed)
+
+    earliest = min(all_dates) if all_dates else None
+    return earliest, sorted(candidate_first_seens)
+
+
+# ---------------------------------------------------------------------------
+# load_census_config — §7.4 census: block reader (independent of task β)
+# ---------------------------------------------------------------------------
+
+def load_census_config(project_root: str | Path) -> CensusConfig:
+    """Read `<project_root>/docs/legibility/legibility.yaml`'s `census:`
+    sub-dict (§7.4) directly via a light pyyaml read -- deliberately NOT
+    task β's `legibility.config.load_config` loader, since β is not a
+    dependency of this task (see module docstring). An absent file returns
+    defaults silently (no legibility.yaml is a normal pre-β-adoption
+    state). A malformed file (YAML parse error, non-dict top level, or a
+    non-dict `census:` block) returns defaults plus exactly one WARNING --
+    never raises.
+    """
+    path = Path(project_root) / "docs" / "legibility" / "legibility.yaml"
+    if not path.exists():
+        return CensusConfig()
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning("legibility config at %s is malformed: %s", path, exc)
+        return CensusConfig()
+
+    if not isinstance(data, dict):
+        logger.warning(
+            "legibility config at %s is malformed: expected a YAML mapping, got %s",
+            path,
+            type(data).__name__,
+        )
+        return CensusConfig()
+
+    census_block = data.get("census")
+    if census_block is not None and not isinstance(census_block, dict):
+        logger.warning(
+            "legibility config at %s has a malformed census: block (expected a mapping, got %s)",
+            path,
+            type(census_block).__name__,
+        )
+        return CensusConfig()
+
+    return CensusConfig.from_mapping(census_block)
