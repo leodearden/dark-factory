@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 
 from escalation.queue import EscalationQueue
 
+from orchestrator.workflow_types import StewardResolved
+
 
 class FakeMcp:
     """Minimal McpLifecycle stand-in."""
@@ -226,7 +228,14 @@ def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
 
     class _FakeSteward:
         def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
-            pass
+            self._outcome_channel = None
+            self._wip_probe = None
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:
+            self._wip_probe = probe
 
         async def start(self) -> None:
             pending = queue.get_by_task(task_id, status='pending', level=0)
@@ -234,6 +243,10 @@ def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
             for esc in pending:
                 queue.resolve(
                     esc.id, 'Resolved by FakeSteward', resolved_by='fake-steward',
+                )
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(
+                    StewardResolved(resolution_text='Resolved by FakeSteward'),
                 )
 
         async def stop(self) -> None:
@@ -254,13 +267,24 @@ def _make_status_setting_steward(
 
     class _FakeSteward:
         def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
-            pass
+            self._outcome_channel = None
+            self._wip_probe = None
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:
+            self._wip_probe = probe
 
         async def start(self) -> None:
             pending = queue.get_by_task(task_id, status='pending', level=0)
             for esc in pending:
                 queue.resolve(esc.id, 'Resolved', resolved_by='fake-steward')
             await scheduler.set_task_status(task_id, final_status)
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(
+                    StewardResolved(resolution_text='Resolved'),
+                )
 
         async def stop(self) -> None:
             pass

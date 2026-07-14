@@ -33,8 +33,16 @@ from shared.proc_group import terminate_process_group
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.workflow_types import (
+    StewardBudgetExhausted,
+    StewardInterrupted,
+    StewardReescalatedL1,
+    StewardResolved,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
     from shared.config_dir import TaskConfigDir
@@ -43,6 +51,7 @@ if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
     from orchestrator.mcp_lifecycle import McpLifecycle
     from orchestrator.usage_gate import UsageGate
+    from orchestrator.workflow_types import StewardOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +116,15 @@ class TaskSteward:
         self._empty_output_counts: dict[str, int] = {}
         self.metrics = StewardMetrics()
 
+        # Outcome channel (task 2248 / W9-delta): the workflow registers a
+        # per-task asyncio.Queue + a wip-derivation probe via the setters
+        # below (in TaskWorkflow._ensure_steward_started).  Both stay None
+        # for stewards built without that wiring (most of this module's
+        # unit tests, and any other caller) — _publish_outcome is a no-op
+        # and the wip-gated guards below default to wip=False in that case.
+        self._outcome_channel: asyncio.Queue | None = None
+        self._wip_probe: Callable[[], Awaitable[bool]] | None = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -117,6 +135,37 @@ class TaskSteward:
             self._run_loop(), name=f'steward-{self.task_id}',
         )
         logger.info(f'Steward started for task {self.task_id}')
+
+    def set_outcome_channel(self, channel: asyncio.Queue) -> None:
+        """Register the in-process channel :meth:`_handle_escalation` publishes on.
+
+        Wired by :meth:`TaskWorkflow._ensure_steward_started`.  Left unset
+        (``None``) by every caller that does not need the typed outcome —
+        :meth:`_publish_outcome` is then a no-op.
+        """
+        self._outcome_channel = channel
+
+    def set_wip_probe(self, probe: Callable[[], Awaitable[bool]]) -> None:
+        """Register the callable used to derive ``wip_commits_present``.
+
+        Wired by :meth:`TaskWorkflow._ensure_steward_started` to
+        ``TaskWorkflow._worktree_has_wip_commits`` — the SAME implementation
+        the workflow uses for its own grace-timeout case, so wip is derived
+        via one shared primitive (``git_ops.worktree_has_unsaved_work``).
+        """
+        self._wip_probe = probe
+
+    def _publish_outcome(self, outcome: StewardOutcome) -> None:
+        """Put *outcome* on the registered channel; no-op when none is set.
+
+        Synchronous (``put_nowait``, not ``await queue.put``) so it is safe
+        to call from both async call sites (``_handle_escalation``) and sync
+        ones (``_auto_escalate_to_human``).  A per-task ``asyncio.Queue`` is
+        unbounded by construction here, so ``put_nowait`` never raises
+        ``QueueFull``.
+        """
+        if self._outcome_channel is not None:
+            self._outcome_channel.put_nowait(outcome)
 
     async def stop(self) -> None:
         """Cancel the steward loop and cleanup."""
@@ -318,25 +367,42 @@ class TaskSteward:
                 escalation, 'Steward lifetime budget exhausted '
                 f'(${self.metrics.total_cost_usd:.2f} / '
                 f'${self.config.steward_lifetime_budget:.2f})',
+                outcome=StewardBudgetExhausted(),
             )
             return
 
         # Guard: per-escalation retry limit
         retry_count = self._retry_counts.get(escalation.id, 0)
         if retry_count >= self.config.steward_max_attempts:
-            self._auto_escalate_to_human(
-                escalation,
-                f'Failed after {retry_count} attempt{"s" if retry_count != 1 else ""}: {escalation.summary}',
-            )
+            wip = await self._wip_probe() if self._wip_probe else False
+            outcome = StewardInterrupted(reason='attempt_cap', wip_commits_present=wip)
+            if wip:
+                # Task-2060 lesson: a wall-clock kill with partial WIP commits
+                # must resume the plan, not be triaged as "steward failed" via
+                # an L1. Skip _auto_escalate_to_human entirely — the workflow's
+                # _mark_blocked dismisses the still-pending L0 and re-pends.
+                self._publish_outcome(outcome)
+            else:
+                self._auto_escalate_to_human(
+                    escalation,
+                    f'Failed after {retry_count} attempt{"s" if retry_count != 1 else ""}: {escalation.summary}',
+                    outcome=outcome,
+                )
             return
 
         # Guard: per-escalation timeout-kill cap
         timeout_count = self._timeout_counts.get(escalation.id, 0)
         if timeout_count >= self.config.steward_max_timeouts_per_escalation:
-            self._auto_escalate_to_human(
-                escalation,
-                f'Invocation repeatedly timed out ({timeout_count}/{self.config.steward_max_timeouts_per_escalation})',
-            )
+            wip = await self._wip_probe() if self._wip_probe else False
+            outcome = StewardInterrupted(reason='timeout', wip_commits_present=wip)
+            if wip:
+                self._publish_outcome(outcome)
+            else:
+                self._auto_escalate_to_human(
+                    escalation,
+                    f'Invocation repeatedly timed out ({timeout_count}/{self.config.steward_max_timeouts_per_escalation})',
+                    outcome=outcome,
+                )
             return
 
         # Guard: per-escalation empty-output cap
@@ -489,6 +555,12 @@ class TaskSteward:
             self._retry_counts.pop(escalation.id, None)
             self._timeout_counts.pop(escalation.id, None)
             self._empty_output_counts.pop(escalation.id, None)
+            resolution_text = (
+                (updated.resolution if updated else None)
+                or result.output
+                or escalation.summary
+            )
+            self._publish_outcome(StewardResolved(resolution_text=resolution_text))
 
     # ------------------------------------------------------------------
     # Session-aware invocation with cap-hit recovery
@@ -674,8 +746,18 @@ class TaskSteward:
 
     def _auto_escalate_to_human(
         self, escalation: Escalation, reason: str,
+        outcome: StewardOutcome | None = None,
     ) -> None:
-        """Re-escalate to level-1 and dismiss the original level-0."""
+        """Re-escalate to level-1 and dismiss the original level-0.
+
+        Publishes *outcome* on the outcome channel (see :meth:`_publish_outcome`)
+        once the L1 has been submitted — the single choke point for every
+        give-up path that routes through here. Callers with a more specific
+        outcome (``StewardBudgetExhausted``, a wip-gated ``StewardInterrupted``)
+        pass it explicitly; every other caller (empty-output cap,
+        worktree-missing preflight, the generic run-loop give-up paths) omits
+        it and gets the default ``StewardReescalatedL1(esc_id=reesc.id)``.
+        """
         from escalation.models import Escalation as EscModel
 
         reesc = EscModel(
@@ -713,6 +795,9 @@ class TaskSteward:
         logger.warning(
             f'Steward for task {self.task_id}: re-escalated {escalation.id} '
             f'to level 1: {reason}'
+        )
+        self._publish_outcome(
+            outcome if outcome is not None else StewardReescalatedL1(esc_id=reesc.id),
         )
 
     # ------------------------------------------------------------------

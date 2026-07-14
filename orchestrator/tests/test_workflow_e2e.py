@@ -23,6 +23,7 @@ from _workflow_helpers import (
     _make_status_setting_steward,
 )
 from escalation.queue import EscalationQueue
+from shared.task_statuses import TaskStatus
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, JUDGE, MERGER
@@ -32,7 +33,16 @@ from orchestrator.event_store import EventType
 from orchestrator.git_ops import AdvanceOutcome, GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+from orchestrator.workflow import (
+    StewardBudgetExhausted,
+    StewardInterrupted,
+    StewardReescalatedL1,
+    StewardResolved,
+    StewardTerminalDecision,
+    TaskWorkflow,
+    WorkflowOutcome,
+    WorkflowState,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1825,15 +1835,25 @@ def _build_workflow_no_merge_worker(
 
 
 def _make_dismissing_steward(queue: EscalationQueue, task_id: str) -> type:
-    """Return a steward that DISMISSES (terminate=True) all pending L0s.
+    """Return a steward that DISMISSES (terminate=True) all pending L0s and
+    files a level-1 escalation of its own — mirroring the real
+    ``TaskSteward._auto_escalate_to_human`` give-up choke point (task 2248 /
+    W9-delta): dismiss the L0, submit an L1, publish ``StewardReescalatedL1``.
 
-    Used by Fix A tests to exercise the "steward gives up" code path —
-    the workflow must NOT re-pend; instead it submits an L1 and returns
-    BLOCKED.
+    Used to exercise the "steward gives up" code path — the workflow must
+    NOT re-pend; instead it leaves the steward's L1 in place and returns
+    ESCALATED (SO-1: REESCALATED_L1 -> ESCALATED, no duplicate L1 filed).
     """
+    from escalation.models import Escalation
 
     class _FakeSteward:
         def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
             pass
 
         async def start(self) -> None:
@@ -1843,6 +1863,22 @@ def _make_dismissing_steward(queue: EscalationQueue, task_id: str) -> type:
                 queue.resolve(
                     esc.id, 'Cannot fix — terminating',
                     dismiss=True, resolved_by='fake-steward',
+                )
+            l1 = Escalation(
+                id=queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='steward',
+                severity='blocking',
+                category='task_failure',
+                summary='Steward re-escalation: cannot fix',
+                detail='steward gave up and dismissed the L0',
+                suggested_action='manual_intervention',
+                level=1,
+            )
+            queue.submit(l1)
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(
+                    StewardReescalatedL1(esc_id=l1.id),
                 )
 
         async def stop(self) -> None:
@@ -1856,20 +1892,29 @@ def _make_resolve_then_dismiss_chained_steward(
 ) -> type:
     """Steward that RESOLVES the workflow's pending L0(s), then submits a
     follow-on L0 of its own (e.g. ``infra_issue`` after handling a
-    ``task_failure``) and DISMISSES it with terminate=True.
+    ``task_failure``), DISMISSES it with terminate=True, and files a level-1
+    escalation — mirroring ``TaskSteward._auto_escalate_to_human`` (task 2248
+    / W9-delta).
 
-    Mirrors the live failure mode that drove the broadened guard: the
-    steward chains a fresh L0 and gives up on it.  ``get_by_task(...,
-    level=0, status='pending')`` after ``start()`` returns no pending
-    entries (chained one is dismissed), so the post-steward
-    ``if not remaining:`` branch runs and the broadened window-scoped
-    guard must catch the dismissed chained L0 — even though it is NOT
-    the one the workflow itself submitted (``created_l0_id``).
+    Mirrors the live failure mode that drove the original Fix A: the
+    steward chains a fresh L0 and gives up on it rather than the one the
+    workflow itself submitted (``created_l0_id``).  Publishes
+    ``StewardResolved`` (for the resolved workflow L0) THEN
+    ``StewardReescalatedL1`` (for the chained give-up) — the same dual
+    publish the real steward performs — so the workflow's drain+reduce
+    (task 2248 / W9-delta review fix) must see past the leading
+    ``StewardResolved`` to route to ESCALATED.
     """
     from escalation.models import Escalation
 
     class _FakeSteward:
         def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
             pass
 
         async def start(self) -> None:
@@ -1879,6 +1924,18 @@ def _make_resolve_then_dismiss_chained_steward(
                 queue.resolve(
                     esc.id, 'Resolved by FakeSteward (workflow L0)',
                     resolved_by='fake-steward',
+                )
+            # Faithful to the real steward's dual publish (task 2248 /
+            # W9-delta review fix): TaskSteward._handle_escalation publishes
+            # StewardResolved for the workflow's own L0 (steward.py:563)
+            # BEFORE it ever chains a follow-on escalation of its own — so
+            # the channel must carry [StewardResolved, StewardReescalatedL1],
+            # not just the trailing re-escalation.
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(
+                    StewardResolved(
+                        resolution_text='Resolved by FakeSteward (workflow L0)',
+                    ),
                 )
             chained = Escalation(
                 id=queue.make_id(task_id),
@@ -1895,6 +1952,22 @@ def _make_resolve_then_dismiss_chained_steward(
                 'Terminating cleanly — needs human triage',
                 dismiss=True, resolved_by='fake-steward',
             )
+            l1 = Escalation(
+                id=queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='steward',
+                severity='blocking',
+                category='infra_issue',
+                summary='Steward re-escalation: chained L0 terminated',
+                detail='steward gave up on the chained infra_issue L0',
+                suggested_action='manual_intervention',
+                level=1,
+            )
+            queue.submit(l1)
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(
+                    StewardReescalatedL1(esc_id=l1.id),
+                )
 
         async def stop(self) -> None:
             pass
@@ -3091,7 +3164,12 @@ class TestMarkBlockedFalseDoneGuard:
     ):
         """Fix A: when steward calls resolve_issue(terminate=True), the L0
         is marked dismissed.  The workflow must NOT re-pend (which would
-        spin the same failure) — it must submit an L1 and return BLOCKED.
+        spin the same failure).  Task 2248 / W9-delta: the fake steward now
+        mirrors the real ``TaskSteward._auto_escalate_to_human`` give-up
+        choke point (dismiss L0 + submit L1 + publish
+        ``StewardReescalatedL1``), so ``_mark_blocked`` routes to ESCALATED
+        (SO-1) — the steward's L1 is already filed; _mark_blocked must not
+        file a duplicate or re-pend.
         """
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -3109,8 +3187,8 @@ class TestMarkBlockedFalseDoneGuard:
 
         outcome = await workflow._mark_blocked('architect produced no plan.json')
 
-        assert outcome == WorkflowOutcome.BLOCKED, (
-            f'Expected BLOCKED but got {outcome!r} — '
+        assert outcome == WorkflowOutcome.ESCALATED, (
+            f'Expected ESCALATED but got {outcome!r} — '
             'dismiss-with-terminate should not re-pend'
         )
         # Status must NOT be re-pended: scheduler should never have seen 'pending'
@@ -3119,10 +3197,14 @@ class TestMarkBlockedFalseDoneGuard:
         assert statuses[-1] == 'blocked', (
             f'Final status must be blocked (not requeued), got {statuses}'
         )
-        # An L1 escalation must have been submitted.
+        # An L1 escalation must have been submitted (by the steward itself;
+        # _mark_blocked's StewardReescalatedL1 branch must not file another).
         assert queue.has_open_l1(task_assignment.task_id), (
             'Fix A: L1 escalation must be open after steward dismisses-with-terminate'
         )
+        assert len(queue.get_by_task(
+            task_assignment.task_id, status='pending', level=1,
+        )) == 1, 'Exactly one L1 must be open — no duplicate filed by _mark_blocked'
 
     async def test_steward_chained_l0_dismiss_blocks_with_l1(
         self, config, git_ops, task_assignment, tmp_path
@@ -3131,12 +3213,15 @@ class TestMarkBlockedFalseDoneGuard:
         cleanly but then submits a chained follow-on L0 (e.g. an
         ``infra_issue`` raised during steward handling) and dismisses
         THAT one with terminate=True, the workflow must still treat it
-        as "agent gives up" — submit an L1 and return BLOCKED rather
-        than re-pending the task.
+        as "agent gives up".
 
-        Pins the window-scoped guard.  The narrow ``created_l0_id``
-        check from the original Fix A misses this case because the
-        dismissed L0 is NOT the one the workflow itself submitted.
+        Task 2248 / W9-delta: the old timestamp-window dismissal guard
+        that used to catch this case is deleted; the fake steward now
+        publishes ``StewardReescalatedL1`` (mirroring the real give-up
+        choke point) and ``_mark_blocked``'s single isinstance dispatch
+        (SO-1) routes it to ESCALATED — no re-pend, no duplicate L1.  This
+        still exercises the "not just created_l0_id" case: the dismissed
+        L0 is NOT the one the workflow itself submitted.
         """
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -3154,9 +3239,9 @@ class TestMarkBlockedFalseDoneGuard:
 
         outcome = await workflow._mark_blocked('architect produced no plan.json')
 
-        assert outcome == WorkflowOutcome.BLOCKED, (
-            f'Expected BLOCKED but got {outcome!r} — broadened guard '
-            'should catch chained dismissed L0s, not just created_l0_id'
+        assert outcome == WorkflowOutcome.ESCALATED, (
+            f'Expected ESCALATED but got {outcome!r} — chained dismissed L0s '
+            'should still route through StewardReescalatedL1, not re-pend'
         )
         statuses = scheduler.statuses.get(task_assignment.task_id, [])
         assert statuses[-1] == 'blocked', (
@@ -3166,6 +3251,9 @@ class TestMarkBlockedFalseDoneGuard:
             'Broadened Fix A: L1 must be open after a chained L0 is '
             'dismissed-with-terminate during the steward window'
         )
+        assert len(queue.get_by_task(
+            task_assignment.task_id, status='pending', level=1,
+        )) == 1, 'Exactly one L1 must be open — no duplicate filed by _mark_blocked'
 
     async def test_steward_resolves_still_requeues_no_l1(
         self, config, git_ops, task_assignment, tmp_path
@@ -3554,6 +3642,352 @@ class TestMarkBlockedFalseDoneGuard:
         )
         assert workflow.state != WorkflowState.DONE, (
             f'workflow.state must not be DONE: {workflow.state!r}'
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.mocks_dry_run_unblock
+class TestMarkBlockedStewardOutcomeRouting:
+    """_mark_blocked branches on the StewardOutcome union in ONE place.
+
+    Task 2248 / W9-delta, SO-1: replaces the forensic re-read of escalation-
+    queue state (current-status / L0-empty / has_open_l1 / deferred /
+    recent_dismissals-window probes) with a single isinstance dispatch on
+    the typed outcome ``_await_steward_completion`` returns.  These tests
+    stub ``_ensure_steward_started`` (so ``self._steward`` is truthy without
+    a real steward-factory/channel round-trip) and replace
+    ``_await_steward_completion`` with an ``AsyncMock`` returning each
+    ``StewardOutcome`` variant directly, pinning the routing table without
+    driving a full escalation cycle.
+    """
+
+    async def _build(self, config, git_ops, task_assignment, tmp_path):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt_info.path
+        workflow.artifacts = TaskArtifacts(wt_info.path)
+        # Bypass the real steward-factory/channel wiring — pretend a steward
+        # is already running and stub what it "publishes".
+        workflow._ensure_steward_started = AsyncMock()
+        workflow._steward = object()
+        return workflow, scheduler, queue
+
+    async def test_resolved_requeues(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """StewardResolved -> REQUEUED (status re-pended to 'pending')."""
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow._await_steward_completion = AsyncMock(
+            return_value=StewardResolved(resolution_text='fixed it'),
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.REQUEUED, (
+            f'Expected REQUEUED but got {outcome!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert statuses[-1] == 'pending', (
+            f"Last scheduler status must be 'pending' after requeue, got: {statuses}"
+        )
+        assert not queue.has_open_l1(task_assignment.task_id), (
+            'Resolved L0 must NOT trigger an L1'
+        )
+
+    async def test_terminal_decision_done_enters_done_phase(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """StewardTerminalDecision(DONE) -> DONE (phase DONE)."""
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow._await_steward_completion = AsyncMock(
+            return_value=StewardTerminalDecision(new_status=TaskStatus.DONE),
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE but got {outcome!r}'
+        )
+        assert workflow.state == WorkflowState.DONE, (
+            f'Expected phase DONE, got {workflow.state!r}'
+        )
+
+    async def test_terminal_decision_deferred_blocks_no_requeue(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """StewardTerminalDecision(DEFERRED) -> BLOCKED, no auto-requeue."""
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow._await_steward_completion = AsyncMock(
+            return_value=StewardTerminalDecision(new_status=TaskStatus.DEFERRED),
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED but got {outcome!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'pending' not in statuses, (
+            f"Steward's deferred decision must not be overwritten by an "
+            f'auto-requeue: {statuses}'
+        )
+
+    async def test_terminal_decision_cancelled_blocks_no_requeue(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """StewardTerminalDecision(CANCELLED) -> BLOCKED, no auto-requeue."""
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow._await_steward_completion = AsyncMock(
+            return_value=StewardTerminalDecision(new_status=TaskStatus.CANCELLED),
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED but got {outcome!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'pending' not in statuses, (
+            f"Steward's cancelled decision must not be overwritten by an "
+            f'auto-requeue: {statuses}'
+        )
+
+    async def test_reescalated_l1_returns_escalated_without_duplicate_filing(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """StewardReescalatedL1 -> ESCALATED; _mark_blocked files no L1 of
+        its own (the steward's _auto_escalate_to_human already did).
+        """
+        from escalation.models import Escalation
+
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        # Model what the real steward already did before publishing this
+        # outcome: filed the L1 and dismissed its L0.
+        l1 = Escalation(
+            id=queue.make_id(task_assignment.task_id),
+            task_id=task_assignment.task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='task_failure',
+            summary='Steward re-escalation',
+            detail='steward gave up',
+            suggested_action='manual_intervention',
+            level=1,
+        )
+        queue.submit(l1)
+        workflow._await_steward_completion = AsyncMock(
+            return_value=StewardReescalatedL1(esc_id=l1.id),
+        )
+        workflow._ensure_l1_escalation_for_blocked = AsyncMock()
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.ESCALATED, (
+            f'Expected ESCALATED but got {outcome!r}'
+        )
+        workflow._ensure_l1_escalation_for_blocked.assert_not_called()
+        pending_l1 = queue.get_by_task(
+            task_assignment.task_id, status='pending', level=1,
+        )
+        assert len(pending_l1) == 1, (
+            f'Expected exactly the one L1 the steward already filed, got '
+            f'{len(pending_l1)} — _mark_blocked must not file a duplicate'
+        )
+
+    async def test_interrupted_with_wip_dismisses_l0_and_requeues(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Task-2060 fix / boundary row 9: StewardInterrupted(wip=True) ->
+        REQUEUED (resume-plan) with the pending L0 dismissed and NO L1
+        filed — a wall-clock kill with partial WIP must not be triaged as
+        "steward failed".
+        """
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow._await_steward_completion = AsyncMock(
+            return_value=StewardInterrupted(
+                reason='attempt_cap', wip_commits_present=True,
+            ),
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.REQUEUED, (
+            f'Expected REQUEUED (resume-plan) when wip is present, got {outcome!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert statuses[-1] == 'pending', (
+            f"Last scheduler status must be 'pending' after requeue, got: {statuses}"
+        )
+        assert not queue.get_by_task(
+            task_assignment.task_id, status='pending', level=0,
+        ), 'The L0 _mark_blocked submitted must be dismissed, not left pending'
+        assert not queue.has_open_l1(task_assignment.task_id), (
+            'INTERRUPTED+wip must NOT file an L1 (task-2060 lesson: a '
+            "wall-clock kill with partial WIP must not be triaged as "
+            "'steward failed')"
+        )
+
+    async def test_interrupted_without_wip_blocks_with_l1(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """StewardInterrupted(wip=False) -> BLOCKED + L1 filed."""
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow._await_steward_completion = AsyncMock(
+            return_value=StewardInterrupted(
+                reason='timeout', wip_commits_present=False,
+            ),
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED but got {outcome!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'pending' not in statuses, (
+            f'Must not auto-requeue when wip is absent: {statuses}'
+        )
+        assert queue.has_open_l1(task_assignment.task_id), (
+            'INTERRUPTED without wip must file an L1'
+        )
+
+    async def test_budget_exhausted_blocks_with_l1(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """StewardBudgetExhausted -> BLOCKED + L1 filed."""
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow._await_steward_completion = AsyncMock(
+            return_value=StewardBudgetExhausted(),
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED but got {outcome!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'pending' not in statuses, (
+            f'Must not auto-requeue on budget exhaustion: {statuses}'
+        )
+        assert queue.has_open_l1(task_assignment.task_id), (
+            'Budget exhaustion must file an L1'
+        )
+
+    async def test_grace_timeout_synthesis_dismisses_orphan_l0(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """FAITHFUL grace-timeout synthesis (incident esc-3576-234): when the
+        REAL ``_await_steward_completion`` hits its grace deadline with an
+        empty channel and no WIP, it synthesizes
+        ``StewardInterrupted('timeout', wip_commits_present=False)`` —
+        ``_mark_blocked`` must dismiss the still-pending L0 it submitted
+        itself, not merely file an L1 and leave the L0 stranded for the
+        orphan-L0 reaper to promote into a duplicate L1.
+        """
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        tid = task_assignment.task_id
+        # Do NOT mock _await_steward_completion — drive the real grace-timeout
+        # synthesis path (workflow.py:9635-9637) with a short deadline.
+        workflow._steward_outcome_channel = asyncio.Queue()
+        workflow.config.steward_completion_timeout = 0.05
+        workflow._worktree_has_wip_commits = AsyncMock(return_value=False)
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED but got {outcome!r}'
+        )
+        assert queue.get_by_task(tid, status='pending', level=0) == [], (
+            'The L0 _mark_blocked submitted must not be left stranded pending'
+        )
+        assert len(queue.get_by_task(tid, status='dismissed', level=0)) == 1, (
+            'The L0 must be dismissed (preserved on disk for audit), not deleted'
+        )
+        assert len(queue.get_by_task(tid, status='pending', level=1)) == 1, (
+            'Expected exactly one human-facing L1 — no duplicate'
+        )
+
+    async def test_interrupted_without_wip_dismisses_orphan_l0(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """DIRECT-branch belt-and-suspenders: pins the _mark_blocked branch
+        itself (independent of the grace-timeout synthesis path) — a no-wip
+        StewardInterrupted must dismiss the pending L0, not just file an L1.
+        """
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        tid = task_assignment.task_id
+        workflow._await_steward_completion = AsyncMock(
+            return_value=StewardInterrupted(
+                reason='timeout', wip_commits_present=False,
+            ),
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED but got {outcome!r}'
+        )
+        assert queue.get_by_task(tid, status='pending', level=0) == [], (
+            'The L0 _mark_blocked submitted must not be left stranded pending'
+        )
+        assert len(queue.get_by_task(tid, status='dismissed', level=0)) == 1, (
+            'The L0 must be dismissed (preserved on disk for audit), not deleted'
+        )
+        assert len(queue.get_by_task(tid, status='pending', level=1)) == 1, (
+            'Expected exactly one human-facing L1 — no duplicate'
+        )
+
+    async def test_budget_exhausted_dismisses_orphan_l0(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """SYMMETRY for budget: StewardBudgetExhausted must also dismiss the
+        pending L0 it stranded, not just file an L1 (same orphan-L0 leak as
+        the no-wip StewardInterrupted branch).
+        """
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        tid = task_assignment.task_id
+        workflow._await_steward_completion = AsyncMock(
+            return_value=StewardBudgetExhausted(),
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED but got {outcome!r}'
+        )
+        assert queue.get_by_task(tid, status='pending', level=0) == [], (
+            'The L0 _mark_blocked submitted must not be left stranded pending'
+        )
+        assert len(queue.get_by_task(tid, status='dismissed', level=0)) == 1, (
+            'The L0 must be dismissed (preserved on disk for audit), not deleted'
+        )
+        assert len(queue.get_by_task(tid, status='pending', level=1)) == 1, (
+            'Expected exactly one human-facing L1 — no duplicate'
         )
 
 
@@ -5209,11 +5643,20 @@ def _make_l1_escalating_steward(
     """FakeSteward that resolves L0s and then submits an L1 escalation.
 
     Models the 'steward gave up, handed off to human' path.  The workflow
-    must NOT auto-requeue when an L1 is pending.
+    must NOT auto-requeue when an L1 is pending.  Publishes
+    ``StewardReescalatedL1`` (task 2248 / W9-delta) so the real
+    ``_await_steward_completion`` channel-wait returns promptly instead of
+    blocking for the full ``steward_completion_timeout`` grace period.
     """
 
     class _FakeSteward:
         def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
             pass
 
         async def start(self) -> None:
@@ -5236,6 +5679,10 @@ def _make_l1_escalating_steward(
                 level=1,
             )
             queue.submit(l1)
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(
+                    StewardReescalatedL1(esc_id=l1.id),
+                )
 
         async def stop(self) -> None:
             pass
@@ -6325,9 +6772,19 @@ def _make_done_setting_steward(
     ``_await_steward_completion``, the steward marks the task done via MCP
     (out-of-band from the workflow). The workflow must observe the fresh
     status via ``get_status`` and return DONE, not requeue to pending.
+    Publishes ``StewardResolved`` (task 2248 / W9-delta) purely to unblock
+    the channel-wait promptly — ``_await_steward_completion``'s fresh
+    status read overrides it with ``StewardTerminalDecision(DONE)`` since
+    'done' is terminal, mirroring ``_make_status_setting_steward``.
     """
     class _FakeSteward:
         def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
             pass
 
         async def start(self) -> None:
@@ -6339,6 +6796,10 @@ def _make_done_setting_steward(
                 task_id, 'done',
                 done_provenance={'note': 'phantom-done regression test'},
             )
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(
+                    StewardResolved(resolution_text='Implementation already shipped'),
+                )
 
         async def stop(self) -> None:
             pass
