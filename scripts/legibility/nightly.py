@@ -37,7 +37,7 @@ from pathlib import Path
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import digest, inventory, sampling  # noqa: E402
+from legibility import census_trigger, digest, inventory, sampling  # noqa: E402
 from legibility.config import LegibilityConfig, load_config  # noqa: E402
 
 logger = logging.getLogger('legibility.nightly')
@@ -358,6 +358,79 @@ def post_escalation(
             'still exits non-zero): %s', exc,
         )
         return False
+
+
+# ---------------------------------------------------------------------------
+# evaluate_census_step — census trigger (ζ) evaluation + best-effort launch
+# ---------------------------------------------------------------------------
+
+_CENSUS_ENTRYPOINT_NAME = 'census.py'
+"""scripts/legibility/census.py -- task η. NOT a dependency of ε: this
+module must keep working whether or not η has landed on main yet."""
+
+
+def _default_entrypoint_exists() -> bool:
+    return (Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME).exists()
+
+
+def _default_census_launcher() -> None:
+    """Best-effort subprocess launch of the census entrypoint (task η)."""
+    subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME)],
+        check=False,
+    )
+
+
+def evaluate_census_step(
+    cfg: LegibilityConfig,
+    *,
+    now=None,
+    status_fetcher=None,
+    decide=census_trigger.decide_for_project,
+    entrypoint_exists=None,
+    launcher=None,
+) -> tuple[str, bool]:
+    """Evaluate the periodic-census trigger (ζ) at the end of a nightly
+    run, returning ``(one_line_decision, fire)``.
+
+    *decide* (default ``census_trigger.decide_for_project``, never raises
+    -- fail-safe) makes the FIRE/NO-FIRE call. On NO-FIRE, *launcher* is
+    never called. On FIRE: if *entrypoint_exists* (default: does
+    ``scripts/legibility/census.py`` -- task η -- exist) is False, this
+    logs a LOUD "FIRE-WITHOUT-LAUNCH" warning and returns without calling
+    *launcher* -- η is NOT a dependency of ε, so a fired trigger before η
+    lands must never crash or fail the nightly run. If the entrypoint is
+    present, *launcher* (default: best-effort subprocess launch) is called
+    once; any launcher failure is caught and logged, never propagated --
+    this function never raises and never fails the run.
+    """
+    if entrypoint_exists is None:
+        entrypoint_exists = _default_entrypoint_exists
+    if launcher is None:
+        launcher = _default_census_launcher
+
+    decision = decide(cfg.project_root, now=now, status_fetcher=status_fetcher)
+    line = 'census trigger: {} -- {}'.format(
+        'FIRE' if decision.fire else 'NO-FIRE', '; '.join(decision.reasons),
+    )
+
+    if not decision.fire:
+        return line, False
+
+    if not entrypoint_exists():
+        logger.warning(
+            'census trigger FIRED but the census entrypoint '
+            '(scripts/legibility/census.py, task η) is not on main -- '
+            'FIRE-WITHOUT-LAUNCH; no census started'
+        )
+        return line, True
+
+    try:
+        launcher()
+    except Exception as exc:  # noqa: BLE001 - best-effort, never fail the run
+        logger.warning('legibility trickle: census launcher failed (best-effort): %s', exc)
+
+    return line, True
 
 
 if __name__ == '__main__':
