@@ -115,7 +115,7 @@ async def invoke_agent(
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
-    Dispatches to the appropriate backend (claude, codex, gemini).
+    Dispatches to the appropriate backend (claude, codex, gemini, pi).
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
     *resume_session_id*, when set, resumes an existing Claude session.
@@ -160,6 +160,16 @@ async def invoke_agent(
             max_budget_usd=max_budget_usd, mcp_config=mcp_config,
             sandbox_modules=sandbox_modules, effort=effort,
             timeout_seconds=timeout_seconds, prices=prices,
+        )
+    elif backend == 'pi':
+        return await _invoke_pi(
+            prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
+            max_budget_usd=max_budget_usd, allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools, mcp_config=mcp_config,
+            sandbox_modules=sandbox_modules, effort=effort,
+            oauth_token=oauth_token, resume_session_id=resume_session_id,
+            session_id=session_id, timeout_seconds=timeout_seconds,
+            env_overrides=env_overrides, prices=prices,
         )
     else:
         raise ValueError(f'Unknown backend: {backend!r}')
