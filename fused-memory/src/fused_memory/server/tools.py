@@ -969,6 +969,7 @@ def create_mcp_server(
                     query=content,
                     project_id=project_id,
                     categories=['procedural_knowledge'],
+                    stores=['mem0'],
                     limit=5,
                 )
             except Exception:
