@@ -6,6 +6,7 @@ sys.path pollution — mirrors the pattern in test_audit_duplicate_tasks.py.
 from __future__ import annotations
 
 import importlib.util
+import json
 import types
 from pathlib import Path
 
@@ -40,6 +41,7 @@ def _load_module() -> types.ModuleType:
 _mod = _load_module()
 find_near_duplicate_memory_groups = _mod.find_near_duplicate_memory_groups
 pick_survivor = _mod.pick_survivor
+build_sweep_plan = _mod.build_sweep_plan
 
 
 # ---------------------------------------------------------------------------
@@ -286,3 +288,94 @@ class TestPickSurvivorEdgeCases:
         assert survivor not in losers
         assert len(losers) == len(group) - 1
         assert {m['id'] for m in losers} | {survivor['id']} == {m['id'] for m in group}
+
+
+# ===========================================================================
+# Step-5: build_sweep_plan
+# ===========================================================================
+
+class TestBuildSweepPlanCategoryFiltering:
+    """Only category=='procedural_knowledge' memories are considered."""
+
+    def test_non_procedural_memories_excluded_from_clustering(self):
+        memories = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-12T00:00:00+00:00'),
+            _memory(
+                'm2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00',
+                category='observations_and_summaries',
+            ),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        assert plan['clusters_total'] == 0
+        assert plan['delete_candidates'] == []
+
+
+class TestBuildSweepPlanClusterReport:
+    """A near-dup cluster reports its survivor and losers under delete_candidates."""
+
+    def test_survivor_and_losers_reported(self):
+        memories = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-13T00:00:00+00:00'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-12T00:00:00+00:00'),
+            _memory('m3', _VENV_GOTCHA_C, created_at='2026-07-13T01:00:00+00:00'),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        assert plan['clusters_total'] == 1
+        group_report = plan['near_duplicate_groups'][0]
+        assert group_report['survivor_id'] == 'm2'
+        assert set(group_report['member_ids']) == {'m1', 'm2', 'm3'}
+        assert set(plan['delete_candidates']) == {'m1', 'm3'}
+        assert 'm2' not in plan['delete_candidates']
+
+
+class TestBuildSweepPlanShape:
+    """The plan always has the documented keys, correctly populated."""
+
+    def test_plan_has_required_keys(self):
+        plan = build_sweep_plan([], threshold=_THRESHOLD)
+        required = {'clusters_total', 'near_duplicate_groups', 'delete_candidates'}
+        assert required <= set(plan.keys())
+
+    def test_group_report_has_survivor_content_and_members(self):
+        memories = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-13T00:00:00+00:00'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-12T00:00:00+00:00'),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        group_report = plan['near_duplicate_groups'][0]
+        assert group_report['survivor_id'] == 'm2'
+        assert group_report['survivor_content'] == _VENV_GOTCHA_B
+        assert set(group_report['member_ids']) == {'m1', 'm2'}
+
+
+class TestBuildSweepPlanEmptyAndNoDuplicates:
+    """No duplicates / empty input produces an empty plan."""
+
+    def test_empty_input_produces_empty_plan(self):
+        plan = build_sweep_plan([], threshold=_THRESHOLD)
+        assert plan['clusters_total'] == 0
+        assert plan['near_duplicate_groups'] == []
+        assert plan['delete_candidates'] == []
+
+    def test_no_duplicates_produces_empty_plan(self):
+        memories = [
+            _memory('m1', _VENV_GOTCHA_A),
+            _memory('m4', _DISTRACTOR),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        assert plan['clusters_total'] == 0
+        assert plan['delete_candidates'] == []
+
+
+class TestBuildSweepPlanJsonSerializable:
+    """The plan is always JSON-serializable (backs the CLI's dry-run report)."""
+
+    def test_plan_is_json_serializable(self):
+        memories = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-13T00:00:00+00:00'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-12T00:00:00+00:00'),
+            _memory('m4', _DISTRACTOR),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        serialized = json.dumps(plan, default=str)
+        assert isinstance(serialized, str)
