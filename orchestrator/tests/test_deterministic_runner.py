@@ -876,6 +876,45 @@ class TestBeforeDoneCrossUnitDeploy:
             _BASELINE_UNIT_STATE['ActiveEnterTimestampMonotonic']
         )
 
+    async def test_act_then_ask_advances_deploy_state_phase_ran_to_escalated_at_gate(
+        self, tmp_path: Path,
+    ):
+        """ζ DS-1: cross-unit act-then-ask (always_escalates=True) — the
+        deploy runs and verifies, then falls through to the milestone gate
+        WITHOUT writing done; the gate's update_task call carries
+        deploy_state.phase=='escalated'."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='250', target_unit='orchestrator-reify.service')
+        task['metadata']['always_escalates'] = True
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('250', status='pending')
+        assert len(pending) == 1
+        assert pending[0].category == 'milestone_gate'
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
+
 
 # ---------------------------------------------------------------------------
 # Task 2238 (W10-δ), step-3: run()'s cross-unit `if not self_target:` branch
@@ -1473,6 +1512,46 @@ class TestCrossUnitWritebackResilience:
         )
         script_runner.assert_awaited_once()
 
+    async def test_verified_stamp_write_advances_deploy_state_phase_to_verified(
+        self, tmp_path: Path,
+    ):
+        """ζ DS-1: the verified-stamp update_task call — the FIRST write of
+        the shared retry-budget pair — also carries
+        deploy_state.phase=='verified', folded into the SAME write. No third
+        write is added to the pair (the retry budget stays exactly two
+        writes: the verified stamp, then the done status write)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2066', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        verified_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_verified_at')
+        ]
+        assert len(verified_calls) == 1, (
+            f'phase fold must not add a THIRD write to the shared retry '
+            f'budget; got {len(verified_calls)} verified-stamp write(s)'
+        )
+        assert verified_calls[0].args[1].get('deploy_state', {}).get('phase') == 'verified', (
+            'the verified-stamp write must atomically carry deploy_state.phase==verified'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Default seam: _default_run_script env merge
@@ -1895,6 +1974,51 @@ class TestInspectUnitTimeoutHardening:
             'the verify-leg inspect is ever invoked'
         )
 
+    async def test_baseline_inspect_fail_advances_deploy_state_phase_ran_to_escalated(
+        self, tmp_path: Path,
+    ):
+        """ζ DS-1: an untrustworthy baseline (no ActiveState) is detected
+        AFTER the shared before_done_ran_at/phase=ran write (that stamp
+        precedes baseline capture) — the infra_issue filing then advances
+        deploy_state.phase ran->escalated, gated to the deploy path only.
+
+        Uses a direct unit_inspector mock (rather than subprocess-level
+        wedging) since only the ``ActiveState`` == '' branch matters here.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='502', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(return_value={
+            'MainPID': 0, 'ActiveState': '', 'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        })
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('502', status='pending')
+        assert len(pending) == 1
+        assert 'Baseline inspect failed' in pending[0].summary
+        script_runner.assert_not_called()
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
+
 
 # ---------------------------------------------------------------------------
 # Task 2119 — _default_inspect_unit delegates to systemd_inspect.inspect_systemd_unit
@@ -2161,6 +2285,47 @@ class TestBeforeDoneRunFnOuterGuard:
             'no escalation should be filed on the success path'
         )
 
+    async def test_run_fn_hang_advances_deploy_state_phase_ran_to_escalated(
+        self, tmp_path: Path,
+    ):
+        """ζ DS-1: the outer-guard timeout (Layer B) advances
+        deploy_state.phase ran->escalated via _file_infra_issue_and_block,
+        gated to the deploy path only."""
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='300', target_unit='orchestrator-reify.service', timeout_secs=0,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0.05,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
+
 
 # ---------------------------------------------------------------------------
 # Step-3: B7a — script rc ≠ 0 failure (RED until step-4 implements the path)
@@ -2350,6 +2515,35 @@ class TestBeforeDoneRcNonZero:
         outcome = await runner.run(assignment)
 
         assert outcome == WorkflowOutcome.BLOCKED
+
+    async def test_b7a_advances_deploy_state_phase_ran_to_escalated(self, tmp_path: Path):
+        """ζ DS-1: rc ≠ 0 (RESTART_FAILED) advances deploy_state.phase
+        ran->escalated via _file_infra_issue_and_block, gated to the deploy
+        path only (before_done with target_unit)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='300')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(1, 'boom: unit failed to start'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
 
 
 # ---------------------------------------------------------------------------
@@ -2541,6 +2735,38 @@ class TestBeforeDoneVerifyFail:
         outcome = await runner.run(assignment)
 
         assert outcome == WorkflowOutcome.BLOCKED
+
+    @pytest.mark.parametrize('post_state', _STALE_POST_STATES)
+    async def test_b7b_advances_deploy_state_phase_ran_to_escalated(
+        self, tmp_path: Path, post_state: dict,
+    ):
+        """ζ DS-1: verify-fail (VERIFY_FAILED) advances deploy_state.phase
+        ran->escalated via _file_infra_issue_and_block, gated to the deploy
+        path only (before_done with target_unit)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='400', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, post_state])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
 
 # ---------------------------------------------------------------------------
 # Step-7: B7 reaper / I1 once-only quiescence
