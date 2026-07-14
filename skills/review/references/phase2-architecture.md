@@ -201,7 +201,7 @@ Trace how data structures transform as they cross module boundaries:
 
 2. **Read and audit.** If present, Read it and audit the modules in scope against each invariant's checkable question. The doc is normative — reference invariant slugs only; do not restate the invariant list here.
 
-3. **Classify severity.** Classify findings like stub findings in Step 2 (by blast radius).
+3. **Classify severity.** Classify findings like stub findings in Step 2 (by blast radius): `severity` ∈ `{high, warning, info}` — the same vocabulary Step 2's classify table uses and Phase 3 triage's Priority mapping (`phase3-triage.md`) consumes.
 
 ### Record findings
 
