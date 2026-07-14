@@ -62,6 +62,8 @@ import logging
 import sys
 from typing import Any
 
+from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
 # ---------------------------------------------------------------------------
 # Module-level constants
 # Cross-reference: payload contract defined in
@@ -117,6 +119,47 @@ def find_taskless_markers(members: list[dict]) -> list[dict]:
         m for m in members
         if (m.get('metadata') or {}).get('task_id') in (None, '')
     ]
+
+
+def classify_marker_task_id(tid: Any) -> str:
+    """Bucket a marker's ``task_id`` into one of four shapes (task 2596).
+
+    Buckets:
+        - ``'numeric'``: a single all-digit string, e.g. ``'2408'``.
+        - ``'fp_hash'``: a canonical ``fp:``+32-hex content-fingerprint key
+          (per :func:`is_content_fingerprint_task_id`), e.g.
+          ``'fp:' + 'a' * 32``.
+        - ``'comma_joined'``: two or more comma-separated components that
+          are EACH individually all-digit after stripping whitespace, e.g.
+          ``'1944,2408'`` or ``'2405, 540'``. AMENDMENT 1: this never
+          naive-``isdigit()``s the whole string (which is always False for
+          a comma-joined value) — it splits first and validates each
+          sub-id, matching the live record a07972e7 shape
+          (``task_id='1944,2408'``).
+        - ``'null_or_invalid'``: ``None``, ``''``, a non-``str`` value, or
+          any string that matches none of the above (e.g. ``'garbage'``,
+          a malformed ``'fp:bad'`` variant, or a comma-joined value with a
+          non-digit component like ``'12,x'``).
+
+    Pure, sync, no I/O.
+
+    Args:
+        tid: The raw ``metadata.get('task_id')`` value (any type).
+
+    Returns:
+        One of ``'numeric'``, ``'fp_hash'``, ``'comma_joined'``,
+        ``'null_or_invalid'``.
+    """
+    if not isinstance(tid, str) or not tid:
+        return 'null_or_invalid'
+    if is_content_fingerprint_task_id(tid):
+        return 'fp_hash'
+    if tid.isdigit():
+        return 'numeric'
+    components = tid.split(',')
+    if len(components) >= 2 and all(part.strip().isdigit() for part in components):
+        return 'comma_joined'
+    return 'null_or_invalid'
 
 
 # ---------------------------------------------------------------------------
