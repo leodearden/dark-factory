@@ -80,7 +80,7 @@ from orchestrator.task_status import (
     TERMINAL_STATUSES,
     WORKFLOW_PRESERVE_STATUSES,
 )
-from orchestrator.unblock_types import classify_block_reason
+from orchestrator.unblock_types import BlockClass, classify_block_reason
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import (
     VerifyInfraError,
@@ -8512,7 +8512,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # Legitimate done — fall through; the existing post-steward
                 # flow below handles current==done by returning DONE.
             if _status_set_ok:
-                self._spawn_dry_run_unblock(reason, detail or reason)
+                self._spawn_dry_run_unblock(
+                    reason, detail or reason,
+                    block_class=(disposition.block_class if disposition is not None else None),
+                )
         elif spawn_dry_run:
             # Post-merge red-main class: merge_phase suppressed the status
             # transition and the spawn above, but this IS the mechanically
@@ -8546,7 +8549,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     f'that causes b3_gate to act on incorrect data.  Update '
                     f'this guard if adding a new post-advance class.'
                 )
-            self._spawn_dry_run_unblock(reason, detail or reason)
+            self._spawn_dry_run_unblock(
+                reason, detail or reason,
+                block_class=(disposition.block_class if disposition is not None else None),
+            )
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
 
         if self.escalation_queue and skip_escalation:
@@ -8934,13 +8940,23 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             self.task_id, esc.id,
         )
 
-    def _spawn_dry_run_unblock(self, reason: str, detail: str) -> None:
+    def _spawn_dry_run_unblock(
+        self, reason: str, detail: str,
+        block_class: BlockClass | None = None,
+    ) -> None:
         """Fire-and-forget: spawn an autonomous dry-run investigation.
 
         Skips when unblock_auto is disabled. Wraps asyncio.create_task so
         _mark_blocked never awaits the investigation — it is a pure side-effect.
         Any exception inside run_dry_run_unblock is caught there and written
         as a fallback proposal entry, so unhandled task exceptions are closed.
+
+        *block_class* (W9-ε) lets a disposition-aware caller supply the
+        typed BlockClass explicitly (``_mark_blocked`` passes
+        ``disposition.block_class`` when a :class:`BlockDisposition` was
+        given); when omitted (``None``, the back-compat default for the
+        ~55 disposition-less ``_mark_blocked`` callers), it is derived via
+        the ``classify_block_reason(reason)`` prose sniff exactly as before.
         """
         if not getattr(self.config, 'unblock_auto', None) or not self.config.unblock_auto.enabled:
             return
@@ -8960,7 +8976,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self.task_id,
             )
             return
-        block_class = classify_block_reason(reason)
+        if block_class is None:
+            block_class = classify_block_reason(reason)
         try:
             _task = asyncio.create_task(
                 run_dry_run_unblock(
