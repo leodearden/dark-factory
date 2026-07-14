@@ -939,7 +939,10 @@ def create_mcp_server(
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
-        if category == 'procedural_knowledge':
+        allow_near_duplicate = (
+            isinstance(metadata, dict) and metadata.get('allow_near_duplicate') is True
+        )
+        if category == 'procedural_knowledge' and not allow_near_duplicate:
             near_dup_results = await memory_service.search(
                 query=content,
                 project_id=project_id,
