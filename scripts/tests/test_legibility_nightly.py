@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import json
 import subprocess
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from legibility import census_trigger, nightly
+from legibility import census_trigger, codebook, nightly
 from legibility.config import load_config
 
 
@@ -444,3 +444,145 @@ def test_resolve_config_path_env_override(tmp_path, monkeypatch):
     resolved = nightly.resolve_config_path("proj_a")
 
     assert resolved == config_a
+
+
+# ---------------------------------------------------------------------------
+# step-13/14: run_nightly -- end-to-end happy path (real tmp git repo)
+# ---------------------------------------------------------------------------
+
+def _write_known_cause_codebook(repo: Path) -> Path:
+    """Write a v2 confusion-codebook.yaml under *repo* with one entry,
+    id='known-cause', sightings: [] -- the pre-existing codebook state for
+    the end-to-end fixture (step-13)."""
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    cb = {
+        'version': 2,
+        'entries': [
+            {
+                'id': 'known-cause',
+                'title': 'Known Cause',
+                'severity': 'medium',
+                'status': 'open',
+                'origin_phase': 'implement',
+                'manifested_phase': 'implement',
+                'sightings': [],
+            },
+        ],
+        'candidates': [],
+    }
+    codebook.dump(cb, codebook_path)
+    return codebook_path
+
+
+def _init_e2e_repo(tmp_path: Path, *, work_cwd: str) -> tuple[Path, Path]:
+    """Build a tmp git repo with a committed legibility.yaml (project_id=
+    'testproj') + a v2 codebook carrying one entry (id='known-cause',
+    sightings: []), tree clean -- the end-to-end fixture (step-13)."""
+    repo = tmp_path / 'e2e-repo'
+    repo.mkdir()
+    subprocess.run(['git', 'init', '-q', '-b', 'main'], cwd=repo, check=True)
+    subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=repo, check=True)
+    subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=repo, check=True)
+
+    config_path = _write_config(
+        repo, project_id='testproj', escalation_port=8199, cwd_prefixes=[work_cwd],
+    )
+    _write_known_cause_codebook(repo)
+
+    subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+    subprocess.run(['git', 'commit', '-q', '-m', 'initial'], cwd=repo, check=True)
+    return repo, config_path
+
+
+def _fake_invoke_known_cause(prompt: str, model: str) -> str:
+    return json.dumps({
+        'matches': [{
+            'entry_id': 'known-cause',
+            'origin_phase': 'implement',
+            'manifested_phase': 'implement',
+            'note': 'matched the known cause',
+        }],
+        'candidates': [],
+    })
+
+
+def test_run_nightly_happy_path_end_to_end(tmp_path):
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    escalation_calls = []
+
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_known_cause,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result.exit_code == 0
+    assert result.commit_made is True
+    assert result.applied == 1
+    assert result.coder_status == 'ok'
+    assert result.census_line is not None and 'NO-FIRE' in result.census_line
+    assert escalation_calls == []
+
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert len(after_log) == len(before_log) + 1
+
+    shown = subprocess.run(
+        ['git', 'show', '--stat', '--format=', 'HEAD'],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout
+    assert 'confusion-codebook.yaml' in shown
+    touched_files = [line for line in shown.splitlines() if '|' in line]
+    assert len(touched_files) == 1
+
+    committed = codebook.load(repo / 'docs' / 'legibility' / 'confusion-codebook.yaml')
+    entry = next(e for e in committed['entries'] if e['id'] == 'known-cause')
+    assert len(entry['sightings']) == 1
+    sighting = entry['sightings'][0]
+    assert sighting['date'] == '2026-07-13'
+    assert sighting['project'] == 'testproj'
+    assert sighting['session'] == 'session-1'
+
+    # Idempotency: a second run makes no new commit and leaves exactly one sighting.
+    result_2 = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_known_cause,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result_2.exit_code == 0
+    assert result_2.commit_made is False
+    assert result_2.applied == 0
+    assert escalation_calls == []
+
+    after_log_2 = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log_2 == after_log
+
+    committed_2 = codebook.load(repo / 'docs' / 'legibility' / 'confusion-codebook.yaml')
+    entry_2 = next(e for e in committed_2['entries'] if e['id'] == 'known-cause')
+    assert len(entry_2['sightings']) == 1
