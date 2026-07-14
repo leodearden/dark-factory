@@ -883,7 +883,13 @@ def create_mcp_server(
         soft-blocked at write time when they match an existing entry at high
         similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected);
         override with metadata={'allow_near_duplicate': True} only when the
-        content is genuinely distinct.
+        content is genuinely distinct. The guard only covers writes with an
+        explicit category='procedural_knowledge' (a category=None write that
+        auto-classifies to procedural_knowledge is not covered) and exempts
+        recon-stage-* agents (Stage-1 consolidation writes a merged/canonical
+        entry that is expected to closely resemble the duplicates it
+        replaces, with no ordering guarantee that those duplicates are
+        deleted first).
 
         Args:
             content: The memory itself (a fact, preference, procedure, etc.)
@@ -895,7 +901,9 @@ def create_mcp_server(
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Arbitrary key-value pairs (optional). For procedural_knowledge,
                       set {'allow_near_duplicate': True} to bypass the near-duplicate
-                      write guard when the content is genuinely distinct.
+                      write guard when the content is genuinely distinct. This flag is
+                      write-time-only and is stripped before persistence — it is never
+                      stored on the resulting memory.
             dual_write: Force write to both stores (default: false)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
@@ -958,9 +966,11 @@ def create_mcp_server(
         allow_near_duplicate = (
             isinstance(metadata, dict) and metadata.get('allow_near_duplicate') is True
         )
+        is_recon_stage_agent = isinstance(agent_id, str) and agent_id.startswith('recon-stage-')
         if (
             category == 'procedural_knowledge'
             and not allow_near_duplicate
+            and not is_recon_stage_agent
             and resolve_near_dup_guard_enabled(memory_service)
         ):
             near_dup_threshold = resolve_near_dup_threshold(memory_service)
@@ -985,6 +995,10 @@ def create_mcp_server(
                     agent_id, content, near_dup_match, near_dup_threshold
                 )
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
+        if isinstance(cleaned_meta, dict):
+            # allow_near_duplicate is a write-time-only control flag for the
+            # guard above; it must never be persisted into stored metadata.
+            cleaned_meta.pop('allow_near_duplicate', None)
         result = await memory_service.add_memory(
             content=content,
             category=category,

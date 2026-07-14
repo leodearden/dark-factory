@@ -232,6 +232,101 @@ class TestAddMemoryNearDuplicateGate:
         mock_service.add_memory.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_override_flag_is_stripped_from_persisted_metadata(self):
+        """allow_near_duplicate is a write-time-only control flag.
+
+        It must never leak into the metadata handed to
+        memory_service.add_memory -- otherwise it is stamped on the stored
+        memory forever and shows up in future search results' metadata.
+        """
+        mock_service = AsyncMock()
+        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+                'metadata': {'allow_near_duplicate': True, 'keep_me': 'yes'},
+            },
+        )
+
+        mock_service.add_memory.assert_called_once()
+        persisted_metadata = mock_service.add_memory.call_args.kwargs.get('metadata')
+        assert persisted_metadata == {'keep_me': 'yes'}, (
+            f'allow_near_duplicate must be stripped before persistence; got: '
+            f'{persisted_metadata!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_guard_skipped_when_category_is_none(self):
+        """The guard only covers explicit category='procedural_knowledge'.
+
+        A write that omits category (auto-classified downstream by the
+        service) is not covered by this write-time guard. This is
+        best-effort scoping, mirroring the explicit-category pattern the
+        existing recon-stage guards (count_snapshot / mixed_temporal_framing
+        / conflicting_task_status) already use.
+        """
+        mock_service = AsyncMock()
+        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _CONTENT,
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'procedural_knowledge_near_duplicate_write_blocked', (
+            f'Gate must not fire when category is omitted; got: {result!r}'
+        )
+        mock_service.search.assert_not_called()
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_guard_exempts_recon_stage_agents(self):
+        """recon-stage-* agents are exempt from the near-duplicate guard.
+
+        Stage-1 consolidation writes a merged/canonical procedural_knowledge
+        entry through this same add_memory tool with an
+        agent_id='recon-stage-*' (see reconciliation/prompts/stage1.py). That
+        canonical entry is expected to closely resemble the duplicate
+        entries it replaces, and there is no guarantee those duplicates are
+        deleted before the canonical write lands -- so recon-stage writes
+        must not be blocked by this guard, mirroring the trust boundary the
+        other recon-stage-scoped guards in this file already use.
+        """
+        mock_service = AsyncMock()
+        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'recon-stage-memory_consolidator',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'procedural_knowledge_near_duplicate_write_blocked', (
+            f'Gate must not fire for recon-stage-* agents; got: {result!r}'
+        )
+        mock_service.search.assert_not_called()
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_pre_check_search_pins_to_mem0_store(self):
         """The guard's pre-check search must pin stores=['mem0'].
 
@@ -304,6 +399,7 @@ class TestAddMemoryNearDuplicateGateConfig:
         assert result.get('error') != 'procedural_knowledge_near_duplicate_write_blocked', (
             f'Guard must be skipped when disabled via config; got: {result!r}'
         )
+        mock_service.search.assert_not_called()
         mock_service.add_memory.assert_called_once()
 
     @pytest.mark.asyncio
