@@ -3838,6 +3838,33 @@ async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root, mo
     )
 
 
+# ── list_tags (task 2603) ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_tags_returns_distinct_tags(backend, project_root):
+    """list_tags enumerates every distinct tag with at least one task row.
+
+    One task lands under the implicit DEFAULT_TAG ('master'); the other is
+    filed explicitly under 'feature-x'. The result is compared as a set —
+    enumeration order is not part of the contract.
+    """
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_task(project_root=project_root, title='b', tag='feature-x')
+
+    tags = await backend.list_tags(project_root)
+
+    assert set(tags) == {'master', 'feature-x'}
+
+
+@pytest.mark.asyncio
+async def test_list_tags_empty_project_returns_empty(backend, project_root):
+    """A fresh project_root with no tasks yet returns an empty list, not an error."""
+    tags = await backend.list_tags(project_root)
+
+    assert tags == []
+
+
 # ── get_statuses_fresh (task 2388) ───────────────────────────────────────
 
 
