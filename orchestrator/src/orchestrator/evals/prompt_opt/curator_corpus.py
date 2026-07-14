@@ -24,16 +24,24 @@ import json
 import logging
 import random
 import sqlite3
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
+from orchestrator.evals.reviewer_trial.mining import assign_split
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     'CuratorCorpusManifest',
     'CuratorReplayItem',
+    'FrontierLabel',
+    'FrontierProposerFn',
     'RecordedDecision',
+    'build_curator_corpus',
+    'propose_curator_label_frontier',
     'read_curator_decisions',
     'recover_recorded_action',
     'select_spot_check_subset',
@@ -320,3 +328,238 @@ class CuratorCorpusManifest:
             version=raw.get('version', '1.0'),
             split_seed=raw.get('split_seed'),
         )
+
+
+# ---------------------------------------------------------------------------
+# build_curator_corpus (frontier-adjudicated gold labels, PRD D-6)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FrontierLabel:
+    """A frontier-proposed GOLD label for one candidate: action + target.
+
+    Never the recorded ticket decision (PRD D-6) -- always produced by the
+    injected *frontier_proposer* seam in :func:`build_curator_corpus`.
+    """
+
+    action: str
+    target_fingerprint: str | None = None
+    target_id: str | None = None
+    justification: str = ''
+
+
+FrontierProposerFn = Callable[[dict], Awaitable[FrontierLabel]]
+
+
+def _sample_stratified(decisions: list[RecordedDecision], n: int, seed: int) -> list[RecordedDecision]:
+    """Deterministically sample down to at most *n* decisions, round-robin
+    across recorded-action strata.
+
+    Round-robin (rather than proportional allocation) keeps a bounded *n*
+    representative of drop/combine/create even when one action dominates
+    the raw ticket history, without needing precise proportional math.
+    Returns *decisions* unchanged when it already has <= *n* items.
+    """
+    if n >= len(decisions):
+        return list(decisions)
+
+    by_action: dict[str, list[RecordedDecision]] = {}
+    for d in decisions:
+        by_action.setdefault(d.action, []).append(d)
+
+    shuffled_by_action: dict[str, list[RecordedDecision]] = {}
+    for action, items in by_action.items():
+        ordered = sorted(items, key=lambda d: d.ticket_id)
+        rng = random.Random(f'{seed}:sample:{action}')
+        rng.shuffle(ordered)
+        shuffled_by_action[action] = ordered
+
+    sampled: list[RecordedDecision] = []
+    cursors = dict.fromkeys(shuffled_by_action, 0)
+    actions_cycle = sorted(shuffled_by_action)
+    while len(sampled) < n:
+        progressed = False
+        for action in actions_cycle:
+            if len(sampled) >= n:
+                break
+            cursor = cursors[action]
+            pool = shuffled_by_action[action]
+            if cursor < len(pool):
+                sampled.append(pool[cursor])
+                cursors[action] = cursor + 1
+                progressed = True
+        if not progressed:
+            break  # every stratum exhausted before reaching n
+
+    return sampled
+
+
+async def build_curator_corpus(
+    db_path: Path,
+    *,
+    n: int,
+    seed: int,
+    spot_check_size: int,
+    frontier_proposer: FrontierProposerFn,
+) -> tuple[CuratorCorpusManifest, AdjudicationLog]:
+    """Build a labeled curator replay corpus from *db_path* (T5).
+
+    Reads recorded decisions from tickets.db (:func:`read_curator_decisions`),
+    optionally downsamples to *n* stratified by recorded action
+    (:func:`_sample_stratified`), obtains a GOLD label for every sampled
+    candidate from the injected *frontier_proposer* (NEVER the recorded
+    decision -- PRD D-6: decisions != ground truth), flags a deterministic
+    human spot-check subset capped at *spot_check_size*
+    (:func:`select_spot_check_subset`), assigns a stable per-ticket 2:1:7
+    split (reusing ``reviewer_trial.mining.assign_split``), and returns the
+    assembled manifest alongside a companion :class:`AdjudicationLog`
+    recording one frontier-proposal entry per item.
+
+    Fully hermetic given a fake *frontier_proposer*: makes no real LLM call
+    and only reads (never writes) *db_path*.
+    """
+    decisions = read_curator_decisions(db_path)
+    sampled = _sample_stratified(decisions, n, seed)
+
+    spot_check_ids = set(select_spot_check_subset(sampled, cap=spot_check_size, seed=seed))
+
+    log = AdjudicationLog()
+    items: list[CuratorReplayItem] = []
+    for decision in sampled:
+        label = await frontier_proposer(decision.candidate)
+        item = CuratorReplayItem(
+            ticket_id=decision.ticket_id,
+            candidate=decision.candidate,
+            recorded_action=decision.action,
+            recorded_target_fingerprint=decision.target_fingerprint,
+            recorded_target_id=decision.target_id,
+            gold_action=label.action,
+            gold_target_fingerprint=label.target_fingerprint,
+            gold_target_id=label.target_id,
+            provenance={'source_db': str(db_path)},
+        )
+        items.append(item)
+        log.append(
+            decision.ticket_id,
+            frontier_proposal=[asdict(label)],
+            in_spot_check_subset=decision.ticket_id in spot_check_ids,
+            frontier_model='frontier_proposer',
+            notes=label.justification,
+        )
+
+    assignment = assign_split([item.ticket_id for item in items], seed=str(seed))
+    for item in items:
+        item.split = assignment[item.ticket_id]
+
+    manifest = CuratorCorpusManifest(items=items, split_seed=seed)
+    return manifest, log
+
+
+# JSON schema for the frontier curator-label proposal LLM output -- mirrors
+# reviewer_trial.mining's _FRONTIER_LABEL_SCHEMA invoke_agent pattern but
+# proposes a drop/combine/create action rather than a list of issues.
+_FRONTIER_CURATOR_LABEL_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'properties': {
+        'action': {'type': 'string', 'enum': list(_RECOVERABLE_ACTIONS)},
+        'target_fingerprint': {'type': ['string', 'null']},
+        'target_id': {'type': ['string', 'null']},
+        'justification': {'type': 'string'},
+    },
+    'required': ['action', 'justification'],
+}
+
+
+def _parse_frontier_label(data: Any) -> FrontierLabel | None:
+    """Pure mapping: frontier structured-output dict -> :class:`FrontierLabel`.
+
+    Returns ``None`` (never raises) when *data* isn't a dict, has no
+    ``'action'`` key, or ``'action'`` isn't one of drop/combine/create.
+    """
+    if not isinstance(data, dict):
+        return None
+    action = data.get('action')
+    if action not in _RECOVERABLE_ACTIONS:
+        return None
+    return FrontierLabel(
+        action=action,
+        target_fingerprint=data.get('target_fingerprint'),
+        target_id=data.get('target_id'),
+        justification=data.get('justification', ''),
+    )
+
+
+async def propose_curator_label_frontier(
+    candidate: dict,
+    model: str = 'opus',
+    oauth_token: str | None = None,
+    max_turns: int = 15,
+) -> FrontierLabel:
+    """Propose a GOLD curator label for *candidate* via a frontier model.
+
+    Build-time only -- never called from a hermetic test (those inject a
+    fake ``FrontierProposerFn``). Mirrors
+    ``reviewer_trial.mining.propose_labels_frontier``'s ``invoke_agent``
+    pattern: no tools, structured JSON output, cost always reported (see
+    ``result.cost_usd``, surfaced to CLI callers via ``__main__.py``).
+
+    Never raises: an unparseable/malformed response degrades to
+    ``action='create'`` -- the live curator's own best-effort fallback
+    semantics (a spurious "create" is far cheaper to have in a corpus than
+    silently losing the candidate).
+    """
+    from orchestrator.agents.invoke import invoke_agent
+
+    candidate_json = json.dumps(candidate, indent=2)
+    prompt = f"""\
+You are adjudicating a task-curation decision for an evaluation corpus.
+
+## Candidate task
+
+```json
+{candidate_json}
+```
+
+## Instructions
+
+Decide ONE action for this candidate: "drop" (already covered by existing
+work), "combine" (should be folded into an existing pending task), or
+"create" (genuinely new work). For "combine", also give target_fingerprint
+(the verbatim title of the task it should combine into, if inferable from
+the candidate's own context) and target_id (if inferable). Give a brief
+justification. Output your decision as JSON.
+"""
+    system_prompt = (
+        'You are a meticulous adjudicator proposing ground-truth curator-decision '
+        'labels for an evaluation corpus. Be precise and conservative -- default to '
+        '"create" when uncertain. Output ONLY valid JSON.'
+    )
+
+    result = await invoke_agent(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        cwd=Path('/home/leo/src/dark-factory'),
+        model=model,
+        max_turns=max_turns,
+        max_budget_usd=1.0,
+        output_schema=_FRONTIER_CURATOR_LABEL_SCHEMA,
+        effort='high',
+        allowed_tools=[],  # no tools needed -- all context is in the prompt
+        oauth_token=oauth_token,
+    )
+
+    data = result.structured_output
+    if not data:
+        try:
+            data = json.loads(result.output)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'Frontier curator-label proposal produced unparseable output: %s',
+                result.output[:200],
+            )
+            data = None
+
+    label = _parse_frontier_label(data)
+    if label is None:
+        return FrontierLabel(action='create', justification='unparseable-frontier-output')
+    return label
