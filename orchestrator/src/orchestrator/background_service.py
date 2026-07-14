@@ -10,6 +10,7 @@ becomes structurally impossible.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -100,3 +101,19 @@ class BackgroundService:
                     )
                 self._consecutive_failures += 1
                 await asyncio.sleep(self.backoff.delay_for(self._consecutive_failures))
+
+    async def stop(self) -> None:
+        """Cancel the loop task, suppress CancelledError, and clear the slot.
+
+        Idempotent: a second call (or a call when never started) is a clean
+        no-op. Mirrors the cancel/suppress/None idiom shared by every
+        existing ``_stop_*`` method in harness.py. The bounded wait (LR-2)
+        is the registry's job (``LifecycleRegistry.stop_all``, step-12), not
+        this method's — a wedging ``pass_fn`` that ignores cancellation would
+        otherwise hang this ``await`` forever.
+        """
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._task
+            self._task = None
