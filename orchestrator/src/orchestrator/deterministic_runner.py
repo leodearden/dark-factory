@@ -110,8 +110,18 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
    - Run the deploy script to completion (``script_runner``, blocking).
    - If ``rc != 0``: file born-at-L2 ``infra_issue`` escalation, set blocked
      (B7a).
-   - Re-inspect and verify a fresh ``MainPID`` (>0, non-sentinel) and a
-     strictly-later ``ActiveEnterTimestampMonotonic`` (B7b).
+   - Re-inspect and verify freshness (B7b), delegated to
+     ``proc_supervision.RestartPlan.execute()``'s ``FreshPidVerify`` check
+     (task 2238/δ): when the pre-deploy baseline had a persistent MainPID
+     (``baseline_main_pid > 0``), a fresh non-sentinel ``MainPID`` (>0,
+     different from the baseline) and a strictly-later
+     ``ActiveEnterTimestampMonotonic`` are both required. When the baseline
+     was EMPTY (``baseline_main_pid == 0`` — a ``.timer`` unit or a
+     ``Type=oneshot`` service, neither of which ever reports a live MainPID,
+     even once genuinely active — task 2611/esc-2584-1), the ``MainPID>0``
+     requirement is dropped: freshness instead requires the
+     ``ActiveEnterTimestampMonotonic`` to have strictly advanced past the
+     baseline AND ``ActiveState`` not in ``('', 'failed')``.
    - If ``always_escalates=False``: hand off to ``_writeback_deploy_success``
      (task 2066), which stamps ``before_done_verified_at`` (the positive proof
      the resume path requires) and then sets the task to ``done`` with

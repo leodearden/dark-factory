@@ -111,7 +111,7 @@ def _deterministic_deploy_health_verdict(
 ) -> str:
     """Classify a systemd unit-inspector result as 'healthy' or 'unconfirmed'.
 
-    Two modes:
+    Three modes:
 
     - **No baseline** (``verify_baseline=None``, the default): 'healthy' iff
       MainPID is a positive int AND ActiveState == 'active' — a conservative
@@ -120,20 +120,36 @@ def _deterministic_deploy_health_verdict(
       EXACT pre-ζ behaviour, preserved verbatim for backward compat — a
       deploy stranded from BEFORE task 2240/ζ activated never persisted a
       baseline, so it always falls into this branch (see the CAVEAT below).
-    - **With baseline** (ζ/task 2240, DS-3): 'healthy' iff MainPID is a
-      positive int AND the live ActiveEnterTimestampMonotonic has advanced
-      STRICTLY PAST the pre-deploy baseline's — real freshness, resolving
-      the CAVEAT below for an always-on unit (a stale/unchanged monotonic
-      now correctly reads 'unconfirmed' even when the unit is currently
-      active, because the restart demonstrably did not happen).
-      ``verify_baseline`` accepts either a ``VerifyBaseline`` instance or a
-      plain ``Mapping`` (the ``to_metadata()``-shaped
-      ``{'active_enter_timestamp_monotonic': ..., 'main_pid': ...}`` dict).
+    - **With a persistent-PID baseline** (``verify_baseline.main_pid > 0`` —
+      ζ/task 2240, DS-3): 'healthy' iff MainPID is a positive int AND the
+      live ActiveEnterTimestampMonotonic has advanced STRICTLY PAST the
+      pre-deploy baseline's — real freshness, resolving the CAVEAT below for
+      an always-on unit (a stale/unchanged monotonic now correctly reads
+      'unconfirmed' even when the unit is currently active, because the
+      restart demonstrably did not happen). MainPID>0 remains the liveness
+      signal in this mode, unchanged from pre-task-2611 behaviour.
+    - **With an EMPTY baseline** (``verify_baseline.main_pid == 0`` — task
+      2611, esc-2584-1): no persistent main process was observed at the
+      pre-deploy baseline inspect, inferred to mean the target is a
+      ``.timer`` unit, a ``Type=oneshot`` service, or a unit that simply was
+      not running yet — none of which can ever report a live MainPID, even
+      once genuinely active. Requiring MainPID>0 here would permanently
+      misclassify a healthy install as 'unconfirmed', so it is dropped:
+      'healthy' iff the live ActiveEnterTimestampMonotonic has advanced
+      STRICTLY PAST the (zero) baseline's AND ActiveState is not in
+      ``('', 'failed')`` — the activation clock advancing, without the unit
+      ending up failed, is the fallback liveness signal when no persistent
+      PID is possible.
+
+    ``verify_baseline`` accepts either a ``VerifyBaseline`` instance or a
+    plain ``Mapping`` (the ``to_metadata()``-shaped
+    ``{'active_enter_timestamp_monotonic': ..., 'main_pid': ...}`` dict) in
+    all baseline modes.
 
     None-safe throughout: a missing/malformed *inspect_result* is
     'unconfirmed'.
 
-    CAVEAT (task 2074 amendment; superseded by the freshness branch above
+    CAVEAT (task 2074 amendment; superseded by the freshness branches above
     whenever a baseline is available): the no-baseline liveness check is NOT
     a freshness check — it does not confirm that *this* deploy's restart is
     what made the unit active, only that the unit is up right now.  For a
@@ -154,18 +170,34 @@ def _deterministic_deploy_health_verdict(
     if not inspect_result:
         return 'unconfirmed'
     pid = inspect_result.get('MainPID', 0)
-    if not (isinstance(pid, int) and pid > 0):
-        return 'unconfirmed'
+    pid_live = isinstance(pid, int) and pid > 0
     if verify_baseline is not None:
         baseline_monotonic = (
             verify_baseline.active_enter_timestamp_monotonic
             if isinstance(verify_baseline, VerifyBaseline)
             else verify_baseline.get('active_enter_timestamp_monotonic', 0)
         )
+        baseline_pid = (
+            verify_baseline.main_pid
+            if isinstance(verify_baseline, VerifyBaseline)
+            else verify_baseline.get('main_pid', 0)
+        )
         live_monotonic = inspect_result.get('ActiveEnterTimestampMonotonic', 0)
-        if isinstance(live_monotonic, int) and live_monotonic > baseline_monotonic:
+        monotonic_advanced = (
+            isinstance(live_monotonic, int) and live_monotonic > baseline_monotonic
+        )
+        if baseline_pid == 0:
+            # Empty baseline (task 2611): fall back to activation-clock
+            # advance + non-failed ActiveState — pid>0 can never be
+            # satisfied for a .timer/Type=oneshot target, so it is not
+            # required in this mode.
+            active_state = inspect_result.get('ActiveState')
+            if monotonic_advanced and active_state not in ('', 'failed'):
+                return 'healthy'
+            return 'unconfirmed'
+        if pid_live and monotonic_advanced:
             return 'healthy'
         return 'unconfirmed'
-    if inspect_result.get('ActiveState') == 'active':
+    if pid_live and inspect_result.get('ActiveState') == 'active':
         return 'healthy'
     return 'unconfirmed'
