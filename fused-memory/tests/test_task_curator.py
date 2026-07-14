@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -5247,4 +5248,37 @@ class TestCuratorBatchRouteDeterministic:
         assert decisions[1].action == "drop"
         assert decisions[1].batch_target_index == 0
         assert decisions[1].justification == "pre-batch-dedup: identical payload_hash"
+
+
+# ----------------------------------------------------------------------
+# TaskCurator.evict_task() — witness deletion at task-removal time
+# (curator corpus RC1 — task 2520)
+# ----------------------------------------------------------------------
+
+
+def _expected_point_id(project_id: str, task_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f'{project_id}/{task_id}'))
+
+
+class TestEvictTask:
+    @pytest.mark.asyncio
+    async def test_evict_task_deletes_point(self):
+        """evict_task() deletes the exact deterministic point for (project_id, task_id)."""
+        from qdrant_client.models import PointIdsList
+
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        mock_client = AsyncMock()
+        mock_client.collection_exists = AsyncMock(return_value=True)
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client):
+            await curator.evict_task('proj', '292')
+
+        mock_client.delete.assert_awaited_once()
+        call_kwargs = mock_client.delete.call_args.kwargs
+        assert call_kwargs.get('collection_name') == 'task_curator_proj'
+        points_selector = call_kwargs.get('points_selector')
+        assert isinstance(points_selector, PointIdsList)
+        assert points_selector.points == [_expected_point_id('proj', '292')]
 
