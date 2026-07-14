@@ -154,6 +154,29 @@ async def test_on_task_done_sparse_knowledge(reconciler, mock_memory_service):
 
 
 @pytest.mark.asyncio
+async def test_on_task_done_empty_details_falls_back_to_description(reconciler):
+    """Empty-string details (present but empty) must fall back to description.
+
+    dict.get(key, default) only substitutes the default when the key is
+    ABSENT; Taskmaster commonly emits details='' (present but empty — the
+    common case), so a naive task.get('details', description) leaves the
+    verifier context empty instead of falling back.
+    """
+    task_before = {
+        'id': '1', 'title': 'Add tests', 'status': 'in-progress',
+        'description': 'Test suite', 'details': '',
+    }
+
+    await reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before=task_before,
+    )
+
+    reconciler.verifier.verify.assert_called_once()
+    assert reconciler.verifier.verify.call_args.kwargs['context'] == 'Task details: Test suite'
+
+
+@pytest.mark.asyncio
 async def test_on_task_done_rich_knowledge(reconciler, mock_memory_service):
     """When task is done and knowledge is rich, should not verify."""
     mock_memory_service.search = AsyncMock(return_value=[

@@ -561,7 +561,7 @@ class TargetedReconciler:
             try:
                 verification = await self.verifier.verify(
                     claim=f"Task '{title}' has been completed",
-                    context=f'Task details: {task.get("details", description)}',
+                    context=f'Task details: {task.get("details") or description}',
                     scope_hints=_extract_scope_hints(task),
                 )
                 if verification.verdict in ('confirmed', 'contradicted'):

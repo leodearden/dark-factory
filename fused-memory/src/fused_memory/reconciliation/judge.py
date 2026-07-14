@@ -267,7 +267,12 @@ Review this run and provide your verdict as JSON.
         # _parse_claude_output maps empty stdout → success=False / subtype
         # 'error_empty_output'.  Treat that as a benign empty string rather
         # than an error so callers remain consistent with the prior subprocess
-        # implementation that returned '' on exit-0 + empty stdout.
+        # implementation that returned '' on exit-0 + empty stdout.  This
+        # benign contract depends on _parse_verdict special-casing empty
+        # text (see its early-return below) rather than routing it through
+        # the loud severity=serious parse-failure path — otherwise a quiet,
+        # successful CLI run would be indistinguishable from a systemic
+        # judge/CLI outage and could halt the project.
         if not result.success and result.subtype == 'error_empty_output':
             return ''
 
@@ -278,6 +283,29 @@ Review this run and provide your verdict as JSON.
 
     def _parse_verdict(self, response_text: str, run_id: str) -> JudgeVerdict:
         """Parse judge response into JudgeVerdict."""
+        if not response_text.strip():
+            # Empty output is a documented benign case, NOT a parse failure:
+            # _call_judge_cli returns '' for exit-0/empty-stdout CLI runs
+            # (legacy "empty stdout = valid empty verdict" semantics — see
+            # the comment there) and the anthropic branch returns '' when
+            # the response has no text blocks. Neither indicates a systemic
+            # judge/CLI outage, so it must not be conflated with the loud
+            # severity=serious path below (reserved for genuinely
+            # unparseable non-empty responses) — doing so would turn a
+            # quiet, successful run into a project halt when
+            # halt_on_judge_serious=True. Stay at severity=minor, matching
+            # the non-halting behavior this replaced for the empty case.
+            return JudgeVerdict(
+                run_id=run_id,
+                reviewed_at=datetime.now(UTC),
+                severity=VerdictSeverity.minor,
+                findings=[{
+                    'issue': 'Judge returned empty output',
+                    'severity': 'minor',
+                    'recommendation': 'Manual review recommended',
+                }],
+                action_taken=VerdictAction.none,
+            )
         try:
             # Extract JSON from response (might be wrapped in markdown)
             text = response_text.strip()
@@ -295,15 +323,34 @@ Review this run and provide your verdict as JSON.
                 action_taken=VerdictAction.none,
             )
         except (json.JSONDecodeError, IndexError, KeyError) as e:
-            logger.warning(f'Failed to parse judge response: {e}')
+            logger.error(f'Failed to parse judge response: {e}')
+            # severity=serious is deliberate: it routes through the existing
+            # halt path (review_run() halts on config.halt_on_judge_serious;
+            # _check_error_trends treats 'serious' as non-ok) so a systemic
+            # judge/CLI outage surfaces loudly instead of hiding behind a
+            # fabricated fail-soft 'minor' verdict. This intentionally halts
+            # on a SINGLE unparseable response — review_run() acts on
+            # severity=serious immediately, it does not wait for
+            # _check_error_trends' multi-occurrence/consecutive window. A
+            # lone parse failure is treated as sufficient grounds to halt
+            # (rather than requiring a trend) because an unparseable judge
+            # response means the review pipeline itself may be broken, so
+            # subsequent verdicts can't be trusted to detect a trend either;
+            # see test_review_run_unparseable_response_halts_when_enabled /
+            # ..._no_halt_when_disabled in test_judge.py for the covered
+            # behavior at both settings of halt_on_judge_serious.
             return JudgeVerdict(
                 run_id=run_id,
                 reviewed_at=datetime.now(UTC),
-                severity=VerdictSeverity.minor,
+                severity=VerdictSeverity.serious,
                 findings=[{
-                    'issue': 'Judge response could not be parsed',
-                    'severity': 'minor',
-                    'recommendation': 'Manual review recommended',
+                    'issue': f'Judge response could not be parsed: {e}',
+                    'severity': 'serious',
+                    'recommendation': (
+                        'This verdict was not a real review — the judge output was '
+                        'unparseable. Investigate the judge LLM/CLI output before '
+                        'trusting subsequent verdicts.'
+                    ),
                 }],
                 action_taken=VerdictAction.none,
             )
