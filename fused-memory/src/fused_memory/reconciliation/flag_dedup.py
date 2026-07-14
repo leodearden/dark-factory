@@ -202,6 +202,26 @@ class SuppressionPayload(TypedDict):
     metadata: _SuppressionMetadata
 
 
+def _decompose_suppression_task_id(tid: str) -> list[str]:
+    """Split a ``stage1_flag_suppression`` ledger row's ``task_id`` into its
+    component id string(s) (task 2454).
+
+    A single-id row (e.g. ``'42'``) decomposes to a one-element list
+    (``['42']``). A composite comma-joined row (e.g. ``'2405,540,544'``, a
+    signature spanning multiple projects) decomposes to one entry per id,
+    each stripped of surrounding whitespace. Falsy/empty input (or input
+    that decomposes to only blank components, e.g. ``','``) returns ``[]``.
+
+    Only the SUPPRESSION row's task_id is ever decomposed by this helper --
+    a flag's own task_id is never split (see :func:`filter_suppressed`).
+
+    Pure, sync, no I/O.
+    """
+    if not tid:
+        return []
+    return [p.strip() for p in tid.split(',') if p.strip()]
+
+
 async def filter_suppressed(
     memory_service: Any,
     project_id: str,
@@ -215,13 +235,24 @@ async def filter_suppressed(
     ``task_id -> (wildcard | flag_types)`` map from the returned rows'
     ``task_id``/``flag_type`` columns:
 
+    - A row's ``task_id`` is DECOMPOSED into its component id(s) via
+      :func:`_decompose_suppression_task_id` before indexing (task 2454): a
+      single-id row (e.g. ``'42'``) decomposes to one component, while a
+      composite comma-joined row (e.g. ``'2405,540,544'``, mixing ids across
+      projects) decomposes to one entry per id -- so a single-component flag
+      lookup (e.g. ``task_id=544``) matches even though the ledger row is a
+      composite. Read-time decomposition (rather than write-time fan-out)
+      also matches any pre-existing/opaque composite row. Only the
+      SUPPRESSION row's task_id is decomposed -- the flag-side task_id
+      (below) is never split.
     - A row with ``flag_type == ''`` is a WILDCARD -- it blanket-suppresses
-      every flag_type for that task_id.
+      every flag_type for each of its component task_id(s).
     - A row with a non-empty ``flag_type`` is SCOPED -- it suppresses only
-      that (task_id, flag_type) pair.
-    - When both a scoped and a wildcard row exist for the same task_id
-      (in either row order), the wildcard wins -- union semantics, since a
-      blanket suppression cannot be narrowed by a more specific record.
+      that (component task_id, flag_type) pair.
+    - When both a scoped and a wildcard row (or component) exist for the
+      same task_id (in either row order), the wildcard wins -- union
+      semantics, since a blanket suppression cannot be narrowed by a more
+      specific record.
 
     A flag is dropped iff its ``task_id`` has a wildcard entry, or has a
     scoped entry whose set contains the flag's (str-coerced) ``flag_type``.
@@ -230,9 +261,10 @@ async def filter_suppressed(
     remaining flags are returned unchanged so they can proceed through the
     signature-dedup loop.
 
-    Rows with ``task_id == ''`` are skipped when building the map (a
-    degenerate/malformed suppression with no task target) -- this mirrors
-    the old producer-side guard that rejected a missing/empty ``task_id``.
+    Rows with ``task_id == ''`` (or which decompose to no components) are
+    skipped when building the map (a degenerate/malformed suppression with
+    no task target) -- this mirrors the old producer-side guard that
+    rejected a missing/empty ``task_id``.
 
     Conservative pass-through (zero I/O beyond the attribute check itself):
     when *flags* is empty, or ``memory_service.recon_ledger`` is unset/
@@ -270,27 +302,29 @@ async def filter_suppressed(
         return flags
 
     # task_id (str) -> None (wildcard/blanket) | set[str] (scoped flag_types
-    # allowlist).  See docstring for wildcard-wins union semantics.
+    # allowlist).  See docstring for wildcard-wins union semantics.  Each
+    # row's task_id is decomposed into its component id(s) (task 2454) so a
+    # composite comma-joined row indexes every component.
     suppressed: dict[str, set[str] | None] = {}
     for row in rows:
-        tid_str = row.task_id
-        if not tid_str:
+        if not row.task_id:
             continue  # degenerate row with no task target; can never match a kept flag
 
-        if tid_str in suppressed and suppressed[tid_str] is None:
-            continue  # already wildcard for this task_id; cannot be narrowed further
+        for tid_str in _decompose_suppression_task_id(row.task_id):
+            if tid_str in suppressed and suppressed[tid_str] is None:
+                continue  # already wildcard for this task_id; cannot be narrowed further
 
-        if not row.flag_type:
-            # Wildcard/blanket row -> overrides any scoped entry accumulated
-            # so far for this task_id (union semantics: wildcard wins).
-            suppressed[tid_str] = None
-            continue
+            if not row.flag_type:
+                # Wildcard/blanket row -> overrides any scoped entry accumulated
+                # so far for this task_id (union semantics: wildcard wins).
+                suppressed[tid_str] = None
+                continue
 
-        scoped = suppressed.get(tid_str)
-        if not isinstance(scoped, set):
-            scoped = set()
-            suppressed[tid_str] = scoped
-        scoped.add(row.flag_type)
+            scoped = suppressed.get(tid_str)
+            if not isinstance(scoped, set):
+                scoped = set()
+                suppressed[tid_str] = scoped
+            scoped.add(row.flag_type)
 
     def _keep(f: dict[str, Any]) -> bool:
         flag_tid = f.get('task_id')
