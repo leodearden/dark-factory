@@ -2643,6 +2643,7 @@ class TestAlreadyTrackedSystemicPatternWiring:
         """The e61b38f9/1938 false finding is dropped; benign finding survives."""
         stage = _make_consolidator(project_root='/tmp/reify')
         stage.known_projects = {'dark_factory': '/df'}
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
         stage.taskmaster.get_tasks = AsyncMock(return_value={
             'tasks': [self._make_matching_done_task()],
         })
@@ -2706,6 +2707,7 @@ class TestAlreadyTrackedSystemicPatternWiring:
         """
         stage = _make_consolidator(project_root='/tmp/reify')
         stage.known_projects = {}  # dark_factory not registered
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
         stage.taskmaster.get_tasks = AsyncMock(return_value={
             'tasks': [self._make_matching_done_task()],
         })
