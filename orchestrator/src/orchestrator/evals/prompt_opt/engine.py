@@ -96,18 +96,37 @@ async def run_optimization_loop(
     wall-clock or subprocess dependency and is fully deterministic given
     deterministic *rollout_fn*/*scorer*/*propose_fn* — see
     test_prompt_opt_engine.py's hermetic dry-run.
+
+    Raises :class:`ValueError` immediately (before any rollout/score call)
+    when *corpus* is too small for :func:`split_corpus`'s default ratios to
+    produce a non-empty selection and test split — acceptance decisions are
+    scored on the selection split every step, and the final heuristics are
+    scored on the test split once, so both must be non-empty.
     """
     split = split_corpus(corpus, seed=split_seed)
+    if not split.selection or not split.test:
+        raise ValueError(
+            f'run_optimization_loop: corpus of {len(corpus)} items is too small for '
+            f"split_corpus's default ratios — got train={len(split.train)}, "
+            f'selection={len(split.selection)}, test={len(split.test)} items, and both '
+            'selection and test must be non-empty (selection is scored every step for '
+            'acceptance decisions, test is scored once at the end). Supply a larger corpus.'
+        )
     current_heuristics = spec.baseline_heuristics
     rejected_buffer: list[str] = []
     accept_records: list[AcceptanceRecord] = []
-    last_accepted_delta = 0.0
+    # NaN sentinel (never 0.0, which would be indistinguishable from a real
+    # "accepted with zero delta" outcome — structurally impossible since
+    # acceptance requires delta > band >= 0) until a candidate is accepted.
+    last_accepted_delta = float('nan')
 
     async def _score_split(heuristics: str, items: list[Any]) -> list[float]:
         """Roll out + score *heuristics* over *items* once (one 'repeat'), on the executor."""
+        # compose_prompt depends only on *heuristics*, not on the item, so
+        # it is computed once per call rather than once per item.
+        composed = compose_prompt(spec.contract, heuristics)
         scores = []
         for item in items:
-            composed = compose_prompt(spec.contract, heuristics)
             rollout = await rollout_fn(composed, item, executor_model)
             scores.append(await scorer.score(item, rollout))
         return scores
@@ -124,10 +143,12 @@ async def run_optimization_loop(
         minibatch_rng = random.Random(split_seed + step)
         minibatch_items = minibatch_rng.sample(split.train, min(minibatch_size, len(split.train)))
 
+        # compose_prompt depends only on current_heuristics, not on the
+        # item, so it is computed once per step rather than once per item.
+        composed_minibatch_prompt = compose_prompt(spec.contract, current_heuristics)
         scored_minibatch: list[ScoredItem] = []
         for item in minibatch_items:
-            composed = compose_prompt(spec.contract, current_heuristics)
-            rollout = await rollout_fn(composed, item, executor_model)
+            rollout = await rollout_fn(composed_minibatch_prompt, item, executor_model)
             score = await scorer.score(item, rollout)
             scored_minibatch.append(ScoredItem(item=item, rollout=rollout, score=score))
 
@@ -139,7 +160,23 @@ async def run_optimization_loop(
             optimizer_model=optimizer_model,
         )
 
-        base_repeats = [await _score_split(current_heuristics, split.selection) for _ in range(n_repeats)]
+        if step == 0:
+            # band_batches above already measured N repeats of scoring this
+            # exact (starting) current_heuristics on the selection split —
+            # reuse it instead of re-issuing the identical rollouts a second
+            # time back-to-back.
+            base_repeats = band_batches
+        else:
+            # From step 1 onward current_heuristics may have advanced to an
+            # accepted candidate, or stayed put after a rejection — either
+            # way it is deliberately RE-measured fresh here rather than
+            # reused from the previous step's repeats, so every acceptance
+            # decision is judged against noise sampled contemporaneously
+            # with *this* step's candidate, not noise measured one or more
+            # steps earlier.
+            base_repeats = [
+                await _score_split(current_heuristics, split.selection) for _ in range(n_repeats)
+            ]
         cand_repeats = [await _score_split(candidate, split.selection) for _ in range(n_repeats)]
         record = evaluate_acceptance(base_repeats, cand_repeats, band)
         accept_records.append(record)
