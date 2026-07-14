@@ -140,7 +140,7 @@ def is_wip_safety_commit(subject: str) -> bool:
 # never the shared refs/stash stack, which a human or other session in
 # project_root can race (incident 13674d3c68: the worker popped/dropped a
 # human's stash).  See GitOps._park_wip_on_private_ref and
-# _safe_stash_pop_with_recovery.
+# _safe_restore_park_with_recovery.
 MERGE_PARK_REF = 'refs/dark-factory/merge-park'
 
 
@@ -7182,16 +7182,16 @@ class GitOps:
                         unmark_rc, unmark_err,
                     )
 
-            # Restore stash before returning — ref didn't move.
-            # Use _safe_stash_pop_with_recovery so that a pop conflict here
-            # does NOT leave UU markers in project_root and is escalated to
-            # humans rather than silently cascading to 'stash_failed' on the
-            # next cycle.
+            # Restore parked WIP before returning — ref didn't move.
+            # Use _safe_restore_park_with_recovery so that an apply conflict
+            # here does NOT leave UU markers in project_root and is
+            # escalated to humans rather than silently cascading to
+            # 'stash_failed' on the next cycle.
             if did_park:
-                pop_ok, recovery = await self._safe_stash_pop_with_recovery(
+                restore_ok, recovery = await self._safe_restore_park_with_recovery(
                     branch or merge_sha[:8],
                 )
-                if not pop_ok:
+                if not restore_ok:
                     self._last_recovery_branch = recovery
                     logger.critical(
                         'CRITICAL: stash pop conflicted during CAS-failure recovery '
@@ -7226,10 +7226,10 @@ class GitOps:
                 )
 
             if did_park:
-                pop_ok, recovery = await self._safe_stash_pop_with_recovery(
+                restore_ok, recovery = await self._safe_restore_park_with_recovery(
                     branch or merge_sha[:8],
                 )
-                if not pop_ok:
+                if not restore_ok:
                     self._last_recovery_branch = recovery
                     logger.warning(
                         'Stash pop conflicted after merge advance (task %s). '
@@ -7439,11 +7439,14 @@ class GitOps:
         (incident 13674d3c68).
 
         Raises :class:`MergeParkError` if ``git stash create`` fails or
-        produces no commit.  Raises :class:`MergeParkContentionError` if
-        MERGE_PARK_REF already exists — the merge worker is serialized, so a
-        resolvable ref here is either an invariant violation or a
-        crash-leftover holding real, unrecovered WIP; it is never
-        overwritten.
+        produces no commit, or if the final ``git read-tree -u --reset HEAD``
+        (which cleans the working tree after the WIP is captured on the ref)
+        fails — the WIP is already safe on MERGE_PARK_REF at that point, but
+        the caller must still halt rather than proceed with a dirty tree.
+        Raises :class:`MergeParkContentionError` if MERGE_PARK_REF already
+        exists — the merge worker is serialized, so a resolvable ref here is
+        either an invariant violation or a crash-leftover holding real,
+        unrecovered WIP; it is never overwritten.
         """
         # Single-flight guard: explicit pre-check so a stale/contended ref
         # fails loudly with a clear message rather than via the terser
@@ -7485,12 +7488,19 @@ class GitOps:
                 f'appeared concurrently: {update_err!r}'
             )
 
-        await _run(
+        reset_rc, _, reset_err = await _run(
             ['git', 'read-tree', '-u', '--reset', 'HEAD'],
             cwd=self.project_root,
         )
+        if reset_rc != 0:
+            raise MergeParkError(
+                f'read-tree -u --reset HEAD failed after parking WIP on '
+                f'{MERGE_PARK_REF} (rc={reset_rc}, stderr={reset_err!r}) — '
+                'WIP is safe on the ref, but the working tree may still be '
+                'dirty; halting rather than proceeding out of sync.'
+            )
 
-    async def _create_recovery_branch_from_stash(self, label: str) -> str:
+    async def _create_recovery_branch_from_park_ref(self, label: str) -> str:
         """Create a branch from MERGE_PARK_REF to preserve WIP, then clean up.
 
         1. Create a deterministic branch name.
@@ -7513,8 +7523,21 @@ class GitOps:
             ['git', 'branch', name, MERGE_PARK_REF],
             cwd=self.project_root,
         )
-        # Delete the private ref (WIP is now reachable via the branch)
-        await _run(['git', 'update-ref', '-d', MERGE_PARK_REF], cwd=self.project_root)
+        # Delete the private ref (WIP is now reachable via the branch).  A
+        # failed delete leaks the ref rather than losing WIP (the branch
+        # already anchors it), but the leak would surface as a confusing
+        # MergeParkContentionError halt on the *next* park — log loudly now
+        # so the real cause is diagnosable.
+        del_rc, _, del_err = await _run(
+            ['git', 'update-ref', '-d', MERGE_PARK_REF], cwd=self.project_root,
+        )
+        if del_rc != 0:
+            logger.critical(
+                'CRITICAL: failed to delete %s after branching WIP to %s '
+                '(rc=%d, err=%s) — the ref may leak and cause a spurious '
+                'contention halt on the next park.',
+                MERGE_PARK_REF, name, del_rc, del_err,
+            )
         # Reset working tree to HEAD (removes conflict markers / UU state)
         await _run(
             ['git', 'read-tree', '-u', '--reset', 'HEAD'],
@@ -7522,7 +7545,7 @@ class GitOps:
         )
         return name
 
-    async def _safe_stash_pop_with_recovery(
+    async def _safe_restore_park_with_recovery(
         self, label: str,
     ) -> tuple[bool, str | None]:
         """Apply MERGE_PARK_REF and preserve WIP on a recovery branch if it conflicts.
@@ -7532,7 +7555,7 @@ class GitOps:
            stash stack.
         2. Check return code AND ``_detect_unmerged_paths`` — either signal
            is sufficient to declare failure (belt-and-braces).
-        3. On failure: call ``_create_recovery_branch_from_stash(label)``
+        3. On failure: call ``_create_recovery_branch_from_park_ref(label)``
            which branches off MERGE_PARK_REF, deletes the ref, and resets
            the working tree to HEAD.
         4. On success: delete MERGE_PARK_REF (WIP is now applied to the
@@ -7540,21 +7563,35 @@ class GitOps:
         5. Return ``(True, None)`` on clean apply, or
            ``(False, recovery_branch_name)`` on conflict.
         """
-        pop_rc, _, pop_err = await _run(
+        apply_rc, _, apply_err = await _run(
             ['git', 'stash', 'apply', MERGE_PARK_REF], cwd=self.project_root,
         )
         unmerged = await self._detect_unmerged_paths(self.project_root)
 
-        if pop_rc != 0 or unmerged:
+        if apply_rc != 0 or unmerged:
             logger.warning(
-                'Stash apply failed (rc=%d, unmerged=%s, err=%s) for label %r — '
+                'Park ref apply failed (rc=%d, unmerged=%s, err=%s) for label %r — '
                 'creating recovery branch to preserve WIP.',
-                pop_rc, unmerged or [], pop_err, label,
+                apply_rc, unmerged or [], apply_err, label,
             )
-            recovery = await self._create_recovery_branch_from_stash(label)
+            recovery = await self._create_recovery_branch_from_park_ref(label)
             return (False, recovery)
 
-        await _run(['git', 'update-ref', '-d', MERGE_PARK_REF], cwd=self.project_root)
+        # Delete the private ref (WIP is now applied to the working tree).
+        # A failed delete leaks the ref — it doesn't lose WIP (already
+        # applied), but the leak surfaces as a confusing spurious
+        # MergeParkContentionError halt on the *next* park; log loudly now
+        # so the real cause is diagnosable.
+        del_rc, _, del_err = await _run(
+            ['git', 'update-ref', '-d', MERGE_PARK_REF], cwd=self.project_root,
+        )
+        if del_rc != 0:
+            logger.critical(
+                'CRITICAL: failed to delete %s after a clean apply for label '
+                '%r (rc=%d, err=%s) — the ref may leak and cause a spurious '
+                'contention halt on the next park.',
+                MERGE_PARK_REF, label, del_rc, del_err,
+            )
         return (True, None)
 
     async def has_dirty_working_tree(self) -> str:
