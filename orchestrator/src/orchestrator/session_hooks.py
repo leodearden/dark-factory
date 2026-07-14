@@ -316,6 +316,7 @@ def _resolve_wm_window_id(
             if attempt < attempts - 1:
                 sleep(_WM_WINDOW_ID_RETRY_SLEEP_SECS)
     except Exception:
+        logger.warning("wmctrl window-id resolution failed; degrading to display=None", exc_info=True)
         return None
     return None
 
