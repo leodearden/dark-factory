@@ -37,11 +37,15 @@ assertion.
 from __future__ import annotations
 
 import asyncio
+import inspect
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from escalation.models import Escalation
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import ActorClass, is_legal_transition, outcome_allows_status
@@ -69,6 +73,7 @@ from test_workflow_e2e import (
 from test_workflow_merge_provenance import _bind_landed_row, _make
 from test_workflow_warm_lane_requeue import _make_workflow as _make_warmlane_workflow
 
+from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import _FAMILY_TOOL_PREFIXES, ROLES, AgentRole
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -80,15 +85,13 @@ from orchestrator.steward import TaskSteward
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
-from orchestrator.workflow import TaskWorkflow, WorkflowMetrics, _PriorImplStatus
+from orchestrator.workflow import TaskWorkflow, WorkflowMetrics
 from orchestrator.workflow_types import (
     STATE_TO_STATUS,
     BlockDisposition,
     IllegalTransition,
     RequeueKind,
-    StewardBudgetExhausted,
     StewardInterrupted,
-    StewardReescalatedL1,
     StewardResolved,
     StewardTerminalDecision,
     TerminalReport,
@@ -1108,4 +1111,438 @@ class TestStewardOutcomeRouting:
         wf._ensure_l1_escalation_for_blocked.assert_awaited_once()
         wf.scheduler.set_task_status.assert_called_once_with(  # type: ignore[attr-defined]
             wf.task_id, 'blocked',
+        )
+
+
+# ---------------------------------------------------------------------------
+# Boundary rows 10-11 — BlockDisposition (``classify_failure`` PRODUCER ↔ the
+# four independent ``AllAccountsCappedException`` cap-catch-site CONSUMERs),
+# BD-1 / BD-2.
+# ---------------------------------------------------------------------------
+
+
+def _public_exception_types(module):
+    """Every public (no leading underscore) BaseException subclass in *module*.
+
+    Duplicated verbatim from test_block_disposition.py's helper of the same
+    name (established repo convention — this module re-derives the sweep
+    independently rather than importing it, so row 11 stays a genuine
+    boundary gate rather than a re-import of the ε seam's own test infra).
+    """
+    return [
+        obj for name, obj in vars(module).items()
+        if not name.startswith('_')
+        and inspect.isclass(obj)
+        and issubclass(obj, BaseException)
+    ]
+
+
+class TestBlockDispositionOneClassifierAndCompleteness:
+    """Boundary rows 10-11 (PRD §9): ``classify_failure`` (PRODUCER) ↔ the
+    four independent ``AllAccountsCappedException`` cap-catch sites —
+    ``workflow.run()``, ``steward._pre_triage_suggestions``,
+    ``review_checkpoint.run_focused``, ``dry_run_unblock.run_dry_run_unblock``
+    (CONSUMERs) — plus the BD-2 completeness sweep, BD-1 / BD-2.
+    """
+
+    # -- Row 10 (BD-1): canonical, type-only classification ------------------
+
+    def test_row10_two_distinct_cap_instances_classify_identically(self):
+        """classify_failure is a function of the exception's TYPE alone —
+        payload (retries/elapsed_secs/label) never affects the resolved
+        disposition, so all four cap sites below are guaranteed to consult
+        an IDENTICAL BlockDisposition regardless of instance payload."""
+        from shared.cli_invoke import AllAccountsCappedException
+
+        exc_a = AllAccountsCappedException(retries=1, elapsed_secs=10.0, label='A')
+        exc_b = AllAccountsCappedException(retries=99, elapsed_secs=9999.0, label='B')
+        assert classify_failure(exc_a) == classify_failure(exc_b)
+
+    # -- Row 10 (BD-1): workflow.run() consults the REAL shared classifier ---
+
+    @pytest.mark.asyncio
+    async def test_row10_workflow_run_consults_real_classifier_for_cap_reason(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """The workflow.py cap-catch site: a real blocked run's
+        ``report.reason`` and the ``_mark_blocked(escalate_to_human=...)``
+        kwarg both trace back to the SAME
+        ``classify_failure(AllAccountsCappedException)`` row pinned by
+        test_block_disposition.py's ``TestClassifyFailureKnownRows`` — not an
+        independent literal."""
+        from shared.cli_invoke import AllAccountsCappedException
+
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        async def raise_cap_exc(*args, **kwargs):
+            raise AllAccountsCappedException(
+                retries=3, elapsed_secs=120.0, label='Task 42 [architect]',
+            )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', raise_cap_exc)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+        mark_blocked_spy = AsyncMock(wraps=workflow._mark_blocked)
+        workflow._mark_blocked = mark_blocked_spy  # type: ignore[method-assign]
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.reason.lower().startswith('all accounts capped')
+        assert report.category is FailureCategory.NONE
+        assert mark_blocked_spy.await_args is not None
+        assert mark_blocked_spy.await_args.kwargs.get('escalate_to_human', False) is False
+
+    # -- Row 10 (BD-1): the other three sites consult the SAME classifier ----
+    # (sentinel-patched — proves consultation rather than a coincidental
+    # literal match; reuses each sibling seam's own exposed helper factories,
+    # imported function-locally — a local `from X import Y` binds Y only in
+    # this function's namespace, so it does not collide with this module's
+    # own rows-8-9 `_make_steward`/`_make_escalation` module-level names.)
+
+    @pytest.mark.asyncio
+    async def test_row10_steward_pre_triage_consults_shared_classifier(self, caplog):
+        import json
+        import logging
+
+        from shared.cli_invoke import AllAccountsCappedException
+        from test_suggestion_triage import _make_escalation, _make_steward, _make_suggestions
+
+        steward = _make_steward()
+        suggestions = _make_suggestions(15)
+        escalation = _make_escalation(detail=json.dumps(suggestions))
+        cap_exc = AllAccountsCappedException(
+            retries=2, elapsed_secs=30.0, label='Steward for task 42 [pre-triage]',
+        )
+        sentinel = BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='SENTINEL_steward_cap',
+            block_class=BlockClass.AGENT_FAILURE,
+        )
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', AsyncMock(side_effect=cap_exc),
+        ), patch(
+            'orchestrator.steward.classify_failure', lambda _e: sentinel,
+        ), caplog.at_level(logging.WARNING, logger='orchestrator.steward'):
+            result = await steward._pre_triage_suggestions(escalation)
+
+        assert result is escalation
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('sentinel_steward_cap' in t.lower() for t in warning_texts), (
+            f'Expected warning single-sourced from classify_failure, got: {warning_texts}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_row10_review_checkpoint_consults_shared_classifier(
+        self, monkeypatch, caplog,
+    ):
+        import logging
+
+        from shared.cli_invoke import AllAccountsCappedException
+        from test_review_checkpoint_cap import _PHASE1_RESULT, _make_checkpoint
+
+        checkpoint = _make_checkpoint()
+        cap_exc = AllAccountsCappedException(
+            retries=4, elapsed_secs=300.0, label='Review checkpoint [x]',
+        )
+        sentinel = BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='SENTINEL_review_cap',
+            block_class=BlockClass.AGENT_FAILURE,
+        )
+
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.invoke_with_cap_retry',
+            AsyncMock(side_effect=cap_exc),
+        )
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.run_full_verification',
+            AsyncMock(return_value=_PHASE1_RESULT),
+        )
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.classify_failure', lambda _e: sentinel,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.review_checkpoint'):
+            report = await checkpoint.run_focused()
+
+        assert report.findings_count == 0
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('sentinel_review_cap' in t.lower() for t in warning_texts), (
+            f'Expected warning single-sourced from classify_failure, got: {warning_texts}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_row10_dry_run_unblock_consults_shared_classifier(self, tmp_path: Path):
+        from shared.cli_invoke import AllAccountsCappedException
+        from test_dry_run_unblock import _make_config
+
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        cap_exc = AllAccountsCappedException(
+            retries=3, elapsed_secs=1800.0, label='Task 42 [unblock_auto]',
+        )
+        # block_class deliberately differs from AGENT_FAILURE (what
+        # classify_block_reason would derive from the reason string) so the
+        # assertion below cannot pass by coincidence.
+        sentinel = BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='SENTINEL_dry_run_cap',
+            block_class=BlockClass.MERGE_VERIFY_RED,
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_with_cap_retry',
+            AsyncMock(side_effect=cap_exc),
+        ), patch(
+            'orchestrator.dry_run_unblock.classify_failure', lambda _e: sentinel,
+        ):
+            await run_dry_run_unblock(
+                task_id='42', worktree=str(tmp_path), reason='verify exhausted',
+                detail='', scheduler=scheduler, mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['block_class'] == 'merge_verify_red', (
+            f'Expected block_class from classify_failure(cap_exc), got: '
+            f'{entry["block_class"]!r}'
+        )
+
+    # -- Row 11 (BD-2): completeness sweep across the four BD-2 modules ------
+
+    def test_row11_every_exported_exception_across_four_modules_has_a_row(self):
+        import shared.cli_invoke as cli_invoke
+        import shared.usage_gate as usage_gate
+
+        import orchestrator.git_ops as git_ops
+        import orchestrator.verify as verify
+
+        exc_types = [
+            t
+            for module in (git_ops, verify, cli_invoke, usage_gate)
+            for t in _public_exception_types(module)
+        ]
+        assert exc_types, 'sanity: the 4 BD-2 modules must export at least one exception'
+
+        missing = [t for t in exc_types if _lookup_disposition(t) is None]
+        assert not missing, (
+            'exported exception types with no explicit disposition row: '
+            f'{[t.__qualname__ for t in missing]}'
+        )
+
+    def test_row11_brand_new_exception_type_has_no_row_but_classify_stays_total(self):
+        """A synthetic type with no table row proves the completeness check
+        above is meaningful: it FAILS for an unrecognized type rather than
+        silently matching everything, while classify_failure itself is still
+        TOTAL — it falls back to the default disposition rather than
+        raising."""
+
+        class _BrandNewFailure(Exception):
+            pass
+
+        assert _lookup_disposition(_BrandNewFailure) is None
+        disp = classify_failure(_BrandNewFailure('surprise'))
+        assert disp is not None
+
+
+# ---------------------------------------------------------------------------
+# Boundary row 12 — capability wiring (roles.py AgentRole.__post_init__
+# PRODUCER ↔ workflow._invoke gating CONSUMER), CW-1.
+# ---------------------------------------------------------------------------
+
+
+async def _invoke_probe(
+    role: AgentRole, config: OrchestratorConfig, git_ops: GitOps,
+    task_assignment: TaskAssignment,
+) -> tuple[Mapping[str, Any], TaskWorkflow]:
+    """Build a TaskWorkflow, patch invoke_with_cap_retry, invoke ``_invoke``.
+
+    Duplicated (not imported) from test_agent_capability_wiring.py's helper
+    of the same name — that module's own η-seam unit suite already covers
+    this exhaustively; this boundary module re-derives the probe
+    independently so row 12 stays a genuine two-way gate (mirrors this
+    module's rows 5-6 duplicated git_repo/config/git_ops/task_assignment
+    fixtures — same rationale, see their docstring above).
+
+    Returns (call_kwargs, workflow) — the kwargs invoke_with_cap_retry was
+    awaited with, and the workflow instance (so callers can assert against
+    workflow.modules).
+    """
+    wt_info = await git_ops.create_worktree(task_assignment.task_id)
+    cwd = wt_info.path
+
+    config.sandbox.enabled = True
+
+    workflow = TaskWorkflow(
+        assignment=task_assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        briefing=FakeBriefing(),  # type: ignore[arg-type]
+        mcp=FakeMcp(),
+    )
+    workflow.artifacts = None
+
+    with patch(
+        'orchestrator.workflow.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+        return_value=AgentResult(success=True, output=''),
+    ) as mock_cap_retry:
+        await workflow._invoke(role, 'PROMPT', cwd)
+
+    assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
+    assert mock_cap_retry.await_args is not None
+    return mock_cap_retry.await_args.kwargs, workflow
+
+
+class TestCapabilityWiringImportAssert:
+    """Boundary row 12 (PRD §9): ``AgentRole.__post_init__``'s import-time
+    capability assertion (PRODUCER) ↔ ``TaskWorkflow._invoke``'s role-derived
+    sandbox/MCP gating (CONSUMER), CW-1 — the SIMPLE_TASK silent-fallthrough
+    regression class (reify esc-4943-54) now fails LOUDLY at import instead
+    of weeks later.
+    """
+
+    # -- Producer: import-time/construction capability assertion -------------
+
+    def test_row12_plan_tools_tool_without_family_raises_naming_plan_tools(self):
+        with pytest.raises(ValueError, match='plan_tools'):
+            AgentRole(
+                name='probe', system_prompt='x',
+                allowed_tools=['mcp__plan-tools__create_plan'],
+            )
+
+    def test_row12_fused_memory_tool_without_family_raises_naming_orchestrator(self):
+        with pytest.raises(ValueError, match='orchestrator'):
+            AgentRole(
+                name='probe', system_prompt='x',
+                allowed_tools=['mcp__fused-memory__search'],
+            )
+
+    def test_row12_escalation_tool_without_family_raises_naming_orchestrator(self):
+        with pytest.raises(ValueError, match='orchestrator'):
+            AgentRole(
+                name='probe', system_prompt='x',
+                allowed_tools=['mcp__escalation__escalate_info'],
+            )
+
+    def test_row12_unmapped_family_drift_guard_raises_naming_the_family(self):
+        """_FAMILY_TOOL_PREFIXES drift guard: a family with no prefix-mapping
+        entry must fail loudly rather than silently skip validation for it."""
+        with pytest.raises(ValueError, match='unmapped_family'):
+            AgentRole(
+                name='probe', system_prompt='x',
+                mcp_families=frozenset({'unmapped_family'}),  # type: ignore[arg-type]
+            )
+
+    def test_row12_roles_module_imports_cleanly_every_shipped_role_passes(self):
+        """Import-time firing: every shipped ROLES entry's __post_init__
+        passes — this module's own top-of-file
+        ``from orchestrator.agents.roles import ... ROLES ...`` already
+        proved the module imports cleanly; this test re-derives the
+        invariant explicitly against the live ROLES/_FAMILY_TOOL_PREFIXES
+        objects rather than relying on import success alone."""
+        assert len(ROLES) >= 9
+        assert set(ROLES) >= {
+            'architect', 'implementer', 'debugger', 'merger', 'steward',
+            'deep_reviewer', 'reviewer_comprehensive', 'judge', 'simple_task',
+        }
+        for name, role in ROLES.items():
+            for family, prefixes in _FAMILY_TOOL_PREFIXES.items():
+                if family in role.mcp_families:
+                    continue
+                offending = [t for t in role.allowed_tools if t.startswith(prefixes)]
+                assert not offending, (
+                    f'{name!r} allows {offending!r} without declaring {family!r} '
+                    'in mcp_families'
+                )
+
+    # -- Consumer: _invoke derives gating from role.mcp_families/sandboxed ---
+
+    @pytest.mark.asyncio
+    async def test_row12_invoke_derives_sandbox_modules_from_role_sandboxed(
+        self, config, git_ops, task_assignment,
+    ):
+        role = AgentRole(
+            name='probe_sbx', system_prompt='x', allowed_tools=[], sandboxed=True,
+        )
+        call_kwargs, workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        assert call_kwargs.get('sandbox_modules') == workflow.modules, (
+            f"Expected sandbox_modules == {workflow.modules!r} (role.sandboxed=True) "
+            f"but got {call_kwargs.get('sandbox_modules')!r}. _invoke must gate "
+            "sandboxing off role.sandboxed, not a role.name string check."
+        )
+
+    @pytest.mark.asyncio
+    async def test_row12_invoke_derives_plan_tools_server_from_role_mcp_families(
+        self, config, git_ops, task_assignment,
+    ):
+        role = AgentRole(
+            name='probe_plan', system_prompt='x', allowed_tools=[],
+            mcp_families=frozenset({'plan_tools'}),
+        )
+        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        mcp_config = call_kwargs.get('mcp_config')
+        servers = (mcp_config or {}).get('mcpServers', {})
+        assert 'plan-tools' in servers, (
+            "Expected mcp_config['mcpServers'] to contain 'plan-tools' "
+            f"(role.mcp_families={{'plan_tools'}}) but got {mcp_config!r}. _invoke "
+            "must gate the plan-tools injection off 'plan_tools' in "
+            'role.mcp_families, not a role.name string check.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_row12_invoke_derives_mcp_config_from_role_mcp_families(
+        self, config, git_ops, task_assignment,
+    ):
+        role = AgentRole(
+            name='probe_orch', system_prompt='x', allowed_tools=[],
+            mcp_families=frozenset({'orchestrator'}),
+        )
+        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        assert call_kwargs.get('mcp_config') is not None, (
+            "Expected mcp_config to be built (role.mcp_families={'orchestrator'}) "
+            f"but got {call_kwargs.get('mcp_config')!r}. _invoke must gate the "
+            "orchestrator-assembled MCP config off 'orchestrator' in "
+            'role.mcp_families, not a role.name string check.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_row12_bare_role_gets_no_sandbox_and_no_plan_tools_negative_control(
+        self, config, git_ops, task_assignment,
+    ):
+        """Negative control: a role declaring neither family and unsandboxed
+        gets no sandbox modules and no plan-tools server wired."""
+        role = AgentRole(name='probe_bare', system_prompt='x', allowed_tools=[])
+        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        assert call_kwargs.get('sandbox_modules') is None, (
+            f"Expected sandbox_modules is None (role.sandboxed=False) but got "
+            f"{call_kwargs.get('sandbox_modules')!r}."
+        )
+        mcp_config = call_kwargs.get('mcp_config')
+        servers = (mcp_config or {}).get('mcpServers', {})
+        assert 'plan-tools' not in servers, (
+            f"Expected no 'plan-tools' server wired (role.mcp_families=frozenset()) "
+            f'but found one in mcp_config={mcp_config!r}.'
         )
