@@ -2568,7 +2568,9 @@ class GitOps:
                 globs, artifact_dir, exc_info=True,
             )
 
-    async def _seed_warm_lane(self, lane_dir: Path, mode: str) -> int:
+    async def _seed_warm_lane(
+        self, lane_dir: Path, mode: str, *, take_lane_lock: bool = True,
+    ) -> int:
         """Run seed-warm-lane.sh to CoW-seed the lane's target/ from the warm base.
 
         Invokes ``<lane_dir>/scripts/seed-warm-lane.sh <base_target> <lane_dir> <mode>``
@@ -2602,6 +2604,20 @@ class GitOps:
         re-acquire's seed can no longer both proceed against the same
         ``target/`` at once — see that method's "Lane-lock coupling gap"
         docstring note for the full race analysis (now closed).
+
+        **``take_lane_lock`` (task 2567)**: when ``False``, the OUTER
+        ``flock -x <lane_dir>.lock`` wrapper described above is omitted
+        entirely — only the INNER per-gen-dir ``flock -s <gen>.lock``
+        (symlink branch only; a different path) is still taken. Callers
+        that already hold ``<lane_dir>.lock`` themselves for the whole
+        call (e.g. :meth:`GitOps.ephemeral_worktree`'s CM-lifetime flock,
+        task 2507) MUST pass ``take_lane_lock=False`` — re-acquiring the
+        IDENTICAL path from the same process would self-deadlock against
+        the bounded wait below, timing out at
+        ``_SEED_WARM_LANE_LOCK_TIMEOUT_RC`` after
+        ``_SEED_WARM_LANE_LOCK_WAIT_SECS`` on every call. Default ``True``
+        keeps every other existing caller (``acquire_warm_lane``,
+        ``create_interactive_worktree``, recycle) byte-identical.
 
         **Bounded wait, not unbounded (task 2599 amendment)**: seeding runs
         on the latency-sensitive warm-lane acquisition hot path, so the
@@ -2657,12 +2673,16 @@ class GitOps:
             # distinct, diagnosable rc instead of stalling this hot path
             # forever.
             lane_lock = lane_dir.with_name(lane_dir.name + '.lock')
-            lane_lock_flock = [
-                'flock', '-x',
-                '-w', str(_SEED_WARM_LANE_LOCK_WAIT_SECS),
-                '-E', str(_SEED_WARM_LANE_LOCK_TIMEOUT_RC),
-                str(lane_lock),
-            ]
+            lane_lock_flock = (
+                [
+                    'flock', '-x',
+                    '-w', str(_SEED_WARM_LANE_LOCK_WAIT_SECS),
+                    '-E', str(_SEED_WARM_LANE_LOCK_TIMEOUT_RC),
+                    str(lane_lock),
+                ]
+                if take_lane_lock
+                else []
+            )
             base_path = self.warm_lane_base_target_path
             if base_path.is_symlink():
                 # D8: resolve relative-sibling symlink (target -> .gen.N) to the
