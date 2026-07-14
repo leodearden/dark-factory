@@ -2038,9 +2038,19 @@ class TaskCurator:
         """Fetch a full task for an embedding neighbor, fall back to payload.
 
         ``get_task`` is called without a ``tag`` — it resolves to
-        ``DEFAULT_TAG``, matching the Qdrant corpus's own (project,
-        DEFAULT_TAG) scope, so a ``TaskNotFoundError`` here means "deleted
-        under the same scope as the corpus" (task 2521 RC2).
+        ``DEFAULT_TAG``. That does NOT match the Qdrant corpus's own scope:
+        the corpus is keyed by ``project_id`` ALONE (see the tag-scope
+        CAUTION on ``prune_orphans`` above), and ``record_task``/
+        ``index_committed_tasks`` write a task's vector regardless of which
+        tag it was filed under. So a ``TaskNotFoundError`` here does NOT
+        prove the task is gone — it also fires for a live task filed under
+        a non-default tag, which is then excluded from the pool exactly
+        like a genuine deletion (task 2521 RC2). This is an accepted
+        tradeoff, not a correctness proof: worst case a near-identical
+        re-file of a non-default-tag task is filed as a duplicate instead
+        of combined — the same "duplicate is cheap" bias this method
+        already applies to inconclusive errors below. It is the same
+        known multi-tag gap tracked on ``prune_orphans``, not fixed here.
         """
         if self._taskmaster is not None:
             try:
@@ -2049,11 +2059,13 @@ class TaskCurator:
                 if entry is not None:
                     return entry
             except TaskNotFoundError:
-                # Definitive zero-row absence: the task was removed and this
-                # Qdrant point is an orphan. Exclude it from the pool rather
-                # than fabricating a live-looking entry from the stale
-                # payload — a duplicate is a cheap failure; silently losing
-                # a real candidate to a fabricated "existing" match is not.
+                # Zero-row absence under DEFAULT_TAG: usually the task was
+                # removed and this Qdrant point is an orphan, but it also
+                # fires for a live non-default-tag task (see the docstring
+                # tag-scope note above) — exclude either way rather than
+                # fabricating a live-looking entry from the stale payload.
+                # A duplicate is a cheap failure; silently losing a real
+                # candidate to a fabricated "existing" match is not.
                 return None
             except Exception:
                 # Inconclusive (e.g. TASKMASTER_UNAVAILABLE, a raw driver
