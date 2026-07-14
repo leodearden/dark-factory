@@ -4070,6 +4070,33 @@ class GitOps:
             )
             return WorktreeInfo(path=lane, base_commit=base_commit, reify_debug_port=port)
 
+        except BranchResetError:
+            # task 2403 (reviewer_comprehensive error_handling finding): a
+            # BranchResetError raised by _reuse_warm_lane's guarded rebase
+            # (rebase_preserving_task_commits, reached via the disk-backstop
+            # reuse route @3975 or the orphan-reattach reuse route @4039)
+            # must escape to _drive's targeted branch_reset escalation
+            # (workflow.py's isinstance(e, BranchResetError) branch) — NOT
+            # be flattened by the broad `except Exception` below into
+            # WarmLaneUnavailable.FAULT, which create_worktree maps to a
+            # generic RuntimeError that branch_reset routing can never
+            # match, mislabeling a wipe as an ordinary warm-lane fault.
+            # The guard already attempted (best-effort; see
+            # BranchResetError.restore_ok — a failed restore is called out
+            # explicitly in str(e), not silently assumed safe) to restore
+            # the pre-rebase HEAD before raising, so this is a lost-
+            # escalation-SIGNAL fix, not a data-loss fix. Deliberately do
+            # NOT call _abort_lane_acquisition here — that would
+            # release/reset the lane and discard whatever the guard's
+            # restore left in place; fail-safe-retain the (possibly
+            # restored) work on the ASSIGNED lane for human recovery,
+            # mirroring the raise-not-destroy contract of the
+            # orphan-checkout RuntimeError guards above (~4013). Scoped to
+            # BranchResetError only — every other exception (seed/
+            # worktree-add failure, absent seed script, a WorktreeConflict-
+            # Error from commit(), etc.) still flows through the broad
+            # handler below unchanged.
+            raise
         except Exception:
             logger.warning(
                 'acquire_warm_lane: unexpected error for %s; releasing', lane, exc_info=True,
