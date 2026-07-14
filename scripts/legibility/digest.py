@@ -466,7 +466,11 @@ def score_signals(counts: dict[str, int], n_user_turns: int) -> float:
 ORCHESTRATED_TASK_MARKERS: tuple[str, ...] = ('task id:', 'worktree:')
 """Injected task-briefing preamble literal
 (orchestrator/src/orchestrator/dry_run_unblock.py: f'Task ID: {task_id}\\n'
-f'Worktree: {worktree}\\n')."""
+f'Worktree: {worktree}\\n'). Both markers must co-occur (matched via
+all(), not any()) since they are the two lines of a single injected
+preamble -- a lone incidental mention of one marker (e.g. bare 'Worktree:'
+prose in an ordinary interactive session) must not alone trigger this
+classification."""
 
 RECON_MARKERS: tuple[str, ...] = ('operating in sleep mode',)
 """Phrase shared by all three reconciliation stage system prompts
@@ -510,7 +514,7 @@ def classify_agent_class(
         )
     ).lower()
 
-    if any(marker in haystack for marker in ORCHESTRATED_TASK_MARKERS):
+    if all(marker in haystack for marker in ORCHESTRATED_TASK_MARKERS):
         return 'orchestrated-task'
     if any(marker in haystack for marker in RECON_MARKERS):
         return 'recon'

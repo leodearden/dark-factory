@@ -655,6 +655,19 @@ class TestClassifyAgentClass:
 
         assert mod.classify_agent_class(records) == 'orchestrated-task'
 
+    def test_bare_worktree_mention_alone_is_not_orchestrated_task(self):
+        # 'Worktree:' alone (without its paired 'Task ID:' preamble line) is
+        # ordinary interactive prose -- e.g. this very project's docs and
+        # sessions mention worktrees constantly -- and must not by itself
+        # trigger a false-positive orchestrated-task classification. Both
+        # preamble lines must co-occur (PRD Sec 13.2-adjacent decoy-style
+        # false-positive guard, owned here).
+        records = [_assistant(_text(
+            'The worktree: /home/leo/src/dark-factory/.worktrees/2572 is where this runs.'
+        ))]
+
+        assert mod.classify_agent_class(records) == 'interactive'
+
     def test_recon_stage_marker_is_recon(self):
         # Shared phrase across all reconciliation stage system prompts
         # (fused_memory/reconciliation/prompts/stage{1,2,3}.py).
