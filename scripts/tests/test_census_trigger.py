@@ -110,3 +110,46 @@ def test_evaluate_condition_b_day_6_min_days_not_met_no_fire():
 def test_evaluate_condition_b_delta_unavailable_no_fire():
     decision = _evaluate_a(last_census_at=NOW - timedelta(days=9), tasks_landed=None)
     assert decision.fire is False
+
+
+# ---------------------------------------------------------------------------
+# step-7: RED — evaluate() condition (c): novelty spike
+# ---------------------------------------------------------------------------
+
+def _evaluate_c(*, candidate_first_seens):
+    """last_census_at=now-6d: > floor(5), < max_interval(10), < min_days(7)
+    -- so only condition (c) can possibly fire. first_seen values are
+    passed as YYYY-MM-DD date strings, exactly as the codebook writes them
+    (§7.1 candidates[].first_seen), parsed to datetimes here (evaluate()
+    itself takes already-parsed datetimes)."""
+    return ct.evaluate(
+        now=NOW,
+        last_census_at=NOW - timedelta(days=6),
+        never_censused=False,
+        tasks_landed=None,
+        candidate_first_seens=[datetime.fromisoformat(s) for s in candidate_first_seens],
+        config=ct.CensusConfig(),
+    )
+
+
+def test_evaluate_condition_c_four_within_72h_fires():
+    # 2026-07-14/13/12 (twice) are 0h/0h/36h/60h before NOW -- all <= 72h.
+    decision = _evaluate_c(
+        candidate_first_seens=["2026-07-14", "2026-07-14", "2026-07-13", "2026-07-12"]
+    )
+    assert decision.fire is True
+    assert any("novelty-spike" in r and "4" in r for r in decision.reasons)
+
+
+def test_evaluate_condition_c_only_three_within_72h_no_fire():
+    decision = _evaluate_c(candidate_first_seens=["2026-07-14", "2026-07-13", "2026-07-12"])
+    assert decision.fire is False
+
+
+def test_evaluate_condition_c_four_but_one_outside_window_counts_as_three_no_fire():
+    # 2026-07-11 is 84h before NOW -- outside the 72h window, so only 3
+    # of these 4 candidates count.
+    decision = _evaluate_c(
+        candidate_first_seens=["2026-07-14", "2026-07-13", "2026-07-12", "2026-07-11"]
+    )
+    assert decision.fire is False
