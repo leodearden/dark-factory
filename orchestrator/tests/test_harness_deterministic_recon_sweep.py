@@ -155,6 +155,73 @@ class TestRevalidateDeployHealth:
         assert verdict == 'unconfirmed'
         h._recon_unit_inspector.assert_not_awaited()
 
+    # --- ζ/task 2240 DS-3: deploy_state.verify_baseline pass-through --------
+
+    @pytest.mark.asyncio
+    async def test_revalidate_passes_deploy_state_verify_baseline_to_verdict(self) -> None:
+        """_revalidate_deterministic_deploy_health must read
+        deploy_state.verify_baseline from metadata and thread it through to
+        the verdict fn — proven behaviourally: an inspect result with
+        ActiveState NOT 'active' (so the liveness-only branch would read
+        'unconfirmed') still verdicts 'healthy' once the live monotonic has
+        advanced past a persisted baseline, because the freshness branch
+        does not require ActiveState=='active'."""
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock(return_value={
+            'MainPID': 4321, 'ActiveState': 'deactivating',
+            'ActiveEnterTimestampMonotonic': 500,
+        })
+        metadata = {
+            'before_done': {'target_unit': 'fused-memory.service'},
+            'deploy_state': {
+                'phase': 'ran',
+                'verify_baseline': {'active_enter_timestamp_monotonic': 100, 'main_pid': 999},
+            },
+        }
+
+        verdict = await h._revalidate_deterministic_deploy_health(metadata)
+
+        assert verdict == 'healthy'
+
+    @pytest.mark.asyncio
+    async def test_revalidate_unconfirmed_with_baseline_when_monotonic_stale(self) -> None:
+        """The live unit reports 'active' (the OLD liveness-only check would
+        call this 'healthy'), but the freshness branch overrides it to
+        'unconfirmed' because the monotonic did NOT advance past baseline."""
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock(return_value={
+            'MainPID': 4321, 'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 100,
+        })
+        metadata = {
+            'before_done': {'target_unit': 'fused-memory.service'},
+            'deploy_state': {
+                'phase': 'ran',
+                'verify_baseline': {'active_enter_timestamp_monotonic': 100, 'main_pid': 999},
+            },
+        }
+
+        verdict = await h._revalidate_deterministic_deploy_health(metadata)
+
+        assert verdict == 'unconfirmed'
+
+    @pytest.mark.asyncio
+    async def test_revalidate_no_baseline_falls_back_to_liveness_only(self) -> None:
+        """When deploy_state has no verify_baseline, the pre-existing
+        liveness-only verdict is used (backward compat)."""
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock(return_value={
+            'MainPID': 4321, 'ActiveState': 'active', 'ActiveEnterTimestampMonotonic': 5,
+        })
+        metadata = {
+            'before_done': {'target_unit': 'fused-memory.service'},
+            'deploy_state': {'phase': 'ran'},
+        }
+
+        verdict = await h._revalidate_deterministic_deploy_health(metadata)
+
+        assert verdict == 'healthy'
+
 
 # ---------------------------------------------------------------------------
 # Amendment: _recon_inspect_unit — the real I/O default inspector.

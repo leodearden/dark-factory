@@ -14,6 +14,7 @@ import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.deploy_state import VerifyBaseline
 
 from orchestrator.systemd_inspect import (
     _INSPECT_TIMEOUT_SECS,
@@ -118,3 +119,69 @@ class TestDeterministicDeployHealthVerdict:
 
     def test_unconfirmed_when_inspect_result_is_empty(self) -> None:
         assert _deterministic_deploy_health_verdict({}) == 'unconfirmed'
+
+    # --- ζ/task 2240 DS-3: freshness branch (verify_baseline present) ------
+
+    def test_healthy_with_baseline_when_monotonic_advanced_and_pid_positive(self) -> None:
+        result = {
+            'MainPID': 1234, 'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 500,
+        }
+        baseline = {'active_enter_timestamp_monotonic': 100, 'main_pid': 999}
+        assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'healthy'
+
+    def test_healthy_with_baseline_accepts_verifybaseline_instance(self) -> None:
+        result = {
+            'MainPID': 1234, 'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 500,
+        }
+        baseline = VerifyBaseline(active_enter_timestamp_monotonic=100, main_pid=999)
+        assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'healthy'
+
+    def test_healthy_with_baseline_even_when_active_state_not_active(self) -> None:
+        """The freshness branch does not require ActiveState=='active' — only
+        MainPID>0 and monotonic advancement past baseline (real freshness
+        supersedes the liveness proxy)."""
+        result = {
+            'MainPID': 1234, 'ActiveState': 'deactivating',
+            'ActiveEnterTimestampMonotonic': 500,
+        }
+        baseline = {'active_enter_timestamp_monotonic': 100, 'main_pid': 999}
+        assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'healthy'
+
+    def test_unconfirmed_with_baseline_when_monotonic_not_advanced(self) -> None:
+        """Stale — the always-on-unit ambiguity the liveness-only CAVEAT
+        described: the unit is active, but the live monotonic equals the
+        pre-deploy baseline, so this restart demonstrably did NOT happen."""
+        result = {
+            'MainPID': 1234, 'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 100,
+        }
+        baseline = {'active_enter_timestamp_monotonic': 100, 'main_pid': 999}
+        assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'unconfirmed'
+
+    def test_unconfirmed_with_baseline_when_monotonic_regressed(self) -> None:
+        result = {
+            'MainPID': 1234, 'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 50,
+        }
+        baseline = {'active_enter_timestamp_monotonic': 100, 'main_pid': 999}
+        assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'unconfirmed'
+
+    def test_unconfirmed_with_baseline_when_pid_zero(self) -> None:
+        result = {
+            'MainPID': 0, 'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 500,
+        }
+        baseline = {'active_enter_timestamp_monotonic': 100, 'main_pid': 999}
+        assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'unconfirmed'
+
+    def test_no_baseline_preserves_liveness_only_verdict(self) -> None:
+        """verify_baseline=None (explicit) is identical to omitting it — the
+        exact pre-existing liveness-only branch (backward compat)."""
+        result = {
+            'MainPID': 1234, 'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 5,
+        }
+        assert _deterministic_deploy_health_verdict(result, verify_baseline=None) == 'healthy'
+        assert _deterministic_deploy_health_verdict(result) == 'healthy'
