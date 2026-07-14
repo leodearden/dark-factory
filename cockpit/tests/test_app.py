@@ -110,6 +110,110 @@ class TestInitialRender:
             assert 'unblock:df#2085' in row
 
 
+class TestSessionTableDefaultFilter:
+    @pytest.mark.timeout(10)
+    async def test_terminal_sessions_are_hidden_by_default_on_mount(self, tmp_path):
+        """FINDING F2 (C10 tour, esc-2303-1): the default session-table view
+        hides terminal (exited/failed-to-start) sessions on launch, so
+        "tens, not 10k" holds even when the registry carries stale history."""
+        from textual.widgets.data_table import RowDoesNotExist
+
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
+        dead = _make_record(session_slug='dead-1', status=sr.Status.EXITED)
+        for r in (live, dead):
+            sr.write_record(r, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            table = app.query_one(SessionTable)
+            assert table.get_row('live-1')
+            with pytest.raises(RowDoesNotExist):
+                table.get_row('dead-1')
+            assert table.row_count == 1
+
+
+class TestToggleHistory:
+    @pytest.mark.timeout(10)
+    async def test_h_toggles_terminal_sessions_and_round_trips(self, tmp_path):
+        """'h' (PRD-adjacent, FINDING F2 C10 tour esc-2303-1) reveals the full,
+        unfiltered history on demand and hides it again on a second press --
+        an in-memory-only toggle, re-rendered immediately (no poll tick)."""
+        from textual.widgets.data_table import RowDoesNotExist
+
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
+        dead = _make_record(session_slug='dead-1', status=sr.Status.EXITED)
+        for r in (live, dead):
+            sr.write_record(r, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            table = app.query_one(SessionTable)
+            with pytest.raises(RowDoesNotExist):
+                table.get_row('dead-1')
+            assert table.row_count == 1
+
+            await pilot.press('h')
+            await pilot.pause()
+
+            assert table.get_row('dead-1')
+            assert table.row_count == 2
+
+            await pilot.press('h')
+            await pilot.pause()
+
+            with pytest.raises(RowDoesNotExist):
+                table.get_row('dead-1')
+            assert table.row_count == 1
+
+    @pytest.mark.timeout(10)
+    async def test_toggle_persists_across_a_poll_tick(self, tmp_path):
+        """_rebuild_session_table reads self._show_history fresh on every
+        _apply_scan (both the synchronous refresh_registry path and the
+        threaded poll path route through it) -- so toggling history on and
+        then having a scan pick up a disk change must not silently revert
+        to the filtered default view. A regression that reset the flag, or
+        that hard-coded the filtered view inside _apply_scan, would only be
+        caught by a test with an intervening scan -- pressing 'h' and
+        asserting immediately (as above) is not enough."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
+        dead = _make_record(session_slug='dead-1', status=sr.Status.EXITED)
+        for r in (live, dead):
+            sr.write_record(r, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            await pilot.press('h')
+            await pilot.pause()
+
+            assert table.get_row('dead-1')
+            assert table.row_count == 2
+
+            live2 = _make_record(session_slug='live-2', status=sr.Status.RUNNING)
+            sr.write_record(live2, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert table.get_row('dead-1')
+            assert table.get_row('live-2')
+            assert table.row_count == 3
+
+
 class TestPollRefresh:
     @pytest.mark.timeout(10)
     async def test_new_record_appears_and_orders_blocked_first(self, tmp_path):
@@ -237,6 +341,39 @@ class TestRowSelectionDetail:
             assert 'Which port?' in detail.rendered_text
             assert '2085' in detail.rendered_text
             assert 'esc-99' in detail.rendered_text
+
+
+class TestReplaceRowsChildrenCountAgainstFullSet:
+    @pytest.mark.timeout(10)
+    async def test_children_counted_against_all_records_not_visible_subset(self, tmp_path):
+        """replace_rows' all_records param counts outstanding children against
+        the FULL scanned set, not just the (possibly filtered) visible
+        `records` -- so a visible parent's non-terminal child is never
+        undercounted just because the child itself is hidden from view."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        parent = _make_record(session_slug='parent-1', parent_session_id=None)
+        running_child = _make_record(
+            session_slug='child-running',
+            parent_session_id='parent-1',
+            status=sr.Status.RUNNING,
+        )
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            table.replace_rows(
+                [parent],
+                datetime.fromisoformat('2026-07-07T00:00:00+00:00'),
+                all_records=[parent, running_child],
+            )
+            await pilot.pause()
+
+            assert table.row_count == 1
+            assert table.get_row('parent-1')[4] == '1'
 
 
 class TestWriteDiscipline:

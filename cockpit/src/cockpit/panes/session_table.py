@@ -87,12 +87,16 @@ def count_outstanding_children(slug: str, all_records: list[SessionRecord]) -> i
     """Count *slug*'s non-terminal children (records with parent_session_id == slug).
 
     A terminal child (exited/failed-to-start) is not "outstanding" -- it no
-    longer needs attention -- so it's excluded per TERMINAL_STATUSES.
+    longer needs attention -- so it's excluded per TERMINAL_STATUSES. A
+    foreign/unrecognized child status is treated as non-terminal (kept,
+    counted) rather than raising -- fail-soft via _is_terminal, mirroring
+    _state_rank/state_glyph (PRD §2): one unclassifiable child must never
+    abort the whole count.
     """
     return sum(
         1
         for record in all_records
-        if record.parent_session_id == slug and Status(record.status) not in TERMINAL_STATUSES
+        if record.parent_session_id == slug and not _is_terminal(record.status)
     )
 
 
@@ -151,6 +155,61 @@ def order_sessions(records: list[SessionRecord]) -> list[SessionRecord]:
     )
 
 
+def _is_terminal(status: Status | str) -> bool:
+    """Is *status* one of TERMINAL_STATUSES (exited/failed-to-start)?
+
+    A foreign/unrecognized status resolves to False (kept, not hidden) --
+    mirrors _state_rank's fail-soft try/except (PRD §2): never hide a
+    record we can't classify.
+    """
+    try:
+        resolved = Status(status)
+    except ValueError:
+        return False
+    return resolved in TERMINAL_STATUSES
+
+
+# Hard ceiling on the default live band so ~10k scanned records never
+# drown the view. Callers pass an already blocked-first-ordered list (see
+# order_sessions), so slicing to the first `cap` retains the top-N most
+# important sessions, not an arbitrary subset.
+_DEFAULT_VISIBLE_CAP = 200
+
+
+def filter_live_sessions(
+    records: list[SessionRecord], *, cap: int = _DEFAULT_VISIBLE_CAP
+) -> list[SessionRecord]:
+    """Drop terminal-status (exited/failed-to-start) records, preserving order.
+
+    Then slices to the first `cap` of what remains -- pass an
+    already-ordered list (see order_sessions) so the cap keeps the top-N
+    of that order. Pure and total: an empty input returns [] and a
+    foreign status is kept (see _is_terminal), never raising.
+    """
+    return [record for record in records if not _is_terminal(record.status)][:cap]
+
+
+def _count_children_by_parent(all_records: list[SessionRecord]) -> dict[str, int]:
+    """Precompute {parent_slug: outstanding-child-count} in a single pass over *all_records*.
+
+    replace_rows previously called count_outstanding_children once per
+    visible row, each call rescanning the full all_records list from
+    scratch -- O(visible_rows * len(all_records)). With the history toggle
+    able to set both to the full ~10k-record set, that's ~10k^2
+    comparisons on every rebuild. Scanning all_records exactly once here
+    and looking counts up by key is O(len(all_records)) regardless of how
+    many rows are visible. Uses the same fail-soft _is_terminal check as
+    count_outstanding_children (which is left in place, still directly
+    tested, as the single-slug primitive).
+    """
+    counts: dict[str, int] = {}
+    for record in all_records:
+        parent = record.parent_session_id
+        if parent and not _is_terminal(record.status):
+            counts[parent] = counts.get(parent, 0) + 1
+    return counts
+
+
 class SessionTable(DataTable):
     """The session-registry table: one row per session, keyed by session_slug.
 
@@ -181,12 +240,25 @@ class SessionTable(DataTable):
         row_key = self.coordinate_to_cell_key(self.cursor_coordinate).row_key
         return row_key.value
 
-    def replace_rows(self, records: list[SessionRecord], now: datetime) -> None:
-        """Rebuild rows from *records* (already ordered), preserving the cursor by slug.
+    def replace_rows(
+        self,
+        records: list[SessionRecord],
+        now: datetime,
+        *,
+        all_records: list[SessionRecord] | None = None,
+    ) -> None:
+        """Rebuild VISIBLE rows from *records* (already ordered), preserving the cursor by slug.
 
-        *records* is the FULL record set (ordered) -- outstanding-children
-        counts are computed against it, not a filtered subset.
+        Outstanding-children counts are computed against *all_records* when
+        given (the full scanned set), falling back to *records* otherwise --
+        so a filtered/capped visible subset never undercounts a visible
+        parent's non-terminal children just because those children
+        themselves are hidden from view. Counted via a single O(all_records)
+        pass (_count_children_by_parent) rather than one full rescan of
+        all_records per visible row.
         """
+        counting_set = all_records if all_records is not None else records
+        children_by_parent = _count_children_by_parent(counting_set)
         previous_slug = self.highlighted_slug()
         self.clear()
         for record in records:
@@ -195,7 +267,7 @@ class SessionTable(DataTable):
                 format_title(record),
                 format_age(record.start_ts, now),
                 record.project,
-                str(count_outstanding_children(record.session_slug, records)),
+                str(children_by_parent.get(record.session_slug, 0)),
                 key=record.session_slug,
             )
         if not self.row_count:

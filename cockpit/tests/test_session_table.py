@@ -184,6 +184,23 @@ class TestCountOutstandingChildren:
 
         assert count_outstanding_children('parent-1', all_records) == 0
 
+    def test_foreign_status_child_is_treated_as_non_terminal_fail_soft(self):
+        """A child with an unrecognized status must not abort the whole
+        count -- fail-soft via _is_terminal, mirroring state_glyph/
+        _state_rank (PRD §2): never let one unclassifiable record crash
+        the view."""
+        from cockpit.panes.session_table import count_outstanding_children
+
+        parent = _make_record(session_slug='parent-1')
+        foreign_child = _make_record(
+            session_slug='child-foreign',
+            parent_session_id='parent-1',
+            status='some-foreign-status',
+        )
+        all_records = [parent, foreign_child]
+
+        assert count_outstanding_children('parent-1', all_records) == 1
+
 
 class TestOrderSessions:
     def test_blocked_sorts_above_all_else_regardless_of_age(self):
@@ -255,3 +272,77 @@ class TestOrderSessions:
         ordered = order_sessions([no_ts, has_ts])
 
         assert [r.session_slug for r in ordered] == ['has-ts', 'no-ts']
+
+
+class TestFilterLiveSessions:
+    def test_terminal_statuses_are_dropped(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        exited = _make_record(session_slug='s-exited', status=sr.Status.EXITED)
+        failed = _make_record(session_slug='s-failed', status=sr.Status.FAILED_TO_START)
+
+        assert filter_live_sessions([exited, failed]) == []
+
+    def test_non_terminal_statuses_are_all_kept(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        awaiting = _make_record(session_slug='s-awaiting', status=sr.Status.AWAITING_INPUT)
+        running = _make_record(session_slug='s-running', status=sr.Status.RUNNING)
+        launching = _make_record(session_slug='s-launching', status=sr.Status.LAUNCHING)
+        idle = _make_record(session_slug='s-idle', status=sr.Status.IDLE)
+        records = [awaiting, running, launching, idle]
+
+        kept = filter_live_sessions(records)
+
+        assert [r.session_slug for r in kept] == [r.session_slug for r in records]
+
+    def test_foreign_status_is_kept_fail_soft(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        foreign = _make_record(session_slug='s-foreign', status='some-foreign-status')
+
+        assert filter_live_sessions([foreign]) == [foreign]
+
+    def test_relative_order_of_kept_records_is_preserved(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        awaiting = _make_record(session_slug='s-awaiting', status=sr.Status.AWAITING_INPUT)
+        exited = _make_record(session_slug='s-exited', status=sr.Status.EXITED)
+        running = _make_record(session_slug='s-running', status=sr.Status.RUNNING)
+        idle = _make_record(session_slug='s-idle', status=sr.Status.IDLE)
+        ordered_input = [awaiting, exited, running, idle]
+
+        kept = filter_live_sessions(ordered_input)
+
+        assert [r.session_slug for r in kept] == ['s-awaiting', 's-running', 's-idle']
+
+    def test_empty_input_returns_empty_list(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        assert filter_live_sessions([]) == []
+
+    def test_explicit_cap_keeps_only_the_first_n_by_input_order(self):
+        from cockpit.panes.session_table import filter_live_sessions
+
+        records = [
+            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(5)
+        ]
+
+        kept = filter_live_sessions(records, cap=3)
+
+        assert [r.session_slug for r in kept] == ['s-0', 's-1', 's-2']
+
+    def test_default_cap_limits_to_default_visible_cap(self):
+        from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP, filter_live_sessions
+
+        records = [
+            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING)
+            for i in range(_DEFAULT_VISIBLE_CAP + 10)
+        ]
+
+        kept = filter_live_sessions(records)
+
+        assert len(kept) == _DEFAULT_VISIBLE_CAP
+        assert [r.session_slug for r in kept] == [
+            f's-{i}' for i in range(_DEFAULT_VISIBLE_CAP)
+        ]
