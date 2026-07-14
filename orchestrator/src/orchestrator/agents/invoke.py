@@ -635,6 +635,26 @@ def _pi_tool_name(spec: str) -> str | None:
     return _PI_BUILTIN_TOOL_MAP.get(base, base.lower())
 
 
+_PI_THINKING_LEVELS = {'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'}
+
+
+def _pi_thinking(effort: str | None) -> str | None:
+    """Map a Claude-style effort level to pi's ``--thinking`` level.
+
+    pi's thinking vocabulary (off/minimal/low/medium/high/xhigh/max) is a
+    superset of the Claude effort levels used elsewhere in this codebase
+    (low/medium/high/max — see ``EffortConfig`` in config.py), so a
+    recognized effort passes through unchanged. An unset/empty effort
+    returns None (caller omits ``--thinking`` entirely); an unrecognized
+    non-empty effort string falls back to pi's 'high' level rather than
+    being silently dropped, mirroring _write_gemini_settings'
+    ``thinking_map.get(effort, 'high')`` pattern.
+    """
+    if not effort:
+        return None
+    return effort if effort in _PI_THINKING_LEVELS else 'high'
+
+
 def _parse_pi_output(
     result: _SubprocessResult,
     model: str,
@@ -817,6 +837,10 @@ async def _invoke_pi(
             'pi', '--model', model, '--mode', 'json', '-p',
             '--session-dir', str(session_dir),
             '--system-prompt', system_prompt,
+            # Don't auto-discover the repo's AGENTS.md/CLAUDE.md — the
+            # system prompt above is the sole instruction source, mirroring
+            # how codex/gemini are driven (no double-instruction surface).
+            '--no-context-files',
         ]
 
         if resume_session_id:
@@ -824,10 +848,34 @@ async def _invoke_pi(
         elif session_id:
             cmd.extend(['--session-id', session_id])
 
-        tool_names = [_pi_tool_name(t) for t in (allowed_tools or [])]
+        thinking_level = _pi_thinking(effort)
+        if thinking_level:
+            cmd.extend(['--thinking', thinking_level])
+
+        allowed_specs = allowed_tools or []
+        tool_names = [_pi_tool_name(t) for t in allowed_specs]
+        dropped_specs = [spec for spec, name in zip(allowed_specs, tool_names, strict=True) if not name]
         tools_csv = ','.join(name for name in tool_names if name)
         if tools_csv:
             cmd.extend(['--tools', tools_csv])
+
+        disallowed_specs = disallowed_tools or []
+        exclude_names = [_pi_tool_name(t) for t in disallowed_specs]
+        dropped_specs += [spec for spec, name in zip(disallowed_specs, exclude_names, strict=True) if not name]
+        exclude_csv = ','.join(name for name in exclude_names if name)
+        if exclude_csv:
+            cmd.extend(['--exclude-tools', exclude_csv])
+
+        if dropped_specs:
+            # spike Q3: a wildcard mcp__server__* spec isn't expressible as
+            # a single pi direct-tool name — drop it from
+            # --tools/--exclude-tools but never silently: log exactly which
+            # spec(s) were lost (no silent cap, matches the repo's
+            # no-silent-truncation ethos).
+            logger.warning(
+                f'pi backend: dropped tool spec(s) not expressible as a pi '
+                f'direct-tool name (wildcards are unmappable): {", ".join(dropped_specs)}'
+            )
 
         if mcp_config:
             # pi (per the spike) reads MCP servers from .mcp.json in its
