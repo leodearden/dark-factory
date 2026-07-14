@@ -31,7 +31,20 @@ function prdTitle(prdPath) {
   return base;
 }
 
-const API = { prdTitle };
+// ── Aggregate a single status for a PRD box from its member tasks ──
+// Precedence: any-blocked > any-(in-progress|merge-deferred) >
+// any-(pending|deferred) > all-done > cancelled (the catch-all fallback,
+// covering an all-cancelled group or a done+cancelled mix that isn't ALL
+// done).
+function aggregatePrdStatus(tasks) {
+  if (tasks.some(t => t.status === 'blocked')) return 'blocked';
+  if (tasks.some(t => t.status === 'in-progress' || t.status === 'merge-deferred')) return 'in-progress';
+  if (tasks.some(t => t.status === 'pending' || t.status === 'deferred')) return 'pending';
+  if (tasks.every(t => t.status === 'done')) return 'done';
+  return 'cancelled';
+}
+
+const API = { prdTitle, aggregatePrdStatus };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = API;
