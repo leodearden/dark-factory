@@ -24,12 +24,15 @@ import json
 import logging
 import random
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'CuratorCorpusManifest',
+    'CuratorReplayItem',
     'RecordedDecision',
     'read_curator_decisions',
     'recover_recorded_action',
@@ -224,3 +227,96 @@ def select_spot_check_subset(
         selected = selected[:cap]
 
     return sorted(set(selected))
+
+
+# ---------------------------------------------------------------------------
+# CuratorReplayItem + CuratorCorpusManifest (labeled corpus data model)
+# ---------------------------------------------------------------------------
+
+_ANNOTATIONS_DIRNAME = 'annotations'
+
+
+@dataclass
+class CuratorReplayItem:
+    """One item in the curator replay corpus.
+
+    ``recorded_action``/``recorded_target_fingerprint``/``recorded_target_id``
+    are the ticket's historical (unverified) curator decision -- retained
+    only as provenance/weak signal (PRD D-6: decisions != ground truth).
+    ``gold_action``/``gold_target_fingerprint``/``gold_target_id`` are the
+    frontier-adjudicated (+ possibly human-spot-checked) label
+    :class:`~orchestrator.evals.prompt_opt.curator_scorer.CuratorActionScorer`
+    actually grades against -- NEVER the recorded fields.
+    """
+
+    ticket_id: str
+    candidate: dict
+    recorded_action: str
+    recorded_target_fingerprint: str | None
+    recorded_target_id: str | None
+    gold_action: str
+    gold_target_fingerprint: str | None
+    gold_target_id: str | None
+    split: str | None = None
+    provenance: dict = field(default_factory=dict)
+
+
+@dataclass
+class CuratorCorpusManifest:
+    """Collection of :class:`CuratorReplayItem`\\ s with save/load.
+
+    Mirrors ``reviewer_trial.corpus.CorpusManifest``'s on-disk shape: a
+    top-level ``manifest.json`` listing ``(ticket_id, split)`` plus one
+    ``annotations/<ticket_id>.json`` file per item holding the full item
+    (candidate, recorded_*, gold_*, provenance).
+    """
+
+    items: list[CuratorReplayItem] = field(default_factory=list)
+    version: str = '1.0'
+    split_seed: int | None = None
+
+    def get_item(self, ticket_id: str) -> CuratorReplayItem | None:
+        for item in self.items:
+            if item.ticket_id == ticket_id:
+                return item
+        return None
+
+    def save(self, path: Path) -> None:
+        """Save the manifest + one annotation file per item."""
+        corpus_dir = path.parent
+        ann_dir = corpus_dir / _ANNOTATIONS_DIRNAME
+        ann_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest_data: dict[str, Any] = {'version': self.version, 'items': []}
+        if self.split_seed is not None:
+            manifest_data['split_seed'] = self.split_seed
+
+        for item in self.items:
+            ann_file = ann_dir / f'{item.ticket_id}.json'
+            ann_file.write_text(json.dumps(asdict(item), indent=2))
+
+            entry: dict[str, Any] = {'ticket_id': item.ticket_id}
+            if item.split is not None:
+                entry['split'] = item.split
+            manifest_data['items'].append(entry)
+
+        path.write_text(json.dumps(manifest_data, indent=2))
+
+    @classmethod
+    def load(cls, path: Path) -> CuratorCorpusManifest:
+        """Load a manifest + its per-item annotation files."""
+        corpus_dir = path.parent
+        raw = json.loads(path.read_text())
+
+        items: list[CuratorReplayItem] = []
+        for entry in raw['items']:
+            ticket_id = entry['ticket_id']
+            ann_file = corpus_dir / _ANNOTATIONS_DIRNAME / f'{ticket_id}.json'
+            data = json.loads(ann_file.read_text())
+            items.append(CuratorReplayItem(**data))
+
+        return cls(
+            items=items,
+            version=raw.get('version', '1.0'),
+            split_seed=raw.get('split_seed'),
+        )
