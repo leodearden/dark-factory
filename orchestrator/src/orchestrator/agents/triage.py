@@ -297,6 +297,32 @@ def parse_triage_result(result) -> dict | None:
     return None
 
 
+def extract_triage_verdict(envelope: dict | None) -> dict | None:
+    """Unwrap and validate a verdict-tools envelope's triage payload.
+
+    ``envelope`` is the schema-versioned artifact read via
+    ``TaskArtifacts.read_verdict('triage')``:
+    ``{role, schema_version, session_id, emitted_at, verdict: {...}}``.
+    Returns the inner ``verdict`` dict on success, or None on any failure
+    (no envelope, non-dict envelope, missing/non-dict ``verdict``, or a
+    verdict dict missing one of the required keys) — mirroring
+    :func:`parse_triage_result`'s fail-safe contract so the caller can fall
+    back to inline triage.
+    """
+    if not isinstance(envelope, dict):
+        logger.warning('Triage verdict envelope missing or not a dict (got %r)', type(envelope).__name__)
+        return None
+    verdict = envelope.get('verdict')
+    if not isinstance(verdict, dict):
+        logger.warning('Triage verdict envelope missing a dict "verdict" key')
+        return None
+    required = {'accepted', 'skipped', 'proposed_task_groups'}
+    if not required <= verdict.keys():
+        logger.warning('Triage verdict missing required keys: %s', required - verdict.keys())
+        return None
+    return verdict
+
+
 def format_pretriaged_detail(
     triage_result: dict,
     original_suggestions: list[dict],
