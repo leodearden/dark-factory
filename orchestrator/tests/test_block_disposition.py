@@ -19,10 +19,31 @@ Test coverage:
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import inspect
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
+
+# Cross-module reuse — conftest.py injects orchestrator/tests onto sys.path
+# (see test_workflow_terminal_report.py for the same precedent). ``_derive_
+# meta_root_like_production`` is imported (not just the plain helpers)
+# because it is an autouse fixture in test_workflow_e2e.py — autouse only
+# auto-applies within a module where pytest can SEE the fixture.
+from test_workflow_e2e import (
+    AgentStub,
+    _build_workflow,
+    _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see above
+    _init_repo,
+)
+
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps
+from orchestrator.scheduler import TaskAssignment
+from orchestrator.verify_categories import FailureCategory
+from orchestrator.workflow_types import WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # step-01: RequeueKind + BlockDisposition value types
@@ -300,3 +321,152 @@ class TestBD2Completeness:
         # classify_failure is still TOTAL — it falls back to the default.
         disp = classify_failure(_BrandNewFailure('surprise'))
         assert disp is not None
+
+
+# ---------------------------------------------------------------------------
+# step-07: run()-level BLOCK outcome-kind tests (mirrors test_workflow_
+# terminal_report.py's e2e-style block-path fixtures verbatim).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    """A bare-minimum git repo with an initial commit (mirrors test_workflow_e2e.py)."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_init_repo(repo))
+    return repo
+
+
+@pytest.fixture
+def config(git_repo: Path) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        project_root=git_repo,
+        max_concurrent_tasks=1,
+        max_execute_iterations=5,
+        max_verify_attempts=3,
+        max_review_cycles=2,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+
+
+@pytest.fixture
+def git_ops(config: OrchestratorConfig) -> GitOps:
+    return GitOps(config.git, config.project_root)
+
+
+@pytest.fixture
+def task_assignment() -> TaskAssignment:
+    return TaskAssignment(
+        task_id='42',
+        task={
+            'id': '42',
+            'title': 'Add farewell function',
+            'description': 'Add a farewell(name) function to lib.py with tests',
+            'status': 'pending',
+            'metadata': {'files': ['lib']},
+            'dependencies': [],
+        },
+        modules=['lib'],
+    )
+
+
+@pytest.mark.asyncio
+class TestRunLevelBlockOutcomeKind:
+    """``run()`` collapses the 8-clause ladder to ONE ``classify_failure``-
+    driven block path (boundary rows 7/8). Still RED at this step — ``_drive()``
+    is not collapsed until step-8, so ``TerminalReport.category`` stays the
+    hard-``None`` of the pre-refactor ladder for every case below.
+
+    Each case forces ``_drive()`` to raise by patching ``invoke_agent`` (the
+    earliest awaited coroutine in the PLAN phase) — the same "early-phase
+    coroutine" technique ``test_workflow_terminal_report.py`` already uses
+    for ``AllAccountsCappedException``, generalized to the other ladder
+    exception types. ``_mark_blocked`` is wrapped (not replaced) with an
+    ``AsyncMock`` spy so the REAL implementation still runs (producing a
+    genuine ``TerminalReport``) while the call's ``escalate_to_human`` kwarg
+    stays inspectable — ``TerminalReport`` itself carries no such field.
+    """
+
+    async def _run_forcing_exception(
+        self, config, git_ops, task_assignment, monkeypatch, exc: BaseException,
+    ):
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        async def raise_exc(*args, **kwargs):
+            raise exc
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', raise_exc)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+        mark_blocked_spy = AsyncMock(wraps=workflow._mark_blocked)
+        workflow._mark_blocked = mark_blocked_spy  # type: ignore[method-assign]
+
+        report = await workflow.run()
+        return report, mark_blocked_spy
+
+    async def test_all_accounts_capped_still_blocks_with_cap_reason(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        from shared.cli_invoke import AllAccountsCappedException
+
+        exc = AllAccountsCappedException(retries=3, elapsed_secs=120.0, label='Task 42 [architect]')
+        report, mark_blocked_spy = await self._run_forcing_exception(
+            config, git_ops, task_assignment, monkeypatch, exc,
+        )
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.reason.lower().startswith('all accounts capped')
+        assert report.category is FailureCategory.NONE
+        assert mark_blocked_spy.await_args.kwargs.get('escalate_to_human', False) is False
+
+    async def test_verify_infra_error_blocks_and_escalates_to_human(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        from orchestrator.verify import VerifyInfraError
+
+        exc = VerifyInfraError(phase='verify', errno=28)
+        report, mark_blocked_spy = await self._run_forcing_exception(
+            config, git_ops, task_assignment, monkeypatch, exc,
+        )
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.category is FailureCategory.NONE
+        assert mark_blocked_spy.await_args.kwargs.get('escalate_to_human') is True
+
+    async def test_worktree_conflict_error_blocks_and_escalates_to_human(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        from orchestrator.git_ops import WorktreeConflictError
+
+        exc = WorktreeConflictError(Path('/tmp/wt'), ['a.py'])
+        report, mark_blocked_spy = await self._run_forcing_exception(
+            config, git_ops, task_assignment, monkeypatch, exc,
+        )
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.category is FailureCategory.NONE
+        assert mark_blocked_spy.await_args.kwargs.get('escalate_to_human') is True
+
+    async def test_bare_runtime_error_blocks_via_steward_path(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """A bare (unclassified) failure routes to the steward path — i.e.
+        ``escalate_to_human=False`` — same as the pre-refactor broad
+        ``except Exception`` tail."""
+        exc = RuntimeError('unexpected failure mid-plan')
+        report, mark_blocked_spy = await self._run_forcing_exception(
+            config, git_ops, task_assignment, monkeypatch, exc,
+        )
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.category is FailureCategory.NONE
+        assert mark_blocked_spy.await_args.kwargs.get('escalate_to_human', False) is False
