@@ -12,6 +12,7 @@ test in this module so a bound outbox never leaks into another test.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -556,6 +557,44 @@ class TestRecoverBeforeMerge:
         assert outcome is None
         assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
+
+    async def test_warning_scoped_to_ancestor_without_work_only(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """The 'branch appears merged ... but has no implementation
+        entries' breadcrumb (task 2504 subtlety A) must fire ONLY on the
+        ancestor-but-no-work spurious-merge-signal sub-case — never on a
+        normal divergent (not-ancestor) merge, which must stay silent."""
+        breadcrumb = 'but has no implementation entries'
+
+        # (a) Ancestor + no prior work → spurious merge signal → breadcrumb.
+        f_ancestor = _make(
+            worktree=tmp_path / 'wt-ancestor', project_root=tmp_path / 'proj-ancestor',
+            branch_on_main=True,
+        )
+        f_ancestor.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
+            return_value=_PriorImplStatus(has_work=False, entries=[], base_commit=None),
+        )
+        with caplog.at_level(logging.WARNING):
+            outcome_ancestor = await f_ancestor.wf._recover_before_merge(
+                'branchhead123', 'mainsha123',
+            )
+        assert outcome_ancestor is None
+        assert breadcrumb in caplog.text
+
+        caplog.clear()
+
+        # (b) NOT an ancestor → real divergent merge → must stay silent.
+        f_not_ancestor = _make(
+            worktree=tmp_path / 'wt-not-ancestor', project_root=tmp_path / 'proj-not-ancestor',
+            branch_on_main=False,
+        )
+        with caplog.at_level(logging.WARNING):
+            outcome_not_ancestor = await f_not_ancestor.wf._recover_before_merge(
+                'branchhead123', 'mainsha123',
+            )
+        assert outcome_not_ancestor is None
+        assert breadcrumb not in caplog.text
 
 
 # ---------------------------------------------------------------------------
