@@ -156,3 +156,122 @@ def _make_req(
         merge_first_enqueued_at=merge_first_enqueued_at,
         **kwargs,
     )
+
+
+# ── step-1/2: Scenarios 1+2 — VerifyCmd render round-trip (P2) + OPAQUE never
+#              scoped (P1); Boundary-test sketch rows 1-2 ────────────────────
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# The real orchestrator/orchestrator.yaml pytest test_command (uv `--directory`
+# form) — drives the scenario-1b producer<->runner scoped drive. NOT used for
+# the strict round-trip assertion in scenario 1a: render() normalises a
+# `--directory` flag into a leading `cd <dir> &&`, which is argv-equivalent in
+# *effect* but not shlex-list-equal to the original (one extra `&&` token) —
+# the round-trip corpus below is ported from test_verify_cmd.py's own fixtures,
+# which are already --directory-free/leading-cd-form and provably round-trip.
+_PYTEST_UV_DIRECTORY_RAW = (
+    'uv run --project orchestrator --directory orchestrator pytest tests/ --tb=short -q'
+)
+
+# The historical broken lint/type_check &&-chain (orchestrator/config.yaml:50)
+# — recognised-but-unstructurable (ruff + a follow-up script, not pytest/cargo
+# chain-aware), classifies OPAQUE, and must never be scoped (P1).
+_LINT_CHAIN_RAW = (
+    'uv run ruff check shared escalation fused-memory orchestrator dashboard && '
+    'python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests '
+    'escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+)
+
+
+class TestVerifyCmdRoundTrip:
+    """Scenarios 1+2 — VerifyCmd render round-trip (P2) + OPAQUE never scoped (P1).
+
+    Drives the REAL parse_config_command/render/scope_to/strip_cwd (β) against
+    representative non-OPAQUE config commands (ported from test_verify_cmd.py's
+    proven-safe round-trip corpus) and closes the producer<->runner loop for
+    the pytest case: scope_to's structured output (producer side) is rendered
+    and ACTUALLY EXECUTED (runner side) against a throwaway probe file,
+    proving the two sides agree on what "scoped" means. Row 2/P1 pins the
+    real historical broken lint/type_check &&-chain (orchestrator/config.yaml:50)
+    as OPAQUE and never scoped.
+
+    RED until step-2 GREEN imports parse_config_command/render/ToolKind/
+    scope_to/strip_cwd/VerifyCmd from orchestrator.verify_cmd and adds the
+    subprocess-exec wiring.
+    """
+
+    # ── scenario 1a / Row 1 / P2: render round-trip is argv-equivalent per
+    #    non-OPAQUE ToolKind. Corpus ported verbatim from test_verify_cmd.py's
+    #    TestRenderRoundTrip.test_round_trip_argv_equivalent (β) — the exact
+    #    fixtures already proven to dodge both round-trip hazards (a
+    #    `--directory` flag normalising into an extra leading `cd &&` token,
+    #    and a flags/targets interleaving render always re-emits flags-first).
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'pytest tests/test_x.py',
+            'ruff check src/foo.py',
+            'pyright src/foo.py',
+            'cargo test --workspace',
+            'cargo clippy --workspace',
+            'npx --version',
+            'uv run --project shared pytest tests/x.py',
+            'cd fused-memory && npx pyright',
+        ],
+        ids=[
+            'pytest', 'ruff', 'pyright', 'cargo_test', 'cargo_clippy', 'npx',
+            'uv_run_project', 'leading_cd_npx',
+        ],
+    )
+    def test_render_round_trip_is_argv_equivalent_per_tool_kind(self, raw):
+        """shlex.split(render(parse(x))) == shlex.split(x) for every non-OPAQUE tool."""
+        cmd = parse_config_command(raw)
+        assert cmd.tool is not ToolKind.OPAQUE
+        assert shlex.split(render(cmd)) == shlex.split(raw)
+
+    # ── scenario 1b / Row 1: producer<->runner scoped-pytest drive ──────────
+    def test_scoped_pytest_producer_and_runner_agree_on_scope(self, tmp_path):
+        """scope_to's structured output (producer) IS what render+exec (runner) runs.
+
+        Producer side: parse the real orchestrator.yaml test_command and
+        scope_to() it down to one throwaway probe file. Runner side: render()
+        that scoped VerifyCmd (strip_cwd'd so it runs unchanged from the repo
+        root with an absolute probe path) and ACTUALLY EXECUTE it via
+        `bash -c` — if the two sides disagreed on what "scoped" means, this
+        would either fail to launch or collect more than the one scoped test.
+        """
+        probe = tmp_path / 'test_verify_cmd_scope_probe.py'
+        probe.write_text('def test_probe_passes():\n    assert True\n')
+
+        parsed = parse_config_command(_PYTEST_UV_DIRECTORY_RAW)
+        scoped = scope_to(parsed, [str(probe)])
+        runnable = strip_cwd(scoped)
+
+        argv = shlex.split(render(runnable))
+        assert argv[-1] == str(probe)
+        assert 'tests/' not in argv  # the original unscoped target is gone, not appended
+        assert '--tb=short' in argv and '-q' in argv  # other flags survive scoping
+
+        proc = subprocess.run(
+            ['bash', '-c', render(runnable)],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert '1 passed' in proc.stdout
+
+    # ── scenario 2 / Row 2 / P1: OPAQUE is never scoped ──────────────────────
+    def test_opaque_lint_chain_is_never_scoped(self):
+        """The historical broken &&-chain classifies OPAQUE and scope_to no-ops on it.
+
+        render(parse(x)) == x verbatim (raw retained unchanged) — this is the
+        exact lint_command value at orchestrator/config.yaml:50 that regressed
+        under the old string-surgery scoper.
+        """
+        cmd = parse_config_command(_LINT_CHAIN_RAW)
+        assert cmd.tool is ToolKind.OPAQUE
+        assert scope_to(cmd, ['orchestrator/src/orchestrator/foo.py']) is cmd
+        assert render(parse_config_command(_LINT_CHAIN_RAW)) == _LINT_CHAIN_RAW
