@@ -1144,6 +1144,57 @@ class TestBacklogVerdict:
 
 
 # ===========================================================================
+# Tests: _resolve_check_exit_code (task 2596 amendment, reviewer_comprehensive #1)
+# ===========================================================================
+
+class TestResolveCheckExitCode:
+    """Tests for _resolve_check_exit_code(report, max_backlog) — the report
+    -> exit-code wiring main() delegates to for --check.
+
+    Extracted from main() (task 2596 amendment, reviewer_comprehensive #1)
+    so this resolution — pick after.total_source when an 'after' key is
+    present (an --apply run), else fall back to before.total_source (a
+    dry-run/--check-only invocation) — is unit-testable without any live
+    I/O. Previously this branch was reachable only by running main() itself,
+    so a regression (e.g. a KeyError from a reshaped report, or resolving
+    against the wrong count on a dry-run) had no test coverage even though
+    the sweep is meant to drive a deterministic before_done predicate, where
+    a wrong exit code silently mis-gates a deployment.
+    """
+
+    def test_dry_run_report_holds_uses_before_total_source(self):
+        """A report with no 'after' key (dry-run) resolves against
+        before.total_source; at-or-under max_backlog holds -> 0."""
+        report = {'before': {'total_source': 5, 'total_with_kind': 5}}
+        assert _mod._resolve_check_exit_code(report, max_backlog=5) == 0
+
+    def test_dry_run_report_violated_uses_before_total_source(self):
+        """A report with no 'after' key (dry-run) resolves against
+        before.total_source; over max_backlog is violated -> 1."""
+        report = {'before': {'total_source': 6, 'total_with_kind': 6}}
+        assert _mod._resolve_check_exit_code(report, max_backlog=5) == 1
+
+    def test_apply_report_holds_uses_after_not_before_total_source(self):
+        """A report WITH an 'after' key (--apply) must resolve against
+        after.total_source, not before.total_source — before is still over
+        budget here, but the post-delete after count holds."""
+        report = {
+            'before': {'total_source': 50, 'total_with_kind': 50},
+            'after': {'total_source': 0, 'total_with_kind': 0},
+        }
+        assert _mod._resolve_check_exit_code(report, max_backlog=0) == 0
+
+    def test_apply_report_violated_uses_after_not_before_total_source(self):
+        """A report WITH an 'after' key (--apply) must resolve against
+        after.total_source even when it is still violated post-delete."""
+        report = {
+            'before': {'total_source': 50, 'total_with_kind': 50},
+            'after': {'total_source': 3, 'total_with_kind': 3},
+        }
+        assert _mod._resolve_check_exit_code(report, max_backlog=0) == 1
+
+
+# ===========================================================================
 # Tests: _build_parser (task 2596 CLI surface)
 # ===========================================================================
 

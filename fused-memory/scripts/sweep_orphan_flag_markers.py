@@ -617,6 +617,30 @@ def backlog_verdict(after_total_source: int, max_backlog: int) -> int:
     return 0 if after_total_source <= max_backlog else 1
 
 
+def _resolve_check_exit_code(report: dict, max_backlog: int) -> int:
+    """Resolve --check's exit code from a sweep report.
+
+    Extracted from :func:`main` (task 2596 amendment, reviewer_comprehensive
+    #1) so the report -> exit-code wiring is unit-testable without any live
+    I/O: uses ``report['after']['total_source']`` when an ``'after'`` key is
+    present (an ``--apply`` run), falling back to
+    ``report['before']['total_source']`` otherwise (a dry-run/``--check``-only
+    invocation, which never populates ``'after'``).
+
+    Pure, sync, no I/O.
+
+    Args:
+        report: The dict returned by :func:`run`.
+        max_backlog: Ceiling forwarded to :func:`backlog_verdict`.
+
+    Returns:
+        ``0`` if the resolved count holds, else ``1`` — see
+        :func:`backlog_verdict`.
+    """
+    after = report.get('after', report['before'])
+    return backlog_verdict(after['total_source'], max_backlog)
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -781,8 +805,7 @@ def main() -> int:
     print(json.dumps(report, indent=2))
 
     if args.check:
-        after = report.get('after', report['before'])
-        return backlog_verdict(after['total_source'], args.max_backlog)
+        return _resolve_check_exit_code(report, args.max_backlog)
 
     return 0
 
