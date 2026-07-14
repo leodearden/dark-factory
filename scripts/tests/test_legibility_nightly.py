@@ -848,3 +848,88 @@ def test_run_nightly_fail_loud_on_extractor_crash(tmp_path, monkeypatch):
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
     assert after_log == before_log
+
+
+# ---------------------------------------------------------------------------
+# step-23/24: main(argv) -- CLI: `run` + `resolve-config` subcommands
+# ---------------------------------------------------------------------------
+
+def test_main_resolve_config_prints_path_and_returns_zero(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / 'proj-a' / 'docs' / 'legibility' / 'legibility.yaml'
+
+    def _fake_resolve(project_id, search_roots=None):
+        assert project_id == 'proj_a'
+        return config_path
+
+    monkeypatch.setattr(nightly, 'resolve_config_path', _fake_resolve)
+
+    exit_code = nightly.main(['resolve-config', 'proj_a'])
+
+    assert exit_code == 0
+    assert capsys.readouterr().out.strip() == str(config_path)
+
+
+def test_main_resolve_config_unknown_id_returns_nonzero(monkeypatch, capsys):
+    def _fake_resolve(project_id, search_roots=None):
+        raise FileNotFoundError(f'no legibility.yaml found for project_id={project_id!r}')
+
+    monkeypatch.setattr(nightly, 'resolve_config_path', _fake_resolve)
+
+    exit_code = nightly.main(['resolve-config', 'proj_unknown'])
+
+    assert exit_code != 0
+
+
+def test_main_run_with_config_invokes_run_nightly_and_returns_exit_code(monkeypatch, tmp_path):
+    config_path = tmp_path / 'legibility.yaml'
+    projects_root = tmp_path / 'projects'
+    calls = []
+
+    def _fake_run_nightly(**kwargs):
+        calls.append(kwargs)
+        return nightly.NightlyResult(exit_code=0)
+
+    monkeypatch.setattr(nightly, 'run_nightly', _fake_run_nightly)
+
+    exit_code = nightly.main([
+        'run', '--config', str(config_path),
+        '--projects-root', str(projects_root),
+        '--date', '2026-07-13',
+    ])
+
+    assert exit_code == 0
+    assert len(calls) == 1
+    kwargs = calls[0]
+    assert kwargs['config_path'] == str(config_path)
+    assert kwargs['project_id'] is None
+    assert kwargs['projects_root'] == str(projects_root)
+    assert kwargs['target_date'] == date(2026, 7, 13)
+
+
+def test_main_run_with_project_id_resolves_then_runs(monkeypatch):
+    calls = []
+
+    def _fake_run_nightly(**kwargs):
+        calls.append(kwargs)
+        return nightly.NightlyResult(exit_code=0)
+
+    monkeypatch.setattr(nightly, 'run_nightly', _fake_run_nightly)
+
+    exit_code = nightly.main(['run', '--project-id', 'proj_a'])
+
+    assert exit_code == 0
+    assert len(calls) == 1
+    kwargs = calls[0]
+    assert kwargs['config_path'] is None
+    assert kwargs['project_id'] == 'proj_a'
+
+
+def test_main_run_propagates_fail_loud_exit_code(monkeypatch):
+    def _fake_run_nightly(**kwargs):
+        return nightly.NightlyResult(exit_code=1, escalated=True, reason='boom')
+
+    monkeypatch.setattr(nightly, 'run_nightly', _fake_run_nightly)
+
+    exit_code = nightly.main(['run', '--project-id', 'proj_a'])
+
+    assert exit_code == 1
