@@ -2449,6 +2449,82 @@ async def test_mid_run_cancel_window_grace(harness: Harness, tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# task 2243 (W10-θ2) step-11 — LEAVE parity + race-guard removal.
+#
+# _reconcile_stranded_in_progress's own `if mid_run and
+# self.scheduler.is_actively_held(tid): continue` guard duplicates what
+# recovery_for already derives (is_actively_held folds into
+# report.live_claimant, and ANY live claimant collapses every _RECOVERY row
+# to the LEAVE default). Step-12 deletes that driver-level guard together
+# with _reconcile_one_stranded's own has_open_l1(tid) veto (L1-only; the
+# resolver's row (f) / LEAVE default already folds an open escalation at
+# ANY level). Both tests below are RED under the pre-step-12 code: the
+# live-claimant case is currently protected ONLY by the driver's own
+# continue (so _reconcile_one_stranded is never even called), and the
+# open-L2-escalation case is currently NOT protected at all (has_open_l1
+# misses it and the sweep falls through to an incorrect revert).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mid_run_live_claimant_not_shortcut_by_driver_guard(harness: Harness):
+    """A live-claimant (is_actively_held) in-progress task is still left
+    untouched once the driver's own continue-guard is removed — driven
+    purely by recovery_for's LEAVE classification, not a driver short-circuit.
+
+    RED under current code: the driver's `if mid_run and
+    self.scheduler.is_actively_held(tid): continue` guard 'continue's before
+    _reconcile_one_stranded is ever called, so the spy below is never
+    invoked and the assertion fails.
+    """
+    harness.scheduler._dispatched = {'70'}  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = mock_lock_table()  # type: ignore[attr-defined]
+    harness.scheduler.get_statuses.return_value = ({'70': 'in-progress'}, None)  # type: ignore[attr-defined]
+    # No worktree/plan.lock for '70' — if the sweep ever fell through to the
+    # revert applier despite the live claimant, it would revert.
+
+    spy = AsyncMock(wraps=harness._reconcile_one_stranded)
+    harness._reconcile_one_stranded = spy  # type: ignore[method-assign]
+
+    changed = await harness._reconcile_stranded_in_progress(mid_run=True)
+
+    spy.assert_awaited_once_with('70', 'in-progress', mid_run=True)
+    assert changed == 0
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_in_progress_on_main_with_open_l2_escalation_leaves_untouched(
+    harness: Harness, tmp_path: Path,
+):
+    """An in-progress task whose branch is already on main but carries an
+    OPEN escalation at level 2 (not level 1) must be left alone —
+    recovery_for's row (f) folds an open escalation at ANY level, not just
+    level 1, into the LEAVE veto.
+
+    RED under current code: the in-function guard checks
+    self._escalation_queue.has_open_l1(tid) (level=1 ONLY), which misses an
+    L2-only escalation and falls through to the revert applier.
+    """
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    harness.scheduler.get_statuses.return_value = ({'71': 'in-progress'}, None)  # type: ignore[attr-defined]
+    # No plan.lock/worktree for '71' — if the sweep fell through to the
+    # revert applier, it would revert (no-lock orphan path).
+
+    harness._escalation_queue = EscalationQueue(tmp_path / 'esc_l2_on_main')
+    harness._escalation_queue.submit(Escalation(
+        id=harness._escalation_queue.make_id('71'),
+        task_id='71', agent_role='steward', severity='critical',
+        category='infra_issue', summary='open L2, on-main evidence present',
+        level=2, status='pending',
+    ))
+
+    changed = await harness._reconcile_stranded_in_progress()
+
+    assert changed == 0
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
 # R4: blocked-task pass (Stage 4)
 # ---------------------------------------------------------------------------
 
