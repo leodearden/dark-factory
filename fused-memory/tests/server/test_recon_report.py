@@ -997,6 +997,88 @@ class TestCreateReconReportServer:
 
 
 # ---------------------------------------------------------------------------
+# task-2432 step-3/4 (bullet 1a, FastMCP wrapper): actionable computed
+# default via mcp._tool_manager.call_tool — RED until step-4 changes the
+# registered add_finding tool wrapper's `actionable` parameter from
+# `bool = True` to a `bool | None = None` sentinel passed through unchanged
+# to state.add_finding.
+# ---------------------------------------------------------------------------
+
+
+class TestAddFindingWrapperActionableDefault:
+    """Verify the registered add_finding FastMCP tool applies the SAME
+    computed actionable default as ReconReportState.add_finding when the
+    caller omits `actionable` from the call_tool arguments dict — a static
+    wrapper default of True would silently override the state method's
+    computed default before it ever sees `None`.
+    """
+
+    def _make(self):
+        from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        mcp = create_recon_report_server(state)
+        return state, mcp
+
+    async def _actionable_via_call_tool(self, state, mcp, **finding_kwargs):
+        tm = mcp._tool_manager
+        await tm.call_tool('start_report', {
+            'run_id': 'r1', 'stage': 'memory_consolidator', 'project_id': 'dark_factory',
+        })
+        args = dict(
+            run_id='r1',
+            severity='moderate',
+            category='memory_stale',
+            description='d',
+            suggested_action='a',
+        )
+        args.update(finding_kwargs)
+        result = await tm.call_tool('add_finding', args)
+        assert 'finding_id' in result, result
+        report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report is not None
+        matches = [item for item in report['flagged_items'] if item['finding_id'] == result['finding_id']]
+        assert len(matches) == 1
+        return matches[0]['actionable']
+
+    @pytest.mark.asyncio
+    async def test_null_task_id_omitted_actionable_defaults_false(self):
+        state, mcp = self._make()
+        actionable = await self._actionable_via_call_tool(
+            state, mcp, task_id=None, flag_type='orphaned_knowledge',
+        )
+        assert actionable is False
+
+    @pytest.mark.asyncio
+    async def test_cross_project_category_omitted_actionable_defaults_false(self):
+        state, mcp = self._make()
+        actionable = await self._actionable_via_call_tool(
+            state, mcp,
+            category='cross_project_routing',
+            task_id='123',
+            flag_type='cross_project',
+        )
+        assert actionable is False
+
+    @pytest.mark.asyncio
+    async def test_normal_finding_omitted_actionable_defaults_true(self):
+        state, mcp = self._make()
+        actionable = await self._actionable_via_call_tool(
+            state, mcp, task_id='123', flag_type='orphaned_knowledge',
+        )
+        assert actionable is True
+
+    @pytest.mark.asyncio
+    async def test_explicit_true_with_null_task_id_stays_true(self):
+        state, mcp = self._make()
+        actionable = await self._actionable_via_call_tool(
+            state, mcp, actionable=True, task_id=None, flag_type='orphaned_knowledge',
+        )
+        assert actionable is True
+
+
+# ---------------------------------------------------------------------------
 # step-17: _build_recon_report_components helper in main.py — RED until step-18
 # ---------------------------------------------------------------------------
 
