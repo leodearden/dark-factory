@@ -47,6 +47,7 @@ from shared.cli_invoke import (
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 
+from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.reconciliation.context_assembler import estimate_tokens
 
@@ -2034,14 +2035,43 @@ class TaskCurator:
         lock_depth: int,
         project_root: str,
     ) -> _PoolEntry | None:
-        """Fetch a full task for an embedding neighbor, fall back to payload."""
+        """Fetch a full task for an embedding neighbor, fall back to payload.
+
+        ``get_task`` is called without a ``tag`` — it resolves to
+        ``DEFAULT_TAG``. That does NOT match the Qdrant corpus's own scope:
+        the corpus is keyed by ``project_id`` ALONE (see the tag-scope
+        CAUTION on ``prune_orphans`` above), and ``record_task``/
+        ``index_committed_tasks`` write a task's vector regardless of which
+        tag it was filed under. So a ``TaskNotFoundError`` here does NOT
+        prove the task is gone — it also fires for a live task filed under
+        a non-default tag, which is then excluded from the pool exactly
+        like a genuine deletion (task 2521 RC2). This is an accepted
+        tradeoff, not a correctness proof: worst case a near-identical
+        re-file of a non-default-tag task is filed as a duplicate instead
+        of combined — the same "duplicate is cheap" bias this method
+        already applies to inconclusive errors below. It is the same
+        known multi-tag gap tracked on ``prune_orphans``, not fixed here.
+        """
         if self._taskmaster is not None:
             try:
                 task = await self._taskmaster.get_task(tid, project_root)
                 entry = _to_pool_entry(task, source=source, lock_depth=lock_depth)
                 if entry is not None:
                     return entry
+            except TaskNotFoundError:
+                # Zero-row absence under DEFAULT_TAG: usually the task was
+                # removed and this Qdrant point is an orphan, but it also
+                # fires for a live non-default-tag task (see the docstring
+                # tag-scope note above) — exclude either way rather than
+                # fabricating a live-looking entry from the stale payload.
+                # A duplicate is a cheap failure; silently losing a real
+                # candidate to a fabricated "existing" match is not.
+                return None
             except Exception:
+                # Inconclusive (e.g. TASKMASTER_UNAVAILABLE, a raw driver
+                # error, or _to_pool_entry rejecting a malformed task): bias
+                # to the cheap failure and keep the conservative thin entry
+                # built below, rather than risk dropping a live candidate.
                 pass
         # Fallback: build a thin entry from the qdrant payload
         return _PoolEntry(

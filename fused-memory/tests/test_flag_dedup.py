@@ -1861,6 +1861,39 @@ class TestConfirmTaskAbsent:
                 f'confirm_task_absent must return False for non-dict {bad!r} (fail-closed)'
             )
 
+    def test_true_for_tasknotfounderror_subclass(self):
+        """Returns True for the TaskNotFoundError subclass's error_type name too.
+
+        get_task's sqlite backend now raises the more-specific TaskNotFoundError
+        subclass (task-2521) on a definitive zero-row absence, so the normalised
+        {error, error_type} dict carries error_type == 'TaskNotFoundError' instead
+        of the base 'TaskmasterError'. confirm_task_absent must accept both names
+        so the reconciliation false-absence path does not fail-closed (stop
+        confirming absence) for every genuinely-absent task after that change.
+
+        RED: confirm_task_absent only accepts error_type == 'TaskmasterError', so
+        the 'TaskNotFoundError' variant currently returns False.
+        """
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        not_found = {
+            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 3',
+            'error_type': 'TaskNotFoundError',
+        }
+        assert confirm_task_absent(not_found) is True, (
+            'confirm_task_absent must return True for the TaskNotFoundError subclass '
+            '(error_type widening for task-2521)'
+        )
+
+        # The base TaskmasterError case must still return True (unchanged).
+        base = {
+            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 3',
+            'error_type': 'TaskmasterError',
+        }
+        assert confirm_task_absent(base) is True, (
+            'confirm_task_absent must still return True for the base TaskmasterError error_type'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step 9: filter_false_absence_flags (RED tests)
@@ -2066,6 +2099,42 @@ class TestFilterFalseAbsenceFlags:
         assert absent_for_absent in result, 'Flag for confirmed-absent task must be kept'
         assert non_absence in result, 'Non-absence flag must be kept'
         assert no_id in result, 'Absence flag without task_id must be kept'
+
+    @pytest.mark.asyncio
+    async def test_absence_flag_when_get_task_raises_tasknotfounderror_is_kept(self):
+        """Absence flag whose get_task RAISES TaskNotFoundError is KEPT.
+
+        task-2521 changes the sqlite backend's get_task to raise the more
+        specific TaskNotFoundError subclass (instead of the base TaskmasterError)
+        on a definitive zero-row absence. filter_false_absence_flags normalises
+        the raised exception's type name into the {error, error_type} dict passed
+        to confirm_task_absent, so this pins that the widened classifier keeps
+        the flag for the new subclass — guarding against the reconciliation
+        false-absence path silently fail-closing (never confirming absence, so
+        orphaned knowledge edges for removed tasks are never deleted) after the
+        sqlite backend change.
+
+        RED: confirm_task_absent does not yet accept error_type ==
+        'TaskNotFoundError', so the flag is dropped as inconclusive.
+        """
+        from fused_memory.backends.task_backend_errors import TaskNotFoundError
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            side_effect=TaskNotFoundError('9999', tag='master')
+        )
+        project_root = '/proj'
+
+        flag = {'task_id': '9999', 'flag_type': 'task_absent', 'description': 'confirmed absent'}
+        result = await filter_false_absence_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'Absence flag must be KEPT when get_task raises TaskNotFoundError '
+            '(task-2521 sqlite backend behavior). '
+            "RED: confirm_task_absent does not yet accept error_type == "
+            "'TaskNotFoundError', so the flag is dropped."
+        )
 
 
 # ---------------------------------------------------------------------------

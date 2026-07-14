@@ -72,6 +72,37 @@ class DuplicateCandidateKeyError(TaskmasterError):
         self.candidate_key = candidate_key
 
 
+class TaskNotFoundError(TaskmasterError):
+    """Raised by ``get_task`` when a successful zero-row query proves absence.
+
+    Marks a DEFINITIVE (project, tag, id) not-found — the query executed
+    successfully and returned no row — as distinct from a connect/execute
+    outage (``TASKMASTER_UNAVAILABLE`` / a raw driver exception raised before
+    the query even runs). Callers that need to tell "task was deleted" apart
+    from "backend is having a moment" can branch on
+    ``isinstance(err, TaskNotFoundError)``.
+
+    Keeps ``code='TASKMASTER_TOOL_ERROR'`` and the verbatim
+    ``'No tasks found for ID(s): {task_id}'`` message byte-identical to the
+    generic raise it replaces, so discrimination is by exception TYPE only —
+    every existing ``except TaskmasterError`` site, ``err.code ==
+    'TASKMASTER_TOOL_ERROR'`` branch, and not-found message-phrase matcher
+    (e.g. ``flag_dedup.confirm_task_absent``) keeps working unchanged.
+
+    Attributes:
+        task_id: The id that was queried and not found.
+        tag: The tag the lookup was scoped to (``None`` if not supplied),
+            documenting the (project, tag) absence scope.
+    """
+
+    def __init__(self, task_id: str, tag: str | None = None, raw: Any = None) -> None:
+        self.task_id = task_id
+        self.tag = tag
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR', f'No tasks found for ID(s): {task_id}', raw=raw,
+        )
+
+
 def status_via_update_task_error(task_id: str, status: object) -> dict[str, Any]:
     """Canonical rejection shape for ``update_task(status=…)`` calls.
 
@@ -177,6 +208,7 @@ __all__ = [
     'TASKMASTER_UNAVAILABLE',
     'DuplicateCandidateKeyError',
     'TaskmasterError',
+    'TaskNotFoundError',
     'StatusWriteAuthorityError',
     'DoneProvenanceWriteAuthorityError',
     'status_via_update_task_error',
