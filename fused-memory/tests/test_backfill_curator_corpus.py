@@ -714,6 +714,28 @@ class TestPruneDriver:
         assert passed_project_id == project_id
         assert set(passed_live_ids) == {'1', '2', '2.1'}
 
+    @pytest.mark.asyncio
+    async def test_run_prune_skips_on_read_failure(self):
+        """A failed live-task read must never be treated as a legitimate empty
+        set — run_prune() must skip the sweep entirely rather than calling
+        prune_orphans() (which would otherwise diff against nothing and
+        orphan every corpus point)."""
+        from fused_memory.maintenance.backfill_curator_corpus import run_prune
+
+        project_root = '/fake/project'
+
+        with TestRunBackfill()._run_backfill_context() as (mock_curator, mock_tm_cls):
+            mock_curator.prune_orphans = AsyncMock()
+            mock_tm_instance = AsyncMock()
+            mock_tm_instance.get_tasks = AsyncMock(side_effect=RuntimeError('db read failed'))
+            mock_tm_cls.return_value = mock_tm_instance
+
+            report = await run_prune(config_path=None, project_root=project_root)
+
+        mock_curator.prune_orphans.assert_not_called()
+        assert report.skipped is True
+        assert report.reason == 'read_failed'
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Steps 10, 11, 13: TaskInterceptor auto-backfill hook
