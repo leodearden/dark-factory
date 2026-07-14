@@ -340,3 +340,80 @@ def test_code_digest_happy_path_success(tmp_path):
     assert digest_text in captured["prompt"]
     index = mod.build_codebook_index(live_codebook)
     assert index in captured["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# step-11: RED — code_digest() never-fabricate + empty-vs-failure
+# ---------------------------------------------------------------------------
+
+def test_code_digest_unparseable_output_is_failure_not_fabricated():
+    digest_text = _hand_digest(_SESSION_ID, "a confusing correction happened here")
+    codebook = _tiny_codebook()
+
+    def fake_invoke(prompt, model):
+        return "I'm sorry, I cannot help with that request."
+
+    result = mod.code_digest(
+        digest_text, codebook, project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+
+    assert result.ok is False
+    assert result.record is None
+    assert result.reason, "a failure reason must be recorded"
+    assert result.session == _SESSION_ID
+
+
+def test_code_digest_schema_invalid_record_is_failure_not_fabricated():
+    digest_text = _hand_digest(_SESSION_ID, "a confusing correction happened here")
+    codebook = _tiny_codebook()
+
+    # A match with an out-of-enum origin_phase, and separately a candidate
+    # missing its required `title` -- two independent schema violations in
+    # one judgment.
+    judgment = {
+        "matches": [
+            {
+                "entry_id": "one-shot-subagent-contract",
+                "origin_phase": "not_a_real_phase",
+            }
+        ],
+        "candidates": [
+            {"cause": "a candidate missing its required title field"}
+        ],
+    }
+
+    def fake_invoke(prompt, model):
+        return json.dumps(judgment)
+
+    result = mod.code_digest(
+        digest_text, codebook, project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+
+    assert result.ok is False
+    assert result.record is None
+    assert result.reason is not None
+    assert "origin_phase" in result.reason, result.reason
+    assert "title" in result.reason, result.reason
+    assert result.session == _SESSION_ID
+
+
+def test_code_digest_empty_judgment_is_success_not_failure():
+    digest_text = _hand_digest(_SESSION_ID, "nothing confusing happened this session")
+    codebook = _tiny_codebook()
+
+    def fake_invoke(prompt, model):
+        return json.dumps({"matches": [], "candidates": []})
+
+    result = mod.code_digest(
+        digest_text, codebook, project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+
+    assert result.ok is True
+    assert result.reason is None
+    assert result.record is not None
+    assert result.record["matches"] == []
+    assert result.record["candidates"] == []
+    assert codebook_mod.validate_coding_record(result.record) == []
