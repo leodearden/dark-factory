@@ -441,6 +441,92 @@ def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable
 
 
 # ---------------------------------------------------------------------------
+# amendment pass (review findings #1/#2): _extract_tool_result() unwraps the
+# real MCP tools/call JSON-RPC envelope. httpx is not installed in this test
+# env (see test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable
+# above -- default_status_fetcher's ImportError branch is the only reachable
+# path here), so default_status_fetcher's HTTP round-trip itself cannot be
+# driven end-to-end; these tests instead exercise the envelope parser
+# directly against realistic tools/call response shapes, and then bridge its
+# output into compute_tasks_landed to pin the exact contract between them.
+# ---------------------------------------------------------------------------
+
+def _done_statuses_envelope(count):
+    return {str(i): "done" for i in range(count)}
+
+
+def test_extract_tool_result_prefers_structured_content():
+    # structuredContent and content disagree on purpose, so a returned value
+    # equal to structuredContent's (not content's) proves precedence.
+    rpc_response = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "content": [{"type": "text", "text": json.dumps({"statuses": {"decoy": "done"}})}],
+            "structuredContent": {"statuses": {"1": "done"}},
+            "isError": False,
+        },
+    }
+    assert ct._extract_tool_result(rpc_response) == {"statuses": {"1": "done"}}
+
+
+def test_extract_tool_result_falls_back_to_content_text_when_no_structured_content():
+    rpc_response = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "content": [{"type": "text", "text": json.dumps({"statuses": {"1": "done"}})}],
+            "isError": False,
+        },
+    }
+    assert ct._extract_tool_result(rpc_response) == {"statuses": {"1": "done"}}
+
+
+def test_extract_tool_result_raises_when_no_result_key():
+    # e.g. a JSON-RPC error response, which carries "error" instead of "result".
+    rpc_response = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "boom"}}
+    with pytest.raises(ct.StatusFetchUnavailable):
+        ct._extract_tool_result(rpc_response)
+
+
+def test_extract_tool_result_raises_when_content_text_unparseable():
+    rpc_response = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"content": [{"type": "text", "text": "not json"}]},
+    }
+    with pytest.raises(ct.StatusFetchUnavailable):
+        ct._extract_tool_result(rpc_response)
+
+
+def test_extract_tool_result_feeds_compute_tasks_landed_correct_delta():
+    """Pins the exact shape contract between a realistic MCP tools/call
+    envelope (as get_statuses actually returns it) and
+    compute_tasks_landed -- closing the gap where only the hand-rolled
+    _wrapped_fetcher test double (which bypasses envelope parsing entirely)
+    was ever exercised. Before the fix, this delta silently came out
+    negative (0 - 500) instead of 130."""
+    statuses = _done_statuses_envelope(630)
+    statuses.update({str(i): "pending" for i in range(630, 645)})
+    rpc_response = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "content": [{"type": "text", "text": json.dumps({"statuses": statuses})}],
+            "structuredContent": {"statuses": statuses},
+            "isError": False,
+        },
+    }
+    state = {"last_census_done_count": 500}
+
+    result = ct.compute_tasks_landed(
+        state=state, status_fetcher=lambda: ct._extract_tool_result(rpc_response)
+    )
+
+    assert result == 130
+
+
+# ---------------------------------------------------------------------------
 # step-17: RED — decide_for_project() end-to-end over the full §8.5 matrix
 # ---------------------------------------------------------------------------
 

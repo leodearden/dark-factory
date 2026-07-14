@@ -38,7 +38,10 @@ shared`) has no httpx and no MCP client available (see
 shared/pyproject.toml), so the pure decision core stays fully unit-testable
 and "a failing get_statuses fails SAFE" is testable with a raising fake.
 `default_status_fetcher` provides a best-effort glue implementation for the
-standalone CLI; task ε injects the real MCP-backed fetcher.
+standalone CLI, unwrapping the real MCP `tools/call` JSON-RPC envelope via
+`_extract_tool_result` (the tool's actual return value lives at
+`result.structuredContent` or `result.content[0].text`, never at the
+envelope's top level); task ε injects the real MCP-backed fetcher.
 """
 from __future__ import annotations
 
@@ -433,6 +436,57 @@ _FUSED_MEMORY_URL_ENV_VAR = "FUSED_MEMORY_MCP_URL"
 _DEFAULT_FUSED_MEMORY_URL = "http://localhost:8002"  # dashboard.config.DEFAULT_FUSED_MEMORY_URLS[0]
 
 
+def _extract_tool_result(rpc_response: dict) -> dict:
+    """Unwrap a JSON-RPC `tools/call` response into the tool's actual
+    return value.
+
+    An MCP `tools/call` response does NOT put the tool's result at the top
+    level of the JSON-RPC envelope: FastMCP places it at
+    `result.structuredContent` (get_statuses declares a typed return,
+    `-> dict[str, Any]`) and/or as a JSON string at `result.content[0].text`
+    (the universal fallback every MCP client must support). Returning
+    `response.json()` verbatim -- the envelope, not the unwrapped value --
+    left `compute_tasks_landed` reading a `statuses` key that was never
+    there, so `current_done` was silently always `0` and the delta always
+    negative (never fires condition (b), but with zero visibility into why;
+    review finding, task 2579 amendment pass).
+
+    Prefers `structuredContent` (already a dict, no string to parse);
+    falls back to parsing `content[0].text` (mirrors
+    `dashboard.data.memory._extract_tool_result`, the same unwrap this
+    codebase already relies on elsewhere for a live get_statuses call).
+
+    Raises `StatusFetchUnavailable` -- rather than returning `{}` -- when
+    neither shape is present/parseable, so a malformed envelope fails safe
+    through the exact same path as a network failure (one WARNING logged by
+    `compute_tasks_landed`) instead of silently degrading to an
+    unwarned-about negative delta.
+    """
+    result = rpc_response.get("result") if isinstance(rpc_response, dict) else None
+    if not isinstance(result, dict):
+        raise StatusFetchUnavailable(f"malformed MCP response (no result): {rpc_response!r}")
+
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+
+    content = result.get("content")
+    if isinstance(content, list) and content:
+        first = content[0]
+        text = first.get("text") if isinstance(first, dict) else None
+        if isinstance(text, str):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise StatusFetchUnavailable(f"unparseable MCP content text: {exc}") from exc
+            if isinstance(parsed, dict):
+                return parsed
+
+    raise StatusFetchUnavailable(
+        f"MCP tools/call result has neither structuredContent nor parseable content: {result!r}"
+    )
+
+
 def default_status_fetcher(project_root: str | Path):
     """Return a zero-arg best-effort get_statuses caller for the standalone
     `evaluate` CLI (task ε injects the real MCP-backed fetcher for the
@@ -442,7 +496,10 @@ def default_status_fetcher(project_root: str | Path):
     scripts/ dependency (see module docstring); that ImportError, along with
     any network/HTTP/parse failure, is wrapped as `StatusFetchUnavailable`
     so callers can catch fetch failures deterministically rather than a bare
-    Exception.
+    Exception. The raw JSON-RPC `tools/call` response is unwrapped via
+    `_extract_tool_result` before returning, so the callable's return value
+    matches `compute_tasks_landed`'s expected `{"statuses": {...}}` shape
+    instead of the outer JSON-RPC envelope.
     """
     project_root_str = str(project_root)
     url = os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL)
@@ -468,7 +525,7 @@ def default_status_fetcher(project_root: str | Path):
                 timeout=10.0,
             )
             response.raise_for_status()
-            return response.json()
+            return _extract_tool_result(response.json())
         except StatusFetchUnavailable:
             raise
         except Exception as exc:  # noqa: BLE001 - any failure must fail safe
