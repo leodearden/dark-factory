@@ -3778,13 +3778,18 @@ class TaskInterceptor:
             # Best-effort, and still inside the curator lock so the next
             # curator waiter sees row-gone AND vector-gone together. Wrapped
             # defense-in-depth beyond evict_task's own swallow — an eviction
-            # error must never fail the removal itself.
+            # error must never fail the removal itself. Evictions run
+            # concurrently (not a sequential loop) so a multi-id batch does
+            # not serialize N Qdrant round-trips while holding both locks —
+            # each evict_task call already swallows its own errors, so a
+            # failure in one does not short-circuit the others.
             try:
                 removed = result.get('removed_ids') or ids
                 curator = await self._get_curator()
                 if curator is not None:
-                    for tid in removed:
-                        await curator.evict_task(project_id, str(tid))
+                    await asyncio.gather(
+                        *(curator.evict_task(project_id, str(tid)) for tid in removed)
+                    )
             except Exception:
                 logger.warning('remove_tasks: curator eviction failed', exc_info=True)
         # One task_deleted event per requested id — clearer reconciliation
