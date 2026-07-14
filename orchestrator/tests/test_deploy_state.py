@@ -135,6 +135,20 @@ class TestLegalTransitionTable:
         # no self-loop.
         assert is_legal_transition(DeployPhase.RAN, DeployPhase.RAN) is False
 
+    def test_new_middle_edges_for_self_restart_are_legal(self) -> None:
+        """ζ finalizes the middle edges: the self-restart path adds exactly
+        two — ran→scheduled (detached restart registered) and
+        scheduled→escalated (act-then-ask self-restart gate)."""
+        assert _LEGAL[(DeployPhase.RAN, DeployPhase.SCHEDULED)] is True
+        assert _LEGAL[(DeployPhase.SCHEDULED, DeployPhase.ESCALATED)] is True
+
+    def test_new_middle_edges_do_not_disturb_pinned_illegal_edges(self) -> None:
+        """The two new ζ edges must not make a pinned-illegal edge legal."""
+        assert is_legal_transition(DeployPhase.SCHEDULED, DeployPhase.DONE) is False
+        assert is_legal_transition(DeployPhase.DONE, DeployPhase.SCHEDULED) is False
+        assert is_legal_transition(DeployPhase.VERIFIED, DeployPhase.SCHEDULED) is False
+        assert is_legal_transition(DeployPhase.RAN, DeployPhase.RAN) is False
+
     def test_legal_table_shape_and_default_false_fallback(self) -> None:
         assert isinstance(_LEGAL, dict)
         for (old, new), legal in _LEGAL.items():
