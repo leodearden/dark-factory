@@ -45,6 +45,16 @@ from fused_memory.services.live_workflow_detector import is_workflow_live_for_ta
 # so the server enforces the same keys the post-hoc guard checked.
 SNAPSHOT_TOKEN_KEYS: tuple[str, ...] = ('snapshot_status', 'observed_status')
 
+# Stable, machine-readable Verdict.corrective_path token for the Gate 1
+# (terminal-write) rejection. Names the sanctioned same-status
+# done_provenance repair seam
+# (``set_task_status(task_id, 'done', done_provenance={...})``, which routes
+# an already-done task to
+# ``task_interceptor._repair_done_provenance_same_status`` — task 2401)
+# rather than the destructive reopen path. Never used by the Gate 2
+# (live-workflow) or Gate 3 (stale-snapshot) rejections — see :class:`Verdict`.
+TERMINAL_CORRECTIVE_PATH = 'set_task_status_done_provenance_repair'
+
 # ---------------------------------------------------------------------------
 # Verdict
 # ---------------------------------------------------------------------------
@@ -74,6 +84,14 @@ class Verdict:
             (``set_task_status`` only; ``None`` for ``update_task``).
         snapshot_token: The snapshot status token the caller's write was
             based on, when supplied.
+        corrective_path: Stable, machine-readable token naming the
+            sanctioned seam a caller should use instead, when one exists.
+            Empty on ok and on rejections with no sanctioned redirect
+            (Gate 2 live-workflow, Gate 3 stale-snapshot). Populated only
+            on the Gate 1 terminal-write rejection, where it names the
+            same-status ``done_provenance`` repair seam
+            (``set_task_status(..., 'done', done_provenance={...})``) —
+            see :data:`TERMINAL_CORRECTIVE_PATH`.
     """
 
     outcome: Literal['ok', 'rejection']
@@ -86,6 +104,7 @@ class Verdict:
     live_status: str = ''
     target_status: str | None = None
     snapshot_token: str | None = None
+    corrective_path: str = ''
 
     @property
     def is_rejection(self) -> bool:
@@ -105,6 +124,7 @@ class Verdict:
             'target_status': self.target_status,
             'snapshot_token': self.snapshot_token,
             'hint': self.hint,
+            'corrective_path': self.corrective_path,
         }
 
 
@@ -119,6 +139,7 @@ def _reject(
     live_status: str,
     target_status: str | None = None,
     snapshot_token: str | None = None,
+    corrective_path: str = '',
 ) -> Verdict:
     """Small internal factory for a rejection :class:`Verdict`."""
     return Verdict(
@@ -132,6 +153,7 @@ def _reject(
         live_status=live_status,
         target_status=target_status,
         snapshot_token=snapshot_token,
+        corrective_path=corrective_path,
     )
 
 
@@ -184,13 +206,18 @@ def check(
             ),
             hint=(
                 'Terminal tasks (done, cancelled) are frozen against '
-                'recon-stage writes. If this task genuinely needs updating, '
-                'use a non-recon-stage agent_id or route through '
-                'set_task_status with a reopen_reason.'
+                'recon-stage update_task writes. To correct done_provenance '
+                'or other metadata on a done task, use set_task_status('
+                'task_id, \'done\', done_provenance={\'kind\': \'merged\'|'
+                '\'found_on_main\', \'commit\': <ancestor-checked sha>}) '
+                '— a done->done repair that does not reopen the task. '
+                'Note: update_task can never write done_provenance — it is '
+                'rejected for every caller by the write-authority floor.'
             ),
             live_status=live_status,
             target_status=target_status,
             snapshot_token=snapshot_token,
+            corrective_path=TERMINAL_CORRECTIVE_PATH,
         )
 
     if op == 'set_task_status' and is_workflow_live_for_task(
