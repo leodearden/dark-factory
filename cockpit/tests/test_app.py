@@ -1279,6 +1279,57 @@ class TestSpawnTreeEnterFocus:
             assert backend.focus_calls == [DisplayTarget(kind='wm', wm_title='child title')]
 
 
+class TestSessionTableEnterFocus:
+    @pytest.mark.timeout(10)
+    async def test_enter_focuses_the_highlighted_session_row(self, tmp_path):
+        """Enter on the session table's HIGHLIGHTED row (deliberately not
+        the default row-0) focuses THAT session's terminal -- the C10 tour
+        F6 fix (PRD §1: "Pressing Enter on a row raises that terminal"),
+        mirroring TestSpawnTreeEnterFocus's contract at the top-level
+        session-table Enter path.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+        from cockpit.panes.session_table import SessionTable
+
+        session_a = _make_record(
+            session_slug='session-a',
+            status=sr.Status.RUNNING,
+            start_ts='2026-07-07T00:00:00+00:00',
+            display=sr.Display(kind='wm', wm_title='session-a title'),
+        )
+        session_b = _make_record(
+            session_slug='session-b',
+            status=sr.Status.RUNNING,
+            start_ts='2026-07-07T01:00:00+00:00',
+            display=sr.Display(kind='wm', wm_title='session-b title'),
+        )
+        for r in (session_a, session_b):
+            sr.write_record(r, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+            table.focus()
+            await pilot.pause()
+
+            # session-a (older start_ts) is the default row-0 cursor -- the
+            # assertions below only pass if selecting session-b actually
+            # drives the focus call, not just whatever's highlighted by
+            # default after mount.
+            assert table.highlighted_slug() != 'session-b'
+
+            table.move_cursor(row=table.get_row_index('session-b'))
+            await pilot.pause()
+
+            await pilot.press('enter')
+            await pilot.pause()
+
+            assert backend.focus_calls == [DisplayTarget(kind='wm', wm_title='session-b title')]
+
+
 class TestSpawnTreeToggle:
     @pytest.mark.timeout(10)
     async def test_toggle_key_closes_an_already_open_tree(self, tmp_path):
