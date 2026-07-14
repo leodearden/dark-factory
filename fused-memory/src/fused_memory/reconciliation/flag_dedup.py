@@ -62,8 +62,9 @@ SCOPED to that pair AND any flag_type FAMILY VARIANT of it (task 2503) —
 see ``canonical_flag_type_family``.  Family matching is word-order
 insensitive, an ACCEPTED RISK reviewed and documented at both
 ``canonical_flag_type_family``'s and ``filter_suppressed``'s docstrings
-(the latter's row-scan logs a WARNING on an observed family collision as a
-partial audit mitigation).  When both a wildcard and a scoped row
+(the latter's row-scan logs a WARNING, at most once per (project_id,
+task_id, family) for the process lifetime, on an observed family collision
+as a partial audit mitigation).  When both a wildcard and a scoped row
 exist for the same task_id, the wildcard wins (union semantics — a blanket
 suppression cannot be narrowed by a more specific record).
 ``write_suppression_record`` upserts these rows: ``flag_types=None``
@@ -310,6 +311,22 @@ def canonical_flag_type_family(flag_type: str) -> str:
     return '_'.join(sorted({t for t in tokens if t}))
 
 
+#: ``(project_id, task_id, family)`` keys for which :func:`filter_suppressed`
+#: has already logged a flag_type-family-collision WARNING (task 2503
+#: amendment, reviewer_comprehensive robustness_log_noise). Suppression rows
+#: never expire (``expires_at=None``), and ``filter_suppressed`` rebuilds its
+#: ``suppressed`` map from scratch on every call with no memory of prior
+#: calls -- so a pre-existing (e.g. legacy or composite-seeded) collision
+#: between two distinct raw flag_types would otherwise re-emit the identical
+#: WARNING on EVERY reconciliation cycle indefinitely. This module-level set
+#: makes the log "once per distinct collision key for the life of the
+#: process" rather than "once per call". Tests that assert on this WARNING
+#: must reset this between cases -- see the
+#: ``_reset_flag_type_family_collision_warning_cache`` autouse fixture in
+#: test_flag_dedup.py.
+_WARNED_FLAG_TYPE_FAMILY_COLLISIONS: set[tuple[str, str, str]] = set()
+
+
 async def filter_suppressed(
     memory_service: Any,
     project_id: str,
@@ -374,7 +391,13 @@ async def filter_suppressed(
     collapsing into the same family, so an operator can audit the ledger for a
     suspected collision -- this can only detect a collision AMONG SUPPRESSION
     ROWS themselves, not between a row and a flag being filtered, since only
-    the ledger side is available for comparison in this function.
+    the ledger side is available for comparison in this function. Since
+    suppression rows never expire, this WARNING is throttled to at most once
+    per ``(project_id, task_id, family)`` for the life of the process (task
+    2503 amendment, reviewer_comprehensive robustness_log_noise) -- see
+    :data:`_WARNED_FLAG_TYPE_FAMILY_COLLISIONS` -- so a persistent benign
+    collision in a pre-existing (legacy or composite-seeded) row cannot flood
+    the log with an identical WARNING on every reconciliation cycle.
 
     Rows with ``task_id == ''`` (or which decompose to no components) are
     skipped when building the map (a degenerate/malformed suppression with
@@ -459,16 +482,26 @@ async def filter_suppressed(
                 # token-multiset collision between two DIFFERENT findings (the
                 # accepted-risk failure mode) -- this function cannot tell
                 # which, so it surfaces both raw values for operator review.
-                logger.warning(
-                    'filter_suppressed: flag_type family collision for project'
-                    ' %s task_id=%s: family=%r groups distinct raw flag_types'
-                    ' %r -- verify these describe the same finding (task 2503'
-                    ' accepted over-suppression risk)',
-                    project_id,
-                    tid_str,
-                    family,
-                    sorted(raw_variants | {row.flag_type}),
-                )
+                # Logged at most ONCE per (project_id, task_id, family) for the
+                # life of the process (task 2503 amendment,
+                # reviewer_comprehensive robustness_log_noise): suppression
+                # rows never expire, so an unfixed benign collision would
+                # otherwise flood the log with an identical WARNING on every
+                # reconciliation cycle.
+                collision_key = (project_id, tid_str, family)
+                if collision_key not in _WARNED_FLAG_TYPE_FAMILY_COLLISIONS:
+                    _WARNED_FLAG_TYPE_FAMILY_COLLISIONS.add(collision_key)
+                    logger.warning(
+                        'filter_suppressed: flag_type family collision for project'
+                        ' %s task_id=%s: family=%r groups distinct raw flag_types'
+                        ' %r -- verify these describe the same finding (task 2503'
+                        ' accepted over-suppression risk; logged once per'
+                        ' project/task_id/family for the process lifetime)',
+                        project_id,
+                        tid_str,
+                        family,
+                        sorted(raw_variants | {row.flag_type}),
+                    )
             raw_variants.add(row.flag_type)
 
     def _keep(f: dict[str, Any]) -> bool:
@@ -860,6 +893,49 @@ async def dedup_flags(
     return result
 
 
+def _canonicalize_suppression_task_id(task_id: int | str) -> str:
+    """Validate and canonicalize *task_id* to the ``str`` form used by
+    ``stage1_flag_suppression`` records.
+
+    Accepts a single numeric id (``int`` or numeric ``str``) OR a
+    comma-joined composite of numeric ids (e.g. ``'2405,540,544'``, mixing
+    ids across projects) — a composite's components are stripped of
+    surrounding whitespace before joining (``'2405, 540'`` canonicalizes to
+    ``'2405,540'``). Raises a descriptive, chained ``ValueError`` (mentioning
+    ``build_suppression_payload`` and the offending value, with
+    ``__cause__`` set to the original ``ValueError``/``TypeError``) for
+    anything else — the same contract :func:`build_suppression_payload` has
+    always exposed publicly; the error message keeps mentioning
+    ``build_suppression_payload`` rather than this helper's own name since
+    that is the documented public entry point callers see.
+
+    Extracted as a standalone helper (task 2503 amendment,
+    reviewer_comprehensive efficiency_reuse) so :func:`write_suppression_record`
+    can validate/canonicalize *task_id* up front WITHOUT constructing a full
+    :class:`SuppressionPayload` (content string + metadata dict) merely to
+    read back ``metadata['task_id']`` and discard the rest.
+    :func:`build_suppression_payload` itself now delegates here too, so the
+    validation logic has exactly one implementation.
+
+    Pure, sync, no I/O.
+    """
+    try:
+        return str(int(task_id))
+    except (TypeError, ValueError) as e:
+        # Composite fallback: a comma-joined list of numeric ids (e.g. a
+        # cross-project signature like '2405,540,544'). Mirrors the
+        # numeric/comma-joined validation convention in
+        # _is_valid_marker_task_id. Only reached when the single-id int()
+        # fast-path above fails.
+        components = [c.strip() for c in task_id.split(',')] if isinstance(task_id, str) else []
+        if len(components) >= 2 and all(c.isdigit() for c in components):
+            return ','.join(components)
+        raise ValueError(
+            f'build_suppression_payload: task_id must be an int or numeric '
+            f'string, got {task_id!r}'
+        ) from e
+
+
 def build_suppression_payload(
     task_id: int | str, flag_types: list[str] | None = None
 ) -> SuppressionPayload:
@@ -904,22 +980,7 @@ def build_suppression_payload(
       - ``metadata.flag_types = [<str>, ...]`` (optional; sorted-unique)
       - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
     """
-    try:
-        tid = str(int(task_id))
-    except (TypeError, ValueError) as e:
-        # Composite fallback: a comma-joined list of numeric ids (e.g. a
-        # cross-project signature like '2405,540,544'). Mirrors the
-        # numeric/comma-joined validation convention in
-        # _is_valid_marker_task_id. Only reached when the single-id int()
-        # fast-path above fails.
-        components = [c.strip() for c in task_id.split(',')] if isinstance(task_id, str) else []
-        if len(components) >= 2 and all(c.isdigit() for c in components):
-            tid = ','.join(components)
-        else:
-            raise ValueError(
-                f'build_suppression_payload: task_id must be an int or numeric '
-                f'string, got {task_id!r}'
-            ) from e
+    tid = _canonicalize_suppression_task_id(task_id)
     metadata: _SuppressionMetadata = {
         'kind': 'stage1_flag_suppression',
         'task_id': tid,
@@ -996,10 +1057,13 @@ async def write_suppression_record(
 ) -> AddMemoryResponse:
     """Upsert a ``stage1_flag_suppression`` record to the ledger for *task_id*.
 
-    Builds the canonical payload via :func:`build_suppression_payload` (which
-    validates *task_id* is numeric and canonicalizes it to ``str``, and pins
-    ``metadata.kind``/``content``) to derive the canonicalized *tid*, then --
-    before writing anything -- runs a PRE-WRITE COVERAGE CHECK (task 2503):
+    Validates and canonicalizes *task_id* to ``str`` via
+    :func:`_canonicalize_suppression_task_id` (task 2503 amendment,
+    reviewer_comprehensive efficiency_reuse -- the same numeric/composite
+    validation :func:`build_suppression_payload` itself delegates to,
+    without constructing a full :class:`SuppressionPayload` up front just to
+    discard everything but the tid) to derive the canonicalized *tid*, then
+    -- before writing anything -- runs a PRE-WRITE COVERAGE CHECK (task 2503):
     :func:`_existing_suppression_coverage` is queried for *tid*, and the
     requested ``(flag_types or [''])`` is filtered down to the subset NOT
     already covered by an existing active row -- covered by either an
@@ -1092,7 +1156,7 @@ async def write_suppression_record(
     Returns the :class:`AddMemoryResponse` from the memory service so callers
     can inspect ``memory_ids`` for empty-list deduplication / no-op detection.
     """
-    tid = str(build_suppression_payload(task_id, flag_types=flag_types)['metadata']['task_id'])
+    tid = _canonicalize_suppression_task_id(task_id)
 
     ledger = getattr(memory_service, 'recon_ledger', None)
     requested = flag_types or ['']
