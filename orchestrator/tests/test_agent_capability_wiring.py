@@ -171,10 +171,10 @@ class TestShippedRoleCapabilityDeclarations:
         'architect': (frozenset({'orchestrator', 'plan_tools'}), False),
         'implementer': (frozenset({'orchestrator', 'plan_tools'}), True),
         'debugger': (frozenset({'orchestrator', 'plan_tools'}), True),
-        'merger': (frozenset({'orchestrator'}), False),
-        'judge': (frozenset({'orchestrator'}), False),
+        'merger': (frozenset({'orchestrator', 'verdict_tools'}), False),
+        'judge': (frozenset({'orchestrator', 'verdict_tools'}), False),
         'simple_task': (frozenset({'orchestrator', 'plan_tools'}), False),
-        'reviewer_comprehensive': (frozenset(), False),
+        'reviewer_comprehensive': (frozenset({'verdict_tools'}), False),
         'steward': (frozenset({'orchestrator'}), False),
         'deep_reviewer': (frozenset({'orchestrator'}), False),
     }
@@ -211,6 +211,21 @@ class TestShippedRoleCapabilityDeclarations:
 
         assert sandboxed_names == {'implementer', 'debugger'}
 
+    @pytest.mark.parametrize(
+        'role_name', ['reviewer_comprehensive', 'judge', 'merger'],
+    )
+    def test_role_grants_a_verdict_tools_tool(self, role_name):
+        """reviewer/judge/merger each get a mcp__verdict-tools__* grant in
+        allowed_tools (PRD task β — verdict-tools stdio server wiring,
+        task 2482)."""
+        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
+
+        role = ROLES[role_name]
+        assert any(t.startswith('mcp__verdict-tools__') for t in role.allowed_tools), (
+            f'{role_name!r} allowed_tools has no mcp__verdict-tools__* entry: '
+            f'{role.allowed_tools!r}'
+        )
+
 
 class TestInverseCapabilityInvariant:
     """Every ROLES entry that allows a family's tool prefix must declare
@@ -244,6 +259,21 @@ class TestInverseCapabilityInvariant:
                     f'{name!r} allows fused-memory/escalation tools but does '
                     f"not declare 'orchestrator' in mcp_families (reify "
                     f'esc-4943-54 class)'
+                )
+
+    def test_every_role_allowing_verdict_tools_declares_verdict_tools_family(self):
+        """PRD task β (task 2482): the same inverse invariant, extended to the
+        new verdict_tools family."""
+        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
+
+        for name, role in ROLES.items():
+            allows_verdict_tools = any(
+                t.startswith('mcp__verdict-tools__') for t in role.allowed_tools
+            )
+            if allows_verdict_tools:
+                assert 'verdict_tools' in role.mcp_families, (
+                    f'{name!r} allows verdict-tools tools but does not declare '
+                    f"'verdict_tools' in mcp_families (reify esc-4943-54 class)"
                 )
 
 
