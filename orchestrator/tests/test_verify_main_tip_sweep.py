@@ -27,6 +27,8 @@ Test coverage:
            covered independently at BOTH the first-pass and the retry call
            site; a CONTROL test pins narrowness — an ENOENT naming a
            DIFFERENT path is still real drift and passes through unchanged.
+  task-2370 step-1 (confirm-before-alarm gate — node-id extraction):
+           TestExtractFailingTestIds
 """
 
 from __future__ import annotations
@@ -822,3 +824,96 @@ class TestRunMainTipSweepEnoentOwnWorktree:
 
         remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
         assert remove_calls, 'git worktree remove should run even on drift passthrough'
+
+
+# ---------------------------------------------------------------------------
+# task-2370 step-1: _extract_failing_test_ids — pure node-id extraction
+# ---------------------------------------------------------------------------
+
+
+class TestExtractFailingTestIds:
+    """task-2370 step-1: verify._extract_failing_test_ids(test_output) -> list[str].
+
+    Pure helper (no I/O) that recovers pytest node-ids from raw test output
+    for the confirm-before-alarm isolated re-run gate. RED today: the
+    function does not exist yet.
+    """
+
+    def test_extracts_node_ids_from_failed_lines(self) -> None:
+        """FAILED lines yield node-ids, including a parametrized case and a
+        line with a trailing ' - AssertionError: ...' reason."""
+        from orchestrator import verify as verify_module
+
+        output = (
+            'FAILED orchestrator/tests/test_x.py::test_y\n'
+            "FAILED orchestrator/tests/test_x.py::test_z[case-1] - AssertionError: boom\n"
+        )
+        assert verify_module._extract_failing_test_ids(output) == [
+            'orchestrator/tests/test_x.py::test_y',
+            'orchestrator/tests/test_x.py::test_z[case-1]',
+        ]
+
+    def test_extracts_node_id_from_xdist_worker_crash_notice(self) -> None:
+        """An explicit "crashed while running '<nodeid>'" notice yields the
+        quoted node-id."""
+        from orchestrator import verify as verify_module
+
+        output = "worker 'gw3' crashed while running 'tests/test_a.py::test_b'\n"
+        assert verify_module._extract_failing_test_ids(output) == [
+            'tests/test_a.py::test_b',
+        ]
+
+    def test_extracts_node_id_preceding_node_down_marker(self) -> None:
+        """When no explicit "crashed while running" phrasing is present, the
+        in-progress node-id line immediately preceding a
+        "[gwN] node down: Not properly terminated" marker is recovered."""
+        from orchestrator import verify as verify_module
+
+        output = (
+            'tests/test_a.py::test_b\n'
+            '[gw3] node down: Not properly terminated\n'
+        )
+        assert verify_module._extract_failing_test_ids(output) == [
+            'tests/test_a.py::test_b',
+        ]
+
+    def test_deduplicates_preserving_first_seen_order(self) -> None:
+        """Repeated node-ids (e.g. FAILED line + a later re-mention) collapse
+        to one entry, in first-seen order."""
+        from orchestrator import verify as verify_module
+
+        output = (
+            'FAILED orchestrator/tests/test_x.py::test_y\n'
+            'FAILED orchestrator/tests/test_a.py::test_b\n'
+            'FAILED orchestrator/tests/test_x.py::test_y\n'
+        )
+        assert verify_module._extract_failing_test_ids(output) == [
+            'orchestrator/tests/test_x.py::test_y',
+            'orchestrator/tests/test_a.py::test_b',
+        ]
+
+    def test_returns_empty_list_for_non_test_failure(self) -> None:
+        """A pure lint (ruff) error block has no pytest node-ids."""
+        from orchestrator import verify as verify_module
+
+        ruff_output = (
+            'orchestrator/src/orchestrator/foo.py:12:5: F401 unused import\n'
+            'Found 1 error.\n'
+        )
+        assert verify_module._extract_failing_test_ids(ruff_output) == []
+
+    def test_returns_empty_list_for_unparseable_worker_crash(self) -> None:
+        """A node-down marker with no adjacent node-id-shaped line yields []
+        rather than a guessed/garbage id."""
+        from orchestrator import verify as verify_module
+
+        opaque_crash_output = (
+            'Something bad happened.\n'
+            '[gw3] node down: Not properly terminated\n'
+        )
+        assert verify_module._extract_failing_test_ids(opaque_crash_output) == []
+
+    def test_returns_empty_list_for_falsy_output(self) -> None:
+        from orchestrator import verify as verify_module
+
+        assert verify_module._extract_failing_test_ids('') == []
