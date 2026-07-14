@@ -99,7 +99,6 @@ def _make_recon_harness() -> Harness:
     h._escalation_queue = MagicMock()
     h._escalation_queue.make_id = MagicMock(return_value='esc-recon-1')
     h._recon_unit_inspector = None
-    h._deterministic_recon_sweep_task = None
     return h
 
 

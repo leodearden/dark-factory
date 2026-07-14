@@ -80,7 +80,6 @@ def _make_sweep_harness(*, main_sha: str = MAIN_SHA) -> Harness:
     h._escalation_queue = MagicMock()
     h._escalation_queue.make_id = MagicMock(return_value='esc-sweep-1')
     h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
-    h._main_tip_sweep_task = None
     h._last_swept_main_sha = None
     return h
 

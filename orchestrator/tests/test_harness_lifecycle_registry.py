@@ -79,6 +79,7 @@ class TestLifecycleRegistrationOrder:
 
         harness._build_lifecycle_registry()
 
+        assert harness._lifecycle is not None
         names = [s.name for s in harness._lifecycle.services]
         assert 'warm-lane-gc' not in names
         assert names == [n for n in _CANONICAL_ORDER if n != 'warm-lane-gc']
@@ -183,8 +184,10 @@ class TestLifecycleRegistryRunWiring:
         h._lifecycle.stop_all = AsyncMock()
 
         parent = MagicMock(name='order')
+        dismiss_mock = AsyncMock()
+        h._dismiss_stale_escalations = dismiss_mock
         parent.attach_mock(h._lifecycle.start_all, 'start_all')
-        parent.attach_mock(h._dismiss_stale_escalations, '_dismiss_stale_escalations')
+        parent.attach_mock(dismiss_mock, '_dismiss_stale_escalations')
 
         with pytest.raises(RuntimeError, match='__stop_sentinel__'):
             await h.run(prd_path=None)

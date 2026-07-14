@@ -1897,10 +1897,6 @@ def _make_run_wired_harness(tmp_path: Path) -> tuple:
     h._reconcile_lane_checkouts = AsyncMock()
     h._reconcile_stranded_in_progress = AsyncMock()
     h._tag_prd_metadata = AsyncMock()
-    h._start_orphan_l0_reaper = MagicMock()
-    h._start_stranded_reconcile = MagicMock()
-    h._start_main_tip_sweep = MagicMock()
-    h._start_no_landings_breaker = MagicMock()  # task θ/1893 loop (task 1907)
 
     # Scheduler: one pending task so run() proceeds to the acquire_next loop,
     # which then raises RuntimeError('stop') to halt immediately after startup.
@@ -1917,23 +1913,17 @@ def _make_run_wired_harness(tmp_path: Path) -> tuple:
 
     # Children: AsyncMock for async methods, MagicMock for sync.
     dismiss_mock = AsyncMock()
-    start_terminal_mock = MagicMock()
     start_watcher_mock = MagicMock()
-    stop_terminal_mock = AsyncMock()
     stop_watcher_mock = AsyncMock()
     mcp_stop_mock = AsyncMock()
 
     parent.attach_mock(dismiss_mock, '_dismiss_stale_escalations')
-    parent.attach_mock(start_terminal_mock, '_start_terminal_status_watcher')
     parent.attach_mock(start_watcher_mock, '_start_watcher_supervisor')
-    parent.attach_mock(stop_terminal_mock, '_stop_terminal_status_watcher')
     parent.attach_mock(stop_watcher_mock, '_stop_watcher_supervisor')
     parent.attach_mock(mcp_stop_mock, 'mcp_stop')
 
     h._dismiss_stale_escalations = dismiss_mock
-    h._start_terminal_status_watcher = start_terminal_mock
     h._start_watcher_supervisor = start_watcher_mock
-    h._stop_terminal_status_watcher = stop_terminal_mock
     h._stop_watcher_supervisor = stop_watcher_mock
     mock_mcp.stop = mcp_stop_mock
 
