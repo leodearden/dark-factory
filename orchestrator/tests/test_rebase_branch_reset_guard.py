@@ -219,6 +219,130 @@ class TestRebasePreservingTaskCommitsGuard:
         assert result is True
         assert await _commits_over_main(wt) == 0
 
+    async def test_guard_detects_wipe_of_own_delta_measured_against_onto(
+        self, git_ops: GitOps, git_repo: Path, monkeypatch,
+    ):
+        """Amendment review finding #1: for a stacked-train-style rebase
+        (``onto=<predecessor tip>``, itself ahead of main), a wipe of just
+        the branch's OWN delta must still be detected even though the
+        predecessor's commits keep commits-over-MAIN > 0. Measuring only
+        against main would hide this (n_after-over-main stays 1, from the
+        surviving predecessor commit) — the guard must measure against
+        ``onto`` instead."""
+        # Predecessor: 1 commit ahead of main.
+        pred_wt_info = await git_ops.create_worktree('pred')
+        pred_wt = pred_wt_info.path
+        await _commit_unique_work(pred_wt, filename='pred.txt')
+        predecessor_sha = await _head_sha(pred_wt)
+        assert await _commits_over_main(pred_wt) == 1
+
+        # Successor built ON TOP of the predecessor's tip (mirrors a
+        # stacked train member): main + predecessor's commit + its own.
+        succ_wt = git_repo / '.worktrees' / 'succ'
+        await _run(
+            ['git', 'worktree', 'add', '-b', 'task/succ', str(succ_wt), predecessor_sha],
+            cwd=git_repo,
+        )
+        await _commit_unique_work(succ_wt, filename='succ.txt')
+        pre_head = await _head_sha(succ_wt)
+        assert await _commits_over_main(succ_wt) == 2, 'predecessor + own commit'
+
+        # Engineer a wipe of JUST the successor's own delta: collapse HEAD
+        # back to the predecessor's tip, as a rebase-onto-predecessor that
+        # dropped the branch's own commit would look from the outside.
+        async def _wipe_own_delta_only(worktree: Path, onto: str | None = None) -> bool:
+            await _run(['git', 'reset', '--hard', predecessor_sha], cwd=worktree)
+            return True
+
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', _wipe_own_delta_only)
+
+        with pytest.raises(BranchResetError):
+            await git_ops.rebase_preserving_task_commits(succ_wt, onto=predecessor_sha)
+
+        assert await _head_sha(succ_wt) == pre_head, 'own commit must be restored'
+        assert await _commits_over_main(succ_wt) == 2, 'both commits must survive'
+
+    async def test_guard_returns_true_on_patch_id_dedup_not_wipe(
+        self, git_ops: GitOps, git_repo: Path, monkeypatch,
+    ):
+        """Amendment review finding #2: a total wipe (n_after == 0) that is
+        fully explained by the branch's pre-rebase commit(s) already being
+        patch-id-equivalent to a commit landed at the baseline (e.g. a
+        re-dispatched task whose work previously merged) is a legitimate
+        dedup, not a destructive wipe — the guard must return True without
+        raising or touching HEAD."""
+        wt_info = await git_ops.create_worktree('dedup')
+        wt = wt_info.path
+        await _commit_unique_work(wt, filename='feature.txt')
+        assert await _commits_over_main(wt) == 1
+
+        # Simulate the task's work having already landed on main — same
+        # patch content, different (later, independently-created) commit.
+        # `git add feature.txt` specifically (not `-A`): the worktree
+        # created above already lives under git_repo/.worktrees/dedup, and
+        # a blanket `-A` here would also stage it as a gitlink, changing
+        # this commit's diff/patch-id and defeating the scenario.
+        (git_repo / 'feature.txt').write_text('unique task work\n')
+        await _run(['git', 'add', 'feature.txt'], cwd=git_repo)
+        await _run(
+            ['git', 'commit', '-m', 'task: add feature (already landed)'],
+            cwd=git_repo,
+        )
+
+        # Engineer the "rebase succeeded but collapsed to 0 commits over
+        # main" observable exactly like the other wipe tests — this is
+        # what a real patch-id-drop rebase would also produce, but without
+        # depending on git-version-specific auto-drop behavior (see
+        # _wipe_via_reset's docstring).
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', _wipe_via_reset)
+
+        result = await git_ops.rebase_preserving_task_commits(wt)
+
+        assert result is True, (
+            'a total wipe that is fully patch-id-dedupable against main '
+            'must not raise — it is a dedup, not a destructive wipe'
+        )
+        assert await _commits_over_main(wt) == 0, (
+            'no restore should happen for a genuine dedup — HEAD stays as '
+            'the rebase (here, simulated reset) left it'
+        )
+
+    async def test_guard_branch_reset_error_reports_failed_restore(
+        self, git_ops: GitOps, git_repo: Path, monkeypatch,
+    ):
+        """Amendment review finding #3: if the recovery
+        ``git reset --hard`` itself fails after a wipe is detected,
+        ``BranchResetError.restore_ok`` is False and the message says so
+        explicitly — it must never claim the work was restored when it
+        wasn't."""
+        wt_info = await git_ops.create_worktree('restore-fails')
+        wt = wt_info.path
+        await _commit_unique_work(wt)
+        pre_head = await _head_sha(wt)
+        assert await _commits_over_main(wt) == 1
+
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', _wipe_via_reset)
+
+        import orchestrator.git_ops as git_ops_module
+
+        real_run = git_ops_module._run
+
+        async def _failing_restore_run(cmd: list[str], cwd: Path | None = None):
+            if cmd[:3] == ['git', 'reset', '--hard'] and cmd[3:] == [pre_head]:
+                return 1, '', 'simulated: recovery reset failed'
+            return await real_run(cmd, cwd=cwd)
+
+        monkeypatch.setattr(git_ops_module, '_run', _failing_restore_run)
+
+        with pytest.raises(BranchResetError) as exc_info:
+            await git_ops.rebase_preserving_task_commits(wt)
+
+        assert exc_info.value.restore_ok is False
+        assert 'FAILED TO RESTORE' in str(exc_info.value)
+        # The (simulated-failed) restore never actually happened — HEAD is
+        # left wherever the wipe left it, NOT back at pre_head.
+        assert await _head_sha(wt) != pre_head
+
 
 # ---------------------------------------------------------------------------
 # step-3: the two git_ops requeue reuse sites route THROUGH the guard.
