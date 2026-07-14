@@ -5359,3 +5359,30 @@ class TestPruneOrphans:
         }
         assert result.pruned == 2
 
+    @pytest.mark.asyncio
+    async def test_prune_empty_live_is_noop(self):
+        """Corpus-nuke regression guard: an empty live set (e.g. from a total
+        live-read failure) must never be treated as 'every point is an
+        orphan'. The hard gate must refuse before touching Qdrant at all."""
+        from types import SimpleNamespace
+
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        records = [
+            SimpleNamespace(id=_expected_point_id('proj', tid))
+            for tid in ('1', '2')
+        ]
+
+        mock_client = AsyncMock()
+        mock_client.collection_exists = AsyncMock(return_value=True)
+        mock_client.scroll = AsyncMock(return_value=(records, None))
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client):
+            result = await curator.prune_orphans('proj', set())
+
+        mock_client.scroll.assert_not_called()
+        mock_client.delete.assert_not_called()
+        assert result.skipped is True
+        assert result.pruned == 0
+
