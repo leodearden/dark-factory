@@ -70,6 +70,126 @@ import asyncio
 import json
 import logging
 import sys
+from typing import Any
 
-from fused_memory.maintenance.rehome_scope_tag import CGL_ETA_REHOME_KIND
+from fused_memory.maintenance.rehome_scope_tag import (
+    CGL_ETA_REHOME_KIND,
+    apply_scope_tag,
+    scope_tag_for,
+)
 from fused_memory.models.scope import Scope
+
+logger = logging.getLogger('tag_cgl_eta_rehome_scope')
+
+
+# ---------------------------------------------------------------------------
+# Pure core: classify_rehome_record
+# ---------------------------------------------------------------------------
+
+def classify_rehome_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Classify one ``cgl_eta_cross_target_rehome`` record for tagging.
+
+    Reads content from ``record['metadata']['data']`` (Mem0's payload
+    content key) and computes ``apply_scope_tag(content, record['metadata'])``.
+
+    Returns a decision dict ``{'id', 'action', 'new_content'}`` where
+    ``action`` is one of:
+
+    - ``'skip:no_src_project'`` -- :func:`~fused_memory.maintenance.
+      rehome_scope_tag.scope_tag_for` returned ``None`` (no origin project
+      to disambiguate against);
+    - ``'skip:already_tagged'`` -- a tag was computable but *content*
+      already carries it (``apply_scope_tag`` returned it unchanged);
+    - ``'tag'`` -- content needs (and gets) the scope tag prepended.
+
+    ``new_content`` always holds ``apply_scope_tag``'s return value, so a
+    ``'tag'`` decision can be applied directly and re-applying a ``'skip'``
+    decision (if ever done by mistake) is a no-op.
+
+    Pure function -- no I/O.
+    """
+    metadata = record['metadata']
+    content = metadata.get('data') or ''
+    new_content = apply_scope_tag(content, metadata)
+
+    if scope_tag_for(metadata) is None:
+        action = 'skip:no_src_project'
+    elif new_content == content:
+        action = 'skip:already_tagged'
+    else:
+        action = 'tag'
+
+    return {'id': record['id'], 'action': action, 'new_content': new_content}
+
+
+# ---------------------------------------------------------------------------
+# Pure core: audit report
+# ---------------------------------------------------------------------------
+
+def build_tag_report(
+    decisions_by_project: dict[str, list[dict[str, Any]]],
+    applied_ids: set[str],
+    dry_run: bool,
+    generated_at: str,
+) -> dict[str, Any]:
+    """Assemble the structured JSON-serialisable tag report.
+
+    Mirrors ``prune_recon_cycle_summaries.build_prune_report``'s shape and
+    deterministic sorting, adapted to per-record (not per-pool)
+    classification.
+
+    Args:
+        decisions_by_project: ``{project_id: [classify_rehome_record(...),
+            ...]}`` -- one list per project that was scanned.
+        applied_ids: Set of memory ids actually updated (empty on dry-run).
+        dry_run: True when no writes were made.
+        generated_at: ISO timestamp string.
+
+    Returns:
+        Dict with keys: dry_run, generated_at, projects, totals, changes.
+        ``projects`` nests ``{project_id: {scanned, taggable, tagged,
+        skipped}}``. ``changes`` is a deterministically-ordered list of
+        ``{project_id, id, action, applied}`` dicts -- one entry per 'tag'
+        decision (skips never appear, mirroring build_prune_report's
+        deletions-only 'deletions' list).
+    """
+    projects: dict[str, dict[str, Any]] = {}
+    changes: list[dict[str, Any]] = []
+
+    for project_id in sorted(decisions_by_project):
+        decisions = decisions_by_project[project_id]
+        scanned = len(decisions)
+        taggable_ids = [d['id'] for d in decisions if d['action'] == 'tag']
+        taggable = len(taggable_ids)
+        tagged = sum(1 for mid in taggable_ids if mid in applied_ids)
+        skipped = scanned - taggable
+
+        projects[project_id] = {
+            'scanned': scanned,
+            'taggable': taggable,
+            'tagged': tagged,
+            'skipped': skipped,
+        }
+
+        for mid in sorted(taggable_ids):
+            changes.append({
+                'project_id': project_id,
+                'id': mid,
+                'action': 'tag',
+                'applied': mid in applied_ids,
+            })
+
+    totals: dict[str, Any] = {
+        'scanned': sum(p['scanned'] for p in projects.values()),
+        'taggable': sum(p['taggable'] for p in projects.values()),
+        'tagged': sum(p['tagged'] for p in projects.values()),
+        'skipped': sum(p['skipped'] for p in projects.values()),
+    }
+
+    return {
+        'dry_run': dry_run,
+        'generated_at': generated_at,
+        'projects': projects,
+        'totals': totals,
+        'changes': changes,
+    }
