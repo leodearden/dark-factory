@@ -8,6 +8,8 @@ plans/tier1-prompt-optimization-prd.md T6.
 
 from __future__ import annotations
 
+import collections.abc
+import typing
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -37,8 +39,12 @@ class _NonConformingScorer:
 class TestScorerProtocol:
     def test_is_runtime_checkable(self) -> None:
         # A @runtime_checkable Protocol supports isinstance() checks; a
-        # plain (non-runtime-checkable) Protocol raises TypeError here.
-        isinstance(_ConformingScorer(), Scorer)
+        # plain (non-runtime-checkable) Protocol raises TypeError here, so
+        # the fact that this returns (rather than raises) is itself the
+        # signal — assert the boolean result explicitly rather than relying
+        # on the absence of an exception.
+        result = isinstance(_ConformingScorer(), Scorer)
+        assert result is True
 
     def test_conforming_fake_passes_isinstance(self) -> None:
         assert isinstance(_ConformingScorer(), Scorer)
@@ -70,8 +76,12 @@ class TestScoredItem:
 
 
 class TestTypeAliases:
-    def test_rollout_fn_is_importable(self) -> None:
-        assert RolloutFn is not None
+    def test_rollout_fn_is_a_callable_type_alias(self) -> None:
+        # RolloutFn = Callable[[str, Any, str], Awaitable[Any]] — assert it
+        # is actually a `collections.abc.Callable` generic alias (the seam's
+        # real shape), not just "importable and non-None".
+        assert typing.get_origin(RolloutFn) is collections.abc.Callable
 
-    def test_propose_fn_is_importable(self) -> None:
-        assert ProposeFn is not None
+    def test_propose_fn_is_a_callable_type_alias(self) -> None:
+        # ProposeFn = Callable[..., Awaitable[str]] — same shape check.
+        assert typing.get_origin(ProposeFn) is collections.abc.Callable
