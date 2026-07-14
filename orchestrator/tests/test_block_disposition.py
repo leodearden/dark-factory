@@ -20,6 +20,7 @@ Test coverage:
 from __future__ import annotations
 
 import dataclasses
+import inspect
 
 import pytest
 
@@ -243,4 +244,59 @@ class TestClassifyFailureKnownRows:
             pass
 
         disp = classify_failure(_SomeUnrelatedError('surprise'))
+        assert disp is not None
+
+
+# ---------------------------------------------------------------------------
+# step-05: BD-2 completeness test (boundary row 11)
+# ---------------------------------------------------------------------------
+
+
+def _public_exception_types(module):
+    """Every public (no leading underscore) BaseException subclass in *module*."""
+    return [
+        obj for name, obj in vars(module).items()
+        if not name.startswith('_')
+        and inspect.isclass(obj)
+        and issubclass(obj, BaseException)
+    ]
+
+
+class TestBD2Completeness:
+    """Every exception exported by the four BD-2 modules has an EXPLICIT
+    ``_DISPOSITION_TABLE`` row — never just the fallback default."""
+
+    def test_every_exported_exception_has_an_explicit_row(self):
+        import shared.cli_invoke as cli_invoke
+        import shared.usage_gate as usage_gate
+
+        import orchestrator.git_ops as git_ops
+        import orchestrator.verify as verify
+        from orchestrator.workflow_types import _lookup_disposition
+
+        exc_types = [
+            t
+            for module in (git_ops, verify, cli_invoke, usage_gate)
+            for t in _public_exception_types(module)
+        ]
+        assert exc_types, 'sanity: the 4 BD-2 modules must export at least one exception'
+
+        missing = [t for t in exc_types if _lookup_disposition(t) is None]
+        assert not missing, (
+            'exported exception types with no explicit disposition row: '
+            f'{[t.__qualname__ for t in missing]}'
+        )
+
+    def test_a_brand_new_exception_type_has_no_row_but_still_classifies(self):
+        # A synthetic type with no table row proves the completeness check
+        # above is meaningful: it FAILS for an unrecognized type rather than
+        # silently matching everything.
+        from orchestrator.workflow_types import _lookup_disposition, classify_failure
+
+        class _BrandNewFailure(Exception):
+            pass
+
+        assert _lookup_disposition(_BrandNewFailure) is None
+        # classify_failure is still TOTAL — it falls back to the default.
+        disp = classify_failure(_BrandNewFailure('surprise'))
         assert disp is not None
