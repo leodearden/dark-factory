@@ -29,7 +29,8 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      * an escalation was filed and resolved → human acted (act-then-ask) →
        drive to ``done``, no re-run.
      * neither → crash mid-deploy before any terminal decision.  Task 2618:
-       if a PERSISTED ``deploy_state.verify_baseline`` is available, RE-RUN
+       if ``deploy_state.phase`` is ``RAN`` (the genuine crash-window strand)
+       AND a PERSISTED ``deploy_state.verify_baseline`` is available, RE-RUN
        the read-only verify inspect against ``target_unit`` and re-classify
        via ``_deterministic_deploy_health_verdict`` (the same classifier the
        harness recon-sweep uses) — a positive ``'healthy'`` verdict means the
@@ -1849,13 +1850,20 @@ class DeterministicRunner:
                 # deploy that actually succeeded but crashed inside
                 # _writeback_deploy_success before before_done_verified_at could
                 # be stamped (task 2584/esc-2584-*: an infinite reblock loop on
-                # every orchestrator restart). Gated on a PERSISTED
-                # verify_baseline (not merely deploy_state/phase presence) —
-                # without one, the classifier's no-baseline fallback is a
-                # near-constant 'healthy' liveness check for an always-on unit,
-                # which would phantom-done and regress finding-4.0's D3 guard
-                # (see this module's design-decision history / task 2618
-                # plan). This also scopes auto-recovery to be best-effort
+                # every orchestrator restart). Gated on BOTH deploy_state.phase
+                # == RAN (the genuine crash-window strand: ran but never
+                # verified/escalated) AND a PERSISTED verify_baseline —
+                # without the baseline, the classifier's no-baseline fallback is
+                # a near-constant 'healthy' liveness check for an always-on
+                # unit, which would phantom-done and regress finding-4.0's D3
+                # guard (see this module's design-decision history / task 2618
+                # plan); without the RAN-phase check, the rare corrupted state
+                # of phase==ESCALATED with every escalation record for this
+                # task+role deleted (own_escalation_resolved/resolution_proven
+                # both False) would also reach here and could re-verify/
+                # phantom-done over a real prior failure instead of raising a
+                # fresh crash-window escalation. This also scopes auto-recovery
+                # to be best-effort
                 # across an ORCHESTRATOR restart only: verify_baseline's
                 # monotonic clock is CLOCK_MONOTONIC and resets on a MACHINE
                 # reboot, so a post-reboot re-verify conservatively falls
@@ -1870,7 +1878,11 @@ class DeterministicRunner:
                 # untouched in both cases — it is the dedup/reblock_guard
                 # signature and must stay stable.
                 reverify_note: str | None = None
-                if deploy_state is not None and deploy_state.verify_baseline is not None:
+                if (
+                    deploy_state is not None
+                    and deploy_state.phase == DeployPhase.RAN
+                    and deploy_state.verify_baseline is not None
+                ):
                     inspect_fn = self._unit_inspector or self._default_inspect_unit
                     fresh_state = await inspect_fn(target_unit)
                     verdict = _deterministic_deploy_health_verdict(

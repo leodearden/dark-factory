@@ -3601,6 +3601,57 @@ class TestCrashWindowReverify:
         assert pending[0].summary == 'Deploy state unknown after crash: orchestrator-reify.service'
         script_runner.assert_not_awaited()
 
+    async def test_escalated_phase_with_deleted_escalations_does_not_reinspect(
+        self, tmp_path: Path,
+    ):
+        """Defensive-correctness (task 2618 review): the re-verify gate must be
+        scoped to a genuine RAN-phase crash-window strand, not merely a
+        persisted verify_baseline. If deploy_state.phase == 'escalated' but
+        every escalation record for this task+role has been deleted
+        (own_escalation_resolved False => resolution_proven False), control
+        still reaches sub-case (c) — this must NOT be treated as a RAN-phase
+        strand even though a verify_baseline is persisted, since a live unit
+        that looks fresh could be masking a real prior failure. Must fall
+        through to the generic crash-window escalation unchanged, with no
+        re-inspect and no phantom-done."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='904',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='escalated',
+            verify_baseline={'main_pid': 100, 'active_enter_timestamp_monotonic': 1_000_000},
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty — no escalation record survives
+        scheduler = _mock_scheduler(task)
+
+        # A live inspect that WOULD classify 'healthy' if the re-verify gate
+        # were wrongly triggered — proves the assertions below are non-vacuous.
+        unit_inspector = AsyncMock(return_value=_FRESH_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        unit_inspector.assert_not_awaited()
+        pending = queue.get_by_task('904', status='pending')
+        assert len(pending) == 1, (
+            f'escalated-phase crash-window must escalate exactly once, got {len(pending)}'
+        )
+        assert pending[0].category == 'infra_issue'
+        assert pending[0].summary == 'Deploy state unknown after crash: orchestrator-reify.service'
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls, 'a non-RAN-phase strand must never phantom-done'
+        script_runner.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # Task 2120: escalation-aliasing phantom-done guard.
