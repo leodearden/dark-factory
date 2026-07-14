@@ -158,6 +158,7 @@ class CockpitApp(App):
         Binding('d', 'defer', 'Defer', show=False),
         Binding('n', 'new_session', 'New session', show=False),
         Binding('t', 'toggle_tree', 'Spawn tree', show=False),
+        Binding('h', 'toggle_history', 'Toggle history', show=False),
         # All ten digits are bound, but a digit's SCORE effect saturates
         # once it exceeds the active Priorities.manual_boost.max (default 5
         # -- see priority.py's score(), which clamps manual_boost into
@@ -734,6 +735,20 @@ class CockpitApp(App):
             return
         records = self._records
         self.push_screen(SpawnTreeScreen(records, lambda slug: self._focus_slug(slug, records)))
+
+    def action_toggle_history(self) -> None:
+        """'h' -- reveal (or re-hide) the full, unfiltered session history.
+
+        FINDING F2 (C10 tour, esc-2303-1): the default view hides terminal
+        sessions and caps the visible band so "tens, not 10k" holds; this
+        toggle is the escape hatch back to today's exact full-history
+        behavior. Flips self._show_history and re-renders immediately via
+        _rebuild_session_table -- bypassing _apply_scan's snapshot
+        short-circuit, since a toggle changes nothing on disk (mirrors
+        _rebuild_queue's "re-render from in-memory state" pattern).
+        """
+        self._show_history = not self._show_history
+        self._rebuild_session_table()
 
     def _focus_slug(self, slug: str, records: list[SessionRecord]) -> None:
         """Resolve *slug* within *records* to a focus target and route it to a backend (Fleet Cockpit C9a).
