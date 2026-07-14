@@ -1875,6 +1875,61 @@ def _verify_duration_secs(runs: list[dict]) -> float:
 
 
 @dataclass
+class CheckRun:
+    """The execution outcome of a single check (test/lint/type).
+
+    Introduced (task 2133) to collapse ``run_verification``'s 15 parallel
+    per-check scalar locals (``{test,lint,type}_{rc,out,timed_out,
+    started_at,duration}``) into one object per check, and — paired with
+    :class:`VerifyAttempt` — to compute the pure-timeout-consistency formula
+    in exactly one place instead of two hand-duplicated copies.
+    """
+
+    label: str
+    cmd: 'str | None'
+    rc: int
+    output: str
+    timed_out: bool
+    started_at: 'str | None'
+    duration_secs: float
+
+    @classmethod
+    def skipped(cls, label: str) -> 'CheckRun':
+        """Build the CheckRun for a check whose command is ``None`` (module_config skip).
+
+        Matches ``_run_or_skip_timed``'s early return for ``cmd is None``:
+        vacuously passing (``rc=0``), no output, never timed out, no start
+        time, zero duration.
+        """
+        return cls(
+            label=label, cmd=None, rc=0, output='', timed_out=False,
+            started_at=None, duration_secs=0.0,
+        )
+
+    def to_dict(self) -> dict:
+        """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
+        ``_build_summary_payload``/``_verify_duration_secs``/``_archive_merge_verify_logs``
+        (all take ``list[dict]``) — the exact 7-key shape previously hand-built
+        inline in ``run_verification`` (label/cmd/rc/output/timed_out/
+        started_at/duration_secs).
+
+        ``started_at`` is normalised via ``or ''``: a skipped check's
+        ``None`` serialises as ``''``, matching the pre-refactor
+        ``test_started_at or ''`` pattern so downstream JSON consumers see
+        the same shape as before.
+        """
+        return {
+            'label': self.label,
+            'cmd': self.cmd,
+            'rc': self.rc,
+            'output': self.output,
+            'timed_out': self.timed_out,
+            'started_at': self.started_at or '',
+            'duration_secs': self.duration_secs,
+        }
+
+
+@dataclass
 class VerifyResult:
     passed: bool
     test_output: str
