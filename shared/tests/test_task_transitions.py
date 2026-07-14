@@ -171,7 +171,13 @@ class TestIsLegalTransitionCore:
 
     @pytest.mark.parametrize(
         'actor',
-        [ActorClass.HUMAN, ActorClass.ORCHESTRATOR, ActorClass.DETERMINISTIC, ActorClass.RECONCILIATION],
+        [
+            ActorClass.HUMAN,
+            ActorClass.ORCHESTRATOR,
+            ActorClass.DETERMINISTIC,
+            ActorClass.RECONCILIATION,
+            ActorClass.ESCALATION,
+        ],
     )
     def test_pending_to_done_legal(self, actor):
         # recon found_on_main / operator direct-complete of a never-dispatched
@@ -181,11 +187,21 @@ class TestIsLegalTransitionCore:
         # actor actually cited above, and the RECONCILIATION restriction
         # (task-1655) only strips in-progress-origin pairs — this
         # pending-origin pair is unaffected and stays in its safe-open subset.
+        # ESCALATION is included for symmetry with the other actor-parametrized
+        # tests in this module (e.g. test_safe_open_contrast_for_other_actors);
+        # it shares the full _UNION with no actor-specific restriction, which
+        # test_transitions_human_is_the_union already pins independently.
         assert is_legal_transition(TaskStatus.PENDING, TaskStatus.DONE, actor) is True
 
     @pytest.mark.parametrize(
         'actor',
-        [ActorClass.HUMAN, ActorClass.ORCHESTRATOR, ActorClass.DETERMINISTIC, ActorClass.RECONCILIATION],
+        [
+            ActorClass.HUMAN,
+            ActorClass.ORCHESTRATOR,
+            ActorClass.DETERMINISTIC,
+            ActorClass.RECONCILIATION,
+            ActorClass.ESCALATION,
+        ],
     )
     def test_pending_to_blocked_legal(self, actor):
         # Deterministic pure-gate born-at-L2 path (deterministic_runner.py:
@@ -194,7 +210,8 @@ class TestIsLegalTransitionCore:
         # task (task 2614). RECONCILIATION is included too: the actor
         # restriction only strips in-progress-origin pairs (task-1655), so
         # this pending-origin pair is unaffected and stays in RECONCILIATION's
-        # safe-open subset.
+        # safe-open subset. ESCALATION is included for the same symmetry
+        # reason as test_pending_to_done_legal above.
         assert is_legal_transition(TaskStatus.PENDING, TaskStatus.BLOCKED, actor) is True
 
 
