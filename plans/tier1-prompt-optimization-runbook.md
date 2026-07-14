@@ -118,7 +118,11 @@ Notes:
 > production traffic. Point `--runs-db` at
 > `/home/leo/src/dark-factory/data/orchestrator/runs.db` explicitly (the
 > CLI's default) or set `PROMPT_OPT_RUNS_DB`; a task worktree's copy (if one
-> exists at all) is stale/empty.
+> exists at all) is stale/empty. The canary opens `runs.db` **read-only**
+> (a `mode=ro` SQLite URI), so it's safe to run against the live file while
+> the orchestrator is actively writing to it — no lock contention, and a
+> mistyped path fails loud (`sqlite3.OperationalError`) instead of silently
+> creating an empty database.
 
 ```bash
 cd /home/leo/src/dark-factory/orchestrator && uv run python -m orchestrator.evals.prompt_opt canary \
@@ -185,14 +189,23 @@ floor and flag ordinary noise as a regression (e.g. `requeue_rate` baseline
 `0.02` at 20% tolerance would relatively-threshold at `0.024` — well under
 the `0.05` floor — without the `max()`).
 
-**Watch for a `NOTE: ... window has ZERO done rows` line.** A window can
-clear `min_samples` on total row count while having zero `outcome=='done'`
-rows (e.g. a deploy that made everything requeue or fail outright,
-completing nothing) — `cost_per_done_task` is then incomparable and
-`mean_review_cycles`/`mean_verify_attempts` fall back to `0.0`, so the
-verdict quietly reduces to `requeue_rate` alone instead of tripping
-`insufficient_data`. The CLI surfaces this explicitly rather than letting
-it read as a clean `pass`; treat a `NOTE`-flagged `pass` as unverified, not
+**A `NOTE: ... window has ZERO done rows` line marks a reduced-signal
+window.** A window can clear `min_samples` on total row count while having
+zero `outcome=='done'` rows (e.g. a deploy that made everything requeue,
+fail, or block outright, completing nothing) — `cost_per_done_task` is then
+incomparable and `mean_review_cycles`/`mean_verify_attempts` fall back to
+`0.0`, so only `requeue_rate` carries real signal for that window. **If
+it's the post window and the baseline window had done rows,
+`compare_windows` forces the verdict to `regress` outright** — a deploy
+that used to complete work and now completes none of it is the canary's
+worst-case signal, and must not read as a clean `pass` just because
+`requeue_rate` alone stayed under threshold. (When this fires, the CLI's
+summary line explains the forced reason explicitly, since no individual
+metric may have crossed its threshold — there's nothing to list under
+"Regressed metrics".) The NOTE can still appear on a genuine `pass`
+verdict in the other zero-done combination — **both** windows having zero
+done rows (e.g. a project that has never completed anything) — in which
+case treat that `pass` as unverified on the done-derived metrics, not
 confirmed-healthy.
 
 **Verdict is one of three states**, printed with a per-metric `[PASS]` /
@@ -202,7 +215,7 @@ it without scraping stdout:
 | Verdict | Exit code | Meaning |
 |---|---|---|
 | `pass` | 0 | every metric within threshold — keep the pin |
-| `regress` | 1 | ≥1 metric exceeded threshold — go to Rollback |
+| `regress` | 1 | ≥1 metric exceeded threshold, **or** the post window completed zero tasks after a baseline that completed some — go to Rollback |
 | `insufficient_data` | 3 | either window has < `min_samples` rows — **not** evidence either way |
 | *(usage error — bad flags, missing `runs.db`)* | 2 | fix the invocation, not a verdict |
 
