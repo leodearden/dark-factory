@@ -7401,6 +7401,41 @@ class GitOps:
         )
         return 'error'
 
+    async def _park_wip_on_private_ref(self, label: str) -> None:
+        """Park uncommitted WIP in project_root onto MERGE_PARK_REF.
+
+        Uses ``git stash create`` (writes a stash commit WITHOUT touching
+        the shared ``refs/stash`` stack) plus ``git update-ref`` to record
+        it on a private ref the merge worker exclusively owns, then
+        ``git read-tree -u --reset HEAD`` to clean the working tree —
+        mirroring what ``git stash push`` used to do.  See MERGE_PARK_REF's
+        module-level docstring for why the shared stash stack is unsafe here
+        (incident 13674d3c68).
+
+        Raises :class:`MergeParkError` if ``git stash create`` fails or
+        produces no commit.
+        """
+        stash_rc, stash_sha, stash_err = await _run(
+            ['git', 'stash', 'create', f'merge-queue: pre-advance for {label}'],
+            cwd=self.project_root,
+        )
+        stash_sha = stash_sha.strip()
+        if stash_rc != 0 or not stash_sha:
+            raise MergeParkError(
+                f'git stash create failed or produced no commit (rc={stash_rc}, '
+                f'stdout={stash_sha!r}, stderr={stash_err!r})'
+            )
+
+        await _run(
+            ['git', 'update-ref', MERGE_PARK_REF, stash_sha],
+            cwd=self.project_root,
+        )
+
+        await _run(
+            ['git', 'read-tree', '-u', '--reset', 'HEAD'],
+            cwd=self.project_root,
+        )
+
     async def _create_recovery_branch_from_stash(self, label: str) -> str:
         """Create a branch from the current stash to preserve WIP, then clean up.
 
