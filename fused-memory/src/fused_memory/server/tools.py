@@ -1623,9 +1623,10 @@ def create_mcp_server(
     @mcp.tool()
     @mcp_tool_errors()
     async def delete_memory(
-        memory_id: str,
         store: str,
         project_id: str,
+        memory_id: str | None = None,
+        id: str | None = None,
         agent_id: str | None = None,
         session_id: str | None = None,
         metadata: dict | None = None,
@@ -1641,10 +1642,17 @@ def create_mcp_server(
         includes its id (edge UUID for Graphiti, memory UUID for Mem0) and
         source_store.
 
+        Accepts either *memory_id* (canonical) or *id* (alias matching the key
+        search results and this tool's own response return). Exactly one must
+        be provided; supplying both with conflicting values is an error.
+
         Args:
-            memory_id: The memory ID (from search results)
             store: "graphiti" or "mem0" (from search results)
             project_id: Project scope (required)
+            memory_id: The memory ID (from search results)
+            id: Alias for memory_id, matching the `id` key returned by search
+                results and by this tool's own response (optional when
+                memory_id is provided)
             agent_id: Which agent is deleting (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
@@ -1657,6 +1665,20 @@ def create_mcp_server(
             return err
         if err := _known_project_gate(project_id):
             return err
+        if memory_id is not None and id is not None and memory_id != id:
+            return {
+                'error': (
+                    f'Conflicting memory_id {memory_id!r} and id {id!r}; '
+                    'provide only one.'
+                ),
+                'error_type': 'ValidationError',
+            }
+        resolved_id = memory_id if memory_id is not None else id
+        if resolved_id is None:
+            return {
+                'error': 'memory_id (or alias id) is required',
+                'error_type': 'ValidationError',
+            }
         if store not in _VALID_STORES:
             return {
                 'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
@@ -1664,7 +1686,7 @@ def create_mcp_server(
             }
         causation_id, source, _ = _extract_causation(metadata, agent_id)
         return await memory_service.delete_memory(
-            memory_id=memory_id,
+            memory_id=resolved_id,
             store=store,
             project_id=project_id,
             agent_id=agent_id,
