@@ -59,9 +59,9 @@ def split_corpus(
 
     train_n = (n * train_ratio) // total_ratio
     selection_n = (n * selection_ratio) // total_ratio
-    # TEST absorbs the remainder so the partition is always exhaustive even
-    # when n isn't evenly divisible by total_ratio.
-    test_n = n - train_n - selection_n
+    # TEST gets whatever remains (shuffled[train_n + selection_n:] below), so
+    # it absorbs the rounding remainder and the partition stays exhaustive
+    # even when n isn't evenly divisible by total_ratio.
 
     train = shuffled[:train_n]
     selection = shuffled[train_n:train_n + selection_n]

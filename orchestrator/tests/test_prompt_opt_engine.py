@@ -24,12 +24,13 @@ import re
 from typing import Any
 
 import pytest
-
 from shared.prompt_artifact import ArtifactProvenance, PromptSpec, compose_prompt
 
 from orchestrator.evals.prompt_opt import LoopResult, Scorer, run_optimization_loop
 from orchestrator.evals.prompt_opt.engine import LoopResult as _EngineLoopResult
-from orchestrator.evals.prompt_opt.engine import run_optimization_loop as _engine_run_optimization_loop
+from orchestrator.evals.prompt_opt.engine import (
+    run_optimization_loop as _engine_run_optimization_loop,
+)
 
 EXECUTOR_MODEL = 'exec-x'
 OPTIMIZER_MODEL = 'frontier-y'
