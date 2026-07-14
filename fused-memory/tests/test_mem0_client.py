@@ -274,6 +274,59 @@ class TestMem0BackendAddSystemRecord:
         )
 
 
+class TestMem0BackendUpdate:
+    """Unit tests for Mem0Backend.update's metadata-forwarding (task 2452).
+
+    mem0's ``AsyncMemory._update_memory`` overwrites the whole Qdrant
+    payload on update -- passing the full existing payload back as
+    ``metadata=`` is what preserves custom keys (``src_project`` /
+    ``dst_project`` / ``kind`` / ...) instead of wiping them.
+    ``Mem0Backend.update`` previously forwarded no metadata at all (and had
+    zero callers), which would have silently wiped such keys for any future
+    caller relying on an in-place edit.
+    """
+
+    @pytest.mark.asyncio
+    async def test_forwards_metadata_to_instance_update(self, backend):
+        """metadata= must be forwarded so mem0's payload-overwriting update
+        preserves the custom provenance keys instead of wiping them."""
+        mock_instance = MagicMock()
+        mock_instance.update = AsyncMock(return_value={'message': 'Memory updated successfully!'})
+        metadata = {'kind': 'cgl_eta_cross_target_rehome', 'src_project': 'reify'}
+
+        with patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)):
+            await backend.update(
+                'mem-id', 'new content', Scope(project_id='p'), metadata=metadata,
+            )
+
+        call = mock_instance.update.await_args
+        assert call.args == ('mem-id', 'new content'), (
+            f'expected positional args (mem-id, new content), got {call.args!r}'
+        )
+        assert call.kwargs.get('metadata') == metadata, (
+            f'expected metadata={metadata!r} forwarded, got {call.kwargs.get("metadata")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_back_compat_no_metadata_arg(self, backend):
+        """Calling update() with no metadata (the pre-task-2452 call shape)
+        must still work and must not forward a non-None metadata kwarg."""
+        mock_instance = MagicMock()
+        mock_instance.update = AsyncMock(return_value={'message': 'Memory updated successfully!'})
+
+        with patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)):
+            await backend.update('mem-id', 'new content', Scope(project_id='p'))
+
+        call = mock_instance.update.await_args
+        assert call.args == ('mem-id', 'new content'), (
+            f'expected positional args (mem-id, new content), got {call.args!r}'
+        )
+        assert call.kwargs.get('metadata') is None, (
+            'expected no non-None metadata kwarg when caller omits it, got '
+            f'{call.kwargs.get("metadata")!r}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Integration: add_system_record fresh-point-per-call (task 2222 / W5-δ, P4)
 # ---------------------------------------------------------------------------
