@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,7 @@ __all__ = [
     'RecordedDecision',
     'read_curator_decisions',
     'recover_recorded_action',
+    'select_spot_check_subset',
 ]
 
 _RECOVERABLE_ACTIONS = ('drop', 'combine', 'create')
@@ -151,3 +153,74 @@ def read_curator_decisions(db_path: Path) -> list[RecordedDecision]:
         ))
 
     return decisions
+
+
+# ---------------------------------------------------------------------------
+# Human spot-check subset (Open-Q Sec9 -- this task's tactical decision)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_SPOT_CHECK_FRACTION = 0.2
+_DEFAULT_SPOT_CHECK_MINIMUM = 5
+_DEFAULT_SPOT_CHECK_CAP = 200
+
+
+def select_spot_check_subset(
+    decisions: list[RecordedDecision],
+    *,
+    fraction: float = _DEFAULT_SPOT_CHECK_FRACTION,
+    minimum: int = _DEFAULT_SPOT_CHECK_MINIMUM,
+    cap: int = _DEFAULT_SPOT_CHECK_CAP,
+    seed: int = 0,
+    stratify_by_action: bool = True,
+) -> list[str]:
+    """Deterministic human spot-check subset of *decisions* (``ticket_id``s).
+
+    The Open-Q Sec9 tactical decision this task owns: bound human review
+    effort while keeping label confidence across the action distribution.
+    By default (``stratify_by_action=True``) samples independently within
+    each recorded-action stratum -- ``~fraction`` of the stratum, floored at
+    *minimum* (so a stratum smaller than *minimum* is taken in full rather
+    than padded past its own size) -- so every present action ends up
+    represented in the human-reviewed subset rather than the sample being
+    dominated by whichever action is most common. The combined subset is
+    then trimmed to *cap* if it would otherwise exceed it, bounding total
+    human effort regardless of corpus size.
+
+    Same *decisions* + *seed* always yields the same subset (``random.Random``
+    seeded per stratum, no wall-clock/real randomness) -- required for a
+    reproducible spot-check protocol; a different *seed* yields a different
+    sample.
+
+    ``stratify_by_action=False`` samples flatly across all *decisions*
+    instead (one "stratum" holding everything) -- provided for parity with
+    a non-stratified sampling mode; :func:`build_curator_corpus` always uses
+    the stratified default so drop/combine/create are each represented.
+    """
+    if not decisions:
+        return []
+
+    if stratify_by_action:
+        groups: dict[str, list[str]] = {}
+        for d in decisions:
+            groups.setdefault(d.action, []).append(d.ticket_id)
+    else:
+        groups = {'_all': [d.ticket_id for d in decisions]}
+
+    selected: list[str] = []
+    for key in sorted(groups):
+        ids = sorted(groups[key])
+        rng = random.Random(f'{seed}:{key}')
+        shuffled = ids[:]
+        rng.shuffle(shuffled)
+        k = min(len(shuffled), max(minimum, round(len(shuffled) * fraction)))
+        selected.extend(shuffled[:k])
+
+    if len(selected) > cap:
+        # Reshuffle the combined selection (still seed-reproducible) rather
+        # than truncating in per-stratum append order, which would silently
+        # starve later-sorted strata whenever the combined set exceeds cap.
+        rng = random.Random(f'{seed}:trim')
+        rng.shuffle(selected)
+        selected = selected[:cap]
+
+    return sorted(set(selected))
