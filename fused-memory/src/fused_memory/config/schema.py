@@ -675,6 +675,18 @@ class ReconciliationConfig(BaseModel):
     # Moves dedup from reactive Stage-1 consolidation to write time: a high-similarity match
     # against an existing procedural_knowledge Mem0 entry soft-blocks the write instead of
     # letting the duplicate land and consuming another cleanup cycle.
+    #
+    # Ownership note: the guard itself is enforced in the server layer (see
+    # server/near_duplicate_guard.py and the add_memory tool in server/tools.py), not in the
+    # reconciliation subsystem -- these two knobs live on ReconciliationConfig anyway because
+    # the guard is the write-time counterpart to Stage-1's reactive procedural_knowledge
+    # consolidation (same recurring-duplicate problem, same operator-tunable bounded-threshold
+    # shape as this model's sibling `*_threshold` fields), not because the write path executes
+    # inside reconciliation. Resolved via `memory_service.config.reconciliation.*` by
+    # `resolve_near_dup_threshold` / `resolve_near_dup_guard_enabled` in
+    # server/near_duplicate_guard.py -- if this guard ever grows independent of reconciliation,
+    # move these two fields to a dedicated server-owned config section instead of assuming
+    # colocation implies subsystem ownership.
     procedural_knowledge_near_dup_guard_enabled: bool = Field(
         default=True,
         description=(
