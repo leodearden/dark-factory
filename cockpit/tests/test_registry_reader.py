@@ -12,6 +12,8 @@ so a purely-time-passing tick is a no-op diff.
 
 from __future__ import annotations
 
+import os
+
 from orchestrator import session_registry as sr
 
 
@@ -83,6 +85,227 @@ class TestScanSessions:
         result = scan_sessions(tmp_path)
 
         assert result == []
+
+
+class TestSessionScanner:
+    """SessionScanner is the stateful, cache-aware counterpart to scan_sessions
+    (registry_reader.py's plain free function) -- see TestScanChangeShortCircuit
+    below for the mtime-cache behavior itself. This class only pins parity
+    with scan_sessions and correct on-disk-set tracking across calls.
+    """
+
+    def test_scan_matches_scan_sessions_for_seeded_dir(self, tmp_path):
+        from cockpit.registry_reader import SessionScanner, scan_sessions
+
+        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        r2 = _make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT)
+        r3 = _make_record(session_slug='c-3', status=sr.Status.IDLE)
+        for r in (r1, r2, r3):
+            sr.write_record(r, root=tmp_path)
+
+        scanner = SessionScanner(root=tmp_path)
+        result = scanner.scan()
+
+        expected = scan_sessions(tmp_path)
+        # Both iterate sorted(base.iterdir()), so scan() must mirror
+        # scan_sessions()'s ORDER, not just its content -- a dict comparison
+        # alone is order-insensitive and would miss a regression that
+        # reordered scan()'s output (e.g. iterating an unsorted dict).
+        assert [r.session_slug for r in result] == [r.session_slug for r in expected]
+        assert {r.session_slug: r for r in result} == {r.session_slug: r for r in expected}
+
+    def test_scan_reflects_slug_added_since_last_scan(self, tmp_path):
+        from cockpit.registry_reader import SessionScanner
+
+        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        sr.write_record(r1, root=tmp_path)
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert {r.session_slug for r in first} == {'a-1'}
+
+        r2 = _make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT)
+        sr.write_record(r2, root=tmp_path)
+
+        second = scanner.scan()
+        assert {r.session_slug for r in second} == {'a-1', 'b-2'}
+
+    def test_scan_drops_slug_removed_since_last_scan(self, tmp_path):
+        """The second scan() reflects the CURRENT on-disk set, not a stale
+        union of everything ever seen."""
+        import shutil
+
+        from cockpit.registry_reader import SessionScanner
+
+        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        r2 = _make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT)
+        for r in (r1, r2):
+            sr.write_record(r, root=tmp_path)
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert {r.session_slug for r in first} == {'a-1', 'b-2'}
+
+        shutil.rmtree(sr.sessions_dir(tmp_path) / 'a-1')
+
+        second = scanner.scan()
+        assert {r.session_slug for r in second} == {'b-2'}
+
+
+class TestScanChangeShortCircuit:
+    """Proves SessionScanner's mtime cache: a scan() call must not re-parse
+    (call session_registry.read_record for) a slug whose record.json mtime
+    is unchanged since the previous scan() -- this is the ~4.5s-at-10k-
+    sessions cost this task exists to eliminate (see the module docstring).
+    """
+
+    _FIXED_NS = 1_700_000_000_000_000_000
+
+    def test_unchanged_mtime_skips_reparse(self, tmp_path, monkeypatch):
+        from cockpit import registry_reader
+        from cockpit.registry_reader import SessionScanner
+
+        record = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        sr.write_record(record, root=tmp_path)
+        path = sr.record_path_for_slug('a-1', root=tmp_path)
+        os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))
+
+        call_count = 0
+        original_read_record = registry_reader.session_registry.read_record
+
+        def counting_read_record(slug, root=None):
+            nonlocal call_count
+            call_count += 1
+            return original_read_record(slug, root=root)
+
+        monkeypatch.setattr(registry_reader.session_registry, 'read_record', counting_read_record)
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert call_count == 1
+        assert {r.session_slug for r in first} == {'a-1'}
+
+        # record.json's mtime is untouched -- the second scan must reuse the
+        # cached SessionRecord rather than calling read_record again.
+        second = scanner.scan()
+        assert call_count == 1
+        assert {r.session_slug: r for r in second} == {r.session_slug: r for r in first}
+
+    def test_changed_mtime_reparses_and_reflects_new_value(self, tmp_path):
+        """A genuine rewrite (write_record/update_status, which always goes
+        through os.replace and so always bumps record.json's mtime) must be
+        picked up by the very next scan() -- the cache never masks a real
+        change."""
+        from cockpit.registry_reader import SessionScanner
+
+        record = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        sr.write_record(record, root=tmp_path)
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert len(first) == 1
+        assert first[0].status == sr.Status.RUNNING
+
+        sr.update_status('a-1', root=tmp_path, status=sr.Status.IDLE)
+
+        second = scanner.scan()
+        assert len(second) == 1
+        assert second[0].status == sr.Status.IDLE
+
+    def test_same_mtime_different_size_rewrite_is_not_masked_by_cache(self, tmp_path):
+        """The cache is keyed on (st_mtime_ns, st_size), not st_mtime_ns
+        alone: a rewrite that coincidentally lands on the exact same mtime
+        (plausible on filesystems whose real mtime resolution is coarser
+        than the nanoseconds st_mtime_ns reports) must still be detected
+        when it also changes the record's serialized length, rather than
+        being masked as a false cache hit.
+        """
+        from cockpit.registry_reader import SessionScanner
+
+        record = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        sr.write_record(record, root=tmp_path)
+        path = sr.record_path_for_slug('a-1', root=tmp_path)
+        os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert first[0].status == sr.Status.RUNNING
+
+        # 'running' (7 chars) -> 'awaiting-input' (14 chars) changes
+        # record.json's byte length; re-pin the mtime back to the exact
+        # value the cache already holds to force the adversarial collision.
+        sr.update_status('a-1', root=tmp_path, status=sr.Status.AWAITING_INPUT)
+        os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))
+
+        second = scanner.scan()
+        assert second[0].status == sr.Status.AWAITING_INPUT
+
+    def test_removed_slug_leaves_no_stale_entry_for_a_different_record_at_same_slug(
+        self, tmp_path
+    ):
+        """A slug removed from disk is absent from the next scan() result and
+        leaves no stale cache entry behind: re-adding a DIFFERENT record at
+        the exact same slug is picked up fresh, even in the adversarial case
+        where its record.json is coincidentally stamped with the very same
+        mtime the removed record's cache entry was keyed on -- proving the
+        cache is keyed on the CURRENT dir set (evicted every scan), not just
+        "mtime happened to differ this time."
+        """
+        import shutil
+
+        from cockpit.registry_reader import SessionScanner
+
+        first_record = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        sr.write_record(first_record, root=tmp_path)
+        path = sr.record_path_for_slug('a-1', root=tmp_path)
+        os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert {r.session_slug for r in first} == {'a-1'}
+
+        shutil.rmtree(sr.sessions_dir(tmp_path) / 'a-1')
+        assert scanner.scan() == []
+
+        second_record = _make_record(session_slug='a-1', status=sr.Status.AWAITING_INPUT)
+        sr.write_record(second_record, root=tmp_path)
+        os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))  # coincidentally the same mtime
+
+        second = scanner.scan()
+        assert len(second) == 1
+        assert second[0].status == sr.Status.AWAITING_INPUT
+
+    def test_slug_unreadable_after_caching_is_skipped_not_stale_or_crashing(self, tmp_path):
+        """Once a slug has been cached, its record.json can later become
+        unreadable in two ways -- removed outright (the slug dir remains, so
+        stat() itself raises) or overwritten with invalid JSON (read_record
+        raises CorruptSessionRecord). Either way, scan() must fail-soft skip
+        it: no crash from an unguarded stat(), and no stale cached record
+        served in its place.
+        """
+        from cockpit.registry_reader import SessionScanner
+
+        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        r2 = _make_record(session_slug='b-2', status=sr.Status.RUNNING)
+        for r in (r1, r2):
+            sr.write_record(r, root=tmp_path)
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert {r.session_slug for r in first} == {'a-1', 'b-2'}
+
+        # a-1: record.json vanishes but the slug directory remains.
+        path_a = sr.record_path_for_slug('a-1', root=tmp_path)
+        path_a.unlink()
+        assert path_a.parent.is_dir()
+
+        # b-2: record.json is overwritten with invalid JSON (a genuine
+        # rewrite, so its mtime naturally advances).
+        path_b = sr.record_path_for_slug('b-2', root=tmp_path)
+        path_b.write_text('{not valid json')
+
+        second = scanner.scan()
+        assert second == []
 
 
 class TestBuildSnapshot:
