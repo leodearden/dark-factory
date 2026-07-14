@@ -3201,6 +3201,97 @@ class TestDeterministicRunnerResolutionProofAliasing:
         assert pending[0].agent_role == 'orchestrator-deterministic'
         assert outcome == WorkflowOutcome.BLOCKED
 
+    # --- test a2: ζ D3 — phase gate replaces bare escalation-existence ------
+
+    async def test_phase_ran_with_resolved_runner_owned_escalation_does_not_resume_to_done(
+        self, tmp_path: Path,
+    ):
+        """D3 negative (finding 4.0, the driving fix): a deploy stranded at
+        deploy_state.phase=='ran' (NOT escalated) with a RESOLVED
+        runner-owned escalation on record must NOT resume to done — bare
+        escalation existence is not proof THIS deploy's own gate/failure is
+        what got resolved; only phase=='escalated' (the runner's OWN
+        recorded transition when it filed that escalation) is. Falls to
+        the crash-window branch instead: re-escalates its own infra_issue
+        and BLOCKS, exactly as if no escalation existed at all.
+
+        RED against current code: `ever_escalated=bool(get_by_task(...,
+        agent_role=...))` is True here (a resolved runner-owned record
+        exists) and phantom-completes via branch (b) regardless of phase —
+        this is finding 4.0.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='805', before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_escalation(queue, '805', 'orchestrator-deterministic', resolved=True)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls, (
+            'phase==ran (not escalated) must NEVER resume to done, even with '
+            'a resolved runner-owned escalation on record — bare escalation '
+            'existence is not proof of resolution (finding 4.0)'
+        )
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('805', status='pending')
+        assert len(pending) == 1, f'must file a fresh crash-window infra_issue, got {len(pending)}'
+        assert pending[0].category == 'infra_issue'
+        script_runner.assert_not_awaited()
+
+    async def test_phase_ran_with_resolved_unrelated_escalation_does_not_resume_to_done(
+        self, tmp_path: Path,
+    ):
+        """D3 negative: same as above but the resolved escalation is the
+        UNRELATED starvation-watchdog role — doubly not proof of THIS
+        runner's resolution. Must also re-escalate and BLOCK, never done."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='806', before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_escalation(queue, '806', self._UNRELATED_ROLE, resolved=True)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('806', status='pending')
+        assert len(pending) == 1
+        assert pending[0].category == 'infra_issue'
+        assert pending[0].agent_role == 'orchestrator-deterministic'
+
     # --- run()'s section-1 gate quiescence aliasing -------------------------
 
     async def test_section1_quiescence_ignores_unrelated_pending_escalation(self, tmp_path: Path):
@@ -3275,13 +3366,19 @@ class TestDeterministicRunnerResolutionProofAliasing:
 
     async def test_parity_runner_owned_resolved_escalation_still_resumes(self, tmp_path: Path):
         """Parity: a RESOLVED escalation filed by the runner itself must still
-        prove resolution (branch b). Must stay GREEN regardless of the
-        ever_escalated agent_role scoping.
+        prove resolution (branch b) — ζ D3: the new contract requires
+        deploy_state.phase=='escalated' as the recorded proof the runner
+        itself transitioned there when it filed the failure/gate escalation
+        (see TestDeterministicRunnerResolutionProofAliasing's phase-gate
+        tests for the finding-4.0 fix this narrows against).
         """
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
-        task = _deploy_task(task_id='803', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        task = _deploy_task(
+            task_id='803', before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='escalated',
+        )
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
         _seed_escalation(queue, '803', 'orchestrator-deterministic', resolved=True)
