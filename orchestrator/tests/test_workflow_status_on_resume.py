@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _workflow_helpers import (
@@ -37,6 +37,7 @@ from orchestrator.workflow import (
     TaskWorkflow,
     WorkflowOutcome,
     WorkflowState,
+    _PriorImplStatus,
 )
 
 # ---------------------------------------------------------------------------
@@ -364,6 +365,58 @@ class TestStatusPreservationOnResume:
             f'Resume invocation must use IMPLEMENTER role; got {role!r}'
         )
 
+    async def test_scope_violation_resume_clean_tree_reinvokes_implementer(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A scope_violation L0 resolved with a clean/empty branch (tip ==
+        base, zero commits) must still resume the implementer — task 2504.
+
+        Before the fix, the ESCALATED-resume guard did a raw
+        ``is_ancestor(wt_head, main_sha)`` check with no has-work guard. An
+        empty branch trivially satisfies that check (its tip IS main's
+        HEAD), so the guard wrongly concluded "already merged" and broke
+        straight to MERGE, skipping implementer resume (and verify)
+        entirely — the un-implemented branch then failed MERGE's
+        plan-files-touched gate. This mirrors
+        test_resume_with_status_in_progress_continues_implementer but uses
+        a fresh/empty worktree (is_ancestor True, has_work naturally False)
+        instead of one commit ahead of main, and a scope_violation category
+        to match the observed incident.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        queue = EscalationQueue(tmp_path / 'queue')
+        _submit_l0(queue, task_assignment.task_id, category='scope_violation')
+        workflow, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+        )
+        # Resolving steward — does not touch task status, so it stays
+        # in-progress and the resume path is live.
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
+        # ESCALATED first, then DONE on the post-resume re-entry.
+        evrl_mock, state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
+        workflow._invoke = invoke_mock  # type: ignore[method-assign]
+
+        outcome = (await workflow.run()).outcome
+
+        assert invoke_mock.await_count >= 1, (
+            'Implementer must be resumed on a clean/empty-tree branch — the '
+            'raw is_ancestor check must not short-circuit straight to MERGE '
+            'for a branch with no prior implementation work.'
+        )
+        call_args = invoke_mock.await_args_list[0]
+        role = call_args.args[0]
+        assert getattr(role, 'name', '') == 'implementer', (
+            f'Resume invocation must use IMPLEMENTER role; got {role!r}'
+        )
+        assert outcome == WorkflowOutcome.DONE
+
     async def test_already_on_main_short_circuit_runs_before_status_check(
         self, config, git_ops, task_assignment, tmp_path,
     ):
@@ -385,6 +438,29 @@ class TestStatusPreservationOnResume:
         # Steward sets deferred — Fix 1 would otherwise return BLOCKED here.
         workflow._steward_factory = _make_status_setting_steward(
             queue, scheduler, task_assignment.task_id, 'deferred',
+        )
+        # This fixture's worktree is fresh/empty (no commits), so it has no
+        # real implementation work — in eval mode, _setup_worktree_and_artifacts
+        # re-stamps base_commit to the current worktree HEAD (task 2504
+        # subtlety B), making the SHA-primary has-work signal unreachable
+        # through the natural run() flow. This test's purpose is ORDERING
+        # (already-on-main short-circuit runs before the Fix-1 status
+        # check), not the has-work predicate itself, so stub has_work=True
+        # to keep it decoupled from the (now-fixed) empty-branch semantics
+        # while still exercising the real is_ancestor check.
+        #
+        # Cross-ref: test_scope_violation_resume_clean_tree_reinvokes_implementer
+        # (above) is the canonical coverage for the has_work=False resume
+        # path — it uses no stub, so a regression there can't be masked by
+        # this test's has_work=True stub. Together the two tests cover both
+        # the short-circuit ordering (this test) and the has-work predicate
+        # itself (that test).
+        workflow._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
+            return_value=_PriorImplStatus(
+                has_work=True,
+                entries=[{'agent': 'implementer', 'steps_completed': ['step-1']}],
+                base_commit='base',
+            ),
         )
         evrl_mock, state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],

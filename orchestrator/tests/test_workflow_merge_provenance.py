@@ -12,6 +12,7 @@ test in this module so a bound outbox never leaks into another test.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -556,6 +557,115 @@ class TestRecoverBeforeMerge:
         assert outcome is None
         assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
+
+    async def test_warning_scoped_to_ancestor_without_work_only(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """The 'branch appears merged ... but has no implementation
+        entries' breadcrumb (task 2504 subtlety A) must fire ONLY on the
+        ancestor-but-no-work spurious-merge-signal sub-case — never on a
+        normal divergent (not-ancestor) merge, which must stay silent."""
+        breadcrumb = 'but has no implementation entries'
+
+        # (a) Ancestor + no prior work → spurious merge signal → breadcrumb.
+        f_ancestor = _make(
+            worktree=tmp_path / 'wt-ancestor', project_root=tmp_path / 'proj-ancestor',
+            branch_on_main=True,
+        )
+        f_ancestor.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
+            return_value=_PriorImplStatus(has_work=False, entries=[], base_commit=None),
+        )
+        with caplog.at_level(logging.WARNING):
+            outcome_ancestor = await f_ancestor.wf._recover_before_merge(
+                'branchhead123', 'mainsha123',
+            )
+        assert outcome_ancestor is None
+        assert breadcrumb in caplog.text
+
+        caplog.clear()
+
+        # (b) NOT an ancestor → real divergent merge → must stay silent.
+        f_not_ancestor = _make(
+            worktree=tmp_path / 'wt-not-ancestor', project_root=tmp_path / 'proj-not-ancestor',
+            branch_on_main=False,
+        )
+        with caplog.at_level(logging.WARNING):
+            outcome_not_ancestor = await f_not_ancestor.wf._recover_before_merge(
+                'branchhead123', 'mainsha123',
+            )
+        assert outcome_not_ancestor is None
+        assert breadcrumb not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Tests: TaskWorkflow._branch_work_landed_on_main (task 2504)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBranchWorkLandedOnMain:
+    """Unit tests for the shared is_ancestor+has_work predicate (task 2504).
+
+    ``_branch_work_landed_on_main`` extracts the ``is_ancestor(...) AND
+    _has_prior_implementation(wt_head=...).has_work`` check that
+    ``_recover_before_merge`` already implemented correctly, so it can be
+    reused (with the correct ``wt_head`` mode per call site) at the
+    ESCALATED-resume site in ``_drive()``, which previously did a raw
+    ``is_ancestor`` check with no has-work guard and false-positived on an
+    empty branch (base is trivially an ancestor of main).
+    """
+
+    async def test_ancestor_with_real_prior_work_returns_true(self, tmp_path: Path):
+        """Ancestor + genuinely-implemented branch (SHA diverged from base
+        AND a work-classified iteration-log entry) → True."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', branch_on_main=True)
+        f.artifacts.append_iteration_log({
+            'agent': 'implementer', 'source': 'orchestrator',
+            'steps_attempted': ['s1'], 'steps_completed': ['s1'],
+            'commit': 'newhead',
+        })
+
+        result = await f.wf._branch_work_landed_on_main(
+            'newhead-diverged', 'mainsha123', wt_head='newhead-diverged',
+        )
+
+        assert result is True
+
+    async def test_ancestor_with_empty_branch_returns_false(self, tmp_path: Path):
+        """Ancestor + empty branch (wt_head == base_commit == 'oldbase') →
+        False — the empty-branch false positive this helper exists to
+        prevent, even with a work-shaped iteration-log entry present (SHA
+        non-divergence vetoes the log signal, per
+        ``_has_prior_implementation``'s defense-in-depth contract)."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', branch_on_main=True)
+        f.artifacts.append_iteration_log({
+            'agent': 'implementer', 'source': 'orchestrator',
+            'steps_attempted': ['s1'], 'steps_completed': ['s1'],
+            'commit': 'newhead',
+        })
+
+        result = await f.wf._branch_work_landed_on_main(
+            'oldbase', 'mainsha123', wt_head='oldbase',
+        )
+
+        assert result is False
+
+    async def test_not_ancestor_returns_false_without_consulting_has_work(
+        self, tmp_path: Path,
+    ):
+        """Not an ancestor of main → False immediately; _has_prior_implementation
+        must not even be consulted (mirrors the sibling guards' short-circuit
+        contract)."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', branch_on_main=False)
+        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError('must not be called when not an ancestor'),
+        )
+
+        result = await f.wf._branch_work_landed_on_main(
+            'branchhead123', 'mainsha123', wt_head='branchhead123',
+        )
+
+        assert result is False
 
 
 # ---------------------------------------------------------------------------

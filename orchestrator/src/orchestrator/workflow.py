@@ -2154,15 +2154,24 @@ class TaskWorkflow:
                             'Steward re-escalated to human',
                             skip_escalation=True,
                         )
-                    # If branch is already on main (e.g. steward merged
-                    # during resolution), skip re-implementation — proceed
-                    # to MERGE which will detect already_merged.
+                    # If branch is already on main AND has genuine prior
+                    # implementation work (e.g. steward merged during
+                    # resolution), skip re-implementation — proceed to
+                    # MERGE which will detect already_merged. A raw
+                    # is_ancestor check alone is NOT enough: an empty
+                    # branch's tip IS main's HEAD, so is_ancestor trivially
+                    # passes and would wrongly skip resume, leaving the
+                    # branch un-implemented (task 2504). wt_head is passed
+                    # for the SHA-primary has-work signal — this path holds
+                    # a reliable post-execution HEAD, so an empty branch
+                    # correctly resolves has_work=False and resume proceeds.
                     _, wt_head_raw, _ = await _run(
                         ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
                     )
+                    wt_head = wt_head_raw.strip()
                     esc_main_sha = await self.git_ops.get_main_sha()
-                    if await self.git_ops.is_ancestor(
-                        wt_head_raw.strip(), esc_main_sha,
+                    if await self._branch_work_landed_on_main(
+                        wt_head, esc_main_sha, wt_head=wt_head,
                     ):
                         logger.info(
                             'Task %s: branch already on main after '
@@ -7941,6 +7950,37 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             base_commit=base_commit,
         )
 
+    async def _branch_work_landed_on_main(
+        self, branch_head: str, main_sha: str, *, wt_head: str | None,
+    ) -> bool:
+        """True iff branch_head is an ancestor of main AND there is prior
+        implementation work — i.e. the branch's work genuinely landed, not
+        an empty/stale branch whose base trivially satisfies the ancestor
+        check.
+
+        Extracted from :meth:`_recover_before_merge` (task 2504), which
+        already implemented this ``is_ancestor AND has_work`` predicate
+        correctly, to share it with the ESCALATED-resume guard in
+        :meth:`_drive`, whose prior raw ``is_ancestor``-only check false-
+        positived on an empty branch (``wt_head == base_commit`` is
+        trivially an ancestor of main) and skipped implementer resume
+        entirely.
+
+        ``wt_head`` selects the :meth:`_has_prior_implementation` has-work
+        mode and is a parameter (not computed internally) because the two
+        call sites need different modes: the resume site passes its
+        reliable post-execution HEAD for the SHA-primary signal (an empty
+        branch correctly resolves ``has_work=False``); ``_recover_before_merge``
+        passes ``wt_head=None`` for the iteration-log fallback, because the
+        merge phase runs after a rebase where a post-rebase HEAD may
+        coincide with base_commit even on a genuinely-implemented branch.
+        See :meth:`_has_prior_implementation`'s docstring for the full
+        trade-off analysis of both modes.
+        """
+        if not await self.git_ops.is_ancestor(branch_head, main_sha):
+            return False
+        return self._has_prior_implementation(wt_head=wt_head).has_work
+
     async def _finalise_recovery_done(
         self, *, basis: str, sha: str, kind: str, note: str,
         files: list[str] | None = None,
@@ -8249,21 +8289,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 note='landed-outbox journal hit (pre-MERGE recovery)',
             )
 
-        if not await self.git_ops.is_ancestor(branch_head, main_sha):
-            return None
+        # wt_head=None: the merge phase runs after a rebase, where a
+        # post-rebase HEAD may coincide with base_commit even on a
+        # genuinely-implemented branch, so this caller must keep the
+        # iteration-log fallback rather than the SHA-primary signal (see
+        # _has_prior_implementation's docstring and task 2504).
+        if await self._branch_work_landed_on_main(branch_head, main_sha, wt_head=None):
+            return await self._finalise_recovery_done(
+                basis='fallback', sha=main_sha, kind='found_on_main',
+                note='branch already on main at merge phase (pre-MERGE recovery)',
+            )
 
-        if not self._has_prior_implementation().has_work:
+        # Not landed. Re-check is_ancestor (cheap, redundant on this path
+        # only) purely to scope the breadcrumb to the spurious-merge-signal
+        # sub-case (ancestor but no work) — a normal divergent (non-ancestor)
+        # merge must stay silent.
+        if await self.git_ops.is_ancestor(branch_head, main_sha):
             logger.warning(
                 f'Task {self.task_id}: branch appears merged at '
                 f'merge phase but has no implementation entries '
                 f'— proceeding with merge'
             )
-            return None
-
-        return await self._finalise_recovery_done(
-            basis='fallback', sha=main_sha, kind='found_on_main',
-            note='branch already on main at merge phase (pre-MERGE recovery)',
-        )
+        return None
 
     def _escalate_plan_overwrite(self) -> None:
         """Submit a blocking escalation when plan.json ownership doesn't match.
