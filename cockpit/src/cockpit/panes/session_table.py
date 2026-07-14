@@ -151,6 +151,29 @@ def order_sessions(records: list[SessionRecord]) -> list[SessionRecord]:
     )
 
 
+def _is_terminal(status: Status | str) -> bool:
+    """Is *status* one of TERMINAL_STATUSES (exited/failed-to-start)?
+
+    A foreign/unrecognized status resolves to False (kept, not hidden) --
+    mirrors _state_rank's fail-soft try/except (PRD §2): never hide a
+    record we can't classify.
+    """
+    try:
+        resolved = Status(status)
+    except ValueError:
+        return False
+    return resolved in TERMINAL_STATUSES
+
+
+def filter_live_sessions(records: list[SessionRecord]) -> list[SessionRecord]:
+    """Drop terminal-status (exited/failed-to-start) records, preserving order.
+
+    Pure and total: an empty input returns [] and a foreign status is kept
+    (see _is_terminal), never raising.
+    """
+    return [record for record in records if not _is_terminal(record.status)]
+
+
 class SessionTable(DataTable):
     """The session-registry table: one row per session, keyed by session_slug.
 
