@@ -879,7 +879,7 @@ class TestCiteTaskEntityScopedFold:
         known_roots = {'/home/leo/src/dark-factory'}
         results = {}
         for pr in known_roots:
-            for tid in ['2405', '2406', '5040', '7777', '9999']:
+            for tid in ['2405', '2406', '5040', '5149', '7777', '9999']:
                 results[(tid, pr)] = {'id': tid, 'title': f'T-{tid}'}
         return _FakeTaskInterceptor(results=results)
 
@@ -1145,6 +1145,98 @@ class TestCiteTaskEntityScopedFold:
         assert report is not None
         ids = {item['finding_id'] for item in report['flagged_items']}
         assert ids == {fid_null, fid_local}
+
+    # -- CORE (RED, comma-joined — task-2432 step-9) ------------------
+    #
+    # step-8's fold-eligibility gate is EQUALITY: canonical(finding.task_id)
+    # == canonical(cited task_id). A comma-joined top-level task_id like
+    # '5040,5149' is never equal to either of its own individual components,
+    # so a comma-joined finding is fold-INELIGIBLE on both sides of the
+    # check -- it can neither be folded onto an existing single-component
+    # anchor, nor register an anchor a later single-component finding could
+    # fold onto. step-10 widens the gate to subset (comma-split) membership.
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_top_level_folds_via_matching_component_cite(self):
+        """(1) occ1 (null) cites '5040' then '5149'; occ_c's TOP-LEVEL
+        task_id is the comma-joined '5040,5149' -- occ_c's cite_task('5040')
+        must fold onto occ1 via the '5040' component anchor occ1's cite_task
+        registered.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        occ1 = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='occ1 desc', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in occ1, occ1
+        fid1 = occ1['finding_id']
+
+        cite1_5040 = await state.cite_task('run-1', fid1, 'dark_factory', '5040')
+        assert 'error' not in cite1_5040, cite1_5040
+        cite1_5149 = await state.cite_task('run-1', fid1, 'dark_factory', '5149')
+        assert 'error' not in cite1_5149, cite1_5149
+
+        occ_c = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='occ_c desc, worded differently', suggested_action='a',
+            task_id='5040,5149', flag_type='X',
+        )
+        assert 'finding_id' in occ_c, occ_c
+        fid_c = occ_c['finding_id']
+
+        cite_c = await state.cite_task('run-1', fid_c, 'dark_factory', '5040')
+        assert cite_c.get('error') == 'duplicate_finding'
+        assert cite_c.get('existing_finding_id') == fid1
+
+        report = state.get_assembled_report('run-1', 'task_knowledge_sync')
+        assert report is not None
+        ids = [item['finding_id'] for item in report['flagged_items']]
+        assert ids == [fid1]
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_top_level_folds_via_matching_component_cite_reverse_order(self):
+        """(2) Reverse order: occ_c (comma-joined '5040,5149') is filed and
+        cites '5040' FIRST; occ1 (null) is filed second and its cite_task
+        ('5040') must fold onto occ_c -- occ_c's cite_task call must
+        register an anchor for its '5040' component, not just its full
+        comma-joined string.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        occ_c = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='occ_c desc', suggested_action='a',
+            task_id='5040,5149', flag_type='X',
+        )
+        assert 'finding_id' in occ_c, occ_c
+        fid_c = occ_c['finding_id']
+
+        cite_c = await state.cite_task('run-1', fid_c, 'dark_factory', '5040')
+        assert 'error' not in cite_c, cite_c
+
+        occ1 = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='occ1 desc, worded differently', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in occ1, occ1
+        fid1 = occ1['finding_id']
+
+        cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '5040')
+        assert cite1.get('error') == 'duplicate_finding'
+        assert cite1.get('existing_finding_id') == fid_c
+
+        # The folded (null-task_id) finding is fully purged, not just hidden.
+        assert state._resolve_finding('run-1', fid1) is None
+
+        report = state.get_assembled_report('run-1', 'task_knowledge_sync')
+        assert report is not None
+        ids = [item['finding_id'] for item in report['flagged_items']]
+        assert ids == [fid_c]
 
 
 # ---------------------------------------------------------------------------
