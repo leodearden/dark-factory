@@ -1173,22 +1173,46 @@ class ReconReportState:
         it. Titles are cosmetic display text, not part of the citation's
         identity, so this staleness is accepted rather than reconciled.
 
-        In-run cited-task fold (task-2425): when *finding* has a null
-        top-level task_id and this is its PRIMARY (first-ever) citation, the
-        (project_id, task_id) pair doubles as an in-run dedup anchor. If an
-        earlier finding in this run already registered the same primary
-        cited task, the just-looked-up finding is purged and
-        ``duplicate_finding`` is returned instead — two findings citing the
-        same external blocker are semantically duplicate regardless of how
-        differently they are worded. Findings with a real top-level task_id,
-        and secondary (non-first) citations, are never fold anchors.
+        Two in-run folds anchor on this call — BOTH are CHECKED before
+        EITHER registers, so a call that folds under either one always
+        purges/returns rather than leaving a half-registered anchor from the
+        other:
 
-        The fold EXEMPTS ``memory_consolidator`` (Stage-1) findings, mirroring
-        Fix-1's read-time ``stage != 'memory_consolidator'`` carve-out in
-        :meth:`get_assembled_report`: two sibling Stage-1 findings that cite the
-        same target stay distinct, and a Stage-2 echo of a Stage-1 citation is
-        already suppressed at read time — so the write-time fold only collapses
-        same-run duplicates in a non-Stage-1 stage that Fix-1 cannot reach.
+        1. Project-scoped null+null fold (task-2425): when *finding* has a
+           null top-level task_id and this is its PRIMARY (first-ever)
+           citation, the (project_id, task_id) pair doubles as an in-run
+           dedup anchor keyed in ``_run_cited_task_index``. Findings with a
+           real top-level task_id, and secondary (non-first) citations, are
+           never anchors here. EXEMPTS ``memory_consolidator`` (Stage-1)
+           findings, mirroring Fix-1's read-time ``stage !=
+           'memory_consolidator'`` carve-out in :meth:`get_assembled_report`:
+           two sibling Stage-1 findings that cite the same target stay
+           distinct, and a Stage-2 echo of a Stage-1 citation is already
+           suppressed at read time — so this fold only collapses same-run
+           duplicates in a non-Stage-1 stage that Fix-1 cannot reach.
+
+        2. Entity-scoped derived-signature fold (task-2432 bullets 1b/2/3):
+           reuses ``_run_sig_index`` — the SAME index add_finding's ordinary
+           (task_id, flag_type) signature lookup consults — with a
+           PROJECTLESS derived key ``(canonical(task_id), finding.flag_type)``
+           built from *this citation's* task_id. Registering it there means a
+           LATER add_finding whose top-level task_id equals this cited tid
+           collapses via add_finding's own ordinary signature lookup, with no
+           add_finding change needed. Eligible only for a finding's PRIMARY
+           citation (``cited_tasks`` still empty) with a non-null
+           ``flag_type`` (a null flag_type can't form a meaningful derived
+           signature — every null-flag_type citation of the same task would
+           collide), and only when ``finding.task_id is None`` or already
+           equals this citation's task_id (canonicalized) — a finding citing
+           an unrelated foreign task is never folded (see
+           test_non_null_task_id_finding_is_never_a_fold_anchor). Unlike
+           fold 1, this fold has NO memory_consolidator carve-out: the
+           derived signature lives in the same run-wide, cross-stage index
+           add_finding already consults from every stage, so exempting one
+           stage from registering it would just let that stage's findings
+           silently evade the whole-run fold. (Comma-joined top-level
+           task_id subset-membership eligibility is added in task-2432
+           step-10.)
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -1216,32 +1240,48 @@ class ReconReportState:
         title = result.get('title') or data.get('title', '')
         citation = {'project_id': project_id, 'task_id': task_id, 'title': title}
 
-        # In-run cited-task fold (task-2425) — see docstring above. Only the
-        # PRIMARY citation (finding.cited_tasks still empty) of a null-
-        # top-level-task_id finding is a fold anchor.
-        #
-        # memory_consolidator (Stage 1) findings are EXEMPT from the fold —
-        # mirroring Fix-1's own read-time carve-out in get_assembled_report
-        # (`stage != 'memory_consolidator'`). Two sibling Stage-1 findings that
-        # cite the same target are deliberately kept distinct (see
-        # test_sibling_stage1_findings_not_mutually_suppressed); a Stage-2 echo
-        # of a Stage-1 citation is already handled at read time by
-        # _traces_exclusively_to_stage1. The write-time fold therefore only
-        # targets the gap Fix-1 cannot reach: two same-run findings in a
-        # non-Stage-1 stage (e.g. task_knowledge_sync) that cite the same
-        # external blocker Stage 1 never cited — the autopilot_video repro.
-        if (
+        # In-run cited-task folds (task-2425 project-scoped; task-2432
+        # entity-scoped) — see docstring above. Both folds' EXISTENCE CHECKS
+        # run before EITHER registers.
+        project_fold_eligible = (
             finding.task_id is None
             and not finding.cited_tasks
             and finding_entry.stage != 'memory_consolidator'
-        ):
-            cited_task_key = _cited_task_key(project_id, task_id)
-            run_cited_tasks = self._run_cited_task_index.setdefault(run_id, {})
-            existing_id = run_cited_tasks.get(cited_task_key)
-            if existing_id is not None and existing_id != finding.finding_id:
-                self._purge_finding(run_id, finding_entry, finding)
-                return _duplicate_finding_error(existing_id)
-            run_cited_tasks[cited_task_key] = finding.finding_id
+        )
+        cited_task_key = _cited_task_key(project_id, task_id) if project_fold_eligible else None
+        project_existing_id = (
+            self._run_cited_task_index.get(run_id, {}).get(cited_task_key)
+            if project_fold_eligible
+            else None
+        )
+
+        c_cited_task_id = _canonical_sig_field(task_id)
+        entity_fold_eligible = (
+            not finding.cited_tasks
+            and finding.flag_type is not None
+            and (
+                finding.task_id is None
+                or _canonical_sig_field(finding.task_id) == c_cited_task_id
+            )
+        )
+        derived_sig = (c_cited_task_id, finding.flag_type) if entity_fold_eligible else None
+        entity_existing_id = (
+            self._run_sig_index.get(run_id, {}).get(derived_sig)
+            if entity_fold_eligible
+            else None
+        )
+
+        project_hit = project_existing_id is not None and project_existing_id != finding.finding_id
+        entity_hit = entity_existing_id is not None and entity_existing_id != finding.finding_id
+        if project_hit or entity_hit:
+            existing_id = project_existing_id if project_hit else entity_existing_id
+            self._purge_finding(run_id, finding_entry, finding)
+            return _duplicate_finding_error(existing_id)
+
+        if project_fold_eligible:
+            self._run_cited_task_index.setdefault(run_id, {})[cited_task_key] = finding.finding_id
+        if entity_fold_eligible:
+            self._run_sig_index.setdefault(run_id, {})[derived_sig] = finding.finding_id
 
         # task-2425 amend: skip the append when an identical {project_id,
         # task_id} citation is already present. Without this, re-citing a
