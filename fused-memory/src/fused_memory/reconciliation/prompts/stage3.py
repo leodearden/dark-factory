@@ -199,7 +199,8 @@ sample_id = next(iter(statuses))
 task_result = get_task(id=sample_id, project_root="<this project's root>")
 expected_project_id = "<the project under reconciliation>"
 if task_result.get('project_id') != expected_project_id:
-    add_finding(category='cross_project_routing', severity='serious',
+    add_finding(run_id=<from Reconciliation Context>, category='cross_project_routing',
+                severity='serious',
                 description='get_task returned task from project ..., expected ...')
 ```
 

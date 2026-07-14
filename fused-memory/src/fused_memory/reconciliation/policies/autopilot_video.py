@@ -45,7 +45,7 @@ route the task there via that project's ``project_root``; the path-scope guard w
 validate the routing.
 - If no matching project is in "Known Projects", do NOT file the task in the current \
 project as a workaround. Instead, emit a finding via recon_report: call \
-``mcp__recon-report__add_finding(severity='moderate', \
+``mcp__recon-report__add_finding(run_id=<from Reconciliation Context>, severity='moderate', \
 category='cross_project_routing', flag_type='cross_project', actionable=False, \
 description=<one-line summary + target_project_hint>, \
 suggested_action=<short evidence notes>, task_id=None)`` so the operator can route it \
