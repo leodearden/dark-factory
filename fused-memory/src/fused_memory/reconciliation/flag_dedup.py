@@ -58,14 +58,28 @@ indexed ``(project_id, record_kind, state)`` ledger query, no Mem0 search
 — and drops flags matched by an active ``stage1_flag_suppression`` row. A
 row with ``flag_type == ''`` is a WILDCARD (blanket-suppresses every
 flag_type for its task_id); a row with a non-empty ``flag_type`` is
-SCOPED to just that pair.  When both a wildcard and a scoped row exist for
-the same task_id, the wildcard wins (union semantics — a blanket
+SCOPED to that pair AND any flag_type FAMILY VARIANT of it (task 2503) —
+see ``canonical_flag_type_family``.  Family matching is word-order
+insensitive, an ACCEPTED RISK reviewed and documented at both
+``canonical_flag_type_family``'s and ``filter_suppressed``'s docstrings
+(the latter's row-scan logs a WARNING, at most once per (project_id,
+task_id, family) for the process lifetime, on an observed family collision
+as a partial audit mitigation).  When both a wildcard and a scoped row
+exist for the same task_id, the wildcard wins (union semantics — a blanket
 suppression cannot be narrowed by a more specific record).
 ``write_suppression_record`` upserts these rows: ``flag_types=None``
 writes a single blanket row; a non-empty list writes one scoped row per
 flag_type.  Suppression rows never expire (``expires_at=None``) — they are
-operator-managed and persist until explicitly cleared.  See
-``filter_suppressed`` and ``write_suppression_record`` for full semantics.
+operator-managed and persist until explicitly cleared.  Before upserting,
+``write_suppression_record`` also runs a PRE-WRITE COVERAGE CHECK
+(task 2503): it skips both the ledger upsert(s) and the Mem0 mirror for any
+requested flag_type already covered by an existing wildcard row, or by an
+existing scoped row whose flag_type family matches — the fix for the
+Mem0-mirror-never-upserts companion-record sprawl (mem0 c3a1bdfd on task
+544) — and additionally dedups the requested flag_types AGAINST EACH OTHER
+by family within the same call, so one call cannot mint its own
+multi-row companion sprawl either.  See ``filter_suppressed`` and
+``write_suppression_record`` for full semantics.
 
 Completion-marker same-cycle self-delete (task-2312)
 -----------------------------------------------------
@@ -124,9 +138,13 @@ Public API
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
 - ``compute_content_fingerprint_signature(flag)`` — cheap, sync, no I/O;
   fallback signature for null-task_id flags lacking ``cited_tasks``.
+- ``canonical_flag_type_family(flag_type)`` — cheap, sync, no I/O;
+  canonicalizes a flag_type into a case/separator/whitespace/word-order
+  -insensitive family key (task 2503), used by ``filter_suppressed`` and
+  ``write_suppression_record``'s pre-write coverage check.
 - ``filter_suppressed(memory_service, project_id, flags)`` — async, one
-  indexed ``recon_ledger`` query; drops suppressed flags before signature
-  dedup.
+  indexed ``recon_ledger`` query; drops suppressed flags (by exact match or
+  flag_type family match, task 2503) before signature dedup.
 - ``dedup_flags(memory_service, project_id, run_id, flags)`` — async, calls
   ``filter_suppressed`` first, then UPSERTs a ``stage1_flag_marker`` ledger
   row per (task_id, flag_type) signature; best-effort (exceptions are
@@ -134,7 +152,11 @@ Public API
   are instead treated as one-time completion markers (see above).
 - ``write_suppression_record(memory_service, *, project_id, task_id,
   flag_types=None, causation_id=None)`` — async, upserts
-  ``stage1_flag_suppression`` ledger row(s) for *task_id*.
+  ``stage1_flag_suppression`` ledger row(s) for *task_id*.  Runs a pre-write
+  coverage check first (task 2503): a requested flag_type already covered by
+  an existing wildcard/family-matching row is skipped for BOTH the ledger
+  upsert and the Mem0 mirror; fails open (writes normally) on a ledger read
+  failure or absent ledger.
 - ``acknowledge_flag_marker(memory_service, *, project_id, run_id, task_id,
   flag_type, mode, log)`` — async, marks the ``stage1_flag_marker`` row for
   one (task_id, flag_type) signature ``state='addressed'``; never raises;
@@ -231,6 +253,94 @@ def _decompose_suppression_task_id(tid: str) -> list[str]:
     return [p.strip() for p in tid.split(',') if p.strip()]
 
 
+#: Splits on runs of non-alphanumeric characters for flag_type family
+#: tokenization (task 2503) -- underscore, hyphen, and whitespace are all
+#: treated as separators, mirroring the tokenization style of the module's
+#: existing normalization helpers (see :func:`_significant_terms`).
+#:
+#: A DEDICATED constant rather than a reused splitter: although structurally
+#: identical to the never-tracked-systemic-pattern feature's _TERM_SPLIT_RE,
+#: coupling the suppression-family key to that unrelated splitter would let a
+#: future edit to _TERM_SPLIT_RE silently alter suppression matching. The
+#: module already keeps per-feature regex constants dedicated (_CONTENT_FP_RE,
+#: _COUNT_GROUP_RE, _INCORRECT_WORD_RE, _TERM_SPLIT_RE); this follows the same
+#: convention.
+_FLAG_TYPE_TOKEN_SPLIT_RE: re.Pattern[str] = re.compile(r'[^a-z0-9]+')
+
+
+def canonical_flag_type_family(flag_type: str) -> str:
+    """Return a canonical "family" key for *flag_type* (task 2503).
+
+    Collapses four normalization axes onto one deterministic key so a
+    reworded/reordered flag_type for the SAME underlying finding is
+    recognized as a match by :func:`filter_suppressed` and
+    ``write_suppression_record``'s pre-write coverage check: case
+    (``'Missing_Deliverable'``), separator (``'-'``/``'_'``/``' '``),
+    whitespace, and word-order (``'deliverable_missing'`` ==
+    ``'missing_deliverable'``).
+
+    Algorithm: casefold *flag_type*, split on runs of non-alphanumeric
+    characters (:data:`_FLAG_TYPE_TOKEN_SPLIT_RE`), drop empty tokens, then
+    join ``sorted(set(tokens))`` with ``'_'``. Empty/whitespace/
+    all-separator input (or input that yields zero tokens) returns ``''``.
+
+    Deliberately does NOT stem, synonym-map, or tolerate an added/removed
+    word -- only case/separator/whitespace/word-order variants collapse to
+    the same family. Wider tolerance would risk false-positive
+    over-suppression: the scoped-suppression PRD documents a
+    genuinely-recurring finding (``live_workflow_recurrence_counter_needed``)
+    hidden for 6+ cycles by an over-broad suppression record.
+    Under-suppression here only costs one extra companion record, which the
+    pre-write coverage check still catches for reorder/case/separator
+    variants of an already-covered flag_type.
+
+    Note the specific mechanism the word-order axis accepts: two flag_types
+    that merely share the same TOKEN MULTISET (e.g. ``'user_missing'`` and
+    ``'missing_user'``) collapse to the same family even if they describe
+    different findings -- see :func:`filter_suppressed`'s "ACCEPTED RISK"
+    docstring paragraph for the reviewed rationale and the audit-log
+    mitigation it emits on such a collision.
+
+    Idempotent: the output is already lowercase, separator-free, and
+    ``'_'``-joined in sorted order, so re-applying this function to its own
+    output is a no-op.
+
+    Pure, sync, no I/O.
+    """
+    tokens = _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold())
+    return '_'.join(sorted({t for t in tokens if t}))
+
+
+#: ``(project_id, task_id, family)`` keys for which :func:`filter_suppressed`
+#: has already logged a flag_type-family-collision WARNING (task 2503
+#: amendment, reviewer_comprehensive robustness_log_noise). Suppression rows
+#: never expire (``expires_at=None``), and ``filter_suppressed`` rebuilds its
+#: ``suppressed`` map from scratch on every call with no memory of prior
+#: calls -- so a pre-existing (e.g. legacy or composite-seeded) collision
+#: between two distinct raw flag_types would otherwise re-emit the identical
+#: WARNING on EVERY reconciliation cycle indefinitely. This module-level set
+#: makes the log "once per distinct collision key for the life of the
+#: process" rather than "once per call". Tests that assert on this WARNING
+#: must reset this between cases -- see the
+#: ``_reset_flag_type_family_collision_warning_cache`` autouse fixture in
+#: test_flag_dedup.py.
+#:
+#: UNBOUNDED GROWTH (task 2503 amendment, reviewer_comprehensive
+#: robustness_resource): this set has no eviction and accumulates for the
+#: life of the process -- one entry per distinct ``(project_id, task_id,
+#: family)`` collision ever observed, never per reconciliation cycle or per
+#: flag filtered. Accepted as-is rather than capped (e.g. LRU/maxlen): actual
+#: cardinality is bounded by the number of distinct legacy/composite-seeded
+#: flag_type collisions across all suppression rows ever written, which is
+#: expected to be small (a collision is a data-quality signal, not the common
+#: case) -- and a size-based cap would let the WARNING re-fire for an evicted
+#: key on a later cycle, silently breaking the "once per process lifetime"
+#: contract this cache exists to provide, for exactly the long-lived-process
+#: case a cap would aim to help. Revisit with a bounded cache only if this
+#: assumption is ever observed to not hold in practice.
+_WARNED_FLAG_TYPE_FAMILY_COLLISIONS: set[tuple[str, str, str]] = set()
+
+
 async def filter_suppressed(
     memory_service: Any,
     project_id: str,
@@ -256,19 +366,52 @@ async def filter_suppressed(
       (below) is never split.
     - A row with ``flag_type == ''`` is a WILDCARD -- it blanket-suppresses
       every flag_type for each of its component task_id(s).
-    - A row with a non-empty ``flag_type`` is SCOPED -- it suppresses only
-      that (component task_id, flag_type) pair.
+    - A row with a non-empty ``flag_type`` is SCOPED -- it suppresses that
+      (component task_id, flag_type) pair AND any FAMILY VARIANT of
+      ``flag_type`` (task 2503): the scoped allowlist stores
+      :func:`canonical_flag_type_family` of each row's ``flag_type`` rather
+      than the raw string, so a case/separator/whitespace/word-order
+      variant (e.g. ``'deliverable_missing'`` for a seeded
+      ``'missing_deliverable'`` row) is also recognized as suppressed.
+      Family matching is a strict superset of exact-string matching -- an
+      exact match still matches, since :func:`canonical_flag_type_family`
+      is a pure function of its input.
     - When both a scoped and a wildcard row (or component) exist for the
       same task_id (in either row order), the wildcard wins -- union
       semantics, since a blanket suppression cannot be narrowed by a more
       specific record.
 
     A flag is dropped iff its ``task_id`` has a wildcard entry, or has a
-    scoped entry whose set contains the flag's (str-coerced) ``flag_type``.
-    A flag with no ``flag_type`` (``None``/absent) can never match a scoped
-    entry -- it is kept unless the task_id entry is a wildcard. The
-    remaining flags are returned unchanged so they can proceed through the
-    signature-dedup loop.
+    scoped entry whose family set contains the flag's (str-coerced,
+    family-canonicalized) ``flag_type``. A flag with no ``flag_type``
+    (``None``/absent) can never match a scoped entry -- it is kept unless
+    the task_id entry is a wildcard. The remaining flags are returned
+    unchanged so they can proceed through the signature-dedup loop.
+
+    ACCEPTED RISK -- word-order collisions (task 2503 review;
+    reviewer_comprehensive over-suppression-risk): :func:`canonical_flag_type_family`
+    is insensitive to word order, so two flag_types that merely share the same
+    TOKEN MULTISET -- not just case/separator/whitespace variants of the SAME
+    finding -- collapse to one family (e.g. ``'user_missing'`` ==
+    ``'missing_user'``, or ``'review_missing_deliverable'`` ==
+    ``'deliverable_missing_review'``). If two conceptually-DIFFERENT findings
+    for the same task_id happen to share a token multiset, the second is
+    silently over-suppressed here. This is a deliberate, reviewed tradeoff
+    (see the task 2503 design_decisions entry and
+    :func:`canonical_flag_type_family`'s docstring): under-suppression (missing
+    a genuine reworded/reordered-variant match) was judged the worse failure
+    mode. As a partial mitigation, the row-scan below logs a WARNING whenever
+    it observes two DISTINCT raw ``flag_type`` values for the same task_id
+    collapsing into the same family, so an operator can audit the ledger for a
+    suspected collision -- this can only detect a collision AMONG SUPPRESSION
+    ROWS themselves, not between a row and a flag being filtered, since only
+    the ledger side is available for comparison in this function. Since
+    suppression rows never expire, this WARNING is throttled to at most once
+    per ``(project_id, task_id, family)`` for the life of the process (task
+    2503 amendment, reviewer_comprehensive robustness_log_noise) -- see
+    :data:`_WARNED_FLAG_TYPE_FAMILY_COLLISIONS` -- so a persistent benign
+    collision in a pre-existing (legacy or composite-seeded) row cannot flood
+    the log with an identical WARNING on every reconciliation cycle.
 
     Rows with ``task_id == ''`` (or which decompose to no components) are
     skipped when building the map (a degenerate/malformed suppression with
@@ -310,11 +453,18 @@ async def filter_suppressed(
         )
         return flags
 
-    # task_id (str) -> None (wildcard/blanket) | set[str] (scoped flag_types
-    # allowlist).  See docstring for wildcard-wins union semantics.  Each
-    # row's task_id is decomposed into its component id(s) (task 2454) so a
-    # composite comma-joined row indexes every component.
-    suppressed: dict[str, set[str] | None] = {}
+    # task_id (str) -> None (wildcard/blanket) | dict[family -> set(raw
+    # flag_type strings observed for that family)].  See docstring for
+    # wildcard-wins union semantics.  Each row's task_id is decomposed into
+    # its component id(s) (task 2454) so a composite comma-joined row indexes
+    # every component.  The inner dict (rather than a flat set[str] of
+    # families) retains the raw strings purely so a FAMILY COLLISION -- two
+    # distinct raw flag_types landing in the same family bucket -- can be
+    # logged as a monitoring/audit signal (see "ACCEPTED RISK" above);
+    # membership testing for suppression matching (`family in allowlist`,
+    # below in `_keep`) is unaffected by this extra bookkeeping since `in` on
+    # a dict tests its keys.
+    suppressed: dict[str, dict[str, set[str]] | None] = {}
     for row in rows:
         if not row.task_id:
             continue  # degenerate row with no task target; can never match a kept flag
@@ -330,10 +480,43 @@ async def filter_suppressed(
                 continue
 
             scoped = suppressed.get(tid_str)
-            if not isinstance(scoped, set):
-                scoped = set()
+            if not isinstance(scoped, dict):
+                scoped = {}
                 suppressed[tid_str] = scoped
-            scoped.add(row.flag_type)
+            # Store the flag_type FAMILY key (task 2503), not the raw string, so a
+            # case/separator/word-order variant is recognized as the same finding.
+            family = canonical_flag_type_family(row.flag_type)
+            raw_variants = scoped.setdefault(family, set())
+            if raw_variants and row.flag_type not in raw_variants:
+                # Monitoring/audit signal (task 2503 amendment,
+                # reviewer_comprehensive over-suppression-risk): two DISTINCT
+                # raw flag_type strings for the same task_id collapsed into the
+                # same family. This may be a benign reworded/reordered variant
+                # of the SAME finding (the intended case) or a genuine
+                # token-multiset collision between two DIFFERENT findings (the
+                # accepted-risk failure mode) -- this function cannot tell
+                # which, so it surfaces both raw values for operator review.
+                # Logged at most ONCE per (project_id, task_id, family) for the
+                # life of the process (task 2503 amendment,
+                # reviewer_comprehensive robustness_log_noise): suppression
+                # rows never expire, so an unfixed benign collision would
+                # otherwise flood the log with an identical WARNING on every
+                # reconciliation cycle.
+                collision_key = (project_id, tid_str, family)
+                if collision_key not in _WARNED_FLAG_TYPE_FAMILY_COLLISIONS:
+                    _WARNED_FLAG_TYPE_FAMILY_COLLISIONS.add(collision_key)
+                    logger.warning(
+                        'filter_suppressed: flag_type family collision for project'
+                        ' %s task_id=%s: family=%r groups distinct raw flag_types'
+                        ' %r -- verify these describe the same finding (task 2503'
+                        ' accepted over-suppression risk; logged once per'
+                        ' project/task_id/family for the process lifetime)',
+                        project_id,
+                        tid_str,
+                        family,
+                        sorted(raw_variants | {row.flag_type}),
+                    )
+            raw_variants.add(row.flag_type)
 
     def _keep(f: dict[str, Any]) -> bool:
         flag_tid = f.get('task_id')
@@ -348,7 +531,11 @@ async def filter_suppressed(
         flag_type = f.get('flag_type')
         if flag_type is None:
             return True  # cannot match a scoped allowlist without a flag_type
-        return str(flag_type) not in allowlist
+        # ACCEPTED RISK (see docstring): this is a TOKEN-MULTISET (word-order
+        # insensitive) match, so a flag_type that merely shares tokens with an
+        # unrelated suppressed finding for this task_id (e.g. 'missing_user'
+        # vs 'user_missing') is treated as covered here.
+        return canonical_flag_type_family(str(flag_type)) not in allowlist
 
     return [f for f in flags if _keep(f)]
 
@@ -720,6 +907,49 @@ async def dedup_flags(
     return result
 
 
+def _canonicalize_suppression_task_id(task_id: int | str) -> str:
+    """Validate and canonicalize *task_id* to the ``str`` form used by
+    ``stage1_flag_suppression`` records.
+
+    Accepts a single numeric id (``int`` or numeric ``str``) OR a
+    comma-joined composite of numeric ids (e.g. ``'2405,540,544'``, mixing
+    ids across projects) — a composite's components are stripped of
+    surrounding whitespace before joining (``'2405, 540'`` canonicalizes to
+    ``'2405,540'``). Raises a descriptive, chained ``ValueError`` (mentioning
+    ``build_suppression_payload`` and the offending value, with
+    ``__cause__`` set to the original ``ValueError``/``TypeError``) for
+    anything else — the same contract :func:`build_suppression_payload` has
+    always exposed publicly; the error message keeps mentioning
+    ``build_suppression_payload`` rather than this helper's own name since
+    that is the documented public entry point callers see.
+
+    Extracted as a standalone helper (task 2503 amendment,
+    reviewer_comprehensive efficiency_reuse) so :func:`write_suppression_record`
+    can validate/canonicalize *task_id* up front WITHOUT constructing a full
+    :class:`SuppressionPayload` (content string + metadata dict) merely to
+    read back ``metadata['task_id']`` and discard the rest.
+    :func:`build_suppression_payload` itself now delegates here too, so the
+    validation logic has exactly one implementation.
+
+    Pure, sync, no I/O.
+    """
+    try:
+        return str(int(task_id))
+    except (TypeError, ValueError) as e:
+        # Composite fallback: a comma-joined list of numeric ids (e.g. a
+        # cross-project signature like '2405,540,544'). Mirrors the
+        # numeric/comma-joined validation convention in
+        # _is_valid_marker_task_id. Only reached when the single-id int()
+        # fast-path above fails.
+        components = [c.strip() for c in task_id.split(',')] if isinstance(task_id, str) else []
+        if len(components) >= 2 and all(c.isdigit() for c in components):
+            return ','.join(components)
+        raise ValueError(
+            f'build_suppression_payload: task_id must be an int or numeric '
+            f'string, got {task_id!r}'
+        ) from e
+
+
 def build_suppression_payload(
     task_id: int | str, flag_types: list[str] | None = None
 ) -> SuppressionPayload:
@@ -764,22 +994,7 @@ def build_suppression_payload(
       - ``metadata.flag_types = [<str>, ...]`` (optional; sorted-unique)
       - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
     """
-    try:
-        tid = str(int(task_id))
-    except (TypeError, ValueError) as e:
-        # Composite fallback: a comma-joined list of numeric ids (e.g. a
-        # cross-project signature like '2405,540,544'). Mirrors the
-        # numeric/comma-joined validation convention in
-        # _is_valid_marker_task_id. Only reached when the single-id int()
-        # fast-path above fails.
-        components = [c.strip() for c in task_id.split(',')] if isinstance(task_id, str) else []
-        if len(components) >= 2 and all(c.isdigit() for c in components):
-            tid = ','.join(components)
-        else:
-            raise ValueError(
-                f'build_suppression_payload: task_id must be an int or numeric '
-                f'string, got {task_id!r}'
-            ) from e
+    tid = _canonicalize_suppression_task_id(task_id)
     metadata: _SuppressionMetadata = {
         'kind': 'stage1_flag_suppression',
         'task_id': tid,
@@ -793,6 +1008,81 @@ def build_suppression_payload(
     }
 
 
+async def _existing_suppression_coverage(
+    ledger: Any, project_id: str, tid: str
+) -> tuple[bool, set[str]]:
+    """Return the existing ``stage1_flag_suppression`` coverage for *tid*.
+
+    Returns ``(wildcard_present, scoped_families)``: ``wildcard_present`` is
+    True iff an existing active row covering *tid* is a blanket/wildcard row
+    (``flag_type == ''``); ``scoped_families`` is the set of
+    :func:`canonical_flag_type_family` keys already covered by existing
+    scoped rows for *tid*. A row covers *tid* iff ``tid == row.task_id``
+    (exact match, catching an exact-composite duplicate) OR ``tid`` is one of
+    ``row.task_id``'s components per :func:`_decompose_suppression_task_id`
+    (task 2503 step-8; reuses task 2454's read-time decomposition) -- so a
+    single-id write is recognized as covered by a pre-existing composite
+    cross-project row (e.g. ``'2405,540,544'``). Coverage across multiple
+    covering rows is aggregated (union): wildcard OR'd, families unioned.
+
+    KNOWN ASYMMETRY -- composite *tid* writes (task 2503 amendment,
+    reviewer_comprehensive efficiency_completeness): decomposition above is
+    applied only to ``row.task_id`` (existing rows), never to *tid* itself.
+    A single-id *tid* is therefore recognized as covered by a pre-existing
+    composite row, but the reverse does NOT hold -- when *tid* is ITSELF
+    composite (e.g. ``'2405,540'``), it is covered only by an existing row
+    whose (possibly-decomposed) task_id equals the FULL composite string; it
+    is NOT considered covered merely because every one of its own components
+    (``'2405'``, ``'540'``) already has separate matching single-id
+    suppression rows. In that (rare) case the composite write proceeds and
+    mints a fresh ledger row / Mem0 companion even though each component is
+    individually already suppressed elsewhere. This is an accepted,
+    deliberately out-of-scope edge case rather than a bug: composite task_ids
+    are a rare cross-project signature shape, and biasing toward one extra
+    companion record over risking a wrongly-skipped suppression matches this
+    function's fail-open philosophy (see the "Never raises" paragraph below
+    and task 2503's plan.json design_decisions). Closing this gap would mean
+    additionally decomposing *tid* itself and requiring every component to be
+    individually covered (by family) before treating the whole write as
+    covered -- left for a future task if composite-write sprawl is ever
+    observed in practice.
+
+    Returns ``(False, set())`` -- no coverage -- when *ledger* is None.
+
+    Never raises: a ``list_suppressions`` failure is caught and degrades to
+    ``(False, set())`` with a WARNING logged -- the caller must never wrongly
+    skip a suppression write on a transient ledger read error (mirrors
+    :func:`filter_suppressed`'s conservative pass-through on a ledger read
+    failure).
+    """
+    if ledger is None:
+        return False, set()
+    try:
+        rows = await ledger.list_suppressions(project_id)
+    except Exception as e:
+        logger.warning(
+            'write_suppression_record: recon_ledger.list_suppressions failed for'
+            ' project %s task_id=%s: %s (best-effort — treating as no existing'
+            ' suppression coverage; the write proceeds normally rather than'
+            ' being wrongly skipped)',
+            project_id,
+            tid,
+            e,
+            exc_info=True,
+        )
+        return False, set()
+    wildcard = False
+    families: set[str] = set()
+    for row in rows:
+        if tid != row.task_id and tid not in _decompose_suppression_task_id(row.task_id):
+            continue
+        if not row.flag_type:
+            wildcard = True
+        else:
+            families.add(canonical_flag_type_family(row.flag_type))
+    return wildcard, families
+
+
 async def write_suppression_record(
     memory_service: Any,
     *,
@@ -803,30 +1093,86 @@ async def write_suppression_record(
 ) -> AddMemoryResponse:
     """Upsert a ``stage1_flag_suppression`` record to the ledger for *task_id*.
 
-    Builds the canonical payload via :func:`build_suppression_payload` (which
-    validates *task_id* is numeric and canonicalizes it to ``str``, and pins
-    ``metadata.kind``/``content``) then upserts one ``recon_ledger`` row per entry in
-    ``(flag_types or [''])`` to ``memory_service.recon_ledger`` — ``''`` is
-    the blanket/wildcard ``flag_type`` (suppresses every flag_type for
-    *task_id*); a non-empty ``flag_types`` list upserts one SCOPED row per
-    flag_type. Each row's identity is ``(project_id,
-    'stage1_flag_suppression', task_id, flag_type, run_id='')``, so a
-    repeated call with the same arguments UPSERTs the same row(s) — the
-    suppression row count never grows on recurrence. ``expires_at=None``:
-    suppressions are operator-managed and never expire via TTL.
+    Validates and canonicalizes *task_id* to ``str`` via
+    :func:`_canonicalize_suppression_task_id` (task 2503 amendment,
+    reviewer_comprehensive efficiency_reuse -- the same numeric/composite
+    validation :func:`build_suppression_payload` itself delegates to,
+    without constructing a full :class:`SuppressionPayload` up front just to
+    discard everything but the tid) to derive the canonicalized *tid*, then
+    -- before writing anything -- runs a PRE-WRITE COVERAGE CHECK (task 2503):
+    :func:`_existing_suppression_coverage` is queried for *tid*, and the
+    requested ``(flag_types or [''])`` is filtered down to the subset NOT
+    already covered by an existing active row -- covered by either an
+    existing wildcard row for *tid*, or an existing scoped row whose
+    :func:`canonical_flag_type_family` matches. This is the writer-side fix
+    for the stage1_flag_suppression companion-record sprawl (task 544): the
+    ``recon_ledger`` UPSERT below already self-collapses EXACT (task_id,
+    flag_type) identity, but the Mem0 mirror's ``add_memory`` NEVER upserts,
+    so a flag_type wording variant previously minted a fresh Mem0 companion
+    on every write. Coverage for a COMPOSITE *tid* is checked as a whole
+    string, not per-component -- see :func:`_existing_suppression_coverage`'s
+    "KNOWN ASYMMETRY" paragraph for the accepted edge case this leaves open.
 
-    ``memory_service.recon_ledger`` being unset/``None`` (ledger disabled or
-    not yet wired) skips the ledger write entirely — this degrades to a
-    Mem0-only mirror write, matching :func:`filter_suppressed`'s
-    pass-through contract when it finds no ledger to read.
+    - If EVERY requested flag_type is already covered, BOTH the ledger
+      upsert(s) AND the Mem0 mirror are skipped entirely: a structured
+      ``reconciliation.suppression_companion_skip`` INFO log is emitted and
+      an empty :class:`AddMemoryResponse` (``memory_ids=[]``) is returned
+      immediately -- no I/O beyond the coverage read itself.
+    - If only SOME requested flag_types are covered, only the not-yet-covered
+      subset is upserted to the ledger AND mirrored to Mem0 (the mirror
+      payload's ``metadata.flag_types`` reflects the subset, not the full
+      original request).
+    - If NOTHING is covered (the common case: no pre-existing rows, or a
+      genuinely new flag_type), behavior is unchanged from before task 2503
+      -- the full requested set is written and mirrored.
+    - IN-CALL family dedup (task 2503 amendment): the not-yet-covered subset
+      is additionally deduped AGAINST ITSELF by
+      :func:`canonical_flag_type_family`, keeping only the first raw variant
+      encountered per family. Without this, a single call requesting e.g.
+      ``flag_types=['missing_deliverable', 'deliverable_missing']`` with no
+      pre-existing rows would write/mirror BOTH (neither is covered by an
+      existing row), minting two rows for one family in one call -- the
+      pre-write coverage check alone only guards against existing ledger
+      rows, not duplicates within the same request.
 
-    After the ledger write(s), best-effort mirrors the same payload to Mem0
-    via ``memory_service.add_memory`` (PRD decision #4/#6 write-both/
-    read-new) — wrapped in try/except so a Mem0 failure never raises past
-    this function; reads never consult Mem0. On a mirror failure (or when
-    the ledger write happened but the mirror wasn't attempted for another
-    reason) an empty :class:`AddMemoryResponse` is synthesized so the return
-    type stays uniform.
+    Each written row's identity is ``(project_id, 'stage1_flag_suppression',
+    task_id, flag_type, run_id='')``, so a repeated call with the same
+    arguments UPSERTs the same row(s) — the suppression row count never
+    grows on exact recurrence (and, as of task 2503, never grows on a
+    flag_type-family or wildcard-covered recurrence either). ``expires_at
+    =None``: suppressions are operator-managed and never expire via TTL.
+
+    FAIL-OPEN contract for the coverage query itself: ``memory_service.
+    recon_ledger`` being unset/``None`` skips the coverage query AND the
+    ledger write entirely — this degrades to a Mem0-only mirror write,
+    matching :func:`filter_suppressed`'s pass-through contract when it finds
+    no ledger to read. A raising ``list_suppressions`` degrades to
+    "no coverage found" (logged at WARNING) rather than aborting the write —
+    a skipped suppression write would be a silent loss of an
+    operator-authored gate, which is strictly worse than one extra
+    (self-healing) companion record on a transient ledger error.
+
+    After the ledger write(s) (if any), best-effort mirrors the (possibly
+    subset) payload to Mem0 via ``memory_service.add_memory`` (PRD decision
+    #4/#6 write-both/read-new) — wrapped in try/except so a Mem0 failure
+    never raises past this function; reads never consult Mem0. On a mirror
+    failure (or when the ledger write happened but the mirror wasn't
+    attempted for another reason) an empty :class:`AddMemoryResponse` is
+    synthesized so the return type stays uniform.
+
+    ROBUSTNESS NOTE on mirror-gating permanence (task 2503 review;
+    reviewer_comprehensive robustness): coverage is inferred purely from
+    ``recon_ledger`` rows, never from Mem0 itself. If a FIRST call
+    successfully upserts the ledger row(s) but its best-effort Mem0 mirror
+    then fails (silently, per the try/except above), every SUBSEQUENT call
+    for that (or a flag_type-family-variant) request will see ledger
+    coverage and skip the mirror again — no Mem0 audit-journal entry is ever
+    created for that suppression. This is considered acceptable rather than
+    a bug: no runtime reader consults Mem0 for suppressions (the ledger is
+    the sole read source — see :func:`filter_suppressed`), so a missing Mem0
+    companion cannot cause a functional (suppression-matching) regression,
+    only a gap in the legacy Mem0-based audit trail during the ledger
+    cutover.
 
     The ``_source='stage1_flag_suppression'`` sentinel distinguishes these
     mirror writes from ``'targeted_recon'`` writes in the audit journal,
@@ -848,14 +1194,60 @@ async def write_suppression_record(
     Returns the :class:`AddMemoryResponse` from the memory service so callers
     can inspect ``memory_ids`` for empty-list deduplication / no-op detection.
     """
-    payload = build_suppression_payload(task_id, flag_types=flag_types)
-    tid = str(payload['metadata']['task_id'])
+    tid = _canonicalize_suppression_task_id(task_id)
 
     ledger = getattr(memory_service, 'recon_ledger', None)
+    requested = flag_types or ['']
+    is_blanket = not flag_types
+
+    wildcard_covered, covered_families = await _existing_suppression_coverage(
+        ledger, project_id, tid
+    )
+
+    def _is_covered(ft: str) -> bool:
+        if wildcard_covered:
+            return True
+        if not ft:
+            return False  # a blanket write is only covered by an existing wildcard
+        return canonical_flag_type_family(ft) in covered_families
+
+    # In-call family dedup (task 2503 amendment, reviewer_comprehensive
+    # correctness-completeness): the coverage check above only guards against
+    # EXISTING ledger rows -- it does not dedup the requested flag_types
+    # against EACH OTHER. Without this pass, a single call requesting e.g.
+    # ['missing_deliverable', 'deliverable_missing'] with no prior rows would
+    # keep both (neither is covered by an existing row) and mint two ledger
+    # rows / two Mem0 mirror entries for one family in ONE call -- the same
+    # companion-record sprawl this task exists to eliminate. Keep only the
+    # first raw variant encountered per family (stable order == request order).
+    to_write: list[str] = []
+    seen_families: set[str] = set()
+    for ft in requested:
+        if _is_covered(ft):
+            continue
+        family = canonical_flag_type_family(ft)
+        if family in seen_families:
+            continue
+        seen_families.add(family)
+        to_write.append(ft)
+
+    if not to_write:
+        logger.info(
+            'reconciliation.suppression_companion_skip task_id=%s project_id=%s '
+            'requested=%r fully covered by existing stage1_flag_suppression '
+            'row(s) -- skipping ledger upsert and Mem0 mirror',
+            tid,
+            project_id,
+            requested,
+        )
+        return AddMemoryResponse(memory_ids=[])
+
+    write_payload = build_suppression_payload(tid, flag_types=(None if is_blanket else to_write))
+
     if ledger is not None:
         now_iso = datetime.now(UTC).isoformat()
-        payload_json = json.dumps(payload['metadata'])
-        for ft in flag_types or ['']:
+        payload_json = json.dumps(write_payload['metadata'])
+        for ft in to_write:
             await ledger.upsert(ReconLedgerRecord(
                 project_id=project_id,
                 record_kind='stage1_flag_suppression',
@@ -870,7 +1262,7 @@ async def write_suppression_record(
 
     try:
         return await memory_service.add_memory(
-            **payload,
+            **write_payload,
             project_id=project_id,
             causation_id=causation_id,
             _source='stage1_flag_suppression',

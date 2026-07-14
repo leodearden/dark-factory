@@ -14,8 +14,28 @@ import pytest_asyncio
 
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.reconciliation import flag_dedup
 from fused_memory.reconciliation.flag_dedup import build_suppression_payload
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+
+
+@pytest.fixture(autouse=True)
+def _reset_flag_type_family_collision_warning_cache():
+    """Reset filter_suppressed's process-lifetime family-collision warning
+    memo (task 2503 amendment, reviewer_comprehensive robustness_log_noise)
+    before AND after every test in this module.
+
+    The cache is deliberately process-lifetime (not per-call) so a
+    persistent benign collision does not flood production logs every
+    reconciliation cycle -- see _WARNED_FLAG_TYPE_FAMILY_COLLISIONS. Without
+    this autouse reset, whichever test happens to run first for a given
+    (project_id, task_id, family) key would "use up" the one-time WARNING
+    and silently make a later test's assertion order-dependent.
+    """
+    flag_dedup._WARNED_FLAG_TYPE_FAMILY_COLLISIONS.clear()
+    yield
+    flag_dedup._WARNED_FLAG_TYPE_FAMILY_COLLISIONS.clear()
+
 
 # ---------------------------------------------------------------------------
 # compute_flag_signature tests (step-1)
@@ -666,6 +686,79 @@ async def test_dedup_flags_multiple_flags_one_ledger_failure_does_not_poison_bat
 
 
 # ---------------------------------------------------------------------------
+# canonical_flag_type_family helper (task 2503 step-1/step-2)
+# ---------------------------------------------------------------------------
+
+
+class TestCanonicalFlagTypeFamily:
+    """Tests for canonical_flag_type_family(flag_type) -> str.
+
+    Pure, sync, no-I/O helper that collapses case/separator/whitespace/
+    word-order variants of a flag_type into one deterministic family key —
+    used by filter_suppressed (reader) and write_suppression_record's
+    pre-write coverage check (writer) to recognize a reworded/reordered
+    flag_type as the same underlying finding (task 2503, causes #2/#3 of the
+    stage1_flag_suppression companion-record sprawl).
+
+    No literal-key pinning beyond the empty case — assertions compare
+    equality/inequality between inputs so the tests stay robust to the
+    exact canonicalization algorithm.
+    """
+
+    def test_case_variant_maps_to_same_family(self):
+        """'Missing_Deliverable' and 'missing_deliverable' collapse to the same key."""
+        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
+
+        assert canonical_flag_type_family('Missing_Deliverable') == canonical_flag_type_family(
+            'missing_deliverable'
+        )
+
+    def test_separator_variants_map_to_same_family(self):
+        """Hyphen, underscore, and space separators all collapse to the same key."""
+        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
+
+        underscore = canonical_flag_type_family('missing_deliverable')
+        hyphen = canonical_flag_type_family('missing-deliverable')
+        space = canonical_flag_type_family('missing deliverable')
+        assert underscore == hyphen == space
+
+    def test_word_order_variant_maps_to_same_family(self):
+        """Reordered tokens ('deliverable_missing') collapse to the same
+        family key as 'missing_deliverable' — the core fix for a reworded
+        flag_type evading exact-string suppression matching."""
+        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
+
+        assert canonical_flag_type_family('deliverable_missing') == canonical_flag_type_family(
+            'missing_deliverable'
+        )
+
+    def test_distinct_findings_stay_distinct(self):
+        """Genuinely different flag_types must NOT collapse to the same family."""
+        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
+
+        assert canonical_flag_type_family('missing_deliverable') != canonical_flag_type_family(
+            'stale_metadata'
+        )
+
+    @pytest.mark.parametrize('value', ['', '   ', '___', '---'])
+    def test_degenerate_input_collapses_to_empty_string(self, value):
+        """Empty/whitespace/all-separator input collapses to ''."""
+        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
+
+        assert canonical_flag_type_family(value) == ''
+
+    def test_idempotent(self):
+        """Applying the helper to its own output is a no-op — the output is
+        already lowercase, sorted, and '_'-joined."""
+        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
+
+        for value in ('missing_deliverable', 'Missing-Deliverable Foo', ''):
+            once = canonical_flag_type_family(value)
+            twice = canonical_flag_type_family(once)
+            assert once == twice
+
+
+# ---------------------------------------------------------------------------
 # TestFilterSuppressed (task-1186 step-1; rewritten onto the ledger at task
 # 2227 step-4) — filter_suppressed reads the ReconLedgerStore's indexed
 # list_suppressions(project_id) query; no Mem0 search.
@@ -1250,6 +1343,109 @@ async def test_dedup_flags_invalid_tid_flags_not_collapsed_when_repeated():
     )
     assert result == flags
     memory_service.add_memory.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# flag_type family matching in filter_suppressed (task 2503 step-3/step-4)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterSuppressedFlagTypeFamily:
+    """filter_suppressed must recognize a flag_type FAMILY variant (case/
+    separator/word-order) of an existing SCOPED suppression row as
+    suppressed, not just an exact string match — the reader-side fix for
+    the task-544 companion-record incident (a reworded flag_type for a
+    settled finding must now be recognized as suppressed)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag_flag_type',
+        [
+            pytest.param('missing_deliverable', id='exact-match'),
+            pytest.param('deliverable_missing', id='reordered'),
+            pytest.param('missing-deliverable', id='separator'),
+            pytest.param('Missing_Deliverable', id='case'),
+        ],
+    )
+    async def test_family_variant_of_scoped_row_is_dropped(
+        self, ledger_memory_service, flag_flag_type
+    ):
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '544', 'missing_deliverable'
+        )
+
+        flag = {'task_id': 544, 'flag_type': flag_flag_type}
+        result = await filter_suppressed(ledger_memory_service, 'p', [flag])
+        assert result == [], (
+            f'flag_type={flag_flag_type!r} should be recognized as the same '
+            f'family as the seeded missing_deliverable suppression'
+        )
+
+    @pytest.mark.asyncio
+    async def test_genuinely_different_flag_type_still_survives(self, ledger_memory_service):
+        """A flag_type that is NOT a family variant of the seeded row must
+        still survive — family matching must not over-suppress."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '544', 'missing_deliverable'
+        )
+
+        flag = {'task_id': 544, 'flag_type': 'stale_metadata'}
+        result = await filter_suppressed(ledger_memory_service, 'p', [flag])
+        assert result == [flag]
+
+    @pytest.mark.asyncio
+    async def test_family_collision_across_distinct_raw_flag_types_logs_warning(
+        self, ledger_memory_service, caplog
+    ):
+        """Two DIFFERENT raw flag_types for the SAME task_id that happen to
+        share a token multiset (word-order variants of each other, e.g.
+        'user_missing' / 'missing_user') collapse to the same family --
+        filter_suppressed logs a WARNING surfacing this as a potential
+        over-suppression collision for operator review (task 2503 amendment,
+        reviewer_comprehensive over-suppression-risk)."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '800', 'user_missing')
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '800', 'missing_user')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            await filter_suppressed(
+                ledger_memory_service, 'p', [{'task_id': 1, 'flag_type': 'unrelated'}]
+            )
+
+        assert any(
+            'family collision' in record.message
+            and '800' in record.message
+            and record.levelno == logging.WARNING
+            for record in caplog.records
+        ), f'Expected a WARNING family-collision log, got: {[r.message for r in caplog.records]}'
+
+    @pytest.mark.asyncio
+    async def test_no_collision_warning_for_single_raw_flag_type_per_family(
+        self, ledger_memory_service, caplog
+    ):
+        """No collision WARNING is logged when only ONE raw flag_type exists
+        per family for a task_id -- the common, non-colliding case."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '544', 'missing_deliverable'
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            await filter_suppressed(
+                ledger_memory_service, 'p', [{'task_id': 544, 'flag_type': 'missing_deliverable'}]
+            )
+
+        assert not any('family collision' in record.message for record in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -1940,6 +2136,257 @@ class TestWriteSuppressionRecord:
         svc.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['supp-1']))
 
         result = await write_suppression_record(svc, project_id='p', task_id=42)
+
+        svc.add_memory.assert_called_once()
+        assert result.memory_ids == ['supp-1']
+
+
+# ---------------------------------------------------------------------------
+# write_suppression_record pre-write coverage check (task 2503 step-5/step-6)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteSuppressionRecordPreWriteCheck:
+    """write_suppression_record performs a pre-write coverage check against
+    existing stage1_flag_suppression ledger rows before upserting/mirroring
+    (task 2503) — the writer-side fix for the task-544 companion-record
+    sprawl: the ledger UPSERT already self-collapses EXACT (task_id,
+    flag_type) identity, but the Mem0 mirror's add_memory NEVER upserts, so
+    a flag_type wording variant (or a request already covered by a
+    wildcard row) previously minted a fresh Mem0 companion on every write."""
+
+    @pytest.mark.asyncio
+    async def test_family_variant_write_fully_skipped(self, ledger_memory_service, caplog):
+        """(a) A second write whose flag_type is a FAMILY variant of an
+        already-written scoped row is fully skipped: no new ledger row, no
+        mirror call, empty AddMemoryResponse, INFO skip-log."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id=544, flag_types=['missing_deliverable']
+        )
+        ledger_memory_service.add_memory.reset_mock()
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await write_suppression_record(
+                ledger_memory_service,
+                project_id='p',
+                task_id=544,
+                flag_types=['deliverable_missing'],
+            )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1
+        assert rows[0].flag_type == 'missing_deliverable'
+
+        ledger_memory_service.add_memory.assert_not_called()
+        assert result == AddMemoryResponse(memory_ids=[])
+        assert any(
+            'suppression_companion_skip' in record.message and record.levelno == logging.INFO
+            for record in caplog.records
+        ), f'Expected an INFO skip-log, got: {[r.message for r in caplog.records]}'
+
+    @pytest.mark.asyncio
+    async def test_wildcard_covers_subsequent_scoped_write(self, ledger_memory_service):
+        """(b) An existing WILDCARD row for a task_id covers any subsequent
+        scoped write for that task_id — skipped entirely."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '42', '')
+
+        result = await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id=42, flag_types=['anything']
+        )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1
+        assert rows[0].flag_type == ''
+
+        ledger_memory_service.add_memory.assert_not_called()
+        assert result == AddMemoryResponse(memory_ids=[])
+
+    @pytest.mark.asyncio
+    async def test_scoped_only_coverage_does_not_skip_blanket_write(
+        self, ledger_memory_service
+    ):
+        """(i) The inverse of (b): a pre-existing SCOPED-only row must NOT
+        cover a subsequent BLANKET write for the same task_id -- only an
+        existing WILDCARD row can cover a blanket write
+        (``_is_covered('')`` is False whenever ``wildcard_covered`` is
+        False). A blanket suppression is strictly broader than any scoped
+        row, so it must always proceed and widen coverage rather than being
+        silently skipped (task 2503 amendment, reviewer_comprehensive
+        test_coverage)."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '9', 'missing_deliverable'
+        )
+
+        result = await write_suppression_record(ledger_memory_service, project_id='p', task_id=9)
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert {row.flag_type for row in rows} == {'missing_deliverable', ''}
+        assert len(rows) == 2
+
+        ledger_memory_service.add_memory.assert_called_once()
+        kwargs = ledger_memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['task_id'] == '9'
+        assert 'flag_types' not in kwargs['metadata']
+        assert result.memory_ids == ['mirror-id']
+
+    @pytest.mark.asyncio
+    async def test_partial_subset_writes_only_uncovered_flag_types(self, ledger_memory_service):
+        """(c) A write with a mix of already-covered and new flag_types
+        writes/mirrors ONLY the not-yet-covered subset."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '7', 'a')
+
+        result = await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id=7, flag_types=['a', 'b']
+        )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert {row.flag_type for row in rows} == {'a', 'b'}
+        assert len(rows) == 2
+
+        ledger_memory_service.add_memory.assert_called_once()
+        kwargs = ledger_memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['flag_types'] == ['b']
+        assert result.memory_ids == ['mirror-id']
+
+    @pytest.mark.asyncio
+    async def test_in_call_family_variants_collapse_to_one_write(self, ledger_memory_service):
+        """(h) A SINGLE call requesting two flag_types that are family
+        variants of each other (no pre-existing coverage) must still
+        collapse to ONE ledger row and ONE mirror entry -- the pre-write
+        coverage check alone only guards against EXISTING ledger rows, not
+        duplicates within the same request, so without an in-call dedup pass
+        one call could mint its own companion sprawl (task 2503 amendment,
+        reviewer_comprehensive correctness-completeness)."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        result = await write_suppression_record(
+            ledger_memory_service,
+            project_id='p',
+            task_id=544,
+            flag_types=['missing_deliverable', 'deliverable_missing'],
+        )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1, f'expected exactly one ledger row, got: {rows!r}'
+        assert rows[0].flag_type == 'missing_deliverable', (
+            'the first requested variant is kept as the representative'
+        )
+
+        ledger_memory_service.add_memory.assert_called_once()
+        kwargs = ledger_memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['flag_types'] == ['missing_deliverable']
+        assert result.memory_ids == ['mirror-id']
+
+    # -----------------------------------------------------------------
+    # Composite-existing-row decomposition (task 2503 step-7/step-8)
+    # -----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_composite_wildcard_row_covers_single_id_blanket_write(
+        self, ledger_memory_service
+    ):
+        """(d) A COMPOSITE blanket/wildcard row (task_id='2405,540,544')
+        covers a subsequent single-id blanket write for one of its
+        components -- no new row for the single id, mirror not called."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '2405,540,544', '')
+
+        result = await write_suppression_record(ledger_memory_service, project_id='p', task_id=544)
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1
+        assert rows[0].task_id == '2405,540,544'
+
+        ledger_memory_service.add_memory.assert_not_called()
+        assert result == AddMemoryResponse(memory_ids=[])
+
+    @pytest.mark.asyncio
+    async def test_composite_scoped_row_covers_single_id_family_variant_write(
+        self, ledger_memory_service
+    ):
+        """(e) A COMPOSITE scoped row (task_id='2405,544',
+        flag_type='missing_deliverable') covers a subsequent single-id write
+        for a FAMILY VARIANT of that flag_type for one of its components."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '2405,544', 'missing_deliverable'
+        )
+
+        result = await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id=544, flag_types=['deliverable_missing']
+        )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1
+        assert rows[0].task_id == '2405,544'
+
+        ledger_memory_service.add_memory.assert_not_called()
+        assert result == AddMemoryResponse(memory_ids=[])
+
+    # -----------------------------------------------------------------
+    # Fail-open guards on the pre-write coverage query (task 2503 step-9/step-10)
+    # -----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_list_suppressions_exception_fails_open_and_writes(
+        self, ledger_memory_service, caplog
+    ):
+        """(f) A raising recon_ledger.list_suppressions must not abort the
+        write -- fail-open: treat as no coverage, proceed with the write, and
+        log a WARNING (mirrors filter_suppressed's fail-open contract)."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        ledger_memory_service.recon_ledger.list_suppressions = AsyncMock(
+            side_effect=RuntimeError('list_suppressions boom')
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await write_suppression_record(
+                ledger_memory_service, project_id='p', task_id=42, flag_types=['x']
+            )
+
+        ledger_memory_service.add_memory.assert_called_once()
+        assert result.memory_ids == ['mirror-id']
+
+        row = await ledger_memory_service.recon_ledger.get_by_identity(
+            'p', 'stage1_flag_suppression', '42', 'x', ''
+        )
+        assert row is not None
+
+        assert any(
+            'list_suppressions' in record.message and record.levelno == logging.WARNING
+            for record in caplog.records
+        ), f'Expected a WARNING log mentioning list_suppressions, got: {[r.message for r in caplog.records]}'
+
+    @pytest.mark.asyncio
+    async def test_none_ledger_with_would_be_variant_proceeds_to_mirror(self):
+        """(g) memory_service.recon_ledger is None -- the pre-write check
+        degrades to no-coverage without any ledger read, and a write that
+        WOULD be a family variant of some hypothetical prior proceeds to the
+        mirror unconditionally, never raising."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        svc = AsyncMock()
+        svc.recon_ledger = None
+        svc.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['supp-1']))
+
+        result = await write_suppression_record(
+            svc, project_id='p', task_id=544, flag_types=['deliverable_missing']
+        )
 
         svc.add_memory.assert_called_once()
         assert result.memory_ids == ['supp-1']
