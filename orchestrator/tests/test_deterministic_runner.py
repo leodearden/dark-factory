@@ -917,6 +917,64 @@ class TestBeforeDoneCrossUnitDeploy:
 
 
 # ---------------------------------------------------------------------------
+# ζ D2 boundary: an illegal deploy-phase transition files a REAL born-at-L2
+# escalation before raising — never a silent write.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDeployTransitionEnforcement:
+    """ζ D2: DeterministicRunner._advance_deploy_phase enforces the _LEGAL
+    transition table via a REAL EscalationQueue — an illegal edge (e.g.
+    scheduled->done) files a born-at-L2 escalation observable via
+    get_by_task, THEN raises IllegalDeployTransition."""
+
+    async def test_illegal_transition_files_l2_escalation_before_raising(
+        self, tmp_path: Path,
+    ):
+        """scheduled->done is pinned-illegal (D2 boundary signal): driving
+        _advance_deploy_phase there must file a born-at-L2 escalation into a
+        REAL EscalationQueue AND raise IllegalDeployTransition."""
+        from orchestrator.deploy_state import DeployPhase, IllegalDeployTransition
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(_deploy_task(task_id='999'))
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        metadata = {'deploy_state': {'phase': 'scheduled'}}
+
+        with pytest.raises(IllegalDeployTransition):
+            await runner._advance_deploy_phase('999', metadata, DeployPhase.DONE)
+
+        escs = queue.get_by_task('999')
+        assert len(escs) == 1, f'Expected exactly 1 escalation, got {len(escs)}'
+        esc = escs[0]
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'illegal_deploy_transition'
+
+    async def test_no_update_task_write_occurs_on_illegal_transition(
+        self, tmp_path: Path,
+    ):
+        """D2 file-before-raise: the illegal transition must never reach
+        update_task — no silent write of a bogus phase."""
+        from orchestrator.deploy_state import DeployPhase, IllegalDeployTransition
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(_deploy_task(task_id='999'))
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        metadata = {'deploy_state': {'phase': 'scheduled'}}
+
+        with pytest.raises(IllegalDeployTransition):
+            await runner._advance_deploy_phase('999', metadata, DeployPhase.DONE)
+
+        scheduler.update_task.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # Task 2238 (W10-δ), step-3: run()'s cross-unit `if not self_target:` branch
 # delegates run+verify to proc_supervision.RestartPlan.execute() with a
 # FreshPidVerify instead of an inline run-then-reinspect block.
