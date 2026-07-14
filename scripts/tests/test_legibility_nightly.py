@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from legibility import nightly
+from legibility import census_trigger, nightly
 from legibility.config import load_config
 
 
@@ -358,6 +358,62 @@ def test_post_escalation_is_best_effort_on_poster_failure(tmp_path):
     ok = nightly.post_escalation(cfg, 'summary text', 'detail text', poster=raising_poster)
 
     assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# step-11/12: evaluate_census_step
+# ---------------------------------------------------------------------------
+
+def test_evaluate_census_step_no_fire_never_launches(tmp_path):
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        return census_trigger.Decision(fire=False, reasons=['max-interval: 1.0d (threshold 10d)'])
+
+    launcher_calls = []
+    line, fire = nightly.evaluate_census_step(
+        cfg, now=None, status_fetcher=None, decide=fake_decide,
+        entrypoint_exists=lambda: True, launcher=lambda: launcher_calls.append(1),
+    )
+
+    assert fire is False
+    assert 'NO-FIRE' in line
+    assert launcher_calls == []
+
+
+def test_evaluate_census_step_fire_without_entrypoint_logs_loud_no_launch(tmp_path, caplog):
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        return census_trigger.Decision(fire=True, reasons=['max-interval: 11.0d -> FIRE'])
+
+    launcher_calls = []
+    with caplog.at_level('WARNING'):
+        line, fire = nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            entrypoint_exists=lambda: False, launcher=lambda: launcher_calls.append(1),
+        )
+
+    assert fire is True
+    assert 'FIRE' in line
+    assert launcher_calls == []
+    assert any('FIRE-WITHOUT-LAUNCH' in record.message for record in caplog.records)
+
+
+def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        return census_trigger.Decision(fire=True, reasons=['max-interval: 11.0d -> FIRE'])
+
+    launcher_calls = []
+    line, fire = nightly.evaluate_census_step(
+        cfg, now=None, status_fetcher=None, decide=fake_decide,
+        entrypoint_exists=lambda: True, launcher=lambda: launcher_calls.append(1),
+    )
+
+    assert fire is True
+    assert launcher_calls == [1]
 
 
 # ---------------------------------------------------------------------------
