@@ -458,18 +458,48 @@ def test_graph_layout_js_loads_before_tab_tasks(index_html_body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: prd_grouping.js must load BEFORE tab_tasks.jsx (task 2530)
+# ---------------------------------------------------------------------------
+
+_PRD_GROUPING_PREFIX = '/static/redux/prd_grouping.js'
+
+
+def test_prd_grouping_js_loads_before_tab_tasks(index_html_body: str) -> None:
+    """prd_grouping.js must load as a classic synchronous script BEFORE
+    tab_tasks.jsx.
+
+    tab_tasks.jsx destructures window.DF_PRD_GROUPING at top-level execution
+    time — if prd_grouping.js loaded after (or not at all), that destructure
+    would silently produce undefined, and the "group by PRD" view would throw
+    the moment it tries to call one of those functions.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _PRD_GROUPING_PREFIX,
+        _TAB_TASKS_PREFIX,
+        before_label='prd_grouping.js',
+        after_label='tab_tasks.jsx',
+        consumer_note=(
+            'tab_tasks.jsx destructures window.DF_PRD_GROUPING at top level; '
+            'prd_grouping.js must define it first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: all /static/redux/* cache-busters share one bumped version
 # ---------------------------------------------------------------------------
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 28,
-    and graph_layout.js must be among the versioned assets.
+    """All /static/redux/*?v= cache-busters must share a single version >= 29,
+    and graph_layout.js / prd_grouping.js must both be among the versioned
+    assets.
 
     Mirrors the existing single-shared-version guards in test_tab_escalations.py,
-    test_tab_scheduler.py, and test_scheduler_page.py, raising the floor to 28 to
-    prove the uniform bump landed alongside task 2529's focus-mode changes to
-    graph_layout.js, tab_tasks.jsx, and styles.css.
+    test_tab_scheduler.py, and test_scheduler_page.py, raising the floor to 29 to
+    prove the uniform bump landed alongside task 2530's PRD-grouping changes to
+    prd_grouping.js, tab_tasks.jsx, and styles.css.
     """
     versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
     assert len(versions) == 1, (
@@ -477,11 +507,15 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'bump all of them uniformly to the same value.'
     )
     v = int(next(iter(versions)))
-    assert v >= 28, (
-        f'index.html cache-buster version is {v}, expected >= 28 (proves the '
-        'uniform bump from 27 alongside task 2529\'s focus-mode changes).'
+    assert v >= 29, (
+        f'index.html cache-buster version is {v}, expected >= 29 (proves the '
+        'uniform bump from 28 alongside task 2530\'s PRD-grouping changes).'
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
+        'assets in index.html.'
+    )
+    assert re.search(r'/static/redux/prd_grouping\.js\?v=\d+', index_html_body), (
+        'prd_grouping.js is not present among the versioned /static/redux/* '
         'assets in index.html.'
     )
