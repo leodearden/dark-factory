@@ -350,6 +350,99 @@ class TestReconcileOneStrandedGroundTruthRevert:
 
 
 # ---------------------------------------------------------------------------
+# task 2243 (W10-θ2) step-7 — degenerate-branch parity (RESOLVER GAP).
+#
+# θ1's _RECOVERY table has no degenerate-branch guard: a stranded task whose
+# branch is an ancestor of main but carries ZERO commits beyond its creation
+# point (tip == branch_base_sha) classifies ON_MAIN -> MARK_DONE, same as a
+# genuinely merged branch.  The migrated sweep keeps a thin degenerate
+# refinement (design decision, task 2243) that downgrades this to a revert
+# — pre-migration behavior, preserved.  Covers both the metadata-based
+# signal (_branch_is_degenerate) and the metadata-independent primitive
+# fallback (warm_lane_ref_is_degenerate).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestReconcileOneStrandedDegenerateBranchParity:
+    async def test_degenerate_branch_via_metadata_reverts_instead_of_done(
+        self, harness: Harness,
+    ):
+        """ON_MAIN evidence (is_ancestor=True) but the branch tip equals the
+        recorded branch_base_sha (zero commits pushed) — the metadata-based
+        degenerate signal downgrades MARK_DONE_WITH_PROVENANCE to a revert."""
+        tid = '9005'
+        degenerate_sha = 'aabbccdd' + 'e' * 32
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={
+                'status': 'in-progress',
+                'metadata': {'branch_base_sha': degenerate_sha},
+            },
+        )
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=degenerate_sha)  # type: ignore[attr-defined]
+
+        result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'pending',
+        )
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 1
+
+    async def test_degenerate_branch_via_primitive_reverts_instead_of_done(
+        self, harness: Harness,
+    ):
+        """ON_MAIN evidence but no branch_base_sha in metadata (the
+        metadata-based signal can't fire) — the metadata-independent
+        warm_lane_ref_is_degenerate primitive still downgrades to a revert."""
+        tid = '9006'
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'in-progress', 'metadata': {}},
+        )
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(  # type: ignore[attr-defined]
+            return_value='deadbeef' + 'a' * 32,
+        )
+        harness.git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+
+        result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'pending',
+        )
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 1
+
+    async def test_blocked_degenerate_branch_leaves_task_untouched(
+        self, harness: Harness,
+    ):
+        """R4 upgrades a stranded 'blocked' task with ON_MAIN evidence to
+        MARK_DONE_WITH_PROVENANCE — but a degenerate branch carries no real
+        work, and blocked discipline forbids a silent blocked->pending
+        revert, so this must resolve to no action at all (matching
+        pre-migration behavior): no mark_done, no status change."""
+        tid = '9007'
+        degenerate_sha = 'aabbccdd' + 'e' * 32
+        harness.scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={
+                'status': 'blocked',
+                'metadata': {'branch_base_sha': degenerate_sha},
+            },
+        )
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=degenerate_sha)  # type: ignore[attr-defined]
+
+        result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 0
+
+
+# ---------------------------------------------------------------------------
 # _reconcile_stranded_in_progress tests
 # ---------------------------------------------------------------------------
 
