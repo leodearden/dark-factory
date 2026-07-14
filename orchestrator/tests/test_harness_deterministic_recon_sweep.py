@@ -749,6 +749,78 @@ class TestRunDeterministicReconSweep:
 
         assert calls == ['tid-bad', 'tid-good']
 
+    # -----------------------------------------------------------------------
+    # ζ/task 2240 D1 composition: a FULL sweep pass (Source A's real
+    # _recover_stranded_deterministic_task, NOT mocked out this time) over a
+    # blocked deterministic deploy at deploy_state.phase=='ran' with a
+    # persisted verify_baseline, proving the freshness verdict — not
+    # phantom-done — drives the recovery escalation's category end-to-end.
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_d1_ran_phase_with_advanced_baseline_files_stranded_blocked_resume(self) -> None:
+        h = _make_recon_harness()
+        h.event_store = None
+        metadata = _strand_metadata(
+            phase=DeployPhase.RAN,
+            verify_baseline={'active_enter_timestamp_monotonic': 100, 'main_pid': 999},
+        )
+        task = {
+            'id': 'tid-fresh', 'status': 'blocked',
+            'description': 'Deploy fused-memory restart', 'metadata': metadata,
+        }
+        h.scheduler.get_tasks = AsyncMock(return_value=[task])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+        # ActiveState deliberately NOT 'active' -- proves the FRESHNESS
+        # branch (monotonic advance), not the liveness-only fallback, drove
+        # the verdict.
+        h._recon_unit_inspector = AsyncMock(return_value={
+            'MainPID': 4321, 'ActiveState': 'deactivating',
+            'ActiveEnterTimestampMonotonic': 500,
+        })
+
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        esc = h._escalation_queue.submit.call_args[0][0]  # type: ignore[union-attr, attr-defined]
+        assert esc.category == 'stranded_blocked'
+        assert esc.suggested_action == 'resume'
+        h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_d1_ran_phase_with_stale_baseline_files_infra_issue_never_done(self) -> None:
+        h = _make_recon_harness()
+        h.event_store = None
+        metadata = _strand_metadata(
+            phase=DeployPhase.RAN,
+            verify_baseline={'active_enter_timestamp_monotonic': 500, 'main_pid': 999},
+        )
+        task = {
+            'id': 'tid-stale', 'status': 'blocked',
+            'description': 'Deploy fused-memory restart', 'metadata': metadata,
+        }
+        h.scheduler.get_tasks = AsyncMock(return_value=[task])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+        # Live unit reports 'active' -- the OLD liveness-only check would
+        # call this 'healthy'; the freshness branch must override it to
+        # 'unconfirmed' because the monotonic did NOT advance past baseline
+        # (D1: a crash between ran and verified recovers at phase==ran with
+        # the defined re-escalate action, NEVER phantom-done).
+        h._recon_unit_inspector = AsyncMock(return_value={
+            'MainPID': 4321, 'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 500,
+        })
+
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        esc = h._escalation_queue.submit.call_args[0][0]  # type: ignore[union-attr, attr-defined]
+        assert esc.category == 'infra_issue'
+        assert esc.suggested_action == 'manual_intervention'
+        h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
 
 # ---------------------------------------------------------------------------
 # step-13: start/stop/loop lifecycle wiring
