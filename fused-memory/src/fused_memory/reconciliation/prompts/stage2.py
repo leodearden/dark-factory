@@ -7,9 +7,9 @@ from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_PROJECT_ID as _AUTOPILOT_VIDEO_PROJECT_ID,
 )
 from fused_memory.reconciliation.prompts import (
-    _RECON_REPORT_TOOL_GUIDANCE,
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
+    get_recon_report_tool_guidance,
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_cycle_summary_section,
@@ -105,10 +105,12 @@ guard validates the routing and rejects tasks that cite paths owned by another p
 a structured `DarkFactoryPathScopeViolation` error — its `suggested_project` field tells you \
 where to resubmit.
   - To surface a relationship to an EXISTING task there (rather than creating new work): emit \
-`mcp__recon-report__add_finding(severity='moderate', category='cross_project_routing', \
+`mcp__recon-report__add_finding(run_id=<from Reconciliation Context>, severity='moderate', \
+category='cross_project_routing', \
 flag_type='cross_project', actionable=False, description=<summary>, \
 suggested_action=<evidence notes>, task_id=None)`, then immediately call \
-`mcp__recon-report__cite_task(finding_id=<finding_id>, project_id=<that project_id>, \
+`mcp__recon-report__cite_task(run_id=<from Reconciliation Context>, finding_id=<finding_id>, \
+project_id=<that project_id>, \
 task_id=<existing foreign task_id>)` — because the project IS in Known Projects, cite_task \
 resolves it and appends to cited_tasks; that citation is the cross-cycle dedup anchor \
 (without it, _derive_affected_ids returns [] and the escalation fingerprint hashes the \
@@ -117,14 +119,16 @@ cite_task ONLY records a citation for project_ids listed in Known Projects — c
 an unlisted project returns unknown_project and attaches nothing.
 - If no project_root in "Known Projects" matches the scope, do NOT file the task in the \
 current project as a workaround. Instead, emit a finding via recon_report: call \
-`mcp__recon-report__add_finding(severity='moderate', category='cross_project_routing', \
+`mcp__recon-report__add_finding(run_id=<from Reconciliation Context>, severity='moderate', \
+category='cross_project_routing', \
 flag_type='cross_project', actionable=False, \
 description=<one-line summary + target_project_hint>, \
 suggested_action=<short evidence notes>, task_id=None)` so the operator can route it manually. \
 No dedicated cross-project tool is needed — the category/flag_type encoding carries the routing signal. \
 Dedup anchor for this branch has two sub-cases. (1) If a LOCAL task is the subject of the reroute \
 (its scope is being re-scoped or cancelled because the work belongs to the not-yet-known target \
-project), also call `mcp__recon-report__cite_task(finding_id=<finding_id>, project_id=<local project_id>, \
+project), also call `mcp__recon-report__cite_task(run_id=<from Reconciliation Context>, finding_id=<finding_id>, \
+project_id=<local project_id>, \
 task_id=<local task_id>)` for that local task — even when it is being re-scoped or cancelled. The local \
 task's project_id IS in "Known Projects" (this cycle is bound to it), so cite_task resolves and appends \
 to cited_tasks; _derive_affected_ids reads cited_tasks (not the top-level task_id field, which is \
@@ -154,7 +158,7 @@ cancel, use `set_task_status('cancelled')`; do not route the status change throu
 - {_STAGE2_PROJECT_ID_GUIDELINE}
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross_project_routing findings emitted above): \
-{_RECON_REPORT_TOOL_GUIDANCE}
+{get_recon_report_tool_guidance()}
 
 ## Provenance rules for "shipped via X" edges
 These rules prevent fabrication of temporal facts like "Task N shipped via X" \

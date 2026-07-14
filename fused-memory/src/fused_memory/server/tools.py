@@ -1623,9 +1623,10 @@ def create_mcp_server(
     @mcp.tool()
     @mcp_tool_errors()
     async def delete_memory(
-        memory_id: str,
         store: str,
         project_id: str,
+        memory_id: str | None = None,
+        id: str | None = None,
         agent_id: str | None = None,
         session_id: str | None = None,
         metadata: dict | None = None,
@@ -1641,10 +1642,17 @@ def create_mcp_server(
         includes its id (edge UUID for Graphiti, memory UUID for Mem0) and
         source_store.
 
+        Accepts either *memory_id* (canonical) or *id* (alias matching the key
+        search results and this tool's own response return). Exactly one must
+        be provided; supplying both with conflicting values is an error.
+
         Args:
-            memory_id: The memory ID (from search results)
             store: "graphiti" or "mem0" (from search results)
             project_id: Project scope (required)
+            memory_id: The memory ID (from search results)
+            id: Alias for memory_id, matching the `id` key returned by search
+                results and by this tool's own response (optional when
+                memory_id is provided)
             agent_id: Which agent is deleting (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
@@ -1657,6 +1665,20 @@ def create_mcp_server(
             return err
         if err := _known_project_gate(project_id):
             return err
+        if memory_id is not None and id is not None and memory_id != id:
+            return {
+                'error': (
+                    f'Conflicting memory_id {memory_id!r} and id {id!r}; '
+                    'provide only one.'
+                ),
+                'error_type': 'ValidationError',
+            }
+        resolved_id = memory_id if memory_id is not None else id
+        if resolved_id is None:
+            return {
+                'error': 'memory_id (or alias id) is required',
+                'error_type': 'ValidationError',
+            }
         if store not in _VALID_STORES:
             return {
                 'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
@@ -1664,7 +1686,7 @@ def create_mcp_server(
             }
         causation_id, source, _ = _extract_causation(metadata, agent_id)
         return await memory_service.delete_memory(
-            memory_id=memory_id,
+            memory_id=resolved_id,
             store=store,
             project_id=project_id,
             agent_id=agent_id,
@@ -1823,6 +1845,7 @@ def create_mcp_server(
         project_id: str,
         entity_uuid: str | None = None,
         entity_name: str | None = None,
+        name: str | None = None,
         agent_id: str | None = None,
         session_id: str | None = None,
         metadata: dict | None = None,
@@ -1839,6 +1862,11 @@ def create_mcp_server(
         When both are supplied, entity_uuid takes precedence. At least one must
         be provided.
 
+        entity_name also accepts *name* as an alias (matching the key used by
+        get_entity and returned by this tool's own response). Exactly one of
+        entity_name/name should be used; supplying both with conflicting
+        values is an error.
+
         The summary is rebuilt by deduplicating the facts of all currently-valid
         RELATES_TO edges — no LLM call is made.
 
@@ -1848,6 +1876,9 @@ def create_mcp_server(
                 entity_name is provided)
             entity_name: Exact name of the Entity node to resolve and refresh
                 (optional when entity_uuid is provided)
+            name: Alias for entity_name, matching the `name` key used by
+                get_entity and returned by this tool's own response (optional
+                when entity_name or entity_uuid is provided)
             agent_id: Which agent is calling (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
@@ -1858,7 +1889,16 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
-        if not entity_uuid and not entity_name:
+        if entity_name is not None and name is not None and entity_name != name:
+            return {
+                'error': (
+                    f'Conflicting entity_name {entity_name!r} and name {name!r}; '
+                    'provide only one.'
+                ),
+                'error_type': 'ValidationError',
+            }
+        resolved_name = entity_name if entity_name is not None else name
+        if not entity_uuid and not resolved_name:
             return {
                 'error': 'Either entity_uuid or entity_name must be provided',
                 'error_type': 'ValidationError',
@@ -1866,7 +1906,7 @@ def create_mcp_server(
         causation_id, source, _ = _extract_causation(metadata, agent_id)
         return await memory_service.refresh_entity_summary(
             entity_uuid=entity_uuid or None,
-            entity_name=entity_name or None,
+            entity_name=resolved_name or None,
             project_id=project_id,
             agent_id=agent_id,
             session_id=session_id,

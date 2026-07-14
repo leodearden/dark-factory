@@ -1,5 +1,11 @@
 """Stage and judge system prompts."""
 
+import functools
+import inspect
+import logging
+
+logger = logging.getLogger(__name__)
+
 # Base template — use {{project_id}} so it survives .format(tools=...) as {project_id}.
 # Each caller then formats with .format(project_id=self.project_id) at runtime.
 _PROJECT_ID_GUIDELINE = (
@@ -74,17 +80,140 @@ _STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
 #   stable anchor when one primary subject exists.
 #   Exception: cross_project findings use task_id=None (operator routing); cite_task
 #   is the sole dedup anchor there (see ## Cross-Project Routing in stage2.py).
-_RECON_REPORT_TOOL_GUIDANCE = (
+#
+# Call shapes below are GENERATED from live FastMCP tool signatures (task-2559
+# root-cause fix for run_id-omission drift that survived two reviewer rounds) —
+# see render_recon_report_tool_guidance() — rather than hand-transcribed, so a
+# rendered example can never silently omit a required kwarg again.
+_RECON_REPORT_PLACEHOLDERS = {
+    'run_id': '<from Reconciliation Context>',
+    'finding_id': '<finding_id from add_finding response>',
+    'severity': '<severity>',
+    'category': '<category>',
+    'description': '<description>',
+    'suggested_action': '<suggested_action>',
+    'actionable': '<actionable>',
+    'task_id': '<task_id>',
+    'flag_type': '<flag_type>',
+    'key': '<key>',
+    'value': '<value>',
+    'delta': '<delta>',
+    'summary': '<brief human-readable summary>',
+    'name': '<canonical entity name>',
+    'edge_uuid': '<full 36-char UUID>',
+    'project_id': '<project_id>',
+    'memory_id': '<uuid>',
+    'store': "<'mem0'|'graphiti'>",
+}
+
+
+def render_recon_report_tool_guidance() -> str:
+    """Render _RECON_REPORT_TOOL_GUIDANCE's call shapes from live tool signatures.
+
+    Introspects each agent-called report tool's live signature (via
+    :func:`fused_memory.server.recon_report.get_recon_report_tool_signatures`,
+    which owns the one place this package reaches into FastMCP's tool-manager
+    internals) so every rendered call always carries every parameter the live
+    tool requires. This is the root-cause fix for run_id-omission drift: a
+    hand-transcribed example can silently go stale when a signature changes;
+    a generated one cannot (task-2559). A param with no entry in
+    _RECON_REPORT_PLACEHOLDERS falls back to a generic ``<param_name>``
+    placeholder, so even a newly-added required kwarg is guaranteed to render.
+
+    Every parameter still renders — dropping optional ones would reopen the
+    drift hole this task closed — but a parameter carrying a default value
+    (genuinely optional) is wrapped in square brackets, e.g.
+    ``[task_id=<task_id>]``, so the example does not read as though every
+    kwarg must always be supplied. A parameter with no default (required)
+    renders bare, mirroring common CLI usage-string conventions
+    (``cmd required [optional]``).
+
+    start_report is harness-called (agents never call it themselves) and is
+    intentionally excluded from generation — its mention below stays prose.
+
+    Raises whatever :func:`get_recon_report_tool_signatures` raises (e.g. if
+    FastMCP's internals have changed shape) — :func:`get_recon_report_tool_guidance`
+    catches this and falls back to a frozen static string rather than letting
+    it become an ImportError for every consumer of this package.
+    """
+    from fused_memory.server.recon_report import get_recon_report_tool_signatures
+
+    signatures = get_recon_report_tool_signatures()
+
+    def render_call(tool_name: str) -> str:
+        parts = []
+        for param_name, param in signatures[tool_name].parameters.items():
+            placeholder = _RECON_REPORT_PLACEHOLDERS.get(param_name, f'<{param_name}>')
+            kwarg = f'{param_name}={placeholder}'
+            parts.append(kwarg if param.default is inspect.Parameter.empty else f'[{kwarg}]')
+        return f'mcp__recon-report__{tool_name}({", ".join(parts)})'
+
+    add_finding_call = render_call('add_finding')
+    cite_entity_call = render_call('cite_entity')
+    cite_edge_call = render_call('cite_edge')
+    cite_task_call = render_call('cite_task')
+    cite_memory_call = render_call('cite_memory')
+    set_stat_call = render_call('set_stat')
+    inc_stat_call = render_call('inc_stat')
+    complete_call = render_call('complete')
+
+    return (
+        'The harness calls `mcp__recon-report__start_report` for you before the stage begins'
+        f' — do NOT call it yourself. For each finding, call `{add_finding_call}`'
+        ' and capture the `finding_id` from the response. Then attach typed citations:\n'
+        f'- `{cite_entity_call}` —'
+        ' pass the ENTITY NAME (not a UUID); the server resolves the UUID internally.\n'
+        f'- `{cite_edge_call}` —'
+        ' copy the UUID verbatim from the `id` field of a fresh tool result'
+        ' (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.\n'
+        f'- `{cite_task_call}`'
+        ' — both project_id and task_id are required. **Dedup anchor**:'
+        ' `_derive_affected_ids` reads `cited_tasks` (not the top-level `task_id` field of'
+        ' `add_finding`) when building the fingerprint for `compute_content_fingerprint`.'
+        ' Always call `cite_task` for the primary subject task so the fingerprint is stable.'
+        ' For multi-task findings, the cited_tasks signature shifts as citations grow or'
+        ' shrink — also pass `task_id=<primary>` at the top level of `add_finding` as a'
+        ' supplementary stable anchor when one clear primary subject exists. Exception:'
+        ' cross_project findings use `task_id=None` (operator routing); `cite_task` is the'
+        ' sole dedup anchor there.\n'
+        f'- `{cite_memory_call}` — `memory_id` must be the full 36-char UUID from the'
+        ' `id` field of a fresh tool result.\n'
+        f'For stats counters use `{set_stat_call}` or'
+        f' `{inc_stat_call}`. When all findings are recorded'
+        ' and all work is done, call'
+        f' `{complete_call}` as your'
+        ' terminal action — do NOT produce a structured JSON response; the assembled'
+        ' recon_report state is the authoritative output channel for this stage.'
+    )
+
+
+# Last-resort fallback if render_recon_report_tool_guidance() raises when first
+# called (e.g. a FastMCP upgrade changes the tool-manager internals guarded by
+# get_recon_report_tool_signatures(), or recon_report's server construction
+# regresses). This is a FROZEN, hand-written snapshot of a known-good render
+# — it is not exercised on the normal path and is not re-verified against the
+# live signatures, so treat it as a crash-avoidance safety net, not a source
+# of truth: it can go stale exactly like the hand-transcribed text this task
+# replaced. Every call shape below still carries run_id, so even a stale
+# fallback cannot regress the original run_id-omission bug this task fixed.
+_RECON_REPORT_TOOL_GUIDANCE_FALLBACK = (
     'The harness calls `mcp__recon-report__start_report` for you before the stage begins'
-    ' — do NOT call it yourself. For each finding, call `mcp__recon-report__add_finding(...)`'
-    ' and capture the `finding_id` from the response. Then attach typed citations:\n'
-    '- `mcp__recon-report__cite_entity(finding_id=..., name=<canonical entity name>)` —'
-    ' pass the ENTITY NAME (not a UUID); the server resolves the UUID internally.\n'
-    '- `mcp__recon-report__cite_edge(finding_id=..., edge_uuid=<full 36-char UUID>)` —'
-    ' copy the UUID verbatim from the `id` field of a fresh tool result'
+    ' — do NOT call it yourself. For each finding, call'
+    ' `mcp__recon-report__add_finding(run_id=<from Reconciliation Context>,'
+    ' severity=<severity>, category=<category>, description=<description>,'
+    ' suggested_action=<suggested_action>, actionable=<actionable>, task_id=<task_id>,'
+    ' flag_type=<flag_type>)` and capture the `finding_id` from the response. Then attach'
+    ' typed citations:\n'
+    '- `mcp__recon-report__cite_entity(run_id=<from Reconciliation Context>,'
+    ' finding_id=<finding_id from add_finding response>, name=<canonical entity name>)`'
+    ' — pass the ENTITY NAME (not a UUID); the server resolves the UUID internally.\n'
+    '- `mcp__recon-report__cite_edge(run_id=<from Reconciliation Context>,'
+    ' finding_id=<finding_id from add_finding response>, edge_uuid=<full 36-char UUID>)`'
+    ' — copy the UUID verbatim from the `id` field of a fresh tool result'
     ' (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.\n'
-    '- `mcp__recon-report__cite_task(finding_id=..., project_id=<project_id>,'
-    ' task_id=<task_id>)` — both fields are required. **Dedup anchor**:'
+    '- `mcp__recon-report__cite_task(run_id=<from Reconciliation Context>,'
+    ' finding_id=<finding_id from add_finding response>, project_id=<project_id>,'
+    ' task_id=<task_id>)` — both project_id and task_id are required. **Dedup anchor**:'
     ' `_derive_affected_ids` reads `cited_tasks` (not the top-level `task_id` field of'
     ' `add_finding`) when building the fingerprint for `compute_content_fingerprint`.'
     ' Always call `cite_task` for the primary subject task so the fingerprint is stable.'
@@ -93,13 +222,70 @@ _RECON_REPORT_TOOL_GUIDANCE = (
     ' supplementary stable anchor when one clear primary subject exists. Exception:'
     ' cross_project findings use `task_id=None` (operator routing); `cite_task` is the'
     ' sole dedup anchor there.\n'
-    "- `mcp__recon-report__cite_memory(finding_id=..., memory_id=<uuid>,"
+    '- `mcp__recon-report__cite_memory(run_id=<from Reconciliation Context>,'
+    ' finding_id=<finding_id from add_finding response>, memory_id=<uuid>,'
     " store=<'mem0'|'graphiti'>)` — `memory_id` must be the full 36-char UUID from the"
     ' `id` field of a fresh tool result.\n'
-    'For stats counters use `mcp__recon-report__set_stat(key=..., value=...)` or'
-    ' `mcp__recon-report__inc_stat(key=..., delta=...)`. When all findings are recorded'
-    ' and all work is done, call'
-    ' `mcp__recon-report__complete(summary=<brief human-readable summary>)` as your'
-    ' terminal action — do NOT produce a structured JSON response; the assembled'
-    ' recon_report state is the authoritative output channel for this stage.'
+    'For stats counters use `mcp__recon-report__set_stat(run_id=<from Reconciliation'
+    ' Context>, key=<key>, value=<value>)` or `mcp__recon-report__inc_stat(run_id=<from'
+    ' Reconciliation Context>, key=<key>, delta=<delta>)`. When all findings are recorded'
+    ' and all work is done, call `mcp__recon-report__complete(run_id=<from Reconciliation'
+    ' Context>, summary=<brief human-readable summary>)` as your terminal action — do NOT'
+    ' produce a structured JSON response; the assembled recon_report state is the'
+    ' authoritative output channel for this stage.'
 )
+
+
+@functools.lru_cache(maxsize=1)
+def _cached_recon_report_tool_guidance() -> str:
+    """Cache wrapper around :func:`render_recon_report_tool_guidance`.
+
+    Split out from :func:`get_recon_report_tool_guidance` (task-2559
+    amendment) so that ``lru_cache`` only ever memoizes a *successful*
+    render: ``functools.lru_cache`` does not cache a call that raises (the
+    exception propagates on every call until one succeeds), so a transient
+    introspection failure here is retried on the very next call instead of
+    being pinned forever. See :func:`get_recon_report_tool_guidance` for the
+    fallback handling built on top of this.
+    """
+    return render_recon_report_tool_guidance()
+
+
+def get_recon_report_tool_guidance() -> str:
+    """Return the recon-report tool-call guidance text, computed once and cached.
+
+    Deliberately lazy (task-2559 amendment): computing this at
+    ``prompts/__init__.py`` import time meant EVERY import of the ``prompts``
+    package — including sibling submodules unrelated to recon-report guidance,
+    e.g. ``prompts.judge`` (imported by ``reconciliation.judge``, which never
+    touches recon-report tool calls) — paid the cost of constructing a
+    throwaway FastMCP recon_report server. Deferring to first call means only
+    a consumer that actually needs the guidance (Stage 1/2/3, which interpolate
+    it into their system prompts at their own module import) triggers the
+    build, and the :func:`_cached_recon_report_tool_guidance` helper ensures a
+    successful build happens at most once per process.
+
+    Falls back to the frozen :data:`_RECON_REPORT_TOOL_GUIDANCE_FALLBACK`
+    static string if :func:`render_recon_report_tool_guidance` raises (e.g. a
+    FastMCP upgrade changes the tool-manager internals guarded by
+    ``get_recon_report_tool_signatures``) rather than letting it become an
+    ImportError for every consumer of this package. Unlike the successful
+    path, the fallback is deliberately NOT cached — only
+    :func:`_cached_recon_report_tool_guidance`'s ``lru_cache`` is consulted,
+    and it never stores a raised call, so a transient failure (e.g. a
+    momentary hiccup constructing the throwaway FastMCP server) does not
+    permanently pin every later call in this same process to the frozen
+    fallback; the very next call retries the live render and self-heals as
+    soon as it succeeds.
+    """
+    try:
+        return _cached_recon_report_tool_guidance()
+    except Exception:
+        logger.exception(
+            'render_recon_report_tool_guidance() failed; falling back to '
+            'the frozen _RECON_REPORT_TOOL_GUIDANCE_FALLBACK static string. Recon-report '
+            'tool-call guidance may be stale until the underlying introspection failure '
+            '(see fused_memory.server.recon_report.get_recon_report_tool_signatures) is '
+            'fixed — the next call retries automatically, in this process or a fresh one.'
+        )
+        return _RECON_REPORT_TOOL_GUIDANCE_FALLBACK
