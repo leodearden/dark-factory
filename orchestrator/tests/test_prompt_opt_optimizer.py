@@ -46,7 +46,7 @@ class TestProposeHeuristicsEdit:
             cwd=Path('/tmp'),
         )
 
-        assert fake_invoke.await_args.kwargs['model'] == 'frontier-y'
+        assert fake_invoke.await_args.kwargs['model'] == 'frontier-y'  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
     async def test_prompt_contains_heuristics_scores_and_rejected_but_not_contract(self) -> None:
