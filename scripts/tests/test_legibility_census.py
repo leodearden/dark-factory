@@ -368,3 +368,47 @@ def test_render_matrix_omits_unknown_when_no_unknown_sightings():
 
 def test_render_matrix_empty_matrix_is_deterministic_placeholder():
     assert mod.render_matrix({}) == "_No sightings recorded._\n"
+
+
+# ---------------------------------------------------------------------------
+# step-7: RED — preflight_headroom() tiny probe
+# ---------------------------------------------------------------------------
+
+def test_preflight_headroom_ok_on_normal_reply():
+    fake_invoke = _make_fake_invoke(default="pong")
+    result = mod.preflight_headroom(fake_invoke, model="sonnet")
+    assert result.ok is True
+    assert fake_invoke.calls[0]["model"] == "sonnet"
+
+
+@pytest.mark.parametrize(
+    "banner",
+    [
+        "You have reached your usage limit for this period.",
+        "Rate limit exceeded, please try again later.",
+        "Please run /login to authenticate.",
+        "Invalid API key provided.",
+    ],
+)
+def test_preflight_headroom_defers_on_known_banner(banner):
+    fake_invoke = _make_fake_invoke(default=banner)
+    result = mod.preflight_headroom(fake_invoke, model="sonnet")
+    assert result.ok is False
+    assert result.reason
+
+
+def test_preflight_headroom_banner_match_is_case_insensitive():
+    fake_invoke = _make_fake_invoke(default="USAGE LIMIT REACHED, TRY AGAIN LATER")
+    result = mod.preflight_headroom(fake_invoke, model="sonnet")
+    assert result.ok is False
+
+
+def test_preflight_headroom_invocation_error_defers_fail_safe():
+    def raising_invoke(prompt, model):
+        raise coder.CoderInvocationError(
+            "claude CLI exited 1 (model='sonnet'): simulated backend outage"
+        )
+
+    result = mod.preflight_headroom(raising_invoke, model="sonnet")
+    assert result.ok is False
+    assert result.reason
