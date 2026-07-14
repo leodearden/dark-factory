@@ -1213,6 +1213,7 @@ class Scheduler:
         'stale_sweep',
         'cooldown_gc',
         'external_dep_policy',
+        'delivered_check_gate',
         'stamp_milestone',
         'override_snapshot_gc',
         'reserve_now',
@@ -4555,6 +4556,42 @@ class Scheduler:
             )
         ctx.external_cache = external_cache
         ctx.external_resolver_failed = external_err is not None
+        return _CONTINUE
+
+    async def _phase_delivered_check_gate(self, ctx: TickContext) -> object:
+        """Delivered-check dep-gate per-tick sweep (capability-delivered-
+        checks PRD, task delta).
+
+        Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``.
+        Writes: ``ctx.delivered_check_cache``. Runs immediately after
+        ``external_dep_policy`` and before either candidate-dispatch loop
+        (``build_candidates`` / ``select_pins``), both of which forward the
+        cache into ``_eligible_for_dispatch`` → ``_deps_satisfied``.
+        ``_compute_delivered_check_cache`` already collects the relevant
+        (terminal, checked) deps internally — a dep-free or check-free
+        pending task is a no-op for it — so this phase simply forwards all
+        pending tasks, mirroring how ``_apply_external_dep_policy`` is
+        itself the one that filters for relevant deps.
+
+        The sweep call is wrapped in try/except so a failure (e.g. a
+        transient git error surfacing as an unexpected exception) degrades
+        to a fail-safe EMPTY cache instead of aborting the tick — no task
+        gated by an unverified delivered check dispatches this tick, and
+        the sweep retries next tick. Always continues.
+        """
+        _pending_tasks = [t for t in ctx.tasks if t.get('status') == 'pending']
+        try:
+            cache = await self._compute_delivered_check_cache(
+                _pending_tasks, ctx.status_map, ctx.tasks_by_id
+            )
+        except Exception:
+            logger.warning(
+                'Delivered-check gate sweep raised — degrading to fail-safe '
+                'empty cache this tick',
+                exc_info=True,
+            )
+            cache = {}
+        ctx.delivered_check_cache = cache
         return _CONTINUE
 
     async def _phase_stamp_milestone(self, ctx: TickContext) -> object:
