@@ -12,12 +12,40 @@ On-disk contract mirrored from orchestrator/src/orchestrator/fleet_heartbeat.py:
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from pathlib import Path
 
 # Fleet-common heartbeat directory default. Hardcoded mirror of
 # orchestrator.fleet_heartbeat.DEFAULT_FLEET_DIR -- pinned against silent
 # drift by test_drain_check.py's drift test (step-3).
 DEFAULT_FLEET_DIR = Path('/home/leo/src/dark-factory/data/fleet')
+
+
+def resolve_fleet_dir(env: Mapping[str, str] | None = None) -> Path:
+    """Resolve the fleet-common heartbeat directory.
+
+    Mirrors orchestrator.fleet_heartbeat.resolve_fleet_dir: returns
+    ``Path(env['ORCH_FLEET_DIR'])`` when that key is present and
+    non-empty, else ``DEFAULT_FLEET_DIR``. ``env`` defaults to
+    ``os.environ`` so the CLI needs no arguments while tests can inject an
+    explicit mapping.
+    """
+    if env is None:
+        env = os.environ
+    override = env.get('ORCH_FLEET_DIR', '')
+    if override:
+        return Path(override)
+    return DEFAULT_FLEET_DIR
+
+
+def heartbeat_path(fleet_dir: Path, unit: str) -> Path:
+    """Return the on-disk heartbeat path for *unit* within *fleet_dir*.
+
+    Mirrors the filename shape written by
+    orchestrator.fleet_heartbeat.write_heartbeat: ``<fleet_dir>/<unit>.json``.
+    """
+    return Path(fleet_dir) / f'{unit}.json'
 
 
 def classify(heartbeat: dict | None, now: float, fresh_window: float) -> str:
