@@ -525,32 +525,50 @@ class TestSweepYieldsAndInterleaves:
             sweep_task = asyncio.create_task(
                 run_full_verification(project_root, config, role='background')
             )
+            task_task: asyncio.Task | None = None
+            try:
+                # 1st background subproject: grant, then wait for its full
+                # acquire+release pair before letting anything else proceed.
+                bg_gate_0.set()
+                await _wait_for_log_len(acq, 2)
 
-            # 1st background subproject: grant, then wait for its full
-            # acquire+release pair before letting anything else proceed.
-            bg_gate_0.set()
-            await _wait_for_log_len(acq, 2)
-
-            # Contending task-role verify, started only now so its acquire
-            # attempt lands after the 1st background release.
-            task_task = asyncio.create_task(
-                run_verification(
-                    worktree=task_worktree,
-                    config=config,
-                    module_config=_module_config(),
-                    role='task',
-                    attempt_id=None,
+                # Contending task-role verify, started only now so its
+                # acquire attempt lands after the 1st background release.
+                task_task = asyncio.create_task(
+                    run_verification(
+                        worktree=task_worktree,
+                        config=config,
+                        module_config=_module_config(),
+                        role='task',
+                        attempt_id=None,
+                    )
                 )
-            )
-            task_gate_0.set()
-            await _wait_for_log_len(acq, 4)
+                task_gate_0.set()
+                await _wait_for_log_len(acq, 4)
 
-            # 2nd background subproject, granted last.
-            bg_gate_1.set()
-            await _wait_for_log_len(acq, 6)
+                # 2nd background subproject, granted last.
+                bg_gate_1.set()
+                await _wait_for_log_len(acq, 6)
 
-            sweep_result = await sweep_task
-            task_result = await task_task
+                sweep_result = await sweep_task
+                task_result = await task_task
+            finally:
+                # Release every pre-registered gate FIRST, regardless of how
+                # far the happy path got — a worker thread blocked in
+                # `_held`'s `gate.wait()` runs on the process-global
+                # `_admission_executor` singleton (verify.py, never torn
+                # down), so a failed assertion/exception above must not
+                # leave one parked there to leak into a later test.
+                # Event.set() is idempotent, so re-setting an
+                # already-released gate here is harmless.
+                bg_gate_0.set()
+                bg_gate_1.set()
+                task_gate_0.set()
+                for pending in (sweep_task, task_task):
+                    if pending is not None and not pending.done():
+                        pending.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await pending
 
         # (c) interleave: task's grant lands BETWEEN the two background grants.
         acquire_order = [role for role, event in acq.log if event == 'acquire']
@@ -690,6 +708,17 @@ class TestUntimedWaitNoRequeue:
         ]
         assert len(waiter_test_calls) == 1
         waiter_timeout = waiter_test_calls[0]['timeout']
+        # NOTE on what this assertion does and doesn't prove: `_run_cmd` is
+        # a spy, not the real subprocess runner, so it never enforces
+        # `timeout` — this only guards the *budget-value* invariant (the
+        # contended waiter is handed the exact same timeout number as the
+        # free-slot baseline). It does not independently observe *where*
+        # `_run_or_skip_timed`'s clock actually starts (t0/started_at set
+        # INSIDE `_admission_slot`, after acquisition) — that clock-start-
+        # point guarantee is structural/by-construction (see the class
+        # docstring and plan.json design_decisions[3]), which is exactly why
+        # this test asserts arg equality rather than measuring elapsed wait
+        # time, and is not re-verified independently here.
         assert waiter_timeout == baseline_timeout, (
             f'expected the contended waiter to receive the same timeout '
             f'budget as the free-slot baseline (slot-wait excluded from '
