@@ -1337,17 +1337,6 @@ class TestReconcileStrandedInProgress:
     # Guard 3 structurally rejects zero-commit branches sitting on main.
     # ------------------------------------------------------------------
 
-    @pytest.mark.xfail(
-        reason=(
-            'task 2243 W10-θ2: the degenerate-branch refinement (tip == '
-            'branch_base_sha must NOT mark-done) is deferred to plan '
-            'step-7/8 — TaskGroundTruth (θ1) has no degenerate check, and '
-            "the interim MARK_DONE decision doesn't consult metadata "
-            'at all yet. My.blocked+on-main refinement (step-4) also does '
-            "not yet guard degeneracy — step-8 must cover both."
-        ),
-        strict=True,
-    )
     async def test_already_merged_skipped_when_branch_never_advanced(
         self, harness: Harness
     ):
@@ -1462,15 +1451,6 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_awaited_once_with('50', 'pending')  # type: ignore[attr-defined]
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
 
-    @pytest.mark.xfail(
-        reason=(
-            'task 2243 W10-θ2 step-4: the blocked+on-main R4 refinement '
-            'does not yet guard degeneracy (deferred to step-7/8 alongside '
-            "TaskGroundTruth's own degenerate gap — see "
-            'test_already_merged_skipped_when_branch_never_advanced).'
-        ),
-        strict=True,
-    )
     async def test_degenerate_blocked_not_reverted(self, harness: Harness):
         """Blocked discipline regression: a degenerate branch on a BLOCKED task is
         left intact — never blocked→pending, never marked done.  Pins the revert

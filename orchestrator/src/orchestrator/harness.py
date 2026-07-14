@@ -3524,6 +3524,35 @@ Output JSON matching the schema. Every task must appear in the output.
             action = RecoveryAction.MARK_DONE_WITH_PROVENANCE
 
         if action == RecoveryAction.MARK_DONE_WITH_PROVENANCE:
+            # Degenerate-branch refinement (task 2243, W10-θ2; RESOLVER GAP
+            # design decision): θ1's _RECOVERY table has no degenerate-branch
+            # guard — a zero-commit branch (tip == branch_base_sha) that is
+            # an ancestor of main classifies ON_MAIN -> MARK_DONE the same as
+            # a genuinely merged branch. Extending θ1's resolver would mean
+            # threading task metadata into _resolve_branch_state, undoing its
+            # reviewed branch-state/task-row concurrency split — so this
+            # thin, sweep-side check downgrades the decision instead. Safe
+            # for journal hits: a genuinely merged branch is never
+            # degenerate, so this never fires for a real MergeProvenance
+            # journal row.
+            if (
+                await self._branch_is_degenerate(branch, metadata)
+                or await self.git_ops.warm_lane_ref_is_degenerate(tid)
+            ):
+                # A degenerate branch carries ZERO task work, so MARK_DONE
+                # would phantom-complete a task that never actually landed
+                # anything. An in-progress incarnation with no live claimant
+                # (already established by recovery_for reaching this action)
+                # is recovered by reverting to pending so the scheduler
+                # re-dispatches it. 'blocked' keeps the leave-alone
+                # discipline: only flip to done on positive evidence, which a
+                # degenerate branch is not — matching pre-migration behavior.
+                if status == 'in-progress':
+                    return await self._revert_in_progress_if_no_live_claimant(
+                        tid, mid_run=mid_run, metadata=metadata, status=status,
+                    )
+                return None
+
             on_main = report.branch_state.kind == BranchStateKind.ON_MAIN
             if status == 'blocked':
                 note = (
