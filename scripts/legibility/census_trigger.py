@@ -167,6 +167,20 @@ def evaluate(
             )
         )
 
-    fire = cond_a or cond_b
+    window_start = now_utc - timedelta(hours=config.novelty_spike_window_hours)
+    in_window = [
+        fs for fs in candidate_first_seens if window_start <= _as_utc(fs) <= now_utc
+    ]
+    cond_c = len(in_window) >= config.novelty_spike_count
+    reasons.append(
+        "novelty-spike: {} candidate(s) within {}h (threshold {}){}".format(
+            len(in_window),
+            config.novelty_spike_window_hours,
+            config.novelty_spike_count,
+            " -> FIRE" if cond_c else "",
+        )
+    )
+
+    fire = cond_a or cond_b or cond_c
 
     return Decision(fire=fire, reasons=reasons)
