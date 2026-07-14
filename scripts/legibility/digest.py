@@ -412,6 +412,53 @@ def find_retry_loops(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return loops
 
 
+def signal_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    """Assemble the 5-key signal tally required by the frontmatter contract
+    (PRD Sec 7.2): ``{tool_error, self_correct, not_found, df_guard,
+    interrupt}``. Each value is the hit count from the corresponding
+    detector; an absent signal class reports 0 rather than being omitted.
+    """
+    return {
+        'tool_error': len(iter_error_neighborhoods(records)),
+        'self_correct': len(iter_self_corrections(records)),
+        'not_found': len(iter_not_found(records)),
+        'df_guard': len(iter_df_guards(records)),
+        'interrupt': len(iter_interrupts(records)),
+    }
+
+
+SIGNAL_WEIGHTS: dict[str, float] = {
+    'user_turn': 5.0,
+    'self_correct': 3.0,
+    'df_guard': 2.0,
+    'interrupt': 2.0,
+    'tool_error': 1.0,
+    'not_found': 1.0,
+}
+"""Documented weights for :func:`score_signals`. Non-sidechain user turns
+are gold (PRD Sec 5) and outweigh any single occurrence of any other
+individual signal class. Self-corrections (an explicit "I was wrong"
+moment) are the strongest non-gold signal; df_guard/interrupt are
+mid-weight structural signals; tool_error/not_found are the lowest-weight,
+highest-frequency noise signals. Every weight is strictly positive, which
+is what makes score_signals monotonic."""
+
+
+def score_signals(counts: dict[str, int], n_user_turns: int) -> float:
+    """Weighted-sum confusion score used by beta's sampler to rank sessions.
+
+    Strictly monotonic in every input: since every SIGNAL_WEIGHTS entry is
+    positive, incrementing any one count (or n_user_turns) by 1 strictly
+    raises the score.
+    """
+    score = SIGNAL_WEIGHTS['user_turn'] * n_user_turns
+    for key, weight in SIGNAL_WEIGHTS.items():
+        if key == 'user_turn':
+            continue
+        score += weight * counts.get(key, 0)
+    return score
+
+
 def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return genuine non-sidechain, non-meta human user turns.
 
