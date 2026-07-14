@@ -24,6 +24,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from shared.prompt_artifact import PromptArtifactStore, default_artifacts_root
+
 __all__ = [
     'CanaryThresholds',
     'CanaryVerdict',
@@ -32,6 +34,7 @@ __all__ = [
     'WindowMetrics',
     'compare_windows',
     'compute_window_metrics',
+    'deploy_at_from_provenance',
     'load_window_rows',
     'run_canary',
 ]
@@ -352,3 +355,21 @@ def run_canary(
     post_metrics = compute_window_metrics(post_rows)
 
     return compare_windows(baseline_metrics, post_metrics, thresholds)
+
+
+def deploy_at_from_provenance(
+    prompt_id: str, executor_model: str, harness_version: str, *, root: Path | None = None,
+) -> str | None:
+    """Read-only T8->T1 seam: the T1 provenance sidecar's ``date`` for this
+    pinned key, or ``None`` when nothing is pinned (or the sidecar is
+    unverifiable — see :meth:`PromptArtifactStore.read_provenance`).
+
+    A convenience only — it lets an operator run the canary right after
+    pinning without hand-copying the deploy timestamp out of
+    ``provenance.json``. This module never pins/unpins; *root* defaults to
+    :func:`default_artifacts_root` (the one on-disk root every T1 consumer
+    agrees on) when not given.
+    """
+    store = PromptArtifactStore(root if root is not None else default_artifacts_root())
+    provenance = store.read_provenance(prompt_id, executor_model, harness_version)
+    return provenance.date if provenance is not None else None
