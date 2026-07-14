@@ -8,9 +8,13 @@ test_legibility_config.py's module docstring for the import mechanics).
 from __future__ import annotations
 
 import json
+from datetime import date as dt_date
 from pathlib import Path
 
+from legibility import inventory
 from legibility import sampling as mod
+
+MAIN_CWD = '/home/leo/src/dark-factory'
 
 
 def _write_transcript(path: Path, records: list[dict]) -> Path:
@@ -207,3 +211,78 @@ class TestClassifyAgentClass:
         path = Path('/root/-home-leo-src-dark-factory--worktrees-2573/sess.jsonl')
         text = '## Reconciliation Run\n'
         assert mod.classify_agent_class(_user_turn(text), path) == 'orchestrated-task'
+
+
+def _scored(session_id, stratum, counts, first_turn_text, size_bytes=1000):
+    session = inventory.SessionRecord(
+        path=Path(f'/root/-home-leo-src-dark-factory/{session_id}.jsonl'),
+        encoded_dir='-home-leo-src-dark-factory',
+        cwd=MAIN_CWD,
+        date=dt_date(2026, 7, 13),
+        size_bytes=size_bytes,
+    )
+    return mod.ScoredRecord(
+        session=session, stratum=stratum, counts=counts, first_turn_text=first_turn_text
+    )
+
+
+class TestShapeFingerprint:
+    """shape_fingerprint is a cheap hashable key: (stratum, signal-shape,
+    normalized first-turn skeleton). Signal-SHAPE is a boolean
+    presence-per-class pattern, not exact counts — recon clones fire the
+    same classes night after night even when exact counts drift."""
+
+    def test_clones_share_a_fingerprint(self):
+        a = _scored('a', 'recon', mod.SignalCounts(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
+        b = _scored('b', 'recon', mod.SignalCounts(tool_error=3), '## Reconciliation Run\nDate: 2026-07-12\n')
+        assert mod.shape_fingerprint(a) == mod.shape_fingerprint(b)
+
+    def test_distinct_content_differs(self):
+        a = _scored('a', 'recon', mod.SignalCounts(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
+        distinct = _scored(
+            'distinct', 'recon',
+            mod.SignalCounts(self_correct=1, not_found=1),
+            'A completely different opening about something else entirely.',
+        )
+        assert mod.shape_fingerprint(a) != mod.shape_fingerprint(distinct)
+
+    def test_different_stratum_differs_even_with_same_text_and_shape(self):
+        a = _scored('a', 'recon', mod.SignalCounts(tool_error=1), 'same text')
+        b = _scored('b', 'watcher', mod.SignalCounts(tool_error=1), 'same text')
+        assert mod.shape_fingerprint(a) != mod.shape_fingerprint(b)
+
+
+class TestDedupeShapes:
+    """dedupe_shapes collapses near-duplicate clones to the highest-scoring
+    representative per fingerprint; a structurally distinct record in the
+    same stratum survives independently."""
+
+    def _build(self):
+        clone_low = _scored(
+            'recon-a', 'recon', mod.SignalCounts(tool_error=1),
+            '## Reconciliation Run\nDate: 2026-07-10\n',
+        )
+        clone_mid = _scored(
+            'recon-b', 'recon', mod.SignalCounts(tool_error=2),
+            '## Reconciliation Run\nDate: 2026-07-11\n',
+        )
+        clone_high = _scored(
+            'recon-c', 'recon', mod.SignalCounts(tool_error=3),
+            '## Reconciliation Run\nDate: 2026-07-12\n',
+        )
+        distinct = _scored(
+            'recon-distinct', 'recon',
+            mod.SignalCounts(self_correct=1, not_found=1),
+            'A completely different opening about something else entirely.',
+        )
+        return [clone_low, clone_mid, clone_high, distinct]
+
+    def test_clones_collapse_to_highest_scoring(self):
+        deduped = mod.dedupe_shapes(self._build())
+        assert {r.path.stem for r in deduped} == {'recon-c', 'recon-distinct'}
+
+    def test_kept_clone_representative_is_the_highest_scoring_one(self):
+        deduped = mod.dedupe_shapes(self._build())
+        kept_clone = next(r for r in deduped if r.path.stem.startswith('recon-') and r.path.stem != 'recon-distinct')
+        assert kept_clone.path.stem == 'recon-c'
+        assert kept_clone.score == 3
