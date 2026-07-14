@@ -36,6 +36,7 @@ from fused_memory.backends.task_backend_errors import (
     DuplicateCandidateKeyError,
     StatusWriteAuthorityError,
     TaskmasterError,
+    TaskNotFoundError,
 )
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
@@ -1323,9 +1324,13 @@ class SqliteTaskBackend:
         )
         row = await cursor.fetchone()
         if row is None:
-            raise TaskmasterError(
-                'TASKMASTER_TOOL_ERROR', f'No tasks found for ID(s): {task_id}',
-            )
+            # Definitive zero-row absence: the query executed successfully
+            # and found nothing, under this specific (project, tag) scope —
+            # distinct from a connect/execute outage raised above, before
+            # this point, by ensure_connected()/_get_connection() (task 2521
+            # RC2). TaskNotFoundError keeps this call's code/message
+            # byte-identical; only its type is more specific.
+            raise TaskNotFoundError(task_id, tag=tag)
         deps = await self._fetch_dependencies(conn, tag)
 
         out = _row_to_task(row, deps.get(row['id'], []), project_root=project_root)
