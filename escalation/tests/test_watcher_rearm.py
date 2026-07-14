@@ -133,3 +133,35 @@ def test_ceiling_smoke(tmp_path):
     assert 'esc-' not in result.stdout, (
         f'Expected no escalation JSON on stdout; got {result.stdout!r}'
     )
+
+
+def test_exclude_file_ownership_suppresses(tmp_path):
+    """A pending escalation whose id is already listed in the wrapper's
+    OWNED default exclude-file (<queue_dir>/.watcher-rearm-exclude-l<level>)
+    must be suppressed even with no --exclude-file override on the command
+    line -- proving the wrapper defaults its own exclude-file path AND
+    wires it into the watcher invocation, not just computes it for --check
+    output."""
+    queue_dir = tmp_path / 'queue'
+    queue_dir.mkdir()
+    esc = _write_pending(queue_dir, 'esc-51-1', task_id='51', level=2)
+
+    default_exclude_file = queue_dir / '.watcher-rearm-exclude-l2'
+    default_exclude_file.write_text(f'{esc.id}\n')
+
+    result = _run(
+        '--queue-dir', str(queue_dir), '--level', '2', '--timeout', '1',
+        env=_live_env(REPO_ROOT),
+    )
+
+    assert result.returncode == 124, (
+        f'Expected exit 124 (pending item suppressed via the wrapper-owned '
+        f'exclude-file); got {result.returncode}\n'
+        f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    assert 'WATCHER_REARM_OUTCOME: CEILING exit=124' in result.stderr, (
+        f'Expected the CEILING outcome line on stderr; got {result.stderr!r}'
+    )
+    assert 'esc-' not in result.stdout, (
+        f'Expected no escalation JSON on stdout; got {result.stdout!r}'
+    )
