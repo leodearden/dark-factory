@@ -30,6 +30,27 @@ _SNAPSHOT_FIELDS = (
 )
 
 
+def _read_record_soft(
+    slug: str, root: Path | str | None, *, caller: str
+) -> session_registry.SessionRecord | None:
+    """Read *slug*'s record.json, fail-soft: return None instead of raising.
+
+    Shared by scan_sessions and SessionScanner.scan (below) so the fail-soft
+    policy -- which exceptions are swallowed, what gets logged -- lives in
+    exactly one place: both loops build their per-slug read step on this one
+    helper, so they stay behaviorally identical by construction rather than
+    by convention (PRD §2; see the parity test
+    test_scan_matches_scan_sessions_for_seeded_dir). *caller* is folded into
+    the warning message only, preserving each call site's original
+    log-message prefix for anyone grepping logs.
+    """
+    try:
+        return session_registry.read_record(slug, root=root)
+    except (FileNotFoundError, session_registry.CorruptSessionRecord):
+        logger.warning('%s: skipping unreadable record for %s', caller, slug, exc_info=True)
+        return None
+
+
 def scan_sessions(root: Path | str | None = None) -> list[session_registry.SessionRecord]:
     """Return every readable SessionRecord under ``sessions_dir(root)``.
 
@@ -46,13 +67,9 @@ def scan_sessions(root: Path | str | None = None) -> list[session_registry.Sessi
     for slug_dir in sorted(base.iterdir()):
         if not slug_dir.is_dir():
             continue
-        slug = slug_dir.name
-        try:
-            record = session_registry.read_record(slug, root=root)
-        except (FileNotFoundError, session_registry.CorruptSessionRecord):
-            logger.warning('scan_sessions: skipping unreadable record for %s', slug, exc_info=True)
-            continue
-        records.append(record)
+        record = _read_record_soft(slug_dir.name, root, caller='scan_sessions')
+        if record is not None:
+            records.append(record)
     return records
 
 
@@ -124,12 +141,8 @@ class SessionScanner:
                 records.append(cached[1])
                 continue
 
-            try:
-                record = session_registry.read_record(slug, root=self._root)
-            except (FileNotFoundError, session_registry.CorruptSessionRecord):
-                logger.warning(
-                    'SessionScanner.scan: skipping unreadable record for %s', slug, exc_info=True
-                )
+            record = _read_record_soft(slug, self._root, caller='SessionScanner.scan')
+            if record is None:
                 continue
             if mtime_ns is not None:
                 new_cache[slug] = (mtime_ns, record)
