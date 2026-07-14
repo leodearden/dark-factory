@@ -20,6 +20,7 @@ import json
 
 import pytest
 
+import codebook as codebook_mod
 import coder as mod
 import digest as digest_mod
 
@@ -178,3 +179,25 @@ def test_parse_frontmatter_raises_on_non_mapping_block():
     malformed = "---\n- just\n- a\n- list\n---\nbody\n"
     with pytest.raises(mod.CoderParseError):
         mod.parse_frontmatter(malformed)
+
+
+# ---------------------------------------------------------------------------
+# step-5: RED — build_prompt() embeds digest + codebook index + phase enum
+# ---------------------------------------------------------------------------
+
+def test_build_prompt_embeds_digest_and_index_verbatim():
+    digest_text = '---\nsession: "s1"\n---\n\n## User Corrections\n- unique marker UC123'
+    index = "- entry-a: Title A — cause a\n- entry-b: Title B — cause b"
+
+    prompt = mod.build_prompt(digest_text, index)
+
+    assert digest_text in prompt
+    assert index in prompt
+
+
+def test_build_prompt_embeds_phase_enum_including_unknown():
+    prompt = mod.build_prompt("digest text", "codebook index")
+
+    for phase in codebook_mod.PHASES:
+        assert phase in prompt
+    assert "unknown" in prompt
