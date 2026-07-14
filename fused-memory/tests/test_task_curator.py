@@ -1926,6 +1926,27 @@ class TestParseDecisionDict:
         assert result.action == 'combine'
         assert result.target_id == '10'
 
+    def test_within_batch_drop_unaffected_by_unknown_status_guard(self):
+        """Regression: a within-batch drop (target_id=None, batch_target_index
+        set) references a sibling candidate not yet materialised as a pool
+        task, so there is no status for the RC3 guard to inspect. The guard
+        is gated on `target_id` being truthy — this pins that gating against
+        future refactors of the guard ordering, even when the pool happens
+        to contain an unrelated 'unknown' entry.
+        """
+        pool = _pool_with_ids(('11', 'unknown'))
+        result = self._call(
+            {
+                'action': 'drop',
+                'target_id': None,
+                'batch_target_index': 2,
+                'justification': 'dup of batch item 2',
+            },
+            pool,
+        )
+        assert result.action == 'drop'
+        assert result.batch_target_index == 2
+
 
 # ----------------------------------------------------------------------
 # _parse_batch_decisions
