@@ -2150,6 +2150,93 @@ class TestGetMergeQueue:
         from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
         return OrchestratorConfig(project_root=tmp_path)
 
+    def _make_finalize_fixture(
+        self,
+        tmp_path: Path,
+        task_id: str,
+        advance_outcome,
+        merge_commit: str,
+    ):
+        """Shared setup for the ``_finalize_inflight`` retirement-oracle
+        sibling tests (``test_gate_reverify_failure_retires_registry_entry``,
+        ``test_wip_overlap_finalize_retires_head_and_preserves_halt``):
+        builds a ``SpeculativeMergeWorker`` wired to a stub ``git_ops`` whose
+        ``advance_main`` always returns ``advance_outcome``, plus a
+        registered sole ``RealMergeItem``/``InflightEntry`` (state
+        ``VERIFYING``) ready for ``await worker._finalize_inflight(entry)``.
+
+        Returns ``(worker, req, entry, advance_call_args)`` — the last
+        element accumulates each ``advance_main`` call's ``(args, kwargs)``
+        for callers that assert on call/retry counts.
+        """
+        import asyncio
+        import types
+
+        from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InflightEntry,
+            ItemLifecycleState,
+            MergeRequest,
+            RealMergeItem,
+            SpeculativeMergeWorker,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+
+        merge_wt = tmp_path / 'merge'
+        merge_wt.mkdir()
+
+        advance_call_args: list[tuple[tuple, dict]] = []
+
+        async def fake_advance_main(*args, **kwargs):
+            advance_call_args.append((args, kwargs))
+            return advance_outcome
+
+        async def fake_cleanup_merge_worktree(path):
+            pass
+
+        git_ops_stub = types.SimpleNamespace(
+            advance_main=fake_advance_main,
+            cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            config=config,
+        )
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
+
+        req = MergeRequest(
+            task_id=task_id,
+            branch=task_id,
+            worktree=tmp_path / 'wt',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+        )
+        merge_result = MergeResult(
+            success=True,
+            merge_commit=merge_commit,
+            merge_worktree=merge_wt,
+        )
+        item = RealMergeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt,
+            base_sha='base0sha',
+            speculative=False,
+        )
+        entry = InflightEntry(
+            item=item,
+            lease=None,
+            verify_task=None,
+            merge_wt=merge_wt,
+            was_speculative=False,
+        )
+        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
+
+        return worker, req, entry, advance_call_args
+
     # ── step-1: standalone error ──────────────────────────────────────────
 
     async def test_standalone_returns_error(self, tmp_path: Path):
@@ -2796,86 +2883,26 @@ class TestGetMergeQueue:
         this test fails: ``_finalizing_head_entry()`` returns the ghost entry
         and snapshot() reports an active 'gate_reverify' state.
         """
-        import asyncio
-        import types
-
-        from orchestrator.git_ops import (  # type: ignore[reportMissingImports]
-            AdvanceOutcome,
-            MergeResult,
-        )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            InflightEntry,
-            ItemLifecycleState,
-            MergeOutcome,
-            MergeRequest,
-            RealMergeItem,
-            SpeculativeMergeWorker,
-        )
-
-        loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
-        mq: asyncio.Queue = asyncio.Queue()
-
-        merge_wt = tmp_path / 'merge'
-        merge_wt.mkdir()
+        from orchestrator.git_ops import AdvanceOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
 
         REBASED_SHA = 'rebased0abc'
         REBASED_FROM = 'from0sha'
         REBASED_ONTO = 'onto0sha'
 
-        advance_call_args: list[tuple[tuple, dict]] = []
-
-        async def fake_advance_main(*args, **kwargs) -> AdvanceOutcome:
-            advance_call_args.append((args, kwargs))
-            # Single call: trigger the rebase/reverify path.  The gate then
-            # fails, so advance_main is never called a second time.
-            return AdvanceOutcome(
+        # Single call expected: trigger the rebase/reverify path.  The gate
+        # then fails, so advance_main is never called a second time.
+        worker, req, entry, advance_call_args = self._make_finalize_fixture(
+            tmp_path,
+            task_id='GRF',
+            advance_outcome=AdvanceOutcome(
                 'rebased_pending_reverify',
                 advanced_sha=REBASED_SHA,
                 rebased_from=REBASED_FROM,
                 rebased_onto=REBASED_ONTO,
-            )
-
-        async def fake_cleanup_merge_worktree(path):
-            pass
-
-        git_ops_stub = types.SimpleNamespace(
-            advance_main=fake_advance_main,
-            cleanup_merge_worktree=fake_cleanup_merge_worktree,
-            config=config,
-        )
-        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
-
-        req = MergeRequest(
-            task_id='GRF',
-            branch='GRF',
-            worktree=tmp_path / 'wt',
-            pre_rebased=False,
-            task_files=None,
-            module_configs=[],
-            config=config,
-            result=loop.create_future(),
-        )
-        merge_result = MergeResult(
-            success=True,
+            ),
             merge_commit='deadbeef00000002',
-            merge_worktree=merge_wt,
         )
-        item = RealMergeItem(
-            request=req,
-            merge_result=merge_result,
-            merge_wt=merge_wt,
-            base_sha='base0sha',
-            speculative=False,
-        )
-        entry = InflightEntry(
-            item=item,
-            lease=None,
-            verify_task=None,
-            merge_wt=merge_wt,
-            was_speculative=False,
-        )
-        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
 
         import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
 
@@ -2958,76 +2985,22 @@ class TestGetMergeQueue:
         combined halted+retired end-state and confirm the halt reverses
         cleanly via ``unhalt_wip()``.
         """
-        import asyncio
-        import types
-
-        from orchestrator.git_ops import (  # type: ignore[reportMissingImports]
-            AdvanceOutcome,
-            MergeResult,
-        )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            InflightEntry,
-            ItemLifecycleState,
-            MergeRequest,
-            RealMergeItem,
-            SpeculativeMergeWorker,
+        from orchestrator.git_ops import AdvanceOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (
+            ItemLifecycleState,  # type: ignore[reportMissingImports]
         )
 
-        loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
-        mq: asyncio.Queue = asyncio.Queue()
-
-        merge_wt = tmp_path / 'merge'
-        merge_wt.mkdir()
-
-        async def fake_advance_main(*args, **kwargs) -> AdvanceOutcome:
-            # wip_overlap: a recoverable halt, not a terminal advance
-            # failure — the real _map_advance_failure (merge_gates.py:699)
-            # owns this mapping, so no _reverify_rebased_tree monkeypatch is
-            # needed (unlike the rebased_pending_reverify gate-fail sibling
-            # test above).
-            return AdvanceOutcome('wip_overlap')
-
-        async def fake_cleanup_merge_worktree(path):
-            pass
-
-        git_ops_stub = types.SimpleNamespace(
-            advance_main=fake_advance_main,
-            cleanup_merge_worktree=fake_cleanup_merge_worktree,
-            config=config,
-        )
-        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
-
-        req = MergeRequest(
+        # wip_overlap: a recoverable halt, not a terminal advance failure —
+        # the real _map_advance_failure (merge_gates.py:699) owns this
+        # mapping, so no _reverify_rebased_tree monkeypatch is needed
+        # (unlike the rebased_pending_reverify gate-fail sibling test
+        # above).
+        worker, req, entry, _advance_call_args = self._make_finalize_fixture(
+            tmp_path,
             task_id='WIP',
-            branch='WIP',
-            worktree=tmp_path / 'wt',
-            pre_rebased=False,
-            task_files=None,
-            module_configs=[],
-            config=config,
-            result=loop.create_future(),
-        )
-        merge_result = MergeResult(
-            success=True,
+            advance_outcome=AdvanceOutcome('wip_overlap'),
             merge_commit='deadbeef00000003',
-            merge_worktree=merge_wt,
         )
-        item = RealMergeItem(
-            request=req,
-            merge_result=merge_result,
-            merge_wt=merge_wt,
-            base_sha='base0sha',
-            speculative=False,
-        )
-        entry = InflightEntry(
-            item=item,
-            lease=None,
-            verify_task=None,
-            merge_wt=merge_wt,
-            was_speculative=False,
-        )
-        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
 
         assert not worker.is_wip_halted, 'sanity: queue should start un-halted'
 
