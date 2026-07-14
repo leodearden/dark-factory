@@ -169,6 +169,25 @@ class TestIsLegalTransitionCore:
         # pending -> merge-deferred is not an enumerated call site.
         assert is_legal_transition(TaskStatus.PENDING, TaskStatus.MERGE_DEFERRED, ActorClass.HUMAN) is False
 
+    @pytest.mark.parametrize(
+        'actor', [ActorClass.HUMAN, ActorClass.ORCHESTRATOR, ActorClass.DETERMINISTIC]
+    )
+    def test_pending_to_done_legal(self, actor):
+        # recon found_on_main / operator direct-complete of a never-dispatched
+        # task (task 2614) — the pending-origin sibling of the existing
+        # (in-progress, done) completion pair.
+        assert is_legal_transition(TaskStatus.PENDING, TaskStatus.DONE, actor) is True
+
+    @pytest.mark.parametrize(
+        'actor', [ActorClass.HUMAN, ActorClass.ORCHESTRATOR, ActorClass.DETERMINISTIC]
+    )
+    def test_pending_to_blocked_legal(self, actor):
+        # Deterministic pure-gate born-at-L2 path (deterministic_runner.py:
+        # 755/853, set_task_status(task_id, 'blocked') while still pending,
+        # never flipping to in-progress) and human manual-block of a pending
+        # task (task 2614).
+        assert is_legal_transition(TaskStatus.PENDING, TaskStatus.BLOCKED, actor) is True
+
 
 # Core enumerated (from, to) pairs, grouped by kind, each with its call-site
 # anchor — verified verbatim against the working tree on 2026-07-06. This
@@ -183,6 +202,11 @@ _CORE_UNION_PAIRS = [
     (TaskStatus.IN_PROGRESS, TaskStatus.DONE, 'completion: merged workflow.py:1380, found_on_main workflow.py:3809/7396/harness.py:3623'),
     (TaskStatus.MERGE_DEFERRED, TaskStatus.DONE, 'completion: workflow.py:1015/6424, harness.py:619/646'),
     (TaskStatus.BLOCKED, TaskStatus.DONE, 'completion: train attribution workflow.py:6424'),
+    (
+        TaskStatus.PENDING,
+        TaskStatus.DONE,
+        'completion: recon found_on_main / operator direct-complete of a never-dispatched task',
+    ),
     # park
     (TaskStatus.IN_PROGRESS, TaskStatus.MERGE_DEFERRED, 'park: workflow.py:867/896'),
     # requeue
@@ -206,6 +230,11 @@ _CORE_UNION_PAIRS = [
     ),
     (TaskStatus.MERGE_DEFERRED, TaskStatus.BLOCKED, 'block: train failer workflow.py:6464'),
     (TaskStatus.DEFERRED, TaskStatus.BLOCKED, 'block: recon targeted.py:1041'),
+    (
+        TaskStatus.PENDING,
+        TaskStatus.BLOCKED,
+        'block: deterministic pure-gate born-at-L2 deterministic_runner.py:755/853; human block of a pending task',
+    ),
     # cancel
     (TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED, 'cancel: abandon harness.py:8417'),
     (TaskStatus.BLOCKED, TaskStatus.CANCELLED, 'cancel: harness.py:8417'),
