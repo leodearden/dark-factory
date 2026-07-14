@@ -3437,7 +3437,11 @@ def create_mcp_server(
             # already-fetched tasks_data (no extra reads). Only attaches the
             # report key when a sidecar actually exists on disk, so a batch
             # with no capability-manifest involvement gets a byte-identical
-            # legacy response.
+            # legacy response. agent_id is intentionally omitted: unlike most
+            # write tools in this module, commit_planning takes no
+            # agent_id/ctx parameter of its own — the set_task_status call
+            # above this one is likewise un-attributed — so passing None
+            # here is parity with that call, not a missed wiring.
             manifest_report = await stamp_capability_manifests(
                 project_root=project_root,
                 ids=ids,
