@@ -160,16 +160,28 @@ def _stage2_agent(state: ReconReportState):
             task_id='99',
         )
 
-        # Cross-project routing finding (PRD γ §OQ5 — category-coded)
-        state.add_finding(
+        # Cross-project routing finding (PRD γ §OQ5 — category-coded). Local
+        # task 99 is the subject of the reroute, so it anchors the finding
+        # via cite_task — the get_task routing-check proof required by the
+        # task-2453 taxonomy guard (recon_report.py:
+        # _apply_cross_project_routing_guard). Without this anchor,
+        # get_assembled_report would downgrade category to 'other' /
+        # flag_type to 'cross_project_info'.
+        r2 = state.add_finding(
             run_id=_RUN_ID,
             severity='moderate',
             category='cross_project_routing',
-            description='Work belongs to sibling_project — orphaned edge',
+            description='Local task 99 belongs to sibling_project — orphaned edge',
             suggested_action='Route to sibling_project owner for cleanup',
             actionable=False,
             task_id=None,
             flag_type='cross_project',
+        )
+        await state.cite_task(
+            run_id=_RUN_ID,
+            finding_id=r2['finding_id'],
+            project_id=_PROJECT_ID,
+            task_id='99',
         )
 
         state.complete(

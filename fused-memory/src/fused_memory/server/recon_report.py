@@ -149,6 +149,48 @@ def _traces_exclusively_to_stage1(
 
 
 # ---------------------------------------------------------------------------
+# Cross-project routing taxonomy guard (task-2453)
+# ---------------------------------------------------------------------------
+
+# category='cross_project_routing' is claimed by Stage 2 (task_knowledge_sync)
+# for findings asserting that work belongs to a different project. Without a
+# cite_task-produced cited_tasks entry, that claim is unverified — see
+# _apply_cross_project_routing_guard below.
+_CROSS_PROJECT_ROUTING_CATEGORY = 'cross_project_routing'
+_CROSS_PROJECT_INFO_DOWNGRADE_CATEGORY = 'other'
+_CROSS_PROJECT_INFO_FLAG_TYPE = 'cross_project_info'
+
+
+def _apply_cross_project_routing_guard(finding: dict) -> dict:
+    """Downgrade an anchor-less ``cross_project_routing`` finding in place.
+
+    A non-empty ``cited_tasks`` list is the sole machine-checkable proof that
+    a ``cite_task`` -> ``task_interceptor.get_task`` routing check actually
+    ran for the cited project/task (see :meth:`ReconReportState.cite_task`).
+    ``cited_entities``/``cited_edges``/``cited_memories`` do NOT count — they
+    resolve graph/memory objects, not task routing.
+
+    When ``finding['category'] == 'cross_project_routing'`` and
+    ``finding['cited_tasks']`` is empty, this rewrites the category to
+    ``'other'`` and the flag_type to ``'cross_project_info'`` — the claim is
+    downgraded to a plain informational note rather than surfaced as a
+    routing finding. All other fields (finding_id/description/actionable/
+    task_id/etc.) are left untouched, and a finding with a cited_tasks entry
+    is returned unchanged.
+
+    *finding* is mutated in place and also returned for call-site convenience.
+    Callers must pass a freshly-built projection dict (as
+    :meth:`ReconReportState.get_assembled_report` does) — never the stored
+    ``_Finding`` — so re-reads stay idempotent and cite_* resolution by
+    finding_id is unaffected.
+    """
+    if finding.get('category') == _CROSS_PROJECT_ROUTING_CATEGORY and not finding.get('cited_tasks'):
+        finding['category'] = _CROSS_PROJECT_INFO_DOWNGRADE_CATEGORY
+        finding['flag_type'] = _CROSS_PROJECT_INFO_FLAG_TYPE
+    return finding
+
+
+# ---------------------------------------------------------------------------
 # Fix 2 helpers — overlength description/suggested_action/category truncation
 # (task-2410)
 # ---------------------------------------------------------------------------
@@ -797,6 +839,10 @@ class ReconReportState:
                 'cited_tasks': list(f.cited_tasks),
                 'cited_memories': list(f.cited_memories),
             }
+            # Cross-project routing taxonomy guard (task-2453): downgrade an
+            # anchor-less cross_project_routing claim before the Fix-1 check
+            # below, which reads only actionable/cited_* — ordering is safe.
+            _apply_cross_project_routing_guard(finding_dict)
             # Fix 1 suppression: stage1_ids = full union minus this candidate's
             # own identities (self-exclusion so Stage-1 findings are not
             # suppressed by their own citations).
