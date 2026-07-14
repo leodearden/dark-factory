@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import json
+from pathlib import Path
 
 import pytest
 
@@ -694,3 +695,21 @@ class TestMainCLI:
         assert len(entry["sightings"]) == 1
         assert len(reloaded["candidates"]) == 1
         assert mod.validate(reloaded) == []
+
+
+# ---------------------------------------------------------------------------
+# step-17: RED (live-file guard, PRD §11 γ observable) — committed codebook
+# ---------------------------------------------------------------------------
+
+# scripts/tests/test_codebook.py -> scripts/tests/ -> scripts/ -> repo root
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_LIVE_CODEBOOK_PATH = _REPO_ROOT / "docs" / "legibility" / "confusion-codebook.yaml"
+
+
+def test_live_codebook_is_v2_and_validates_green():
+    """Pins that the committed registry conforms post-migration and guards
+    future hand-edits: version == 2 and validate() returns zero errors.
+    RED until the in-place v1->v2 migration lands (file is still v1)."""
+    codebook = mod.load(_LIVE_CODEBOOK_PATH)
+    assert codebook["version"] == 2
+    assert mod.validate(codebook) == []
