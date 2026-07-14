@@ -4128,6 +4128,31 @@ async def run_main_tip_sweep(
         async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
             WorktreeKind.MAIN_SWEEP, main_sha,
         ) as tmp_path:
+            def _enoent_on_self(r: 'VerifyResult') -> bool:
+                """SECONDARY backstop (task 2507): True iff *r* is a
+                not-passed result whose cause_hint names an ENOENT ('No
+                such file or directory' / '[Errno 2]') referencing THIS
+                sweep's own tmp_path — i.e. the worktree vanished mid-run.
+
+                Narrowly scoped to this sweep's own path — deliberately
+                NOT a blanket 'unknown_test_failure' addition to
+                INFRA_TRANSIENT_CATEGORIES, which would silently swallow
+                genuine main-tip drift under that broad category. This is
+                defense-in-depth behind the PRIMARY fix (
+                GitOps.ephemeral_worktree's flock-liveness guard, which
+                stops the warm-lane-GC race that used to cause exactly
+                this ENOENT); it backstops residual worktree-vanish causes
+                (disk fault, a manual ``rm``) after the flock closes the
+                GC race.
+                """
+                if r.passed or not r.cause_hint:
+                    return False
+                hint_lower = r.cause_hint.lower()
+                return (
+                    ('no such file or directory' in hint_lower or '[errno 2]' in hint_lower)
+                    and str(tmp_path) in r.cause_hint
+                )
+
             # Run full (unscoped) verification — all discovered subprojects, no scope filter.
             # role='background' (lowest nice tier — task 2391/PRD T3): the sweep is a
             # background asyncio.Task with no dispatch/merge/deploy path awaiting it, so
@@ -4148,6 +4173,15 @@ async def run_main_tip_sweep(
                     'pytest INTERNALERROR' if result.category == 'pytest_internalerror'
                     else 'environmental shared-venv transient (env_transient)',
                     result.cause_hint,
+                )
+                return None
+
+            if _enoent_on_self(result):
+                logger.warning(
+                    'run_main_tip_sweep: sweep worktree %s vanished mid-run '
+                    '(cause_hint=%r) — treating as infra transient, not '
+                    'drift (retrying next tick)',
+                    tmp_path, result.cause_hint,
                 )
                 return None
 
@@ -4177,6 +4211,15 @@ async def run_main_tip_sweep(
                         'pytest INTERNALERROR' if retry.category == 'pytest_internalerror'
                         else 'an environmental shared-venv transient (env_transient)',
                         retry.cause_hint,
+                    )
+                    return None
+
+                if _enoent_on_self(retry):
+                    logger.warning(
+                        'run_main_tip_sweep: sweep worktree %s vanished '
+                        'mid-run on retry (cause_hint=%r) — treating as '
+                        'infra transient, not drift (retrying next tick)',
+                        tmp_path, retry.cause_hint,
                     )
                     return None
 
