@@ -349,6 +349,39 @@ class TestBackgroundServiceStop:
 
         assert svc._task is None
 
+    @pytest.mark.asyncio
+    async def test_stop_logs_warning_on_unexpected_task_exception(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Amendment (reviewer_comprehensive): a non-CancelledError exception
+        surfacing from the loop task at teardown (e.g. a genuine bug outside
+        the pass_fn contract, which _loop already bounded-logs on its own)
+        is logged at WARNING rather than silently discarded."""
+        svc = _make_service(AsyncMock())
+
+        async def _boom() -> None:
+            raise RuntimeError('unexpected loop bug')
+
+        # Run the replacement task to completion (with its exception) BEFORE
+        # handing it to stop(), so `.cancel()` on an already-done task is a
+        # deterministic no-op and `await self._task` immediately re-raises
+        # the stored exception — no timing race with real cancellation.
+        task = asyncio.create_task(_boom(), name='test-service')
+        with contextlib.suppress(RuntimeError):
+            await task
+        assert task.done()
+        svc._task = task
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.background_service'):
+            await svc.stop()
+
+        assert svc._task is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'test-service' in warnings[0].message
+        assert 'unexpected loop bug' in warnings[0].message
+        assert warnings[0].exc_info is None, 'must use logger.warning, never logger.exception'
+
 
 class _RecordingService:
     """Fake lifecycle service recording start()/stop() calls into a shared

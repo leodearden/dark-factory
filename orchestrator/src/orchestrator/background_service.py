@@ -10,7 +10,6 @@ becomes structurally impossible.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import inspect
 import logging
 from collections.abc import Awaitable, Callable
@@ -117,11 +116,27 @@ class BackgroundService:
         is the registry's job (``LifecycleRegistry.stop_all``, step-12), not
         this method's — a wedging ``pass_fn`` that ignores cancellation would
         otherwise hang this ``await`` forever.
+
+        ``CancelledError`` is expected and suppressed silently. Any other
+        ``Exception`` surfacing from the task (e.g. a genuine bug outside
+        the ``pass_fn`` contract, which ``_loop`` already bounded-logs on
+        its own) is unexpected at this point and is logged at WARNING
+        rather than discarded, mirroring ``LifecycleRegistry.stop_all``'s
+        own catch-and-log of a raising ``stop()``.
         """
         if self._task is not None:
             self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
+            try:
                 await self._task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning(
+                    '%s loop task raised during stop(): %s: %s',
+                    self.name,
+                    type(exc).__name__,
+                    exc,
+                )
             self._task = None
 
 
