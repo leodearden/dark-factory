@@ -3519,6 +3519,88 @@ class TestCrashWindowReverify:
         )
         script_runner.assert_not_awaited()
 
+    async def test_reverify_unconfirmed_still_escalates_with_enriched_detail(
+        self, tmp_path: Path,
+    ):
+        """A persisted baseline whose live monotonic has NOT advanced => the
+        re-verify comes back 'unconfirmed' => still escalates (never
+        phantom-done), but the detail records that a re-verify was attempted
+        and what it observed."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='902',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+            verify_baseline={'main_pid': 100, 'active_enter_timestamp_monotonic': 1_000_000},
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty — no prior escalation
+        scheduler = _mock_scheduler(task)
+
+        # Same MainPID, same (unadvanced) monotonic as the baseline => 'unconfirmed'.
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('902', status='pending')
+        assert len(pending) == 1, (
+            f'an unconfirmed re-verify must still escalate exactly once, got {len(pending)}'
+        )
+        assert pending[0].category == 'infra_issue'
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls, 'an unconfirmed re-verify must NOT drive to done'
+        script_runner.assert_not_awaited()
+        detail = pending[0].detail
+        assert 'unconfirmed' in detail, (
+            f'detail must record that the re-verify came back unconfirmed: {detail!r}'
+        )
+        assert 'MainPID' in detail, (
+            f'detail must record the re-inspected live unit state: {detail!r}'
+        )
+
+    async def test_no_baseline_crash_window_does_not_reinspect(self, tmp_path: Path):
+        """Pre-ζ shape (no deploy_state at all): the persisted-baseline gate
+        must not re-inspect the unit and must fall straight through to the
+        existing generic crash-window escalation, unchanged."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='903', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        unit_inspector.assert_not_awaited()
+        pending = queue.get_by_task('903', status='pending')
+        assert len(pending) == 1, (
+            f'no-baseline crash-window must escalate exactly once, got {len(pending)}'
+        )
+        assert pending[0].category == 'infra_issue'
+        assert pending[0].summary == 'Deploy state unknown after crash: orchestrator-reify.service'
+        script_runner.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # Task 2120: escalation-aliasing phantom-done guard.
