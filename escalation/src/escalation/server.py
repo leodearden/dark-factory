@@ -917,6 +917,7 @@ def create_server(
         worktree: str,
         description: str = '',
         wait_secs: int = 0,
+        verified_green: bool = False,
     ) -> dict[str, Any]:
         """Submit a merge request to the orchestrator merge queue.
 
@@ -936,6 +937,16 @@ def create_server(
           Resolves within clamp → terminal outcome shape.
           Timeout → non-terminal ``status='queued'`` shape (shield ensures
           expiry never cancels the entry's future).
+
+        *verified_green* — set True to vouch that the caller already ran a
+        passing verification of this branch against its own base before
+        submitting.  Only the caller can know this; the server cannot infer
+        it.  When True (and an event store is wired), emits a
+        ``workflow_verify`` event so the merge-skew classifier can attribute
+        a later skewed merge failure to ``INTEGRATION_SKEW`` instead of
+        degrading to ``INDETERMINATE``.  Default ``False`` — no attribution,
+        emits nothing (mirrors the orchestrator's own emission at the
+        VERIFY→REVIEW transition for its own submissions).
 
         Response shapes:
         - Normal outcome: ``{status, request_id, reason, conflict_details,
@@ -1052,6 +1063,53 @@ def create_server(
         # returns immediately with in_flight=True — no future await, no duplicate
         # enqueue.  On dispatch acquires the registry slot and awaits the future
         # exactly as the original enqueue_merge_request path.
+        # Task 2411: mirror the orchestrator's own workflow_verify emission
+        # (workflow.py:1724-1733) for non-orchestrator submission pathways
+        # (/merge-queue, /unblock, /do) so the merge-skew classifier's I5
+        # branch-green fact (merge_disposition._branch_pre_merge_verify_green,
+        # keyed by task_id, reads only data['passed']) can source from these
+        # too.  verified_green is a caller-supplied vouch — only the caller
+        # (which just ran the verification) can know it happened; the server
+        # cannot infer it.  base_sha is best-effort/informational only (the
+        # classifier ignores it).  event_store is None for a standalone
+        # server (no orchestrator wired) — guarded so this degrades to no
+        # attribution instead of raising (fail-open, mirrors the git-error
+        # None-degrade inside _resolve_dispatch_time_merge_base).
+        if verified_green and event_store is not None:
+            from orchestrator.event_store import (  # type: ignore[reportMissingImports]
+                EventType,
+            )
+            from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+                _resolve_dispatch_time_merge_base,
+            )
+            base_sha = (
+                await _resolve_dispatch_time_merge_base(
+                    orch_config.project_root, orch_config.git.main_branch, resolved_tip,
+                )
+                if resolved_tip is not None
+                else None
+            )
+            # SYNC CONTRACT (reviewer follow-up on step-4): this payload shape —
+            # keys 'passed' / 'base_sha' / 'branch', task_id-keyed — MUST stay
+            # byte-identical to the orchestrator's own emission at
+            # workflow.py:1724-1733, since merge_disposition._branch_pre_merge_verify_green
+            # reads both call sites as one logical event stream.  A shared
+            # canonical constructor (e.g. an `emit_workflow_verify(...)` helper)
+            # would remove this manual-sync risk, but its natural home is
+            # orchestrator (workflow.py would need to call it too) — out of
+            # this task's locked scope (escalation/server.py + tests +
+            # skills/{merge-queue,unblock}/SKILL.md only).  Deferred as a
+            # follow-up rather than expanding this task's file locks.
+            event_store.emit(
+                EventType.workflow_verify,
+                task_id=task_id,
+                data={
+                    'passed': True,
+                    'base_sha': base_sha,
+                    'branch': canonical_queued_branch_name(branch, orch_config.git.branch_prefix),
+                },
+            )
+
         # classifier_git_ops: the same harness GitOps handle is reused here so
         # the recency check (resolve_attach_action) can classify the tip relation
         # between req.snapshot_tip and the in-flight entry's snapshot_tip.  When
