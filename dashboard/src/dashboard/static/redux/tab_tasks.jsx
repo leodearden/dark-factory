@@ -253,17 +253,28 @@ function ProjectTaskGraph({ filtered, selectedId, focusMode, focusAnchorId, onSe
 // it resolves endpoint positions purely from getBoundingClientRect() over a
 // nodeRefs map, so one overlay covering all boxes draws intra-box AND
 // cross-box edges with no edge-router change. It's fed the project's full
-// filtered task list (not just one box's) so it can see cross-box dep edges.
-// Each per-box TaskGraph is told renderEdges={false} (skip its own overlay)
-// and handed the SAME shared nodeRefs map (via the nodeRefs prop) so its
-// nodes register into the map the hoisted overlay reads from.
-function ProjectPrdGroups({ filtered, allProjectTasks, selectedId, onSelect, onEnterFocus }) {
+// filtered (and, in focus mode, focus-narrowed — see graphTasks below) task
+// list so it can see cross-box dep edges. Each per-box TaskGraph is told
+// renderEdges={false} (skip its own overlay) and handed the SAME shared
+// nodeRefs map (via the nodeRefs prop) so its nodes register into the map
+// the hoisted overlay reads from.
+function ProjectPrdGroups({ filtered, allProjectTasks, selectedId, focusMode, focusAnchorId, onSelect, onEnterFocus }) {
   const containerRef = uR_T(null);
   const nodeRefs = uR_T({});
 
+  // Mirrors ProjectTaskGraph's focus-subset narrowing above: onEnterFocus is
+  // wired into every rendered node's double-click below exactly like the
+  // list view, so without this the "focus" affordance would silently do
+  // nothing while grouped — the boxes would keep showing every group's full
+  // filtered membership instead of narrowing to the anchor's neighborhood.
+  const graphTasks = uM_T(
+    () => (focusMode && selectedId != null ? focusSubset(filtered, focusAnchorId) : filtered),
+    [filtered, focusMode, selectedId, focusAnchorId]
+  );
+
   // Content signatures so the pricier work below (bucketing + PRD-level
   // mini-DAG tiering, and the full-member summaries) only reruns when
-  // something it actually reads changes. `filtered`/`allProjectTasks` are
+  // something it actually reads changes. `graphTasks`/`allProjectTasks` are
   // fresh array instances on every TasksTab render — including the app-wide
   // 1s clock tick (app.jsx's `setInterval(() => setNow(...), 1000)`, unrelated
   // to data polling) — which would defeat a plain reference-keyed useMemo
@@ -273,24 +284,24 @@ function ProjectPrdGroups({ filtered, allProjectTasks, selectedId, onSelect, onE
   // deps), since a stale cache here would freeze those fields' displayed
   // values across ticks — keep it in sync with renderNode if it starts
   // reading more of a task.
-  const filteredSig = uM_T(() => filtered.map(t =>
+  const filteredSig = uM_T(() => graphTasks.map(t =>
     `${t.id}:${t.status}:${t.prd || ''}:${t.title}:${t.started}:${t.completed || ''}:` +
     `${t.train ? `${t.train.id}/${t.train.order}` : ''}:` +
     `${(t.deps || []).map(d => d.id + (d.done ? '1' : '0')).join(',')}`
-  ).join('|'), [filtered]);
+  ).join('|'), [graphTasks]);
   // fullMembersByPrd (below) only feeds aggregatePrdStatus/summarizePrdMembers,
   // which look at nothing but id/status/prd — a narrower, cheaper signature.
   const allSig = uM_T(() => allProjectTasks.map(t => `${t.id}:${t.status}:${t.prd || ''}`).join('|'), [allProjectTasks]);
 
-  const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(filtered), computeTiers), [filteredSig]);
-  const neighborhood = uM_T(() => computeNeighborhood(filtered, selectedId), [filteredSig, selectedId]);
+  const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(graphTasks), computeTiers), [filteredSig]);
+  const neighborhood = uM_T(() => computeNeighborhood(graphTasks, selectedId), [filteredSig, selectedId]);
 
   // "n/m done", the outline/pip aggregate status, and the stacked status bar
   // all read from each PRD's FULL member set (every task with that prd,
-  // regardless of the active status display filter) — per the plan's
-  // truthful-burndown requirement. Keyed by prd (null for the "no PRD"
-  // bucket) for O(1) lookup per rendered box below. Rendered node layout
-  // (g.tasks, from `groups` above) stays on the filtered subset.
+  // regardless of the active status display filter or focus narrowing) —
+  // per the plan's truthful-burndown requirement. Keyed by prd (null for
+  // the "no PRD" bucket) for O(1) lookup per rendered box below. Rendered
+  // node layout (g.tasks, from `groups` above) stays on the narrowed set.
   const fullMembersByPrd = uM_T(() => {
     const m = new Map();
     for (const g of groupTasksByPrd(allProjectTasks)) m.set(g.noPrd ? null : g.prd, g.tasks);
@@ -299,7 +310,7 @@ function ProjectPrdGroups({ filtered, allProjectTasks, selectedId, onSelect, onE
 
   return (
     <div className="prd-groups" ref={containerRef}>
-      <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={filtered}
+      <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={graphTasks}
                       selectedId={selectedId} neighborhood={neighborhood} />
       {groups.map(g => {
         const key = g.noPrd ? null : g.prd;
@@ -328,6 +339,20 @@ function ProjectPrdGroups({ filtered, allProjectTasks, selectedId, onSelect, onE
 function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nodeRefs }) {
   const agg = aggregatePrdStatus(fullMembers);
   const stats = summarizePrdMembers(fullMembers);
+
+  // active_tasks.py only exempts a PRD's done/cancelled members from its
+  // project-wide terminal-task cap while the PRD still has an active-status
+  // member (`_ACTIVE_STATUSES` server-side — the same statuses
+  // aggregatePrdStatus treats as non-done/non-cancelled: blocked,
+  // in-progress, merge-deferred, pending, deferred). Active-status tasks
+  // are never capped, so if fullMembers (this PRD's complete client-visible
+  // membership) contains none, this PRD was NOT exempt server-side and its
+  // done/cancelled members may extend past that cap — "n/m done" could then
+  // undercount the true total. That's a possibility, not a certainty (the
+  // cap may simply not have been hit), so it's surfaced as a tooltip on the
+  // count rather than a stronger UI treatment.
+  const countMayUndercount = agg === 'done' || agg === 'cancelled';
+
   // Lazy-init only: this is a *default*, not an enforced state — later
   // renders (e.g. a member finishing while the box is open) must not yank a
   // manually-reopened box shut again, so the argument is only consulted by
@@ -395,7 +420,12 @@ function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nod
         </span>
         <span className="status-pip"></span>
         <span className="prd-box-title" title={g.noPrd ? undefined : g.prd}>{title}</span>
-        <span className="prd-box-count">{stats.done}/{stats.total} done</span>
+        <span className="prd-box-count"
+              title={countMayUndercount
+                ? 'No active members in this PRD, so it wasn\'t exempt from the dashboard\'s done/cancelled-task cap — this count may undercount the true total.'
+                : undefined}>
+          {stats.done}/{stats.total} done
+        </span>
       </div>
       <div className="prd-bar">
         {segs.map(s => (
@@ -713,6 +743,7 @@ function TasksTab({ projectFilter, search }) {
                     summary={summary} summaryRight={summaryRight}>
                 {groupByPrd
                   ? <ProjectPrdGroups filtered={filtered} allProjectTasks={projTasks} selectedId={selectedId}
+                                      focusMode={focusMode} focusAnchorId={focusAnchorId}
                                       onSelect={setSelectedId} onEnterFocus={enterFocus} />
                   : <ProjectTaskGraph filtered={filtered} selectedId={selectedId} focusMode={focusMode}
                                       focusAnchorId={focusAnchorId} onSelect={setSelectedId} onEnterFocus={enterFocus} />}
