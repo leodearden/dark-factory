@@ -482,14 +482,26 @@ def parse_metadata(
     for key, submodel in _SUBMODEL_REGISTRY.items():
         if key not in parsed:
             continue
+        raw = parsed[key]
         try:
-            # `submodel(**parsed[key])` raises TypeError (not ValidationError)
-            # when the slice's value isn't a mapping at all (e.g. a list or
-            # str) — caught alongside ValidationError so a non-mapping slice
-            # is absorbed by the same warn-or-raise policy as any other
-            # malformed sub-model, never escaping uncaught in read or
-            # write+enforce=False.
-            parsed = {**parsed, key: submodel(**parsed[key])}
+            if isinstance(raw, list):
+                # A registered slice may itself be list-valued (e.g. a
+                # future metadata.delivered_checks) rather than a single
+                # mapping — validate each element independently and swap in
+                # the typed list. The comprehension raises on the first bad
+                # element (TypeError for a non-mapping item, ValidationError
+                # for a mapping that fails the model), which aborts before
+                # `parsed` is reassigned below, so a malformed list is
+                # retained wholesale — same as the dict path.
+                parsed = {**parsed, key: [submodel(**item) for item in raw]}
+            else:
+                # `submodel(**raw)` raises TypeError (not ValidationError)
+                # when the slice's value isn't a mapping at all (e.g. a
+                # str) — caught alongside ValidationError so a non-mapping
+                # slice is absorbed by the same warn-or-raise policy as any
+                # other malformed sub-model, never escaping uncaught in
+                # read or write+enforce=False.
+                parsed = {**parsed, key: submodel(**raw)}
         except (ValidationError, TypeError) as exc:
             if direction == 'write' and enforce:
                 raise
