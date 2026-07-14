@@ -1238,6 +1238,92 @@ class TestCiteTaskEntityScopedFold:
         ids = [item['finding_id'] for item in report['flagged_items']]
         assert ids == [fid_c]
 
+    # -- Purge/refile clears the derived sig (task-2432 step-11) -------
+    #
+    # _purge_finding (as of step-10) only clears the ORDINARY sig
+    # (finding.task_id, finding.flag_type) and the project-scoped
+    # _run_cited_task_index anchor -- it does not know about the derived
+    # (cited_task_id, flag_type) key the entity-scoped fold registers into
+    # _run_sig_index. Deleting a finding that was a derived-sig anchor
+    # therefore leaves a stale pointer a later refile bounces off. step-12
+    # extends _purge_finding to also clear it.
+
+    @pytest.mark.asyncio
+    async def test_delete_then_refile_matching_top_level_task_id_succeeds(self):
+        """Deleting a null-task_id finding that cited '5040' (registering
+        derived sig ('5040', 'X')) must clear that derived sig so a LATER
+        finding whose top-level task_id is '5040' allocates fresh instead of
+        bouncing off the deleted finding's stale pointer.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        occ1 = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='occ1 desc', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in occ1, occ1
+        fid1 = occ1['finding_id']
+
+        cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '5040')
+        assert 'error' not in cite1, cite1
+
+        delete_result = state.delete_finding('run-1', fid1)
+        assert delete_result == {'status': 'deleted', 'finding_id': fid1}
+
+        occ2 = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='occ2 desc', suggested_action='a',
+            task_id='5040', flag_type='X',
+        )
+        assert 'finding_id' in occ2, occ2
+
+        report = state.get_assembled_report('run-1', 'task_knowledge_sync')
+        assert report is not None
+        ids = [item['finding_id'] for item in report['flagged_items']]
+        assert ids == [occ2['finding_id']]
+
+    @pytest.mark.asyncio
+    async def test_delete_then_refile_comma_joined_top_level_task_id_succeeds(self):
+        """Comma variant: after deleting a folded finding whose primary cite
+        was '5040', a later comma-joined finding ('5040,5149') that cites
+        '5040' must allocate and keep fresh, not fold onto (and be purged
+        by) the deleted finding's stale derived-sig pointer.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        occ1 = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='occ1 desc', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in occ1, occ1
+        fid1 = occ1['finding_id']
+
+        cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '5040')
+        assert 'error' not in cite1, cite1
+
+        delete_result = state.delete_finding('run-1', fid1)
+        assert delete_result == {'status': 'deleted', 'finding_id': fid1}
+
+        occ3 = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='occ3 desc', suggested_action='a',
+            task_id='5040,5149', flag_type='X',
+        )
+        assert 'finding_id' in occ3, occ3
+        fid3 = occ3['finding_id']
+
+        cite3 = await state.cite_task('run-1', fid3, 'dark_factory', '5040')
+        assert 'error' not in cite3, cite3
+
+        report = state.get_assembled_report('run-1', 'task_knowledge_sync')
+        assert report is not None
+        ids = [item['finding_id'] for item in report['flagged_items']]
+        assert ids == [fid3]
+
 
 # ---------------------------------------------------------------------------
 # task-2425 step-3: TestCiteTaskFoldKeyClearedOnDelete — RED until step-4
