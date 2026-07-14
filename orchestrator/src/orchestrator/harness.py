@@ -7941,6 +7941,14 @@ Output JSON matching the schema. Every task must appear in the output.
         ``_close_superseded_main_sweep_escalations`` with the just-verified
         clean SHA to auto-close any prior main-sweep escalation whose swept
         SHA this clean tip has superseded.  Never called on the failure path.
+
+        Before filing, a drifting result is passed through
+        ``verify.confirm_main_tip_failure_is_real`` (task 2370): a fresh
+        isolated re-run of just the named failing tests at ``swept_sha`` that
+        catches load-induced xdist flakes the same-worktree full-suite retry
+        above cannot.  Confirmed-flake (``False``) suppresses the alarm
+        without self-healing; confirmed-real (``True``) files it exactly as
+        before.
         """
         from orchestrator import verify as verify_mod  # noqa: PLC0415
 
@@ -7989,6 +7997,21 @@ Output JSON matching the schema. Every task must appear in the output.
         # (_file_restored_pause_escalation, _mark_blocked, scheduler-pause, etc.).
         if self._escalation_queue.has_open_l1(task_id):
             return
+
+        # Confirm-before-alarm gate (task 2370): the full-suite retry above ran
+        # in the SAME contended worktree, so a load-induced xdist flake can
+        # fail both passes and still reach here as "drift" — the false-alarm
+        # source behind esc-main-sweep-ea2bd3c95e33-2 and the 2026-07-09
+        # park_stop/symlink-loop incidents. Re-run just the named failing
+        # tests, in isolation, in a FRESH probe worktree pinned at swept_sha.
+        # A confirmed flake (False) is deliberately NOT self-healed: that
+        # requires a genuine full-verify PASS (see vr.passed branch above),
+        # and an isolated subset re-run is weaker evidence than that.
+        if not await verify_mod.confirm_main_tip_failure_is_real(
+            self.config, self.git_ops, vr, main_sha=swept_sha
+        ):
+            return
+
         summary = f'Main-tip integrity sweep failed at {swept_sha[:12]}: {vr.category}'[:200]
         detail = (
             f'Full verification of main at {swept_sha} failed.\n'
