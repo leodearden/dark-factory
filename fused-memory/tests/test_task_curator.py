@@ -5295,11 +5295,11 @@ class TestEvictTask:
         mock_client.collection_exists = AsyncMock(return_value=True)
         mock_client.delete = AsyncMock(side_effect=RuntimeError('qdrant down'))
 
-        with patch.object(curator, '_get_qdrant', return_value=mock_client):
-            with caplog.at_level(
-                logging.WARNING, logger='fused_memory.middleware.task_curator',
-            ):
-                result = await curator.evict_task('proj', '7')
+        with patch.object(curator, '_get_qdrant', return_value=mock_client), \
+             caplog.at_level(
+                 logging.WARNING, logger='fused_memory.middleware.task_curator',
+             ):
+            result = await curator.evict_task('proj', '7')
 
         assert result is None
         assert any(
@@ -5397,11 +5397,11 @@ class TestPruneOrphans:
         mock_client.collection_exists = AsyncMock(return_value=True)
         mock_client.scroll = AsyncMock(side_effect=RuntimeError('qdrant down'))
 
-        with patch.object(curator, '_get_qdrant', return_value=mock_client):
-            with caplog.at_level(
-                logging.WARNING, logger='fused_memory.middleware.task_curator',
-            ):
-                result = await curator.prune_orphans('proj', {'1', '2'})
+        with patch.object(curator, '_get_qdrant', return_value=mock_client), \
+             caplog.at_level(
+                 logging.WARNING, logger='fused_memory.middleware.task_curator',
+             ):
+            result = await curator.prune_orphans('proj', {'1', '2'})
 
         mock_client.delete.assert_not_called()
         assert result.skipped is True
