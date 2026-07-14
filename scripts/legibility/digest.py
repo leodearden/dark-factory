@@ -538,3 +538,54 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         turns.append({'index': index, 'text': text})
     return turns
+
+
+def _yaml_dquote(value: Any) -> str:
+    """Render *value* as a double-quoted YAML scalar.
+
+    Frontmatter values are always explicitly quoted, never left as bare
+    scalars: PyYAML's default (safe) resolver treats an unquoted ISO date
+    (e.g. ``2026-07-14``) as a ``datetime.date`` object rather than a
+    string, and similarly special-cases bare ``true``/``false``/``null``/
+    numeric-looking scalars. Quoting sidesteps that whole implicit-typing
+    surface so every string field round-trips as a plain str.
+    """
+    escaped = str(value).replace('\\', '\\\\').replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+FRONTMATTER_KEYS: tuple[str, ...] = (
+    'session', 'cwd', 'encoded_dir', 'agent_class', 'date', 'size_bytes', 'score',
+)
+"""Top-level frontmatter keys in the exact PRD Sec 7.2 order (everything
+before ``signal_counts``, which is rendered as its own nested block)."""
+
+SIGNAL_COUNT_KEYS: tuple[str, ...] = (
+    'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
+)
+"""``signal_counts`` nested keys in the exact PRD Sec 7.2 order."""
+
+
+def render_frontmatter(meta: dict[str, Any]) -> str:
+    """Hand-render *meta* as a '---'-delimited YAML frontmatter block.
+
+    Fixed key order (PRD Sec 7.2), explicit hand rendering rather than
+    ``yaml.safe_dump`` -- deterministic, byte-stable output for exact tests
+    and stable downstream diffs, and avoids a dumper's default surprises
+    (key sorting, quoting, anchors, float formatting). String-valued fields
+    are explicitly double-quoted (see :func:`_yaml_dquote`); numeric fields
+    (size_bytes, score, and every signal_counts value) are emitted bare.
+    """
+    lines = ['---']
+    for key in FRONTMATTER_KEYS:
+        value = meta[key]
+        if key in ('size_bytes', 'score'):
+            lines.append(f'{key}: {value}')
+        else:
+            lines.append(f'{key}: {_yaml_dquote(value)}')
+    lines.append('signal_counts:')
+    counts = meta['signal_counts']
+    for key in SIGNAL_COUNT_KEYS:
+        lines.append(f'  {key}: {counts[key]}')
+    lines.append('---')
+    return '\n'.join(lines) + '\n'
