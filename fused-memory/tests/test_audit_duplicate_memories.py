@@ -170,6 +170,37 @@ class TestFindNearDuplicateMemoryGroupsDeterminism:
         assert ids_a == ids_b
 
 
+class TestFindNearDuplicateMemoryGroupsEmptyContent:
+    """Empty/blank content never clusters (safe degradation), even though
+    ``SequenceMatcher(None, '', '').ratio()`` returns 1.0."""
+
+    def test_two_empty_content_records_do_not_cluster(self):
+        memories = [
+            _memory('m1', '', created_at='2026-07-12T00:00:00+00:00'),
+            _memory('m2', '', created_at='2026-07-13T00:00:00+00:00'),
+        ]
+        assert find_near_duplicate_memory_groups(memories, threshold=_THRESHOLD) == []
+
+    def test_empty_content_does_not_join_real_cluster(self):
+        # An unextractable-content record must not be swept up with genuine
+        # near-duplicates.
+        memories = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-12T00:00:00+00:00'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00'),
+            _memory('m3', '', created_at='2026-07-13T01:00:00+00:00'),
+        ]
+        result = find_near_duplicate_memory_groups(memories, threshold=_THRESHOLD)
+        assert len(result) == 1
+        assert {m['id'] for m in result[0]} == {'m1', 'm2'}
+
+    def test_blank_whitespace_content_treated_as_empty(self):
+        memories = [
+            _memory('m1', '   ', created_at='2026-07-12T00:00:00+00:00'),
+            _memory('m2', '\t\n', created_at='2026-07-13T00:00:00+00:00'),
+        ]
+        assert find_near_duplicate_memory_groups(memories, threshold=_THRESHOLD) == []
+
+
 class TestFindNearDuplicateMemoryGroupsEdgeCases:
     """Degenerate inputs: empty / single-element / all-dissimilar lists produce no groups."""
 
@@ -434,6 +465,7 @@ class TestFetchProceduralMemoriesNormalization:
         assert result == [{
             'id': 'm1',
             'content': 'gotcha text',
+            'category': 'procedural_knowledge',
             'created_at': '2026-07-12T00:00:00+00:00',
             'metadata': {'memory': 'gotcha text', 'category': 'procedural_knowledge'},
         }]
@@ -484,6 +516,75 @@ class TestFetchProceduralMemoriesEmptyScan:
         result = await fetch_procedural_memories(memory, 'dark_factory', scan_limit=100)
 
         assert result == []
+
+
+# ===========================================================================
+# Integration: fetch_procedural_memories output -> build_sweep_plan
+# ===========================================================================
+
+@pytest.mark.asyncio
+class TestFetchToSweepPlanIntegration:
+    """The real fetch normalization shape must flow through build_sweep_plan
+    and actually cluster — guards against a category-key mismatch making the
+    sweep a silent no-op in production."""
+
+    async def test_fetched_records_cluster_and_report(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        # scroll_by_metadata-shaped raw records: category lives inside the
+        # payload ('metadata'), NOT at the top level — the shape the real
+        # Mem0 fetch pipeline produces.
+        raw = [
+            _raw_record(
+                'm1', '2026-07-12T00:00:00+00:00',
+                {'memory': _VENV_GOTCHA_A, 'category': 'procedural_knowledge'},
+            ),
+            _raw_record(
+                'm2', '2026-07-13T00:00:00+00:00',
+                {'memory': _VENV_GOTCHA_B, 'category': 'procedural_knowledge'},
+            ),
+            _raw_record(
+                'm3', '2026-07-13T01:00:00+00:00',
+                {'memory': _VENV_GOTCHA_C, 'category': 'procedural_knowledge'},
+            ),
+        ]
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = AsyncMock(return_value=raw)
+
+        records = await fetch_procedural_memories(memory, 'dark_factory', scan_limit=100)
+        plan = build_sweep_plan(records, threshold=_THRESHOLD)
+
+        assert plan['clusters_total'] == 1
+        group_report = plan['near_duplicate_groups'][0]
+        assert group_report['survivor_id'] == 'm1'  # oldest created_at
+        assert set(group_report['member_ids']) == {'m1', 'm2', 'm3'}
+        assert set(plan['delete_candidates']) == {'m2', 'm3'}
+
+    async def test_fetched_unextractable_content_not_deleted(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        # Two records whose content cannot be extracted degrade to '' and must
+        # not cluster with each other (or be marked for deletion).
+        raw = [
+            _raw_record(
+                'm1', '2026-07-12T00:00:00+00:00',
+                {'unrelated': 'x', 'category': 'procedural_knowledge'},
+            ),
+            _raw_record(
+                'm2', '2026-07-13T00:00:00+00:00',
+                {'unrelated': 'y', 'category': 'procedural_knowledge'},
+            ),
+        ]
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = AsyncMock(return_value=raw)
+
+        records = await fetch_procedural_memories(memory, 'dark_factory', scan_limit=100)
+        plan = build_sweep_plan(records, threshold=_THRESHOLD)
+
+        assert plan['clusters_total'] == 0
+        assert plan['delete_candidates'] == []
 
 
 # ===========================================================================

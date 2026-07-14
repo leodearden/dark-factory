@@ -118,7 +118,16 @@ def find_near_duplicate_memory_groups(
             parent[rx] = ry
 
     for i in range(n):
+        # Empty/blank content never clusters and is never deleted (safe
+        # degradation). Guard here because SequenceMatcher(None, '', '').ratio()
+        # returns 1.0, which would otherwise union two empty-content records
+        # and mark one for deletion — a real memory whose content simply could
+        # not be extracted. See the docstring safety carve-out.
+        if not normalized[i]:
+            continue
         for j in range(i + 1, n):
+            if not normalized[j]:
+                continue
             ratio = difflib.SequenceMatcher(None, normalized[i], normalized[j]).ratio()
             if ratio >= threshold:
                 union(i, j)
@@ -242,7 +251,12 @@ async def fetch_procedural_memories(
     Calls ``memory.mem0.scroll_by_metadata(scope, {'category':
     'procedural_knowledge'}, limit=scan_limit)`` and normalises each raw
     record (``{'id', 'created_at', 'metadata'}``) into ``{'id', 'content',
-    'created_at', 'metadata'}``. Content is extracted from the payload by
+    'category', 'created_at', 'metadata'}``. The top-level ``'category'`` is
+    lifted out of the payload so ``build_sweep_plan`` (which filters on
+    ``m['category']``) sees the same shape the real fetch path produces —
+    without it, every fetched record's ``m.get('category')`` would be
+    ``None`` and the sweep would be a silent no-op. Content is extracted from
+    the payload by
     trying ``_CONTENT_KEYS`` in order, falling back to ``''`` when no key
     yields a usable value — a record with no extractable content therefore
     normalises to ``content=''``, which never clusters and is never deleted
@@ -278,6 +292,7 @@ async def fetch_procedural_memories(
         normalized.append({
             'id': record.get('id'),
             'content': content,
+            'category': payload.get('category'),
             'created_at': record.get('created_at'),
             'metadata': payload,
         })
