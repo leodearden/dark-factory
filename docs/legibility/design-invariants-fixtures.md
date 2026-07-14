@@ -163,6 +163,39 @@ def nightly_cleanup(snapshot):
 
 ## INV-4 `storm-escape-required`
 
+### PRD-leaf-shaped (`INV-4-PRD`)
+
+> Add a suppression counter with no escalation: the watcher increments an
+> in-memory `suppressed_count` each time it swallows a duplicate
+> escalation, but never surfaces the count anywhere — no rate/streak
+> threshold, no escalation if it fires 100×/hr.
+
+**Expected disposition**: `flag: storm-escape-required`
+
+**Redesign that clears it**: Add a consecutive-streak or rate-threshold
+escalation — name who hears about it (e.g. `escalate_info` to the
+steward) once `suppressed_count` crosses N/hr — per the consecutive-streak
+gate / storm-counter (1755) house pattern.
+
+### Code-snippet-shaped (`INV-4-CODE`)
+
+```python
+_suppressed_count = 0
+
+def maybe_suppress_escalation(esc):
+    global _suppressed_count
+    if is_duplicate(esc):
+        _suppressed_count += 1  # counted but never compared to a
+        return None             # rate/streak threshold or escalated
+    return esc
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "storm-escape-required", "file": "escalation/src/escalation/dedup_filter.py", "line": 6, "issue": "_suppressed_count is incremented on every duplicate but never compared against a rate/streak threshold — no escalation path if suppression fires continuously", "severity": "high"}
+```
+
 ## INV-5 `no-lockstep-duplication`
 
 ## Rehearsal verdict table
