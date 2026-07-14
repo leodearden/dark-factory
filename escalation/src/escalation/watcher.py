@@ -105,6 +105,32 @@ def _initial_scan(
     return best
 
 
+def _read_exclude_file(path: Path | None) -> frozenset[str]:
+    """Read a newline-delimited esc-id exclude list, tolerating blank lines
+    and `#`-comments, and normalizing a trailing `.json` suffix like
+    `--exclude-id` does (watcher.py's static exclude normalization).
+
+    Fails open (returns an empty frozenset) when path is None or the file
+    is missing/unreadable — a transient miss is retried on the next poll
+    rather than treated as a fatal error.
+    """
+    if path is None:
+        return frozenset()
+
+    try:
+        text = path.read_text()
+    except OSError:
+        return frozenset()
+
+    ids: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        ids.add(stripped[:-5] if stripped.endswith('.json') else stripped)
+    return frozenset(ids)
+
+
 def _send_ntfy(url: str, escalation: Escalation) -> None:
     """POST an escalation as a push notification to an ntfy.sh endpoint."""
     is_urgent = escalation.severity in (BORN_AT_L2_SEVERITIES | {'blocking'})
