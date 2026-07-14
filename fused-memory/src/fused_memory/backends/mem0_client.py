@@ -235,11 +235,29 @@ class Mem0Backend:
             logger.warning(f'Mem0 get timed out after {self._read_timeout}s')
             return None
 
-    async def update(self, memory_id: str, data: str, scope: Scope) -> dict[str, Any]:
-        """Update a memory."""
+    async def update(
+        self,
+        memory_id: str,
+        data: str,
+        scope: Scope,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Update a memory.
+
+        ``metadata``, when passed, is forwarded to mem0's
+        ``AsyncMemory.update``. mem0's ``_update_memory`` OVERWRITES the
+        whole Qdrant payload on update -- it starts a fresh payload from
+        ``deepcopy(metadata) if metadata else {}`` and only re-preserves
+        ``created_at``/session ids from the existing point, so calling this
+        with ``metadata=None`` (the default) wipes any custom payload keys
+        (e.g. ``kind``/``src_project``/``dst_project``) the point already
+        carried. To edit content in place WITHOUT losing that provenance,
+        callers must pass the point's full existing metadata payload back
+        as ``metadata=``.
+        """
         instance = await self._get_instance(scope)
         return await asyncio.wait_for(
-            instance.update(memory_id, data),
+            instance.update(memory_id, data, metadata=metadata),
             timeout=self._write_timeout,
         )
 
