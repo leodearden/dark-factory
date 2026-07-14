@@ -657,6 +657,65 @@ class TestRunBackfill:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# TestPruneDriver: BackfillManager.prune() / run_prune() orchestration
+# (curator corpus RC1 — task 2520, Layer C driver)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestPruneDriver:
+    @pytest.mark.asyncio
+    async def test_run_prune_reads_snapshot_and_prunes(self):
+        """run_prune() reads the live task snapshot, flattens it (including
+        subtasks), and calls curator.prune_orphans() with the project's live
+        task-id set."""
+        from fused_memory.maintenance.backfill_curator_corpus import run_prune
+        from fused_memory.middleware.task_curator import PruneResult
+
+        project_root = '/fake/project'
+        project_id = 'project'
+
+        canned_task_tree = {
+            'tasks': [
+                {'id': '1', 'title': 'Task A', 'description': 'Desc A', 'status': 'done'},
+                {
+                    'id': '2',
+                    'title': 'Task B',
+                    'description': 'Desc B',
+                    'status': 'pending',
+                    'subtasks': [
+                        {'id': '2.1', 'title': 'Sub B1', 'description': '', 'status': 'pending'},
+                    ],
+                },
+            ],
+        }
+        mock_prune_result = PruneResult(pruned=1, live=3)
+
+        with TestRunBackfill()._run_backfill_context() as (mock_curator, mock_tm_cls):
+            mock_curator.prune_orphans = AsyncMock(return_value=mock_prune_result)
+            mock_tm_instance = AsyncMock()
+            mock_tm_instance.get_tasks = AsyncMock(return_value=canned_task_tree)
+            mock_tm_cls.return_value = mock_tm_instance
+
+            await run_prune(config_path=None, project_root=project_root)
+
+        mock_tm_instance.get_tasks.assert_called_once_with(project_root)
+
+        mock_curator.prune_orphans.assert_called_once()
+        call_args = mock_curator.prune_orphans.call_args
+        passed_project_id = (
+            call_args.args[0] if call_args.args else call_args.kwargs.get('project_id')
+        )
+        passed_live_ids = (
+            call_args.args[1]
+            if len(call_args.args) > 1
+            else call_args.kwargs.get('live_task_ids')
+        )
+
+        assert passed_project_id == project_id
+        assert set(passed_live_ids) == {'1', '2', '2.1'}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Steps 10, 11, 13: TaskInterceptor auto-backfill hook
 # ──────────────────────────────────────────────────────────────────────────────
 
