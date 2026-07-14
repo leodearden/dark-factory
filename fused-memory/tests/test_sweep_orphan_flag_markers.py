@@ -792,3 +792,180 @@ class TestRun:
         assert apply_report['bucket_counts'] == expected_bucket_counts
         assert 'after' in apply_report
         assert apply_report['after']['total_source'] == 1
+
+
+# ===========================================================================
+# Tests: targeted correction (--delete-ids)
+# ===========================================================================
+
+class TestTargetedCorrection:
+    """Tests for the targeted --delete-ids correction pass in run() (task 2596).
+
+    A targeted correction force-deletes specific marker UUIDs regardless of
+    age/terminal/orphan status — the deterministic lever for correcting known-
+    mistagged records that the other predicates cannot catch: the mistagged
+    eb92453f-shaped record (numeric task_id '2408', which is PENDING so the
+    terminal predicate can't catch it) and the composite a07972e7-shaped
+    record (task_id='1944,2408', kept because not ALL components are
+    terminal). Delete (not delete+recreate) is the honest correction — see
+    design_decisions.
+    """
+
+    _NOW = datetime(2026, 7, 14, tzinfo=UTC)
+    # 1944 and 2440 are done (terminal); 2408 is pending (not terminal) —
+    # matches the task's verified get_statuses premises.
+    _TERMINAL = {'1944', '2440'}
+
+    def _args(
+        self,
+        apply: bool = False,
+        project_id: str = 'dark_factory',
+        max_age_days: int = 14,
+        delete_ids: list[str] | None = None,
+    ):
+        """Build a minimal args namespace, with delete_ids support."""
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id=project_id, max_age_days=max_age_days,
+            delete_ids=delete_ids,
+        )
+
+    @staticmethod
+    def _fresh(id: str, task_id: str) -> dict:
+        """A valid-kind, fresh (not stale), non-taskless member — isolates
+        the targeted-correction path from every other predicate."""
+        member = _member(id, task_id=task_id)
+        member['created_at'] = '2026-07-10T00:00:00Z'
+        return member
+
+    def test_mistagged_and_composite_records_not_otherwise_swept(self):
+        """Sanity: neither shape trips any of the pre-existing predicates —
+        this is what makes them require the targeted correction lever."""
+        mistagged = self._fresh('eb92453f', task_id='2408')
+        composite = self._fresh('a07972e7', task_id='1944,2408')
+        members = [mistagged, composite]
+
+        assert _mod.find_orphan_markers(members) == []
+        assert _mod.find_taskless_markers(members) == []
+        assert _mod.find_stale_markers(members, self._NOW, max_age_days=14) == []
+        assert _mod.find_terminal_task_markers(members, self._TERMINAL) == []
+
+    @pytest.mark.asyncio
+    async def test_delete_ids_force_includes_mistagged_and_composite_records(self):
+        """run() with args.delete_ids naming both records sweeps them even
+        though no other predicate would, and reports them under
+        targeted_correction_ids."""
+        mistagged = self._fresh('eb92453f', task_id='2408')
+        composite = self._fresh('a07972e7', task_id='1944,2408')
+        members = [mistagged, composite]
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[2, 2])
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(apply=False, delete_ids=['eb92453f', 'a07972e7']),
+            memory_service,
+            now=self._NOW,
+            terminal_task_ids=self._TERMINAL,
+        )
+
+        assert set(report['orphan_ids']) == {'eb92453f', 'a07972e7'}, (
+            f"Expected both targeted ids swept, got: {report['orphan_ids']!r}"
+        )
+        assert report['orphan_count'] == 2
+        assert set(report['targeted_correction_ids']) == {'eb92453f', 'a07972e7'}
+
+    @pytest.mark.asyncio
+    async def test_delete_ids_actually_deletes_on_apply(self):
+        """With args.apply=True, both targeted records are actually deleted
+        via delete_memory."""
+        mistagged = self._fresh('eb92453f', task_id='2408')
+        composite = self._fresh('a07972e7', task_id='1944,2408')
+        members = [mistagged, composite]
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[2, 2, 0, 0])
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(apply=True, delete_ids=['eb92453f', 'a07972e7']),
+            memory_service,
+            now=self._NOW,
+            terminal_task_ids=self._TERMINAL,
+        )
+
+        assert memory_service.delete_memory.call_count == 2
+        deleted_ids = {
+            c.kwargs.get('memory_id') for c in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'eb92453f', 'a07972e7'}
+        assert report['after']['total_source'] == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_ids_entry_not_present_is_ignored(self):
+        """A delete_ids UUID that doesn't match any enumerated member is
+        silently ignored — no crash, no phantom entry in the report."""
+        valid = self._fresh('v1', task_id='1970')
+        members = [valid]
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1])
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(apply=False, delete_ids=['does-not-exist']),
+            memory_service,
+            now=self._NOW,
+        )
+
+        assert report['orphan_ids'] == []
+        assert report['orphan_count'] == 0
+        assert report['targeted_correction_ids'] == []
+
+    @pytest.mark.asyncio
+    async def test_delete_ids_deduped_with_other_predicates(self):
+        """A delete_ids entry that's also caught by another predicate (e.g.
+        kind-orphan) is deleted exactly once, and is still reported under
+        targeted_correction_ids (found-intersection semantics, not
+        exclusive-to-targeted)."""
+        orphan = _orphan('o1')
+        orphan['created_at'] = '2026-07-10T00:00:00Z'
+        members = [orphan]
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 0, 0, 0])
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(apply=True, delete_ids=['o1']),
+            memory_service,
+            now=self._NOW,
+        )
+
+        assert memory_service.delete_memory.call_count == 1
+        assert report['targeted_correction_ids'] == ['o1']
+
+    @pytest.mark.asyncio
+    async def test_no_delete_ids_yields_empty_targeted_correction_ids(self):
+        """When args.delete_ids is None (default/absent), targeted_correction_ids
+        is [] and behavior is unchanged from before this feature existed."""
+        valid = self._fresh('v1', task_id='1970')
+        members = [valid]
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1])
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(apply=False),  # delete_ids defaults to None
+            memory_service,
+            now=self._NOW,
+        )
+
+        assert report['targeted_correction_ids'] == []
