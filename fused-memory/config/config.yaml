@@ -92,6 +92,15 @@ taskmaster:
 task_metadata:
   enforce: true
 
+# task_status.enforce_transitions — RED-TIER / restart-only (Γ gate; tasks 2214/2215/2216 +
+# τ2 table task 2614). Default false = LOG-MODE: an illegal (from,to,actor) transition logs an
+# 'illegal_transition would-reject' WARNING and the write proceeds. true = a typed
+# illegal_transition rejection. Flipped 2026-07-14 via operator gate esc-2216-1 after task 2614
+# landed the missing PENDING→DONE / PENDING→BLOCKED human edges and a clean production soak
+# (0 would-rejects in ~495k journal lines since the 15:35Z fm restart onto the τ2 fix).
+task_status:
+  enforce_transitions: true
+
 reconciliation:
   enabled: true
   # Phase 2 enforcement of done_provenance: require commit|note payload on done transitions
