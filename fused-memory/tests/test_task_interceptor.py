@@ -1663,6 +1663,51 @@ async def test_remove_tasks_succeeds_when_eviction_raises(interceptor, taskmaste
 
 
 @pytest.mark.asyncio
+async def test_remove_tasks_evicts_using_ids_when_removed_ids_missing(
+    interceptor, taskmaster,
+):
+    """When the backend result omits 'removed_ids', eviction falls back to
+    the originally requested ids (`result.get('removed_ids') or ids`)."""
+    taskmaster.remove_tasks = AsyncMock(
+        return_value={'successful': 2, 'failed': 0, 'message': 'ok'}
+    )
+    mock_curator = AsyncMock()
+    mock_curator.evict_task = AsyncMock()
+    interceptor._get_curator = AsyncMock(return_value=mock_curator)
+
+    result = await interceptor.remove_tasks(['3', '4'], '/project')
+
+    assert mock_curator.evict_task.await_count == 2
+    mock_curator.evict_task.assert_any_await('project', '3')
+    mock_curator.evict_task.assert_any_await('project', '4')
+    assert result == {'successful': 2, 'failed': 0, 'message': 'ok'}
+
+
+@pytest.mark.asyncio
+async def test_remove_tasks_succeeds_without_curator(interceptor, taskmaster):
+    """When no curator is configured (_get_curator() returns None — the
+    default `interceptor` fixture has no curator config, so this is exercised
+    without patching), removal still succeeds and no eviction is attempted."""
+    taskmaster.remove_tasks = AsyncMock(
+        return_value={
+            'successful': 1,
+            'failed': 0,
+            'removed_ids': ['11'],
+            'message': 'ok',
+        }
+    )
+
+    result = await interceptor.remove_tasks(['11'], '/project')
+
+    assert result == {
+        'successful': 1,
+        'failed': 0,
+        'removed_ids': ['11'],
+        'message': 'ok',
+    }
+
+
+@pytest.mark.asyncio
 async def test_dependency_operations_emit_events(interceptor, event_buffer):
     await interceptor.add_dependency('2', '1', '/project')
     await interceptor.remove_dependency('2', '1', '/project')
