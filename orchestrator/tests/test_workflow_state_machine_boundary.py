@@ -177,6 +177,13 @@ class TestGuardCollapseEquivalence:
         f3.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
             side_effect=AssertionError('fallback must not run on a journal hit'),
         )
+        # Pin that f3.is_ancestor really IS the call site
+        # _recover_before_merge consults (self.git_ops.is_ancestor) — not
+        # merely a same-named _Fixture attribute that happens to be
+        # unconnected. Without this, a future _make() shape change could
+        # leave the side_effect below mutating a mock nothing actually
+        # calls, turning the negative guard vacuous (false-green).
+        assert f3.wf.git_ops.is_ancestor is f3.is_ancestor
         f3.is_ancestor.side_effect = AssertionError(
             'is_ancestor must not run on a journal hit',
         )
@@ -187,6 +194,10 @@ class TestGuardCollapseEquivalence:
             f3.wf.task_id, kind='merged', sha='sha3',
             note='landed-outbox journal hit (pre-MERGE recovery)',
         )
+        # Explicit confirmation independent of the side_effect ever firing
+        # correctly — the guard's real contract is "never called", not
+        # merely "raises if called".
+        f3.is_ancestor.assert_not_called()
 
     # -- Row 2: journal-miss ghost-loop shapes must never phantom-DONE --
 
@@ -1122,7 +1133,12 @@ class TestStewardOutcomeRouting:
 
 
 def _public_exception_types(module):
-    """Every public (no leading underscore) BaseException subclass in *module*.
+    """Every public (no leading underscore) BaseException subclass *module*
+    itself defines (``obj.__module__ == module.__name__``) — deliberately
+    excludes exceptions merely imported into the module's namespace (e.g. a
+    top-level ``from x import SomeError``), since those are owned/exported
+    by whichever module defines them, not this one, and requiring a row for
+    them here would be a spurious coupling to an unrelated module's surface.
 
     Duplicated verbatim from test_block_disposition.py's helper of the same
     name (established repo convention — this module re-derives the sweep
@@ -1134,6 +1150,7 @@ def _public_exception_types(module):
         if not name.startswith('_')
         and inspect.isclass(obj)
         and issubclass(obj, BaseException)
+        and obj.__module__ == module.__name__
     ]
 
 
