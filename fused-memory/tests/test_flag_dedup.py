@@ -1255,6 +1255,79 @@ class TestSuppressionTaskIdStringType:
 
 
 # ---------------------------------------------------------------------------
+# RED (task 2454 step-3): build_suppression_payload / write_suppression_record
+# must ACCEPT a composite comma-joined numeric task_id (e.g. a mixed
+# cross-project signature like '2405,540,544'), canonicalizing to a single
+# stripped, comma-joined string -- while still rejecting genuinely-invalid
+# input with the existing descriptive, chained-cause ValueError.
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSuppressionPayloadComposite:
+    """build_suppression_payload / write_suppression_record accept a
+    comma-joined composite task_id (a single ledger row spanning multiple
+    numeric ids), so the read side can later decompose it per-component."""
+
+    def test_composite_task_id_preserved_as_str(self):
+        """A 3-component composite id canonicalizes to itself (str)."""
+        result = build_suppression_payload('2405,540,544')
+        assert result['metadata']['task_id'] == '2405,540,544'
+        assert isinstance(result['metadata']['task_id'], str)
+
+    def test_composite_task_id_content_string(self):
+        """content renders the full composite id."""
+        result = build_suppression_payload('2405,540,544')
+        assert result['content'] == 'STAGE 1 FLAG SUPPRESSION task_id=2405,540,544'
+
+    def test_composite_task_id_whitespace_canonicalizes(self):
+        """A whitespace-padded composite id ('2405, 540') canonicalizes to
+        the stripped, comma-joined form ('2405,540') -- no embedded spaces
+        survive into metadata.task_id or content."""
+        result = build_suppression_payload('2405, 540')
+        assert result['metadata']['task_id'] == '2405,540'
+        assert result['content'] == 'STAGE 1 FLAG SUPPRESSION task_id=2405,540'
+
+    @pytest.mark.asyncio
+    async def test_write_suppression_record_persists_composite_blanket_row(
+        self, ledger_memory_service
+    ):
+        """write_suppression_record can persist a composite id end-to-end:
+        exactly one blanket ledger row with task_id == '2405,544'."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id='2405,544'
+        )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1
+        assert rows[0].task_id == '2405,544'
+        assert rows[0].flag_type == ''
+
+    @pytest.mark.parametrize('bad_value', ['abc', '2405,abc'])
+    def test_invalid_input_raises_descriptive_chained_value_error(self, bad_value):
+        """A bare non-numeric string AND a composite with a non-numeric
+        component both still raise a descriptive, chained-cause ValueError
+        (unchanged contract from TestBuildSuppressionPayload)."""
+        with pytest.raises(ValueError) as exc_info:
+            build_suppression_payload(bad_value)
+
+        error_message = str(exc_info.value)
+        assert 'build_suppression_payload' in error_message, (
+            f"Expected 'build_suppression_payload' in error message but got: {error_message!r}"
+        )
+        assert bad_value in error_message, (
+            f'Expected bad value {bad_value!r} in error message but got: {error_message!r}'
+        )
+        assert exc_info.value.__cause__ is not None, (
+            'Expected __cause__ to be set (from e chaining) but it was None'
+        )
+        assert isinstance(exc_info.value.__cause__, (ValueError, TypeError)), (
+            f'Expected __cause__ to be ValueError or TypeError but got: {type(exc_info.value.__cause__)}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Round-trip schema validation tests (task-1185 step-5)
 #
 # FakeMemoryService: in-test stub generalising the FakeMem0 pattern already
