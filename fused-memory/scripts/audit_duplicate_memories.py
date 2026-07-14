@@ -234,11 +234,13 @@ def build_sweep_plan(memories: list[dict], threshold: float = 0.85) -> dict[str,
 # ---------------------------------------------------------------------------
 
 # Payload keys tried in order when extracting a Mem0 memory's text content
-# from its scroll_by_metadata() 'metadata' payload dict. Mirrors the Mem0
-# content-key convention documented in prune_recon_cycle_summaries.py
-# (payload key 'data') and memory_service.py's MemoryResult.content (payload
-# key 'memory') -- 'content' is included as a defensive third fallback.
-_CONTENT_KEYS: tuple[str, ...] = ('memory', 'data', 'content')
+# from its scroll_by_metadata() 'metadata' payload dict. 'data' is the
+# canonical scroll-payload key (mirrors prune_recon_cycle_summaries.py, which
+# reads only metadata.get('data')) so it is tried first; 'memory' is a
+# search-result-layer key (memory_service.py's MemoryResult.content, built
+# from Mem0's search API, not scroll) that can appear stale on a scroll
+# payload, so it is only a fallback; 'content' is a defensive third fallback.
+_CONTENT_KEYS: tuple[str, ...] = ('data', 'memory', 'content')
 
 
 async def fetch_procedural_memories(

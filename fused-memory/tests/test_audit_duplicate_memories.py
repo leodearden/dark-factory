@@ -484,6 +484,30 @@ class TestFetchProceduralMemoriesNormalization:
         assert result[0]['id'] == 'm2'
         assert result[0]['created_at'] is None
 
+    async def test_data_key_wins_over_memory_key_when_both_present(self):
+        # 'data' is the canonical scroll_by_metadata()/Qdrant payload key
+        # (mirrors prune_recon_cycle_summaries.py, which reads only
+        # metadata.get('data')); 'memory' is a search-result-layer key
+        # (MemoryResult.content) that can appear stale on a scroll payload.
+        # When both are present on the same payload, 'data' must win.
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        raw = [_raw_record(
+            'm5', '2026-07-12T00:00:00+00:00',
+            {
+                'data': 'canonical scroll-payload text',
+                'memory': 'stale search-layer text',
+                'category': 'procedural_knowledge',
+            },
+        )]
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = AsyncMock(return_value=raw)
+
+        result = await fetch_procedural_memories(memory, 'dark_factory', scan_limit=100)
+
+        assert result[0]['content'] == 'canonical scroll-payload text'
+
 
 @pytest.mark.asyncio
 class TestFetchProceduralMemoriesSafeDegradation:
