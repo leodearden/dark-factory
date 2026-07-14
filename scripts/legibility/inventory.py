@@ -98,6 +98,48 @@ def _iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
                 yield record
 
 
+def _session_cwd_and_date(path: Path) -> tuple[str | None, date | None]:
+    """Single-pass read of *path*, returning ``(cwd, date)`` together.
+
+    :func:`session_cwd` and :func:`_first_timestamp_date` each scan *path*
+    independently for their own first-occurrence value, so
+    :func:`enumerate_sessions` calling both on every candidate session read
+    the same transcript twice (reviewer_comprehensive/performance, task
+    2573 amendment pass #2). This helper collects both facts in ONE pass —
+    each still only takes its own first occurrence, so the values returned
+    are identical to calling ``session_cwd(path)`` and
+    ``_first_timestamp_date(path)`` separately — stopping as soon as both
+    have been found. Degrades to ``(None, None)`` on an unreadable path,
+    matching both functions' individual degrade-to-None contracts.
+    """
+    cwd: str | None = None
+    session_date: date | None = None
+    try:
+        for record in _iter_json_lines(path):
+            if cwd is None:
+                candidate_cwd = record.get('cwd')
+                if isinstance(candidate_cwd, str) and candidate_cwd:
+                    cwd = candidate_cwd
+
+            if session_date is None:
+                ts = record.get('timestamp')
+                if isinstance(ts, str) and ts:
+                    try:
+                        parsed = datetime.fromisoformat(ts)
+                    except ValueError:
+                        parsed = None
+                    if parsed is not None:
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=UTC)
+                        session_date = parsed.astimezone(UTC).date()
+
+            if cwd is not None and session_date is not None:
+                break
+    except OSError:
+        return None, None
+    return cwd, session_date
+
+
 def session_cwd(path: Path) -> str | None:
     """Return the first non-empty ``cwd`` string found in *path*, else None.
 
@@ -105,16 +147,14 @@ def session_cwd(path: Path) -> str | None:
     ``agent-name``, ``queue-operation``) carry no ``cwd`` at all, and a few
     metadata-only stub sessions carry no ``cwd`` anywhere in the file. Both
     an unreadable path and a cwd-less file degrade to ``None`` rather than
-    raising.
+    raising. Delegates to :func:`_session_cwd_and_date` — a standalone
+    caller wanting only the cwd also pays for that helper's timestamp scan,
+    but this function is no longer on :func:`enumerate_sessions`'s hot path
+    (it calls :func:`_session_cwd_and_date` directly), so that trade only
+    affects callers wanting the cwd in isolation.
     """
-    try:
-        for record in _iter_json_lines(path):
-            cwd = record.get('cwd')
-            if isinstance(cwd, str) and cwd:
-                return cwd
-    except OSError:
-        return None
-    return None
+    cwd, _ = _session_cwd_and_date(path)
+    return cwd
 
 
 @dataclass(frozen=True)
@@ -139,22 +179,10 @@ def _first_timestamp_date(path: Path) -> date | None:
 
     Returns None when the file is unreadable, has no timestamp line, or
     every timestamp line is unparseable — callers fall back to file mtime.
+    Delegates to :func:`_session_cwd_and_date`; see its docstring for why.
     """
-    try:
-        for record in _iter_json_lines(path):
-            ts = record.get('timestamp')
-            if not isinstance(ts, str) or not ts:
-                continue
-            try:
-                parsed = datetime.fromisoformat(ts)
-            except ValueError:
-                continue
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=UTC)
-            return parsed.astimezone(UTC).date()
-    except OSError:
-        return None
-    return None
+    _, session_date = _session_cwd_and_date(path)
+    return session_date
 
 
 def enumerate_sessions(
@@ -167,10 +195,11 @@ def enumerate_sessions(
     Aggregates across every directory :func:`iter_project_dirs` yields
     (never assumes one dir per project — a project's agents span many
     encodings). For each ``*.jsonl`` file: skip non-existent/unreadable/
-    empty files, confirm membership via the session's real ``cwd``
-    (:func:`session_cwd` + :func:`is_member`), derive the session's UTC
-    date from its first timestamp line (falling back to file mtime when no
-    timestamp is present), and keep only sessions matching *target_date*.
+    empty files, read the session's real ``cwd`` and first-timestamp date
+    together in one pass (:func:`_session_cwd_and_date`) and confirm
+    membership via :func:`is_member`, falling back to file mtime for the
+    date when no timestamp is present, and keep only sessions matching
+    *target_date*.
     """
     root = Path(projects_root)
     records: list[SessionRecord] = []
@@ -183,11 +212,10 @@ def enumerate_sessions(
             if size_bytes == 0:
                 continue
 
-            cwd = session_cwd(session_path)
+            cwd, session_date = _session_cwd_and_date(session_path)
             if cwd is None or not is_member(cwd, cwd_prefixes):
                 continue
 
-            session_date = _first_timestamp_date(session_path)
             if session_date is None:
                 try:
                     session_date = datetime.fromtimestamp(
