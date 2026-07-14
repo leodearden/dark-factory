@@ -1600,9 +1600,29 @@ class DeterministicRunner:
                 # unrelated escalation sharing this task_id (e.g. a starvation-
                 # watchdog filing) must never alias as proof a human resolved
                 # THIS runner's failure (task 2120).
-                ever_escalated = bool(self.escalation_queue.get_by_task(
+                own_escalation_resolved = bool(self.escalation_queue.get_by_task(
                     task_id, agent_role=DETERMINISTIC_AGENT_ROLE,
                 ))
+                # ζ D3 (finding 4.0): bare escalation existence is not proof
+                # THIS deploy's own gate/failure is what got resolved — even
+                # role-scoped, a stale or unrelated same-role record could
+                # alias.  When ζ has been tracking this deploy (deploy_state
+                # present), require the RECORDED fact that the runner itself
+                # transitioned to `escalated` when it filed that failure/gate
+                # escalation, in addition to the resolved-record check above.
+                # A task with no deploy_state at all began its deploy before ζ
+                # activated (no phase was ever recorded) — fall back to the
+                # pre-ζ bare-existence check so in-flight legacy deploys don't
+                # spuriously re-escalate the moment ζ ships (backward-compat
+                # migration shim).
+                deploy_state = DeployState.from_metadata(metadata)
+                if deploy_state is not None:
+                    resolution_proven = (
+                        deploy_state.phase == DeployPhase.ESCALATED
+                        and own_escalation_resolved
+                    )
+                else:
+                    resolution_proven = own_escalation_resolved
 
                 if before_done_verified_at:
                     # (a) Deploy verified OK; crash before the done write.
@@ -1663,7 +1683,7 @@ class DeterministicRunner:
                     )
                     return await self._file_milestone_gate_and_block(task_id, task, metadata)
 
-                if ever_escalated:
+                if resolution_proven:
                     # (b) A failure escalation was filed and resolved by a human.
                     logger.info(
                         'DeterministicRunner: task %s before_done ran + escalation '
