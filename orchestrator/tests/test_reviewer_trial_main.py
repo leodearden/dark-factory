@@ -13,6 +13,7 @@ from click.testing import CliRunner
 
 from orchestrator.evals.reviewer_trial.__main__ import cli
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest
+from orchestrator.evals.reviewer_trial.mining import AuditReport
 from orchestrator.evals.reviewer_trial.runner import PanelRunResult
 from orchestrator.evals.reviewer_trial.scorer import ScoringResult
 
@@ -116,6 +117,87 @@ class TestCorpusSanityCostDisplay:
         # (c) aggregate "Total cost:" line: $3.80 = 1.30 + 2.50 (not panel-only $3.00)
         assert '$3.80' in result.output, (
             f'Expected "$3.80" in Total cost line (combined 1.3 + 2.5).\n'
+            f'Output:\n{result.output}'
+        )
+
+
+class TestMineMinDiffsThreading:
+    """`mine --min-diffs N` must thread N into the post-run audit call."""
+
+    def test_mine_threads_min_diffs_into_post_run_audit(self) -> None:
+        """The CLI-supplied --min-diffs floor must reach audit_corpus's
+        post-run call, not a hardcoded default.
+
+        Hermetic: the candidate pool is forced empty (mine_fn_candidates ->
+        [], mine_escalation_refs -> {}) so the pipeline reaches the audit
+        call at the end of `mine` without touching the real runs.db, git,
+        or a frontier LLM. The synthetic corpus's diffs are all
+        source='mined' so the hand-authored backfill loop skips them and
+        `_resave()` (which would rewrite the real committed corpus) is
+        never invoked. `audit_corpus` is mocked so its return value doesn't
+        depend on the real (bypassed) checks -- we only care what it was
+        CALLED with.
+
+        Before the fix (step 20): line ~802 hardcodes
+        ``audit_corpus(manifest, log, min_diffs=50)``, silently ignoring
+        the CLI flag, so the actual call carries 50 (not 80) and this
+        assertion fails.
+        """
+        manifest = CorpusManifest(diffs=[
+            CorpusDiff(
+                diff_id='mined_1', language='python', source='mined',
+                diff_text='', description='synthetic mined diff 1', ground_truth=[],
+                split='test',
+            ),
+            CorpusDiff(
+                diff_id='mined_2', language='python', source='mined',
+                diff_text='', description='synthetic mined diff 2', ground_truth=[],
+                split='train',
+            ),
+        ])
+        stub_report = AuditReport(ok=True, diff_count=len(manifest.diffs), failures=[])
+
+        with (
+            patch(
+                'orchestrator.evals.reviewer_trial.__main__._load_corpus',
+                return_value=manifest,
+            ),
+            patch(
+                'orchestrator.evals.reviewer_trial.mining.mine_fn_candidates',
+                return_value=[],
+            ),
+            patch(
+                'orchestrator.evals.reviewer_trial.mining.mine_escalation_refs',
+                return_value={},
+            ),
+            patch(
+                'orchestrator.evals.reviewer_trial.__main__._fetch_titles',
+                return_value={},
+            ),
+            patch(
+                'orchestrator.evals.reviewer_trial.mining.audit_corpus',
+                return_value=stub_report,
+            ) as audit_spy,
+        ):
+            runner = CliRunner()
+            result = runner.invoke(cli, ['mine', '--min-diffs', '80'])
+
+        assert result.exit_code == 0, (
+            f'Command exited with code {result.exit_code}.\nOutput:\n{result.output}'
+            + (f'\nException: {result.exception}' if result.exception else '')
+        )
+
+        audit_spy.assert_called_once()
+        call_args = audit_spy.call_args
+        if 'min_diffs' in call_args.kwargs:
+            actual_min_diffs = call_args.kwargs['min_diffs']
+        else:
+            # Accept a positional form too: audit_corpus(manifest, log, min_diffs).
+            actual_min_diffs = call_args.args[2]
+
+        assert actual_min_diffs == 80, (
+            "mine --min-diffs 80 should thread 80 into audit_corpus's min_diffs kwarg, "
+            f'got {actual_min_diffs!r} (call_args={call_args!r}).\n'
             f'Output:\n{result.output}'
         )
 

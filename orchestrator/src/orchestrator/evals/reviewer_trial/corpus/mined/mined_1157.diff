@@ -1,0 +1,129 @@
+diff --git a/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py b/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py
+index 6dd7bf33cd..7b96e6ce07 100644
+--- a/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py
++++ b/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py
+@@ -137,6 +137,30 @@ driven by a server-side fact-text readback. After persisting the edge, the serve
+ count as successful edge updates. This prevents silent write failures from inflating the \
+ `edges_updated` stat and triggering false-positive judge passes.
+ 
++## Refresh Entity Summary Failure Recording (Task 1157)
++When the response from `mcp__fused-memory__refresh_entity_summary` contains an `error` \
++field (commonly with `error_type` such as `NodeNotFoundError`), you MUST preserve the \
++attempted entity_uuid so Stage 2 of this cycle can target it precisely instead of \
++recovering it heuristically. **A response is a successful refresh only when it does NOT \
++contain an `error` key.**
++
++1. On any refresh_entity_summary error response, append the attempted entity_uuid to a list \
++   in your stats dict under the key `entity_refresh_failed_uuids`. The stats dict is \
++   built up across the cycle and emitted in your structured-output report at the end, so \
++   you always have the opportunity to record the UUID there before finalising. Initialise \
++   to a fresh list on the first failure; append (do not overwrite) on subsequent failures \
++   so multiple failures in one cycle are all recorded.
++2. Continue with the remaining work — a single refresh failure does not abort the cycle.
++
++The stats dict is the single channel for these UUIDs. Do **not** invent side-channel \
++markers (e.g. `add_episode(source_description="REFRESH_FAILURE:...")`): episode \
++`source_description` is not surfaced by `search`/`get_episodes`, so any such marker is \
++unrecoverable and Stage 2 has no way to read it.
++
++Skipping this recording forces Stage 2 to re-scan all entity summaries heuristically to \
++discover which one failed, costing a full reconciliation cycle instead of one targeted \
++`refresh_entity_summary` call per UUID.
++
+ ## Retrospective Episodes
+ When creating or reviewing retrospective summaries via `add_episode`, always pass \
+ `reference_time` set to the ISO 8601 date when the described state was **current**, \
+diff --git a/fused-memory/src/fused_memory/reconciliation/prompts/stage2.py b/fused-memory/src/fused_memory/reconciliation/prompts/stage2.py
+index 854a6adfdc..86e4351fe7 100644
+--- a/fused-memory/src/fused_memory/reconciliation/prompts/stage2.py
++++ b/fused-memory/src/fused_memory/reconciliation/prompts/stage2.py
+@@ -214,6 +214,34 @@ cycle, do NOT re-act — instead note in your summary that the flag was carried
+ run `persisted_from_run` and no new action is needed. If no prior action is found, treat \
+ the flag as a normal finding and act on it.
+ 
++## Consuming Stage 1 Refresh Failures (Task 1157)
++At the start of each cycle, check whether the Stage 1 payload includes a non-empty \
++`entity_refresh_failed_uuids` list in its structured report. These are entities whose \
++prior `mcp__fused-memory__refresh_entity_summary` call returned an error response in \
++the Stage 1 run; they are targeted retries, not heuristic re-scans. The stats dict is \
++the single authoritative channel for these UUIDs — do not search for `source_description` \
++markers or other side channels, because Stage 1 does not write them and the fused-memory \
++`search` API does not match on episode `source_description` anyway.
++
++For each UUID in `entity_refresh_failed_uuids`:
++1. Call `mcp__fused-memory__refresh_entity_summary(entity_uuid=<uuid>, \
++   project_id=<current project_id>)` to attempt the deferred refresh.
++2. Inspect the response. **A response is a successful refresh only when it does NOT \
++   contain an `error` key.** On a successful refresh, add the UUID to \
++   `entity_refresh_retried_succeeded` in your stats.
++3. If the response contains an `error` field (commonly with `error_type` such as \
++   `NodeNotFoundError`), add the UUID to `entity_refresh_retried_failed` in your stats \
++   and include a note in your structured report so the operator can investigate the \
++   persistently unreachable entity.
++
++Process up to 20 UUIDs before beginning other reconciliation work. Record any remainder \
++(beyond the 20-UUID cap) in `entity_refresh_retried_deferred` in your stats so the \
++next cycle can pick them up. If you encounter 3 or more consecutive errors, stop \
++retrying and record the remaining UUIDs in `entity_refresh_retried_deferred` — \
++consecutive errors likely indicate a backend outage rather than individual entity \
++problems. Each retry costs one tool call; skipping them forces the next Stage 1 cycle \
++to re-discover the failed entity by scanning all entity summaries heuristically.
++
+ ## Mem0 Active-Query Flag Deletion (FIX C)
+ Some flagged items in the "Stage 1 Flagged Items" section originate from a Mem0 \
+ active-query path (identified by a `_source: mem0_active_query` marker or a `flag_id` \
+diff --git a/fused-memory/tests/test_refresh_entity_summary.py b/fused-memory/tests/test_refresh_entity_summary.py
+index 21aa777874..c14c88add6 100644
+--- a/fused-memory/tests/test_refresh_entity_summary.py
++++ b/fused-memory/tests/test_refresh_entity_summary.py
+@@ -864,6 +864,50 @@ class TestStage1PromptMentionsRefreshEntitySummary:
+         assert 'after delet' in prompt_lower or 'after you delet' in prompt_lower
+ 
+ 
++# ---------------------------------------------------------------------------
++# Contract test: entity_refresh_failed_uuids flows through _format_report
++# ---------------------------------------------------------------------------
++
++class TestEntityRefreshFailedUuidsFlowsToStage2Payload:
++    """Behavioral test: entity_refresh_failed_uuids in Stage 1 stats reaches Stage 2 payload.
++
++    The producer→consumer contract is:
++      Stage 1 writes entity_refresh_failed_uuids to its stats dict →
++      _format_report JSON-serializes stats into the Stage 2 user prompt →
++      Stage 2 reads the UUIDs from the payload.
++
++    This class pins the serialization step so that renaming or dropping the key
++    is caught before it silently breaks Stage 2's retry logic.
++    """
++
++    def test_stage1_stats_with_failed_uuids_preserved_by_format_report(self):
++        """UUIDs in stats['entity_refresh_failed_uuids'] appear in _format_report output.
++
++        _format_report embeds stats as a JSON string in the Stage 2 user prompt (via
++        task_knowledge_sync.py assemble_payload). A UUID placed in the list under
++        entity_refresh_failed_uuids must survive into the rendered string intact so
++        Stage 2 can parse and retry it.
++        """
++        from datetime import UTC, datetime
++
++        from fused_memory.models.reconciliation import StageId, StageReport
++        from fused_memory.reconciliation.stages.task_knowledge_sync import _format_report
++
++        now = datetime.now(tz=UTC)
++        report = StageReport(
++            stage=StageId.memory_consolidator,
++            started_at=now,
++            completed_at=now,
++            stats={"entity_refresh_failed_uuids": ["uuid-aaaa-1111", "uuid-bbbb-2222"]},
++        )
++
++        rendered = _format_report(report)
++
++        assert "entity_refresh_failed_uuids" in rendered
++        assert "uuid-aaaa-1111" in rendered
++        assert "uuid-bbbb-2222" in rendered
++
++
+ # ---------------------------------------------------------------------------
+ # step-15: partial_failure_misreported fix in MemoryService.refresh_entity_summary
+ # ---------------------------------------------------------------------------

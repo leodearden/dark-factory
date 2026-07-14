@@ -1,0 +1,175 @@
+diff --git a/escalation/src/escalation/queue.py b/escalation/src/escalation/queue.py
+index af0a676e16..29d2ec0de8 100644
+--- a/escalation/src/escalation/queue.py
++++ b/escalation/src/escalation/queue.py
+@@ -356,7 +356,11 @@ class EscalationQueue:
+             raise
+ 
+     def dismiss_all_pending(self, resolution: str) -> int:
+-        """Dismiss all pending escalations with the given resolution message.
++        """Dismiss all pending L0 escalations with the given resolution message.
++
++        Level-1 escalations are PRESERVED — they represent steward→human work
++        that must survive orchestrator restart and require human attention.
++        Only level-0 (agent→steward) escalations are dismissed.
+ 
+         Returns the number of escalations where resolve() returned non-None.
+         In the common single-writer case this equals the number actually dismissed.
+@@ -368,14 +372,14 @@ class EscalationQueue:
+         """
+         pending = self.get_pending()
+         count = 0
+-        for esc in pending:
++        for esc in (e for e in pending if e.level == 0):
+             try:
+                 if self.resolve(esc.id, resolution, dismiss=True, resolved_by='auto-dismissed') is not None:
+                     count += 1
+             except Exception as e:
+                 logger.warning(f'Failed to dismiss escalation {esc.id}: {e}')
+         if count:
+-            logger.info(f'Dismissed {count} stale escalation(s): {resolution[:100]}')
++            logger.info(f'Dismissed {count} stale L0 escalation(s): {resolution[:100]}')
+         return count
+ 
+     def make_id(self, task_id: str) -> str:
+diff --git a/escalation/tests/test_queue.py b/escalation/tests/test_queue.py
+index acf00babbd..6fe5e04a65 100644
+--- a/escalation/tests/test_queue.py
++++ b/escalation/tests/test_queue.py
+@@ -13,7 +13,7 @@ from escalation.models import Escalation
+ from escalation.queue import EscalationQueue, iter_all_escalation_paths
+ 
+ 
+-def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending') -> Escalation:
++def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending', level: int = 0) -> Escalation:
+     esc = Escalation(
+         id=esc_id,
+         task_id=task_id,
+@@ -21,6 +21,7 @@ def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending') -
+         severity='blocking',
+         category='task_failure',
+         summary='Something failed',
++        level=level,
+     )
+     esc.status = status
+     return esc
+@@ -201,6 +202,68 @@ class TestDismissAllPendingResilience:
+         assert count == 0
+ 
+ 
++class TestDismissAllPendingPreservesL1:
++    """EscalationQueue.dismiss_all_pending() must NOT dismiss level-1 escalations."""
++
++    def test_dismiss_all_pending_skips_level_1_escalations(self, tmp_path: Path):
++        """L0 escalation is dismissed; L1 escalation remains pending — count is 1."""
++        queue = EscalationQueue(tmp_path / 'queue')
++        l0 = _make_escalation('esc-l0-1', task_id='1', level=0)
++        l1 = _make_escalation('esc-l1-1', task_id='2', level=1)
++        queue.submit(l0)
++        queue.submit(l1)
++
++        count = queue.dismiss_all_pending('Auto-dismissed: orchestrator restarted')
++
++        assert count == 1
++
++        updated_l0 = queue.get('esc-l0-1')
++        assert updated_l0 is not None
++        assert updated_l0.status == 'dismissed'
++
++        updated_l1 = queue.get('esc-l1-1')
++        assert updated_l1 is not None
++        assert updated_l1.status == 'pending'
++        assert updated_l1.resolved_at is None
++        assert updated_l1.resolved_by is None
++
++    def test_dismiss_all_pending_only_l1_returns_zero(self, tmp_path: Path):
++        """Queue with only an L1 escalation: dismiss_all_pending returns 0, L1 stays pending."""
++        queue = EscalationQueue(tmp_path / 'queue')
++        l1 = _make_escalation('esc-l1-1', task_id='1', level=1)
++        queue.submit(l1)
++
++        count = queue.dismiss_all_pending('Auto-dismissed: orchestrator restarted')
++
++        assert count == 0
++
++        updated_l1 = queue.get('esc-l1-1')
++        assert updated_l1 is not None
++        assert updated_l1.status == 'pending'
++
++    def test_dismiss_all_pending_idempotent_with_l1(self, tmp_path: Path):
++        """Calling dismiss_all_pending twice is safe: second call returns 0, L1 is unmodified."""
++        queue = EscalationQueue(tmp_path / 'queue')
++        l0 = _make_escalation('esc-l0-1', task_id='1', level=0)
++        l1 = _make_escalation('esc-l1-1', task_id='2', level=1)
++        queue.submit(l0)
++        queue.submit(l1)
++
++        first = queue.dismiss_all_pending('Auto-dismissed: orchestrator restarted')
++        assert first == 1
++
++        # Second call — no pending L0s remain; L1 is untouched.
++        second = queue.dismiss_all_pending('Auto-dismissed: orchestrator restarted')
++        assert second == 0
++
++        # L1 status/resolved_at/resolved_by are unchanged across both calls.
++        updated_l1 = queue.get('esc-l1-1')
++        assert updated_l1 is not None
++        assert updated_l1.status == 'pending'
++        assert updated_l1.resolved_at is None
++        assert updated_l1.resolved_by is None
++
++
+ class TestGetArchiveFallback:
+     """EscalationQueue.get() falls back to the archive when the root path is missing."""
+ 
+diff --git a/orchestrator/src/orchestrator/harness.py b/orchestrator/src/orchestrator/harness.py
+index e2649b2d6d..e0b4fe3369 100644
+--- a/orchestrator/src/orchestrator/harness.py
++++ b/orchestrator/src/orchestrator/harness.py
+@@ -2202,13 +2202,16 @@ Output JSON matching the schema. Every task must appear in the output.
+                 ) from exc
+ 
+     async def _dismiss_stale_escalations(self) -> None:
+-        """Dismiss all pending escalations left over from prior orchestrator runs.
++        """Dismiss stale L0 escalations left over from prior orchestrator runs.
+ 
+-        Called right after _start_escalation_server() so that any escalations
+-        persisted in the queue directory from a previous (crashed or completed)
+-        run are cleared before the new run begins.  All pending escalations at
+-        startup are by definition stale — a new run should never inherit
+-        unresolved escalations from a prior one.
++        Called right after _start_escalation_server() so that any L0
++        (agent→steward) escalations persisted in the queue directory from a
++        previous (crashed or completed) run are cleared before the new run
++        begins.
++
++        L1 (steward→human) escalations are intentionally preserved across
++        restart — they represent human-attention requests that were not yet
++        acted on and must not be silently lost during long AFK periods.
+         """
+         if self._escalation_queue is None:
+             return
+@@ -2218,7 +2221,10 @@ Output JSON matching the schema. Every task must appear in the output.
+         )
+         count = self._escalation_queue.dismiss_all_pending(resolution)
+         if count:
+-            logger.info(f'Dismissed {count} stale escalation(s) from prior run')
++            logger.info(
++                f'Dismissed {count} stale L0 escalation(s) from prior run; '
++                f'L1 escalations preserved across restart'
++            )
+ 
+     async def _stop_escalation_server(self) -> None:
+         """Stop the escalation server."""
+diff --git a/orchestrator/tests/test_stale_escalation_cleanup.py b/orchestrator/tests/test_stale_escalation_cleanup.py
+index fa6c013952..b857999396 100644
+--- a/orchestrator/tests/test_stale_escalation_cleanup.py
++++ b/orchestrator/tests/test_stale_escalation_cleanup.py
+@@ -16,6 +16,7 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
+     """Create a Harness with mocked internals for unit testing stale escalation cleanup."""
+     with (
+         patch('orchestrator.harness.McpLifecycle'),
++        patch('orchestrator.harness.OverrideStore'),
+         patch('orchestrator.harness.Scheduler'),
+         patch('orchestrator.harness.BriefingAssembler'),
+     ):

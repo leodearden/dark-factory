@@ -1,0 +1,45 @@
+{
+  "diff_id": "mined_924",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/tests/test_ticket_worker.py:2036-2042",
+      "category": "test_flakiness",
+      "severity": "suggestion",
+      "description": "The test gives the background worker a fixed `await asyncio.sleep(0.5)` window to drain 3 tickets and record the batch call, then asserts outside the finally. Under load / a slow CI runner the worker may not have called `_process_add_tickets_batch` yet, yielding `len(call_args_log) == 0` and a false failure; a condition-based wait (poll until `call_args_log` is non-empty or a deadline) would be deterministic.",
+      "mutation_type": "concurrency"
+    },
+    {
+      "id": "frontier_2",
+      "location": "fused-memory/tests/test_ticket_worker.py:2045-2049",
+      "category": "resource_leak",
+      "severity": "suggestion",
+      "description": "Worker cleanup is guarded by `hasattr(ti, '_worker_tasks')`; if the worker-task registry attribute is named differently, `workers` is silently `[]` and the spawned worker task is never cancelled/awaited, leaking a background task across tests and masking the miss. The guard swallows the mismatch rather than failing loudly.",
+      "mutation_type": "resource_leak"
+    },
+    {
+      "id": "frontier_3",
+      "location": "fused-memory/tests/test_ticket_worker.py:2011-2018",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "`ticket_store.submit()` is called for the 3 tickets and then the same ids are manually `put_nowait` onto `ti._ticket_queues[project_id]`; if `submit` also enqueues onto that queue, tickets are double-enqueued, which could produce extra batch calls or extra `add_task` invocations that exhaust the 3-item `side_effect`. The test assumes submit does not enqueue, which is not established.",
+      "mutation_type": "test_gap"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "924",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 3,
+    "verify_attempts": 4,
+    "signal_reason": [
+      "verify_attempts>=2 (actual=4)",
+      "escalation_created event"
+    ],
+    "merge_sha": "c0ec5611a8564be8da04dd6019daa216df01c053",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

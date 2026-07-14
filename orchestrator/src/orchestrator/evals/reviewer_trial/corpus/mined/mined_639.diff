@@ -1,0 +1,321 @@
+diff --git a/orchestrator/src/orchestrator/evals/runner.py b/orchestrator/src/orchestrator/evals/runner.py
+index 2f3f143887..8ef6258a66 100644
+--- a/orchestrator/src/orchestrator/evals/runner.py
++++ b/orchestrator/src/orchestrator/evals/runner.py
+@@ -460,13 +460,17 @@ class _EvalScheduler:
+ 
+     def __init__(self, config: OrchestratorConfig):
+         self.config = config
+-        self._status_cache: dict[str, str] = {}
++        self._cache: dict[str, str] = {}
+ 
+     async def get_tasks(self):
+         return []
+ 
+     async def set_task_status(self, task_id: str, status: str):
+         logger.info(f'[eval] Task {task_id} → {status}')
++        self._cache[task_id] = status
++
++    def get_cached_status(self, task_id: str) -> str | None:
++        return self._cache.get(task_id)
+ 
+     async def handle_blast_radius_expansion(self, task_id: str, current: list[str], needed: list[str]) -> bool:
+         return True  # always allow in eval mode
+diff --git a/orchestrator/src/orchestrator/scheduler.py b/orchestrator/src/orchestrator/scheduler.py
+index ace98da833..3879dd8f47 100644
+--- a/orchestrator/src/orchestrator/scheduler.py
++++ b/orchestrator/src/orchestrator/scheduler.py
+@@ -237,6 +237,10 @@ class Scheduler:
+         except Exception as e:
+             logger.error(f'Failed to set task {task_id} status to {status}: {e}')
+ 
++    def get_cached_status(self, task_id: str) -> str | None:
++        """Return the last known status for a task, or None if not yet seen."""
++        return self._status_cache.get(task_id)
++
+     async def update_task(self, task_id: str, metadata: str | dict) -> bool:
+         """Update task metadata via fused-memory. Returns True on success."""
+         # fused-memory update_task expects metadata as a JSON string
+diff --git a/orchestrator/src/orchestrator/workflow.py b/orchestrator/src/orchestrator/workflow.py
+index 86fa172886..f938a89e11 100644
+--- a/orchestrator/src/orchestrator/workflow.py
++++ b/orchestrator/src/orchestrator/workflow.py
+@@ -53,11 +53,11 @@ if TYPE_CHECKING:
+ 
+ 
+ class _SchedulerLike(Protocol):
+-    _status_cache: dict[str, str]
+     async def set_task_status(self, task_id: str, status: str, /) -> None: ...
+     async def handle_blast_radius_expansion(
+         self, task_id: str, current: list[str], needed: list[str], /
+     ) -> bool: ...
++    def get_cached_status(self, task_id: str, /) -> str | None: ...
+ 
+ 
+ class _McpLike(Protocol):
+@@ -681,6 +681,7 @@ class TaskWorkflow:
+         assert result is not None  # range(2) always executes at least once
+         if not self.plan:
+             logger.error(f'Task {self.task_id}: architect produced no plan.json')
++            assert result is not None  # range(2) is always non-empty; loop always assigns result
+             return await self._mark_blocked(
+                 'Planning failed: no plan.json produced',
+                 detail=(
+@@ -1949,7 +1950,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
+                 # Guard: steward may have marked the task done (terminal).
+                 # The scheduler rejects done→pending, but we must also
+                 # return the correct outcome.
+-                cached = self.scheduler._status_cache.get(self.task_id)
++                cached = self.scheduler.get_cached_status(self.task_id)
+                 if cached in TERMINAL_STATUSES:
+                     logger.info(
+                         'Task %s: status is %s after steward — not re-queueing',
+diff --git a/orchestrator/tests/test_scheduler.py b/orchestrator/tests/test_scheduler.py
+index b6db1cc03f..9f0e4c9a1f 100644
+--- a/orchestrator/tests/test_scheduler.py
++++ b/orchestrator/tests/test_scheduler.py
+@@ -378,7 +378,10 @@ class TestStatusTransitionGuard:
+ 
+ 
+ class TestGetTasksSeedsCache:
+-    """get_tasks() should populate the _status_cache so pre-existing terminal tasks are guarded."""
++    """get_tasks() should populate the status cache so pre-existing terminal tasks are guarded.
++
++    Uses get_cached_status() to verify cache contents.
++    """
+ 
+     @pytest.fixture
+     def scheduler(self) -> Scheduler:
+@@ -426,7 +429,7 @@ class TestGetTasksSeedsCache:
+         set_mock = AsyncMock(return_value={})
+         monkeypatch.setattr('orchestrator.scheduler.mcp_call', set_mock)
+         await scheduler.set_task_status('42', 'cancelled')
+-        assert scheduler._status_cache.get('42') == 'cancelled'
++        assert scheduler.get_cached_status('42') == 'cancelled'
+ 
+         # Step 2: Simulate store reinstatement — task 42 is now 'pending'
+         reinstated_response = {
+@@ -444,7 +447,7 @@ class TestGetTasksSeedsCache:
+ 
+         # Step 3: get_tasks() must resync cache to match store
+         await scheduler.get_tasks()
+-        assert scheduler._status_cache.get('42') == 'pending', (
++        assert scheduler.get_cached_status('42') == 'pending', (
+             'get_tasks() must trust store reinstatement of cancelled -> pending'
+         )
+ 
+@@ -464,7 +467,7 @@ class TestGetTasksSeedsCache:
+         set_mock = AsyncMock(return_value={})
+         monkeypatch.setattr('orchestrator.scheduler.mcp_call', set_mock)
+         await scheduler.set_task_status('42', 'in-progress')
+-        assert scheduler._status_cache.get('42') == 'in-progress'
++        assert scheduler.get_cached_status('42') == 'in-progress'
+ 
+         # Simulate taskmaster reporting a different non-terminal status ('blocked')
+         update_response = {
+@@ -483,7 +486,7 @@ class TestGetTasksSeedsCache:
+         await scheduler.get_tasks()
+ 
+         # Non-terminal cache entry SHOULD be updated
+-        assert scheduler._status_cache.get('42') == 'blocked', (
++        assert scheduler.get_cached_status('42') == 'blocked', (
+             'get_tasks() should update non-terminal cache entries'
+         )
+ 
+@@ -1070,10 +1073,12 @@ class TestCancelledTaskResync:
+     """Regression: externally reinstated cancelled tasks must not spin-loop.
+ 
+     Reproduces the bug where 15 cancelled tasks were reinstated to pending in
+-    the store, but the scheduler's _status_cache still held 'cancelled'.  The
++    the store, but the scheduler's status cache still held 'cancelled'.  The
+     terminal guard rejected every cancelled->in-progress transition, and the
+     task was immediately reacquired — an infinite spin that starved pending
+     tasks (156k+ rejections for a single task).
++
++    Uses get_cached_status() to verify cache contents.
+     """
+ 
+     @pytest.fixture
+@@ -1091,7 +1096,7 @@ class TestCancelledTaskResync:
+ 
+         # 1. Orchestrator cancels the task — cache records 'cancelled'
+         await scheduler.set_task_status('64', 'cancelled')
+-        assert scheduler._status_cache['64'] == 'cancelled'
++        assert scheduler.get_cached_status('64') == 'cancelled'
+ 
+         # 2. External process reinstates to pending (store returns pending)
+         reinstated_task = {
+@@ -1125,7 +1130,7 @@ class TestCancelledTaskResync:
+ 
+         # 4. Cache must now show 'pending' (resynced from store)
+         #    so that set_task_status('in-progress') is NOT rejected
+-        assert scheduler._status_cache['64'] == 'pending'
++        assert scheduler.get_cached_status('64') == 'pending'
+ 
+         # 5. Transition to in-progress must succeed (not be silently dropped)
+         ip_mock = AsyncMock(return_value={})
+@@ -1136,7 +1141,7 @@ class TestCancelledTaskResync:
+             'set_task_status(in-progress) must issue MCP call after reinstatement — '
+             'was silently rejected by stale terminal guard before fix'
+         )
+-        assert scheduler._status_cache['64'] == 'in-progress'
++        assert scheduler.get_cached_status('64') == 'in-progress'
+ 
+     @pytest.mark.asyncio
+     async def test_spin_loop_does_not_occur(
+@@ -1274,3 +1279,25 @@ class TestRequeueCooldown:
+ 
+         a2 = await scheduler.acquire_next()
+         assert a2 is not None and a2.task_id == '99'
++
++
++class TestGetCachedStatus:
++    """get_cached_status() exposes the internal status cache via a public method."""
++
++    @pytest.fixture
++    def scheduler(self) -> Scheduler:
++        config = OrchestratorConfig(max_per_module=1)
++        return Scheduler(config)
++
++    def test_get_cached_status_returns_none_for_unknown_task(self, scheduler: Scheduler):
++        """get_cached_status returns None when the task has never been seen."""
++        assert scheduler.get_cached_status('unknown') is None
++
++    @pytest.mark.asyncio
++    async def test_get_cached_status_returns_status_after_set_task_status(
++        self, scheduler: Scheduler, monkeypatch
++    ):
++        """get_cached_status returns the last status written via set_task_status."""
++        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value={}))
++        await scheduler.set_task_status('42', 'in-progress')
++        assert scheduler.get_cached_status('42') == 'in-progress'
+diff --git a/orchestrator/tests/test_workflow_e2e.py b/orchestrator/tests/test_workflow_e2e.py
+index ec5a2b0236..c1141b29f7 100644
+--- a/orchestrator/tests/test_workflow_e2e.py
++++ b/orchestrator/tests/test_workflow_e2e.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ import asyncio
+ import json
+ from pathlib import Path
++from typing import TYPE_CHECKING
+ from unittest.mock import AsyncMock
+ 
+ import pytest
+@@ -351,7 +352,6 @@ class FakeScheduler:
+ 
+     def __init__(self):
+         self.statuses: dict[str, list[str]] = {}
+-        self._status_cache: dict[str, str] = {}
+ 
+     async def set_task_status(self, task_id: str, status: str) -> None:
+         self.statuses.setdefault(task_id, []).append(status)
+@@ -361,6 +361,10 @@ class FakeScheduler:
+     ) -> bool:
+         return True
+ 
++    def get_cached_status(self, task_id: str) -> str | None:
++        history = self.statuses.get(task_id)
++        return history[-1] if history else None
++
+     def release(self, task_id: str) -> None:
+         pass
+ 
+@@ -2019,33 +2023,77 @@ class TestWipRecoveryNoAdvance:
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# Tests: Protocol Conformance — _SchedulerLike test doubles
++# Protocol conformance — see TYPE_CHECKING block at the bottom of this file.
++# Static assertions (pyright-verified) replaced the old hasattr/isinstance
++# runtime checks, which only tested attribute presence, not method signatures.
+ # ---------------------------------------------------------------------------
+ 
+ 
+-class TestSchedulerProtocolConformance:
+-    """Verify that test doubles satisfy the _SchedulerLike Protocol."""
++# ---------------------------------------------------------------------------
++# Tests: FakeScheduler.get_cached_status
++# ---------------------------------------------------------------------------
++
+ 
+-    def test_fake_scheduler_has_status_cache(self):
+-        """FakeScheduler must have _status_cache to satisfy _SchedulerLike."""
++class TestFakeSchedulerCachedStatus:
++    """FakeScheduler.get_cached_status returns the last status set for a task."""
++
++    def test_get_cached_status_returns_none_before_any_set(self):
++        """Before any set_task_status call, get_cached_status returns None."""
+         fake = FakeScheduler()
+-        assert hasattr(fake, '_status_cache'), (
+-            'FakeScheduler is missing _status_cache required by the _SchedulerLike Protocol'
+-        )
+-        assert isinstance(fake._status_cache, dict), (
+-            '_status_cache must be a dict[str, str]'
+-        )
++        assert fake.get_cached_status('x') is None
++
++    @pytest.mark.asyncio
++    async def test_get_cached_status_returns_last_set_status(self):
++        """get_cached_status returns the most recent status after multiple sets."""
++        fake = FakeScheduler()
++        await fake.set_task_status('x', 'in-progress')
++        await fake.set_task_status('x', 'done')
++        assert fake.get_cached_status('x') == 'done'
++
++
++# ---------------------------------------------------------------------------
++# Tests: _EvalScheduler.get_cached_status
++# ---------------------------------------------------------------------------
++
+ 
+-    def test_eval_scheduler_has_status_cache(self):
+-        """_EvalScheduler must have _status_cache to satisfy _SchedulerLike."""
++class TestEvalSchedulerCachedStatus:
++    """_EvalScheduler.get_cached_status tracks status set via set_task_status."""
++
++    def test_eval_scheduler_get_cached_status_returns_none_initially(self):
++        """Before any set_task_status call, get_cached_status returns None."""
+         from orchestrator.config import OrchestratorConfig
+         from orchestrator.evals.runner import _EvalScheduler
+ 
+-        cfg = OrchestratorConfig()
+-        sched = _EvalScheduler(cfg)
+-        assert hasattr(sched, '_status_cache'), (
+-            '_EvalScheduler is missing _status_cache required by the _SchedulerLike Protocol'
+-        )
+-        assert isinstance(sched._status_cache, dict), (
+-            '_status_cache must be a dict[str, str]'
+-        )
++        sched = _EvalScheduler(OrchestratorConfig())
++        assert sched.get_cached_status('99') is None
++
++    @pytest.mark.asyncio
++    async def test_eval_scheduler_get_cached_status_tracks_set_task_status(self):
++        """get_cached_status returns the status written by set_task_status."""
++        from orchestrator.config import OrchestratorConfig
++        from orchestrator.evals.runner import _EvalScheduler
++
++        sched = _EvalScheduler(OrchestratorConfig())
++        await sched.set_task_status('99', 'done')
++        assert sched.get_cached_status('99') == 'done'
++
++
++# ---------------------------------------------------------------------------
++# Static Protocol conformance checks (pyright-verified)
++#
++# This block MUST live at the bottom of the file, after the FakeScheduler class
++# definition (line ~361). Placing it at the top would require forward-referencing
++# FakeScheduler() before its definition, which forces a # type: ignore[name-defined]
++# suppression. pyright then infers the expression type as Unknown, which trivially
++# satisfies any Protocol — making the check catch nothing. Keeping the block here
++# allows pyright to resolve FakeScheduler to its concrete class and verify full
++# structural conformance (parameter names, types, return types, positional-only
++# markers), not just attribute presence.
++# ---------------------------------------------------------------------------
++
++if TYPE_CHECKING:
++    from orchestrator.evals.runner import _EvalScheduler as _EvalSchedulerStatic
++    from orchestrator.workflow import _SchedulerLike
++
++    _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()
++    _eval_scheduler_conforms: _SchedulerLike = _EvalSchedulerStatic(OrchestratorConfig())

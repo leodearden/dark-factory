@@ -35,6 +35,8 @@ class CorpusDiff:
     ground_truth: list[GroundTruthIssue]
     project: str | None = None  # for cwd resolution
     cwd: Path | None = None
+    split: str | None = None       # "train" | "selection" | "test"
+    provenance: dict | None = None  # mining provenance: runs.db refs, escalation refs, merge_sha
 
     def blocking_issues(self) -> list[GroundTruthIssue]:
         return [gt for gt in self.ground_truth if gt.severity == 'blocking']
@@ -49,6 +51,7 @@ class CorpusManifest:
 
     diffs: list[CorpusDiff] = field(default_factory=list)
     version: str = '1.0'
+    split_seed: str | None = None  # seed used by mining.assign_split for this manifest
 
     def filter_by_language(self, language: str) -> list[CorpusDiff]:
         return [d for d in self.diffs if d.language == language]
@@ -69,6 +72,8 @@ class CorpusManifest:
             'version': self.version,
             'diffs': [],
         }
+        if self.split_seed is not None:
+            manifest_data['split_seed'] = self.split_seed
         for diff in self.diffs:
             # Write diff file
             diff_dir = corpus_dir / diff.source
@@ -84,6 +89,8 @@ class CorpusManifest:
                 'diff_id': diff.diff_id,
                 'ground_truth': [asdict(gt) for gt in diff.ground_truth],
             }
+            if diff.provenance is not None:
+                ann_data['provenance'] = diff.provenance
             ann_file.write_text(json.dumps(ann_data, indent=2))
 
             # Manifest entry (no diff_text — loaded from file)
@@ -95,6 +102,8 @@ class CorpusManifest:
             }
             if diff.project:
                 entry['project'] = diff.project
+            if diff.split is not None:
+                entry['split'] = diff.split
             manifest_data['diffs'].append(entry)
 
         path.write_text(json.dumps(manifest_data, indent=2))
@@ -116,11 +125,13 @@ class CorpusManifest:
             # Load annotations
             ann_file = corpus_dir / 'annotations' / f'{diff_id}.json'
             ground_truth = []
+            provenance = None
             if ann_file.exists():
                 ann_data = json.loads(ann_file.read_text())
                 ground_truth = [
                     GroundTruthIssue(**gt) for gt in ann_data['ground_truth']
                 ]
+                provenance = ann_data.get('provenance')
 
             cwd = None
             project = entry.get('project')
@@ -136,9 +147,15 @@ class CorpusManifest:
                 ground_truth=ground_truth,
                 project=project,
                 cwd=cwd,
+                split=entry.get('split'),
+                provenance=provenance,
             ))
 
-        return cls(diffs=diffs, version=raw.get('version', '1.0'))
+        return cls(
+            diffs=diffs,
+            version=raw.get('version', '1.0'),
+            split_seed=raw.get('split_seed'),
+        )
 
 
 # Project → working directory mapping for invoke_agent cwd

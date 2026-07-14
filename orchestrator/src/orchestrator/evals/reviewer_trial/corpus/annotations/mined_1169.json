@@ -1,0 +1,44 @@
+{
+  "diff_id": "mined_1169",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:240-244",
+      "category": "false_negative",
+      "severity": "blocking",
+      "description": "The suppression check relies on semantic/vector search (`search(query=\"stage1_flag_suppression\", ...)`) to locate a specific task's suppression record. Vector search returns only a bounded top-k ranked by similarity, so when suppression records exist for many tasks (or the corpus is large), the record for the target task_id may not appear in the results at all. The check then concludes 'no suppression in effect' and emits the flag \u2014 a false negative that exactly matches the flagged symptom (review passed but escalation_created). A deterministic metadata lookup (e.g. get_memories_by_metadata / count_memories_by_metadata filtered on kind+task_id) is required.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_2",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:240",
+      "category": "logic",
+      "severity": "blocking",
+      "description": "The search query string is the generic literal \"stage1_flag_suppression\" and does not include the target task_id, so records for all other tasks compete for the limited top-k slots and can crowd out the relevant task's record, again causing the target's suppression to be missed.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_3",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:241-242",
+      "category": "type",
+      "severity": "suggestion",
+      "description": "The validity test requires `metadata.task_id == <N>` as an integer, but metadata persisted through Mem0 may store the task_id as a string; a strict integer equality check would then reject a genuine suppression record and fall through to emitting the flag (false negative). The comparison should be type-normalized.",
+      "mutation_type": "type"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1169",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "7659afed4175b52aa3bcb7c5c6da301930498f8e",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

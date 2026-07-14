@@ -1,0 +1,45 @@
+{
+  "diff_id": "mined_639",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "orchestrator/tests/test_workflow_e2e.py:364-367",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "The refactor silently changes FakeScheduler's cache semantics. Previously `_status_cache` was an empty dict that `set_task_status` never populated, so the workflow's `cached in TERMINAL_STATUSES` check always saw `None` and re-queued. The new `get_cached_status` returns `history[-1]` (the actual last status), so if the last status is terminal the workflow now takes the 'not re-queueing' branch. This is a behavioral divergence in a refactor claimed to be behavior-preserving, and can alter which code path e2e tests exercise.",
+      "mutation_type": "test_gap"
+    },
+    {
+      "id": "frontier_2",
+      "location": "orchestrator/src/orchestrator/workflow.py:684",
+      "category": "dead_code",
+      "severity": "suggestion",
+      "description": "The added `assert result is not None` is redundant \u2014 an identical assertion already exists three lines earlier (line 681) and no code between them reassigns `result`. It adds nothing and is dead/duplicated code.",
+      "mutation_type": "style"
+    },
+    {
+      "id": "frontier_3",
+      "location": "orchestrator/tests/test_workflow_e2e.py:13",
+      "category": "unused_import",
+      "severity": "suggestion",
+      "description": "`from typing import TYPE_CHECKING` is added but there is no visible usage in the diff; if nothing in the file references it, this is an unused import that will trip linters.",
+      "mutation_type": "style"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "639",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 2,
+    "signal_reason": [
+      "verify_attempts>=2 (actual=2)",
+      "escalation_created event"
+    ],
+    "merge_sha": "fce631c072fe781d4ecbb4319ac2129aa21625ea",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

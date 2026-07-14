@@ -1,0 +1,36 @@
+{
+  "diff_id": "mined_1236",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "dashboard/src/dashboard/static/redux/tab_tasks.jsx:238-239",
+      "category": "logic",
+      "severity": "suggestion",
+      "description": "The same-tab exemption only covers hrefs starting with '#' or a single '/'. Genuinely SPA-internal relative links that lack a leading slash \u2014 e.g. './page', '../page', 'page', or query-only 'lang=en' target \u2014 do not match and are therefore treated as external, getting target=_blank + rel=noopener. If any rendered markdown uses relative links, they will incorrectly open in a new tab.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_2",
+      "location": "dashboard/src/dashboard/static/redux/tab_tasks.jsx:238-241",
+      "category": "logic",
+      "severity": "suggestion",
+      "description": "Non-http schemes such as 'mailto:' and 'tel:' do not start with '#' or '/', so they are treated as external and receive target=_blank + rel=noopener noreferrer, which is meaningless (and slightly odd) for these link types. Not harmful, but the external/internal split ignores non-navigational schemes.",
+      "mutation_type": "logic"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1236",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "0aba3344124994f9021e16aa06a9e389d82eb6d3",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

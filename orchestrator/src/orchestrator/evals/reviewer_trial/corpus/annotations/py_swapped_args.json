@@ -6,7 +6,7 @@
       "location": "orchestrator/src/orchestrator/git_ops.py:418",
       "category": "swapped_arguments",
       "severity": "blocking",
-      "description": "The positional arguments to_sha and from_sha are swapped in the git diff command. The original order was 'from_sha, to_sha' but the new code passes 'to_sha, from_sha', which reverses the diff direction. This produces the inverse of the intended changeset — additions appear as deletions and vice versa.",
+      "description": "The positional arguments to_sha and from_sha are swapped in the git diff command. The original order was 'from_sha, to_sha' but the new code passes 'to_sha, from_sha', which reverses the diff direction. This produces the inverse of the intended changeset \u2014 additions appear as deletions and vice versa.",
       "mutation_type": "swapped_args"
     },
     {

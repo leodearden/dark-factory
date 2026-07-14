@@ -1,0 +1,45 @@
+diff --git a/dashboard/src/dashboard/static/redux/index.html b/dashboard/src/dashboard/static/redux/index.html
+index 1f9721136d..b25b278004 100644
+--- a/dashboard/src/dashboard/static/redux/index.html
++++ b/dashboard/src/dashboard/static/redux/index.html
+@@ -25,7 +25,7 @@
+ <script type="text/babel" src="/static/redux/shell.jsx?v=9"></script>
+ <script type="text/babel" src="/static/redux/tab_overview.jsx?v=9"></script>
+ <script type="text/babel" src="/static/redux/tabs.jsx?v=9"></script>
+-<script type="text/babel" src="/static/redux/tab_tasks.jsx?v=9"></script>
++<script type="text/babel" src="/static/redux/tab_tasks.jsx?v=11"></script>
+ <script type="text/babel" src="/static/redux/app.jsx?v=9"></script>
+ </body>
+ </html>
+diff --git a/dashboard/src/dashboard/static/redux/tab_tasks.jsx b/dashboard/src/dashboard/static/redux/tab_tasks.jsx
+index 865c2654d1..01e0fbba33 100644
+--- a/dashboard/src/dashboard/static/redux/tab_tasks.jsx
++++ b/dashboard/src/dashboard/static/redux/tab_tasks.jsx
+@@ -216,15 +216,27 @@ function MarkdownText({ text, className, empty }) {
+     if (!text || typeof marked === 'undefined' || typeof DOMPurify === 'undefined') return null;
+     try {
+       const sanitized = DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }));
++      // Short-circuit: skip the <template> reparse on the common no-link path.
++      // /<a[\s>]/i matches '<a ' (attributed) and bare '<a>' so no anchor is missed.
++      if (!/<a[\s>]/i.test(sanitized)) return sanitized;
+       // Scoped anchor rewrite: mutate <a> attributes after sanitizing rather than
+       // registering a global DOMPurify hook. No future DOMPurify caller in the app
+       // silently inherits target=_blank, and dev-reload re-evaluation is harmless.
+       // <template> is inert (no script execution or resource loading), so walking
+       // already-sanitized HTML is safe; tpl.innerHTML re-serializes the post-mutation
+       // DOM (the value React injects), preserving the sanitizer's guarantees.
++      // Behavioral invariants (no JS test runner; verified manually per task spec):
++      //   a) no-anchor input short-circuits above, returning sanitized unchanged.
++      //   b) https://… external links get target=_blank + rel=noopener noreferrer.
++      //   c) #fragment and /path links stay in the same tab (in-page / SPA-internal).
++      //   d) //host protocol-relative links are treated as external — see (b).
+       const tpl = document.createElement('template');
+       tpl.innerHTML = sanitized;
+       tpl.content.querySelectorAll('a').forEach(a => {
++        // In-page fragment and SPA-relative links stay in the same tab.
++        // '//' is protocol-relative (external) and must NOT be skipped.
++        const href = a.getAttribute('href') || '';
++        if (href.startsWith('#') || (href.startsWith('/') && !href.startsWith('//'))) return;
+         a.setAttribute('target', '_blank');
+         a.setAttribute('rel', 'noopener noreferrer');
+       });

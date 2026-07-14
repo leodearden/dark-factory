@@ -1,0 +1,37 @@
+{
+  "diff_id": "mined_920",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "orchestrator/src/orchestrator/agents/roles.py:L529-L560",
+      "category": "api_misuse",
+      "severity": "suggestion",
+      "description": "The instructions hard-code resolve_ticket(timeout_seconds=60), below the server default of 115 s. On a slow curator, the client-side call can time out and return `failed` even though the curator ultimately creates the task; the agent would then report it as skipped/failed (inaccurate accounting, possible duplicate re-file) despite the task actually being created server-side.",
+      "mutation_type": "error_handling"
+    },
+    {
+      "id": "frontier_2",
+      "location": "orchestrator/src/orchestrator/agents/roles.py:L539-L546",
+      "category": "error_handling",
+      "severity": "suggestion",
+      "description": "The two-step flow only enumerates resolve_ticket statuses created/combined/failed; there is no guidance for a resolve_ticket call that returns an unexpected/missing status or that itself errors after a successful submit_task, leaving that path undefined for the agent.",
+      "mutation_type": "error_handling"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "920",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 2,
+    "signal_reason": [
+      "verify_attempts>=2 (actual=2)",
+      "escalation_created event"
+    ],
+    "merge_sha": "cca766b89a5dd314fc832d701e3b97d87df48d11",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

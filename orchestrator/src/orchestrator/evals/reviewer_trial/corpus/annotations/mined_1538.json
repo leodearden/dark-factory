@@ -1,0 +1,36 @@
+{
+  "diff_id": "mined_1538",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "dashboard/src/dashboard/static/redux/tab_overview.jsx:65",
+      "category": "partial_object_not_defaulted",
+      "severity": "suggestion",
+      "description": "The fallback `(load && load[m.key]) || { current: null, sparkline: [] }` only substitutes the default when the whole metric object is missing. If the API returns a metric object present but lacking `sparkline` (or with `sparkline: null`), `datum.sparkline` is passed to <Sparkline> as undefined/null, which could break rendering. A safer access would default the sparkline field itself.",
+      "mutation_type": "error_handling"
+    },
+    {
+      "id": "frontier_2",
+      "location": "dashboard/src/dashboard/static/redux/tab_overview.jsx:31-45",
+      "category": "overlapping_requests",
+      "severity": "suggestion",
+      "description": "`fetchLoad` is fired on a fixed 5000ms interval with no in-flight guard; if a request takes longer than 5s (slow network/server), multiple overlapping fetches can be issued and complete out of order, potentially showing stale values momentarily. Minor since each response fully replaces state.",
+      "mutation_type": "concurrency"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1538",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 1,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "4682aca54a8c08baabbb1ad3634790048b442703",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

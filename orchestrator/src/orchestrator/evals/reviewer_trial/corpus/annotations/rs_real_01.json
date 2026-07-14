@@ -6,7 +6,7 @@
       "location": "crates/reify-compiler/src/scc.rs:15",
       "category": "silent_data_corruption",
       "severity": "blocking",
-      "description": "The original HashMap::collect() from an iterator silently overwrites duplicate template names — the last entry wins. This corrupts the adjacency graph used for SCC detection because the earlier template's index is lost. The fix detects duplicates explicitly and reports them as diagnostics while preserving the first entry.",
+      "description": "The original HashMap::collect() from an iterator silently overwrites duplicate template names \u2014 the last entry wins. This corrupts the adjacency graph used for SCC detection because the earlier template's index is lost. The fix detects duplicates explicitly and reports them as diagnostics while preserving the first entry.",
       "mutation_type": "real_world"
     },
     {

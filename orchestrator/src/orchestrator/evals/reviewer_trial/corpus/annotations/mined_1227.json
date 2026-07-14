@@ -1,0 +1,44 @@
+{
+  "diff_id": "mined_1227",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "dashboard/src/dashboard/static/redux/tab_tasks.jsx:220",
+      "category": "undefined_reference",
+      "severity": "blocking",
+      "description": "MarkdownText calls `uM_T(() => {...}, [text])` as a React hook, but `uM_T` is a non-standard identifier. Unless it is an established alias for `React.useMemo` defined elsewhere (data.js or top of this module), this throws a ReferenceError and crashes the entire Tasks tab whenever a task is selected. The unusual `_T` suffix makes this a strong candidate for a typo of the intended memo alias \u2014 the kind of runtime break that passes a static review but fails at render time.",
+      "mutation_type": "api_misuse"
+    },
+    {
+      "id": "frontier_2",
+      "location": "dashboard/src/dashboard/static/redux/tab_tasks.jsx:208-216",
+      "category": "global_side_effect",
+      "severity": "suggestion",
+      "description": "DOMPurify.addHook('afterSanitizeAttributes', ...) registers a process-global hook that forces target=_blank and rel=noopener on EVERY anchor produced by ANY DOMPurify.sanitize call anywhere in the app, not just markdown rendered in the Task Detail pane. Any other current or future consumer of DOMPurify inherits this link behavior unexpectedly.",
+      "mutation_type": "api_misuse"
+    },
+    {
+      "id": "frontier_3",
+      "location": "dashboard/src/dashboard/static/redux/tab_tasks.jsx:218-224",
+      "category": "stale_memo",
+      "severity": "suggestion",
+      "description": "The useMemo dependency array is only [text]. If `marked`/`DOMPurify` load asynchronously or fail their integrity check on first render, the memo caches `null` and degrades to plain text; once the libraries later become available the memo will not recompute (text unchanged), leaving the description permanently un-rendered as markdown. Library availability is not part of the memo key.",
+      "mutation_type": "logic"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1227",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 1,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "9c604a8a73fe3bace1144fd7bd86f168481dcf3c",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

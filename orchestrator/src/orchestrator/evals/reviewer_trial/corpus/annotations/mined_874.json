@@ -1,0 +1,36 @@
+{
+  "diff_id": "mined_874",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "orchestrator/tests/test_merge_queue.py:1163-1175",
+      "category": "logic",
+      "severity": "blocking",
+      "description": "The rewrite of `_fail_n_pass_n1` replaces the original 'else \u2192 return pass' branch (explicitly named 'N+1 (re-merged, no N) \u2192 pass') with `raise AssertionError`. The original test deliberately supported the case where N+1 is re-verified alone after N failed and expected it to pass. If the speculative worker re-verifies N+1 after discarding N (the standard discard-and-retry flow), the patched verification function now raises AssertionError instead of returning a passing result, causing the test to error/behave differently rather than exercise the intended path. This is the most likely cause of the unexpected escalation despite review passing.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_2",
+      "location": "orchestrator/pyproject.toml:49-77",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "The `filterwarnings = [\"error:...\"]` entries are set at the project-wide `[tool.pytest.ini_options]` level, so unawaited-coroutine and sync-test-in-asyncio-class warnings become hard errors for the entire suite, not just merge_queue tests. Any pre-existing test elsewhere that legitimately leaks a coroutine or has a sync test in an `@pytest.mark.asyncio` class will now fail; only the test_steward class split addresses one such case.",
+      "mutation_type": "test_gap"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "874",
+    "project_id": "dark_factory",
+    "outcome": "escalated",
+    "review_cycles": 2,
+    "verify_attempts": 1,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "725c30b0e5fa38882e4984ca4402959395b6df03",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

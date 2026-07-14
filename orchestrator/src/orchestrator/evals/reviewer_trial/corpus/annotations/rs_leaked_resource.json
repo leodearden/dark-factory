@@ -6,7 +6,7 @@
       "location": "crates/reify-runtime/src/mesh_export.rs:55",
       "category": "resource_double_close",
       "severity": "blocking",
-      "description": "File::from_raw_fd(fd) takes ownership of the file descriptor. When the BufWriter (and its inner File) is dropped at the end of the function, it closes the fd. But the docstring says 'the caller is responsible for closing the fd when done' — the caller will attempt to use or close an already-closed fd, causing EBADF errors or worse (if the fd number has been reused for a different file).",
+      "description": "File::from_raw_fd(fd) takes ownership of the file descriptor. When the BufWriter (and its inner File) is dropped at the end of the function, it closes the fd. But the docstring says 'the caller is responsible for closing the fd when done' \u2014 the caller will attempt to use or close an already-closed fd, causing EBADF errors or worse (if the fd number has been reused for a different file).",
       "mutation_type": "leaked_resource"
     },
     {

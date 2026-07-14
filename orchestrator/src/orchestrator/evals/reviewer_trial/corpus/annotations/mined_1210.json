@@ -1,0 +1,44 @@
+{
+  "diff_id": "mined_1210",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/tests/test_ticket_janitor.py:544-552",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "The added test is titled/scoped to the pre-existing snapshot contract (_known_projects frozen at init) and does not assert anything about the actual behavior change in this diff \u2014 the once-per-process discoverability log (_registry_log_emitted). The new logging code path is instantiated but never verified (e.g. via caplog), so the diff's real change is untested.",
+      "mutation_type": "test_gap"
+    },
+    {
+      "id": "frontier_2",
+      "location": "fused-memory/tests/test_ticket_janitor.py:548-552",
+      "category": "logic",
+      "severity": "suggestion",
+      "description": "The comment asserts that because 'the proj_a orchestrator lock doesn't exist' the escalation is skipped, but tick() on a failed ticket can actually emit an escalation_created event (unintended side effect). The test passes on the _known_projects assertion while silently triggering escalation machinery, meaning the stated rationale for why tick() is safe here is unverified and likely incorrect.",
+      "mutation_type": "test_gap"
+    },
+    {
+      "id": "frontier_3",
+      "location": "fused-memory/src/fused_memory/middleware/ticket_janitor.py:131",
+      "category": "concurrency",
+      "severity": "suggestion",
+      "description": "_registry_log_emitted is a mutable class-level flag set once per process and never reset. In the test suite (which constructs many janitors), any test that tries to assert the init log was emitted becomes order-dependent/flaky, since an earlier-constructed janitor in the session already flipped the flag to True.",
+      "mutation_type": "concurrency"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1210",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 1,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "2c898dc0f460a054cdd3d8d527054d0503d209dd",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

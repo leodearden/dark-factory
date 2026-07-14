@@ -1,0 +1,52 @@
+{
+  "diff_id": "mined_1328",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "orchestrator/src/orchestrator/config.py:469-471",
+      "category": "logic",
+      "severity": "blocking",
+      "description": "The old implementation used `project_root.glob('*/orchestrator.yaml')`, which discovered a config in ANY top-level directory, including one literally named `build`, `target`, `venv`, `node_modules`, etc. The new code prunes `_DISCOVERY_EXCLUDED_DIRS` at every level of the walk \u2014 including the root level \u2014 so a pre-existing top-level module directory whose name collides with a reserved name now has its `orchestrator.yaml` silently dropped. This is a backward-incompatible regression: such a module loses its overrides (test/lint commands, scheduling limits) with no error, which is a plausible cause of the observed escalation.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_2",
+      "location": "orchestrator/src/orchestrator/config.py:463-484",
+      "category": "logic",
+      "severity": "suggestion",
+      "description": "The recursive walk now discovers `orchestrator.yaml` at arbitrary depth anywhere under project_root, including files that were never intended as module configs (e.g. test fixtures under `orchestrator/tests/.../orchestrator.yaml`, vendored/copied trees not covered by the exclusion list, or nested config files). Any such file is registered as a module config with a deep prefix, producing spurious entries and triggering the depth>lock_depth warnings, whereas the old depth-1 glob could not pick these up.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_3",
+      "location": "orchestrator/src/orchestrator/analyze_modules.py:92",
+      "category": "consistency",
+      "severity": "suggestion",
+      "description": "`_first_component` still groups analytics by the top-level path component, but `for_module` now resolves configs by longest/deepest prefix. The docstring was edited to drop the 'matching how for_module dispatches' claim, acknowledging that analytics grouping no longer corresponds to actual config resolution; per-module analytics can now misattribute stats for modules configured at a deeper prefix (e.g. `foo/bar`).",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_4",
+      "location": "orchestrator/src/orchestrator/config.py:463",
+      "category": "efficiency",
+      "severity": "suggestion",
+      "description": "This performs a full recursive `os.walk` of project_root on every call (startup via load_config and again inside run_full_verification), replacing a single-level glob. On large repositories with many non-excluded subtrees this is a notable, repeated cost, as the docstring's own performance note admits.",
+      "mutation_type": "other"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1328",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "fa12911e978d73348acd2ea235366259554f1ea9",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

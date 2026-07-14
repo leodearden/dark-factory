@@ -1,0 +1,44 @@
+{
+  "diff_id": "mined_1685",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:176-215",
+      "category": "logic",
+      "severity": "blocking",
+      "description": "The suppression gate is built on count_memories_by_metadata, which per its own contract queries ONLY the Mem0/Qdrant backend (observations_and_summaries, preferences_and_norms, procedural_knowledge) and silently returns 0 for any memory routed to Graphiti (entities_and_relations, temporal_facts, decisions_and_rationale). The prompt tells the agent to write the protective guard via add_memory but never constrains it to a Mem0 category; if add_memory classifies the 'task marked done' completion note into a Graphiti store, the pre-check count stays 0 forever and the SKIP branch never fires. The gate is then permanently inert and re-synthesizes already-captured knowledge \u2014 the exact false-negative it claims to eliminate (consistent with 'review passed but escalation_created').",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_2",
+      "location": "fused-memory/tests/test_stages.py:1221-1239",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "The regression test only asserts the write-side literal substring ('stage2_suppress': True, 'task_id': str(task_id)) is present in the prompt. It does not verify the read/pre-check instruction, the required category routing (Mem0 vs Graphiti) of the guard write, or any behavior \u2014 so it provides no protection against the gate being inert, giving false confidence that the suppression mechanism works.",
+      "mutation_type": "test_gap"
+    },
+    {
+      "id": "frontier_3",
+      "location": "fused-memory/tests/test_stages.py:11195",
+      "category": "style",
+      "severity": "suggestion",
+      "description": "A stray trailing blank line is appended at the end of the test file, which serves no purpose and is likely to be flagged by linters (e.g. W391/trailing whitespace checks).",
+      "mutation_type": "style"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1685",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "487fb741bed994489c91ba8364673eb9bcc67238",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

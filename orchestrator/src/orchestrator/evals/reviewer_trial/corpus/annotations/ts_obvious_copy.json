@@ -14,7 +14,7 @@
       "location": "gui/src/viewport/selection.ts:279",
       "category": "redundant_function",
       "severity": "suggestion",
-      "description": "focusOnEntities() is nearly identical to fitToView() — both compute a bounding box from meshes and position the camera. The only difference is fitToView uses all meshes while focusOnEntities uses a subset. fitToView could be implemented as focusOnEntities([...getMeshes().keys()]).",
+      "description": "focusOnEntities() is nearly identical to fitToView() \u2014 both compute a bounding box from meshes and position the camera. The only difference is fitToView uses all meshes while focusOnEntities uses a subset. fitToView could be implemented as focusOnEntities([...getMeshes().keys()]).",
       "mutation_type": "obvious_copy"
     },
     {

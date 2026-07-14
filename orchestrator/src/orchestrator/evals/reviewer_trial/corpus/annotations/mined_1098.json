@@ -1,0 +1,44 @@
+{
+  "diff_id": "mined_1098",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:301-310",
+      "category": "logic",
+      "severity": "blocking",
+      "description": "The resolve_ticket verification was weakened: on status=created/combined the agent now increments tasks_created directly instead of confirming the task exists via get_task. A phantom/failed creation that still reports created/combined with a task_id will be counted as a success and NOT flagged as a discrepancy \u2014 a false negative that reconciliation accounting can no longer catch. This matches the flagged symptom (review passed but escalation_created downstream).",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_2",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:316-322",
+      "category": "logic",
+      "severity": "suggestion",
+      "description": "The new no_op rule contradicts the pre-existing rule without specifying precedence. A no_op means the task was already in the requested status, so tasks[n].newStatus equals the requested status; the earlier rule says 'increment the counter if newStatus matches the requested status', while the new rule says a no_op must NOT increment. Because no check-ordering is stated, an agent may increment or not for the identical response, producing inconsistent counters.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_3",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:322-329",
+      "category": "logic",
+      "severity": "suggestion",
+      "description": "The multi-id wrapper instructions tell the agent to apply the 'tasks[*].newStatus' and 'no_op' rules to each results[i].result, but the original single-response shape is described as top-level {taskId, oldStatus, newStatus} / no_op \u2014 it is left ambiguous whether each results[i].result nests those fields under a 'tasks' array or carries them directly. This underspecification can cause the agent to look for newStatus/no_op at the wrong nesting level for wrapped multi-id responses and silently skip valid per-id success/no-op counting.",
+      "mutation_type": "logic"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1098",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "970a178069dac221535324bb330e34695bc3e877",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

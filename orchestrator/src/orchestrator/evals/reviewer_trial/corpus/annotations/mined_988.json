@@ -1,0 +1,36 @@
+{
+  "diff_id": "mined_988",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/tests/test_task_interceptor.py:2556-2570",
+      "category": "api_misuse",
+      "severity": "blocking",
+      "description": "asyncio.wait_for raises asyncio.TimeoutError, which is only an alias of the builtin TimeoutError on Python 3.11+. On Python 3.10 and earlier they are distinct classes, so `except TimeoutError` would fail to catch the timeout and the intended legible pytest.fail diagnostic (the entire point of task 988) would never run \u2014 the raw asyncio.TimeoutError would propagate instead. Catch asyncio.TimeoutError to be version-safe.",
+      "mutation_type": "error_handling"
+    },
+    {
+      "id": "frontier_2",
+      "location": "fused-memory/tests/test_task_interceptor.py:2756-2758",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "Doubling the latency assertion bound from 2.0s to 4.0s weakens the regression guard; a real 2-3x per-call slowdown would now pass silently. Acceptable as CI-jitter mitigation but reduces the test's sensitivity.",
+      "mutation_type": "test_gap"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "988",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 2,
+    "signal_reason": [
+      "verify_attempts>=2 (actual=2)"
+    ],
+    "merge_sha": "f2a77625c44a8588f3567299e1d11429962bb40d",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

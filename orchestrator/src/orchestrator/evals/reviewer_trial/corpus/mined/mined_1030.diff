@@ -1,0 +1,19 @@
+diff --git a/orchestrator/tests/test_workflow_e2e.py b/orchestrator/tests/test_workflow_e2e.py
+index 0bdbec2ab5..3dc6e089af 100644
+--- a/orchestrator/tests/test_workflow_e2e.py
++++ b/orchestrator/tests/test_workflow_e2e.py
+@@ -379,6 +379,14 @@ class FakeScheduler:
+         history = self.statuses.get(task_id)
+         return history[-1] if history else None
+ 
++    async def update_task(self, task_id: str, metadata: str | dict) -> bool:
++        return True
++
++    async def _dispatch_tool(
++        self, name: str, arguments: dict, *, timeout: float = 30.0
++    ) -> dict:
++        return {}
++
+     def release(self, task_id: str) -> None:
+         pass
+ 

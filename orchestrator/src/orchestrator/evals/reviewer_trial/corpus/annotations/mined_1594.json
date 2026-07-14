@@ -1,0 +1,28 @@
+{
+  "diff_id": "mined_1594",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/__init__.py:94-95",
+      "category": "doc_inconsistency",
+      "severity": "suggestion",
+      "description": "The new __init__.py guidance states as a blanket rule that for cross_project findings 'cite_task is the sole dedup anchor there', but the stage2.py section it cross-references defines two sub-cases: only sub-case (1) (a local task is the subject) has a cite_task anchor; in sub-case (2) (work lives entirely in the unknown target project) cite_task returns unknown_project and attaches nothing, so the finding is deduped by its normalised description \u2014 not by cite_task. The summary overgeneralizes and can mislead the recon agent for the target-project-only case.",
+      "mutation_type": "other"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1594",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "76d1f2cf3a8f82e1e5ec7cd4d62ea17f74f7d182",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

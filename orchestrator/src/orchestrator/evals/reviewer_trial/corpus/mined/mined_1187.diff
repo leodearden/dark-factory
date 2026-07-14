@@ -1,0 +1,53 @@
+diff --git a/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py b/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py
+index 30ec41c7b5..6dd7bf33cd 100644
+--- a/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py
++++ b/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py
+@@ -244,7 +244,12 @@ emit for a suppressed task_id will be dropped by the post-processor regardless.
+ Canonical suppression record schema (Mem0, observations_and_summaries category) — \
+ this is the producer's contract source-of-truth read by the post-processor:
+   - `metadata.kind = "stage1_flag_suppression"`
+-  - `metadata.task_id = <N>` (integer matching the target task)
++  - `metadata.task_id = <N>` (pinned to `int` by the producer \
++`write_suppression_record` → `build_suppression_payload` via `int()` coercion; \
++readers MUST compare as strings via \
++`str(result.metadata.get('task_id')) == str(target_task_id)` because Mem0 \
++metadata round-trips through JSON and historical writers in this codebase have \
++stored task_id as both `int` and `str`)
+   - content: `"STAGE 1 FLAG SUPPRESSION task_id=<N>"`
+ 
+ Producing a suppression record: operators and remediation hooks should call \
+@@ -253,13 +258,30 @@ project_id=..., task_id=N)` rather than constructing the canonical schema by han
+ The helper coerces `task_id` to int and pins the metadata.kind/content shape so \
+ future schema changes touch one location.
+ 
+-If you do choose to check: call `search(query="stage1_flag_suppression", \
+-project_id=...)`, then inspect each result's metadata. A result is a valid \
+-suppression record ONLY when BOTH `metadata.kind == "stage1_flag_suppression"` AND \
+-`metadata.task_id == <N>`. Do NOT rely on semantic/vector proximity alone — vector \
++If you do choose to check: call \
++`search(query="stage1_flag_suppression task_id=<N>", project_id=..., \
++categories=['observations_and_summaries'], stores=['mem0'], limit=50)` — \
++include `task_id=<N>` in the query string to bias vector ranking toward the \
++right record (the post-processor's bulk fetch uses the bare \
++`stage1_flag_suppression` query and filters by metadata afterward; \
++appending `task_id=<N>` here is a single-task optimisation), and pin \
++`categories`/`stores`/`limit` to avoid the default `limit=10` silently \
++missing the record on a busy project (`filter_suppressed` uses `limit=501` \
++for its project-wide sweep; 50 is sufficient here because `task_id=<N>` \
++biases ranking toward the one record you need). Then inspect each \
++result's metadata. A result is a valid suppression record ONLY when BOTH \
++`metadata.kind == "stage1_flag_suppression"` AND \
++`str(result.metadata.get('task_id')) == str(target_task_id)`. Do NOT rely on \
++semantic/vector proximity alone — vector \
+ search may return near-misses. A result that fails either metadata field, or an \
+ empty result set, means "no suppression in effect"; proceed normally.
+ 
++If the suppression search returns an error or times out, treat suppression as \
++not-in-effect and proceed with normal flag emission; record the search failure \
++in your cycle summary so operators can re-check. This mirrors the conservative \
++pass-through that the post-processor's `filter_suppressed` already performs in \
++code, keeping prompt-driven and code-driven outcomes aligned.
++
+ Suppression is distinct from the post-processor dedup described in the next section. \
+ Dedup collapses repeated emissions of the same (task_id, flag_type) pair across runs; \
+ suppression authoritatively forbids ANY flag emission for a specific task. \

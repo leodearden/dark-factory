@@ -1,0 +1,126 @@
+diff --git a/dashboard/src/dashboard/static/redux/index.html b/dashboard/src/dashboard/static/redux/index.html
+index 4f2c7715a4..785ba75b5d 100644
+--- a/dashboard/src/dashboard/static/redux/index.html
++++ b/dashboard/src/dashboard/static/redux/index.html
+@@ -8,7 +8,7 @@
+ <link rel="preconnect" href="https://fonts.googleapis.com">
+ <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+ <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+-<link rel="stylesheet" href="/static/redux/styles.css?v=7" />
++<link rel="stylesheet" href="/static/redux/styles.css?v=8" />
+ </head>
+ <body>
+ <div id="root"></div>
+@@ -16,14 +16,16 @@
+ <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+ <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+ <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
++<script src="https://unpkg.com/marked@12.0.0/marked.min.js" integrity="sha384-FBUquUspONqUXRl6/8JTgGMMu3e1e5OUlJP/6U7oGsgXeXWUIGKtoW1oRp9BL3m7" crossorigin="anonymous"></script>
++<script src="https://unpkg.com/dompurify@3.2.4/dist/purify.min.js" integrity="sha384-a5bUJqmkhkYvQrFuVWjnjkMFwoCeTy0rRKzR5os1TNWrwenlIC7MYLBwJpmwqtCA" crossorigin="anonymous"></script>
+ 
+-<script src="/static/redux/data.js?v=7"></script>
+-<script type="text/babel" src="/static/redux/tweaks-panel.jsx?v=7"></script>
+-<script type="text/babel" src="/static/redux/charts.jsx?v=7"></script>
+-<script type="text/babel" src="/static/redux/shell.jsx?v=7"></script>
+-<script type="text/babel" src="/static/redux/tab_overview.jsx?v=7"></script>
+-<script type="text/babel" src="/static/redux/tabs.jsx?v=7"></script>
+-<script type="text/babel" src="/static/redux/tab_tasks.jsx?v=7"></script>
+-<script type="text/babel" src="/static/redux/app.jsx?v=7"></script>
++<script src="/static/redux/data.js?v=8"></script>
++<script type="text/babel" src="/static/redux/tweaks-panel.jsx?v=8"></script>
++<script type="text/babel" src="/static/redux/charts.jsx?v=8"></script>
++<script type="text/babel" src="/static/redux/shell.jsx?v=8"></script>
++<script type="text/babel" src="/static/redux/tab_overview.jsx?v=8"></script>
++<script type="text/babel" src="/static/redux/tabs.jsx?v=8"></script>
++<script type="text/babel" src="/static/redux/tab_tasks.jsx?v=8"></script>
++<script type="text/babel" src="/static/redux/app.jsx?v=8"></script>
+ </body>
+ </html>
+diff --git a/dashboard/src/dashboard/static/redux/styles.css b/dashboard/src/dashboard/static/redux/styles.css
+index eac27ba3ad..cc5919e87e 100644
+--- a/dashboard/src/dashboard/static/redux/styles.css
++++ b/dashboard/src/dashboard/static/redux/styles.css
+@@ -496,7 +496,24 @@ table { border-collapse: collapse; width: 100%; }
+ .task-detail h4 { margin: 0 0 4px; font-size: 13px; color: var(--fg-0); }
+ .task-detail .sub { font-family: var(--mono); font-size: 10px; color: var(--fg-3); margin-bottom: 12px; letter-spacing: 0.04em; }
+ .task-detail .section-lbl { font-size: 10px; color: var(--fg-3); letter-spacing: 0.1em; text-transform: uppercase; margin: 14px 0 6px; }
+-.task-detail .desc { color: var(--fg-1); white-space: pre-line; }
++.task-detail .desc { color: var(--fg-1); }
+ .task-detail .kv { display: grid; grid-template-columns: 90px 1fr; gap: 4px 12px; font-size: 11px; }
+ .task-detail .kv .k { color: var(--fg-3); font-family: var(--mono); font-size: 10px; }
+ .task-detail .placeholder { color: var(--fg-3); font-style: italic; padding: 24px 12px; text-align: center; font-size: 11px; }
++
++/* Markdown rendering inside Task Detail description / details fields */
++.task-detail .desc h1,
++.task-detail .desc h2,
++.task-detail .desc h3 { color: var(--fg-0); margin: 10px 0 4px; line-height: 1.25; }
++.task-detail .desc h1 { font-size: 14px; }
++.task-detail .desc h2 { font-size: 13px; }
++.task-detail .desc h3 { font-size: 12px; color: var(--fg-1); }
++.task-detail .desc p  { margin: 6px 0; }
++.task-detail .desc ul,
++.task-detail .desc ol { margin: 6px 0; padding-left: 20px; }
++.task-detail .desc li { margin: 2px 0; }
++.task-detail .desc code { font-family: var(--mono); font-size: 11px; background: var(--bg-2); padding: 1px 4px; border-radius: 3px; border: 1px solid var(--line); }
++.task-detail .desc pre { font-family: var(--mono); font-size: 11px; background: var(--bg-2); border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; overflow-x: auto; margin: 8px 0; }
++.task-detail .desc pre code { background: none; border: 0; padding: 0; }
++.task-detail .desc a { color: var(--accent); text-decoration: none; border-bottom: 1px dotted var(--accent-dim); }
++.task-detail .desc a:hover { color: var(--fg-0); border-bottom-color: var(--accent); }
+diff --git a/dashboard/src/dashboard/static/redux/tab_tasks.jsx b/dashboard/src/dashboard/static/redux/tab_tasks.jsx
+index 21562a9d95..c680f51515 100644
+--- a/dashboard/src/dashboard/static/redux/tab_tasks.jsx
++++ b/dashboard/src/dashboard/static/redux/tab_tasks.jsx
+@@ -205,13 +205,38 @@ function fmtAge(t) {
+   return `${t.started}m running`;
+ }
+ 
++// Open links rendered from markdown in a new tab with safe rel attributes.
++// Registered once at module load; DOMPurify guard handles offline/CDN-fail cases.
++if (typeof DOMPurify !== 'undefined') {
++  DOMPurify.addHook('afterSanitizeAttributes', function(node) {
++    if (node.tagName === 'A') {
++      node.setAttribute('target', '_blank');
++      node.setAttribute('rel', 'noopener noreferrer');
++    }
++  });
++}
++
++function MarkdownText({ text, className, empty }) {
++  // Memoize parse+sanitize so it only reruns when text changes, not on every
++  // parent re-render (e.g. streaming status updates from another tab).
++  const html = uM_T(() => {
++    if (!text || typeof marked === 'undefined' || typeof DOMPurify === 'undefined') return null;
++    return DOMPurify.sanitize(marked.parse(text));
++  }, [text]);
++  // No content: render empty-prop placeholder or nothing.
++  if (!text) return empty !== undefined ? <div className={className}>{empty}</div> : null;
++  // CDN libraries unavailable (network blip, ad-blocker, integrity-hash mismatch):
++  // degrade gracefully to plain text instead of throwing a ReferenceError.
++  if (html === null) return <div className={className} style={{whiteSpace: 'pre-line'}}>{text}</div>;
++  return <div className={className} dangerouslySetInnerHTML={{ __html: html }} />;
++}
++
+ function TaskDetail({ task, allTasks }) {
+   if (!task) {
+     return <div className="placeholder">Click a task in the graph to see its full description, dependencies, and locks.</div>;
+   }
+   const deps = task.deps || [];
+   const dependents = allTasks.filter(t => (t.deps || []).some(d => d.id === task.id));
+-  const desc = task.description || '—';
+   return (
+     <div className="task-detail">
+       <h4>{task.title}</h4>
+@@ -226,11 +251,11 @@ function TaskDetail({ task, allTasks }) {
+       </div>
+ 
+       <div className="section-lbl">Description</div>
+-      <div className="desc">{desc}</div>
++      <MarkdownText text={task.description} className="desc" empty="—" />
+ 
+       {task.details && (<>
+         <div className="section-lbl">Details</div>
+-        <div className="desc">{task.details}</div>
++        <MarkdownText text={task.details} className="desc" />
+       </>)}
+ 
+       <div className="section-lbl">Depends on ({deps.length})</div>

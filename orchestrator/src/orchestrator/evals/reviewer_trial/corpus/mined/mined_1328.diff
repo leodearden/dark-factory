@@ -1,0 +1,292 @@
+diff --git a/orchestrator/src/orchestrator/analyze_modules.py b/orchestrator/src/orchestrator/analyze_modules.py
+index a16211c077..8d4a81581d 100644
+--- a/orchestrator/src/orchestrator/analyze_modules.py
++++ b/orchestrator/src/orchestrator/analyze_modules.py
+@@ -89,7 +89,7 @@ class ModuleStats:
+ 
+ 
+ def _first_component(module: str) -> str:
+-    """Return the first path component (matching how for_module dispatches)."""
++    """Return the first path component (groups by top-level path component for analytics)."""
+     return module.strip('/').split('/', 1)[0] if module else ''
+ 
+ 
+diff --git a/orchestrator/src/orchestrator/config.py b/orchestrator/src/orchestrator/config.py
+index 6ed0241a2f..573eb30074 100644
+--- a/orchestrator/src/orchestrator/config.py
++++ b/orchestrator/src/orchestrator/config.py
+@@ -409,6 +409,11 @@ _OVERRIDABLE_FIELDS = frozenset({
+     'scope_cargo',
+ })
+ 
++_DISCOVERY_EXCLUDED_DIRS = frozenset({
++    '.git', '.venv', 'venv', '.worktrees',
++    'node_modules', '__pycache__', 'build', 'target', '.gradle',
++})
++
+ 
+ @dataclass
+ class ModuleConfig:
+@@ -431,10 +436,60 @@ class ModuleConfig:
+ 
+ 
+ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
+-    """Scan project_root/*/orchestrator.yaml and load overridable fields."""
++    """Walk *project_root* recursively for ``orchestrator.yaml`` files and load overridable fields.
++
++    Contract:
++    - Prefix is the POSIX-style relative path from *project_root* (e.g. ``dashboard`` or
++      ``foo/bar``).  A root-level ``orchestrator.yaml`` (prefix ``"."``) is skipped because
++      it is the top-level orchestrator config, not a module config.
++    - Excludes standard build/VCS dirs (``_DISCOVERY_EXCLUDED_DIRS``) by pruning ``dirnames``
++      in place during the walk so their subtrees are never visited.  Exclusions are
++      **name-based** and applied at *every* level of the tree, so any directory with a
++      reserved name — however deeply nested — is silently skipped.  If a legitimate module
++      directory shares a name with a reserved dir (e.g. a module literally called ``build``),
++      its ``orchestrator.yaml`` will not be discovered; rename the directory or place the
++      config at a depth that avoids the collision.
++    - Uses ``followlinks=False`` (passed explicitly) for symlink-cycle safety — a symlink that
++      points back into an ancestor directory cannot drive infinite recursion because the walk
++      will not follow it.
++    - Results are inserted into the returned dict in ``(depth, lex)`` order so iteration is
++      deterministic regardless of filesystem order.
++
++    Performance note:
++    This performs a full recursive walk of *project_root* on every call (once at startup via
++    ``load_config``, and again inside ``run_full_verification``).  On large repositories with
++    many non-excluded subdirectories this can be noticeable.  If discovery latency is a
++    concern, consider adding project-specific directories to ``_DISCOVERY_EXCLUDED_DIRS`` or
++    reducing the nesting depth of your module layout.
++
++    Depth and scheduler coherence:
++    ``OrchestratorConfig.for_module`` resolves configs via longest-matching prefix walk, but
++    the scheduler (``_limit_for``) and workflow (``_resolve_module_configs``) always pass paths
++    that have been truncated to ``lock_depth`` components by ``shared.locking.normalize_lock``.
++    A module config whose prefix has *more* components than ``lock_depth`` will be honoured by
++    ``run_full_verification`` (which iterates ``module_configs.values()`` directly) but will be
++    unreachable through the scheduler/workflow path.  ``load_config`` emits a warning when this
++    mismatch is detected so misplaced ``orchestrator.yaml`` files are surfaced rather than
++    silently half-applied.
++    """
++    found: list[tuple[str, Path]] = []
++    # followlinks=False (the default, stated explicitly so a future refactor cannot flip it
++    # silently): prevents infinite recursion from self-referencing symlink cycles.
++    for dirpath, dirnames, filenames in os.walk(project_root, followlinks=False):
++        dirnames[:] = [d for d in dirnames if d not in _DISCOVERY_EXCLUDED_DIRS]
++        if 'orchestrator.yaml' not in filenames:
++            continue
++        yaml_path = Path(dirpath) / 'orchestrator.yaml'
++        rel = yaml_path.parent.relative_to(project_root)
++        prefix = rel.as_posix()
++        if prefix == '.':
++            # Root-level orchestrator.yaml is the top-level config, not a module config
++            continue
++        found.append((prefix, yaml_path))
++    # Sort by (depth, lex) so dict insertion order is deterministic
++    found.sort(key=lambda item: (item[0].count('/'), item[0]))
+     configs: dict[str, ModuleConfig] = {}
+-    for yaml_path in sorted(project_root.glob('*/orchestrator.yaml')):
+-        prefix = yaml_path.parent.name
++    for prefix, yaml_path in found:
+         try:
+             with open(yaml_path) as f:
+                 raw = yaml.safe_load(f) or {}
+@@ -819,11 +874,40 @@ class OrchestratorConfig(BaseSettings):
+         return self
+ 
+     def for_module(self, module_path: str) -> ModuleConfig | None:
+-        """Return ModuleConfig matching the first path component, or None."""
++        """Return the ModuleConfig whose registered prefix is the longest (deepest) match
++        for *module_path*, or None if no registered prefix matches at all.
++
++        Resolution walks candidate prefixes from the full normalised path inward
++        (``foo/bar/baz`` → ``foo/bar`` → ``foo``) and returns the first registered
++        match — i.e. the deepest/most-specific config wins.
++
++        This ensures coherence across all three consumers:
++        - ``verify.py`` (iterates ``module_configs.values()``)
++        - ``scheduler._limit_for`` (passes ``normalize_lock(module, lock_depth)`` —
++          exactly a depth-``lock_depth`` path like ``foo/bar``)
++        - ``workflow._resolve_module_configs`` (passes normalized module lock paths)
++
++        Precondition / known limitation:
++        The scheduler and workflow always pass paths truncated to ``lock_depth``
++        components, so a config registered at a prefix *deeper* than ``lock_depth``
++        (e.g. ``foo/bar/baz`` with ``lock_depth=2``) is reachable here and by
++        ``run_full_verification``, but is **unreachable** through the scheduler /
++        workflow path.  ``load_config`` logs a warning when such a mismatch is
++        detected.  For full scheduler/workflow integration, keep module configs at a
++        prefix depth no greater than ``lock_depth``.
++
++        Backwards-compatible: single-segment prefixes resolve identically to before
++        because the deepest candidate that matches is still the first path component.
++        """
+         if not self._module_configs:
+             return None
+-        first = module_path.strip('/').split('/')[0]
+-        return self._module_configs.get(first)
++        parts = module_path.strip('/').split('/')
++        for i in range(len(parts), 0, -1):
++            candidate = '/'.join(parts[:i])
++            result = self._module_configs.get(candidate)
++            if result is not None:
++                return result
++        return None
+ 
+     @property
+     def overrides_db_path(self) -> Path:
+@@ -896,4 +980,18 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
+     os.environ['ORCH_CONFIG_PATH'] = str(config_path)
+     config = OrchestratorConfig()
+     config._module_configs = _discover_module_configs(config.project_root)
++    # Warn when a discovered config prefix is deeper than lock_depth: its test/lint
++    # commands will run in full verification, but scheduler and workflow consumers
++    # truncate module paths to lock_depth components via normalize_lock, so the
++    # config's scheduling limits (max_per_module, module_overrides) will be silently
++    # ignored.  Surface the mismatch so operators can adjust the layout or lock_depth.
++    for prefix in config._module_configs:
++        prefix_depth = prefix.count('/') + 1  # number of path components
++        if prefix_depth > config.lock_depth:
++            logger.warning(
++                'Module config %r has prefix depth %d but lock_depth=%d; '
++                'its scheduling limits are unreachable through the scheduler/workflow path. '
++                'Move the orchestrator.yaml up or raise lock_depth.',
++                prefix, prefix_depth, config.lock_depth,
++            )
+     return config
+diff --git a/orchestrator/tests/test_config.py b/orchestrator/tests/test_config.py
+index 1952ddf403..82add805f2 100644
+--- a/orchestrator/tests/test_config.py
++++ b/orchestrator/tests/test_config.py
+@@ -261,6 +261,131 @@ class TestModuleConfigDiscovery:
+         assert config._module_configs['backend'].test_command == 'cargo test'
+         assert config._module_configs['backend'].max_per_module == 2
+ 
++    def test_discover_finds_nested_orchestrator_yaml_at_depth_2(self, tmp_path: Path):
++        """_discover_module_configs finds orchestrator.yaml at depth >= 2."""
++        nested = tmp_path / 'foo' / 'bar'
++        nested.mkdir(parents=True)
++        (nested / 'orchestrator.yaml').write_text(yaml.dump({
++            'test_command': 'pytest foo/bar/',
++        }))
++        configs = _discover_module_configs(tmp_path)
++        assert 'foo/bar' in configs
++        mc = configs['foo/bar']
++        assert mc.prefix == 'foo/bar'
++        assert mc.test_command == 'pytest foo/bar/'
++
++    def test_discover_orders_results_by_depth_then_lex(self, tmp_path: Path):
++        """_discover_module_configs returns keys ordered by (depth, lex): depth-1 first, lex within depth."""
++        # Create four orchestrator.yaml files at varying depths
++        for parts in [
++            ('c',),
++            ('a',),
++            ('a', 'b'),
++            ('d', 'e', 'f'),
++        ]:
++            d = tmp_path.joinpath(*parts)
++            d.mkdir(parents=True, exist_ok=True)
++            (d / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest'}))
++        configs = _discover_module_configs(tmp_path)
++        assert list(configs.keys()) == ['a', 'c', 'a/b', 'd/e/f']
++
++    def test_discover_excludes_standard_dirs(self, tmp_path: Path):
++        """_discover_module_configs does not descend into standard build/VCS directories."""
++        excluded_dirs = [
++            '.git', '.venv', 'venv', '.worktrees', 'node_modules',
++            '__pycache__', 'build', 'target', '.gradle',
++        ]
++        # Create an orchestrator.yaml nested inside each excluded dir
++        for excluded in excluded_dirs:
++            nested = tmp_path / excluded / 'sub'
++            nested.mkdir(parents=True, exist_ok=True)
++            (nested / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest'}))
++        # Also create a legitimate module that should be found
++        legit = tmp_path / 'legit'
++        legit.mkdir()
++        (legit / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest legit/'}))
++        configs = _discover_module_configs(tmp_path)
++        assert 'legit' in configs
++        for excluded in excluded_dirs:
++            for key in configs:
++                assert not key.startswith(excluded + '/') and key != excluded, (
++                    f"Excluded dir {excluded!r} leaked into results as key {key!r}"
++                )
++
++    def test_discover_handles_self_referencing_symlink_loop(self, tmp_path: Path):
++        """_discover_module_configs completes without infinite recursion when a symlink loop exists.
++
++        Regression guard: pins the followlinks=False behavior so a future refactor
++        that flips it is caught immediately.
++        """
++        import os as _os
++        sub = tmp_path / 'sub'
++        sub.mkdir()
++        (sub / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest sub/'}))
++        # Create a self-referencing symlink inside sub -> sub
++        try:
++            _os.symlink(str(sub), str(sub / 'loop'))
++        except OSError:
++            pytest.skip('Cannot create symlinks on this platform')
++        # With followlinks=False this must finish quickly and return exactly {'sub': ...}
++        configs = _discover_module_configs(tmp_path)
++        assert list(configs.keys()) == ['sub']
++        assert configs['sub'].test_command == 'pytest sub/'
++
++    def test_for_module_longest_prefix_match(self):
++        """for_module resolves nested configs by longest-matching prefix (deepest wins).
++
++        This is the regression test the reviewer requires: it retrieves a nested config
++        through for_module() (the workflow/scheduler consumption boundary), not just
++        through _discover_module_configs directly.
++        """
++        config = OrchestratorConfig()
++        config._module_configs = {
++            'foo': ModuleConfig(prefix='foo', test_command='pytest foo/'),
++            'foo/bar': ModuleConfig(prefix='foo/bar', test_command='pytest foo/bar/'),
++        }
++        # (a) Deeper path resolves to the deeper registered prefix
++        mc_deep = config.for_module('foo/bar/baz/app.py')
++        assert mc_deep is not None
++        assert mc_deep.prefix == 'foo/bar'
++        # (b) Exact prefix match — shape scheduler passes after normalize_lock(..., depth=2)
++        mc_exact = config.for_module('foo/bar')
++        assert mc_exact is not None
++        assert mc_exact.prefix == 'foo/bar'
++        # (c) Sibling falls back to the shallower ancestor prefix
++        mc_fallback = config.for_module('foo/qux/app.py')
++        assert mc_fallback is not None
++        assert mc_fallback.prefix == 'foo'
++        # (d) Exact top-level prefix match
++        mc_top = config.for_module('foo')
++        assert mc_top is not None
++        assert mc_top.prefix == 'foo'
++        # (e) Completely unrelated path returns None
++        assert config.for_module('unrelated/x.py') is None
++
++    def test_discover_skips_root_level_orchestrator_yaml(self, tmp_path: Path):
++        """A root-level orchestrator.yaml is NOT returned as a module config.
++
++        Regression guard for the explicit ``if prefix == '.': continue`` guard in
++        _discover_module_configs.  The old glob('*/orchestrator.yaml') excluded the
++        root by construction; the new os.walk relies on an explicit check.
++        """
++        # Root-level config — should be skipped
++        (tmp_path / 'orchestrator.yaml').write_text(yaml.dump({
++            'test_command': 'pytest',
++        }))
++        # Sub-level config — should be found
++        sub = tmp_path / 'sub'
++        sub.mkdir()
++        (sub / 'orchestrator.yaml').write_text(yaml.dump({
++            'test_command': 'pytest sub/',
++        }))
++        configs = _discover_module_configs(tmp_path)
++        assert 'sub' in configs, "sub-level config should be discovered"
++        assert '.' not in configs, "root-level (prefix '.') must not appear in results"
++        # Confirm no key for the root-level file leaked in any form
++        assert len(configs) == 1
++
+ 
+ class TestLayeredConfig:
+     """Tests for deep merge of package defaults + project config."""
