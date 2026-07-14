@@ -245,6 +245,11 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     'count_memories_by_metadata': (
         "count_memories_by_metadata(project_id, filters) -> {'count': N}"
     ),
+    'get_cycle_summary_presence': (
+        'get_cycle_summary_presence(project_id, run_id, stage) -> '
+        "{'present': bool, 'ledger_available': bool, 'project_id': ..., "
+        "'run_id': ..., 'stage': ...}"
+    ),
 }
 
 # --------------------------------------------------------------------------- #
