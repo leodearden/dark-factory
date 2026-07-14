@@ -1326,6 +1326,59 @@ async def test_dedup_flags_invalid_tid_flags_not_collapsed_when_repeated():
 
 
 # ---------------------------------------------------------------------------
+# flag_type family matching in filter_suppressed (task 2503 step-3/step-4)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterSuppressedFlagTypeFamily:
+    """filter_suppressed must recognize a flag_type FAMILY variant (case/
+    separator/word-order) of an existing SCOPED suppression row as
+    suppressed, not just an exact string match — the reader-side fix for
+    the task-544 companion-record incident (a reworded flag_type for a
+    settled finding must now be recognized as suppressed)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag_flag_type',
+        [
+            pytest.param('missing_deliverable', id='exact-match'),
+            pytest.param('deliverable_missing', id='reordered'),
+            pytest.param('missing-deliverable', id='separator'),
+            pytest.param('Missing_Deliverable', id='case'),
+        ],
+    )
+    async def test_family_variant_of_scoped_row_is_dropped(
+        self, ledger_memory_service, flag_flag_type
+    ):
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '544', 'missing_deliverable'
+        )
+
+        flag = {'task_id': 544, 'flag_type': flag_flag_type}
+        result = await filter_suppressed(ledger_memory_service, 'p', [flag])
+        assert result == [], (
+            f'flag_type={flag_flag_type!r} should be recognized as the same '
+            f'family as the seeded missing_deliverable suppression'
+        )
+
+    @pytest.mark.asyncio
+    async def test_genuinely_different_flag_type_still_survives(self, ledger_memory_service):
+        """A flag_type that is NOT a family variant of the seeded row must
+        still survive — family matching must not over-suppress."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '544', 'missing_deliverable'
+        )
+
+        flag = {'task_id': 544, 'flag_type': 'stale_metadata'}
+        result = await filter_suppressed(ledger_memory_service, 'p', [flag])
+        assert result == [flag]
+
+
+# ---------------------------------------------------------------------------
 # build_suppression_payload tests (task-1185 step-1)
 # ---------------------------------------------------------------------------
 
