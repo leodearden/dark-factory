@@ -37,7 +37,11 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.merge_disposition import MergeFailureDisposition
+from orchestrator.merge_disposition import (
+    MergeFailureDisposition,
+    SkewEvidence,
+    classify_merge_failure_disposition,
+)
 from orchestrator.merge_drift import (  # noqa: F401  re-export shim
     _maybe_run_drift_check,
     _run_drift_check,
@@ -754,6 +758,7 @@ def _build_main_health_outcome(verify: VerifyResult, probe_sha: str) -> MergeOut
         dedupe_fingerprint=_main_health_fingerprint(
             verify.category or '', verify.cause_hint, probe_sha,
         ),
+        disposition=MergeFailureDisposition.MAIN_RED,
     )
 
 
@@ -803,6 +808,129 @@ async def _classify_main_health_red(
     outcome = _build_main_health_outcome(verify, probe_sha)
     _emit_merge_attempt(event_store, req.task_id, OutcomeKind.main_health_red)
     return outcome
+
+
+def _render_skew_surfaces(
+    disposition: MergeFailureDisposition,
+    evidence: SkewEvidence | None,
+) -> tuple[str, dict[str, str] | None]:
+    """Render the I4 reason_suffix + failure_diagnostic surfaces for a
+    merge-skew attribution verdict (task 2383 β, M2 of
+    plans/merge-skew-attribution-prd.md).
+
+    Pure, no I/O.  Only ``INTEGRATION_SKEW`` with non-``None`` *evidence*
+    yields a non-empty ``reason_suffix`` — appended to the task-fault reason
+    so the debugger's dry-run context reads "port landed commit <sha>
+    touching <files> — do not hunt your own diff" — and a
+    ``failure_diagnostic`` ``dict[str, str]`` surfaced verbatim via
+    ``merge_status`` (I4).  Every other ``(disposition, evidence)``
+    combination — ``MAIN_RED`` / ``BRANCH_BUG`` / ``INDETERMINATE``, or
+    ``evidence=None`` — returns ``('', None)``.
+    """
+    if disposition is not MergeFailureDisposition.INTEGRATION_SKEW or evidence is None:
+        return '', None
+    commits = ', '.join(evidence.implicated_commits)
+    files = ', '.join(evidence.overlap_files)
+    tests = ', '.join(evidence.failing_tests)
+    reason_suffix = (
+        f'integration_skew: port landed commit(s) {commits} touching '
+        f'{files} — do not hunt your own diff'
+    )
+    failure_diagnostic = {
+        'disposition': disposition.value,
+        'implicated_commits': commits,
+        'overlap_files': files,
+        'failing_tests': tests,
+    }
+    return reason_suffix, failure_diagnostic
+
+
+async def _classify_disposition_for_outcome(
+    verify: VerifyResult,
+    *,
+    req: MergeRequest,
+    merge_base_sha: str,
+    main_sha: str,
+    event_store: EventStore | None,
+) -> tuple[MergeFailureDisposition, dict[str, str] | None, str]:
+    """Classify a non-preexisting merge-verify failure and render its I4
+    surfaces (task 2383 β).
+
+    Thin async wrapper: calls ``classify_merge_failure_disposition`` (with
+    ``preexisting=False`` — I1: this is only ever reached on the non-
+    preexisting bucket) and threads the result through
+    ``_render_skew_surfaces``.
+
+    Belt-and-suspenders fail-open (I3): any exception — including one raised
+    by the classifier itself, atop its own internal fail-open — is caught
+    here, logged at WARNING, and degrades to ``(INDETERMINATE, None, '')``
+    so the caller's outcome is never left half-attached.
+    """
+    try:
+        disposition, evidence = await classify_merge_failure_disposition(
+            verify_result=verify,
+            branch=req.branch,
+            merge_base_sha=merge_base_sha,
+            main_sha=main_sha,
+            preexisting=False,
+            task_id=req.task_id,
+            repo_root=req.config.project_root,
+            event_store=event_store,
+        )
+        reason_suffix, failure_diagnostic = _render_skew_surfaces(disposition, evidence)
+        return disposition, failure_diagnostic, reason_suffix
+    except Exception:
+        logger.warning(
+            'Task %s: _classify_disposition_for_outcome failed; degrading to '
+            'INDETERMINATE (fail-open, I3)',
+            req.task_id,
+            exc_info=True,
+        )
+        return MergeFailureDisposition.INDETERMINATE, None, ''
+
+
+async def _resolve_dispatch_time_merge_base(
+    repo_root: Path,
+    main_sha: str,
+    branch_tip: str | None,
+) -> str | None:
+    """Best-effort ``git merge-base(main_sha, branch_tip)`` for the
+    merge-skew classifier's dispatch-time base facts (task 2383 β, 2357).
+
+    Both *main_sha* and *branch_tip* are caller-supplied frozen values —
+    *main_sha* is the production caller's ``item.base_sha`` (never a fresh
+    ``get_main_sha()`` re-read) and *branch_tip* is ``item.merged_branch_tip``
+    (never a fresh branch-ref re-read) — this helper only computes their
+    common ancestor via a read-only ``git merge-base`` call.
+
+    Returns ``None`` — degrading classification to INDETERMINATE via
+    ``_run_post_merge_verify``'s None-default (I3, fail-open) — when
+    *branch_tip* is unavailable or the git call fails for any reason
+    (non-git *repo_root*, unresolvable SHA, subprocess error).
+    """
+    if not branch_tip:
+        return None
+    try:
+        rc, out, err = await _run(
+            ['git', 'merge-base', main_sha, branch_tip], cwd=repo_root,
+        )
+        if rc != 0:
+            logger.warning(
+                '_resolve_dispatch_time_merge_base: git merge-base failed '
+                '(rc=%d) for main_sha=%s branch_tip=%s: %s; degrading to '
+                'None (fail-safe, I3)',
+                rc, main_sha, branch_tip, err.strip(),
+            )
+            return None
+        return out.strip() or None
+    except Exception:
+        logger.warning(
+            '_resolve_dispatch_time_merge_base: git merge-base raised for '
+            'main_sha=%s branch_tip=%s; degrading to None (fail-safe, I3)',
+            main_sha, branch_tip,
+            exc_info=True,
+        )
+        return None
 
 
 # Sentinel task_id prefix for a laptop-side flock-worktree-contention alarm
@@ -1368,6 +1496,8 @@ async def _run_post_merge_verify(
     main_health_probe_handles: _MainHealthProbeHandles | None = None,
     depth: int | None = None,
     speculative: bool | None = None,
+    merge_base_sha: str | None = None,
+    main_sha: str | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -1440,6 +1570,20 @@ async def _run_post_merge_verify(
         speculative: Mirrors ``item.speculative``; threaded straight into
             ``pool.dispatch`` alongside *depth*.  ``None`` (default) keeps
             every existing caller byte-identical.
+        merge_base_sha: Dispatch-time merge-base SHA (task 2383 β, 2357:
+            caller-supplied, never re-derived here).  Paired with *main_sha*
+            to classify a non-preexisting task-fault failure via
+            :func:`_classify_disposition_for_outcome`, attaching
+            ``disposition``/``failure_diagnostic`` to the returned
+            :class:`MergeOutcome` and appending the rendered reason_suffix.
+            ``None`` (default) skips classification entirely — the train
+            (``_do_train_merge``) and solo (``reverify_member_solo``)
+            callers pass nothing and stay byte-identical (disposition stays
+            ``MergeOutcome``'s ``INDETERMINATE`` default, no
+            ``failure_diagnostic``).
+        main_sha: Dispatch-time main SHA (``item.base_sha``) paired with
+            *merge_base_sha*; see above.  Both must be non-``None`` for
+            classification to run.
     """
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
@@ -1683,6 +1827,28 @@ async def _run_post_merge_verify(
             reason = f'{reason} [category: {verify.category}]'
         if detail:
             reason = f'{reason}\n\n{detail}'
+        # Merge-skew attribution (task 2383 β, M2 of
+        # plans/merge-skew-attribution-prd.md): classify this non-preexisting
+        # (I1: the main-health probe above already returned None) task-fault
+        # failure when the caller supplied dispatch-time base facts.  Absent
+        # base facts (default None — the train and solo-reverify callers pass
+        # nothing) skips classification entirely: disposition stays
+        # MergeOutcome's INDETERMINATE default and failure_diagnostic stays
+        # None, byte-identical to pre-β behaviour (I3).  Runs BEFORE the
+        # dry-run spawn below so the enriched reason (with the 'port landed
+        # commit ... do not hunt your own diff' suffix) flows into the
+        # debugger's dry-run context too.
+        disposition = MergeFailureDisposition.INDETERMINATE
+        failure_diagnostic: dict[str, str] | None = None
+        if merge_base_sha is not None and main_sha is not None:
+            disposition, failure_diagnostic, reason_suffix = (
+                await _classify_disposition_for_outcome(
+                    verify, req=req, merge_base_sha=merge_base_sha,
+                    main_sha=main_sha, event_store=event_store,
+                )
+            )
+            if reason_suffix:
+                reason = f'{reason}\n\n{reason_suffix}'
         # Loop-breaker bookkeeping: bump only when the failure was a
         # pure timeout.  Real test/lint/type failures already bubble
         # up to the steward and don't drive the re-queue oscillation
@@ -1726,6 +1892,8 @@ async def _run_post_merge_verify(
             'blocked', reason=reason,
             failure_category=verify.category,
             failure_cause_hint=verify.cause_hint,
+            disposition=disposition,
+            failure_diagnostic=failure_diagnostic,
         )
 
     return None
@@ -10977,6 +11145,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'worktree={merge_wt.name})'
             )
 
+            # Merge-skew attribution (task 2383 β, 2357): dispatch-time base
+            # facts for the classifier.  main_sha is item.base_sha — the
+            # FROZEN main SHA captured at merge-dispatch time — never a
+            # fresh git_ops.get_main_sha() re-read.  merge_base_sha is the
+            # best-effort git merge-base of that SHA and the item's frozen
+            # merged_branch_tip; None (branch tip unavailable, or the git
+            # call fails) skips classification inside _run_post_merge_verify
+            # and degrades to INDETERMINATE (I3, fail-open).
+            main_sha = item.base_sha
+            merge_base_sha = await _resolve_dispatch_time_merge_base(
+                req.config.project_root, main_sha, item.merged_branch_tip,
+            )
+
             verify_task = asyncio.ensure_future(_run_post_merge_verify(
                 self._git_ops, req, merge_wt,
                 timeouts=self._post_merge_verify_timeouts,
@@ -10997,6 +11178,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 ),
                 depth=depth,
                 speculative=item.speculative,
+                merge_base_sha=merge_base_sha,
+                main_sha=main_sha,
             ))
             # task 2420 (DEFECT 1, split from 2357; extends #1728): no-progress
             # budget seed.  Content-mtime is LOCAL-only — a REMOTE lease's
@@ -11477,6 +11660,58 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if vr is not None and vr.outcome is not None:
                 fail_merge_wt = vr.merge_wt
                 await self._release_or_cleanup(fail_merge_wt, spec_warm=vr.spec_warm)
+                # I4 runs.db surface (task 2383 β, step 18): thread the skew
+                # attribution verdict into a merge_attempt event so gamma's
+                # digest.merge_disposition_counts (task 2384) is non-sentinel
+                # on the production path.  Guarded to INTEGRATION_SKEW/BRANCH_BUG
+                # only — MAIN_RED already emitted 'main_health_red' when the
+                # outcome was built (see _classify_main_health_red, above), and
+                # INDETERMINATE (fail-open default, I3) stays byte-identical
+                # with no emit at all.
+                #
+                # Amendment (reviewer_comprehensive, round 2): this is a
+                # deliberate choice, not an oversight — INDETERMINATE verify
+                # failures (the common fail-open default on non-orchestrator
+                # submit paths and on any classifier degradation) are
+                # intentionally UNCOUNTED here rather than emitted as a
+                # 'verify_failed' row with disposition=indeterminate. 2384's
+                # digest.merge_disposition_counts therefore has no
+                # denominator signal for that bucket and must compute rates
+                # only over {integration_skew, branch_bug}; it cannot
+                # distinguish "zero INDETERMINATE failures" from
+                # "INDETERMINATE failures not recorded" from this event
+                # alone. I3 requires the fail-open default to stay
+                # byte-identical (no emit) rather than manufacture a new kind
+                # of row, and
+                # test_indeterminate_first_attempt_emits_no_disposition_key
+                # (test_merge_skew_end_to_end.py) pins that contract — widening
+                # this guard to include INDETERMINATE is a deliberate,
+                # separately-reviewed semantics change, not a drive-by fix.
+                #
+                # Amendment (reviewer_comprehensive, round 3): BRANCH_BUG is
+                # the COMMON case whenever the caller supplies dispatch-time
+                # base facts (2357), so this guard is not just an
+                # INDETERMINATE-vs-not distinction — it introduces a NET-NEW
+                # merge_attempt row on the ordinary post-merge-verify-fail
+                # path. Before β, the single-task verify-FAILURE finalize
+                # branch emitted no merge_attempt row at all; the only other
+                # `verify_failed` emit in this module is the train path
+                # (~:3686), which is unaffected by this guard. Intended (it
+                # is 2384's disposition denominator), but a consumer counting
+                # merge_attempt rows or computing latency percentiles
+                # (duration_ms is stamped here) over this event kind will see
+                # new volume/outliers starting with this task — future
+                # readers should not assume the speculative verify-fail path
+                # was already emitting these rows pre-β.
+                if vr.outcome.disposition in (
+                    MergeFailureDisposition.INTEGRATION_SKEW,
+                    MergeFailureDisposition.BRANCH_BUG,
+                ):
+                    _emit_merge_attempt(
+                        self._event_store, req.task_id, OutcomeKind.verify_failed,
+                        disposition=vr.outcome.disposition,
+                        duration_ms=_elapsed_ms(item.started_monotonic),
+                    )
                 self._resolve_or_drop_abandoned(req, vr.outcome)
                 _n_failed_val = True
                 return False

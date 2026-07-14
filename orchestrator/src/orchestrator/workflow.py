@@ -1699,6 +1699,38 @@ class TaskWorkflow:
                 EventType.phase_enter,
                 task_id=self.task_id, phase=new_state.value,
             )
+            # Task 2383 β: the branch's OWN pre-merge verify verdict, keyed
+            # by task_id.  REVIEW is reachable from VERIFY only on a PASSING
+            # verify (a failing verify routes to BLOCKED/ESCALATED before
+            # _enter_phase(REVIEW) is ever called), so this edge is a
+            # reliable "branch verified green pre-merge" signal.  Consumed
+            # by the merge-skew attribution classifier's I5 branch-green
+            # fact (merge_disposition._branch_pre_merge_verify_green), which
+            # keys on task_id and reads only data['passed'] — base_sha/branch
+            # below are informational only (kept for future telemetry/log
+            # correlation; the classifier ignores them today).
+            #
+            # Note (reviewer_comprehensive, amendment round 2): I5 reads
+            # "any-prior-green" (never most-recent-wins), so this row
+            # survives untouched across a later review-bounce. If the branch
+            # is re-executed after REVIEW and reaches this edge again having
+            # introduced its OWN new bug, the stale green from before the
+            # bounce can still cause that genuine BRANCH_BUG to be
+            # misclassified as INTEGRATION_SKEW if an unrelated main landing
+            # happens to overlap the same file. This is a documented I5
+            # tradeoff (merge_disposition.py's any-prior-green keying is out
+            # of this task's module scope to change); pinned by
+            # test_merge_skew_end_to_end.py::TestReviewBounceStaleGreenTradeoff.
+            if prev is WorkflowState.VERIFY and new_state is WorkflowState.REVIEW:
+                self.event_store.emit(
+                    EventType.workflow_verify,
+                    task_id=self.task_id,
+                    data={
+                        'passed': True,
+                        'base_sha': self._base_commit,
+                        'branch': f'{self.config.git.branch_prefix}{self.task_id}',
+                    },
+                )
         self._phase_cost_at_entry = self.metrics.total_cost_usd
 
     async def _setup_worktree_and_artifacts(self, branch_name: str) -> None:
@@ -5769,6 +5801,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         paths suppress task-status transitions — the caller retries
         the merge in-place instead of requeueing via the scheduler.
         """
+        from orchestrator.merge_disposition import MergeFailureDisposition
         from orchestrator.merge_queue import (
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
             AttachAction,
@@ -6096,6 +6129,29 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if result.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX):
             self._write_merge_failure_review('main_health_red', result.reason)
             return await self._auto_heal_main_health(result, merge_phase=merge_phase)
+        # Merge-skew short-circuit (task 2383 β, M2 of
+        # plans/merge-skew-attribution-prd.md): the branch verified green
+        # pre-merge, but a landing on main overlapping the failing test's
+        # file(s) is implicated — this is a "port the landed change" case,
+        # not a bug on the branch.  Route straight to a human-facing L1
+        # tagged ``integration_skew`` (not the steward — porting a landed
+        # diff requires human/architect judgement, not a retry) so the
+        # implicated sha + overlap files carried in *result.reason* by
+        # ``_render_skew_surfaces`` are never buried in a generic task-fault
+        # escalation.  Checked AFTER the MAIN_HEALTH_RED short-circuit
+        # (mutually exclusive: MAIN_RED is stamped only when
+        # preexisting=True, INTEGRATION_SKEW only when preexisting=False)
+        # and BEFORE the generic blocked path.
+        if getattr(result, 'disposition', None) is MergeFailureDisposition.INTEGRATION_SKEW:
+            self._write_merge_failure_review('integration_skew', result.reason)
+            return await self._mark_blocked(
+                result.reason,
+                detail=result.reason,
+                merge_phase=merge_phase,
+                escalate_to_human=True,
+                category='integration_skew',
+                suggested_action='port_landed_change',
+            )
         # Fix 3 — capture the merge-queue blocked reason so the merge-phase
         # loop can fingerprint it for the thrash check before resubmitting.
         self._last_merge_block_reason = result.reason
