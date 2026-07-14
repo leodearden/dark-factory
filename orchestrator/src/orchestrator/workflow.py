@@ -203,6 +203,12 @@ def _inject_verdict_tools_mcp(mcp_config: dict | None, cwd: Path, role: AgentRol
     ``meta_root=_meta_root_for_worktree(cwd)`` passthrough so the agent-side
     verdict-tools server targets the identical relocated `.task-meta` root
     the orchestrator's own ``TaskArtifacts`` instance reads from.
+
+    Deliberately passes no ``--session-id`` to ``verdict_tools_mcp_server``,
+    even though the active session id is available here at the ``_invoke``
+    spawn site — see that function's docstring (task 2482 design_decisions
+    #4) for why this is an intentional v1 scope boundary rather than an
+    oversight.
     """
     if not mcp_config:
         mcp_config = {'mcpServers': {}}
