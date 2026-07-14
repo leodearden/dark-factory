@@ -300,7 +300,17 @@ Review this run and provide your verdict as JSON.
             # halt path (review_run() halts on config.halt_on_judge_serious;
             # _check_error_trends treats 'serious' as non-ok) so a systemic
             # judge/CLI outage surfaces loudly instead of hiding behind a
-            # fabricated fail-soft 'minor' verdict.
+            # fabricated fail-soft 'minor' verdict. This intentionally halts
+            # on a SINGLE unparseable response — review_run() acts on
+            # severity=serious immediately, it does not wait for
+            # _check_error_trends' multi-occurrence/consecutive window. A
+            # lone parse failure is treated as sufficient grounds to halt
+            # (rather than requiring a trend) because an unparseable judge
+            # response means the review pipeline itself may be broken, so
+            # subsequent verdicts can't be trusted to detect a trend either;
+            # see test_review_run_unparseable_response_halts_when_enabled /
+            # ..._no_halt_when_disabled in test_judge.py for the covered
+            # behavior at both settings of halt_on_judge_serious.
             return JudgeVerdict(
                 run_id=run_id,
                 reviewed_at=datetime.now(UTC),

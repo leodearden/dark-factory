@@ -479,6 +479,89 @@ async def test_verdict_action_taken_persisted_after_mutation_serious(mock_journa
 
 
 @pytest.mark.asyncio
+async def test_review_run_unparseable_response_halts_when_enabled(mock_journal):
+    """A single unparseable judge response halts the project immediately when
+    halt_on_judge_serious=True.
+
+    This is the behaviorally significant consequence of the loud
+    severity=serious parse-failure verdict: review_run() acts on it the
+    same way it would a genuine serious verdict, without waiting for
+    _check_error_trends' multi-occurrence window. One malformed judge/CLI
+    response is deliberately treated as sufficient grounds to halt — see
+    the comment in Judge._parse_verdict's except block.
+    """
+    from fused_memory.models.reconciliation import ReconciliationRun, RunStatus, RunType
+
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-parse-halt',
+        project_id='test-project-parse-halt',
+        run_type=RunType.full,
+        trigger_reason='buffer_size:3',
+        started_at=now,
+        events_processed=3,
+        status=RunStatus.completed,
+        stage_reports={},
+    )
+    mock_journal.get_run = AsyncMock(return_value=run)
+    mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+
+    with patch.object(
+        judge, '_call_llm', AsyncMock(return_value='not valid json at all {{{')
+    ):
+        verdict = await judge.review_run('run-parse-halt')
+
+    assert verdict is not None
+    assert verdict.severity == VerdictSeverity.serious
+    assert verdict.action_taken == VerdictAction.halt
+    assert judge.is_halted('test-project-parse-halt')
+    mock_journal.set_halt.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_review_run_unparseable_response_no_halt_when_disabled(mock_journal):
+    """An unparseable judge response still yields a loud serious verdict when
+    halt_on_judge_serious=False, but does NOT halt the project.
+
+    The severity itself stays honest/serious regardless of config — only
+    the *action* (halting) is gated on halt_on_judge_serious, same as for
+    a genuine serious verdict.
+    """
+    from fused_memory.models.reconciliation import ReconciliationRun, RunStatus, RunType
+
+    config = _make_judge_config(halt_on_judge_serious=False)
+    judge = Judge(config=config, journal=mock_journal)
+
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-parse-no-halt',
+        project_id='test-project-parse-no-halt',
+        run_type=RunType.full,
+        trigger_reason='buffer_size:3',
+        started_at=now,
+        events_processed=3,
+        status=RunStatus.completed,
+        stage_reports={},
+    )
+    mock_journal.get_run = AsyncMock(return_value=run)
+    mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+
+    with patch.object(
+        judge, '_call_llm', AsyncMock(return_value='not valid json at all {{{')
+    ):
+        verdict = await judge.review_run('run-parse-no-halt')
+
+    assert verdict is not None
+    assert verdict.severity == VerdictSeverity.serious
+    assert verdict.action_taken == VerdictAction.none
+    assert not judge.is_halted('test-project-parse-no-halt')
+    mock_journal.set_halt.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_judge_call_llm_openai_none_content(mock_journal):
     """_call_llm with openai provider returns empty string when message.content is None."""
     config = _make_judge_config(judge_llm_provider='openai', judge_llm_model='gpt-4o-mini')
