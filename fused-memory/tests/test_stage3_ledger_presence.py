@@ -105,3 +105,33 @@ class TestWriteThenReadLedgerSeam:
         assert result.get('ledger_available') is False, (
             'ledger_available=False (inconclusive) must drive Stage 3 to the Mem0 fallback'
         )
+
+    @pytest.mark.asyncio
+    async def test_ledger_read_error_is_not_swallowed_as_definitive_absent(self, mock_config, tmp_path):
+        """A wired ReconLedgerStore whose read raises (e.g. a transient DB
+        error) must NOT be swallowed into a false present=False /
+        ledger_available=True by the service layer — that shape is
+        indistinguishable from a genuinely-absent row and would make Stage
+        3's new PRIMARY rule report a false missing_knowledge. MemoryService
+        has no try/except around the ledger read, so the exception
+        propagates unmodified; it is only the @mcp_tool_errors decorator at
+        the MCP tool boundary
+        (tests/server/test_get_cycle_summary_presence_tool.py::
+        test_service_exception_is_caught_and_returned_as_error_dict) that
+        turns it into an {'error': ..., 'error_type': ...} dict — which
+        carries neither 'present' nor 'ledger_available', so Stage 3's
+        prompt correctly reads it as a tool error and falls through to the
+        Mem0 fallback rather than concluding absence."""
+        service = MemoryService(mock_config)
+        store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await store.initialize()
+        service.set_recon_ledger(store)
+        store.get_by_identity = AsyncMock(side_effect=RuntimeError('ledger read boom'))
+
+        try:
+            with pytest.raises(RuntimeError, match='ledger read boom'):
+                await service.get_cycle_summary_presence(
+                    project_id=_PROJECT_ID, run_id='any-run', stage=_STAGE,
+                )
+        finally:
+            await store.close()
