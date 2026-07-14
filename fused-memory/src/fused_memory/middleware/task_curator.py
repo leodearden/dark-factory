@@ -1860,17 +1860,19 @@ class TaskCurator:
         write points (_point_id), then diffing against the actual corpus
         point ids — robust to payload drift, no reliance on payload task_id.
 
-        CAUTION — tag scope: the corpus is keyed by ``project_id`` alone
-        (``_point_id``/``_collection_name`` take no ``tag``), and
+        Caller contract — tag scope: the corpus is keyed by ``project_id``
+        alone (``_point_id``/``_collection_name`` take no ``tag``), and
         ``record_task``/``index_committed_tasks`` record a task's vector
         regardless of which tag it was filed under. ``live_task_ids`` MUST
         therefore already aggregate every tag the corpus could contain a
         vector for — if it only reflects a single tag's tasks, tasks filed
         under any other tag will look orphaned and be deleted here. As of
-        this writing the only caller (``BackfillManager.prune``) reads a
-        single tag (``get_tasks`` defaults to ``DEFAULT_TAG``), which is a
-        known gap tracked for follow-up rather than fixed in this method —
-        see the matching note on ``BackfillManager.prune``.
+        task 2603 the sole caller (``BackfillManager.prune``) satisfies
+        this: it enumerates every tag via ``list_tags`` and unions
+        ``get_tasks(project_root, tag=t)`` across all of them before
+        calling this method, failing safe (skipping the sweep entirely)
+        if any tag's read fails — see the matching note on
+        ``BackfillManager.prune``.
         """
         live = {str(t) for t in live_task_ids}
         if not live:
@@ -2119,17 +2121,20 @@ class TaskCurator:
         ``get_task`` is called without a ``tag`` — it resolves to
         ``DEFAULT_TAG``. That does NOT match the Qdrant corpus's own scope:
         the corpus is keyed by ``project_id`` ALONE (see the tag-scope
-        CAUTION on ``prune_orphans`` above), and ``record_task``/
-        ``index_committed_tasks`` write a task's vector regardless of which
-        tag it was filed under. So a ``TaskNotFoundError`` here does NOT
-        prove the task is gone — it also fires for a live task filed under
-        a non-default tag, which is then excluded from the pool exactly
-        like a genuine deletion (task 2521 RC2). This is an accepted
-        tradeoff, not a correctness proof: worst case a near-identical
-        re-file of a non-default-tag task is filed as a duplicate instead
-        of combined — the same "duplicate is cheap" bias this method
-        already applies to inconclusive errors below. It is the same
-        known multi-tag gap tracked on ``prune_orphans``, not fixed here.
+        caller-contract note on ``prune_orphans`` above), and
+        ``record_task``/``index_committed_tasks`` write a task's vector
+        regardless of which tag it was filed under. So a
+        ``TaskNotFoundError`` here does NOT prove the task is gone — it
+        also fires for a live task filed under a non-default tag, which is
+        then excluded from the pool exactly like a genuine deletion (task
+        2521 RC2). This is an accepted tradeoff, not a correctness proof:
+        worst case a near-identical re-file of a non-default-tag task is
+        filed as a duplicate instead of combined — the same "duplicate is
+        cheap" bias this method already applies to inconclusive errors
+        below. As of task 2603 the orphan-prune sweep
+        (``BackfillManager.prune``/``prune_orphans``) is tag-complete;
+        this pool-building lookup's own ``DEFAULT_TAG``-only ``get_task``
+        call remains a separate, accepted limitation — not fixed here.
         """
         if self._taskmaster is not None:
             try:
