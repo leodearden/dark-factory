@@ -106,6 +106,17 @@ class TaskBackendProtocol(Protocol):
         """
         ...
 
+    async def list_tags(self, project_root: str) -> list[str]:
+        """Return every distinct tag with at least one task in *project_root*.
+
+        ``get_tasks``/``get_statuses`` default to a single tag
+        (``DEFAULT_TAG``) when none is given — a caller that needs a
+        cross-tag-complete view (e.g. ``BackfillManager.prune``, task 2603)
+        must enumerate every tag first via this method, then call
+        ``get_tasks(project_root, tag=t)`` per tag and aggregate.
+        """
+        ...
+
     # ── Mutations ──────────────────────────────────────────────────────
 
     async def set_task_status(

@@ -1565,6 +1565,50 @@ class SqliteTaskBackend:
                 with contextlib.suppress(Exception):
                     await conn.close()
 
+    async def list_tags(self, project_root: str) -> list[str]:
+        """Return every distinct tag with at least one task row in *project_root*.
+
+        Used by :class:`~fused_memory.maintenance.backfill_curator_corpus.BackfillManager`
+        (task 2603) to build a cross-tag-complete live-task-id snapshot
+        before diffing against the curator corpus — ``get_tasks``/
+        ``get_statuses`` default to a single tag (``DEFAULT_TAG``), so a
+        caller that needs every tag a project has ever used must enumerate
+        them first via this method.
+
+        Reads via the cached per-project AUTOCOMMIT connection returned by
+        :meth:`_get_read_connection` (task 2455) — the same lightweight,
+        connection-unpinning read pattern as :meth:`get_statuses_raw`.
+        Closes its cursor deterministically via ``async with conn.execute(
+        ...) as cursor:`` (mirrors :meth:`_statuses_from_conn`) so the
+        implicit WAL read transaction always releases, keeping the cached
+        read connection unpinnable (see :meth:`_get_read_connection`'s
+        Guardrail note).
+
+        Snapshot consistency: because this reads via :meth:`_get_read_connection`
+        while :meth:`get_task`/:meth:`get_tasks` read via the cached WRITE
+        connection (:meth:`_get_connection`), the two can observe different
+        WAL snapshots — the same cross-connection caveat documented on
+        :meth:`get_statuses_raw`. A caller combining them (e.g.
+        :class:`~fused_memory.maintenance.backfill_curator_corpus.BackfillManager`'s
+        cross-tag prune sweep, which calls this and then ``get_tasks`` once
+        per tag) should treat a tag created concurrently with the read as a
+        benign, self-healing miss for that cycle rather than assume the two
+        calls agree to the instant.
+
+        Args:
+            project_root: Absolute path to the project root.
+
+        Returns:
+            Every distinct ``tag`` value present in the ``tasks`` table, in
+            no particular order (callers requiring a stable order should
+            sort). ``[]`` if the project has no tasks yet.
+        """
+        await self.ensure_connected()
+        conn = await self._get_read_connection(project_root)
+        async with conn.execute('SELECT DISTINCT tag FROM tasks') as cursor:
+            rows = await cursor.fetchall()
+        return [row['tag'] for row in rows]
+
     async def set_task_status(
         self,
         task_id: str,
