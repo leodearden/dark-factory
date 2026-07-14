@@ -1084,6 +1084,36 @@ class TestFilterSuppressedComposite:
         result = await filter_suppressed(ledger_memory_service, 'p', flags)
         assert result == [{'task_id': 99, 'flag_type': 'missing_deliverable'}]
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'degenerate_task_id',
+        [
+            pytest.param(',', id='single-comma'),
+            pytest.param(', ,', id='blank-components'),
+        ],
+    )
+    async def test_degenerate_composite_row_decomposes_to_no_components_is_skipped(
+        self, ledger_memory_service, degenerate_task_id
+    ):
+        """A row whose task_id decomposes to NO components (e.g. ',' or
+        ', ,') is truthy -- it passes the ``if not row.task_id`` guard at
+        flag_dedup.py:310 -- but must still be skipped when building the
+        suppressed map, since _decompose_suppression_task_id returns [] for
+        it and contributes no entries. All input flags must pass through
+        unchanged; this pins the guard's interaction with the
+        empty-decomposition branch, which the well-formed 2-/3-id composite
+        tests above never exercise."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', degenerate_task_id, '')
+
+        flags = [
+            {'task_id': 452, 'flag_type': 'missing_deliverable'},
+            {'task_id': 99, 'flag_type': 'stale_metadata'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+        assert result == flags
+
 
 # ---------------------------------------------------------------------------
 # task-1186 step-5 — integration: dedup_flags calls filter_suppressed FIRST
