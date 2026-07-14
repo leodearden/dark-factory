@@ -2480,9 +2480,10 @@ class TaskWorkflow:
                 # human L1, bypassing the steward corrective loop (mirrors
                 # the WorktreeConflictError branch above) rather than
                 # falling through to the generic 'Workflow error:' handler.
-                # escalate_to_human is passed explicitly (True) rather
-                # than via disp.escalate_to_human — BranchResetError has no
-                # _DISPOSITION_TABLE row, so disp is _DEFAULT_BLOCK here.
+                # escalate_to_human is passed explicitly (True) to keep this
+                # branch self-documenting; it now matches disp.escalate_to_human
+                # since BranchResetError has a dedicated _DISPOSITION_TABLE row
+                # (workflow_types.py) whose reason_prefix supplies the message.
                 logger.warning(
                     'Task %s: BranchResetError escaped run() — %s',
                     self.task_id, e,

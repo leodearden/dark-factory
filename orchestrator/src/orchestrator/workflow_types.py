@@ -222,6 +222,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
     from shared.usage_gate import IllegalTransitionError, SessionBudgetExhausted
 
     from orchestrator.git_ops import (
+        BranchResetError,
         EphemeralWorktreeError,
         InteractiveWorktreeLimitError,
         MergeParkContentionError,
@@ -328,6 +329,23 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='WIP-save aborted: unresolved conflict in worktree',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # BranchResetError (task 2403): a requeue/inter-iteration rebase
+        # collapsed a task branch to zero commits ahead of its baseline,
+        # wiping committed WIP. Caught by NAME in TaskWorkflow.run()'s
+        # `isinstance(e, BranchResetError)` branch (workflow.py ~2470) and
+        # routed to a per-task BLOCKED + human L1 — mirrors
+        # WorktreeConflictError above (RuntimeError subclass, same
+        # halt-and-escalate shape). That branch reads disp.reason_prefix for
+        # the blocked message, so this row's prefix (not the old
+        # _DEFAULT_BLOCK 'Workflow error') is what a human sees.
+        BranchResetError: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Branch reset: rebase wiped committed task work',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # ── BD-2 completeness rows: exported by the 4 covered modules, but
