@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import wire_scheduler_liveness_mock
+from _workflow_helpers import _build_harness, _init_git_repo
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
@@ -29,22 +29,6 @@ from orchestrator.warm_lane_pool import WarmLanePool
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _build_harness(config: OrchestratorConfig) -> Harness:
-    """Construct a Harness with heavy constructors patched out."""
-    with patch('orchestrator.harness.McpLifecycle'), \
-         patch('orchestrator.harness.Scheduler'), \
-         patch('orchestrator.harness.BriefingAssembler'):
-        harness = Harness(config)
-    # `Scheduler` is patched to a bare MagicMock; wire real (non-auto-mock)
-    # liveness-accessor behaviour (task 2235: harness.py now calls
-    # scheduler.is_dispatched()/.is_actively_held()/.workflow_cancel_recent()
-    # instead of reaching into _dispatched/lock_table._held directly) so
-    # tests below that set harness.scheduler._dispatched (or .lock_table)
-    # exercise real semantics instead of an auto-mocked (always-truthy) stub.
-    wire_scheduler_liveness_mock(harness.scheduler)  # type: ignore[arg-type]
-    return harness
 
 
 def _make_config(
@@ -261,16 +245,6 @@ class TestHarnessSpecPoolWiring:
 # ===========================================================================
 # Step-5 (1881): RED — B1: workflow.run() finally releases lane on CANCELLED exit
 # ===========================================================================
-
-
-async def _init_git_repo(repo: Path) -> None:
-    from orchestrator.git_ops import _run
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'init'], cwd=repo)
 
 
 @pytest.mark.asyncio

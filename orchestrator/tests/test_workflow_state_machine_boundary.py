@@ -45,33 +45,39 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
-from escalation.models import Escalation
-from shared.task_statuses import TaskStatus
-from shared.task_transitions import ActorClass, is_legal_transition, outcome_allows_status
 
 # Cross-module reuse — conftest.py injects orchestrator/tests onto sys.path
 # (see test_workflow_terminal_report.py for the same precedent). ``_make``
 # and ``_bind_landed_row`` carry no module-level lock of their own, so they
-# are imported directly rather than duplicated (rows 1-4).
+# are imported directly rather than duplicated (rows 1-4). All of these
+# factories live in _workflow_helpers.py (task 2610) — none are cross-
+# imported from a sibling producer's private namespace.
 #
 # ``_derive_meta_root_like_production`` is imported (not just the plain
-# helpers) because it is an autouse fixture in test_workflow_e2e.py — autouse
-# only auto-applies within a module where pytest can SEE the fixture, and a
-# plain `from test_workflow_e2e import AgentStub, ...` does not pull that in
-# (see test_workflow_terminal_report.py for the same precedent). Without it,
-# AgentStub's legacy-only TaskArtifacts writes are invisible to the
-# workflow's relocated meta_root, so a real run() never reaches DONE (rows
-# 5-6).
-from test_harness_warm_lane_wiring import _build_harness, _init_git_repo
-from test_workflow_e2e import (
+# helpers) because it is an autouse fixture — autouse only auto-applies
+# within a module where pytest can SEE the fixture, and a plain
+# `from _workflow_helpers import AgentStub, ...` that omits its name does
+# not pull that in (see test_workflow_terminal_report.py for the same
+# precedent). Without it, AgentStub's legacy-only TaskArtifacts writes are
+# invisible to the workflow's relocated meta_root, so a real run() never
+# reaches DONE (rows 5-6).
+from _workflow_helpers import (
     AgentStub,
+    FakeBriefing,
+    FakeMcp,
+    FakeScheduler,
+    _bind_landed_row,
+    _build_harness,
     _build_workflow,
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see above
+    _init_git_repo,
     _init_repo,
+    _make,
+    _make_warmlane_workflow,
 )
-from test_workflow_merge_provenance import _bind_landed_row, _make
-from test_workflow_warm_lane_requeue import _make_workflow as _make_warmlane_workflow
+from escalation.models import Escalation
+from shared.task_statuses import TaskStatus
+from shared.task_transitions import ActorClass, is_legal_transition, outcome_allows_status
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import _FAMILY_TOOL_PREFIXES, ROLES, AgentRole
