@@ -19,12 +19,14 @@ primitives rather than reaching into another task's module).
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from collections.abc import Iterator, Sequence
 
+from legibility.config import LegibilityConfig
 from legibility.inventory import SessionRecord
 
 
@@ -405,3 +407,94 @@ def dedupe_shapes(records: Sequence[ScoredRecord]) -> list[ScoredRecord]:
         elif record.score > best[fingerprint].score:
             best[fingerprint] = record
     return [best[fingerprint] for fingerprint in order]
+
+
+# ---------------------------------------------------------------------------
+# stratified_sample — budget-after-stratification sampler (PRD §5.2 point 2, §8.4)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SampleResult:
+    """The result of :func:`stratified_sample`: the selection plus accounting."""
+
+    selected: list[ScoredRecord]
+    per_stratum_counts: dict[str, int]
+    zero_signal_dropped: int
+    bytes_used: int
+
+
+def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig) -> SampleResult:
+    """Pick a budget-bounded, stratified subset of *records* (PRD §5.2 point 2, §8.4).
+
+    Pure function — no I/O, no clock. Per stratum: (1) group; (2) drop
+    zero-signal records; (3) :func:`dedupe_shapes` the survivors; (4) rank
+    by score desc and take ``candidates = top max(ceil(top_fraction *
+    stratum_size), per_stratum_min)`` capped at the survivor count (the
+    ``top_fraction`` proportion is relative to the stratum's ORIGINAL
+    size, including zero-signal/clone records, not just the survivors —
+    otherwise a heavily-noisy stratum would sample far less than intended
+    of its real signal); (5) RESERVE each non-empty stratum's top
+    ``min(per_stratum_min, len(candidates))`` into the selection first —
+    accumulated BEFORE any cross-stratum score comparison, so a stratum of
+    huge high-score sessions elsewhere can never evict this floor (the §8.4
+    "big sessions can't evict a whole stratum" postcondition); (6) fill the
+    remaining ``max_daily_digest_bytes`` from the leftover (non-reserved)
+    candidates across ALL strata, in global score-descending order,
+    stopping outright at the first candidate that would exceed the budget
+    (a strict greedy halt, not a skip-ahead bin-pack). The final selection
+    is returned in score-descending order.
+    """
+    top_fraction = config.sampling.top_fraction
+    per_stratum_min = config.sampling.per_stratum_min
+    max_bytes = config.budgets.max_daily_digest_bytes
+
+    by_stratum: dict[str, list[ScoredRecord]] = {}
+    for record in records:
+        by_stratum.setdefault(record.stratum, []).append(record)
+
+    zero_signal_dropped = 0
+    reserved: list[ScoredRecord] = []
+    leftover: list[ScoredRecord] = []
+
+    for stratum_records in by_stratum.values():
+        stratum_size = len(stratum_records)
+
+        nonzero = [r for r in stratum_records if r.score > 0]
+        zero_signal_dropped += stratum_size - len(nonzero)
+
+        survivors = sorted(dedupe_shapes(nonzero), key=lambda r: r.score, reverse=True)
+
+        candidate_count = min(
+            max(math.ceil(top_fraction * stratum_size), per_stratum_min),
+            len(survivors),
+        )
+        candidates = survivors[:candidate_count]
+
+        reserve_count = min(per_stratum_min, len(candidates))
+        reserved.extend(candidates[:reserve_count])
+        leftover.extend(candidates[reserve_count:])
+
+    selected: list[ScoredRecord] = []
+    bytes_used = 0
+    for record in reserved:
+        selected.append(record)
+        bytes_used += record.size_bytes
+
+    for record in sorted(leftover, key=lambda r: r.score, reverse=True):
+        if bytes_used + record.size_bytes > max_bytes:
+            break
+        selected.append(record)
+        bytes_used += record.size_bytes
+
+    selected.sort(key=lambda r: r.score, reverse=True)
+
+    per_stratum_counts: dict[str, int] = {}
+    for record in selected:
+        per_stratum_counts[record.stratum] = per_stratum_counts.get(record.stratum, 0) + 1
+
+    return SampleResult(
+        selected=selected,
+        per_stratum_counts=per_stratum_counts,
+        zero_signal_dropped=zero_signal_dropped,
+        bytes_used=bytes_used,
+    )
