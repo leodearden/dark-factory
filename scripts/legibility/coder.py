@@ -37,6 +37,8 @@ import re
 
 import yaml
 
+import codebook as codebook_mod
+
 
 class CoderParseError(Exception):
     """Raised when the coder cannot parse a digest's frontmatter or the
@@ -121,3 +123,39 @@ def parse_frontmatter(digest_text: str) -> dict:
             f"frontmatter block did not parse to a mapping, got {type(meta).__name__}"
         )
     return meta
+
+
+# ---------------------------------------------------------------------------
+# build_prompt — instructions + codebook index + digest, embedded verbatim
+# ---------------------------------------------------------------------------
+
+def build_prompt(digest_text: str, codebook_index: str) -> str:
+    """Compose the full prompt handed to the trickle coder LLM.
+
+    Embeds *codebook_index* and *digest_text* verbatim (pure data
+    plumbing — a broken coder would drop one), the legal phase vocabulary
+    (codebook.PHASES, including "unknown"), and the required strict-JSON
+    output shape (PRD §7.3).
+    """
+    phases = ", ".join(codebook_mod.PHASES)
+    return (
+        "You are the trickle coder for the dark-factory agent-confusion "
+        "codebook (plans/confusion-reduction-prd.md §7.3). Read the "
+        "session digest below and decide which existing codebook entries "
+        "it matches (if any), and whether it reveals any novel confusion "
+        "causes not yet in the codebook (candidates).\n\n"
+        "Never guess a phase you can't support from the evidence — use "
+        '"unknown" instead. Legal phase values: ' + phases + ".\n\n"
+        "Respond with STRICT JSON ONLY (no prose, no markdown fences), "
+        "exactly this shape:\n"
+        '{"matches": [{"entry_id": "...", "origin_phase": "...", '
+        '"manifested_phase": "...", "invariant_violated": null, '
+        '"note": "..."}], '
+        '"candidates": [{"title": "...", "cause": "...", "area": "...", '
+        '"origin_phase": "...", "manifested_phase": "...", '
+        '"evidence_quote": "..."}]}\n'
+        'If nothing matches and nothing is novel, respond with '
+        '{"matches": [], "candidates": []}.\n\n'
+        "=== CODEBOOK INDEX ===\n" + codebook_index + "\n\n"
+        "=== SESSION DIGEST ===\n" + digest_text
+    )
