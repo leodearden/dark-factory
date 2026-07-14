@@ -962,6 +962,74 @@ class TestCopyAction:
             after = _snapshot_tree(tmp_path)
             assert after == before
 
+    @pytest.mark.timeout(10)
+    async def test_copy_highlighted_session_puts_slug_and_question_on_clipboard(self, tmp_path):
+        """'y' on a SESSION-backed row (no decision behind it) copies the
+        session slug + question text onto the clipboard. Covers the
+        app-level action_copy -> highlighted SESSION row -> clipboard path
+        end-to-end -- the decision-row case above and format_copy_payload's
+        own pure-formatter unit tests don't exercise this branch through
+        action_copy itself (reviewer_comprehensive test_coverage
+        suggestion, test_app.py:911).
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        awaiting = _make_record(
+            session_slug='awaiting-99',
+            status=sr.Status.AWAITING_INPUT,
+            question=sr.Question(text='Which region?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            queue.move_cursor(row=queue.get_row_index('session:awaiting-99'))
+            await pilot.pause()
+
+            before = _snapshot_tree(tmp_path)
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            # (a) the session row's question + slug landed on the clipboard.
+            assert app._clipboard
+            assert 'Which region?' in app._clipboard
+            assert 'awaiting-99' in app._clipboard
+
+            # (b) strictly read-only -- a session is never cockpit-written.
+            after = _snapshot_tree(tmp_path)
+            assert after == before
+
+    @pytest.mark.timeout(10)
+    async def test_copy_with_empty_queue_is_a_fail_soft_no_op(self, tmp_path):
+        """'y' against an EMPTY queue -- highlighted_key() returns None,
+        mirroring action_drop/action_defer's own fail-soft guard -- must
+        not crash and must leave the clipboard untouched (reviewer_comprehensive
+        test_coverage suggestion's optional no-highlight/no-op case).
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 0
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            assert app._clipboard == ''
+
 
 class TestDeferResetsAge:
     @pytest.mark.timeout(10)
