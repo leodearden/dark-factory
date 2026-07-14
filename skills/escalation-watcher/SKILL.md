@@ -507,6 +507,50 @@ demoted to a generated history view: the cockpit decision queue (C5b), fed by `w
 (see "Filing Parked Decisions to the Cockpit Registry" above), is now the primary return-triage
 surface for any of the above that left a decision open (i.e. every outcome except "Merged").
 
+## Merge-failure disposition vocabulary (skew ⇒ port, don't debug)
+
+Merge-gate verify failures now carry a **disposition** — a classification of whose
+fault the failure is, orthogonal to the failure's `category` (`plans/merge-skew-attribution-prd.md`,
+task β, `orchestrator/src/orchestrator/merge_disposition.py`). It is a **closed enum**:
+
+| Disposition | Meaning |
+|---|---|
+| `main_red` | The failure already reproduces on main tip (preexisting-main-break probe fired) — reported through the existing "fix main:" dedup path, not new. |
+| `integration_skew` | The branch's own pre-merge verify was green, but a commit landed on main since the branch's merge-base that touches the files the failing test(s) depend on. The branch is *semantically stale* against that landing — nothing is wrong with the branch's own diff. |
+| `branch_bug` | No landed commit is implicated — the failure is the branch's own bug. |
+| `indeterminate` | The classifier couldn't reach a verdict (evidence inconclusive, or an internal error — fail-open). Treat exactly like today's undifferentiated failure. |
+
+**Where it surfaces:** `integration_skew` does **not** get its own escalation
+category — it still arrives here as an ordinary `task_failure` / `wip_conflict`
+escalation. What changes is the content: the task's block reason carries an
+appended suffix of the form `integration_skew: port landed commit(s) <sha[, sha...]>
+touching <files> — do not hunt your own diff`, and the same disposition +
+implicated commits + overlap files are available verbatim in `merge_status`'s
+`failure_diagnostic` field. Look for that suffix/field before you (or a spawned
+`/unblock` session) start reading the branch's own diff for a bug that isn't there.
+
+**Triage rule — the load-bearing part:**
+
+- **`integration_skew` ⇒ PORT the named landed commit(s) into the branch.** The fix
+  is an agent edit that brings the branch's content in line with what already
+  landed on main — cherry-pick, reapply, or hand-port the relevant hunks of the
+  named sha(s) into the files the diagnostic lists. Do **not** debug the branch's
+  own diff; the branch's logic was fine when it was cut, and re-running verify or
+  hunting for a regression in the branch's own change is wasted effort.
+- **Skew is NOT a flake, and must not be auto-filed into flake stats.** It reads
+  superficially like a transient failure (retry-after-rebase would make it pass),
+  but it has a deterministic, name-able cause. Any flake-tracking/auto-file path
+  (e.g. reify 5142 / DF 2358's flaky ledger) must filter on `disposition ==
+  'integration_skew'` and exclude it, and a human doing manual triage should
+  likewise never wave it off as "just flaky."
+- `main_red` and `branch_bug` need no special handling beyond what their existing
+  category sections already say; `indeterminate` degrades to today's behavior —
+  treat it as an undifferentiated failure.
+
+This vocabulary matters most for `task_failure` and `wip_conflict` (see those
+sections below) — check the block reason / `failure_diagnostic` for a disposition
+before spawning `/unblock` or trying the low-risk auto-unblock gate.
+
 ## Handling Escalations by Category
 
 For every escalation, read the `suggested_action` field. It's a free-text hint — sometimes a conventional verb, sometimes natural language. First determine the escalation's **L2 origin**, then interpret the hint accordingly:
@@ -564,6 +608,11 @@ If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B
 
 Merge conflicts, verification failures, build breaks. The task agent is stopped and waiting.
 
+Before investigating, check the block reason / `merge_status.failure_diagnostic` for a
+`disposition` — see [Merge-failure disposition vocabulary](#merge-failure-disposition-vocabulary-skew--port-dont-debug)
+above. If it reads `integration_skew`, the fix is porting the named landed commit(s), not
+debugging the branch's own diff, and it must not be counted as a flake.
+
 **Spawn an interactive `/unblock` session** so the human can investigate and resolve it: invoke `/spawn` with `prompt="/unblock <task_id> (esc <escalation_id>, task_failure, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` (e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention), `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — the `/unblock` skill resolves it when the human finishes. Track the spawned session so you can report its status if asked. The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
 
 If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) — try it first.
@@ -578,6 +627,12 @@ Two flavours:
   - Stash pop conflicted after the merge landed (merge IS on main; WIP preserved on `wip/recovery-<task>-<ts>`).
   - Stash pop conflicted on CAS-failure path (merge did NOT land; WIP on recovery branch; task blocks).
 - **`unmerged_state`** — `project_root` already had UU/AA/DD markers before the merge attempted to advance (pre-existing corruption, not caused by this merge).
+
+As with `task_failure`, check for a `disposition` in the block reason / `failure_diagnostic`
+before assuming this is a raw conflict to resolve mechanically — see
+[Merge-failure disposition vocabulary](#merge-failure-disposition-vocabulary-skew--port-dont-debug)
+above. `integration_skew` still needs a port of the named landed commit(s), not just conflict
+resolution, and is never a flake.
 
 **Never auto-resolve** — `manual_intervention` is authoritative. The human has to inspect `project_root`:
 - For `wip_conflict`: recovery branch named in the detail preserves the user's WIP; they may need to cherry-pick or reapply before resolving.
