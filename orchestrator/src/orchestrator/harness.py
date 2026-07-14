@@ -71,6 +71,7 @@ from orchestrator.systemd_inspect import (
     _deterministic_deploy_health_verdict,
     inspect_systemd_unit,
 )
+from orchestrator.task_ground_truth import RecoveryAction, TaskGroundTruth
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_STATUSES,
@@ -130,6 +131,16 @@ _DIRTY_TREE_ESCALATION_SENTINEL: str = 'dirty-project-root-startup'
 # The explicit merge-deferred early-return in _reconcile_one_stranded mirrors
 # the open-L1 /unblock veto guard (harness.py _reconcile_one_stranded:~1598).
 _RECONCILE_SWEEP_STATUSES: frozenset[str] = frozenset({'in-progress', 'blocked'})
+
+# heartbeat_ttl the harness configures TaskGroundTruth (task 2243, W10-θ2)
+# with — the staleness threshold TG-3's live_claimant folding applies to the
+# W2 db claimant signal (shared.task_claimant.is_stranded) and the plan.lock
+# freshness cross-check. No dedicated OrchestratorConfig field exists for
+# this yet, so it is bound explicitly here rather than left to silently ride
+# whatever default TaskGroundTruth ships with; the value mirrors
+# TaskGroundTruth's own _DEFAULT_HEARTBEAT_TTL (task_ground_truth.py) and
+# TaskArtifacts.clear_stale_plan_lock's hardcoded 600s default.
+_RECONCILE_HEARTBEAT_TTL: timedelta = timedelta(minutes=10)
 
 # Non-terminal parked statuses whose worktrees are inviolable — owned by a
 # non-scheduler party, not by the task's own progress — and so must NEVER be
@@ -947,6 +958,15 @@ class Harness:
         self._escalation_queue: EscalationQueue | None = None
         self._escalation_events: dict[str, asyncio.Event] = {}
         self._escalation_task: asyncio.Task | None = None
+
+        # Ground-truth resolver seam (task 2243, W10-θ2) — lazily built (and
+        # memoized) by _get_ground_truth() the first time a reconcile sweep
+        # needs it. MUST stay unbuilt here: TaskGroundTruth captures
+        # escalation_queue at construction, and self._escalation_queue above
+        # is still None at this point in __init__ (only populated later, in
+        # run()) — building eagerly would freeze that None forever. See
+        # _get_ground_truth's docstring.
+        self._ground_truth: TaskGroundTruth | None = None
 
         # Unified lifecycle seam (task 2241, W10-η — PRD §5.3 LR-1/2/3):
         # the eleven background-loop/service lifecycles below register into
@@ -3218,6 +3238,39 @@ Output JSON matching the schema. Every task must appear in the output.
             logger.info(
                 'Terminal-lane reconciler: released %d lane(s)', released,
             )
+
+    def _get_ground_truth(self) -> TaskGroundTruth:
+        """Lazily build (and memoize) the ground-truth resolver (task 2243, W10-θ2).
+
+        ``TaskGroundTruth`` captures its ``escalation_queue`` collaborator at
+        construction time; ``self._escalation_queue`` is ``None`` at
+        ``Harness.__init__`` and is only populated later, during ``run()``
+        startup. Building the resolver once in ``__init__`` (or memoizing it
+        on first use with no refresh) would freeze that startup-time
+        ``None`` forever — every open-escalation-aware recovery row
+        (``_RECOVERY`` rows f/g/h in task_ground_truth.py) would then never
+        see a real queue for the rest of the process lifetime (the
+        "frozen-None trap").
+
+        So: build on first call, and REBUILD whenever ``self._escalation_queue``
+        has since changed identity (the one-time ``None`` -> live-queue
+        startup transition in production; a test re-pointing the queue).
+        Once ``self._escalation_queue`` is stable, repeated calls return the
+        SAME memoized instance rather than reconstructing on every reconcile
+        pass.
+        """
+        if (
+            self._ground_truth is None
+            or self._ground_truth.escalation_queue is not self._escalation_queue
+        ):
+            self._ground_truth = TaskGroundTruth(
+                self.git_ops,
+                self.scheduler,
+                self._escalation_queue,
+                self._resolve_task_worktree,
+                heartbeat_ttl=_RECONCILE_HEARTBEAT_TTL,
+            )
+        return self._ground_truth
 
     async def _reconcile_stranded_in_progress(self, *, mid_run: bool = False) -> int:
         """Sweep stranded in-progress tasks back to pending (or done).
