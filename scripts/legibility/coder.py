@@ -308,3 +308,79 @@ def code_digest(
         )
 
     return CodingResult(ok=True, record=record, session=session)
+
+
+# ---------------------------------------------------------------------------
+# code_digests — a batch of digests -> RunResult, with the storm threshold
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RunResult:
+    """Outcome of coding a batch of digests via code_digests().
+
+    ``records`` holds every successful (schema-valid) coding record;
+    ``failures`` holds a ``(session, reason)`` pair for every digest that
+    could not be coded — never a fabricated record. ``status`` is
+    ``"failure"`` when the batch's failure fraction STRICTLY exceeds 0.5
+    (``failed/total > 0.5``, PRD §5.3/§6.8's storm threshold); exactly 50%
+    failed is NOT a storm and stays ``"ok"``. This function never
+    escalates and never touches the codebook — that is epsilon/gamma's
+    job; it only returns the tallied result.
+    """
+
+    status: str
+    records: list
+    failures: list
+    total: int
+    succeeded: int
+    failed: int
+
+
+def code_digests(
+    digests,
+    codebook: dict,
+    *,
+    project: str,
+    model: str = "haiku",
+    invoke=None,
+) -> RunResult:
+    """Code a batch of digests against one codebook.
+
+    Calls ``code_digest`` once per digest, each wrapped in its own
+    isolated try/except so a single unexpected crash (e.g. a digest whose
+    frontmatter fails to parse) can't abort the rest of the batch — a
+    belt-and-braces layer on top of code_digest's own never-fabricate
+    contract. Successes are appended to ``records``; failures to
+    ``failures`` as ``(session, reason)`` pairs (session is ``None`` when
+    the crash happened before a session could even be determined).
+
+    ``status`` is ``"failure"`` when ``failed/total`` STRICTLY exceeds
+    0.5 — a majority-failure storm — else ``"ok"``. Never escalates,
+    never writes the codebook.
+    """
+    records = []
+    failures = []
+
+    for digest_text in digests:
+        try:
+            result = code_digest(
+                digest_text, codebook, project=project, model=model, invoke=invoke,
+            )
+        except Exception as exc:  # isolate: one crash can't abort the batch
+            failures.append((None, str(exc)))
+            continue
+
+        if result.ok:
+            records.append(result.record)
+        else:
+            failures.append((result.session, result.reason))
+
+    total = len(digests)
+    failed = len(failures)
+    succeeded = len(records)
+    status = "failure" if total and (failed / total) > 0.5 else "ok"
+
+    return RunResult(
+        status=status, records=records, failures=failures,
+        total=total, succeeded=succeeded, failed=failed,
+    )
