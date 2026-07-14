@@ -1089,6 +1089,21 @@ def _write_triage_verdict(worktree: Path, triage_output: dict) -> None:
     TaskArtifacts(worktree, meta_root).write_verdict('triage', envelope)
 
 
+def _invoke_writing_verdict(worktree: Path, triage_output: dict, **result_kwargs):
+    """Build an invoke_with_cap_retry side_effect that writes the verdict
+    artifact (simulating submit_triage) before returning a fake AgentResult.
+
+    The write must happen DURING the (mocked) invocation, not before it:
+    ``_pre_triage_suggestions`` clears any pre-existing verdict (I-FRESH)
+    immediately before spawning, so a verdict written before entering the
+    method under test would be wiped before the read-back.
+    """
+    def _side_effect(*args, **kwargs):
+        _write_triage_verdict(worktree, triage_output)
+        return _fake_agent_result(**result_kwargs)
+    return _side_effect
+
+
 class TestPreTriageSuggestions:
     @pytest.mark.asyncio
     async def test_pre_triage_invoked_above_threshold(self):
@@ -1113,13 +1128,14 @@ class TestPreTriageSuggestions:
 
         esc = _make_escalation(detail=json.dumps(suggestions))
 
-        # Simulate the triage agent calling submit_triage: write the verdict
-        # artifact the steward's TaskArtifacts will read after the (mocked)
-        # invocation returns — replaces the old structured_output= kwarg.
-        _write_triage_verdict(steward.worktree, triage_output)
-
-        with patch('orchestrator.steward.invoke_with_cap_retry',
-                   return_value=_fake_agent_result()):
+        # Simulate the triage agent calling submit_triage during the
+        # (mocked) invocation: the verdict write happens as a side effect of
+        # invoke_with_cap_retry, not before it — replaces the old
+        # structured_output= kwarg.
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry',
+            side_effect=_invoke_writing_verdict(steward.worktree, triage_output),
+        ):
             result = await steward._pre_triage_suggestions(esc)
 
         assert '## Pre-Triaged Results' in result.detail
@@ -1243,10 +1259,10 @@ class TestPreTriageSuggestions:
             ],
         }
 
-        _write_triage_verdict(steward.worktree, triage_output)
-
-        with patch('orchestrator.steward.invoke_with_cap_retry',
-                   return_value=_fake_agent_result()):
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry',
+            side_effect=_invoke_writing_verdict(steward.worktree, triage_output),
+        ):
             result = await steward._pre_triage_suggestions(esc)
 
         # Detail is replaced with pre-triaged markdown

@@ -684,6 +684,7 @@ class TaskSteward:
 
         meta_root = TaskArtifacts.meta_root_for(self.worktree.parent, self.worktree.name)
         artifacts = TaskArtifacts(self.worktree, meta_root)
+        artifacts.clear_verdict('triage')  # I-FRESH: never consume a stale verdict
         mcp_config = _inject_verdict_tools_mcp(None, self.worktree, TRIAGE)
 
         try:
