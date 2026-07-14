@@ -17,10 +17,28 @@ Test coverage:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 
 import pytest
 
-from orchestrator.workflow_types import WorkflowCancelled
+from orchestrator.workflow_types import CancellationScope, WorkflowCancelled
+
+
+def _make_recording_on_terminal(
+    log: list[tuple[str, str | None]],
+    names: tuple[str, ...] = ('a', 'b', 'c'),
+) -> list[tuple[str, Callable[[str | None], Awaitable[None]]]]:
+    """Build an ordered on_terminal list that appends ``(name, kind)`` to
+    *log* for each entry it runs, in the order the scope invokes them —
+    the "recording on_terminal list" the plan's soft/hard-cancel tests use
+    to pin ordering + kind propagation without a real ``TaskWorkflow``.
+    """
+    entries: list[tuple[str, Callable[[str | None], Awaitable[None]]]] = []
+    for name in names:
+        async def _fn(kind: str | None, _name: str = name) -> None:
+            log.append((_name, kind))
+        entries.append((name, _fn))
+    return entries
 
 # ---------------------------------------------------------------------------
 # step-01: WorkflowCancelled construct/raise/catch/read contract
@@ -75,3 +93,67 @@ class TestWorkflowCancelledType:
         with pytest.raises(WorkflowCancelled) as excinfo:
             await _raises()
         assert excinfo.value.kind == 'hard'
+
+
+# ---------------------------------------------------------------------------
+# step-03: CancellationScope.supervise — soft-cancel + normal-return paths
+# ---------------------------------------------------------------------------
+
+
+class TestCancellationScopeSoftCancel:
+    """No real ``TaskWorkflow`` involved — pure asyncio.Event + recording
+    on_terminal list, per the plan's step-03 spec.
+    """
+
+    @pytest.mark.asyncio
+    async def test_soft_cancel_raises_workflow_cancelled_and_runs_on_terminal_in_order(self):
+        # Pre-setting the event (rather than racing a delayed setter against
+        # supervise()) is deterministic: asyncio.wait({body, waiter},
+        # FIRST_COMPLETED) sees waiter already resolvable and body
+        # (asyncio.sleep(3600)) still pending, so the soft-cancel branch is
+        # the only possible outcome — no timing flakiness.
+        log: list[tuple[str, str | None]] = []
+        on_terminal = _make_recording_on_terminal(log)
+        event = asyncio.Event()
+        event.set()
+        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+
+        body_cancelled = False
+
+        async def _body() -> None:
+            nonlocal body_cancelled
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                # Proves the scope actually cancelled+cleaned-up the inner
+                # body task (rather than e.g. abandoning it) — the closest
+                # observable proxy for "body.cancelled() or done" available
+                # to a caller that only supplies a coroutine, not a Task.
+                body_cancelled = True
+                raise
+
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await scope.supervise(_body())
+
+        assert excinfo.value.kind == 'soft'
+        assert [name for name, _kind in log] == ['a', 'b', 'c']
+        assert all(kind == 'soft' for _name, kind in log)
+        assert body_cancelled is True
+
+    @pytest.mark.asyncio
+    async def test_body_returns_normally_runs_on_terminal_once_with_none_kind(self):
+        log: list[tuple[str, str | None]] = []
+        on_terminal = _make_recording_on_terminal(log)
+        event = asyncio.Event()  # never set — body wins on its own
+        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+
+        sentinel = object()
+
+        async def _body() -> object:
+            return sentinel
+
+        result = await scope.supervise(_body())
+
+        assert result is sentinel
+        assert [name for name, _kind in log] == ['a', 'b', 'c']
+        assert all(kind is None for _name, kind in log)
