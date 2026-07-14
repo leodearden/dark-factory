@@ -2331,7 +2331,7 @@ class TestGetMergeQueue:
     async def test_verifier_and_queue_level_state_mapping(
         self, tmp_path: Path, verify_phase: str
     ):
-        """snapshot() maps _verify_item/_inflight_req/_verifier_queue to correct states."""
+        """snapshot() maps the ItemLifecycle registry (merging via _register_item) + _inflight verify entries + _verifier_queue to correct wire states."""
         import asyncio
         import types
 
