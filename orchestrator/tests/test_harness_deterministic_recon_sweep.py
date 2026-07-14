@@ -57,6 +57,7 @@ Amendment pass (post-review) additionally covers:
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -877,7 +878,7 @@ class TestRunDeterministicReconSweep:
 # ---------------------------------------------------------------------------
 
 
-def _make_stranded_reaper_harness() -> Harness:
+def _make_stranded_reaper_harness(tmp_path: Path) -> Harness:
     """Minimal bare Harness sufficient to drive _reconcile_one_stranded down
     the 'blocked, no on-main evidence' path, without the full git-ops-backed
     fixture in test_reconcile_stranded.py (out of this task's locked scope).
@@ -899,6 +900,15 @@ def _make_stranded_reaper_harness() -> Harness:
     # must be an AsyncMock. None preserves this fixture's "no on-main
     # evidence" invariant (docstring above).
     h.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+    # TaskGroundTruth.derive_truth (task 2243, W10-θ2) resolves a worktree
+    # path via _resolve_task_worktree for both _resolve_live_claimant's
+    # plan.lock read and worktree_present — a bare MagicMock chain there
+    # isn't a real Path, so json.loads(<MagicMock>.read_text()) blows up
+    # with TypeError instead of gracefully reading "no lock file". Route
+    # through a real (never-created) tmp_path so `.exists()` cleanly
+    # returns False, matching this fixture's "no worktree" invariant.
+    h.git_ops.warm_lane_pool = None
+    h.git_ops.worktree_base = tmp_path / 'worktrees'
     h.scheduler = MagicMock()
     # Task 2235: harness._reconcile_one_stranded's stranded-blocked gate now
     # calls self.scheduler.workflow_cancel_recent(tid) instead of reading
@@ -921,8 +931,10 @@ class TestGenericStrandedBlockedReaperSkipsDeterministic:
     backstop must not race the health-aware deterministic-recon sweep."""
 
     @pytest.mark.asyncio
-    async def test_deterministic_task_not_escalated_by_generic_reaper(self) -> None:
-        h = _make_stranded_reaper_harness()
+    async def test_deterministic_task_not_escalated_by_generic_reaper(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _make_stranded_reaper_harness(tmp_path)
         h.scheduler.get_task = AsyncMock(return_value={  # type: ignore[attr-defined]
             'metadata': {
                 'task_kind': 'deterministic',
@@ -937,11 +949,13 @@ class TestGenericStrandedBlockedReaperSkipsDeterministic:
         h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
 
     @pytest.mark.asyncio
-    async def test_non_deterministic_task_still_escalated_by_generic_reaper(self) -> None:
+    async def test_non_deterministic_task_still_escalated_by_generic_reaper(
+        self, tmp_path: Path,
+    ) -> None:
         """Control case: the exclusion is scoped to task_kind=='deterministic'
         only — an ordinary blocked task is unaffected and still gets the
         generic backstop escalation."""
-        h = _make_stranded_reaper_harness()
+        h = _make_stranded_reaper_harness(tmp_path)
         h.scheduler.get_task = AsyncMock(return_value={'metadata': {}})  # type: ignore[attr-defined]
 
         result = await h._reconcile_one_stranded('tid-normal', 'blocked', mid_run=False)

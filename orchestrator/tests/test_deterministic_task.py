@@ -167,6 +167,15 @@ class _StoreScheduler:
         cancelled_at = self._workflow_cancel_at.get(str(tid))
         return cancelled_at is not None and time.monotonic() - cancelled_at < 30.0
 
+    def is_actively_held(self, tid: str) -> bool:
+        """TaskGroundTruth._resolve_live_claimant (task 2243, W10-θ2) consults
+        this before falling through to the db-claimant/plan.lock checks. This
+        stand-in tracks no dispatched-set or module-lock table (see class
+        docstring — "no module lock table in this stand-in"), so the only
+        signal it can honestly report is its own workflow-cancel grace stamp.
+        """
+        return self.workflow_cancel_recent(str(tid))
+
 
 # ---------------------------------------------------------------------------
 # det_harness fixture and _dispatch helper
@@ -1741,6 +1750,15 @@ def _build_reaper_harness(
     git_ops.config.branch_prefix = 'task/'
     git_ops.config.main_branch = 'main'
     git_ops.release_lane_for_terminal_task = AsyncMock()
+    # TaskGroundTruth.derive_truth (task 2243, W10-θ2) resolves a worktree
+    # path for both _resolve_live_claimant's plan.lock read and
+    # worktree_present — a bare MagicMock chain there isn't a real Path, so
+    # json.loads(<MagicMock>.read_text()) blows up with TypeError instead of
+    # gracefully reading "no lock file". Route through a real (never-created)
+    # sibling of queue_dir so `.exists()` cleanly returns False, matching
+    # this fixture's "no worktree" invariant (a gate task never creates one).
+    git_ops.warm_lane_pool = None
+    git_ops.worktree_base = queue_dir.parent / 'worktrees'
     h.git_ops = git_ops
     h.config.stranded_blocked_escalate_enabled = True
     # _escalation_events is set to {} by Harness.__init__; _workflow_cancel_at
