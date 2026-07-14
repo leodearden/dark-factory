@@ -462,3 +462,71 @@ class TestPlanGoldenStructural:
         pytest_run = _run_for(plan, '__fallback__', 'pytest:')
         assert pytest_run is not None
         assert pytest_run.scope_kind is ScopeKind.SKIPPED
+
+
+# ── step-9/10: Scenario 6 — classifier tool-isolation (C1); Boundary-test
+#              sketch row 6 ──────────────────────────────────────────────────
+
+_CARGO_TOOL_KINDS = [ToolKind.CARGO_TEST, ToolKind.CARGO_CLIPPY]
+
+
+class TestClassifierToolIsolation:
+    """Scenario 6 — GOLDEN C1: each tool's pattern table is its own narrow
+
+    list, never a continuation of another tool's table — proven both
+    directions. A cargo run never sees pytest's INTERNALERROR token (a); a
+    pytest run never lets a cargo-CLI token swallow its own FAILED line, the
+    PRD's headline C1 example (b). Cargo goldens (c) are re-grounded in the
+    historical re-grounding commits 1703f86f95/18f57fe922/1aed67cd56/
+    264d5b5e8a (tasks 1103/1109/1116); b40a3e0a7f is a cargo-scoping change
+    (not classify_failure) and is deliberately excluded (G6).
+
+    RED until step-10 imports classify_failure/FailureCategory from
+    orchestrator.verify_classify/orchestrator.verify_categories.
+    """
+
+    # ── (a) cargo dispatch never reaches the pytest table ───────────────────
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_pytest_internalerror_not_reachable_via_cargo(self, tool):
+        output = 'INTERNALERROR> pytest crashed unexpectedly\n'
+        result = classify_failure(tool, 1, output, False)
+        assert result == FailureCategory.UNKNOWN_TEST_FAILURE, (
+            f'pytest INTERNALERROR must not leak into the cargo table, got {result!r}'
+        )
+
+    # ── (b) reverse signal: a cargo token embedded in pytest output ─────────
+    def test_cargo_token_in_pytest_output_still_classifies_test_failure(self):
+        output = 'error: no such subcommand: `tset`\nFAILED tests/test_x.py::test_y\n'
+        result = classify_failure(ToolKind.PYTEST, 1, output, False)
+        assert result == FailureCategory.TEST_FAILURE, (
+            f'a cargo CLI token in pytest output must not swallow the FAILED line '
+            f'into cargo_cli_error, got {result!r}'
+        )
+
+    # ── (c) cargo goldens (tasks 1103/1109/1116) ─────────────────────────────
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_cargo_cli_error_exclude_pattern(self, tool):
+        output = (
+            'Compiling my-crate v0.1.0\n'
+            'error: --exclude can only be used together with --workspace\n'
+        )
+        assert classify_failure(tool, 1, output, False) == FailureCategory.CARGO_CLI_ERROR
+
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_cargo_cli_error_no_such_subcommand(self, tool):
+        output = 'error: no such subcommand: `tset`\n'
+        assert classify_failure(tool, 1, output, False) == FailureCategory.CARGO_CLI_ERROR
+
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_compile_error_rustc_code(self, tool):
+        output = 'error[E0308]: mismatched types\n  --> src/lib.rs:10:5\n'
+        assert classify_failure(tool, 1, output, False) == FailureCategory.COMPILE_ERROR
+
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_rustc_top_level_diagnostics_are_unknown_test_failure(self, tool):
+        output = (
+            'Compiling my-crate v0.1.0\n'
+            'error: aborting due to previous errors\n'
+            'error: could not compile `my-crate` (lib) due to previous error\n'
+        )
+        assert classify_failure(tool, 1, output, False) == FailureCategory.UNKNOWN_TEST_FAILURE
