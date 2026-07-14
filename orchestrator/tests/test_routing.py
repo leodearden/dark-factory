@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import asyncio
 
+import orchestrator.routing as routing_module
 import pytest
 import yaml
+from click.testing import CliRunner
 from pydantic import ValidationError
 
+from orchestrator.cli import main
 from orchestrator.config import (
     RELOADABLE_FIELDS,
     ModelsConfig,
@@ -30,7 +33,7 @@ from orchestrator.routing import (
     render_probe_artifact,
 )
 from shared.cli_invoke import AgentResult
-from shared.config_models import AccountConfig
+from shared.config_models import AccountConfig, UsageCapConfig
 
 
 class TestRoutingConfigDefaults:
@@ -394,3 +397,107 @@ class TestRenderProbeArtifact:
         first = render_probe_artifact(report, generated_at='2026-07-13T00:00:00Z')
         second = render_probe_artifact(report, generated_at='2026-07-13T00:00:00Z')
         assert first == second
+
+
+# ---------------------------------------------------------------------------
+# `orchestrator probe-models` CLI: loads config, drives routing.probe_models
+# (network-free via a monkeypatched fake on the routing module, mirroring
+# how test_cli.py patches orchestrator.harness.Harness for the `run`
+# command), and writes the rendered artifact to --output.
+# ---------------------------------------------------------------------------
+
+
+def _fake_probe_cli_config(monkeypatch, tmp_path) -> OrchestratorConfig:
+    """A real, hermetically-constructed OrchestratorConfig for the CLI
+    tests below -- ORCH_CONFIG_PATH/cwd are neutralised first (mirrors
+    every other direct-construction test in this module) so this
+    OrchestratorConfig() call can never pick up a stray real config.yaml
+    from the actual environment."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    # Default RoutingConfig() (haiku/sonnet/opus) -- ModelsConfig's own
+    # defaults (e.g. architect='opus') must stay inside routing.allowed_models
+    # or OrchestratorConfig's fail-fast allowlist validator (step-2) rejects
+    # construction; this test only cares that config.routing.allowed_models
+    # is forwarded to probe_models, not that the list is unusual.
+    return OrchestratorConfig(
+        project_root=tmp_path,
+        usage_cap=UsageCapConfig(
+            accounts=[AccountConfig(name='max-x', oauth_token_env='MAX_X_TOKEN')],
+        ),
+        routing=RoutingConfig(),
+    )
+
+
+class TestProbeModelsCli:
+    def test_writes_artifact_with_fable_row_and_exits_zero(self, monkeypatch, tmp_path):
+        fake_config = _fake_probe_cli_config(monkeypatch, tmp_path)
+        monkeypatch.setattr('orchestrator.cli.load_config', lambda _path: fake_config)
+
+        scripted_report = ProbeReport(
+            models=['haiku', 'sonnet', FABLE_CANDIDATE_MODEL],
+            accounts={
+                'max-x': {
+                    'haiku': 'available',
+                    'sonnet': 'available',
+                    FABLE_CANDIDATE_MODEL: 'available',
+                },
+            },
+        )
+        probe_calls: list[dict] = []
+
+        async def fake_probe_models(accounts, allowed_models, *, models=None, **kwargs):
+            probe_calls.append({
+                'accounts': accounts, 'allowed_models': allowed_models, 'models': models,
+            })
+            return scripted_report
+
+        monkeypatch.setattr(routing_module, 'probe_models', fake_probe_models)
+
+        cfg_file = tmp_path / 'config.yaml'
+        cfg_file.write_text('')
+        output_file = tmp_path / 'model-availability.yaml'
+
+        result = CliRunner().invoke(main, [
+            'probe-models',
+            '--config', str(cfg_file),
+            '--output', str(output_file),
+        ])
+
+        assert result.exit_code == 0, result.output
+        assert output_file.exists(), 'expected the artifact file to be written at --output'
+        parsed = yaml.safe_load(output_file.read_text())
+        assert FABLE_CANDIDATE_MODEL in parsed['models']
+        assert parsed['accounts']['max-x'][FABLE_CANDIDATE_MODEL] == 'available'
+        assert parsed['accounts']['max-x']['haiku'] == 'available'
+
+        assert len(probe_calls) == 1
+        assert probe_calls[0]['models'] is None
+        assert probe_calls[0]['allowed_models'] == list(DEFAULT_ALLOWED_MODELS)
+        assert [a.name for a in probe_calls[0]['accounts']] == ['max-x']
+
+    def test_models_option_is_forwarded_to_probe_models(self, monkeypatch, tmp_path):
+        fake_config = _fake_probe_cli_config(monkeypatch, tmp_path)
+        monkeypatch.setattr('orchestrator.cli.load_config', lambda _path: fake_config)
+
+        probe_calls: list[list[str] | None] = []
+
+        async def fake_probe_models(accounts, allowed_models, *, models=None, **kwargs):
+            probe_calls.append(models)
+            return ProbeReport(models=models or [], accounts={})
+
+        monkeypatch.setattr(routing_module, 'probe_models', fake_probe_models)
+
+        cfg_file = tmp_path / 'config.yaml'
+        cfg_file.write_text('')
+        output_file = tmp_path / 'model-availability.yaml'
+
+        result = CliRunner().invoke(main, [
+            'probe-models',
+            '--config', str(cfg_file),
+            '--output', str(output_file),
+            '--models', 'opus,haiku',
+        ])
+
+        assert result.exit_code == 0, result.output
+        assert probe_calls == [['opus', 'haiku']]
