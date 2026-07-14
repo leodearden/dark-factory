@@ -137,6 +137,45 @@ class TestSessionTableDefaultFilter:
             assert table.row_count == 1
 
 
+class TestToggleHistory:
+    @pytest.mark.timeout(10)
+    async def test_h_toggles_terminal_sessions_and_round_trips(self, tmp_path):
+        """'h' (PRD-adjacent, FINDING F2 C10 tour esc-2303-1) reveals the full,
+        unfiltered history on demand and hides it again on a second press --
+        an in-memory-only toggle, re-rendered immediately (no poll tick)."""
+        from textual.widgets.data_table import RowDoesNotExist
+
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
+        dead = _make_record(session_slug='dead-1', status=sr.Status.EXITED)
+        for r in (live, dead):
+            sr.write_record(r, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            table = app.query_one(SessionTable)
+            with pytest.raises(RowDoesNotExist):
+                table.get_row('dead-1')
+            assert table.row_count == 1
+
+            await pilot.press('h')
+            await pilot.pause()
+
+            assert table.get_row('dead-1')
+            assert table.row_count == 2
+
+            await pilot.press('h')
+            await pilot.pause()
+
+            with pytest.raises(RowDoesNotExist):
+                table.get_row('dead-1')
+            assert table.row_count == 1
+
+
 class TestPollRefresh:
     @pytest.mark.timeout(10)
     async def test_new_record_appears_and_orders_blocked_first(self, tmp_path):
