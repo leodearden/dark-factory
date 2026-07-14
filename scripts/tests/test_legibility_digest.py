@@ -552,6 +552,24 @@ class TestDecoyFailSuppressionContract:
 
         assert [h['pattern'] for h in hits] == ['let me fix']
 
+    def test_decoy_marker_suppresses_same_line_interrupt_match(self):
+        # Parity with the other three text-pattern detectors: a same-line
+        # "# decoy-fail" sentinel suppresses an otherwise-matching line. Two
+        # SEPARATE records are needed to prove this (unlike the multi-pattern
+        # detectors, iter_interrupts contributes at most one hit per record,
+        # so a decoy+real line combined in a single record would still
+        # yield exactly one hit regardless of suppression): the first record
+        # is decoy-only and must vanish; the second is a genuine, unrelated
+        # occurrence and must still be counted.
+        records = [
+            _user_text('Request interrupted by user for tool use  # decoy-fail'),
+            _user_text('[Request interrupted by user for tool use]'),
+        ]
+
+        hits = mod.iter_interrupts(records)
+
+        assert [h['index'] for h in hits] == [1]
+
     def test_decoy_marker_does_not_suppress_other_lines_in_same_block(self):
         # The marker suppresses only its OWN line -- a real signal on a
         # different line in the same block/content still counts.

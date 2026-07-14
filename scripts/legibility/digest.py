@@ -361,13 +361,21 @@ def iter_df_guards(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def iter_interrupts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Detect the injected interrupt marker in non-sidechain user turns."""
+    """Detect the injected interrupt marker in non-sidechain user turns.
+
+    A same-line ``# decoy-fail`` sentinel suppresses an otherwise-matching
+    line, for parity with the other text-pattern detectors (not_found,
+    df_guard, self_correct) and PRD Sec 13.2's decoy-FAIL suppression
+    contract.
+    """
     hits = []
     for index, record in enumerate(records):
         if record.get('type') != 'user' or record.get('isSidechain'):
             continue
         text = _user_turn_text(_message_content(record))
-        if text and INTERRUPT_PATTERN in text.lower():
+        if not text:
+            continue
+        if INTERRUPT_PATTERN in _strip_decoy_lines(text).lower():
             hits.append({'index': index, 'pattern': INTERRUPT_PATTERN})
     return hits
 
