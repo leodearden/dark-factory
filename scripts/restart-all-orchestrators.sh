@@ -32,17 +32,23 @@ set -euo pipefail
 # orchestrator fleet-redeploy PRD): before restarting each unit, its
 # α-produced (task 2395) merge-idle heartbeat
 # (orchestrator/src/orchestrator/fleet_heartbeat.py) is read via
-# scripts/drain_check.py. A unit whose heartbeat reads busy (mid-merge) has
-# its restart DEFERRED — rechecked every ORCH_DRAIN_POLL_INTERVAL_SECS —
-# until it drains (goes idle) or ORCH_RESTART_FORCE_FIRE_AFTER_SECS elapses,
-# at which point the restart is FORCED anyway (one re-verified merge
-# accepted; recover_pending_merges makes this crash-safe). A unit whose
-# heartbeat is missing or stale is given a shorter ORCH_DRAIN_UNKNOWN_GRACE_SECS
-# grace to start reporting before its restart proceeds anyway
-# (fail-toward-convergence — the opposite fail direction from a
-# confirmed-busy unit, which fails toward protecting the merge). Without
-# --drain, the script behaves exactly as before: an immediate, uncapped
-# restart-all with zero heartbeat reads.
+# scripts/drain_check.py, classified into idle/busy/stale/absent. Two
+# deliberately-opposite fail directions:
+#   - busy (fresh, mid-merge): restart is DEFERRED — rechecked every
+#     ORCH_DRAIN_POLL_INTERVAL_SECS — until the unit drains (goes idle) or
+#     ORCH_RESTART_FORCE_FIRE_AFTER_SECS elapses, at which point the restart
+#     is FORCED anyway (one re-verified merge accepted; recover_pending_merges
+#     makes this crash-safe). Fails toward PROTECTING the merge.
+#   - stale/absent (heartbeat missing, unreadable, or too old): given a
+#     shorter ORCH_DRAIN_UNKNOWN_GRACE_SECS grace to start reporting,
+#     rechecked every ORCH_DRAIN_POLL_INTERVAL_SECS; a fresh idle/busy
+#     reading that appears during the grace re-classifies into the idle/busy
+#     handling above, and if the heartbeat is still stale/absent once the
+#     grace elapses, the restart proceeds anyway. Fails toward CONVERGENCE
+#     (the opposite direction from busy — a not-reporting unit must not block
+#     the fleet restart forever).
+# Without --drain, the script behaves exactly as before: an immediate,
+# uncapped restart-all with zero heartbeat reads.
 #
 # Env knobs (all optional, ${VAR:-default} style):
 #   ORCH_FLEET_DIR                       fleet-common heartbeat dir
@@ -52,9 +58,10 @@ set -euo pipefail
 #   ORCH_DRAIN_FRESH_WINDOW_SECS          heartbeat freshness window
 #                                         (default: 120 = 2x run-loop tick)
 #   ORCH_DRAIN_POLL_INTERVAL_SECS         re-check interval while deferring
-#                                         (default: 30)
+#                                         (busy) or awaiting a stale/absent
+#                                         heartbeat (default: 30)
 #   ORCH_DRAIN_UNKNOWN_GRACE_SECS         grace for a stale/absent heartbeat
-#                                         (default: 120)
+#                                         before proceeding anyway (default: 120)
 
 FIELDS="MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic"
 VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
@@ -130,40 +137,56 @@ drain_check_verdict() {
 
 drain_gate() {
     # $1 = unit name.  Only called when --drain was passed.  Blocks
-    # (poll-and-recheck) until it is safe to restart $1: returns immediately
-    # for an idle unit (transparent); for a busy unit, defers with a
-    # journal line and polls every DRAIN_POLL_INTERVAL_SECS until the unit
-    # drains (idle) or FORCE_FIRE_AFTER_SECS elapses, at which point it
-    # force-proceeds anyway.
+    # (poll-and-recheck) until it is safe to restart $1.
+    #
+    # - idle (fresh, merge_idle) returns immediately (transparent).
+    # - stale/absent (heartbeat missing or too old) is given a bounded
+    #   ORCH_DRAIN_UNKNOWN_GRACE_SECS grace, re-polling every
+    #   DRAIN_POLL_INTERVAL_SECS: a fresh idle/busy reading that appears
+    #   during the grace re-classifies into the branch below; if the grace
+    #   elapses with the heartbeat still stale/absent, the restart proceeds
+    #   anyway (fail-toward-convergence -- the opposite fail direction from
+    #   a confirmed-busy unit, which fails toward protecting the merge).
+    # - busy (fresh, mid-merge) defers with a journal line and polls every
+    #   DRAIN_POLL_INTERVAL_SECS until the unit drains (idle) or
+    #   FORCE_FIRE_AFTER_SECS elapses, at which point it force-proceeds
+    #   anyway.
     local unit="$1"
-    local verdict start_secs elapsed
+    local verdict start_secs elapsed grace_start elapsed_grace
     verdict="$(drain_check_verdict "$unit")"
+
+    grace_start=$SECONDS
+    while [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; do
+        elapsed_grace=$((SECONDS - grace_start))
+        if [[ $elapsed_grace -ge $DRAIN_UNKNOWN_GRACE_SECS ]]; then
+            echo "proceeding with restart of ${unit}: heartbeat ${verdict} after ${DRAIN_UNKNOWN_GRACE_SECS}s grace"
+            return 0
+        fi
+        sleep "$DRAIN_POLL_INTERVAL_SECS"
+        verdict="$(drain_check_verdict "$unit")"
+    done
 
     if [[ "$verdict" == "idle" ]]; then
         return 0
     fi
 
-    if [[ "$verdict" == "busy" ]]; then
-        echo "deferring restart of ${unit}: mid-merge (grace $((FORCE_FIRE_AFTER_SECS / 60))m)"
-        start_secs=$SECONDS
-        while true; do
-            elapsed=$((SECONDS - start_secs))
-            if [[ $elapsed -ge $FORCE_FIRE_AFTER_SECS ]]; then
-                echo "force-restarting ${unit}: mid-merge grace of ${FORCE_FIRE_AFTER_SECS}s exceeded"
-                return 0
-            fi
-            sleep "$DRAIN_POLL_INTERVAL_SECS"
-            verdict="$(drain_check_verdict "$unit")"
-            if [[ "$verdict" == "idle" ]]; then
-                echo "resuming restart of ${unit}: drained"
-                return 0
-            fi
-        done
-    fi
-
-    # stale/absent: placeholder fail-open (refined into a bounded
-    # unknown-grace wait by task 2397 step-10).
-    return 0
+    # verdict == "busy" here: idle returned above, and the stale/absent
+    # grace loop only exits once a fresh idle/busy reading appears.
+    echo "deferring restart of ${unit}: mid-merge (grace $((FORCE_FIRE_AFTER_SECS / 60))m)"
+    start_secs=$SECONDS
+    while true; do
+        elapsed=$((SECONDS - start_secs))
+        if [[ $elapsed -ge $FORCE_FIRE_AFTER_SECS ]]; then
+            echo "force-restarting ${unit}: mid-merge grace of ${FORCE_FIRE_AFTER_SECS}s exceeded"
+            return 0
+        fi
+        sleep "$DRAIN_POLL_INTERVAL_SECS"
+        verdict="$(drain_check_verdict "$unit")"
+        if [[ "$verdict" == "idle" ]]; then
+            echo "resuming restart of ${unit}: drained"
+            return 0
+        fi
+    done
 }
 
 # Enumerate running orchestrator units at run time (robust to which projects
