@@ -54,7 +54,7 @@ from cockpit.panes.decision_queue import (
     resolve_target,
 )
 from cockpit.panes.detail_pane import DetailPane
-from cockpit.panes.session_table import SessionTable, order_sessions
+from cockpit.panes.session_table import SessionTable, filter_live_sessions, order_sessions
 from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv
 from cockpit.panes.spawn_tree import SpawnTreeScreen
 from cockpit.priority import Priorities, load_priorities
@@ -225,6 +225,11 @@ class CockpitApp(App):
         self._boosts: dict[str, int] = {}
         self._dropped: set[str] = set()
         self._deferred: dict[str, datetime] = {}
+        # Ephemeral, defaults OFF on every launch -- see _rebuild_session_table
+        # and action_toggle_history. Never persisted to cockpit-ui.json: the
+        # user-observable "on launch: tens, not 10k" signal (FINDING F2,
+        # C10 tour esc-2303-1) must hold on every restart, not just the first.
+        self._show_history = False
 
     def compose(self) -> ComposeResult:
         yield Vertical(
@@ -307,12 +312,28 @@ class CockpitApp(App):
         self._decisions = decisions
         self._records = order_sessions(records)
         try:
-            table = self.query_one('#session-table', SessionTable)
-            table.replace_rows(self._records, self._now_fn())
-            self._sync_detail_pane(table.highlighted_slug())
+            self._rebuild_session_table()
             self._rebuild_queue()
         except NoMatches:
             return
+
+    def _rebuild_session_table(self) -> None:
+        """Render the SessionTable from self._records, honoring the history toggle.
+
+        By default (self._show_history False) renders filter_live_sessions'
+        terminal-dropped, capped view -- FINDING F2 (C10 tour, esc-2303-1):
+        without this, thousands of stale rows drown "see working/idle/
+        blocked at a glance". Toggling history on (see action_toggle_history)
+        renders self._records unfiltered -- today's exact full-history
+        behavior, as a no-regression escape hatch. Either way all_records is
+        the FULL self._records, so outstanding-children counts never
+        undercount a visible parent's non-terminal child just because that
+        child itself is filtered out of view.
+        """
+        visible = self._records if self._show_history else filter_live_sessions(self._records)
+        table = self.query_one('#session-table', SessionTable)
+        table.replace_rows(visible, self._now_fn(), all_records=self._records)
+        self._sync_detail_pane(table.highlighted_slug())
 
     def _poll_registry(self) -> None:
         """on_mount's set_interval callback: launch the threaded scan worker.
