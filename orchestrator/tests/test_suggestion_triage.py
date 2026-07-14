@@ -1162,6 +1162,47 @@ class TestPreTriageSuggestions:
         assert result.summary == esc.summary
 
     @pytest.mark.asyncio
+    async def test_pre_triage_clears_stale_verdict_before_spawn(self):
+        """I-FRESH: a stale verdicts/triage.json from a prior run must not be
+        consumed by a run whose invocation never calls submit_triage.
+
+        Pre-seeds a stale (valid-shaped) verdict at the worktree meta-root
+        before invoking _pre_triage_suggestions; the mocked invocation writes
+        nothing (simulating a run where the agent never calls submit_triage).
+        Until _pre_triage_suggestions clears the verdict before the spawn,
+        this stale verdict would be read back and returned as a bogus
+        pre-triaged escalation instead of falling back to the original.
+        """
+        steward = _make_steward()
+        suggestions = _make_suggestions(15)
+        esc = _make_escalation(detail=json.dumps(suggestions))
+
+        stale_triage_output = {
+            'accepted': [
+                {'index': 0, 'suggestion': 'stale case', 'reason': 'stale',
+                 'files': ['src/stale.py'], 'proposed_task_title': 'Stale fix'},
+            ],
+            'skipped': [],
+            'proposed_task_groups': [
+                {'title': 'Stale group', 'description': 'stale',
+                 'accepted_indices': [0]},
+            ],
+        }
+        # Pre-seed a STALE verdict, simulating leftover artifact state from a
+        # prior triage run against the same worktree meta-root.
+        _write_triage_verdict(steward.worktree, stale_triage_output)
+
+        # This invocation's mocked agent writes NOTHING (never calls submit_triage).
+        with patch('orchestrator.steward.invoke_with_cap_retry',
+                   return_value=_fake_agent_result()):
+            result = await steward._pre_triage_suggestions(esc)
+
+        # Must fall back to the ORIGINAL escalation — the stale verdict must
+        # have been cleared before the spawn, not consumed.
+        assert result.detail == esc.detail
+        assert result.summary == esc.summary
+
+    @pytest.mark.asyncio
     async def test_pre_triage_cost_tracked_in_metrics(self):
         steward = _make_steward()
         assert steward.metrics.total_cost_usd == 0.0
