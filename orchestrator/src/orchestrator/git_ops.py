@@ -46,7 +46,8 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Awaitable, Callable, Collection
+import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -637,6 +638,20 @@ class InteractiveWorktreeLimitError(Exception):
     """
 
 
+class EphemeralWorktreeError(Exception):
+    """Raised by :meth:`GitOps.ephemeral_worktree` when ``git worktree add``
+    fails on every retry attempt (task θ, verify-plan PRD).
+
+    Raised BEFORE the context manager yields, so the caller's ``async with``
+    body never runs and no cleanup ``git worktree remove`` is issued (the
+    add never succeeded, so there is nothing registered to remove) — mirrors
+    :class:`InteractiveWorktreeLimitError`'s raise-before-any-git-op
+    contract.  Callers should catch this and fall back to their existing
+    fail-safe behavior (e.g. the main-tip probes in verify.py return their
+    established sentinel and log a warning).
+    """
+
+
 class WarmLaneRequeue(Exception):
     """Base class for warm-lane failures that should requeue (not block + L1).
 
@@ -1108,6 +1123,95 @@ class GitOps:
         and unit tests targeting the primitive directly are undisturbed.
         """
         return self._refuse_foreign_band(path, owned, context)
+
+    @contextlib.asynccontextmanager
+    async def ephemeral_worktree(
+        self, kind: WorktreeKind, sha: str,
+    ) -> AsyncIterator[Path]:
+        """Mint a throwaway detached worktree pinned at *sha*, with
+        GUARANTEED scoped cleanup on exit (task θ, verify-plan PRD).
+
+        Single extraction point for the main-tip probes' (
+        ``verify_failure_is_preexisting_on_main``, ``run_main_tip_sweep`` —
+        both in verify.py) previously copy-pasted worktree lifecycle: mint
+        ``worktree_base/<kind.value><hex>`` (*kind*'s value IS both the
+        directory-name prefix and its :data:`PROTECTED_PREFIXES` registry
+        key — see :class:`WorktreeKind`), retry ``git worktree add
+        --detach`` up to 3 times with ``0.5 * (attempt + 1)``\\ s linear
+        backoff on transient lock contention (concurrent sibling probes
+        serialise on git's repo-level metadata lock), then yield the path.
+
+        On exit — normal return OR an exception raised in the ``async
+        with`` body — cleanup ALWAYS runs: scoped ``git worktree remove
+        --force <path>`` + an unconditional ``shutil.rmtree(path,
+        ignore_errors=True)`` belt-and-suspenders in case ``remove`` left an
+        empty skeleton.  This method NEVER issues ``git worktree prune``
+        (DD5 — the comment-only invariant that failed in the 2026-07-04
+        warm-lane broad-prune registration-wipe incident, df 2097-2100): a
+        broad prune would deregister ANY concurrently-active sibling
+        probe/merge worktree, not just this one.  Scoped ``remove --force``
+        deregisters ONLY the path minted here.
+
+        Args:
+            kind: Selects the minted directory's prefix band (also its
+                :data:`PROTECTED_PREFIXES` key, so the reaper never
+                reclaims it mid-run).
+            sha: Commit-ish to pin the detached worktree at.
+
+        Yields:
+            The minted worktree path, already checked out at *sha*.
+
+        Raises:
+            EphemeralWorktreeError: ``git worktree add`` failed on all 3
+                attempts.  Raised BEFORE the yield, so the caller's
+                ``async with`` body never runs and — because the add never
+                succeeded — no cleanup ``git worktree remove`` is issued
+                (there is nothing registered to remove).
+        """
+        base = self.worktree_base
+        base.mkdir(parents=True, exist_ok=True)
+        tmp_path = base / f'{kind.value}{uuid.uuid4().hex[:8]}'
+
+        _MAX_ADD_RETRIES = 3
+        worktree_added = False
+        rc, _, err = 1, '', 'not attempted'
+        for attempt in range(_MAX_ADD_RETRIES):
+            rc, _, err = await _run(
+                ['git', 'worktree', 'add', '--detach', str(tmp_path), sha],
+                cwd=self.project_root,
+            )
+            if rc == 0:
+                worktree_added = True
+                break
+            if attempt < _MAX_ADD_RETRIES - 1:
+                await asyncio.sleep(0.5 * (attempt + 1))
+        if not worktree_added:
+            raise EphemeralWorktreeError(
+                f'ephemeral_worktree({kind.name}): git worktree add failed '
+                f'after {_MAX_ADD_RETRIES} retries (rc={rc}): {err}'
+            )
+
+        try:
+            yield tmp_path
+        finally:
+            # Scoped cleanup: remove ONLY this specific ephemeral worktree.
+            # INTENTIONALLY NO 'git worktree prune' here (DD5 guarantee) —
+            # see the docstring above / the 2097-2100 incident.
+            if worktree_added:
+                try:
+                    await _run(
+                        ['git', 'worktree', 'remove', '--force', str(tmp_path)],
+                        cwd=self.project_root,
+                    )
+                except Exception:
+                    logger.debug(
+                        'ephemeral_worktree(%s): worktree remove failed',
+                        kind.name, exc_info=True,
+                    )
+            with contextlib.suppress(Exception):
+                # Belt-and-suspenders: rmtree in case git worktree remove
+                # left an empty skeleton.
+                shutil.rmtree(tmp_path, ignore_errors=True)
 
     def pool_in_use(self) -> bool:
         """True iff a warm or spec lane pool is configured on this host (task 2099).
