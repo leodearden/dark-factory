@@ -4699,6 +4699,19 @@ async def _run_isolated_confirm_group(
                 exc_info=True,
             )
             continue
+        # An infra-sentinel category (pytest_internalerror/env_transient) is
+        # never trusted as confirmation, even in the (normally impossible)
+        # case it were paired with passed=True — mirrors run_main_tip_sweep's
+        # own category-first check, which is deliberately independent of the
+        # passed flag (see its INFRA_TRANSIENT_CATEGORIES branch).
+        if result.category in INFRA_TRANSIENT_CATEGORIES:
+            logger.debug(
+                'confirm_main_tip_failure_is_real: isolated re-run hit %s '
+                '(attempt %d/%d) for %r — unconfirmable, not counted as a pass',
+                result.category, attempt + 1, _SWEEP_CONFIRM_MAX_ATTEMPTS,
+                module_config.test_command,
+            )
+            continue
         if result.passed:
             return True
     return False
