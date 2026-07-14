@@ -2331,7 +2331,7 @@ class TestGetMergeQueue:
     async def test_verifier_and_queue_level_state_mapping(
         self, tmp_path: Path, verify_phase: str
     ):
-        """snapshot() maps _verify_item/_inflight_req/_verifier_queue to correct states."""
+        """snapshot() maps the ItemLifecycle registry (merging via _register_item) + _inflight verify entries + _verifier_queue to correct wire states."""
         import asyncio
         import types
 
@@ -2360,7 +2360,7 @@ class TestGetMergeQueue:
 
         # M — in the merger (merging)
         req_M = _req('M')
-        worker._inflight_req = req_M
+        worker._register_item(req_M, initial=ItemLifecycleState.MERGING)
 
         # A — in the verifier queue (awaiting_verify)
         merge_wt_A = tmp_path / 'mergeA'
@@ -2488,9 +2488,9 @@ class TestGetMergeQueue:
 
         # Capture the LIVE phase that snapshot() would surface at advance_main
         # time: read it through the live finalize-head entry's per-entry phase
-        # (worker._finalizing_head, set by _finalize_inflight — the production
-        # object, not a test-held reference) and snapshot()'s verify_in_progress
-        # (the real merge_status observability path).
+        # (worker._finalizing_head_entry(), set by _finalize_inflight — the
+        # production object, not a test-held reference) and snapshot()'s
+        # verify_in_progress (the real merge_status observability path).
         captured_phases: list[str | None] = []
         captured_snapshot_phases: list[str | None] = []
 
@@ -2499,7 +2499,7 @@ class TestGetMergeQueue:
         # defined below — without it, embedding fake_advance_main in git_ops_stub
         # makes pyright report it as self-referential.
         async def fake_advance_main(*args, **kwargs) -> AdvanceOutcome:
-            fh = worker._finalizing_head
+            fh = worker._finalizing_head_entry()
             captured_phases.append(worker._entry_phase(fh) if fh is not None else None)
             snap = worker.snapshot()
             vip = snap.get('verify_in_progress')
@@ -2567,8 +2567,8 @@ class TestGetMergeQueue:
         assert req.result.done(), 'request future should be resolved after terminal advance_main'
 
         # Finalize-head window cleared after _finalize_inflight returns.
-        assert worker._finalizing_head is None, (
-            f'Expected _finalizing_head cleared, got: {worker._finalizing_head!r}'
+        assert worker._finalizing_head_entry() is None, (
+            f'Expected _finalizing_head_entry() cleared, got: {worker._finalizing_head_entry()!r}'
         )
 
         # snapshot has no active verifier states (entry was popped/finalized).
@@ -2645,7 +2645,7 @@ class TestGetMergeQueue:
                 # Read the live finalize-head entry (production object set by
                 # _finalize_inflight), not a test-held reference, to avoid a
                 # forward closure ref to the later-bound `entry`.
-                fh = worker._finalizing_head
+                fh = worker._finalizing_head_entry()
                 captured_phases_advance2.append(
                     worker._entry_phase(fh) if fh is not None else None
                 )
@@ -2779,6 +2779,146 @@ class TestGetMergeQueue:
 
         # Request future is resolved (not_descendant → blocked)
         assert req.result.done(), 'request future should be resolved after terminal advance_main'
+
+    # ── task 2604 review fix: gate FAILURE retires the registry entry ────────
+
+    async def test_gate_reverify_failure_retires_registry_entry(self, tmp_path: Path):
+        """When the post-rebase reverify gate FAILS (``_reverify_rebased_tree``
+        returns a non-None MergeOutcome), the ``rebased_pending_reverify``
+        gate-fail branch must route the terminal outcome through the unified
+        chokepoint (``_resolve_or_drop_abandoned``) so ``_retire_item`` fires.
+
+        Regression for the task-2604 review finding: the branch used to call a
+        raw ``req.result.set_result(gate)`` and ``return False`` WITHOUT
+        retiring, leaving the entry non-terminal at GATE_REVERIFY in
+        ``_live_items`` forever — a ghost 'gate_reverify' item surfaced by
+        ``_finalizing_head_entry()`` / ``snapshot()``.  On the unfixed code
+        this test fails: ``_finalizing_head_entry()`` returns the ghost entry
+        and snapshot() reports an active 'gate_reverify' state.
+        """
+        import asyncio
+        import types
+
+        from orchestrator.git_ops import (  # type: ignore[reportMissingImports]
+            AdvanceOutcome,
+            MergeResult,
+        )
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InflightEntry,
+            ItemLifecycleState,
+            MergeOutcome,
+            MergeRequest,
+            RealMergeItem,
+            SpeculativeMergeWorker,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+
+        merge_wt = tmp_path / 'merge'
+        merge_wt.mkdir()
+
+        REBASED_SHA = 'rebased0abc'
+        REBASED_FROM = 'from0sha'
+        REBASED_ONTO = 'onto0sha'
+
+        advance_call_args: list[tuple[tuple, dict]] = []
+
+        async def fake_advance_main(*args, **kwargs) -> AdvanceOutcome:
+            advance_call_args.append((args, kwargs))
+            # Single call: trigger the rebase/reverify path.  The gate then
+            # fails, so advance_main is never called a second time.
+            return AdvanceOutcome(
+                'rebased_pending_reverify',
+                advanced_sha=REBASED_SHA,
+                rebased_from=REBASED_FROM,
+                rebased_onto=REBASED_ONTO,
+            )
+
+        async def fake_cleanup_merge_worktree(path):
+            pass
+
+        git_ops_stub = types.SimpleNamespace(
+            advance_main=fake_advance_main,
+            cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            config=config,
+        )
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
+
+        req = MergeRequest(
+            task_id='GRF',
+            branch='GRF',
+            worktree=tmp_path / 'wt',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+        )
+        merge_result = MergeResult(
+            success=True,
+            merge_commit='deadbeef00000002',
+            merge_worktree=merge_wt,
+        )
+        item = RealMergeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt,
+            base_sha='base0sha',
+            speculative=False,
+        )
+        entry = InflightEntry(
+            item=item,
+            lease=None,
+            verify_task=None,
+            merge_wt=merge_wt,
+            was_speculative=False,
+        )
+        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
+
+        import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
+
+        GATE_FAIL = MergeOutcome('blocked', reason='post-rebase reverify gate failed')
+
+        async def fake_reverify_rebased_tree(*args, **kwargs):
+            # Non-None return → gate FAILED; the gate-fail branch resolves the
+            # future and must retire the registry entry.
+            return GATE_FAIL
+
+        original_reverify = mq_module._reverify_rebased_tree
+        mq_module._reverify_rebased_tree = fake_reverify_rebased_tree  # type: ignore[attr-defined]
+        try:
+            await worker._finalize_inflight(entry)
+        finally:
+            mq_module._reverify_rebased_tree = original_reverify  # type: ignore[attr-defined]
+
+        # advance_main called exactly once (gate failed → no retry).
+        assert len(advance_call_args) == 1, (
+            f'Expected 1 advance_main call on gate failure, got: {len(advance_call_args)}'
+        )
+
+        # Future resolved with the gate outcome.
+        assert req.result.done(), 'request future should be resolved on gate failure'
+        assert req.result.result() is GATE_FAIL, (
+            f'Expected the gate MergeOutcome delivered to the waiter, '
+            f'got: {req.result.result()!r}'
+        )
+
+        # KEY REGRESSION: registry entry retired — no ghost finalize head.
+        assert worker._finalizing_head_entry() is None, (
+            f'Expected _finalizing_head_entry() cleared after gate failure, '
+            f'got: {worker._finalizing_head_entry()!r}'
+        )
+
+        # snapshot() surfaces no active verifier states (no lingering
+        # gate_reverify ghost in _live_items).
+        snap = worker.snapshot()
+        bad_states = {e['state'] for e in snap['entries']} & {'verifying', 'finalizing', 'gate_reverify'}
+        assert not bad_states, (
+            f'Snapshot should have no active verifier states after gate '
+            f'failure, got: {bad_states}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3640,7 +3780,7 @@ class TestMergeStatus:
                 base_sha='base', speculative=False,
             )
             if verify_phase in ('merging',):
-                worker._inflight_req = req
+                worker._register_item(req, initial=ItemLifecycleState.MERGING)
             elif verify_phase == 'awaiting_verify':
                 await worker._verifier_queue.put(item)
             else:
