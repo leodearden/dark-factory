@@ -1780,6 +1780,16 @@ class TaskCurator:
         point ids — robust to payload drift, no reliance on payload task_id.
         """
         live = {str(t) for t in live_task_ids}
+        if not live:
+            # Hard gate: a total live-read failure surfaces as an empty
+            # set. Without this, an empty live set would make every corpus
+            # point look orphaned and prune_orphans would nuke the whole
+            # corpus. Refuse before ever touching Qdrant.
+            logger.warning(
+                'task_curator: prune_orphans refused — empty live snapshot '
+                'for %s (fail-safe, no prune)', project_id,
+            )
+            return PruneResult(skipped=True, reason='empty_live_snapshot')
 
         client = await self._get_qdrant()
         collection = self._collection_name(project_id)
