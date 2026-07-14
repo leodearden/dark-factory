@@ -2730,12 +2730,12 @@ def _parse_decision_dict(
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
             )
-        # RC3 create-safe guard: never drop against a pool entry whose status
-        # is unconfirmable ('unknown' — e.g. a thin fallback entry built after
-        # a TRANSIENT get_task failure, see _fetch_entry_for_neighbor).
+        # RC3 create-safe guard: never drop/combine against a pool entry whose
+        # status is unconfirmable ('unknown' — e.g. a thin fallback entry built
+        # after a TRANSIENT get_task failure, see _fetch_entry_for_neighbor).
         # Placed before the combine_eligible check below so it is authoritative
         # even if an unknown entry were ever wrongly marked combine_eligible=True.
-        if action == 'drop' and target_id:
+        if action in ('drop', 'combine') and target_id:
             target_entry = next(e for e in pool if e.task_id == target_id)
             if target_entry.status == 'unknown':
                 return CuratorDecision(
