@@ -35,9 +35,14 @@
 #   *    ERROR -- any other non-zero exit from the watcher itself.
 #
 # A machine-readable `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR>
-# exit=<rc>` line is always emitted to STDERR (never stdout), so callers can
-# grep the outcome without disturbing the watcher's JSON on stdout -- do
-# NOT pipe `2>&1` if you parse stdout as JSON.
+# exit=<rc>` line is emitted to STDERR (never stdout) for every watcher
+# invocation outcome, so callers can grep the outcome without disturbing the
+# watcher's JSON on stdout -- do NOT pipe `2>&1` if you parse stdout as JSON.
+# NOTE: usage/guard failures (exit 2 -- missing DARK_FACTORY_ROOT, an
+# unresolved queue dir, missing --level, or a bad flag) return BEFORE the
+# watcher is ever invoked, so they print a plain stderr diagnostic instead of
+# this marker -- do not grep for the marker to detect a usage error, check
+# for exit code 2 instead.
 #
 # Bash-tool contract: a `--timeout 540` call blocks for up to 540s. The
 # CALLER's Bash tool timeout must be >= 600000ms (10 min), or the bounded
@@ -139,17 +144,25 @@ echo "watcher-rearm.sh: exclude-file=$EXCLUDE_FILE (append a deliberately-pendin
 
 # Interpreter prefix: WATCHER_REARM_PYTHON overrides the default `uv run`
 # invocation (tests inject sys.executable to drive the real module without
-# uv). Deliberately unquoted below so a multi-word override word-splits
-# into separate argv entries, same as the default.
-WATCHER_CMD=${WATCHER_REARM_PYTHON:-uv run --project "$DARK_FACTORY_ROOT/escalation" python}
+# uv). Built as an array so the default branch keeps
+# "$DARK_FACTORY_ROOT/escalation" as a single argv token -- space-safe even
+# if DARK_FACTORY_ROOT contains spaces. Only an explicit WATCHER_REARM_PYTHON
+# override is word-split, on the assumption that a caller supplying a
+# multi-word interpreter command (e.g. "python3 -I") wants each word as a
+# separate argv entry.
+if [ -n "${WATCHER_REARM_PYTHON:-}" ]; then
+    # shellcheck disable=SC2206
+    WATCHER_CMD=($WATCHER_REARM_PYTHON)
+else
+    WATCHER_CMD=(uv run --project "$DARK_FACTORY_ROOT/escalation" python)
+fi
 
 WATCHER_ARGS=(-m escalation.watcher --queue-dir "$QUEUE_DIR" --level "$LEVEL" --timeout "$TIMEOUT" --exclude-file "$EXCLUDE_FILE")
 [ -n "$NTFY_URL" ] && WATCHER_ARGS+=(--ntfy-url "$NTFY_URL")
 [ -n "$TASK_ID" ] && WATCHER_ARGS+=(--task-id "$TASK_ID")
 [ "$BASELINE" -eq 1 ] && WATCHER_ARGS+=(--baseline)
 
-# shellcheck disable=SC2086
-$WATCHER_CMD "${WATCHER_ARGS[@]}"
+"${WATCHER_CMD[@]}" "${WATCHER_ARGS[@]}"
 rc=$?
 
 case "$rc" in
