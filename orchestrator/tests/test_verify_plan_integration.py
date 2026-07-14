@@ -778,3 +778,146 @@ class TestMergeVerifyBlockProducesGateableProposal:
         assert verdict['verdict'] != ABORT, (
             f'Expected a non-ABORT (gateable) verdict; got {verdict!r}'
         )
+
+
+# ── step-17/18: Scenarios 10+11 — b3_gate proposal routing (B2/B3) + BlockRecord
+#               round-trip (B1); Boundary-test sketch rows 10-11 ─────────────
+
+
+class TestB3GateProposalRouting:
+    """Scenarios 10+11 — b3_gate.check_proposal's dual-read routing (B2/B3)
+
+    plus the BlockRecord wire round-trip (B1).
+
+    Row 10/B2 (task-1680): a typed block_class=POST_MERGE_RED_MAIN entry
+    hard-aborts BEFORE risk_label or any git check — regardless of
+    risk_label. Row 11/B3: the legacy dual-read bridge — a pre-block_class
+    proposal still aborts via the prose-prefix sniff (block_reason startswith
+    POST_MERGE_RED_MAIN_REASON_PREFIX) or the status-key-presence sniff, but
+    a TYPED entry with a stray 'status' key must NOT be caught by that
+    legacy status sniff (it is gated on block_class is None). B1: BlockRecord
+    is a wire-round-trip-safe frozen dataclass.
+
+    RED until step-18 imports FRESH/POST_MERGE_RED_MAIN_REASON_PREFIX from
+    orchestrator.b3_gate and BlockRecord from orchestrator.unblock_types.
+    """
+
+    _INVESTIGATED_AT = '2026-06-04T09:00:00+00:00'
+
+    # ── scenario 10 / Row 10 / B2 ────────────────────────────────────────
+    def test_post_merge_red_main_block_class_hard_aborts_before_git(self):
+        """block_class=post_merge_red_main aborts before risk/git, either risk_label."""
+        for risk_label in ('low', 'human-review-required'):
+            calls: list = []
+
+            def _spy(args, cwd, _calls=calls):
+                _calls.append(args)
+                return (0, 'deadbeef')
+
+            entry = {
+                'block_class': BlockClass.POST_MERGE_RED_MAIN,
+                'risk_label': risk_label,
+                'head_sha': 'aaabbbccc',
+                'main_sha': 'dddeeefff',
+                'files_referenced': ['foo.py'],
+                'investigated_at': self._INVESTIGATED_AT,
+            }
+            verdict = check_proposal(
+                entry, worktree='/tmp', category=None, run_git=_spy,
+            )
+            assert verdict['verdict'] == ABORT, (
+                f'risk_label={risk_label!r}: expected ABORT, got {verdict!r}'
+            )
+            assert calls == [], (
+                f'run_git must never be called for POST_MERGE_RED_MAIN '
+                f'(risk_label={risk_label!r}); got calls={calls}'
+            )
+
+    # ── scenario 11 / Row 11 / B3 legacy bridge ──────────────────────────
+    def test_legacy_prose_prefix_without_block_class_aborts(self):
+        """No block_class, but block_reason carries the post-merge prefix -> ABORT."""
+
+        def _never_called(args, cwd):
+            raise AssertionError(f'git should not have been called; args={args}')
+
+        entry = {
+            'risk_label': 'low',
+            'block_reason': POST_MERGE_RED_MAIN_REASON_PREFIX + ': type-check failed on main',
+            'head_sha': 'aaabbbccc',
+            'main_sha': 'dddeeefff',
+            'files_referenced': [],
+            'investigated_at': self._INVESTIGATED_AT,
+        }
+        verdict = check_proposal(
+            entry, worktree='/tmp', category=None, run_git=_never_called,
+        )
+        assert verdict['verdict'] == ABORT, f'expected ABORT via legacy prefix, got {verdict!r}'
+
+    def test_legacy_status_key_without_block_class_aborts(self):
+        """No block_class, but a 'status' key (failure entry) -> ABORT via status-sniff."""
+
+        def _never_called(args, cwd):
+            raise AssertionError(f'git should not have been called; args={args}')
+
+        entry = {
+            'risk_label': 'low',
+            'status': 'investigation_failed',
+            'head_sha': 'aaabbbccc',
+            'main_sha': 'dddeeefff',
+            'files_referenced': [],
+            'investigated_at': self._INVESTIGATED_AT,
+        }
+        verdict = check_proposal(
+            entry, worktree='/tmp', category=None, run_git=_never_called,
+        )
+        assert verdict['verdict'] == ABORT, f'expected ABORT via status sniff, got {verdict!r}'
+
+    def test_typed_entry_with_stray_status_key_does_not_abort_via_status_sniff(self):
+        """A TYPED (block_class-bearing) entry with a stray 'status' key must
+        reach FRESH — the legacy status sniff is gated on block_class is None
+        and must not misfire on the typed path (bridge routes identically to
+        pre-change behaviour ONLY on the legacy path)."""
+
+        def _fake_git_fresh(args, cwd):
+            if 'rev-parse' in args:
+                return (0, 'aaabbbccc')
+            return (0, '')
+
+        entry = {
+            'block_class': BlockClass.MERGE_VERIFY_RED,
+            'risk_label': 'low',
+            'status': 'x',
+            'head_sha': 'aaabbbccc',
+            'main_sha': 'dddeeefff',
+            'files_referenced': [],
+            'investigated_at': self._INVESTIGATED_AT,
+        }
+        verdict = check_proposal(
+            entry, worktree='/tmp', category=None, run_git=_fake_git_fresh,
+        )
+        assert verdict['verdict'] == FRESH, (
+            f'status-key presence must not abort the typed path, got {verdict!r}'
+        )
+
+    # ── B1: BlockRecord wire round-trip ──────────────────────────────────
+    def test_block_record_round_trip_full(self):
+        record = BlockRecord(
+            block_class=BlockClass.MERGE_VERIFY_RED,
+            risk_label='low',
+            head_sha='h',
+            main_sha='m',
+            files_referenced=['f'],
+            investigated_at='ts',
+        )
+        assert BlockRecord.from_dict(record.to_dict()) == record
+
+    def test_block_record_round_trip_none_shas_and_empty_files(self):
+        record = BlockRecord(
+            block_class=BlockClass.AGENT_FAILURE,
+            risk_label='human-review-required',
+            head_sha=None,
+            main_sha=None,
+            files_referenced=[],
+            investigated_at='',
+        )
+        assert BlockRecord.from_dict(record.to_dict()) == record
