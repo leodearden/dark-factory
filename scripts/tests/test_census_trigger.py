@@ -85,3 +85,28 @@ def test_evaluate_condition_a_day_12_fires():
     decision = _evaluate_a(last_census_at=NOW - timedelta(days=12))
     assert decision.fire is True
     assert any("max-interval" in r for r in decision.reasons)
+
+
+# ---------------------------------------------------------------------------
+# step-5: RED — evaluate() condition (b): tasks_landed
+# ---------------------------------------------------------------------------
+
+def test_evaluate_condition_b_day_7_130_landed_fires():
+    decision = _evaluate_a(last_census_at=NOW - timedelta(days=7), tasks_landed=130)
+    assert decision.fire is True
+    assert any("tasks-landed" in r for r in decision.reasons)
+
+
+def test_evaluate_condition_b_day_7_below_threshold_no_fire():
+    decision = _evaluate_a(last_census_at=NOW - timedelta(days=7), tasks_landed=100)
+    assert decision.fire is False
+
+
+def test_evaluate_condition_b_day_6_min_days_not_met_no_fire():
+    decision = _evaluate_a(last_census_at=NOW - timedelta(days=6), tasks_landed=130)
+    assert decision.fire is False
+
+
+def test_evaluate_condition_b_delta_unavailable_no_fire():
+    decision = _evaluate_a(last_census_at=NOW - timedelta(days=9), tasks_landed=None)
+    assert decision.fire is False
