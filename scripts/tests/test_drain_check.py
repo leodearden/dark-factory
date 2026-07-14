@@ -7,7 +7,9 @@ step-1: pure classify(heartbeat, now, fresh_window) taxonomy -- idle / busy
 """
 from __future__ import annotations
 
-from drain_check import classify
+from pathlib import Path
+
+from drain_check import classify, heartbeat_path, resolve_fleet_dir
 
 FRESH_WINDOW = 120.0
 NOW = 1_000_000.0
@@ -82,3 +84,40 @@ def test_exactly_at_fresh_window_boundary_is_still_fresh():
     """now - ts_epoch == fresh_window is fresh (<=, not <)."""
     heartbeat = _heartbeat(merge_idle=True, ts_epoch=NOW - FRESH_WINDOW)
     assert classify(heartbeat, NOW, FRESH_WINDOW) == "idle"
+
+
+# ---------------------------------------------------------------------------
+# step-3: resolve_fleet_dir / heartbeat_path / drift-vs-α test
+# ---------------------------------------------------------------------------
+
+def test_resolve_fleet_dir_honours_env_override():
+    env = {"ORCH_FLEET_DIR": "/tmp/some-fleet-dir"}
+    assert resolve_fleet_dir(env) == Path("/tmp/some-fleet-dir")
+
+
+def test_resolve_fleet_dir_falls_back_to_default_when_unset():
+    assert resolve_fleet_dir({}) == drain_check_default_fleet_dir()
+
+
+def test_resolve_fleet_dir_falls_back_to_default_when_empty():
+    assert resolve_fleet_dir({"ORCH_FLEET_DIR": ""}) == drain_check_default_fleet_dir()
+
+
+def test_heartbeat_path_joins_fleet_dir_and_unit_json():
+    fleet_dir = Path("/tmp/some-fleet-dir")
+    assert heartbeat_path(fleet_dir, UNIT) == fleet_dir / f"{UNIT}.json"
+
+
+def drain_check_default_fleet_dir():
+    from drain_check import DEFAULT_FLEET_DIR
+
+    return DEFAULT_FLEET_DIR
+
+
+def test_default_fleet_dir_matches_orchestrator_fleet_heartbeat():
+    """DRIFT GUARD: the stdlib-only mirror in drain_check.py must never
+    silently diverge from α's canonical DEFAULT_FLEET_DIR."""
+    import drain_check
+    import orchestrator.fleet_heartbeat as fleet_heartbeat
+
+    assert drain_check.DEFAULT_FLEET_DIR == fleet_heartbeat.DEFAULT_FLEET_DIR
