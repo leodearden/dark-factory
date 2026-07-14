@@ -15,12 +15,14 @@ Test coverage:
           raise-on-add-failure)
   step-5: E1 — both probes route through the CM and NEVER issue
           ['git', 'worktree', 'prune']
-  amend-1: no-leak-on-add-failure regression (reviewer_comprehensive
-           robustness_resource_leak)
+  amend-1: no-leak-on-add-failure regression, both probes' fail-safe
+           `except EphemeralWorktreeError` handlers, and the
+           EphemeralWorktreeError -> BlockDisposition table row
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -469,3 +471,151 @@ class TestBothProbesRouteThroughEphemeralWorktree:
         assert any(
             'worktree' in c and 'remove' in c and '--force' in c for c in calls
         ), f'expected a scoped "git worktree remove --force" argv; got calls={calls}'
+
+
+# ---------------------------------------------------------------------------
+# amend-1: both probes' fail-safe `except EphemeralWorktreeError` handlers
+# ---------------------------------------------------------------------------
+
+
+class TestBothProbesFailSafeOnEphemeralWorktreeError:
+    """Amendment (reviewer_comprehensive test_coverage): the CM's raise is
+    covered by TestEphemeralWorktreeRetry, and CM-routing on the happy path
+    is covered by TestBothProbesRouteThroughEphemeralWorktree, but no test
+    previously drove an actual EphemeralWorktreeError THROUGH a probe
+    caller. This pins the fail-safe ``except EphemeralWorktreeError``
+    handler each probe carries — previously an inline early ``return``
+    before ``ephemeral_worktree`` existed — so a regression there (e.g. the
+    exception propagating uncaught) is caught here rather than in
+    production.
+    """
+
+    def test_verify_failure_is_preexisting_on_main_fails_safe_when_add_exhausts_retries(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        # A category/cause_hint combo unique to this test so its key can
+        # never collide with another test's entry in the process-wide
+        # (module-level) verify._PROBE_CACHE.
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='theta_amend_addfail_mainprobe_signal',
+            cause_hint='task theta amendment add-exhaustion fail-safe signal (mainprobe)',
+            category='task_theta_amend_addfail_mainprobe',
+        )
+
+        calls: list[list[str]] = []
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification',
+                         new=AsyncMock(return_value=_PASSING_RESULT)),
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([1, 1, 1], calls)),
+            caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], failing_result, git_ops,
+                )
+            )
+
+        assert result == (False, ''), (
+            f"expected the fail-safe sentinel (False, '') when "
+            f'ephemeral_worktree exhausts add retries; got {result!r}'
+        )
+        add_calls = [c for c in calls if 'worktree' in c and 'add' in c]
+        assert len(add_calls) == 3, f'expected 3 add attempts; got {len(add_calls)}'
+        assert not any(
+            'worktree' in c and 'remove' in c for c in calls
+        ), f'expected no remove call when add never succeeded; got {calls}'
+        assert any(
+            'contagion guard disabled' in r.getMessage() for r in caplog.records
+        ), (
+            f'expected a WARNING noting the contagion guard was disabled; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_run_main_tip_sweep_fails_safe_when_add_exhausts_retries(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        calls: list[list[str]] = []
+        full_verify_called = False
+
+        async def _fake_full_verify(project_root, cfg, **kwargs) -> VerifyResult:
+            nonlocal full_verify_called
+            full_verify_called = True  # must never run
+            return _PASSING_RESULT
+
+        with (
+            patch.object(verify_module, 'run_full_verification', side_effect=_fake_full_verify),
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([1, 1, 1], calls)),
+            caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is None, (
+            f'expected the fail-safe sentinel None when ephemeral_worktree '
+            f'exhausts add retries; got {result!r}'
+        )
+        assert not full_verify_called, (
+            'expected run_full_verification to NEVER run when add exhausts retries'
+        )
+        add_calls = [c for c in calls if 'worktree' in c and 'add' in c]
+        assert len(add_calls) == 3, f'expected 3 add attempts; got {len(add_calls)}'
+        assert not any(
+            'worktree' in c and 'remove' in c for c in calls
+        ), f'expected no remove call when add never succeeded; got {calls}'
+        assert any(
+            'sweep skipped for this tick' in r.getMessage() for r in caplog.records
+        ), (
+            f'expected a WARNING noting the sweep was skipped; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# amend-1: EphemeralWorktreeError -> BlockDisposition table row
+# ---------------------------------------------------------------------------
+
+
+class TestEphemeralWorktreeErrorDisposition:
+    """Amendment (reviewer_comprehensive test_coverage): EphemeralWorktreeError
+    gained an explicit ``workflow_types._disposition_table()`` row (BD-2
+    completeness — commit cced1c0adb, resolving esc-2147-3) but the row's
+    resolved BlockDisposition was untested. The canonical home for
+    classify_failure()-table pins is test_block_disposition.py's
+    TestClassifyFailureKnownRows, which sits outside this task's locked
+    module scope (git_ops.py/verify.py + the 4 verify/ephemeral-worktree
+    test files) — this is a scoped-in stand-in pinning the same contract
+    for the row this task added.
+    """
+
+    def test_classify_failure_resolves_the_expected_disposition(self) -> None:
+        from orchestrator.git_ops import EphemeralWorktreeError
+        from orchestrator.unblock_types import BlockClass
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+
+        disposition = classify_failure(EphemeralWorktreeError('add failed after retries'))
+
+        assert disposition.category is FailureCategory.NONE
+        assert disposition.escalate_to_human is True
+        assert disposition.requeue_kind is RequeueKind.BLOCK
+        assert disposition.counts_against_requeue_cap is True
+        assert disposition.block_class is BlockClass.AGENT_FAILURE
+        assert disposition.reason_prefix == 'Ephemeral probe worktree add failed after retries'
