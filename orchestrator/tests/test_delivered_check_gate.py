@@ -17,6 +17,8 @@ decisions for the point-by-point mirror rationale.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
@@ -112,3 +114,95 @@ class TestRunnerGrepKind:
         result = await run_delivered_check(check, project_root='/proj', runner=runner)
 
         assert result is expected
+
+
+# ---------------------------------------------------------------------------
+# TestRunnerScriptKind (task 2580 — step-3 RED / step-4 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerScriptKind:
+    """``run_delivered_check``'s script-kind branch: argv/cwd shape + exit/timeout mapping."""
+
+    def _fake_runner(self, rc: int = 0, out: str = '', err: str = ''):
+        calls: list[tuple] = []
+
+        async def _runner(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return (rc, out, err)
+
+        return _runner, calls
+
+    @pytest.mark.asyncio
+    async def test_argv_and_cwd_shape(self):
+        runner, calls = self._fake_runner(rc=0)
+        check = {
+            'name': 'cap',
+            'kind': 'script',
+            'script': 'scripts/check.sh',
+            'args': ['--flag', 'value'],
+            'timeout_secs': 30,
+        }
+
+        await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert len(calls) == 1
+        argv, kwargs = calls[0]
+        assert argv == ['/proj/scripts/check.sh', '--flag', 'value']
+        assert kwargs.get('cwd') == Path('/proj')
+
+    @pytest.mark.asyncio
+    async def test_exit_zero_delivered(self):
+        runner, _calls = self._fake_runner(rc=0)
+        check = {'name': 'cap', 'kind': 'script', 'script': 'x.sh', 'timeout_secs': 5}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.DELIVERED
+
+    @pytest.mark.asyncio
+    async def test_nonzero_exit_failed(self):
+        runner, _calls = self._fake_runner(rc=1)
+        check = {'name': 'cap', 'kind': 'script', 'script': 'x.sh', 'timeout_secs': 5}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is DeliveredCheckResult.FAILED
+
+    @pytest.mark.asyncio
+    async def test_timeout_errored(self):
+        """A runner that raises TimeoutError (simulating asyncio.wait_for's
+        own timeout firing, mirroring test_deterministic_runner.py's
+        seam-injection precedent) must map to ERRORED — no real subprocess,
+        no real wait, is needed to exercise this path."""
+        called = False
+
+        async def _runner(argv, **kwargs):
+            nonlocal called
+            called = True
+            raise TimeoutError('simulated timeout')
+
+        check = {'name': 'cap', 'kind': 'script', 'script': 'x.sh', 'timeout_secs': 5}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=_runner)
+
+        assert called, 'the injected runner must actually be invoked'
+        assert result is DeliveredCheckResult.ERRORED
+
+    @pytest.mark.asyncio
+    async def test_missing_executable_errored(self):
+        """A runner that raises OSError (e.g. FileNotFoundError for a
+        missing/non-executable script) must map to ERRORED."""
+        called = False
+
+        async def _runner(argv, **kwargs):
+            nonlocal called
+            called = True
+            raise FileNotFoundError('missing executable')
+
+        check = {'name': 'cap', 'kind': 'script', 'script': 'x.sh', 'timeout_secs': 5}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=_runner)
+
+        assert called, 'the injected runner must actually be invoked'
+        assert result is DeliveredCheckResult.ERRORED
