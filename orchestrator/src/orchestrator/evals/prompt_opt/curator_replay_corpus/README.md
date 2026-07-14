@@ -121,6 +121,24 @@ label instead comes from:
    below) flagged for a human to independently confirm or reject the
    frontier proposal.
 
+**Known limitation: frontier `drop`/`combine` labels are ungrounded, and
+expected to skew toward `create`.** The frontier adjudicator sees *only* the
+candidate task JSON -- it has no catalog of existing/pending tasks to check
+a candidate against. `drop` and `combine` are fundamentally judgments about
+the *rest of the backlog*, which the model cannot see, so it has no grounded
+basis to name a specific duplicate/combine target from the candidate in
+isolation; the system prompt's "default to `create` when uncertain"
+instruction means the frontier pass alone will produce mostly `create`
+labels and sparse `drop`/`combine` targets. This is an accepted PRD D-6
+tradeoff, not a bug: the **human spot-check subset is the primary
+correctness signal for `drop`/`combine` labels**, not the frontier pass by
+itself -- it stratifies by recorded action specifically so drop/combine
+tickets still get reviewed even though the frontier pass under-proposes
+them (see "Human spot-check subset" below). Grounding the frontier pass in a
+relevant slice of existing-task context (nearest neighbors / currently
+pending tasks) is a possible future enhancement, out of this task's scope
+(T5 is the corpus builder + hard scorer).
+
 `build_curator_corpus()`'s own unit test
 (`TestBuildCuratorCorpus::test_returns_manifest_with_frontier_gold_labels_not_recorded_actions`)
 pins this invariant directly: every item's `gold_action` comes from the
@@ -226,6 +244,14 @@ across checkouts -- tickets.db is offline, gitignored data that lives in the
 MAIN repo, not a task worktree). If `--db-path` doesn't point at a real
 file, the command fails fast with a clear error rather than letting
 `sqlite3` silently create an empty database.
+
+The real frontier call (`propose_curator_label_frontier`) also needs a repo
+checkout to run its `invoke_agent` harness in. This defaults to
+`/home/leo/src/dark-factory` as well, overridable via the `CURATOR_REPO_ROOT`
+env var (or the function's own `cwd` parameter for programmatic callers) --
+the same portability reasoning as `CURATOR_TICKETS_DB` above, so running
+`build-curator-corpus` from a different checkout (another operator, CI)
+doesn't silently point the agent at the wrong working directory.
 
 The command prints the total frontier labeling cost (summed from each
 sampled candidate's `FrontierLabel.cost_usd`, populated by

@@ -128,8 +128,13 @@ def recover_recorded_action(
         raw_action = parsed.get('action')
         if raw_action in _RECOVERABLE_ACTIONS:
             action = raw_action
-            target_fingerprint = parsed.get('target_fingerprint')
-            target_id = parsed.get('id') or parsed.get('target_id')
+            if raw_action in ('drop', 'combine'):
+                # 'create' has no "target being combined into" -- guard the
+                # extraction itself (not just the task_id fallback below) so
+                # an explicit {'action': 'create', 'id': ...} result_json
+                # shape can never leak a target onto a create decision.
+                target_fingerprint = parsed.get('target_fingerprint')
+                target_id = parsed.get('id') or parsed.get('target_id')
 
     if action is None and status == 'created':
         action = 'create'
@@ -236,7 +241,13 @@ def select_spot_check_subset(
     ``stratify_by_action=False`` samples flatly across all *decisions*
     instead (one "stratum" holding everything) -- provided for parity with
     a non-stratified sampling mode; :func:`build_curator_corpus` always uses
-    the stratified default so drop/combine/create are each represented.
+    the stratified default so drop/combine/create are each represented. No
+    production caller passes ``False`` today -- its only consumer is
+    ``test_stratify_by_action_false_samples_flatly``, which pins flat
+    sampling as documented fallback behavior of this general-purpose utility
+    (rather than a bespoke stratified-only helper). Keep new call sites on
+    the stratified default unless they specifically want representation-
+    blind sampling.
     """
     if not decisions:
         return []
