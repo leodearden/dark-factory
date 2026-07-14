@@ -15,9 +15,18 @@ from pathlib import Path
 from _curator_replay_fixtures import make_synthetic_tickets_db
 
 from orchestrator.evals.prompt_opt.curator_corpus import (
+    RecordedDecision,
     read_curator_decisions,
     recover_recorded_action,
+    select_spot_check_subset,
 )
+
+
+def _decision(ticket_id: str, action: str) -> RecordedDecision:
+    return RecordedDecision(
+        ticket_id=ticket_id, candidate={'title': ticket_id}, action=action,
+        target_fingerprint=None, target_id=None,
+    )
 
 
 class TestRecoverRecordedAction:
@@ -150,3 +159,69 @@ class TestReadCuratorDecisions:
         second = read_curator_decisions(db_path)
         assert [d.ticket_id for d in first] == [d.ticket_id for d in second]
         assert len(first) == 1
+
+
+def _decisions_for_actions(counts: dict[str, int]) -> list[RecordedDecision]:
+    decisions = []
+    for action, count in counts.items():
+        for i in range(count):
+            decisions.append(_decision(f'{action}-{i}', action))
+    return decisions
+
+
+class TestSelectSpotCheckSubset:
+    """select_spot_check_subset -- the Open-Q Sec9 tactical decision (human
+    spot-check subset size): deterministic, action-stratified sampling
+    bounded to keep human review effort tractable."""
+
+    def test_subset_is_a_subset_of_input_and_never_exceeds_it(self) -> None:
+        decisions = _decisions_for_actions({'create': 20, 'combine': 10, 'drop': 5})
+        subset = select_spot_check_subset(decisions, seed=1)
+        all_ids = {d.ticket_id for d in decisions}
+        assert set(subset) <= all_ids
+        assert len(subset) <= len(decisions)
+
+    def test_every_present_action_gets_representation(self) -> None:
+        decisions = _decisions_for_actions({'create': 20, 'combine': 10, 'drop': 3})
+        subset = set(select_spot_check_subset(decisions, seed=1))
+        by_action = {
+            action: [d.ticket_id for d in decisions if d.action == action]
+            for action in ('create', 'combine', 'drop')
+        }
+        for action, ids in by_action.items():
+            assert subset.intersection(ids), f'{action} stratum has no spot-check representation'
+
+    def test_deterministic_for_a_fixed_seed(self) -> None:
+        decisions = _decisions_for_actions({'create': 20, 'combine': 10, 'drop': 5})
+        first = select_spot_check_subset(decisions, seed=7)
+        second = select_spot_check_subset(decisions, seed=7)
+        assert first == second
+
+    def test_varies_with_seed(self) -> None:
+        decisions = _decisions_for_actions({'create': 40, 'combine': 40, 'drop': 40})
+        first = select_spot_check_subset(decisions, seed=1)
+        second = select_spot_check_subset(decisions, seed=2)
+        assert first != second
+
+    def test_default_sized_subset_is_bounded_by_fraction(self) -> None:
+        decisions = _decisions_for_actions({'create': 100})
+        subset = select_spot_check_subset(decisions, seed=1, fraction=0.2, minimum=5)
+        assert len(subset) == 20
+
+    def test_result_is_capped_to_bound_human_effort(self) -> None:
+        decisions = _decisions_for_actions({'create': 100, 'combine': 100, 'drop': 100})
+        subset = select_spot_check_subset(decisions, seed=1, fraction=0.5, minimum=5, cap=10)
+        assert len(subset) <= 10
+
+    def test_empty_input_returns_empty(self) -> None:
+        assert select_spot_check_subset([], seed=1) == []
+
+    def test_stratify_by_action_false_samples_flatly(self) -> None:
+        decisions = _decisions_for_actions({'create': 30, 'combine': 30, 'drop': 30})
+        subset = select_spot_check_subset(
+            decisions, seed=1, fraction=0.1, minimum=2, stratify_by_action=False,
+        )
+        # Flat sampling still respects subset/size invariants even though
+        # it does not guarantee per-action representation.
+        assert set(subset) <= {d.ticket_id for d in decisions}
+        assert len(subset) <= len(decisions)
