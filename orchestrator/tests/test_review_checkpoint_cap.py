@@ -253,6 +253,7 @@ class TestReviewCheckpointVerifyRole:
 
         assert isinstance(report, ReviewReport)
         mock_run_full_verification.assert_awaited_once()
+        assert mock_run_full_verification.await_args is not None
         call_kwargs = mock_run_full_verification.await_args.kwargs
         assert 'role' not in call_kwargs, (
             'review-checkpoint must not stamp a role on its verify call — '
