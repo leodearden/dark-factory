@@ -476,3 +476,92 @@ def test_build_task_payloads_harness_rooted_cause_can_target_dark_factory():
         clusters, project_root="/home/leo/src/hosted-project", project_id="hosted_project",
     )
     assert payloads[0]["project_root"] == "/home/leo/src/dark-factory"
+
+
+# ---------------------------------------------------------------------------
+# step-11: RED — promote_candidate() / reject_candidate() / retire_entry()
+# in-place codebook lifecycle transforms (never-delete, PRD decision 3)
+# ---------------------------------------------------------------------------
+
+def _codebook_with_candidate():
+    """Mirrors test_codebook.py's _minimal_v2() base shape, plus one
+    pending candidate carrying a real sighting -- the fixture promote/
+    reject tests build on."""
+    cb = _minimal_v2_codebook()
+    cb["candidates"] = [
+        {
+            "id": "cand-20260714-1",
+            "title": "A novel confusion shape",
+            "first_seen": "2026-07-14",
+            "disposition": "pending",
+            "sightings": [
+                {
+                    "date": "2026-07-14",
+                    "project": "dark_factory",
+                    "session": "sess-1",
+                    "origin_phase": "implement",
+                    "manifested_phase": "verify",
+                },
+            ],
+        }
+    ]
+    return cb
+
+
+def test_promote_candidate_appends_entry_and_stamps_disposition():
+    before = _codebook_with_candidate()
+    entry_fields = {
+        "id": "new-entry-a",
+        "title": "A novel confusion shape",
+        "severity": "medium",
+        "status": "open",
+        "origin_phase": "implement",
+        "manifested_phase": "verify",
+    }
+
+    result = mod.promote_candidate(before, "cand-20260714-1", entry_fields)
+
+    new_entry = next(e for e in result["entries"] if e["id"] == "new-entry-a")
+    assert new_entry["sightings"] == before["candidates"][0]["sightings"]
+
+    candidate = next(c for c in result["candidates"] if c["id"] == "cand-20260714-1")
+    assert candidate["disposition"] == "promoted"
+    assert candidate.get("promoted_to") == "new-entry-a", "must name the new entry id"
+    assert len(result["candidates"]) == len(before["candidates"]), "candidate is RETAINED"
+
+    assert codebook.validate(result) == []
+    codebook.assert_no_deletion(before, result)  # must not raise
+
+    # never mutates the input codebook
+    assert before["candidates"][0]["disposition"] == "pending"
+    assert len(before["entries"]) == 1
+
+
+def test_reject_candidate_stamps_disposition_retained():
+    before = _codebook_with_candidate()
+
+    result = mod.reject_candidate(before, "cand-20260714-1")
+
+    candidate = next(c for c in result["candidates"] if c["id"] == "cand-20260714-1")
+    assert candidate["disposition"] == "rejected"
+    assert len(result["candidates"]) == len(before["candidates"]), "candidate is RETAINED"
+
+    assert codebook.validate(result) == []
+    codebook.assert_no_deletion(before, result)
+
+    assert before["candidates"][0]["disposition"] == "pending"
+
+
+def test_retire_entry_sets_status_retained():
+    before = _minimal_v2_codebook()
+
+    result = mod.retire_entry(before, "entry-a")
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert entry["status"] == "retired"
+    assert len(result["entries"]) == len(before["entries"]), "entry is RETAINED"
+
+    assert codebook.validate(result) == []
+    codebook.assert_no_deletion(before, result)
+
+    assert before["entries"][0]["status"] == "open"
