@@ -2231,6 +2231,14 @@ class GitOps:
         The script lives in the LANE's own scripts dir (the lane's checked-out
         tree provides it, consistent with the debug-port script pattern).
 
+        **Does NOT take ``<lane_dir>.lock``**: the only flock this method (or
+        the ``seed-warm-lane.sh`` it invokes) acquires is the *shared*
+        per-gen-dir lock above, scoped to protecting the shared CoW base
+        during copy — never the lane's own lock file. See
+        :meth:`_run_thin_warm_lane`'s "Lane-lock coupling gap" docstring
+        note for why that matters (a concurrent release-thin does not
+        actually contend with a re-acquire on ``<lane_dir>.lock``).
+
         Returns:
             0   — script ran and exited 0 (seed succeeded, lane is warm).
             75  — script exited 75 (EX_TEMPFAIL, disk-pressure discriminant).
@@ -2558,6 +2566,129 @@ class GitOps:
                 task_id, exc_info=True,
             )
             return False
+
+    async def _run_thin_warm_lane(self, lane_dir: Path) -> int:
+        """Invoke ``<project_root>/scripts/thin-warm-lane.sh <lane_dir>``.
+
+        Task 2442 (§9.5 η): fail-soft, never-raise wrapper around reify δ's
+        free-first target-reclaim primitive, modeled on
+        :meth:`_run_warm_lane_gc_reclaim`. Invoked WITHOUT ``--reseed`` (D3) —
+        the next :meth:`acquire_warm_lane` always re-seeds ``target/`` from
+        the current base regardless (D10), so leaving ``target/`` empty here
+        does not change net warmth; only the idle-hold between release and a
+        re-acquire that may never come is eliminated.
+
+        **Pool-storage guard (task 2099)**: refuses to spawn the script when
+        a pool is configured (:meth:`pool_in_use`) but
+        :meth:`pool_storage_present` is False — an unmounted mountpoint must
+        never let this script operate against a lane it can only see as
+        missing. This is the RAW refuse-only check (``pool_in_use() and not
+        pool_storage_present()``) — it does NOT route through
+        :meth:`_reconcile_pool_storage_before_sweep`, the self-healing
+        variant :meth:`_run_warm_lane_gc_reclaim` uses, which recreates a
+        merely-lost ``.pool-root`` sentinel on a provably-healthy mount
+        instead of refusing forever. The raw check is sufficient here:
+        release-thin is a purely optional, fail-open reclaim that nothing
+        else depends on for forward progress, and this method never writes
+        the sentinel itself (:meth:`_seed_warm_lane`'s ``rc == 0`` is the
+        only writer) — so there is nothing for it to self-heal. A spurious
+        refusal here just idle-holds ``target/`` for one more cycle until
+        the sentinel is recreated elsewhere, never the chicken-and-egg
+        deadlock :meth:`_reconcile_pool_storage_before_sweep` exists to
+        break (see that method's docstring).
+
+        **Flock contract (pinned — this wrapper holds no lock of its own)**:
+        safety against a concurrent re-acquire racing this call rests
+        entirely on the script side. reify's ``scripts/thin-warm-lane.sh``
+        acquires ``<lane_dir>.lock`` (a sibling lock file, non-blocking
+        ``flock -n``) BEFORE touching ``target/`` and exits 75 if it cannot
+        — see that script's "T3" block and PRD
+        ``docs/prds/warm-lane-pool-sizing-lifecycle.md`` §9.3 invariant T3 /
+        §9.5 inv.10 (reify repo). This wrapper only spawns the script and
+        interprets its exit code; if the script's flock behavior ever
+        regresses, this wrapper provides no independent defense. See
+        ``TestRunThinWarmLaneFlockContention`` in ``test_git_ops.py`` for a
+        unit test that exercises this against a real held flock (not just a
+        scripted exit code).
+
+        **Lane-lock coupling gap (task 2442 review — CONFIRMED, not just
+        theoretical)**: the mutual exclusion above additionally requires the
+        OTHER party in a concurrent re-acquire — reify's
+        ``<lane_dir>/scripts/seed-warm-lane.sh``, invoked by
+        :meth:`_seed_warm_lane` — to ALSO take ``<lane_dir>.lock`` before
+        writing into ``target/``. As of this writing it does not:
+        ``seed-warm-lane.sh`` takes only a *shared* flock on the separate
+        per-gen-dir lock file for the duration of its ``cp --reflink`` from
+        the shared CoW base (mirrored on the DF side by
+        :meth:`_seed_warm_lane`'s own gen-dir flock, above) — it contains no
+        ``<lane_dir>.lock`` reference at all. DF's own
+        :class:`WarmLanePool` does not fill the gap either: its ASSIGNED/FREE
+        bookkeeping is purely in-memory, guarded by a single ``asyncio.Lock``
+        (see its class docstring) that serializes the fast state-dict flip
+        only — NOT the slow subprocess calls either side makes. This
+        method's ``rm -rf`` and :meth:`_seed_warm_lane`'s ``cp --reflink``
+        both run as real OS subprocesses that can genuinely overlap in
+        wall-clock time across an ``await``, even within a single
+        orchestrator process. So today, a concurrent re-acquire of a
+        just-released lane does NOT contend on ``<lane_dir>.lock`` — thin's
+        ``flock -n`` is uncontested and proceeds, meaning the rc=75
+        benign-skip path is reachable only when something ELSE (another
+        thin or GC invocation) holds the lock, not when a genuine re-acquire
+        is racing this call. ``TestSeedWarmLaneDoesNotTakeLaneLock`` in
+        ``test_git_ops.py`` pins this current behavior down against a real
+        held flock. Teaching either side to take ``<lane_dir>.lock`` for
+        real is a locking-design change out of scope for task 2442 (η) —
+        flagged as a follow-up rather than fixed here.
+
+        Exit-code taxonomy (per the reify δ contract):
+            0   — thinned (``target/`` removed).
+            1   — guard refusal (logged at WARNING).
+            2   — usage error (logged at WARNING).
+            75  — EX_TEMPFAIL: the lane's own flock is held (already
+                  re-acquired concurrently) — a BENIGN skip, never logged at
+                  WARNING (§9.5 inv.11: release-thin is not an
+                  escalation/fault).
+            127 — script absent, pool storage absent, or unexpected
+                  exception (fail-soft sentinel).
+
+        Never raises.
+        """
+        if self.pool_in_use() and not self.pool_storage_present():
+            logger.warning(
+                '_run_thin_warm_lane: pool storage absent/unmounted at %s — '
+                'refusing to spawn thin-warm-lane.sh for %s',
+                self.worktree_base, lane_dir,
+            )
+            self._note_pool_storage_absent()
+            return 127
+        try:
+            script = self.project_root / 'scripts' / 'thin-warm-lane.sh'
+            if not script.exists():
+                logger.debug(
+                    '_run_thin_warm_lane: script absent at %s — no-op', script,
+                )
+                return 127
+            cmd = [str(script), str(lane_dir)]
+            rc, _, err = await _run(cmd, cwd=self.project_root)
+            if rc == 0:
+                logger.info('_run_thin_warm_lane: thinned %s', lane_dir)
+            elif rc == 75:
+                logger.debug(
+                    '_run_thin_warm_lane: lane %s already re-acquired '
+                    '(rc=75, flock held) — benign skip',
+                    lane_dir,
+                )
+            else:
+                logger.warning(
+                    '_run_thin_warm_lane: script exited %d for %s (stderr=%r)',
+                    rc, lane_dir, err,
+                )
+            return rc
+        except Exception:
+            logger.warning(
+                '_run_thin_warm_lane: unexpected error for %s', lane_dir, exc_info=True,
+            )
+            return 127
 
     async def _warm_lane_disk_admission_blocked(self) -> bool:
         """Run the ε disk-pressure admission check: check → reclaim → recheck.
@@ -3932,11 +4063,25 @@ class GitOps:
            main tip).  When it carries commits, the branch is RETAINED and a
            log line is emitted; the pool release still proceeds.
         3. ``await self.warm_lane_pool.release(lane_dir)`` — flip ASSIGNED→FREE.
+        4. **§9.5 η (task 2442)**: when ``self.config.warm_lane_release_thin``
+           is True, invoke :meth:`_run_thin_warm_lane` — an eager free-first
+           reclaim of the lane's ``target/`` via reify δ's
+           ``scripts/thin-warm-lane.sh``, run strictly AFTER the ASSIGNED→FREE
+           flip.  The script holds the lane's own flock (T3), so a concurrent
+           re-acquire of this just-freed lane makes it exit 75 (benign skip) —
+           never thinned while ASSIGNED, by construction (inv.10).  Only
+           ``target/`` is ever removed (T1); invoked WITHOUT ``--reseed`` — the
+           next :meth:`acquire_warm_lane` always re-seeds from the current
+           base regardless (D10), so net warmth is unchanged and only the
+           idle-hold of a divergent ``target/`` is eliminated.  Best-effort /
+           never-raise (:meth:`_run_thin_warm_lane` never raises), so a thin
+           hiccup can never strand the pool release or the scheduler
+           (inv.11: release-thin is not an escalation/fault).
 
-        Never removes the worktree; ``target/`` is left in place incidentally
-        (CoW-cheap, harmless).  The *next* :meth:`acquire_warm_lane` always
-        re-seeds from the current base (D10), so a released lane's target/
-        drift is irrelevant — retention is no longer a contract promise.
+        Absent the knob (default False), ``target/`` is left in place
+        incidentally (CoW-cheap, harmless) — the *next*
+        :meth:`acquire_warm_lane` always re-seeds from the current base (D10),
+        so a released lane's target/ drift is irrelevant either way.
 
         Fully best-effort / never-raise (mirrors ``cleanup_merge_worktree``
         contract) so a hiccup cannot strand the scheduler.
@@ -3966,6 +4111,11 @@ class GitOps:
         await self.warm_lane_pool.release(lane_dir)
         self._lifecycle_note_released(lane_dir)
         logger.info('release_warm_lane: released %s (branch %s)', lane_dir, full_branch)
+
+        # §9.5 η (task 2442): eager free-first release-thin — LAST step, so a
+        # thin hiccup can never strand the pool release above (inv.11).
+        if self.config.warm_lane_release_thin:
+            await self._run_thin_warm_lane(lane_dir)
 
     def _lifecycle_note_released(self, lane: Path) -> None:
         """Best-effort durable RELEASED write for :meth:`release_warm_lane`.
