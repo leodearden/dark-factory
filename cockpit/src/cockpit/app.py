@@ -355,6 +355,19 @@ class CockpitApp(App):
         registry before a fresher one landed can never regress the view.
         self._applied_scan_seq advances even on a no-op (snapshot-unchanged)
         apply, so a later stale result is still correctly dropped.
+
+        Note: seq order tracks scan-*initiation* order, not measured
+        read-completion order -- it is a proxy for freshness, not a direct
+        stamp of it. In principle a scan issued earlier (lower seq) could
+        finish its off-thread registry read later than one issued after it,
+        and this guard would drop that earlier-issued-but-actually-fresher
+        result. That window cannot open today: _scan_in_flight (see
+        _poll_registry) admits only one in-flight poll worker at a time, so
+        poll-issued scans can never race each other, and refresh_registry
+        only ever runs synchronously at on_mount, before the poll timer is
+        registered. The guard's correctness therefore rests on that
+        backpressure serialization keeping initiation order equal to
+        landing order, not on seq tracking true read recency.
         """
         if not self.is_running:
             return
