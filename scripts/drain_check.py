@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """STDLIB-ONLY reader for α's (task 2395) per-unit merge-idle heartbeat.
 
 Consumed by γ's drain gate in restart-all-orchestrators.sh (task 2397).
@@ -8,11 +9,20 @@ importable -- mirroring the stdlib watchdog's decoupled heartbeat read
 
 On-disk contract mirrored from orchestrator/src/orchestrator/fleet_heartbeat.py:
     {unit, merge_idle: bool, depth: int, queue_empty: bool, ts_epoch: float}
+
+CLI usage (called by restart-all-orchestrators.sh's drain_gate):
+    python3 scripts/drain_check.py --unit <unit> [--fleet-dir DIR]
+        [--fresh-window SECS] [--now EPOCH]
+Prints exactly one of idle/busy/stale/absent to stdout and exits 0.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
+import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -71,3 +81,63 @@ def classify(heartbeat: dict | None, now: float, fresh_window: float) -> str:
     if heartbeat.get('merge_idle') is True:
         return 'idle'
     return 'busy'
+
+
+def _read_heartbeat(path: Path) -> dict | None:
+    """Read and parse a heartbeat JSON file at *path*.
+
+    Returns None if the file is missing/unreadable (OSError), its contents
+    are not valid JSON (ValueError), or the parsed value is not a JSON
+    object -- any of these count as "malformed" for classify()'s purposes.
+    """
+    try:
+        text = path.read_text(encoding='utf-8')
+    except OSError:
+        return None
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            'Print the drain-gate verdict (idle/busy/stale/absent) for one '
+            "orchestrator unit's merge-idle heartbeat."
+        ),
+    )
+    parser.add_argument(
+        '--unit', required=True,
+        help='Unit name, e.g. orchestrator-dark-factory.service',
+    )
+    parser.add_argument(
+        '--fleet-dir', type=Path, default=resolve_fleet_dir(),
+        help='Fleet-common heartbeat directory (default: resolve_fleet_dir(), '
+             'honouring ORCH_FLEET_DIR)',
+    )
+    parser.add_argument(
+        '--fresh-window', type=float, default=120.0,
+        help='Freshness window in seconds (default: 120)',
+    )
+    parser.add_argument(
+        '--now', type=float, default=time.time(),
+        help='Reference "now" in epoch seconds (default: current time)',
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    path = heartbeat_path(args.fleet_dir, args.unit)
+    heartbeat = _read_heartbeat(path)
+    verdict = classify(heartbeat, args.now, args.fresh_window)
+    print(verdict)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
