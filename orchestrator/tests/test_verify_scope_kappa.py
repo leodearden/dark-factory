@@ -230,3 +230,166 @@ class TestModuleConfigPlanAuthority:
         # VerifyResult.plan is the plan that DROVE execution above, not an
         # independently re-derived diagnostic mirror.
         assert result.plan == expected_plan.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# step-3: module-path byte-identical scope goldens
+# ---------------------------------------------------------------------------
+
+
+class TestModuleConfigScopeGoldens:
+    """Byte-identical goldens: the plan-driven executed ModuleConfig commands
+    reproduce ``scope_module_config``'s exact pre-refactor decisions, module-config
+    path. Each golden derives its expected string the SAME way
+    ``scope_module_config`` itself would have produced it (the verbatim mc
+    command for a widen/full-suite trigger; ``verify._scope_to_keyword`` for a
+    file-scoped one) — not merely self-consistency with the plan (that's
+    step-1/2's A1 spy) — so a future divergence between the plan-driven bridge
+    and ``scope_module_config``'s historical behaviour is caught here directly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_conftest_touched_uses_full_suite_verbatim(self, tmp_path: Path):
+        """(a) ROOT_CONFTEST_DIFF (task-1077) -> test_command == mc.test_command verbatim (D1)."""
+        conftest_path = ROOT_CONFTEST_DIFF[0]
+        full = tmp_path / conftest_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('# root\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(
+                prefix='orchestrator',
+                test_command=(
+                    'uv run --project orchestrator --directory orchestrator '
+                    'pytest tests/ --tb=short -q'
+                ),
+            ),
+        ]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=[conftest_path],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert executed[0].test_command == module_configs[0].test_command, (
+            f'conftest must trigger the verbatim full suite: {executed[0].test_command!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_data_module_touched_uses_full_suite_verbatim(self, tmp_path: Path):
+        """(b) DATA_MODULE_DIFF (task-1852) -> test_command == mc.test_command verbatim (D1)."""
+        data_path = DATA_MODULE_DIFF[0]
+        full = tmp_path / data_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('ALLOWLIST = set()\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(prefix='shared', test_command='uv run --directory shared pytest tests/'),
+        ]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=[data_path],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert executed[0].test_command == module_configs[0].test_command, (
+            f'a test-data module must trigger the verbatim full suite: {executed[0].test_command!r}'
+        )
+        assert 'silent_fallthrough_allowlist.py' not in (executed[0].test_command or ''), (
+            'the data file must never appear as a pytest target'
+        )
+
+    @pytest.mark.asyncio
+    async def test_structural_file_unscopes_type_check_verbatim(self, tmp_path: Path):
+        """(c) STRUCTURAL_FILE_DIFF -> type_check_command == mc.type_check_command
+        verbatim, INCLUDING --directory (D2)."""
+        struct_path = STRUCTURAL_FILE_DIFF[0]
+        full = tmp_path / struct_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(STRUCTURAL_FILE_CONTENT)
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(
+                prefix='mymod',
+                type_check_command='uv run --project mymod --directory mymod pyright src/ tests/',
+            ),
+        ]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=[struct_path],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert executed[0].type_check_command == module_configs[0].type_check_command, (
+            f'a structural file must trigger the verbatim unscoped type check '
+            f'(--directory preserved): {executed[0].type_check_command!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_source_only_diff_skips_pytest_entirely(self, tmp_path: Path):
+        """(d) SOURCE_ONLY_ZERO_PYTEST_DIFF -> test_command is None (verify_plan.py:318-322)."""
+        source_path = SOURCE_ONLY_ZERO_PYTEST_DIFF[0]
+        full = tmp_path / source_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('def helper():\n    return 1\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(prefix='mymod', test_command='uv run --directory mymod pytest tests/'),
+        ]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=[source_path],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert executed[0].test_command is None, (
+            f'a source-only diff with no collectable tests must never fabricate '
+            f'a pytest run: {executed[0].test_command!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_plain_test_file_matches_scope_to_keyword(self, tmp_path: Path):
+        """(e) a plain touched test file -> test_command == _scope_to_keyword's own output (FILE_SCOPED)."""
+        (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
+        test_path = 'mymod/tests/test_thing.py'
+        (tmp_path / test_path).write_text('def test_thing(): pass\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(prefix='mymod', test_command='uv run --directory mymod pytest tests/'),
+        ]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=[test_path],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        expected = verify._scope_to_keyword(module_configs[0].test_command, 'pytest', [test_path])
+        assert executed[0].test_command == expected, (
+            f'expected the _scope_to_keyword-scoped string {expected!r}, got '
+            f'{executed[0].test_command!r}'
+        )
