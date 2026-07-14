@@ -956,6 +956,136 @@ class TestFilterSuppressed:
 
 
 # ---------------------------------------------------------------------------
+# RED (task 2454 step-5): filter_suppressed must DECOMPOSE a composite
+# comma-joined suppression row's task_id so a single-component flag lookup
+# matches. Today the whole row.task_id string is one opaque map key, so a
+# lookup on any single component (e.g. flag task_id=544 against a row
+# task_id='2405,540,544') never matches.
+# ---------------------------------------------------------------------------
+
+
+class TestFilterSuppressedComposite:
+    """filter_suppressed decomposes a composite/comma-joined suppression
+    row's task_id, indexing EACH component into the suppressed map (per
+    plan.json design decision: read-time decomposition, not write-time
+    fan-out) — so a single-component flag lookup matches any component of a
+    pre-existing or newly-written composite row."""
+
+    @pytest.mark.asyncio
+    async def test_two_id_composite_drops_both_components_keeps_unrelated(
+        self, ledger_memory_service
+    ):
+        """(a) A 2-id blanket composite row drops flags for BOTH components,
+        keeping an unrelated task_id."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '2405,544', '')
+
+        flags = [
+            {'task_id': 2405, 'flag_type': 'missing_deliverable'},
+            {'task_id': 544, 'flag_type': 'stale_metadata'},
+            {'task_id': 99, 'flag_type': 'missing_deliverable'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+        assert result == [{'task_id': 99, 'flag_type': 'missing_deliverable'}]
+
+    @pytest.mark.asyncio
+    async def test_three_id_composite_drops_each_component(self, ledger_memory_service):
+        """(b) A 3-id blanket composite row drops each of its 3 components."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '2405,2417,2425', '')
+
+        flags = [
+            {'task_id': 2405, 'flag_type': 'x'},
+            {'task_id': 2417, 'flag_type': 'y'},
+            {'task_id': 2425, 'flag_type': 'z'},
+            {'task_id': 99, 'flag_type': 'x'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+        assert result == [{'task_id': 99, 'flag_type': 'x'}]
+
+    @pytest.mark.asyncio
+    async def test_cross_project_mixed_composite_drops_each_component(
+        self, ledger_memory_service
+    ):
+        """(c) A cross-project mixed composite ('2405,540,544', a
+        dark_factory id mixed with autopilot_video ids) drops flags matching
+        any of its components, including the one a single-project flag-side
+        lookup cares about (544)."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '2405,540,544', '')
+
+        flags = [
+            {'task_id': 544, 'flag_type': 'missing_deliverable'},
+            {'task_id': 540, 'flag_type': 'missing_deliverable'},
+            {'task_id': 2405, 'flag_type': 'missing_deliverable'},
+            {'task_id': 99, 'flag_type': 'missing_deliverable'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+        assert result == [{'task_id': 99, 'flag_type': 'missing_deliverable'}]
+
+    @pytest.mark.asyncio
+    async def test_int_vs_str_flag_parity_on_composite_component(
+        self, ledger_memory_service
+    ):
+        """(d) A flag's task_id may be int or str; both must match the same
+        composite component (544) of row task_id='2405,540,544'."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '2405,540,544', '')
+
+        flags = [
+            {'task_id': 544, 'flag_type': 'a'},
+            {'task_id': '544', 'flag_type': 'b'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_scoped_composite_row_drops_only_matching_flag_type(
+        self, ledger_memory_service
+    ):
+        """(e) A SCOPED composite row drops only that flag_type for a
+        component, keeping a different flag_type for the same component."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '2405,544', 'human_review_required_deferred'
+        )
+
+        suppressed_flag = {'task_id': 544, 'flag_type': 'human_review_required_deferred'}
+        surviving_flag = {'task_id': 544, 'flag_type': 'live_workflow_recurrence_counter_needed'}
+        result = await filter_suppressed(
+            ledger_memory_service, 'p', [suppressed_flag, surviving_flag]
+        )
+        assert result == [surviving_flag]
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_write_suppression_record_composite_then_filter(
+        self, ledger_memory_service
+    ):
+        """End-to-end: write_suppression_record persists a composite id;
+        filter_suppressed then drops a flag matching one of its components."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_suppressed,
+            write_suppression_record,
+        )
+
+        await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id='2405,540,544'
+        )
+
+        flags = [
+            {'task_id': 544, 'flag_type': 'missing_deliverable'},
+            {'task_id': 99, 'flag_type': 'missing_deliverable'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+        assert result == [{'task_id': 99, 'flag_type': 'missing_deliverable'}]
+
+
+# ---------------------------------------------------------------------------
 # task-1186 step-5 — integration: dedup_flags calls filter_suppressed FIRST
 # ---------------------------------------------------------------------------
 
