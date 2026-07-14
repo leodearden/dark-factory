@@ -28,7 +28,6 @@ from typing import Any
 
 import yaml
 from pydantic import ValidationError
-
 from shared.capability_manifest import DeliveredCheckMeta, parse_capability_manifest
 
 logger = logging.getLogger(__name__)
