@@ -865,6 +865,39 @@ def build_suppression_payload(
     }
 
 
+async def _existing_suppression_coverage(
+    ledger: Any, project_id: str, tid: str
+) -> tuple[bool, set[str]]:
+    """Return the existing ``stage1_flag_suppression`` coverage for *tid*.
+
+    Returns ``(wildcard_present, scoped_families)``: ``wildcard_present`` is
+    True iff an existing active row covering *tid* is a blanket/wildcard row
+    (``flag_type == ''``); ``scoped_families`` is the set of
+    :func:`canonical_flag_type_family` keys already covered by existing
+    scoped rows for *tid*. A row covers *tid* by EXACT string match
+    (``row.task_id == tid``) -- composite-row decomposition is added in
+    :func:`write_suppression_record`'s caller (task 2503 step-8).
+
+    Returns ``(False, set())`` -- no coverage -- when *ledger* is None.
+
+    Pure w.r.t. its inputs beyond the single ``list_suppressions`` read; never
+    raises (task 2503 step-10 adds the fail-open try/except around the read).
+    """
+    if ledger is None:
+        return False, set()
+    rows = await ledger.list_suppressions(project_id)
+    wildcard = False
+    families: set[str] = set()
+    for row in rows:
+        if row.task_id != tid:
+            continue
+        if not row.flag_type:
+            wildcard = True
+        else:
+            families.add(canonical_flag_type_family(row.flag_type))
+    return wildcard, families
+
+
 async def write_suppression_record(
     memory_service: Any,
     *,
@@ -920,14 +953,42 @@ async def write_suppression_record(
     Returns the :class:`AddMemoryResponse` from the memory service so callers
     can inspect ``memory_ids`` for empty-list deduplication / no-op detection.
     """
-    payload = build_suppression_payload(task_id, flag_types=flag_types)
-    tid = str(payload['metadata']['task_id'])
+    tid = str(build_suppression_payload(task_id, flag_types=flag_types)['metadata']['task_id'])
 
     ledger = getattr(memory_service, 'recon_ledger', None)
+    requested = flag_types or ['']
+    is_blanket = not flag_types
+
+    wildcard_covered, covered_families = await _existing_suppression_coverage(
+        ledger, project_id, tid
+    )
+
+    def _is_covered(ft: str) -> bool:
+        if wildcard_covered:
+            return True
+        if not ft:
+            return False  # a blanket write is only covered by an existing wildcard
+        return canonical_flag_type_family(ft) in covered_families
+
+    to_write = [ft for ft in requested if not _is_covered(ft)]
+
+    if not to_write:
+        logger.info(
+            'reconciliation.suppression_companion_skip task_id=%s project_id=%s '
+            'requested=%r fully covered by existing stage1_flag_suppression '
+            'row(s) -- skipping ledger upsert and Mem0 mirror',
+            tid,
+            project_id,
+            requested,
+        )
+        return AddMemoryResponse(memory_ids=[])
+
+    write_payload = build_suppression_payload(tid, flag_types=(None if is_blanket else to_write))
+
     if ledger is not None:
         now_iso = datetime.now(UTC).isoformat()
-        payload_json = json.dumps(payload['metadata'])
-        for ft in flag_types or ['']:
+        payload_json = json.dumps(write_payload['metadata'])
+        for ft in to_write:
             await ledger.upsert(ReconLedgerRecord(
                 project_id=project_id,
                 record_kind='stage1_flag_suppression',
@@ -942,7 +1003,7 @@ async def write_suppression_record(
 
     try:
         return await memory_service.add_memory(
-            **payload,
+            **write_payload,
             project_id=project_id,
             causation_id=causation_id,
             _source='stage1_flag_suppression',
