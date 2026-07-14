@@ -2750,18 +2750,17 @@ def _parse_decision_dict(
                 cost_usd=cost_usd,
             )
         # combine-only tasks must also be combine_eligible (pending status).
-        if action == 'combine' and target_entry is not None:
-            if not target_entry.combine_eligible:
-                return CuratorDecision(
-                    action='create',
-                    justification=(
-                        f'invalid-combine-target: {target_id} has status '
-                        f'{target_entry.status}, not pending'
-                    ),
-                    pool_sizes=pool_sizes,
-                    latency_ms=latency_ms,
-                    cost_usd=cost_usd,
-                )
+        if action == 'combine' and target_entry is not None and not target_entry.combine_eligible:
+            return CuratorDecision(
+                action='create',
+                justification=(
+                    f'invalid-combine-target: {target_id} has status '
+                    f'{target_entry.status}, not pending'
+                ),
+                pool_sizes=pool_sizes,
+                latency_ms=latency_ms,
+                cost_usd=cost_usd,
+            )
 
     rewritten: RewrittenTask | None = None
     if action == 'combine':
