@@ -2311,8 +2311,8 @@ def _emit_merge_attempt(
     train_id: str | None = None,
     member_task_ids: list[str] | None = None,
     disposition: MergeFailureDisposition | None = None,
-    origin_host: str | None = None,
-    probe_host: str | None = None,
+    origin_host: Literal['local', 'remote'] | None = None,
+    probe_host: Literal['local', 'remote'] | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` event for the given outcome.
 
