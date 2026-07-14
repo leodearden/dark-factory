@@ -64,6 +64,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from test_dry_run_unblock import _make_agent_result, _RecordingScheduler
 
 from orchestrator import (
     b3_gate,
@@ -75,10 +76,16 @@ from orchestrator import (
     verify_cmd,
     verify_plan,
 )
+from orchestrator.b3_gate import ABORT, check_proposal
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeRequest
-from orchestrator.verify import CheckRun, VerifyAttempt
+from orchestrator.merge_queue import (
+    MergeRequest,
+    _DryRunInvestigationHandles,
+    _run_post_merge_verify,
+)
+from orchestrator.unblock_types import BlockClass
+from orchestrator.verify import CheckRun, VerifyAttempt, VerifyResult
 from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, _validate_exhaustive
 from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import (
