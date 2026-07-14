@@ -13,6 +13,7 @@ test_ui_config.py.
 from __future__ import annotations
 
 import asyncio
+import shutil
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -1193,6 +1194,89 @@ class TestSpawnTreeEnterFocus:
             await pilot.pause()
 
             assert backend.focus_calls == []
+
+    @pytest.mark.timeout(10)
+    async def test_focus_slug_missing_from_snapshot_is_fail_soft(self, tmp_path):
+        """A slug that isn't in the snapshot passed to _focus_slug (e.g. the
+        opened tree's own snapshot, once stale) resolves to no record at all
+        -- the `record is None` branch -- and must not raise or focus
+        anything (PRD §2), mirroring the no-Display fail-soft case above."""
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+
+        some_record = _make_record(session_slug='parent-1', parent_session_id=None)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test():
+            app._focus_slug('nonexistent-slug', [some_record])
+
+            assert backend.focus_calls == []
+
+    @pytest.mark.timeout(10)
+    async def test_enter_resolves_against_the_opened_snapshot_not_live_records(self, tmp_path):
+        """Enter must resolve against the snapshot action_toggle_tree closed
+        over when the tree was opened, not whatever self._records has been
+        reassigned to by an intervening refresh_registry poll tick -- see
+        action_toggle_tree's and _focus_slug's docstrings. The reassignment
+        is reproduced via a *real* refresh_registry() scan (not a hand-poked
+        app._records assignment): the child's on-disk record is removed
+        first, so the scan legitimately drops it and self._records
+        genuinely no longer contains the child by the time Enter is
+        pressed. This keeps the guard deterministic -- unlike overwriting
+        app._records directly, which the still-running poll_interval=0.05
+        background poller could silently re-populate from the (unchanged)
+        on-disk child before Enter lands, since nothing about that
+        alternate approach stops disk from still backing the child.
+        Enter must still focus the original child's Display, exactly as if
+        the poll tick had never landed."""
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+        from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
+
+        parent_display = sr.Display(kind='wm', wm_title='parent title')
+        child_display = sr.Display(kind='wm', wm_title='child title')
+        parent = _make_record(
+            session_slug='parent-1', parent_session_id=None, display=parent_display
+        )
+        child = _make_record(
+            session_slug='child-1', parent_session_id='parent-1', display=child_display
+        )
+        for r in (parent, child):
+            sr.write_record(r, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('t')
+            await pilot.pause()
+
+            assert isinstance(app.screen, SpawnTreeScreen)
+            tree = app.screen.query_one(SpawnTree)
+            parent_node = next(node for node in tree.root.children if node.data == 'parent-1')
+            child_node = next(node for node in parent_node.children if node.data == 'child-1')
+
+            tree.move_cursor(child_node)
+            await pilot.pause()
+
+            # Simulate an intervening refresh_registry poll tick that
+            # replaces self._records wholesale with a set no longer
+            # containing the highlighted child -- deterministically: the
+            # child's record.json is gone from disk, so this scan (like
+            # any later background poll tick) can only ever find parent-1.
+            shutil.rmtree(sr.record_path_for_slug('child-1', root=tmp_path).parent)
+            app.refresh_registry()
+            await pilot.pause()
+            # sanity: the simulated poll tick actually dropped the child,
+            # so the assertion below isn't vacuously true.
+            assert [r.session_slug for r in app._records] == ['parent-1']
+
+            await pilot.press('enter')
+            await pilot.pause()
+
+            assert backend.focus_calls == [DisplayTarget(kind='wm', wm_title='child title')]
 
 
 class TestSpawnTreeToggle:
