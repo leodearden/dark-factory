@@ -354,3 +354,65 @@ def test_load_census_config_malformed_file_returns_defaults_with_one_warning(tmp
 
     assert config == ct.CensusConfig()
     assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+# ---------------------------------------------------------------------------
+# step-15: RED — compute_tasks_landed() fail-safe delta + default_status_fetcher()
+# ---------------------------------------------------------------------------
+
+def _wrapped_fetcher(statuses):
+    """A fake status_fetcher mimicking get_statuses' wrapped envelope
+    (fused-memory/src/fused_memory/server/tools.py:2665): `{"statuses": {id: status}}`."""
+    return lambda: {"statuses": statuses}
+
+
+def test_compute_tasks_landed_happy_path_returns_delta_over_baseline():
+    state = {"last_census_done_count": 500}
+    statuses = {str(i): "done" for i in range(630)}
+    statuses.update({str(i): "pending" for i in range(630, 645)})
+
+    result = ct.compute_tasks_landed(state=state, status_fetcher=_wrapped_fetcher(statuses))
+
+    assert result == 130
+
+
+def test_compute_tasks_landed_no_fetcher_returns_none_with_one_warning(caplog):
+    state = {"last_census_done_count": 500}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(state=state, status_fetcher=None)
+
+    assert result is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_compute_tasks_landed_raising_fetcher_returns_none_with_one_warning(caplog):
+    state = {"last_census_done_count": 500}
+
+    def _raising_fetcher():
+        raise RuntimeError("get_statuses unreachable")
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(state=state, status_fetcher=_raising_fetcher)
+
+    assert result is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_compute_tasks_landed_missing_baseline_returns_none_with_one_warning(caplog):
+    state = {"last_census_at": "2026-07-01T00:00:00+00:00"}  # no last_census_done_count
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=_wrapped_fetcher({"1": "done"})
+        )
+
+    assert result is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(tmp_path):
+    fetcher = ct.default_status_fetcher(tmp_path)
+
+    with pytest.raises(ct.StatusFetchUnavailable):
+        fetcher()
