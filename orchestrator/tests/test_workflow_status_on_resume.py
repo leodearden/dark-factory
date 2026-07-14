@@ -448,6 +448,13 @@ class TestStatusPreservationOnResume:
         # check), not the has-work predicate itself, so stub has_work=True
         # to keep it decoupled from the (now-fixed) empty-branch semantics
         # while still exercising the real is_ancestor check.
+        #
+        # Cross-ref: test_scope_violation_resume_clean_tree_reinvokes_implementer
+        # (above) is the canonical coverage for the has_work=False resume
+        # path — it uses no stub, so a regression there can't be masked by
+        # this test's has_work=True stub. Together the two tests cover both
+        # the short-circuit ordering (this test) and the has-work predicate
+        # itself (that test).
         workflow._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
             return_value=_PriorImplStatus(
                 has_work=True,
