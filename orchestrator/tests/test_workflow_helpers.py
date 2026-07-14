@@ -145,3 +145,27 @@ def test_warmlane_workflow_factory_identity() -> None:
     from _workflow_helpers import _make_warmlane_workflow  # noqa: PLC0415
 
     assert wr._make_workflow is _make_warmlane_workflow
+
+
+# ---------------------------------------------------------------------------
+# Group C: harness factories (_build_harness, _init_git_repo)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_init_git_repo_factory_smoke(tmp_path) -> None:
+    """_init_git_repo seeds a real git repo with an initial README commit."""
+    from _workflow_helpers import _init_git_repo  # noqa: PLC0415
+
+    await _init_git_repo(tmp_path)
+    assert (tmp_path / '.git').is_dir()
+    assert (tmp_path / 'README.md').exists()
+
+
+def test_harness_factories_identity() -> None:
+    """Anti-duplication guard: the producer re-exports the SAME objects as the shared module."""
+    import test_harness_warm_lane_wiring as hw  # noqa: PLC0415
+    from _workflow_helpers import _build_harness, _init_git_repo  # noqa: PLC0415
+
+    assert hw._build_harness is _build_harness
+    assert hw._init_git_repo is _init_git_repo
