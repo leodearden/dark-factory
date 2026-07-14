@@ -42,6 +42,7 @@ and ``codebook.assert_no_deletion()`` confirm the write is safe.
 """
 from __future__ import annotations
 
+import copy
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -370,3 +371,71 @@ def build_task_payloads(clusters, *, project_root: str, project_id: str) -> list
             }
         )
     return payloads
+
+
+# ---------------------------------------------------------------------------
+# promote_candidate / reject_candidate / retire_entry — census-only
+# codebook lifecycle transforms (PRD decision 1: deterministic, in-memory,
+# reuse gamma's validator + never-delete assertion + sole-writer dump;
+# codebook.py itself is NOT modified)
+# ---------------------------------------------------------------------------
+
+def _find_by_id(items: list[dict], item_id: str, *, kind: str) -> dict:
+    for item in items:
+        if item.get("id") == item_id:
+            return item
+    raise ValueError(f"{kind}: no id {item_id!r} found")
+
+
+def promote_candidate(cb: dict, cand_id: str, entry_fields: dict) -> dict:
+    """Promote candidate *cand_id* in *cb* to a new codebook entry.
+
+    Returns a NEW codebook (a ``copy.deepcopy`` of *cb*, never mutated in
+    place). Appends an entry built from *entry_fields* (expected to carry
+    ``id``/``title``/``severity``/``status``/``origin_phase``/
+    ``manifested_phase`` -- everything ``codebook.py``'s v2 entry schema
+    requires except ``sightings``) with ``sightings`` set to the
+    candidate's OWN sightings (the candidate is the source of truth for
+    what was actually observed, not *entry_fields*). The candidate itself
+    is stamped ``disposition="promoted"`` and ``promoted_to`` naming the
+    new entry id -- RETAINED, never removed (PRD decision 3).
+    ``codebook.assert_no_deletion`` is run against the pre-transform *cb*
+    before returning, as a construction-independent safety net.
+    """
+    result = copy.deepcopy(cb)
+    candidate = _find_by_id(result.get("candidates") or [], cand_id, kind="promote_candidate")
+
+    new_entry_id = entry_fields["id"]
+    entry = dict(entry_fields)
+    entry["sightings"] = copy.deepcopy(candidate.get("sightings") or [])
+    result.setdefault("entries", []).append(entry)
+
+    candidate["disposition"] = "promoted"
+    candidate["promoted_to"] = new_entry_id
+
+    codebook.assert_no_deletion(cb, result)
+    return result
+
+
+def reject_candidate(cb: dict, cand_id: str) -> dict:
+    """Reject candidate *cand_id* in *cb*: stamps ``disposition="rejected"``
+    in place on a deep copy, RETAINED (never removed). Returns a NEW
+    codebook; *cb* is never mutated."""
+    result = copy.deepcopy(cb)
+    candidate = _find_by_id(result.get("candidates") or [], cand_id, kind="reject_candidate")
+    candidate["disposition"] = "rejected"
+
+    codebook.assert_no_deletion(cb, result)
+    return result
+
+
+def retire_entry(cb: dict, entry_id: str) -> dict:
+    """Retire entry *entry_id* in *cb*: stamps ``status="retired"`` in
+    place on a deep copy, RETAINED (never removed). Returns a NEW
+    codebook; *cb* is never mutated."""
+    result = copy.deepcopy(cb)
+    entry = _find_by_id(result.get("entries") or [], entry_id, kind="retire_entry")
+    entry["status"] = "retired"
+
+    codebook.assert_no_deletion(cb, result)
+    return result
