@@ -577,3 +577,250 @@ class TestNoteDeliveredHold:
 
         assert scheduler._streak_delivered_hold.value('A') == 2
         assert scheduler._streak_delivered_hold.value('B') == 1
+
+
+# ---------------------------------------------------------------------------
+# TestComputeDeliveredCheckCache (task 2580 — step-13 RED / step-14 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestComputeDeliveredCheckCache:
+    """``Scheduler._compute_delivered_check_cache`` — the per-tick sweep
+    evaluating every distinct terminal local dep carrying
+    ``metadata.delivered_checks`` against the committed ``main`` tree, and
+    building the ``{dep_task_id: passed}`` projection ``_deps_satisfied``
+    consumes. Injects a fake ``_resolve_main_sha`` (instance override — no
+    real git repo needed) and monkeypatches the module-level
+    ``orchestrator.scheduler.run_delivered_check`` import to record calls
+    without shelling out.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+        scheduler.finish_startup()
+        return scheduler
+
+    _ONE_CHECK = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+    _TWO_CHECKS = [
+        {'name': 'cap-a', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'},
+        {'name': 'cap-b', 'kind': 'grep', 'pattern': 'bar', 'expect': 'present'},
+    ]
+
+    def _dependent(self, task_id: str = '10', dep_id: str = '20') -> dict:
+        return {
+            'id': task_id,
+            'status': 'pending',
+            'dependencies': [{'id': dep_id}],
+            'metadata': {},
+        }
+
+    def _dep(self, dep_id: str = '20', status: str = 'done', checks: list | None = None) -> dict:
+        checks = self._ONE_CHECK if checks is None else checks
+        return {
+            'id': dep_id,
+            'status': status,
+            'dependencies': [],
+            'metadata': {'delivered_checks': checks},
+        }
+
+    def _fake_sha(self, sha: str = 'sha1'):
+        """Fake ``_resolve_main_sha`` recording how many times it's called."""
+        calls = {'n': 0}
+
+        async def _resolve():
+            calls['n'] += 1
+            return sha
+
+        return _resolve, calls
+
+    def _fake_runner(self, results: dict):
+        """Fake ``run_delivered_check`` keyed by ``check['name']`` ->
+        ``DeliveredCheckResult`` (or an ``Exception`` instance to raise).
+        Records every check name it's invoked with, in call order."""
+        calls: list[str] = []
+
+        async def _fake(check, *, project_root, ref='main'):
+            calls.append(check['name'])
+            outcome = results[check['name']]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        return _fake, calls
+
+    def _held_events(self, scheduler: Scheduler) -> list[tuple[str, dict]]:
+        _event_store = scheduler.event_store
+        assert _event_store is not None
+        return [
+            (evt, data)
+            for evt, data in _event_store.events  # type: ignore[attr-defined]
+            if evt == str(EventType.delivered_check_gate_held)
+        ]
+
+    # --- (a) no checked deps -> {} and the SHA resolver is NEVER called ----
+
+    @pytest.mark.asyncio
+    async def test_no_checked_deps_returns_empty_and_never_resolves_sha(
+        self, scheduler: Scheduler
+    ):
+        fake_resolve, sha_calls = self._fake_sha()
+        scheduler._resolve_main_sha = fake_resolve
+        task = self._dependent()
+        dep = {'id': '20', 'status': 'done', 'dependencies': [], 'metadata': {}}
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert result == {}
+        assert sha_calls['n'] == 0
+
+    # --- (b) done dep, all checks DELIVERED -> {dep: True} -----------------
+
+    @pytest.mark.asyncio
+    async def test_done_dep_all_checks_delivered_projects_true(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        fake_resolve, sha_calls = self._fake_sha('sha1')
+        scheduler._resolve_main_sha = fake_resolve
+        fake_runner, runner_calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert result == {'20': True}
+        assert sha_calls['n'] == 1
+        assert runner_calls == ['cap-one']
+
+    # --- (c) done dep, one check FAILED -> {dep: False} + hold (row 4) -----
+
+    @pytest.mark.asyncio
+    async def test_done_dep_one_check_failed_projects_false_and_holds(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, _calls = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert result == {'20': False}
+        assert scheduler._streak_delivered_hold.value('10') == 1
+        held = self._held_events(scheduler)
+        assert len(held) == 1
+        _evt, data = held[0]
+        assert data['task_id'] == '10'
+        assert data['data']['detail'] == {
+            'name': 'cap-one', 'dep_id': '20', 'main_sha': 'sha1', 'kind': 'grep',
+        }
+
+    # --- (d) runner ERRORED -> absent, uncached, no hold, no streak (row 7) -
+
+    @pytest.mark.asyncio
+    async def test_runner_errored_leaves_dep_absent_no_cache_no_hold(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, _calls = self._fake_runner({'cap-one': DeliveredCheckResult.ERRORED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert result == {}
+        assert ('20', 'sha1') not in scheduler._delivered_check_cache
+        assert scheduler._streak_delivered_hold.value('10') == 0
+        assert self._held_events(scheduler) == []
+
+    # --- (e) budget: max_checks_per_tick=1, 2-check dep -> deferred --------
+
+    @pytest.mark.asyncio
+    async def test_budget_defers_second_check_of_a_two_check_dep(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({
+            'cap-a': DeliveredCheckResult.DELIVERED,
+            'cap-b': DeliveredCheckResult.DELIVERED,
+        })
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=self._TWO_CHECKS)
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert result == {}
+        assert calls == ['cap-a'], 'the second check must NOT run once the budget is spent'
+        assert ('20', 'sha1') not in scheduler._delivered_check_cache
+
+    # --- (f) cache hit: same-sha re-sweep does NOT re-invoke the runner ----
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_does_not_reinvoke_runner(self, scheduler: Scheduler, monkeypatch):
+        scheduler._resolve_main_sha, sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert first == {'20': True}
+        assert second == {'20': True}
+        assert calls == ['cap-one'], 'only ONE invocation total across both sweeps'
+        assert sha_calls['n'] == 2, 'the SHA resolver itself still runs every tick'
+
+    # --- (g) self-heal: SHA advance prunes stale cache + clears streak -----
+
+    @pytest.mark.asyncio
+    async def test_sha_advance_self_heals_and_clears_hold_streak(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        sha_box = {'value': 'sha1'}
+
+        async def _resolve():
+            return sha_box['value']
+
+        scheduler._resolve_main_sha = _resolve
+        fake_runner, _calls = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': False}
+        assert scheduler._streak_delivered_hold.value('10') == 1
+
+        # Main advances; the check now resolves DELIVERED.
+        sha_box['value'] = 'sha2'
+        fake_runner2, calls2 = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner2)
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': True}
+        assert calls2 == ['cap-one'], 'stale-sha cache entry must be pruned, forcing re-invoke'
+        assert scheduler._streak_delivered_hold.value('10') == 0
+        assert ('20', 'sha1') not in scheduler._delivered_check_cache
+        assert ('20', 'sha2') in scheduler._delivered_check_cache
