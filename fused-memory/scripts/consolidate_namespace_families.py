@@ -1,18 +1,29 @@
 #!/usr/bin/env python3
 """Consolidation script for the cross-graph entity leak cleanup (CGL-θ, task 2274).
 
-Three independent, order-insensitive operations against the FalkorDB
+Four independent, order-insensitive operations against the FalkorDB
 (Graphiti) and Qdrant (Mem0) backends. Each is dry-run by default and each
 is guarded so a partial/incomplete state is reported UNRESOLVED rather than
 destroying data:
 
   1. GRAPH-FAMILY MERGES with IDENTITY REWRITE -- sibling Graphiti graphs
      that are the same logical project under a different key (hyphenated,
-     no-separator, ...) are merged into their underscore-canonical graph.
-     Reuses ε's move primitive (``move_entity_across_graphs``,
-     ``fused_memory.maintenance.cross_graph_move``, task 2271) with
-     ``rewrite_group_id=canonical`` -- the Phase-2 identity rewrite (PRD
-     decision 6) that ε's Phase-1 moves did not need.
+     no-separator, ...) are merged into their underscore-canonical graph via
+     the three-phase barrier-ordered apply (CGL-η follow-up, task 2415,
+     extended to Episodic-node relocation by task 2502): Phase A creates
+     every sibling Entity (``create_moved_node``) AND every sibling Episodic
+     node (``create_moved_episode``) in the canonical graph, each with
+     ``rewrite_group_id=canonical`` (the Phase-2 identity rewrite, PRD
+     decision 6); Phase B recreates every intra-family RELATES_TO edge and
+     MENTIONS link in ONE batched ``recreate_subgraph_relationships`` call;
+     Phase C deletes every non-blocked source. This closes two bugs the OLD
+     per-node ``move_entity_across_graphs`` loop had: an intra-family
+     RELATES_TO edge between two co-moving nodes was destroyed by the first
+     endpoint's delete before the second endpoint was ever processed, and a
+     MENTIONS link from a sibling-resident Episodic node was silently
+     dropped because episodes were never relocated at all. See
+     ``fused_memory.maintenance.cross_graph_move`` and
+     ``merge_graph_family``'s own docstring for the full barrier contract.
   2. QDRANT COLLECTION MERGES -- legacy/divergent Mem0 collections (from
      historical ``collection_prefix`` values, RCA §4) are merged into their
      ``fused_<project>`` target: scrolled with vectors, payload ``user_id``
@@ -25,17 +36,35 @@ destroying data:
      graph but leaves its key in ``GRAPH.LIST``. Guarded on a live node
      count of exactly 0; a non-empty key is reported UNRESOLVED and its
      deletion is blocked.
+  4. GUARDED EMPTY-COLLECTION DELETION -- known-empty divergent/junk Qdrant
+     collections (``EMPTY_COLLECTION_CLEANUP``) that hold no real data and
+     have no merge target are removed via ``delete_collection``, guarded on
+     a live point count of exactly 0 (``count_collection_points``) --
+     mirroring step 3's count-0 GRAPH.DELETE guard, applied to Qdrant. A
+     non-empty collection is reported UNRESOLVED and its deletion is
+     blocked.
 
 Reviewable, static module-level constants (``GRAPH_FAMILY_ALIASES``,
-``COLLECTION_MERGES``, ``JUNK_KEYS``) are the human-reviewable artifact PRD
-decision 4 requires -- this script ships its OWN config (a sibling to, not
-shared with, the ζ migration script's alias map).
+``COLLECTION_MERGES``, ``JUNK_KEYS``, ``EMPTY_COLLECTION_CLEANUP``) are the
+human-reviewable artifact PRD decision 4 requires -- this script ships its
+OWN config (a sibling to, not shared with, the ζ migration script's alias
+map).
 
 Contract (S7, per ``plans/cross-graph-entity-leak-prd.md``): dry-run by
 default, prints a full JSON manifest; ``--apply`` performs the mutations
-described above plus a post-verify recount, and exits non-zero if any
-section of the manifest carries an ``UNRESOLVED`` disposition (see
-``has_unresolved``).
+described above, and exits non-zero if any section of the manifest carries
+an ``UNRESOLVED`` disposition (see ``has_unresolved``). INTENTIONAL S7
+DEVIATION (task 2502): ``--apply`` here is constants-driven -- there is no
+manifest-path argument to replay a previously-printed dry-run report, and
+no separate post-verify recount pass after the mutations. Both are safe to
+omit because every mutating section is safe-by-construction: graph-family
+merges are create-before-delete (a source is only removed after its
+target-graph copy -- and every intra-family edge/mention -- has been
+successfully recreated, per ``merge_graph_family``'s three-phase barrier),
+and every deletion (junk key or empty collection) is guarded on a live
+count of exactly 0 recomputed at run time, never trusted from a stale
+manifest. The PRD's own S7 wording is left to the ι human-review step
+(shared-doc scope), not edited by this task.
 
 Scope: this script + its test suite are MOCK-unit only (MagicMock graphs,
 AsyncMock Qdrant client) -- no live FalkorDB/Qdrant, and no assertion of
@@ -48,7 +77,8 @@ Usage
   # Dry run (default): print the full JSON manifest, touch nothing.
   python scripts/consolidate_namespace_families.py > consolidation_manifest.json
 
-  # Commit the merges + junk-key deletions (exits non-zero on UNRESOLVED).
+  # Commit the merges + junk-key/empty-collection deletions (exits non-zero
+  # on UNRESOLVED).
   python scripts/consolidate_namespace_families.py --apply
 """
 
@@ -62,8 +92,12 @@ import sys
 from typing import Any
 
 from fused_memory.maintenance.cross_graph_move import (  # noqa: F401
-    MoveResult,
-    move_entity_across_graphs,
+    SubgraphEdgeResult,
+    create_moved_episode,
+    create_moved_node,
+    delete_source_episode,
+    delete_source_node,
+    recreate_subgraph_relationships,
 )
 
 logger = logging.getLogger('consolidate_namespace_families')
@@ -96,6 +130,7 @@ COLLECTION_MERGES: dict[str, str] = {
     'fused_dark-factory': 'fused_dark_factory',
     'reify_reify': 'fused_reify',
     'autopilot_video_autopilot_video': 'fused_autopilot_video',
+    'fused_pump-web-ui': 'fused_pump_web_ui',
 }
 
 # Known-junk FalkorDB graph keys with no legitimate data (RCA §"empty junk
@@ -108,6 +143,24 @@ JUNK_KEYS: tuple[str, ...] = (
     'test-project',
     'default',
     '1098',
+)
+
+# Empty divergent/junk Qdrant collections with no merge target -- unlike
+# COLLECTION_MERGES (which scrolls -> upserts -> deletes a POPULATED
+# source), these strays hold no real data and are simply removed once
+# verified empty (count_collection_points == 0), mirroring the
+# JUNK_KEYS/delete_junk_key count-0 guard for FalkorDB graph keys. reify_
+# (empty project id) and fused_fused_memory are DELIBERATELY OMITTED here
+# too -- PRD Open Q2 defers their disposition to ι human review, same as
+# COLLECTION_MERGES above.
+EMPTY_COLLECTION_CLEANUP: tuple[str, ...] = (
+    'fused_knowlive',
+    'fused_know-live',
+    'fused_autopilot-video',
+    'fused_my-project',
+    'fused_1098',
+    'fused_default',
+    'fused_-home-leo-src-dark-factory',
 )
 
 
@@ -142,6 +195,7 @@ def build_consolidation_report(
     graph_family_items: list[dict],
     collection_items: list[dict],
     junk_key_items: list[dict],
+    empty_collection_items: list[dict],
     *,
     dry_run: bool,
 ) -> dict:
@@ -151,11 +205,12 @@ def build_consolidation_report(
         'graph_family_merges': list(graph_family_items),
         'collection_merges': list(collection_items),
         'junk_key_deletions': list(junk_key_items),
+        'empty_collection_deletions': list(empty_collection_items),
     }
 
 
 def has_unresolved(report: dict) -> bool:
-    """True iff any item in any of the three manifest sections carries an
+    """True iff any item in any of the four manifest sections carries an
     'UNRESOLVED' disposition.
 
     This is the S7 exit-code predicate: ``main()`` returns non-zero on
@@ -165,6 +220,7 @@ def has_unresolved(report: dict) -> bool:
         report['graph_family_merges'],
         report['collection_merges'],
         report['junk_key_deletions'],
+        report['empty_collection_deletions'],
     )
     return any(item.get('disposition') == 'UNRESOLVED' for section in sections for item in section)
 
@@ -181,11 +237,13 @@ async def enumerate_graph_entity_nodes(
 ) -> list[dict]:
     """Read-only enumeration of every :Entity node in the *key* FalkorDB graph.
 
-    Scoped to :Entity (not every label) -- the family-merge move primitive
-    (``move_entity_across_graphs``) only moves Entity nodes; any Episodic-
-    only residual left behind in *key* is exactly what should make the
-    junk-key guard (``delete_junk_key``) classify it UNRESOLVED rather than
-    silently GRAPH.DELETE-ing it.
+    Scoped to :Entity (not every label) -- Episodic nodes are enumerated
+    separately, via ``enumerate_graph_episodic_nodes``, and relocated by
+    ``merge_graph_family``'s own Phase A (``create_moved_episode``). Any
+    OTHER-labeled (e.g. Community) residual left behind in *key* after a
+    clean merge is exactly what should make the junk-key guard
+    (``delete_junk_key``, which counts every label) classify it UNRESOLVED
+    rather than silently GRAPH.DELETE-ing it.
 
     Single-page fetch: this issues exactly ONE ``LIMIT $limit`` query and
     never follows up with a second page, so a graph with more than *limit*
@@ -209,6 +267,46 @@ async def enumerate_graph_entity_nodes(
             len(rows), key, limit,
         )
     return [{'uuid': row[0], 'name': row[1]} for row in rows]
+
+
+async def enumerate_graph_episodic_nodes(
+    graphiti: Any,
+    key: str,
+    *,
+    limit: int = 1000,
+) -> list[dict]:
+    """Read-only enumeration of every :Episodic node in the *key* FalkorDB graph.
+
+    Mirrors ``enumerate_graph_entity_nodes``, scoped to :Episodic instead of
+    :Entity. Every sibling-resident Episodic node must be discovered here so
+    ``merge_graph_family`` can relocate it (``create_moved_episode``) into
+    the canonical graph BEFORE Phase B recreates its MENTIONS links --
+    otherwise the episode stays behind in the sibling and every MENTIONS
+    link onto a moved Entity is silently dropped (Phase B's episode-present
+    MATCH finds nothing).
+
+    Single-page fetch: this issues exactly ONE ``LIMIT $limit`` query and
+    never follows up with a second page, so a graph with more than *limit*
+    Episodic nodes is permanently reported UNRESOLVED at the given --limit --
+    the same no-silent-caps convention as ``enumerate_graph_entity_nodes``.
+    Callers must pass a *limit* larger than the true Episodic-node count of
+    every graph they intend to migrate in this run.
+    """
+    graph = graphiti._graph_for(key)
+    result = await graph.ro_query(
+        'MATCH (n:Episodic) RETURN n.uuid LIMIT $limit',
+        {'limit': limit},
+    )
+    rows = result.result_set or []
+    if len(rows) >= limit:
+        logger.warning(
+            "consolidate_namespace_families: enumerated %d Episodic node(s) in "
+            "graph '%s', which hit limit=%d -- enumeration may be incomplete. "
+            "Re-run with a higher --limit value to ensure the full graph is "
+            "covered.",
+            len(rows), key, limit,
+        )
+    return [{'uuid': row[0]} for row in rows]
 
 
 async def count_graph_nodes(graphiti: Any, key: str) -> int:
@@ -235,31 +333,254 @@ async def merge_graph_family(
     graphiti: Any,
     sibling: str,
     canonical: str,
-    node_rows: list[dict],
+    entity_rows: list[dict],
+    episode_rows: list[dict],
 ) -> dict:
-    """Move every *node_rows* entry from *sibling* into *canonical*.
+    """Move every *entity_rows* Entity and *episode_rows* Episodic node from
+    *sibling* into *canonical* via the three-phase barrier-ordered apply
+    (CGL-η follow-up, task 2502 -- template: ``migrate_cross_graph_leak.py``'s
+    ``run()``, which closed the identical edge-loss bug for the ζ migration
+    script; this brings the same fix -- plus Episodic/MENTIONS relocation --
+    to the θ family merge).
 
-    Calls ``move_entity_across_graphs(graphiti, uuid, sibling, canonical,
-    rewrite_group_id=canonical)`` once per row -- the Phase-2 identity
-    rewrite (PRD decision 6) -- and tallies the returned MoveResults.
+    The OLD implementation drove ``move_entity_across_graphs`` once per node,
+    which DETACH-DELETEd each source node (with its edges) immediately after
+    creating it in target, BEFORE the next node moved -- destroying any
+    RELATES_TO edge between two nodes in the SAME family (the first
+    endpoint's delete took the edge; the second endpoint never saw it). It
+    also never relocated Episodic nodes, so every MENTIONS link from a
+    sibling-resident episode onto a moved entity was lost too (edges are
+    single-graph; the episode stayed behind).
+
+    Phase A: CREATE every entity's (``create_moved_node``) and every
+    episode's (``create_moved_episode``) target-graph copy, each isolated --
+    a single item's create failure is recorded in ``create_failed``/
+    ``episode_create_failed`` (never aborts the batch) and excluded from
+    Phase B/C below. Relocating sibling Episodic nodes here (not just Entity
+    nodes) is what lets Phase B's UNCHANGED MENTIONS recreate succeed: it
+    only recreates a MENTIONS link when the episode is already present in
+    the entity's resolved target graph -- absent, it silently counts the
+    link in ``mentions_skipped`` instead.
+
+    Phase B: recreate every intra-family RELATES_TO edge and MENTIONS link in
+    ONE batched ``recreate_subgraph_relationships`` call, built from a MOVE
+    spec (``uuid``/``disposition='MOVE'``/``source_graph=sibling``/
+    ``target_graph=canonical``) for every entity that survived Phase A.
+    Episodes are never passed as their own specs -- only entities carry
+    RELATES_TO/MENTIONS specs in this module's schema; an episode's
+    relevance to Phase B is only as the MENTIONS target, already satisfied
+    by its Phase-A relocation. A single batched call (not one per entity) is
+    what dedupes a co-moving edge shared by two entities in this family,
+    recreating it exactly once. If the call raises, its ``exc.partial_result``
+    (always attached by ``recreate_subgraph_relationships`` -- see that
+    function's docstring) is recovered so a partial tally is never discarded
+    in favor of an all-zero default. A raise ALSO records the exception in
+    ``phase_b_error``, which Phase C below checks FIRST, before any per-uuid
+    reasoning: a SYSTEMIC failure (a per-spec gather ``ro_query``, or a lost
+    falkor-client acquisition mid-batch -- the two failure modes
+    ``recreate_subgraph_relationships`` documents as raising rather than
+    isolating onto ``blocked``) means the recovered ``partial_result.blocked``
+    names only the items that failed in ISOLATION before the abort -- it says
+    nothing about the specs the batch never reached, whose edges/mentions now
+    exist ONLY in source. Treating that recovered partial as a definitive
+    per-uuid block-list would therefore delete sources the batch never
+    actually confirmed recreating; ``phase_b_error`` instead withholds the
+    WHOLE batch unconditionally (see Phase C).
+
+    Phase C: DETACH DELETE every entity's (``delete_source_node``) and every
+    episode's (``delete_source_episode``) source copy. When Phase B raised a
+    SYSTEMIC error (``phase_b_error is not None``), EVERY entity and episode
+    in the batch is withheld UNCONDITIONALLY -- see the Phase B paragraph
+    above for why a recovered ``partial_result.blocked`` cannot be trusted as
+    a definitive per-uuid list in that case. Otherwise, a source is withheld
+    for any uuid that failed Phase A, or named in Phase B's
+    ``SubgraphEdgeResult.blocked`` (an entity via ``node_uuids``, which are
+    always entity uuids even for a blocked MENTIONS item -- see that
+    dataclass's docstring). BOTH an episode's AND an entity's deletion is
+    ADDITIONALLY withheld whenever ANY MENTIONS link incident to it was not
+    confirmed recreated, closing three more create-before-delete gaps the
+    base entity/episode Phase-A-failure guarantee (and the ``phase_b_error``
+    whole-batch gate above) do not cover by themselves: (1) a Phase-B
+    blocked mention names its episode via the blocked item's
+    ``episode_uuid`` key; (2) an entity whose Phase-A create FAILED is
+    dropped from Phase B's batch entirely, so a mention ONTO it is never
+    even read/recreated there -- caught by a guarded sibling
+    MENTIONS-topology probe (``MATCH (ep:Episodic)-[:MENTIONS]->(n:Entity
+    {uuid: $uuid})``, run only when there are both episodes to withhold and
+    Phase-A entity failures to check, AND Phase B did not itself abort
+    systemically -- every source is already withheld in that case, and
+    issuing more reads against a backend that just failed systemically is
+    pointless/risky); and (3) the mirror image (reviewer follow-up) -- an
+    episode whose Phase-A create FAILED correctly stays behind in sibling
+    (withheld via ``episode_create_failed``), but any entity it MENTIONS is
+    unaffected by THAT failure: the entity's OWN Phase-A create succeeded,
+    so Phase B's MENTIONS CREATE still runs, MATCHes the
+    never-created-in-target episode, finds nothing, and silently counts the
+    link in ``mentions_skipped`` (a WARNING+skip, not a raise, so it never
+    reaches ``blocked`` either) -- caught by the reverse-direction guarded
+    probe (``MATCH (ep:Episodic {uuid: $uuid})-[:MENTIONS]->(n:Entity)
+    RETURN n.uuid``, run only when there are both entities to withhold and
+    Phase-A episode failures to check, likewise short-circuited on a
+    systemic Phase-B abort). In every case, deleting a source whose
+    edge/mention was never successfully recreated elsewhere would destroy
+    the only remaining copy.
+
+    Returns:
+        A summary dict: ``nodes_moved``, ``episodes_moved``,
+        ``nodes_blocked``, ``episodes_blocked`` (counts -- Phase-A failures
+        plus Phase-B ``blocked``/MENTIONS-topology withholding, entities and
+        episodes alike), ``edges_recreated``, ``edges_skipped``,
+        ``mentions_recreated``, ``mentions_skipped`` (straight from the
+        batch's ``SubgraphEdgeResult``), ``dropped_cross_target`` and
+        ``blocked`` (both lists, passed through from the
+        ``SubgraphEdgeResult`` verbatim -- never silently dropped).
     """
-    summary = {
-        'nodes_moved': 0,
-        'edges_moved': 0,
-        'edges_skipped': 0,
-        'mentions_moved': 0,
-        'mentions_skipped': 0,
+    # --- Phase A: create every entity + episode in canonical ---------------
+    create_failed: dict[str, Exception] = {}
+    for row in entity_rows:
+        try:
+            await create_moved_node(
+                graphiti, row['uuid'], sibling, canonical, rewrite_group_id=canonical,
+            )
+        except Exception as exc:
+            create_failed[row['uuid']] = exc
+
+    episode_create_failed: dict[str, Exception] = {}
+    for row in episode_rows:
+        try:
+            await create_moved_episode(
+                graphiti, row['uuid'], sibling, canonical, rewrite_group_id=canonical,
+            )
+        except Exception as exc:
+            episode_create_failed[row['uuid']] = exc
+
+    # --- Phase B: batch-recreate intra-family edges + MENTIONS --------------
+    entity_specs = [
+        {
+            'uuid': row['uuid'], 'disposition': 'MOVE',
+            'source_graph': sibling, 'target_graph': canonical,
+        }
+        for row in entity_rows if row['uuid'] not in create_failed
+    ]
+    edge_result = SubgraphEdgeResult()
+    phase_b_error: Exception | None = None
+    if entity_specs:
+        try:
+            edge_result = await recreate_subgraph_relationships(graphiti, entity_specs)
+        except Exception as exc:
+            phase_b_error = exc
+            partial_result = getattr(exc, 'partial_result', None)
+            if partial_result is not None:
+                edge_result = partial_result
+
+    # blocked_node_uuids (mirrors migrate_cross_graph_leak.py's run()): every
+    # uuid named in a Phase-B blocked item's node_uuids -- both endpoints for
+    # a blocked RELATES_TO edge, the entity uuid for a blocked MENTIONS link
+    # -- must have its Phase-C deletion withheld too, or the un-recreated
+    # edge/mention (which now exists only in source) would be destroyed.
+    blocked_node_uuids: set[str] = set()
+    for blocked_item in edge_result.blocked:
+        for node_uuid in blocked_item.get('node_uuids', []):
+            blocked_node_uuids.add(node_uuid)
+
+    # blocked_episode_uuids (reviewer follow-up, data-loss-barrier-gap): an
+    # episode's Phase-C deletion must be withheld whenever ANY incident
+    # MENTIONS link was not confirmed recreated -- otherwise the un-recreated
+    # link (which now exists only in source) is destroyed right alongside it,
+    # reintroducing for MENTIONS the exact create-before-delete loss the
+    # three-phase barrier eliminates for entities. Two real paths destroy a
+    # source-only MENTIONS link without this:
+    #   (1) a MENTIONS recreate that raised lands in edge_result.blocked with
+    #       kind='mention' and an episode_uuid -- the episode's own Phase-A
+    #       create succeeded, so it is not in episode_create_failed, and
+    #       node_uuids only ever names the ENTITY -- so without reading
+    #       episode_uuid here, nothing would withhold this episode.
+    #   (2) an entity whose Phase-A create FAILED is filtered out of
+    #       entity_specs entirely, so Phase B never reads/recreates its
+    #       incident MENTIONS (not counted in blocked or mentions_skipped) --
+    #       the mentioning episode (Phase-A create ok) would otherwise be
+    #       deleted anyway.
+    blocked_episode_uuids: set[str] = set()
+    for blocked_item in edge_result.blocked:
+        if blocked_item.get('kind') == 'mention':
+            episode_uuid = blocked_item.get('episode_uuid')
+            if episode_uuid is not None:
+                blocked_episode_uuids.add(episode_uuid)
+
+    # Guarded sibling MENTIONS-topology probe for case (2) above -- only run
+    # when there is both an episode that COULD be withheld and a Phase-A
+    # entity failure to check MENTIONS against, so the common (no episodes,
+    # or no Phase-A failures) path issues no extra read.
+    if phase_b_error is None and episode_rows and create_failed:
+        for failed_uuid in create_failed:
+            topology_result = await graphiti._graph_for(sibling).ro_query(
+                'MATCH (ep:Episodic)-[:MENTIONS]->(n:Entity {uuid: $uuid}) RETURN ep.uuid',
+                {'uuid': failed_uuid},
+            )
+            for topology_row in topology_result.result_set or []:
+                blocked_episode_uuids.add(topology_row[0])
+
+    # Guarded sibling MENTIONS-topology probe, REVERSE direction (reviewer
+    # follow-up, data-loss-barrier-gap case (3) above): when an episode's
+    # Phase-A create_moved_episode FAILS, it is correctly withheld via
+    # episode_create_failed -- but any entity it MENTIONS is unaffected by
+    # THAT failure: the entity's own Phase-A create succeeded, so it is
+    # offered to Phase B, whose MENTIONS CREATE MATCHes the
+    # never-created-in-target episode and finds nothing -- silently counted
+    # in edge_result.mentions_skipped (a WARNING+skip, NOT a raise, so it
+    # never lands in edge_result.blocked either). Without this probe the
+    # entity's uuid never reaches blocked_node_uuids, so its Phase-C DETACH
+    # DELETE would proceed and destroy the source-only MENTIONS edge from
+    # the still-sibling-resident failed episode. Only run when there is both
+    # an entity that COULD be withheld and a Phase-A episode failure to
+    # check MENTIONS against, so the common (no entities, or no Phase-A
+    # episode failures) path issues no extra read.
+    if phase_b_error is None and entity_rows and episode_create_failed:
+        for failed_episode_uuid in episode_create_failed:
+            topology_result = await graphiti._graph_for(sibling).ro_query(
+                'MATCH (ep:Episodic {uuid: $uuid})-[:MENTIONS]->(n:Entity) RETURN n.uuid',
+                {'uuid': failed_episode_uuid},
+            )
+            for topology_row in topology_result.result_set or []:
+                blocked_node_uuids.add(topology_row[0])
+
+    # --- Phase C: delete every non-blocked, non-failed source ---------------
+    nodes_moved = 0
+    nodes_blocked = 0
+    for row in entity_rows:
+        uuid = row['uuid']
+        if phase_b_error is not None or uuid in create_failed or uuid in blocked_node_uuids:
+            nodes_blocked += 1
+            continue
+        await delete_source_node(graphiti, uuid, sibling)
+        nodes_moved += 1
+
+    episodes_moved = 0
+    episodes_blocked = 0
+    for row in episode_rows:
+        uuid = row['uuid']
+        if (
+            phase_b_error is not None
+            or uuid in episode_create_failed
+            or uuid in blocked_episode_uuids
+        ):
+            episodes_blocked += 1
+            continue
+        await delete_source_episode(graphiti, uuid, sibling)
+        episodes_moved += 1
+
+    return {
+        'nodes_moved': nodes_moved,
+        'episodes_moved': episodes_moved,
+        'nodes_blocked': nodes_blocked,
+        'episodes_blocked': episodes_blocked,
+        'edges_recreated': edge_result.edges_recreated,
+        'edges_skipped': edge_result.edges_skipped,
+        'mentions_recreated': edge_result.mentions_recreated,
+        'mentions_skipped': edge_result.mentions_skipped,
+        'dropped_cross_target': edge_result.dropped_cross_target,
+        'blocked': edge_result.blocked,
     }
-    for row in node_rows:
-        result = await move_entity_across_graphs(
-            graphiti, row['uuid'], sibling, canonical, rewrite_group_id=canonical,
-        )
-        summary['nodes_moved'] += 1
-        summary['edges_moved'] += result.edges_moved
-        summary['edges_skipped'] += result.edges_skipped
-        summary['mentions_moved'] += result.mentions_moved
-        summary['mentions_skipped'] += result.mentions_skipped
-    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +699,62 @@ async def delete_junk_key(graphiti: Any, key: str, node_count: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Guarded empty-collection deletion (Qdrant)
+# ---------------------------------------------------------------------------
+
+async def count_collection_points(qdrant_client: Any, collection: str) -> int:
+    """Read-only exact point count for *collection* via Qdrant's count API.
+
+    Used as the guard for ``delete_empty_collection``: deletion is only
+    safe when this is exactly 0. An INDETERMINATE result -- a response
+    object with no ``.count`` attribute at all, or an explicit ``.count is
+    None`` -- RAISES (``ValueError``) rather than defaulting to 0
+    (reviewer follow-up: for a deletion guard, an unreadable count must
+    fail CLOSED and block the delete, not fail OPEN and authorize one).
+    ``run()``'s empty-collection loop already catches a raising call here
+    and reports that item UNRESOLVED, exactly like its sibling
+    ``count_graph_nodes``/``delete_junk_key`` guard, so raising is both
+    consistent with that existing handler and strictly safer than the old
+    silent-0 default. A genuine empty collection (``.count == 0``) is
+    unaffected -- 0 is a valid, DETERMINATE count, not treated as missing.
+    In practice Qdrant's count API always returns an int ``.count``, so
+    this is defensive-only.
+    """
+    result = await qdrant_client.count(collection_name=collection)
+    count = getattr(result, 'count', None)
+    if count is None:
+        raise ValueError(
+            f"count_collection_points: Qdrant count() for collection "
+            f"'{collection}' returned no usable .count (got {result!r}) -- "
+            'refusing to treat an indeterminate count as empty.',
+        )
+    return int(count)
+
+
+async def delete_empty_collection(qdrant_client: Any, collection: str, point_count: int) -> str:
+    """Delete the *collection* -- but ONLY when its live *point_count* is
+    exactly 0.
+
+    Mirrors ``delete_junk_key``'s count-0 guard: a non-zero count returns
+    'UNRESOLVED' without ever calling ``delete_collection()`` (deletion
+    blocked, no data loss). Best-effort: a raising ``delete_collection()``
+    is caught and reported as UNRESOLVED rather than propagating.
+    """
+    if point_count > 0:
+        return 'UNRESOLVED'
+    try:
+        await qdrant_client.delete_collection(collection)
+    except Exception as e:
+        logger.warning(
+            "consolidate_namespace_families: failed to delete empty Qdrant "
+            "collection '%s': %s",
+            collection, e,
+        )
+        return 'UNRESOLVED'
+    return 'DELETE'
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -387,22 +764,41 @@ async def run(
     *,
     limit: int = 1000,
 ) -> dict:
-    """Enumerate/scroll/count every configured family, collection, and junk
-    key and, with ``args.apply``, perform the merges + guarded deletions.
+    """Enumerate/scroll/count every configured family, collection, junk key,
+    and empty-collection candidate and, with ``args.apply``, perform the
+    merges + guarded deletions.
 
     Dry-run (``args.apply`` falsy) performs ZERO mutations: every section's
     ``disposition`` is a PREVIEW of what ``--apply`` would do, computed from
     read-only enumeration/count/scroll alone -- ``merge_graph_family`` and
     ``merge_collection`` are only invoked when ``args.apply`` is true AND the
     corresponding read was not capped (an UNRESOLVED item is never mutated,
-    not even partially); the mutating half of ``delete_junk_key`` is only
-    invoked when ``args.apply`` is true (guarded internally on
-    ``node_count == 0``).
+    not even partially); the mutating halves of ``delete_junk_key`` and
+    ``delete_empty_collection`` are only invoked when ``args.apply`` is true
+    (each guarded internally on its own count being exactly 0).
 
     A capped enumeration/scroll (row or point count hits *limit*) is
     reported ``UNRESOLVED`` rather than ``MERGE`` for that item, mirroring
     the junk-key count>0 guard: a partial read must never be mistaken for a
     clean, complete one (no-silent-caps).
+
+    A graph-family item's ``disposition`` is DOWNGRADED from ``MERGE`` to
+    ``UNRESOLVED`` after a clean (uncapped) ``--apply`` merge whenever the
+    returned summary carries any loss/blocked signal (``edges_skipped``,
+    ``mentions_skipped``, a non-empty ``dropped_cross_target``, a non-empty
+    ``blocked``, or any ``nodes_blocked``/``episodes_blocked``) -- otherwise
+    a family that tallies skipped edges/mentions but empties cleanly (no
+    episodes left behind) would exit 0 despite losing data, the exact
+    silent-signal failure task 2502 fixes. This mirrors
+    ``migrate_cross_graph_leak.py``'s ``has_edge_loss``/
+    ``has_dropped_cross_target``/``has_blocked_items`` exit-code folding,
+    adapted to this script's per-item disposition rather than a parallel
+    top-level predicate -- ``has_unresolved`` already scans every section
+    for ``'UNRESOLVED'``, so no new predicate is needed. A source whose
+    deletion was withheld (Phase-A create failure or Phase-B ``blocked``)
+    leaves recoverable residue in the sibling graph, which also keeps that
+    sibling's junk-key node count > 0 -- so its GRAPH.DELETE (step 3 below)
+    is correctly guarded off too, without any extra bookkeeping here.
     """
     graphiti = memory_service.graphiti
     qdrant_client = await memory_service.mem0._get_async_qdrant()
@@ -410,17 +806,40 @@ async def run(
     # --- 1. Graph-family merges (identity rewrite) -------------------------
     graph_family_items: list[dict] = []
     for sibling, canonical in GRAPH_FAMILY_ALIASES.items():
-        rows = await enumerate_graph_entity_nodes(graphiti, sibling, limit=limit)
-        capped = len(rows) >= limit
+        entity_rows = await enumerate_graph_entity_nodes(graphiti, sibling, limit=limit)
+        episode_rows = await enumerate_graph_episodic_nodes(graphiti, sibling, limit=limit)
+        capped = len(entity_rows) >= limit or len(episode_rows) >= limit
         item: dict[str, Any] = {
             'sibling': sibling,
             'canonical': canonical,
-            'node_count': len(rows),
-            'node_uuids': [row['uuid'] for row in rows],
+            'node_count': len(entity_rows),
+            'node_uuids': [row['uuid'] for row in entity_rows],
+            'episode_count': len(episode_rows),
+            'episode_uuids': [row['uuid'] for row in episode_rows],
             'disposition': 'UNRESOLVED' if capped else 'MERGE',
         }
         if args.apply and not capped:
-            item.update(await merge_graph_family(graphiti, sibling, canonical, rows))
+            summary = await merge_graph_family(graphiti, sibling, canonical, entity_rows, episode_rows)
+            item.update(summary)
+            # Fold edge/mention loss + dropped_cross_target + blocked + Phase-A
+            # create failures into UNRESOLVED -- the exact silent-signal
+            # failure this task fixes (merge_graph_family tallies skipped
+            # counts, but a family with no episodes empties cleanly and used
+            # to exit 0 even after losing edges). Mirrors
+            # migrate_cross_graph_leak.py's has_edge_loss/
+            # has_dropped_cross_target/has_blocked_items exit-code folding,
+            # adapted from that script's per-manifest predicate to this
+            # script's per-item disposition -- has_unresolved (already
+            # scanning for 'UNRESOLVED') picks this up with no new predicate.
+            if (
+                summary['edges_skipped']
+                or summary['mentions_skipped']
+                or summary['dropped_cross_target']
+                or summary['blocked']
+                or summary['nodes_blocked']
+                or summary['episodes_blocked']
+            ):
+                item['disposition'] = 'UNRESOLVED'
         graph_family_items.append(item)
 
     # --- 2. Qdrant collection merges ----------------------------------------
@@ -482,8 +901,41 @@ async def run(
             'disposition': disposition,
         })
 
+    # --- 4. Guarded empty-collection deletion (EMPTY_COLLECTION_CLEANUP) ---
+    empty_collection_items: list[dict] = []
+    for collection in EMPTY_COLLECTION_CLEANUP:
+        try:
+            point_count = await count_collection_points(qdrant_client, collection)
+        except Exception as e:
+            # Mirrors the junk-key count guard above: a raising count must
+            # never abort the whole consolidation run -- earlier keys/
+            # sections in this same --apply pass may already hold committed
+            # mutations. Report this collection UNRESOLVED and move on.
+            logger.warning(
+                "consolidate_namespace_families: failed to count points for "
+                "Qdrant collection '%s': %s -- reporting UNRESOLVED rather "
+                "than aborting the run.",
+                collection, e,
+            )
+            empty_collection_items.append({
+                'collection': collection,
+                'point_count': None,
+                'disposition': 'UNRESOLVED',
+            })
+            continue
+        if args.apply:
+            disposition = await delete_empty_collection(qdrant_client, collection, point_count)
+        else:
+            disposition = 'DELETE' if point_count == 0 else 'UNRESOLVED'
+        empty_collection_items.append({
+            'collection': collection,
+            'point_count': point_count,
+            'disposition': disposition,
+        })
+
     return build_consolidation_report(
-        graph_family_items, collection_items, junk_key_items, dry_run=not args.apply,
+        graph_family_items, collection_items, junk_key_items, empty_collection_items,
+        dry_run=not args.apply,
     )
 
 
@@ -501,12 +953,14 @@ def main() -> int:
         description=(
             'Consolidate cross-graph namespace families: merge sibling Graphiti '
             'graphs (with identity rewrite), merge legacy Qdrant collections '
-            '(with user_id rewrite), and delete guarded junk keys.'
+            '(with user_id rewrite), and delete guarded junk keys and empty '
+            'Qdrant collections.'
         ),
     )
     parser.add_argument(
         '--apply', action='store_true', default=False,
-        help='Commit the merges + junk-key deletions (default: dry-run only, report and exit).',
+        help='Commit the merges + junk-key/empty-collection deletions '
+             '(default: dry-run only, report and exit).',
     )
     parser.add_argument(
         '--limit', type=int, default=1000,

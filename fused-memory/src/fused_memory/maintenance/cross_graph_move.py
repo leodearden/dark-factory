@@ -835,12 +835,17 @@ class SubgraphEdgeResult:
             dict with ``kind`` (``'edge'`` or ``'mention'``), the item's own
             ``uuid``, a human-readable ``reason`` (``str(exc)``), and
             ``node_uuids`` (the incident node uuid(s): both endpoints for a
-            RELATES_TO edge, the entity uuid for a MENTIONS link). Per-item
-            isolation (CGL-η follow-up, task 2451) means a single bad
-            edge/mention costs only itself -- the batch continues and this
-            item is surfaced here for human review, same "never silently
-            lost" convention as ``dropped_cross_target``, rather than
-            aborting the whole batch the way it used to (see this
+            RELATES_TO edge, the entity uuid for a MENTIONS link). A
+            ``'mention'``-kind item ADDITIONALLY carries ``episode_uuid`` --
+            the source-resident Episodic node whose MENTIONS link was not
+            recreated -- so a caller MUST withhold THAT episode's Phase-C
+            deletion too, not just the mentioned entity's (a ``'edge'``-kind
+            item never carries this key -- only a MENTIONS link involves an
+            episode). Per-item isolation (CGL-η follow-up, task 2451) means a
+            single bad edge/mention costs only itself -- the batch continues
+            and this item is surfaced here for human review, same "never
+            silently lost" convention as ``dropped_cross_target``, rather
+            than aborting the whole batch the way it used to (see this
             function's docstring). A caller MUST withhold Phase C
             source-deletion for every uuid named here, or the un-recreated
             edge/mention -- which still exists only in source -- would be
@@ -1266,6 +1271,7 @@ async def _recreate_subgraph_relationships_batch(
                 'uuid': mention_uuid,
                 'reason': str(exc),
                 'node_uuids': [entity_uuid],
+                'episode_uuid': episode_uuid,
             })
             # error + exc_info: see the RELATES_TO MOVE-edge pass's matching
             # comment above -- keeps a programming-error traceback visible
@@ -1424,6 +1430,209 @@ async def delete_source_node(graphiti: Any, uuid: str, source_graph: str) -> Non
     )
     logger.info(
         'delete_source_node: deleted uuid=%s source=%s', uuid, source_graph,
+    )
+
+
+@dataclass
+class EpisodeCreateResult:
+    """Result of a ``create_moved_episode`` call (Phase A: episode-only create).
+
+    Mirrors ``CreateResult`` (the Entity/Phase-A counterpart), but for
+    Episodic nodes -- see ``create_moved_episode``'s docstring.
+
+    Attributes:
+        uuid: UUID of the created (or already-present) Episodic node.
+        source_graph: Graph the episode is being moved from -- read-only in
+            this phase; ``create_moved_episode`` never mutates source_graph.
+        target_graph: Graph the episode was (or already is) created in.
+        already_created: True when the episode was already present in
+            target_graph, so no CREATE was (re-)issued -- covers BOTH the
+            fully-idempotent no-op (absent from source, present in target)
+            and the matching-resume case (present in both graphs). False
+            when this call issued a fresh episode CREATE.
+    """
+
+    uuid: str
+    source_graph: str
+    target_graph: str
+    already_created: bool = False
+
+
+async def create_moved_episode(
+    graphiti: Any,
+    uuid: str,
+    source_graph: str,
+    target_graph: str,
+    *,
+    rewrite_group_id: str | None = None,
+) -> EpisodeCreateResult:
+    """Phase A of the three-phase barrier-ordered apply (episode relocation,
+    task 2502): CREATE *uuid*'s Episodic node in *target_graph* -- and ONLY
+    the node.
+
+    Mirrors ``create_moved_node`` (the Entity/Phase-A primitive), scoped to
+    ``:Episodic`` instead of ``:Entity`` and WITHOUT any embedding read:
+    Episodic nodes carry no embedding property at all (graphiti_core's own
+    episode save query -- ``get_episode_node_save_query`` in
+    ``models/nodes/node_db_queries.py`` -- never sets one, unlike the Entity
+    save query's ``name_embedding``), so this is a plain, verbatim property
+    copy (``entity_edges`` included byte-for-byte) via the normal
+    (non-lossy) ``ro_query``/``query`` path -- no raw ``--compact``
+    transport, no ``vecf32`` literal.
+
+    Relocating every sibling Episodic node into the canonical graph in
+    Phase A (before Phase B) is what lets ``recreate_subgraph_relationships``
+    -- unchanged by this addition -- recreate a MENTIONS link that would
+    otherwise be silently counted in ``mentions_skipped``: that function
+    only recreates a MENTIONS link when the episode is already present in
+    the entity's resolved target graph.
+
+    Issues NO RELATES_TO/MENTIONS recreate and NO source DETACH DELETE --
+    those are ``recreate_subgraph_relationships`` (Phase B) and
+    ``delete_source_episode`` (Phase C) respectively.
+
+    Idempotency: a single, unconditional probe reads whether the episode is
+    present in target_graph, run BEFORE any mutation regardless of whether
+    the episode is still present in source_graph -- mirrors
+    ``create_moved_node``'s idempotency probe, but WITHOUT a divergence
+    guard (no ``ForeignDuplicateSuspectedError`` analogue here: unlike
+    Entity uuids, this module has no foreign-duplicate-merge primitive for
+    Episodic nodes to route a divergent case to). Present in target --
+    whether or not also present in source -- is always treated as an
+    already-created no-op; absent from target AND source raises
+    ``NodeNotFoundError``.
+
+    Args:
+        graphiti: An initialized GraphitiBackend (or compatible object
+            exposing ``_graph_for``).
+        uuid: UUID of the Episodic node to create in target_graph.
+        source_graph: Graph the episode currently lives in (read-only).
+        target_graph: Graph to CREATE the episode into.
+        rewrite_group_id: When given, substituted for the episode's
+            ``group_id`` property on recreate; when None, the source
+            episode's own group_id is carried through unchanged.
+
+    Returns:
+        EpisodeCreateResult describing the create (or no-op).
+
+    Raises:
+        NodeNotFoundError: if no Episodic node with *uuid* exists in
+            *source_graph* (and it is also absent from *target_graph*).
+    """
+    source = graphiti._graph_for(source_graph)
+    target = graphiti._graph_for(target_graph)
+
+    node_result = await source.ro_query(
+        'MATCH (n:Episodic {uuid: $uuid}) '
+        'RETURN n.uuid, n.name, n.group_id, n.source_description, n.source, '
+        '       n.content, n.entity_edges, n.created_at, n.valid_at',
+        {'uuid': uuid},
+    )
+
+    # --- unconditional target-presence probe (mirrors create_moved_node) ---
+    target_probe = await target.ro_query(
+        'MATCH (n:Episodic {uuid: $uuid}) RETURN n.uuid',
+        {'uuid': uuid},
+    )
+    episode_already_in_target = bool(target_probe.result_set)
+
+    if not node_result.result_set:
+        if episode_already_in_target:
+            logger.info(
+                'create_moved_episode: already moved, no-op uuid=%s '
+                'source=%s target=%s',
+                uuid, source_graph, target_graph,
+            )
+            return EpisodeCreateResult(
+                uuid=uuid, source_graph=source_graph, target_graph=target_graph,
+                already_created=True,
+            )
+        raise NodeNotFoundError(f'Episodic node not found in source_graph {source_graph!r}: {uuid}')
+
+    if episode_already_in_target:
+        # Resuming after a crash strictly between the episode CREATE and the
+        # source DETACH DELETE (Phase C): skip re-CREATE (no divergence
+        # guard here -- unlike create_moved_node, this module has no
+        # merge_foreign_duplicate analogue for Episodic nodes to route a
+        # genuine foreign-duplicate case to).
+        logger.warning(
+            'create_moved_episode: resuming partially-completed move (episode '
+            'already present in target, skipping CREATE) uuid=%s source=%s '
+            'target=%s',
+            uuid, source_graph, target_graph,
+        )
+        return EpisodeCreateResult(
+            uuid=uuid, source_graph=source_graph, target_graph=target_graph,
+            already_created=True,
+        )
+
+    (node_uuid, name, group_id, source_description, episode_source, content,
+     entity_edges, created_at, valid_at) = node_result.result_set[0]
+    new_group_id = group_id if rewrite_group_id is None else rewrite_group_id
+
+    await target.query(
+        'CREATE (n:Episodic {uuid: $uuid}) '
+        'SET n.name = $name, '
+        '    n.group_id = $group_id, '
+        '    n.source_description = $source_description, '
+        '    n.source = $source, '
+        '    n.content = $content, '
+        '    n.entity_edges = $entity_edges, '
+        '    n.created_at = $created_at, '
+        '    n.valid_at = $valid_at',
+        {
+            'uuid': node_uuid,
+            'name': name,
+            'group_id': new_group_id,
+            'source_description': source_description,
+            'source': episode_source,
+            'content': content,
+            'entity_edges': entity_edges,
+            'created_at': created_at,
+            'valid_at': valid_at,
+        },
+    )
+    return EpisodeCreateResult(
+        uuid=uuid, source_graph=source_graph, target_graph=target_graph,
+        already_created=False,
+    )
+
+
+async def delete_source_episode(graphiti: Any, uuid: str, source_graph: str) -> None:
+    """Phase C of the three-phase barrier-ordered apply (episode relocation,
+    task 2502): ``DETACH DELETE`` *uuid*'s Episodic node from *source_graph*
+    -- and ONLY that.
+
+    Mirrors ``delete_source_node`` (the Entity/Phase-C primitive), scoped to
+    ``:Episodic``. Callers driving the three-phase apply must call this ONLY
+    after every ``create_moved_episode`` (Phase A) and
+    ``recreate_subgraph_relationships`` (Phase B, unchanged by this
+    addition) call for the WHOLE batch has completed -- so every MENTIONS
+    link incident to this episode is already known-recreated in target
+    before its source copy is removed here.
+
+    Touches ONLY source_graph -- never resolves or queries target_graph.
+    Idempotent: FalkorDB's ``MATCH ... DETACH DELETE`` matches (and deletes)
+    nothing when the episode is already gone, so a re-run after a completed
+    apply -- or a retry after Phase C partially completed -- is a safe
+    no-op; this function performs no existence pre-check of its own.
+
+    Args:
+        graphiti: An initialized GraphitiBackend (or compatible object
+            exposing ``_graph_for``).
+        uuid: UUID of the Episodic node to delete from source_graph.
+        source_graph: Graph to delete the episode from.
+
+    Returns:
+        None.
+    """
+    source = graphiti._graph_for(source_graph)
+    await source.query(
+        'MATCH (n:Episodic {uuid: $uuid}) DETACH DELETE n',
+        {'uuid': uuid},
+    )
+    logger.info(
+        'delete_source_episode: deleted uuid=%s source=%s', uuid, source_graph,
     )
 
 
