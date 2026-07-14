@@ -169,6 +169,40 @@ def test_dump_uses_block_style_not_flow_style(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# amendment: dump() writes atomically (temp file + os.replace) instead of
+# truncating the destination in place, so a crash/kill mid-write can never
+# leave a partial/corrupt registry behind for the next load()/validate().
+# ---------------------------------------------------------------------------
+
+def test_dump_leaves_no_temp_file_behind_on_success(tmp_path):
+    path = tmp_path / "codebook.yaml"
+    mod.dump(_minimal_v2(), path)
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_dump_preserves_original_and_cleans_up_temp_file_on_failure(tmp_path, monkeypatch):
+    """If the atomic replace step fails, the destination file must be left
+    exactly as it was (never truncated/partially written), and the temp
+    file used to stage the new content must not be left behind."""
+    path = tmp_path / "codebook.yaml"
+    mod.dump(_minimal_v2(), path)
+    original_bytes = path.read_bytes()
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("simulated os.replace failure")
+
+    monkeypatch.setattr(mod.os, "replace", _boom)
+
+    changed = _minimal_v2()
+    changed["entries"][0]["title"] = "a different title"
+    with pytest.raises(OSError):
+        mod.dump(changed, path)
+
+    assert path.read_bytes() == original_bytes
+    assert list(tmp_path.iterdir()) == [path]  # no stray temp file
+
+
+# ---------------------------------------------------------------------------
 # step-5: RED — migrate_v1_to_v2()
 # ---------------------------------------------------------------------------
 
@@ -716,6 +750,23 @@ def test_assert_no_deletion_allows_candidate_promotion_via_disposition_change():
 
 
 # ---------------------------------------------------------------------------
+# amendment: migrate_v1_to_v2()/apply_coding_record() fail loudly with a
+# clear ValueError on a non-dict codebook (e.g. an empty or malformed YAML
+# file loads via yaml.safe_load as None), instead of an AttributeError deep
+# in the mutation logic — mirrors validate()'s isinstance guard.
+# ---------------------------------------------------------------------------
+
+def test_migrate_v1_to_v2_raises_on_non_dict_codebook():
+    with pytest.raises(ValueError):
+        mod.migrate_v1_to_v2(None)
+
+
+def test_apply_coding_record_raises_on_non_dict_codebook():
+    with pytest.raises(ValueError):
+        mod.apply_coding_record(None, _match_record())
+
+
+# ---------------------------------------------------------------------------
 # step-15: RED — main(argv) CLI end-to-end (tmp_path/capsys)
 # ---------------------------------------------------------------------------
 
@@ -833,6 +884,52 @@ class TestMainCLI:
         assert len(entry["sightings"]) == 1  # the valid line still applied
         assert len(reloaded["candidates"]) == 1
         assert mod.validate(reloaded) == []
+
+    def test_migrate_empty_file_fails_loudly_instead_of_crashing(self, tmp_path, capsys):
+        """An empty codebook file loads via yaml.safe_load() as None.
+        _cmd_migrate must report a clear error and return 1, not raise an
+        unhandled AttributeError/TypeError from inside migrate_v1_to_v2."""
+        path = tmp_path / "codebook.yaml"
+        path.write_text("", encoding="utf-8")
+
+        ret = mod.main(["migrate", str(path)])
+        captured = capsys.readouterr()
+
+        assert ret == 1
+        assert captured.err.strip() != ""
+
+    def test_apply_empty_codebook_file_fails_loudly_instead_of_crashing(self, tmp_path, capsys):
+        """Same guard, via the apply subcommand: an empty codebook file
+        must not crash apply_coding_record() with an unhandled exception."""
+        path = tmp_path / "codebook.yaml"
+        path.write_text("", encoding="utf-8")
+        records_path = tmp_path / "records.jsonl"
+        records_path.write_text(json.dumps(_match_record()) + "\n", encoding="utf-8")
+
+        ret = mod.main(["apply", str(path), str(records_path)])
+        captured = capsys.readouterr()
+
+        assert ret == 1
+        assert captured.err.strip() != ""
+
+    def test_migrate_invalid_output_does_not_clobber_file(self, tmp_path, capsys):
+        """If migrate_v1_to_v2()'s output still fails validate() (e.g. a
+        v1 entry with an out-of-enum severity — a field migrate does not
+        touch), _cmd_migrate must report the errors, return 1, and leave
+        the on-disk file exactly as it was: the migrated-but-invalid
+        result is never dumped over the live registry."""
+        v1 = _v1_fixture()
+        v1["entries"][0]["severity"] = "catastrophic"  # not in {high,medium,low}
+        path = tmp_path / "codebook.yaml"
+        mod.dump(v1, path)
+        before = path.read_bytes()
+
+        ret = mod.main(["migrate", str(path)])
+        captured = capsys.readouterr()
+
+        assert ret == 1
+        assert captured.err.strip() != ""
+        assert path.read_bytes() == before
 
 
 # ---------------------------------------------------------------------------

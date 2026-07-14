@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 
 import yaml
 
@@ -427,7 +428,18 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
     NeverDeleteError immediately, before `codebook` is even copied.
     `assert_no_deletion()` is also run as a construction-independent
     safety net just before returning.
+
+    Raises ValueError if `codebook` is not a dict (e.g. an empty or
+    malformed YAML file loads via yaml.safe_load as None, or as some
+    non-mapping) — mirrors validate()'s isinstance guard so malformed
+    input fails loudly with a clear message before any mutation, rather
+    than an AttributeError deep in the merge logic below.
     """
+    if not isinstance(codebook, dict):
+        raise ValueError(
+            "apply_coding_record: expected a dict-shaped codebook, got "
+            f"{type(codebook).__name__} (empty or malformed YAML file?)"
+        )
     _reject_deletion_directive(record)
 
     stats = {
@@ -536,6 +548,16 @@ def dump(codebook: dict, path: str | os.PathLike) -> None:
     nondeterministic line wrapping), prefixed with the fixed HEADER comment.
     Byte-stable given byte-stable input, so a no-change night commits
     nothing (PRD §6.7).
+
+    Written atomically: the full document is assembled in a temp file
+    created in the same directory as `path`, then moved into place with
+    os.replace() (an atomic rename on POSIX). `path` therefore only ever
+    holds a complete, previously-flushed document — a crash or kill
+    between truncate and write can no longer leave a partial/corrupt file
+    behind for the next load()/validate() to trip over. This matters
+    because this file is the single canonical, sole-writer registry for
+    the whole legibility pipeline (PRD decision 1), rewritten by the
+    nightly/trickle merger.
     """
     body = yaml.safe_dump(
         codebook,
@@ -544,9 +566,19 @@ def dump(codebook: dict, path: str | os.PathLike) -> None:
         allow_unicode=True,
         width=4096,
     )
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(HEADER)
-        f.write(body)
+    directory = os.path.dirname(os.fspath(path)) or "."
+    fd, tmp_file = tempfile.mkstemp(prefix=".codebook-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(HEADER)
+            f.write(body)
+        os.replace(tmp_file, path)
+    except BaseException:
+        try:
+            os.remove(tmp_file)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +601,18 @@ def migrate_v1_to_v2(codebook: dict) -> dict:
     as sightings accumulate, while a mutable timestamp would break dump()'s
     byte-stable no-change-night guarantee (PRD §6.7). Output passes
     validate() (V2_SCHEMA never required `updated`).
+
+    Raises ValueError if `codebook` is not a dict (e.g. an empty or
+    malformed YAML file loads via yaml.safe_load as None, or as some
+    non-mapping) — mirrors validate()'s isinstance guard so malformed
+    input fails loudly with a clear message here instead of an
+    AttributeError/TypeError deep in the mutation logic below.
     """
+    if not isinstance(codebook, dict):
+        raise ValueError(
+            "migrate_v1_to_v2: expected a dict-shaped codebook, got "
+            f"{type(codebook).__name__} (empty or malformed YAML file?)"
+        )
     result = copy.deepcopy(codebook)
     result["version"] = 2
     result.pop("updated", None)
@@ -607,6 +650,13 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
 def _cmd_migrate(args: argparse.Namespace) -> int:
     codebook = load(args.path)
+    if not isinstance(codebook, dict):
+        print(
+            f"{args.path}: expected a dict-shaped codebook, got "
+            f"{type(codebook).__name__} (empty or malformed YAML file?)",
+            file=sys.stderr,
+        )
+        return 1
     migrated = migrate_v1_to_v2(codebook)
     errors = validate(migrated)
     if errors:
@@ -619,6 +669,13 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
 
 def _cmd_apply(args: argparse.Namespace) -> int:
     codebook = load(args.codebook)
+    if not isinstance(codebook, dict):
+        print(
+            f"{args.codebook}: expected a dict-shaped codebook, got "
+            f"{type(codebook).__name__} (empty or malformed YAML file?)",
+            file=sys.stderr,
+        )
+        return 1
     totals = {
         "matched": 0,
         "skipped_unknown_entry": 0,
