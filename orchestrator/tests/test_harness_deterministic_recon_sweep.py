@@ -893,6 +893,12 @@ def _make_stranded_reaper_harness() -> Harness:
     h.git_ops.config.main_branch = 'main'
     h.git_ops.is_ancestor = AsyncMock(return_value=False)
     h.git_ops.find_merge_marker = AsyncMock(return_value=None)
+    # TaskGroundTruth._resolve_branch_state (task 2243, W10-θ2) awaits
+    # resolve_branch_sha unconditionally as its "does the branch still
+    # exist" check — a bare MagicMock attribute isn't awaitable, so this
+    # must be an AsyncMock. None preserves this fixture's "no on-main
+    # evidence" invariant (docstring above).
+    h.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
     h.scheduler = MagicMock()
     # Task 2235: harness._reconcile_one_stranded's stranded-blocked gate now
     # calls self.scheduler.workflow_cancel_recent(tid) instead of reading

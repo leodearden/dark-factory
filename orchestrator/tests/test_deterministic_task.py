@@ -1730,6 +1730,13 @@ def _build_reaper_harness(
     git_ops = MagicMock()
     git_ops.is_ancestor = AsyncMock(return_value=False)
     git_ops.find_merge_marker = AsyncMock(return_value=None)
+    # TaskGroundTruth._resolve_branch_state (task 2243, W10-θ2) awaits
+    # resolve_branch_sha unconditionally as its "does the branch still
+    # exist" check — a bare MagicMock attribute isn't awaitable, so this
+    # must be an AsyncMock. None (no branch, matching a gate task that
+    # never creates one) keeps this fixture's existing "no on-main
+    # evidence" invariant intact.
+    git_ops.resolve_branch_sha = AsyncMock(return_value=None)
     git_ops.config = MagicMock()
     git_ops.config.branch_prefix = 'task/'
     git_ops.config.main_branch = 'main'

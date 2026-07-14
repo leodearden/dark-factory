@@ -3253,9 +3253,16 @@ Output JSON matching the schema. Every task must appear in the output.
         SAME memoized instance rather than reconstructing on every reconcile
         pass.
         """
+        # getattr (not self._ground_truth directly): several narrow-scope
+        # test harnesses build a Harness via Harness.__new__(Harness),
+        # bypassing __init__ (and its _ground_truth = None seed) entirely —
+        # task 2243, W10-θ2 wiring made this the first call site to actually
+        # reach _get_ground_truth from such a harness (test_harness_
+        # deterministic_recon_sweep.py / test_deterministic_task.py).
+        existing = getattr(self, '_ground_truth', None)
         if (
-            self._ground_truth is None
-            or self._ground_truth.escalation_queue is not self._escalation_queue
+            existing is None
+            or existing.escalation_queue is not self._escalation_queue
         ):
             self._ground_truth = TaskGroundTruth(
                 self.git_ops,
