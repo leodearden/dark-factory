@@ -28,11 +28,16 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import pydantic_spec
 
-from orchestrator.config import GitConfig
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import BranchResetError, GitOps, WorktreeInfo, _run
+from orchestrator.scheduler import TaskAssignment
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # Fixtures — copied from test_git_ops.py's git_repo/git_config/git_ops trio
@@ -315,4 +320,232 @@ class TestRequeueReuseSitesRouteThroughGuard:
 
         assert await _commits_over_main(lane) == 1, (
             'branch commit must survive the live-requeue (warm-lane) reuse rebase'
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-5: workflow-level wiring — TaskWorkflow._inter_iteration_rebase must
+# propagate BranchResetError (not swallow it to None), and TaskWorkflow.run()
+# must route an escaping BranchResetError to a targeted human escalation
+# (category='branch_reset', escalate_to_human=True) rather than the generic
+# 'Workflow error:' steward-routed path.
+#
+# RED today (step-5): _inter_iteration_rebase still calls the unguarded
+# ``rebase_onto_main`` directly (rewired to the guard in step-6), and
+# run()'s shared exception handler has no isinstance(e, BranchResetError)
+# branch yet (added in step-6).
+# ---------------------------------------------------------------------------
+
+
+# -- 5(a) harness — copied from test_verify_phase_rebase.py's real-git
+# TaskWorkflow harness (_make_workflow @87, task_assignment fixture) so this
+# file can drive the real _inter_iteration_rebase without importing
+# test-internal helpers from another test module.
+
+
+@pytest.fixture
+def orchestrator_config(git_repo: Path) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        project_root=git_repo,
+        max_concurrent_tasks=1,
+        max_verify_attempts=2,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+
+
+@pytest.fixture
+def task_assignment() -> TaskAssignment:
+    return TaskAssignment(
+        task_id='2403',
+        task={
+            'id': '2403', 'title': 'X', 'description': '',
+            'status': 'pending', 'metadata': {'files': ['lib']},
+            'dependencies': [],
+        },
+        modules=['lib'],
+    )
+
+
+def _make_workflow(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    assignment: TaskAssignment,
+    worktree: Path,
+) -> tuple[TaskWorkflow, TaskArtifacts]:
+    """Wire a minimal TaskWorkflow with all heavy collaborators mocked.
+
+    Copied from test_verify_phase_rebase.py's ``_make_workflow`` (@87).
+    """
+    workflow = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=MagicMock(),  # type: ignore[arg-type]
+        briefing=MagicMock(),  # type: ignore[arg-type]
+        mcp=MagicMock(),  # type: ignore[arg-type]
+    )
+    workflow.worktree = worktree
+    artifacts = TaskArtifacts(
+        worktree, TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+    )
+    artifacts.init('2403', 'X', 'desc', base_commit='base-sha-old')
+    workflow.artifacts = artifacts
+    workflow.plan = {'task_id': '2403', 'steps': []}
+    workflow._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
+    workflow.briefing.build_debugger_prompt = AsyncMock(return_value='debug')  # type: ignore[attr-defined]
+    from orchestrator.agents.invoke import AgentResult
+    workflow._invoke = AsyncMock(  # type: ignore[method-assign]
+        return_value=AgentResult(success=True, output=''),
+    )
+    workflow._get_head_commit = AsyncMock(return_value='head-sha')  # type: ignore[method-assign]
+    return workflow, artifacts
+
+
+@pytest.mark.asyncio
+class TestInterIterationRebasePropagatesBranchReset:
+    async def test_inter_iteration_rebase_propagates_branch_reset(
+        self,
+        orchestrator_config: OrchestratorConfig,
+        git_ops: GitOps,
+        task_assignment: TaskAssignment,
+        git_repo: Path,
+        monkeypatch,
+    ):
+        """A wipe detected while rebasing during a real
+        ``_inter_iteration_rebase`` call must RAISE BranchResetError
+        (rather than being swallowed to ``None`` like an ordinary rebase
+        conflict) and the branch's committed work must survive."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        await _commit_unique_work(wt)
+        assert await _commits_over_main(wt) == 1
+
+        workflow, artifacts = _make_workflow(
+            orchestrator_config, git_ops, task_assignment, wt,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        # Advance main so _inter_iteration_rebase actually triggers a rebase.
+        (git_repo / 'sibling.txt').write_text('sibling change\n')
+        await _run(['git', 'add', 'sibling.txt'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'sibling change'], cwd=git_repo)
+
+        # Engineer the wipe via the same monkeypatch used by the git_ops-level
+        # guard tests above.
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', _wipe_via_reset)
+
+        with pytest.raises(BranchResetError):
+            await workflow._inter_iteration_rebase()
+
+        assert await _commits_over_main(wt) == 1, (
+            'task commit must survive the inter-iteration rebase wipe'
+        )
+
+
+# -- 5(b) harness — copied from test_workflow.py's mocked run()-exception-
+# routing harness (_make_wip_conflict_workflow @1972, TestWorktreeConflict-
+# ErrorRouting @2029) so this file can drive run()'s top-level exception
+# routing without a full plan/execute setup or importing test-internal
+# helpers from another test module.
+
+
+def _make_branch_reset_workflow(*, task_id: str = '2403') -> TaskWorkflow:
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = {
+        'id': task_id, 'title': 'Test task', 'description': 'Test desc',
+        'metadata': {},
+    }
+    assignment.modules = ['mod_a']
+
+    _spec = pydantic_spec(OrchestratorConfig)
+    config = MagicMock(spec_set=_spec)
+    config.fused_memory.project_id = 'dark_factory'
+    config.fused_memory.url = 'http://localhost:8002'
+    config.lock_depth = 2
+    config.steward_completion_timeout = 300.0
+    config.project_root = Path('/tmp/non-existent-for-test')
+
+    scheduler = MagicMock()
+    scheduler.update_task = AsyncMock(return_value=True)
+    scheduler.set_task_status = AsyncMock()
+    # run()'s SM-2 exit check reads this back — _mark_blocked is stubbed
+    # below (its real body, which would persist 'blocked', never runs), so
+    # this must reflect the forced BLOCKED outcome directly.
+    scheduler.get_status = AsyncMock(return_value='blocked')
+    scheduler.get_task = AsyncMock(return_value={'id': task_id, 'metadata': {}})
+
+    git_ops = MagicMock()
+    git_ops.get_main_sha = AsyncMock(return_value='SHA-A')
+
+    queue = MagicMock()
+    queue.get_by_task = MagicMock(return_value=[])
+
+    wf = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,
+        briefing=MagicMock(),
+        mcp=MagicMock(),
+        escalation_queue=queue,
+    )
+
+    wf.worktree = Path('/tmp/fake-worktree-2403')
+    wf.artifacts = MagicMock()
+    wf.artifacts.read_iteration_log = MagicMock(return_value=([], []))
+    wf.plan = {'task_id': task_id, 'steps': []}
+    wf.initial_plan = {'task_id': task_id, 'steps': []}
+
+    # Stub _mark_blocked — assert on how run() CALLS it, mirroring
+    # TestWorktreeConflictErrorRouting rather than re-testing _mark_blocked's
+    # own escalation-filing behavior (covered elsewhere).
+    wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+
+    return wf
+
+
+@pytest.mark.asyncio
+class TestBranchResetErrorRouting:
+    """run(): a BranchResetError escaping the execute/verify path routes to
+    _mark_blocked(category='branch_reset', escalate_to_human=True) — not
+    the generic 'Workflow error:' handler (task 2403)."""
+
+    async def test_run_routes_branch_reset_to_blocked_escalation(self):
+        wf = _make_branch_reset_workflow()
+        worktree = wf.worktree
+        assert worktree is not None
+
+        async def fake_setup(*args, **kwargs):
+            pass
+
+        with (
+            patch.object(wf, '_setup_worktree_and_artifacts', side_effect=fake_setup),
+            patch.object(wf, '_recover_if_already_merged',
+                         new=AsyncMock(return_value=None)),
+            patch.object(wf, '_check_branch_on_main',
+                         new=AsyncMock(return_value=None)),
+            patch.object(
+                wf, '_execute_verify_review_loop',
+                side_effect=BranchResetError(worktree, None, 'pre-rebase-sha', 1),
+            ),
+        ):
+            outcome = (await wf.run()).outcome
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        wf._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
+        call_kwargs = wf._mark_blocked.await_args.kwargs  # type: ignore[attr-defined]
+        assert call_kwargs.get('category') == 'branch_reset', (
+            f"Expected _mark_blocked(category='branch_reset') but got "
+            f"category={call_kwargs.get('category')!r}. A BranchResetError "
+            f"must not fall through to the generic 'Workflow error:' handler."
+        )
+        assert call_kwargs.get('escalate_to_human') is True, (
+            'branch_reset block must set escalate_to_human=True (L1, skips steward)'
         )
