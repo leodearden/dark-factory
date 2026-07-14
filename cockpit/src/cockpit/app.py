@@ -221,6 +221,17 @@ class CockpitApp(App):
         self._snapshot: dict[str, tuple] = {}
         self._decisions_snapshot: dict[str, tuple] = {}
         self._has_scanned = False
+        # Monotonic scan-sequence guard (esc-2517-1, task 2606): _scan_seq is
+        # the next-to-issue sequence number (see _next_scan_seq), bumped once
+        # per scan INITIATED -- by refresh_registry or _poll_registry, both
+        # always on the main thread. _applied_scan_seq is the high-water
+        # mark of the newest sequence _apply_scan has actually applied. A
+        # scan whose seq is older than that mark read the registry before a
+        # fresher scan already landed, and _apply_scan drops it rather than
+        # letting it regress the view. Like _scan_in_flight below, both are
+        # only ever mutated on the main thread, so neither needs a lock.
+        self._scan_seq = 0
+        self._applied_scan_seq = 0
         # Drop-tick backpressure for the threaded poll path (see
         # _poll_registry/_scan_registry_worker): True while a scan launched
         # by _poll_registry is still running. Only ever read/written on the
@@ -268,6 +279,20 @@ class CockpitApp(App):
     def on_unmount(self) -> None:
         self._persist_ui_config()
 
+    def _next_scan_seq(self) -> int:
+        """Issue the next monotonic scan sequence number. MAIN-THREAD-ONLY.
+
+        self._scan_seq += 1 is a non-atomic read-modify-write; only
+        refresh_registry and _poll_registry call this, and both always run
+        on the main thread (mirrors the _scan_in_flight discipline -- see
+        __init__), so no lock is needed. The returned value must travel WITH
+        its scan as an explicit parameter through to _apply_scan, never via
+        a shared mutable attribute -- the whole point of the guard is that a
+        still in-flight, older scan carries its own older sequence.
+        """
+        self._scan_seq += 1
+        return self._scan_seq
+
     def refresh_registry(self) -> None:
         """Scan the registry and rebuild the SessionTable/DecisionQueue, synchronously.
 
@@ -278,8 +303,14 @@ class CockpitApp(App):
         instead, which runs the scan on a background thread (see
         _scan_registry_worker) so a slow scan never blocks the event loop
         (C10 tour F1, esc-2303-1).
+
+        Issues this scan's sequence number via _next_scan_seq() before
+        scanning, so _apply_scan's stale-scan guard (esc-2517-1) can tell
+        this scan apart from any other in-flight one.
         """
-        self._apply_scan(*self._scan_registry())
+        seq = self._next_scan_seq()
+        records, decisions = self._scan_registry()
+        self._apply_scan(records, decisions, seq)
 
     def _scan_registry(self) -> tuple[list[SessionRecord], list[DecisionRecord]]:
         """I/O half of a refresh: scan disk for the current records/decisions.
@@ -293,7 +324,7 @@ class CockpitApp(App):
         return records, decisions
 
     def _apply_scan(
-        self, records: list[SessionRecord], decisions: list[DecisionRecord]
+        self, records: list[SessionRecord], decisions: list[DecisionRecord], seq: int
     ) -> None:
         """UI half of a refresh: rebuild the SessionTable/DecisionQueue only when something changed.
 
@@ -313,9 +344,36 @@ class CockpitApp(App):
         Bails out immediately if the app is no longer running, and no-ops
         (rather than raising) if a widget lookup still finds the DOM
         already torn down -- the threaded hand-off's shutdown-race hazard.
+
+        Also guards against a stale threaded-poll result landing after a
+        fresher scan already applied (esc-2517-1, task 2606): *seq* is the
+        monotonic sequence number the caller obtained from _next_scan_seq()
+        at scan-initiation time (see refresh_registry/_poll_registry). Any
+        seq strictly older than self._applied_scan_seq (the high-water mark
+        of the newest scan already applied) is dropped before the snapshot
+        diff even runs, so an in-flight background scan that read the
+        registry before a fresher one landed can never regress the view.
+        self._applied_scan_seq advances even on a no-op (snapshot-unchanged)
+        apply, so a later stale result is still correctly dropped.
+
+        Note: seq order tracks scan-*initiation* order, not measured
+        read-completion order -- it is a proxy for freshness, not a direct
+        stamp of it. In principle a scan issued earlier (lower seq) could
+        finish its off-thread registry read later than one issued after it,
+        and this guard would drop that earlier-issued-but-actually-fresher
+        result. That window cannot open today: _scan_in_flight (see
+        _poll_registry) admits only one in-flight poll worker at a time, so
+        poll-issued scans can never race each other, and refresh_registry
+        only ever runs synchronously at on_mount, before the poll timer is
+        registered. The guard's correctness therefore rests on that
+        backpressure serialization keeping initiation order equal to
+        landing order, not on seq tracking true read recency.
         """
         if not self.is_running:
             return
+        if seq < self._applied_scan_seq:
+            return
+        self._applied_scan_seq = seq
         new_snapshot = build_snapshot(records)
         new_decisions_snapshot = _decisions_snapshot(decisions)
         if (
@@ -371,14 +429,19 @@ class CockpitApp(App):
         clears the flag -- via call_from_thread, also on the main thread --
         even when the scan raises, so one bad tick never wedges every
         later poll.
+
+        Also issues this poll's scan sequence number via _next_scan_seq()
+        (main-thread-only, like the flag check above) and hands it to the
+        worker, so a stale hand-off can be dropped once it lands -- see
+        _apply_scan's stale-scan guard (esc-2517-1).
         """
         if self._scan_in_flight:
             return
         self._scan_in_flight = True
-        self._scan_registry_worker()
+        self._scan_registry_worker(self._next_scan_seq())
 
     @work(thread=True, group='registry-scan', exit_on_error=False)
-    def _scan_registry_worker(self) -> None:
+    def _scan_registry_worker(self, seq: int) -> None:
         """Threaded poll worker: run the scan off-thread, marshal the UI update back.
 
         Runs _scan_registry() (pure I/O, no widget access) on a background
@@ -390,6 +453,13 @@ class CockpitApp(App):
         fully shut down by the time this (possibly slow) scan finishes --
         see its docstring.
 
+        *seq* is the scan sequence number _poll_registry obtained from
+        _next_scan_seq() (main-thread-only) before launching this worker --
+        carried through unchanged on the background thread and forwarded to
+        _apply_scan via the call_from_thread hand-off, so _apply_scan can
+        tell a stale result apart from a fresher one once it lands
+        (esc-2517-1).
+
         exit_on_error=False: a scan that raises (e.g. a transient disk
         error) must only fail this one tick, never take down the whole app
         -- Textual's default would treat an unhandled worker exception as
@@ -399,7 +469,7 @@ class CockpitApp(App):
         """
         try:
             records, decisions = self._scan_registry()
-            self._call_from_thread_fail_soft(self._apply_scan, records, decisions)
+            self._call_from_thread_fail_soft(self._apply_scan, records, decisions, seq)
         finally:
             self._call_from_thread_fail_soft(self._clear_scan_in_flight)
 
