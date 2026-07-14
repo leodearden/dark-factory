@@ -545,7 +545,7 @@ class TestAuditCuratorCorpus:
 
     def test_fails_when_gold_label_missing(self) -> None:
         manifest, log = self._passing_manifest_and_log(n=30)
-        manifest.items[0].gold_action = None
+        manifest.items[0].gold_action = None  # type: ignore[assignment]
 
         report = audit_curator_corpus(manifest, log, min_items=30)
 
