@@ -377,8 +377,19 @@ class _PoolEntry:
 # baseline block; only their contracts differ (batch adds the within-batch
 # duplicate rules).
 #
-# Every section below is copied VERBATIM from the pre-split prompts, only
-# relocated so the contract is contiguous.
+# Every section's PROSE below is copied VERBATIM from the pre-split prompts —
+# no instruction is reworded or dropped. That said, the EMITTED prompt is NOT
+# byte-identical to the pre-split _SYSTEM_PROMPT/_BATCH_SYSTEM_PROMPT text:
+# compose_prompt() (shared/prompt_artifact.py) always renders CONTRACT, then
+# the "\n\n---\n\n" separator, then HEURISTICS, which reorders sections
+# relative to the original (intro -> combine rules -> positive signals ->
+# rewriting -> output format -> combine safety) so that "## Output format"
+# and "## Combine safety: target_fingerprint" now precede the combine
+# guidance instead of following it. For the batch prompt, "## Within-batch
+# duplicates" also moves from the end of the prompt to immediately before
+# the heuristics block, since it lives in _BATCH_CONTRACT. Treat parity here
+# as content-preservation (no instruction lost), not byte-identity — see
+# TestCuratorPromptSplit's superset tests in test_task_curator.py.
 # ----------------------------------------------------------------------
 
 _CURATOR_CONTRACT = """\
@@ -653,10 +664,23 @@ class TaskCurator:
         when no store was injected. :meth:`PromptArtifactStore.resolve` never
         raises — an absent or unverifiable pin falls back to
         ``spec.in_code_constant`` — so the curator's best-effort contract is
-        preserved even when the artifacts root is missing.
+        preserved even when the artifacts root is missing. That fail-safe
+        means a wrong or empty root (e.g. a worktree-local
+        ``default_artifacts_root()`` that doesn't match the root an optimizer
+        pinned into) never errors — it just silently never applies a pin. Set
+        ``DARK_FACTORY_PROMPT_ARTIFACTS`` so curator and optimizer processes
+        agree on one root; the one-time log line below records which root a
+        lazily-constructed store resolved to, so an unexpectedly-empty root
+        is diagnosable.
         """
         if self._prompt_store is None:
-            self._prompt_store = PromptArtifactStore(default_artifacts_root())
+            root = default_artifacts_root()
+            logger.info(
+                'task_curator: no prompt_store injected; lazily resolved artifacts root to '
+                '%s (set DARK_FACTORY_PROMPT_ARTIFACTS to override)',
+                root,
+            )
+            self._prompt_store = PromptArtifactStore(root)
         return self._prompt_store.resolve(
             spec,
             executor_model=self._config.curator.model,
