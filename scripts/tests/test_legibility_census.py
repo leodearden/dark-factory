@@ -191,3 +191,36 @@ class _TrackingBatchSource:
         for i, batch in enumerate(self._batches):
             self.pulled.append(i)
             yield batch
+
+
+# ---------------------------------------------------------------------------
+# step-1: RED — is_duplicate() / batch_dup_rate()
+# ---------------------------------------------------------------------------
+
+def _record(*, matches=None, candidates=None):
+    return {"matches": matches or [], "candidates": candidates or []}
+
+
+def test_is_duplicate_false_when_record_has_a_candidate():
+    record = _record(candidates=[{"title": "a novel shape"}])
+    assert mod.is_duplicate(record) is False
+
+
+def test_is_duplicate_true_for_matches_only_record():
+    record = _record(matches=[{"entry_id": "entry-a"}])
+    assert mod.is_duplicate(record) is True
+
+
+def test_is_duplicate_true_for_empty_record():
+    record = _record()
+    assert mod.is_duplicate(record) is True
+
+
+def test_batch_dup_rate_nine_of_ten_duplicates():
+    records = [_record(matches=[{"entry_id": "entry-a"}]) for _ in range(9)]
+    records.append(_record(candidates=[{"title": "novel"}]))
+    assert mod.batch_dup_rate(records) == pytest.approx(0.9)
+
+
+def test_batch_dup_rate_empty_batch_is_zero_no_zero_division():
+    assert mod.batch_dup_rate([]) == 0.0
