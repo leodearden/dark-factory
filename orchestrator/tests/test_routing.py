@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from orchestrator.config import (
@@ -21,7 +22,13 @@ from orchestrator.config import (
     RoutingConfig,
     apply_reload,
 )
-from orchestrator.routing import DEFAULT_ALLOWED_MODELS, FABLE_CANDIDATE_MODEL, probe_models
+from orchestrator.routing import (
+    DEFAULT_ALLOWED_MODELS,
+    FABLE_CANDIDATE_MODEL,
+    ProbeReport,
+    probe_models,
+    render_probe_artifact,
+)
 from shared.cli_invoke import AgentResult
 from shared.config_models import AccountConfig
 
@@ -334,3 +341,56 @@ class TestProbeModelsMissingToken:
         # Only max-x's calls were dispatched (2 models: haiku + fable).
         assert len(cli.calls) == 2
         assert all(call['oauth_token'] == 'tok-x' for call in cli.calls)
+
+
+# ---------------------------------------------------------------------------
+# render_probe_artifact: pure, deterministic YAML serializer for the
+# probe-models report -- safe to commit and diff (see this task's plan
+# design_decisions).
+# ---------------------------------------------------------------------------
+
+
+def _sample_probe_report() -> ProbeReport:
+    return ProbeReport(
+        models=['haiku', 'sonnet', FABLE_CANDIDATE_MODEL],
+        accounts={
+            'max-x': {
+                'haiku': 'available',
+                'sonnet': 'unavailable',
+                FABLE_CANDIDATE_MODEL: 'available',
+            },
+            'max-y': {
+                'haiku': 'auth_error',
+                'sonnet': 'capped',
+                FABLE_CANDIDATE_MODEL: 'no_token',
+            },
+        },
+    )
+
+
+class TestRenderProbeArtifact:
+    """render_probe_artifact(report, generated_at) is a pure, deterministic
+    YAML serializer -- safe to commit and diff."""
+
+    def test_yaml_round_trip_contains_models_generated_at_and_account_statuses(self):
+        report = _sample_probe_report()
+        artifact = render_probe_artifact(report, generated_at='2026-07-13T00:00:00Z')
+
+        parsed = yaml.safe_load(artifact)
+
+        assert parsed['generated_at'] == '2026-07-13T00:00:00Z'
+        assert parsed['models'] == ['haiku', 'sonnet', FABLE_CANDIDATE_MODEL]
+        assert FABLE_CANDIDATE_MODEL in parsed['models']
+
+        for account_name, statuses in report.accounts.items():
+            for model, status in statuses.items():
+                assert parsed['accounts'][account_name][model] == status
+            # The G3 gate content task xi consumes: a claude-fable-5 row
+            # present per account.
+            assert FABLE_CANDIDATE_MODEL in parsed['accounts'][account_name]
+
+    def test_is_pure_and_deterministic(self):
+        report = _sample_probe_report()
+        first = render_probe_artifact(report, generated_at='2026-07-13T00:00:00Z')
+        second = render_probe_artifact(report, generated_at='2026-07-13T00:00:00Z')
+        assert first == second
