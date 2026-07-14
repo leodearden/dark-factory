@@ -5581,3 +5581,62 @@ class TestStopInstructionGuard:
         assert len(pending) == 0, (
             f'A predicate must not be blocked by the stop-instruction guard: {pending}'
         )
+
+    async def test_preexisting_unrelated_escalation_does_not_suppress_filing(
+        self, tmp_path: Path,
+    ):
+        """Review amendment: the dedup guard is scoped to category==
+        'stop_instruction' — a pre-existing PENDING escalation of a
+        DIFFERENT category (e.g. infra_issue, filed by an earlier crash) on
+        the same task must NOT suppress filing the stop_instruction
+        escalation. A category-agnostic dedup guard would incorrectly treat
+        the unrelated pending escalation as "already escalated" and skip
+        filing — silently dropping the higher-authority stop-instruction
+        signal.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='402',
+            description='Investigate the failure, but do not apply any fix yet.',
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        # Pre-seed an unrelated pending escalation for the SAME task_id and
+        # agent_role (mirrors a prior _file_infra_issue_and_block filing).
+        queue.submit(Escalation(
+            id=queue.make_id('402'),
+            task_id='402',
+            agent_role='orchestrator-deterministic',
+            severity='critical',
+            category='infra_issue',
+            summary='pre-existing unrelated infra_issue escalation',
+            level=2,
+        ))
+
+        unit_inspector = AsyncMock()
+        script_runner = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        script_runner.assert_not_awaited()
+
+        pending = queue.get_by_task(
+            '402', status='pending', agent_role='orchestrator-deterministic',
+        )
+        categories = sorted(e.category for e in pending)
+        assert categories == ['infra_issue', 'stop_instruction'], (
+            f'Expected the pre-existing infra_issue escalation to remain '
+            f'AND a new stop_instruction escalation to be filed alongside '
+            f'it, got categories={categories}: {pending}'
+        )

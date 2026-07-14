@@ -781,6 +781,144 @@ class TestReadLatestProposal:
 
 
 # ---------------------------------------------------------------------------
+# review amendment: reader failures warn instead of failing open silently
+# ---------------------------------------------------------------------------
+
+class TestReaderFailureWarning:
+    """_read_task_description / _read_latest_proposal emit a deduped WARNING
+    when their read genuinely fails (e.g. tasks.db lacks the expected
+    column — an older/foreign schema) rather than degrading silently (task
+    2509 review amendment). The benign "no data yet" branches (missing db,
+    missing row, empty column) stay silent — only a raised exception warns.
+    """
+
+    def _seed_tasks_without_description_column(self, tmp_path, task_id=42):
+        """A 'tasks' table that lacks the 'description' column entirely —
+        the older/foreign-schema scenario the review finding names."""
+        db_dir = tmp_path / '.taskmaster' / 'tasks'
+        db_dir.mkdir(parents=True, exist_ok=True)
+        db_path = db_dir / 'tasks.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS tasks '
+            '(tag TEXT, id INTEGER, status TEXT, priority TEXT, metadata TEXT, updated_at TEXT)'
+        )
+        conn.execute(
+            "INSERT INTO tasks VALUES ('master', ?, 'blocked', 'medium', ?, ?)",
+            (task_id, json.dumps({}), '2026-06-04T00:00:00+00:00'),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_missing_description_column_warns(self, tmp_path, caplog):
+        import logging as _logging
+
+        from orchestrator.b3_gate import _read_task_description
+        self._seed_tasks_without_description_column(tmp_path, task_id=42)
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            result = _read_task_description(42, tmp_path)
+
+        assert result is None
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
+        ]
+        assert len(warn_records) >= 1, (
+            f'Expected a WARNING under orchestrator.b3_gate for a missing '
+            f'description column; got records: '
+            f'{[(r.name, r.message) for r in caplog.records]}'
+        )
+
+    def test_missing_description_column_warning_is_deduped(self, tmp_path, caplog):
+        """A second call for the SAME (reader, project_root, tag, task_id)
+        key must not re-warn within the same process."""
+        import logging as _logging
+
+        from orchestrator.b3_gate import _read_task_description
+        self._seed_tasks_without_description_column(tmp_path, task_id=42)
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            _read_task_description(42, tmp_path)
+            _read_task_description(42, tmp_path)
+
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
+        ]
+        assert len(warn_records) == 1, (
+            f'Expected exactly one deduped WARNING across two calls with the '
+            f'same key; got {len(warn_records)}: {[r.message for r in warn_records]}'
+        )
+
+    def test_missing_db_stays_silent(self, tmp_path, caplog):
+        """Benign 'no tasks.db at all' must NOT warn — this is not a failure,
+        it's the ordinary first-run-absent case."""
+        import logging as _logging
+
+        from orchestrator.b3_gate import _read_task_description
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            result = _read_task_description(42, tmp_path)
+
+        assert result is None
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
+        ]
+        assert len(warn_records) == 0, (
+            f'missing tasks.db must not warn (benign first-run absence); got: '
+            f'{[r.message for r in warn_records]}'
+        )
+
+    def test_latest_proposal_missing_metadata_column_stays_silent(self, tmp_path, caplog):
+        """_read_latest_proposal is deliberately NOT given the same WARNING
+        instrumentation as _read_task_description above, despite having the
+        identical fail-open shape (review finding explicitly named it as an
+        "ideal" sibling fix). This exact site already has a pre-existing,
+        reasoned entry in shared/tests/silent_fallthrough_allowlist.py
+        ("narrow fix deferred to follow-up"); adding a WARNING here would
+        change the handler's AST shape and require also editing that
+        allowlist file — which sits outside this task's locked module scope
+        (task 2509 review amendment: scope discipline). Locks in the
+        intentional asymmetry so a future edit doesn't "fix" this half
+        without the matching allowlist update.
+        """
+        import logging as _logging
+
+        from orchestrator.b3_gate import _read_latest_proposal
+
+        db_dir = tmp_path / '.taskmaster' / 'tasks'
+        db_dir.mkdir(parents=True, exist_ok=True)
+        db_path = db_dir / 'tasks.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS tasks '
+            '(tag TEXT, id INTEGER, status TEXT, priority TEXT, description TEXT, updated_at TEXT)'
+        )
+        conn.execute(
+            "INSERT INTO tasks VALUES ('master', 42, 'blocked', 'medium', 'desc', ?)",
+            ('2026-06-04T00:00:00+00:00',),
+        )
+        conn.commit()
+        conn.close()
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            result = _read_latest_proposal(42, tmp_path)
+
+        assert result is None
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
+        ]
+        assert len(warn_records) == 0, (
+            f'_read_latest_proposal is intentionally NOT warning-instrumented '
+            f'in this amendment pass (scope discipline — see docstring); got: '
+            f'{[r.message for r in warn_records]}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-15: _resolve_cap
 # ---------------------------------------------------------------------------
 

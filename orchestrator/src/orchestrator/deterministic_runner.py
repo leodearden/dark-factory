@@ -701,6 +701,14 @@ class DeterministicRunner:
         and best-effort blocked-status writeback, but uses ``category=
         'stop_instruction'`` so the halt is distinguishable from an infra
         fault — and, critically, does NOT stamp ``metadata.gate_escalated_at``.
+
+        Unlike ``_file_infra_issue_and_block``'s dedup guard, this one is
+        scoped to ``category == 'stop_instruction'`` (review amendment): a
+        pre-existing, unrelated pending escalation on the same task (e.g. an
+        ``infra_issue`` filed by a prior crash) must not silently suppress
+        filing THIS one — the stop-instruction halt is a distinct, higher-
+        authority signal that a human resolving the other escalation could
+        otherwise miss entirely.
         This is a re-checkable HALT, not a resolve-to-done gate: leaving
         ``gate_escalated_at`` unset means the next dispatch re-evaluates the
         stop-instruction guard from scratch — section 1's
@@ -727,13 +735,21 @@ class DeterministicRunner:
         """
         from escalation.models import Escalation
 
-        existing_pending = self.escalation_queue.get_by_task(
-            task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
-        )
+        # category-scoped (review amendment): get_by_task has no server-side
+        # category filter, so filter client-side — an unrelated pending
+        # escalation (e.g. infra_issue) on the same task must not suppress
+        # filing this one. See the docstring note above.
+        existing_pending = [
+            e for e in self.escalation_queue.get_by_task(
+                task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+            )
+            if e.category == 'stop_instruction'
+        ]
         if existing_pending:
             logger.info(
-                'DeterministicRunner: task %s already has %d pending escalation(s) — '
-                'skipping re-file (stop_instruction dedup guard)',
+                'DeterministicRunner: task %s already has %d pending '
+                'stop_instruction escalation(s) — skipping re-file '
+                '(stop_instruction dedup guard)',
                 task_id, len(existing_pending),
             )
         else:

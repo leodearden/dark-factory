@@ -129,3 +129,48 @@ class TestDetectStopInstructionVarargs:
         from orchestrator.stop_instruction import detect_stop_instruction
         result = detect_stop_instruction(None, 'benign one', '', 'benign two')
         assert result is None
+
+
+class TestDetectStopInstructionBroadPhraseFalsePositivePosture:
+    """Locks in the documented, DELIBERATE false-positive tradeoff (module
+    docstring's KNOWN LIMITATIONS section): 'do not run', 'do not execute',
+    and 'do not proceed' are broad enough to plausibly appear in benign
+    deploy/rollback prose (e.g. a manual-step warning), yet
+    detect_stop_instruction intentionally matches them anyway. A false
+    positive here only routes work to a human — fail-safe, never an
+    incorrect automated action — so erring toward broader phrases is
+    preferred over a narrower set that risks silently missing a genuine
+    stop instruction (task 2509 review amendment: FALSE-POSITIVE POSTURE).
+
+    These tests exist so a future "fix" cannot silently narrow the phrase
+    set — reducing false positives at the cost of reintroducing the silent-
+    miss risk — without a test failure surfacing the tradeoff it reverses.
+    """
+
+    def test_do_not_run_matches_benign_manual_step_warning(self):
+        from orchestrator.stop_instruction import detect_stop_instruction
+        result = detect_stop_instruction('do not run this step manually')
+        assert result == 'do not run', (
+            f'expected the broad phrase "do not run" to deliberately match '
+            f'this benign-looking deploy/rollback note, got {result!r}'
+        )
+
+    def test_do_not_execute_matches_benign_rollback_note(self):
+        from orchestrator.stop_instruction import detect_stop_instruction
+        result = detect_stop_instruction(
+            'Rollback note: do not execute the cleanup script twice.',
+        )
+        assert result == 'do not execute', (
+            f'expected the broad phrase "do not execute" to deliberately '
+            f'match this benign-looking rollback note, got {result!r}'
+        )
+
+    def test_do_not_proceed_matches_benign_deploy_gate_note(self):
+        from orchestrator.stop_instruction import detect_stop_instruction
+        result = detect_stop_instruction(
+            'Deploy gate: do not proceed until the canary is healthy.',
+        )
+        assert result == 'do not proceed', (
+            f'expected the broad phrase "do not proceed" to deliberately '
+            f'match this benign-looking deploy-gate note, got {result!r}'
+        )

@@ -458,6 +458,32 @@ def check_proposal(
 
 
 # ---------------------------------------------------------------------------
+# Reader failure warning (task 2509 review amendment)
+# ---------------------------------------------------------------------------
+
+# Per-process dedup for _read_task_description's reader-failure WARNING,
+# keyed by (project_root, tag, task_id) — mirrors
+# sqlite_task_backend._warned_malformed_task_ids / safe_io._warned_corrupt_paths.
+# A restart re-enables the warning.
+#
+# Scope note (task 2509 review amendment): the sibling _read_latest_proposal
+# has the identical "except Exception: return None" fail-open shape, but is
+# deliberately NOT covered by this dedup set / WARNING — see the comment in
+# its except clause. Only _read_task_description (this file's newly-added
+# reader, with no pre-existing allowlist entry) is instrumented here.
+#
+# NOTE: the WARNING call itself is kept INLINE in _read_task_description's
+# ``except Exception`` block below (not wrapped in a shared logging helper)
+# so it stays visible to the repo's silent-fallthrough AST-scan gate
+# (shared/tests/test_silent_fallthrough_gate.py, PRD
+# plans/silent-fallthrough-dedup-prd.md) — that gate only recognizes a
+# directly-called ``logger.warning(...)`` (or sibling WARN+ method) inside
+# the handler's own scope, not one reached indirectly through a helper
+# function call.
+_warned_description_read_failures: set[tuple[str, str, str]] = set()
+
+
+# ---------------------------------------------------------------------------
 # _read_latest_proposal
 # ---------------------------------------------------------------------------
 
@@ -471,7 +497,11 @@ def _read_latest_proposal(
     """Read the latest dry_run_proposals entry from tasks.db for the given task.
 
     Returns None on any error (missing db, missing row, empty proposals list).
-    Uses stdlib sqlite3 only — no fused_memory dependency.
+    Uses stdlib sqlite3 only — no fused_memory dependency. Unlike the sibling
+    _read_task_description below, a genuine read failure here (as opposed to
+    the benign "no data yet" branches) does NOT emit a WARNING — see the
+    comment in the except clause for why (task 2509 review amendment, scope
+    discipline).
 
     *conn*: reuse an already-open read-only connection instead of opening a
     fresh one (task 2509 review amendment) — lets ``run_check`` share a
@@ -509,6 +539,16 @@ def _read_latest_proposal(
             return None
         return proposals[-1]
     except Exception:
+        # NOT instrumented with the _read_task_description WARNING below —
+        # deliberately, not an oversight (task 2509 review amendment, scope
+        # discipline). This exact site is already covered by a pre-existing,
+        # reasoned entry in shared/tests/silent_fallthrough_allowlist.py
+        # ("pre-existing optional DB accessor ... narrow fix deferred to
+        # follow-up"). Adding a WARNING here would change this handler's AST
+        # shape and make that allowlist entry stale, requiring an edit to
+        # shared/tests/silent_fallthrough_allowlist.py — a file outside this
+        # task's locked module scope. Left as a follow-up (see the escalation
+        # filed alongside this amendment).
         return None
 
 
@@ -529,7 +569,11 @@ def _read_task_description(
     description) — an empty string is treated as "no description" so callers
     can pass the result straight through to check_proposal's extra_texts
     without a separate truthiness check. Read-only (mode=ro), stdlib sqlite3
-    only — sibling pattern to _read_latest_proposal above.
+    only — sibling pattern to _read_latest_proposal above. A genuine read
+    failure (e.g. tasks.db lacks a description column — an older/foreign
+    schema) emits a deduped WARNING (task 2509 review amendment) rather than
+    silently suppressing the description's contribution to the
+    stop-instruction scan.
 
     *conn*: reuse an already-open read-only connection instead of opening a
     fresh one (task 2509 review amendment) — see _read_latest_proposal's
@@ -559,7 +603,17 @@ def _read_task_description(
         if row is None or not row[0]:
             return None
         return row[0]
-    except Exception:
+    except Exception as exc:
+        key = (str(project_root), tag, str(task_id))
+        if key not in _warned_description_read_failures:
+            _warned_description_read_failures.add(key)
+            logger.warning(
+                'b3_gate._read_task_description: read failed for task_id=%s '
+                'tag=%s project_root=%s — fail-open to None (caller treats as '
+                'no-data; the description is silently skipped in the '
+                'stop-instruction scan this call): %s: %s',
+                task_id, tag, project_root, type(exc).__name__, exc,
+            )
         return None
 
 
