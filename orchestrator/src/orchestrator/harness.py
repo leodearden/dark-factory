@@ -3259,14 +3259,15 @@ Output JSON matching the schema. Every task must appear in the output.
             existing is None
             or existing.escalation_queue is not self._escalation_queue
         ):
-            self._ground_truth = TaskGroundTruth(
+            existing = TaskGroundTruth(
                 self.git_ops,
                 self.scheduler,
                 self._escalation_queue,
                 self._resolve_task_worktree,
                 heartbeat_ttl=_RECONCILE_HEARTBEAT_TTL,
             )
-        return self._ground_truth
+            self._ground_truth = existing
+        return existing
 
     async def _reconcile_stranded_in_progress(self, *, mid_run: bool = False) -> int:
         """Sweep stranded in-progress tasks back to pending (or done).
@@ -3289,44 +3290,36 @@ Output JSON matching the schema. Every task must appear in the output.
         decide whether to keep the main loop running (Fix 4: stuck-blocked
         recovery).
 
-        **Already-on-main fast-path** (is_ancestor == True):
-        When the task branch is already an ancestor of main, the task is
-        terminal.  We resolve the branch to its 40-char commit SHA via
-        ``git rev-parse --verify`` *before* ``cleanup_worktree`` (which calls
-        ``git branch -D`` and would invalidate a post-cleanup rev-parse — see
-        git_ops.py lines around cleanup_worktree).
+        **Ground-truth delegation** (task 2243, W10-θ2): per-candidate
+        branch-state derivation and recovery classification are NOT performed
+        here or in ``_reconcile_one_stranded`` — this driver only filters
+        candidates (``_RECONCILE_SWEEP_STATUSES``) and dispatches each to
+        ``_reconcile_one_stranded``, which calls
+        ``TaskGroundTruth.recovery_for(tid)`` (``_get_ground_truth()``) to get
+        a ``(TruthReport, RecoveryAction)`` pair and then applies the
+        indicated action:
 
-        Success path: ``done_provenance={'commit': <sha>, 'note': '…'}`` —
-        matches the workflow.py:656 convention so downstream consumers
-        (fused-memory ``_validate_done_provenance``,
-        ``invalidate_fabricated_shipping_edges.py``, Stage 2 reconciliation)
-        can identify the SHA the task ended on.
+        - ``MARK_DONE_WITH_PROVENANCE`` → ``_mark_in_progress_done`` calls
+          ``scheduler.mark_done(kind='found_on_main', sha=report.branch_state.sha, ...)``.
+          ``report.branch_state.sha`` is populated whether the resolver found
+          the landing via a ``MergeProvenance`` journal row (journal-first) or
+          its git fallback (``is_ancestor`` / ``find_merge_marker``, resolved
+          internally by ``derive_truth`` — see task_ground_truth.py).
+        - ``REVERT_TO_PENDING`` → ``_revert_in_progress_if_no_live_claimant``
+          flips the task back to pending.
+        - ``RE_FILE_ESCALATION`` → a ``stranded_blocked`` L1 escalation is
+          filed (blocked-status only).
+        - ``LEAVE`` (default) → no change.
 
-        Failure path: if the branch ref vanishes between is_ancestor and the
-        subsequent rev-parse (rare TOCTOU race), ``resolve_branch_sha`` returns
-        None.  We fall back to note-only provenance and emit a WARNING log so
-        operators can spot the race.  Reconciliation is best-effort and must
-        not abort on this edge case; fused-memory accepts note-only provenance.
-
-        **Branch-deleted fast-path** (find_merge_marker):
-        ``is_ancestor`` returns False in two cases: (1) the branch ref still
-        exists but isn't on main — revert is correct; (2) the branch ref is
-        gone — ``git merge-base --is-ancestor`` exits non-zero because it
-        cannot resolve the ref.  Case (2) is the realistic post-merge-queue
-        crash scenario: ``advance_main`` succeeded and ``cleanup_worktree``
-        deleted the branch, but ``set_task_status('done')`` never ran.
-
-        To distinguish case (2) from case (1) we call
-        ``git_ops.find_merge_marker(branch)`` immediately after the
-        ``is_ancestor`` block.  ``find_merge_marker`` gates on
-        ``resolve_branch_sha`` (returns None when the branch is still present,
-        so it can only hit the git-log path when the ref is truly gone), then
-        searches recent main commits for a subject matching
-        ``Merge {branch} into {main_branch}`` — the format ``merge_to_main``
-        writes.  A hit is treated identically to the
-        is_ancestor path: pop ``_recovered_plans``, attempt
-        ``cleanup_worktree`` (swallow errors), call
-        ``set_task_status('done', done_provenance={'commit': marker_sha, ...})``.
+        ``done_provenance={'commit': <sha>, 'note': '…'}`` matches the
+        workflow.py:656 convention so downstream consumers (fused-memory
+        ``_validate_done_provenance``, ``invalidate_fabricated_shipping_edges.py``,
+        Stage 2 reconciliation) can identify the SHA the task ended on. If the
+        resolver's branch ref vanishes mid-derivation (rare TOCTOU race),
+        ``report.branch_state.sha`` is ``None`` and ``_mark_in_progress_done``
+        skips the flip with a WARNING log so operators can spot the race and
+        the next sweep retries; reconciliation is best-effort and must not
+        abort on this edge case.
         """
         statuses, err = await self.scheduler.get_statuses()
         reverted = 0
@@ -3435,9 +3428,12 @@ Output JSON matching the schema. Every task must appear in the output.
 
         A branch is degenerate when its live tip SHA equals the recorded
         branch_base_sha (#1226), meaning zero commits were ever pushed beyond
-        the creation point.  Called from the Guard-2 citation-miss path and the
-        Guard-3 citation-hit path in _reconcile_one_stranded to share the same
-        degeneracy signal without duplicating the three-step check.
+        the creation point.  Called from the MARK_DONE_WITH_PROVENANCE
+        degenerate-branch refinement in _reconcile_one_stranded (task 2243,
+        W10-θ2) — downgrading a would-be mark-done to a revert when
+        TaskGroundTruth's resolver classifies a zero-commit branch as
+        ON_MAIN — and from _revert_in_progress_if_no_live_claimant's
+        infra-held guard, which share this same degeneracy signal.
 
         Returns False when:
         - branch_base_sha is absent or not a valid 40-hex SHA (backward compat
