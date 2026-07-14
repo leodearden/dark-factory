@@ -26,6 +26,7 @@ from typing import Any
 
 from shared.safe_io import load_json_or_warn
 
+from orchestrator.stop_instruction import detect_stop_instruction
 from orchestrator.unblock_types import BlockClass
 
 logger = logging.getLogger(__name__)
@@ -288,6 +289,7 @@ def check_proposal(
     category: str | None,
     run_git: Any = None,
     now: datetime | None = None,
+    extra_texts: list[str] | None = None,
 ) -> dict[str, Any]:
     """Classify a proposal entry and return a verdict dict.
 
@@ -305,6 +307,18 @@ def check_proposal(
           falls through to the checks below rather than re-enabling the
           legacy prose/status sniffs (those stay gated on `block_class is
           None`, not on validity).
+      1c. EXPLICIT STOP INSTRUCTION (task 2509, reconciliation finding
+          0aac21b4): if entry['proposal_text'], entry['block_reason'], or any
+          string in extra_texts (e.g. the task description — see
+          b3_gate.run_check) contains a phrase from
+          orchestrator.stop_instruction.STOP_INSTRUCTION_PHRASES -> abort.
+          Hard-aborted before risk_label/git checks, same shape as 1b, and
+          takes precedence even over an otherwise-fresh low-risk entry — a
+          stop instruction is the highest-authority human directive and must
+          never be self-authorized around (task 2407's autonomous /unblock
+          session did exactly that; task 2273's SIGTERM-killed sibling
+          session is the "what right looks like" precedent this gate makes
+          mechanical rather than relying on an external kill).
       2. risk_label != 'low' -> abort
       3. LEGACY-ONLY (B3): 'block_class' absent AND 'status' key present
           (failure entry) -> abort. When 'block_class' is present, every
@@ -385,6 +399,24 @@ def check_proposal(
             'unattended-edit scenario; routed to human (B3 never auto-acts on this class)',
         )
 
+    # --- (1c) Explicit stop instruction (task 2509) ---
+    # Hard-abort regardless of risk_label/freshness — a stop instruction is the
+    # highest-authority human directive.  Checked before any git call so it
+    # consumes no git and cannot be bypassed by an otherwise-fresh proposal
+    # (mirrors 1b's placement and shape).  orchestrator.stop_instruction is the
+    # single source of truth for the phrase set — also reused by
+    # DeterministicRunner's before_done guard and the /unblock +
+    # unblock-low-risk runbook prose, so it cannot drift between surfaces.
+    stop_phrase = detect_stop_instruction(
+        entry.get('proposal_text'), entry.get('block_reason'), *(extra_texts or []),
+    )
+    if stop_phrase:
+        return _result(
+            ABORT,
+            f'explicit stop instruction present: {stop_phrase!r} — routed to human '
+            f'(no self-authorization; task 2509)',
+        )
+
     # --- (2) Risk label ---
     if entry.get('risk_label') != 'low':
         return _result(ABORT, f'risk_label is not low: {entry.get("risk_label")!r}')
@@ -426,6 +458,32 @@ def check_proposal(
 
 
 # ---------------------------------------------------------------------------
+# Reader failure warning (task 2509 review amendment)
+# ---------------------------------------------------------------------------
+
+# Per-process dedup for _read_task_description's reader-failure WARNING,
+# keyed by (project_root, tag, task_id) — mirrors
+# sqlite_task_backend._warned_malformed_task_ids / safe_io._warned_corrupt_paths.
+# A restart re-enables the warning.
+#
+# Scope note (task 2509 review amendment): the sibling _read_latest_proposal
+# has the identical "except Exception: return None" fail-open shape, but is
+# deliberately NOT covered by this dedup set / WARNING — see the comment in
+# its except clause. Only _read_task_description (this file's newly-added
+# reader, with no pre-existing allowlist entry) is instrumented here.
+#
+# NOTE: the WARNING call itself is kept INLINE in _read_task_description's
+# ``except Exception`` block below (not wrapped in a shared logging helper)
+# so it stays visible to the repo's silent-fallthrough AST-scan gate
+# (shared/tests/test_silent_fallthrough_gate.py, PRD
+# plans/silent-fallthrough-dedup-prd.md) — that gate only recognizes a
+# directly-called ``logger.warning(...)`` (or sibling WARN+ method) inside
+# the handler's own scope, not one reached indirectly through a helper
+# function call.
+_warned_description_read_failures: set[tuple[str, str, str]] = set()
+
+
+# ---------------------------------------------------------------------------
 # _read_latest_proposal
 # ---------------------------------------------------------------------------
 
@@ -434,22 +492,36 @@ def _read_latest_proposal(
     project_root: str | Path,
     *,
     tag: str = DEFAULT_TAG,
+    conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any] | None:
     """Read the latest dry_run_proposals entry from tasks.db for the given task.
 
     Returns None on any error (missing db, missing row, empty proposals list).
-    Uses stdlib sqlite3 only — no fused_memory dependency.
+    Uses stdlib sqlite3 only — no fused_memory dependency. Unlike the sibling
+    _read_task_description below, a genuine read failure here (as opposed to
+    the benign "no data yet" branches) does NOT emit a WARNING — see the
+    comment in the except clause for why (task 2509 review amendment, scope
+    discipline).
+
+    *conn*: reuse an already-open read-only connection instead of opening a
+    fresh one (task 2509 review amendment) — lets ``run_check`` share a
+    single connection with ``_read_task_description`` instead of opening
+    tasks.db twice per invocation. Defaults to None: opens (and closes) its
+    own connection exactly as before. A caller-supplied *conn* is never
+    closed here — the caller retains ownership of its lifecycle.
     """
     try:
-        db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
-        if not db_path.exists():
-            return None
-        # Open read-only via URI
-        uri = f'file:{db_path}?mode=ro'
-        try:
-            conn = sqlite3.connect(uri, uri=True)
-        except sqlite3.OperationalError:
-            return None
+        owns_conn = conn is None
+        if owns_conn:
+            db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+            if not db_path.exists():
+                return None
+            # Open read-only via URI
+            uri = f'file:{db_path}?mode=ro'
+            try:
+                conn = sqlite3.connect(uri, uri=True)
+            except sqlite3.OperationalError:
+                return None
         try:
             cursor = conn.execute(
                 'SELECT metadata FROM tasks WHERE tag=? AND id=?',
@@ -457,7 +529,8 @@ def _read_latest_proposal(
             )
             row = cursor.fetchone()
         finally:
-            conn.close()
+            if owns_conn:
+                conn.close()
         if row is None:
             return None
         data = json.loads(row[0])
@@ -466,6 +539,81 @@ def _read_latest_proposal(
             return None
         return proposals[-1]
     except Exception:
+        # NOT instrumented with the _read_task_description WARNING below —
+        # deliberately, not an oversight (task 2509 review amendment, scope
+        # discipline). This exact site is already covered by a pre-existing,
+        # reasoned entry in shared/tests/silent_fallthrough_allowlist.py
+        # ("pre-existing optional DB accessor ... narrow fix deferred to
+        # follow-up"). Adding a WARNING here would change this handler's AST
+        # shape and make that allowlist entry stale, requiring an edit to
+        # shared/tests/silent_fallthrough_allowlist.py — a file outside this
+        # task's locked module scope. Left as a follow-up (see the escalation
+        # filed alongside this amendment).
+        return None
+
+
+# ---------------------------------------------------------------------------
+# _read_task_description
+# ---------------------------------------------------------------------------
+
+def _read_task_description(
+    task_id: int | str,
+    project_root: str | Path,
+    *,
+    tag: str = DEFAULT_TAG,
+    conn: sqlite3.Connection | None = None,
+) -> str | None:
+    """Read the task's description column from tasks.db for the given task.
+
+    Returns None on any error (missing db, missing row, missing/empty
+    description) — an empty string is treated as "no description" so callers
+    can pass the result straight through to check_proposal's extra_texts
+    without a separate truthiness check. Read-only (mode=ro), stdlib sqlite3
+    only — sibling pattern to _read_latest_proposal above. A genuine read
+    failure (e.g. tasks.db lacks a description column — an older/foreign
+    schema) emits a deduped WARNING (task 2509 review amendment) rather than
+    silently suppressing the description's contribution to the
+    stop-instruction scan.
+
+    *conn*: reuse an already-open read-only connection instead of opening a
+    fresh one (task 2509 review amendment) — see _read_latest_proposal's
+    *conn* doc. Defaults to None: opens (and closes) its own connection
+    exactly as before; a caller-supplied *conn* is never closed here.
+    """
+    try:
+        owns_conn = conn is None
+        if owns_conn:
+            db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+            if not db_path.exists():
+                return None
+            uri = f'file:{db_path}?mode=ro'
+            try:
+                conn = sqlite3.connect(uri, uri=True)
+            except sqlite3.OperationalError:
+                return None
+        try:
+            cursor = conn.execute(
+                'SELECT description FROM tasks WHERE tag=? AND id=?',
+                (tag, int(task_id)),
+            )
+            row = cursor.fetchone()
+        finally:
+            if owns_conn:
+                conn.close()
+        if row is None or not row[0]:
+            return None
+        return row[0]
+    except Exception as exc:
+        key = (str(project_root), tag, str(task_id))
+        if key not in _warned_description_read_failures:
+            _warned_description_read_failures.add(key)
+            logger.warning(
+                'b3_gate._read_task_description: read failed for task_id=%s '
+                'tag=%s project_root=%s — fail-open to None (caller treats as '
+                'no-data; the description is silently skipped in the '
+                'stop-instruction scan this call): %s: %s',
+                task_id, tag, project_root, type(exc).__name__, exc,
+            )
         return None
 
 
@@ -527,7 +675,25 @@ def run_check(args: argparse.Namespace) -> None:
     state, state_ok = _load_state_checked(sp)
 
     tag = getattr(args, 'tag', DEFAULT_TAG)
-    entry = _read_latest_proposal(args.task_id, args.project_root, tag=tag)
+
+    # Single shared read-only connection for both the proposal and
+    # description reads (task 2509 review amendment — this used to open
+    # tasks.db twice per invocation, once per reader). Falls back to each
+    # reader's own independent open (and its existing fail-closed-to-None
+    # behavior) when this shared connection can't be established.
+    db_path = Path(args.project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    shared_conn: sqlite3.Connection | None = None
+    if db_path.exists():
+        try:
+            shared_conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+        except sqlite3.OperationalError:
+            shared_conn = None
+    try:
+        entry = _read_latest_proposal(args.task_id, args.project_root, tag=tag, conn=shared_conn)
+        description = _read_task_description(args.task_id, args.project_root, tag=tag, conn=shared_conn)
+    finally:
+        if shared_conn is not None:
+            shared_conn.close()
     category = getattr(args, 'category', None)
 
     result = check_proposal(
@@ -535,6 +701,7 @@ def run_check(args: argparse.Namespace) -> None:
         worktree=args.worktree,
         category=category,
         now=now,
+        extra_texts=[description] if description else None,
     )
 
     # Add state-derived fields — fail CLOSED on corrupt state

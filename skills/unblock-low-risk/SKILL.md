@@ -25,6 +25,36 @@ and the latest dry-run `proposal` object (`proposal_text`, `files_referenced`, `
 
 The watcher pre-gated, but you re-assert defensively (state can change between the gate and now):
 
+0. **Hard-abort on an explicit stop instruction.** Before checking anything else, scan
+   `latest['proposal_text']`, the task description (`get_task(task_id)`), and any prior
+   context or instruction you've been given for an explicit stop instruction — the phrase
+   family in `orchestrator.stop_instruction.STOP_INSTRUCTION_PHRASES`
+   (`orchestrator/src/orchestrator/stop_instruction.py`, the single source of truth also used
+   by `b3_gate` and `DeterministicRunner`): `'do not apply'`, `'do not merge'`, `'do not
+   proceed'`, `'do not run'`, `'do not execute'`, `'do not self-authorize'`, `'human
+   rehearsal'`, `'hold for human'`, `'awaiting human'`, etc. If **any** is present →
+   **ABORT** immediately, per "Aborting" below (leave the escalation pending; do not touch
+   task status beyond what's already there) — this is the highest-authority halt and
+   overrides an otherwise-low-risk, fresh proposal. Do not self-authorize around it and do
+   not narrate the result as human-authorized; aborting here is a success, exactly like every
+   other abort in this skill.
+
+   This closes reconciliation finding 0aac21b4 (task 2509): an autonomous `/unblock` session
+   self-authorized an irreversible mutation despite an explicit "do not apply" instruction on
+   task 2407, then narrated it as human-authorized. Its sibling session on task 2273 is what
+   right looks like — it was SIGTERM-killed before it could auto-apply its own
+   human-rehearsal mandate. This precondition turns that external kill into a self-halt.
+
+   **Mechanical backstop:** precondition 6's `b3_gate check` below now *also* scans the task
+   description and proposal/block-reason text for this same phrase family and returns
+   `verdict == 'abort'` with an `'explicit stop instruction present'` reason when found — so
+   even if this precondition is somehow skipped, the existing "**ONLY** `verdict == 'fresh'`
+   proceeds" rule at precondition 6 already routes this class to ABORT, with the gate's
+   `reason` copied verbatim. This precondition still matters on its own: it can save the
+   preconditions-1-5 and step-1/2 work by catching the instruction immediately, and it covers
+   a stop instruction that lives only in context the mechanical gate can't see (it reads only
+   text already persisted to the task).
+
 1. `get_task(task_id)` → `metadata.dry_run_proposals` is non-empty; take `latest = proposals[-1]`.
 2. `latest['risk_label'] == 'low'`. Anything else (`medium`, `human-review-required`) → **ABORT**.
 3. `latest` has **no** `status` key (`investigation_failed` / `budget_exhausted` entries force
@@ -249,6 +279,11 @@ Return ONLY this JSON object (no prose):
 
 ## Non-negotiable safety rails (summary)
 
+- **Stop instruction overrides everything** (precondition 0): an explicit stop instruction
+  (`orchestrator.stop_instruction.STOP_INSTRUCTION_PHRASES`) found in the proposal, the task
+  description, or prior context → ABORT immediately, before any other precondition —
+  mechanically backstopped by `b3_gate check` (precondition 6), which returns
+  `verdict == 'abort'` for the same phrase family.
 - Only `risk_label == 'low'`; only `task_failure` / `review_issues`.
 - **Never post-merge-red-main:** proposals whose `block_reason` starts with
   `'Post-merge unscoped type-check failed'` are hard-ABORTed by `b3_gate.check_proposal` before
