@@ -26,11 +26,17 @@ intentionally excluded — see reconciliation/prompts/__init__.py.
 """
 from __future__ import annotations
 
+import logging
 import re
 
 import pytest
 
-from fused_memory.reconciliation.prompts import render_recon_report_tool_guidance
+from fused_memory.reconciliation import prompts as prompts_module
+from fused_memory.reconciliation.prompts import (
+    _RECON_REPORT_TOOL_GUIDANCE_FALLBACK,
+    get_recon_report_tool_guidance,
+    render_recon_report_tool_guidance,
+)
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import (
     STAGE2_SYSTEM_PROMPT,
@@ -143,5 +149,86 @@ class TestReconReportRunIdGuardOverAssembledPrompts:
                 args_substr = _extract_call_args_at(prompt_text, paren_idx)
                 assert 'run_id' in args_substr, (
                     f'{prompt_label}: a `{tool_name}(...)` call example is missing '
+                    f'`run_id` — got: {tool_name}({args_substr})'
+                )
+
+
+class TestReconReportGuidanceFallback:
+    """get_recon_report_tool_guidance()'s exception/fallback branch (reviewer finding).
+
+    _RECON_REPORT_TOOL_GUIDANCE_FALLBACK exists specifically as a run_id-safe
+    safety net for when render_recon_report_tool_guidance() raises (e.g. a
+    FastMCP internals change). Unlike the generated path, it is hand-written
+    and was previously never exercised by a test nor scanned for the very
+    run_id-omission drift this task set out to eliminate. This class covers
+    both gaps.
+    """
+
+    def setup_method(self):
+        # get_recon_report_tool_guidance() is backed by the lru_cache'd
+        # _cached_recon_report_tool_guidance() helper — clear it so tests
+        # don't observe each other's cached renders.
+        prompts_module._cached_recon_report_tool_guidance.cache_clear()
+
+    def teardown_method(self):
+        prompts_module._cached_recon_report_tool_guidance.cache_clear()
+
+    def test_falls_back_and_logs_when_render_raises(self, monkeypatch, caplog):
+        """A raising get_recon_report_tool_signatures() forces the frozen fallback."""
+
+        def _raise():
+            raise RuntimeError('FastMCP tool-manager internals changed shape')
+
+        monkeypatch.setattr(
+            'fused_memory.server.recon_report.get_recon_report_tool_signatures', _raise
+        )
+        with caplog.at_level(logging.ERROR):
+            result = get_recon_report_tool_guidance()
+
+        assert result == _RECON_REPORT_TOOL_GUIDANCE_FALLBACK
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any('falling back' in r.message for r in error_records), (
+            f'Expected an ERROR log containing "falling back", got: '
+            f'{[r.message for r in error_records]}'
+        )
+
+    def test_self_heals_on_next_call_after_transient_failure(self, monkeypatch):
+        """A transient failure must not be cached — the next call retries live.
+
+        Regression guard for the reviewer's robustness finding: because the
+        fallback path is deliberately NOT memoized (only a successful render
+        is, via _cached_recon_report_tool_guidance), a call made after the
+        introspection failure clears should get the real generated guidance
+        again in the SAME process, not the frozen fallback forever.
+        """
+
+        def _raise():
+            raise RuntimeError('transient hiccup')
+
+        monkeypatch.setattr(
+            'fused_memory.server.recon_report.get_recon_report_tool_signatures', _raise
+        )
+        assert get_recon_report_tool_guidance() == _RECON_REPORT_TOOL_GUIDANCE_FALLBACK
+
+        monkeypatch.undo()
+        healed = get_recon_report_tool_guidance()
+        assert healed == render_recon_report_tool_guidance()
+        assert healed != _RECON_REPORT_TOOL_GUIDANCE_FALLBACK
+
+    def test_fallback_call_examples_all_carry_run_id(self):
+        """Guard the frozen fallback string with the same run_id scan used above.
+
+        The fallback is hand-written and unlike the generated path is never
+        re-verified against live signatures — this pins it against the exact
+        drift bug (a call example silently missing `run_id`) this task exists
+        to eliminate.
+        """
+        for tool_name in _AGENT_CALLED_REPORT_TOOLS:
+            for paren_idx in _iter_call_openers(_RECON_REPORT_TOOL_GUIDANCE_FALLBACK, tool_name):
+                args_substr = _extract_call_args_at(
+                    _RECON_REPORT_TOOL_GUIDANCE_FALLBACK, paren_idx
+                )
+                assert 'run_id' in args_substr, (
+                    f'fallback: a `{tool_name}(...)` call example is missing '
                     f'`run_id` — got: {tool_name}({args_substr})'
                 )

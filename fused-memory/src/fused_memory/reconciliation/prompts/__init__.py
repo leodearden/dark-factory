@@ -237,6 +237,20 @@ _RECON_REPORT_TOOL_GUIDANCE_FALLBACK = (
 
 
 @functools.lru_cache(maxsize=1)
+def _cached_recon_report_tool_guidance() -> str:
+    """Cache wrapper around :func:`render_recon_report_tool_guidance`.
+
+    Split out from :func:`get_recon_report_tool_guidance` (task-2559
+    amendment) so that ``lru_cache`` only ever memoizes a *successful*
+    render: ``functools.lru_cache`` does not cache a call that raises (the
+    exception propagates on every call until one succeeds), so a transient
+    introspection failure here is retried on the very next call instead of
+    being pinned forever. See :func:`get_recon_report_tool_guidance` for the
+    fallback handling built on top of this.
+    """
+    return render_recon_report_tool_guidance()
+
+
 def get_recon_report_tool_guidance() -> str:
     """Return the recon-report tool-call guidance text, computed once and cached.
 
@@ -248,24 +262,30 @@ def get_recon_report_tool_guidance() -> str:
     throwaway FastMCP recon_report server. Deferring to first call means only
     a consumer that actually needs the guidance (Stage 1/2/3, which interpolate
     it into their system prompts at their own module import) triggers the
-    build, and ``lru_cache`` ensures it happens at most once per process.
+    build, and the :func:`_cached_recon_report_tool_guidance` helper ensures a
+    successful build happens at most once per process.
 
     Falls back to the frozen :data:`_RECON_REPORT_TOOL_GUIDANCE_FALLBACK`
     static string if :func:`render_recon_report_tool_guidance` raises (e.g. a
     FastMCP upgrade changes the tool-manager internals guarded by
     ``get_recon_report_tool_signatures``) rather than letting it become an
-    ImportError for every consumer of this package. The fallback result is
-    cached too (a normal return, from ``lru_cache``'s point of view) — a
-    fresh process retries the real render.
+    ImportError for every consumer of this package. Unlike the successful
+    path, the fallback is deliberately NOT cached — only
+    :func:`_cached_recon_report_tool_guidance`'s ``lru_cache`` is consulted,
+    and it never stores a raised call, so a transient failure (e.g. a
+    momentary hiccup constructing the throwaway FastMCP server) does not
+    permanently pin every later call in this same process to the frozen
+    fallback; the very next call retries the live render and self-heals as
+    soon as it succeeds.
     """
     try:
-        return render_recon_report_tool_guidance()
+        return _cached_recon_report_tool_guidance()
     except Exception:
         logger.exception(
             'render_recon_report_tool_guidance() failed; falling back to '
             'the frozen _RECON_REPORT_TOOL_GUIDANCE_FALLBACK static string. Recon-report '
             'tool-call guidance may be stale until the underlying introspection failure '
             '(see fused_memory.server.recon_report.get_recon_report_tool_signatures) is '
-            'fixed — this self-heals once that succeeds again in a fresh process.'
+            'fixed — the next call retries automatically, in this process or a fresh one.'
         )
         return _RECON_REPORT_TOOL_GUIDANCE_FALLBACK
