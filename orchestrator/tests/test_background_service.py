@@ -446,6 +446,26 @@ class TestLifecycleRegistryStartAll:
 
         assert calls == ['slow:start-done', 'fast:start-done']
 
+    @pytest.mark.asyncio
+    async def test_start_all_logs_info_per_service(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Amendment (reviewer_comprehensive): preserves the visibility the
+        old per-service ``_start_*`` methods used to log individually —
+        operators can confirm from logs which services actually started."""
+        from orchestrator.background_service import LifecycleRegistry
+
+        calls: list[str] = []
+        registry = LifecycleRegistry()
+        for name in ['a', 'b']:
+            registry.register(_RecordingService(name, calls))
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.background_service'):
+            await registry.start_all()
+
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert [r.message for r in info_records] == ['a started', 'b started']
+
 
 class TestLifecycleRegistryStopAll:
     """step-11: LifecycleRegistry.stop_all() (S1 / LR-2 — hang-class
@@ -539,6 +559,27 @@ class TestLifecycleRegistryStopAll:
         assert len(warnings) == 1
         assert 'raiser' in warnings[0].message
         assert 'stop() failed' in warnings[0].message
+
+    @pytest.mark.asyncio
+    async def test_stop_all_logs_info_per_clean_stop(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Amendment (reviewer_comprehensive): preserves the visibility the
+        old per-service ``_stop_*`` methods used to log individually —
+        operators can confirm shutdown progressed through the ladder."""
+        from orchestrator.background_service import LifecycleRegistry
+
+        calls: list[str] = []
+        registry = LifecycleRegistry()
+        for name in ['a', 'b']:
+            registry.register(_RecordingService(name, calls))
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.background_service'):
+            await asyncio.wait_for(registry.stop_all(), timeout=5)
+
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        # Reverse registration order: 'b' stops before 'a'.
+        assert [r.message for r in info_records] == ['b stopped', 'a stopped']
 
 
 class TestManagedService:

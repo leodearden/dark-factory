@@ -216,11 +216,17 @@ class LifecycleRegistry:
         The result is awaited only when it is itself awaitable, so a
         service's start-up work (if any) still fully completes before the
         next service's start() begins (LR-3).
+
+        Logs one INFO line per service once its start() has completed, so
+        operators can confirm from logs which of the eleven services
+        actually started — preserving the visibility the old per-service
+        ``_start_*`` methods used to log individually.
         """
         for service in self._services:
             result = service.start()
             if inspect.isawaitable(result):
                 await result
+            logger.info('%s started', service.name)
 
     async def stop_all(self) -> None:
         """Stop every registered service in REVERSE registration order.
@@ -231,6 +237,11 @@ class LifecycleRegistry:
         plain ``Exception`` is caught and logged so one failing service can
         never abort the ladder. This is the structural elimination of the
         shutdown-hang class this module exists to fix.
+
+        A clean stop logs one INFO line per service, so operators can
+        confirm shutdown progressed through the whole ladder — preserving
+        the visibility the old per-service ``_stop_*`` methods used to log
+        individually.
         """
         for service in reversed(self._services):
             try:
@@ -243,3 +254,5 @@ class LifecycleRegistry:
                 )
             except Exception as exc:
                 logger.warning('%s stop() failed: %s', service.name, exc)
+            else:
+                logger.info('%s stopped', service.name)
