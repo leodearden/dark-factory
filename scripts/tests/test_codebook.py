@@ -291,6 +291,25 @@ def test_migrate_v1_to_v2_maps_yaml_boolean_true_status_to_open():
     assert mod.validate(result) == []
 
 
+def test_migrate_v1_to_v2_drops_stale_updated_field():
+    """Amendment: under the sole-writer design, dump()/apply_coding_record()
+    never stamp the top-level `updated` field, so retaining it would freeze
+    at the migration date and mislead readers as sightings accumulate.
+    migrate_v1_to_v2 drops it rather than retaining or re-stamping it (a
+    mutable timestamp would break dump()'s byte-stable no-change-night
+    guarantee). Idempotent: already-absent on a second migration pass."""
+    v1 = _v1_fixture()
+    assert "updated" in v1  # fixture carries the v1 top-level field
+
+    once = mod.migrate_v1_to_v2(v1)
+    assert "updated" not in once
+    assert mod.validate(once) == []
+
+    twice = mod.migrate_v1_to_v2(once)
+    assert "updated" not in twice
+    assert once == twice
+
+
 # ---------------------------------------------------------------------------
 # step-7: RED — validate_coding_record() against §7.3 schema
 # ---------------------------------------------------------------------------
@@ -790,6 +809,28 @@ class TestMainCLI:
         reloaded = mod.load(codebook_path)
         entry = next(e for e in reloaded["entries"] if e["id"] == "entry-a")
         assert len(entry["sightings"]) == 1
+        assert len(reloaded["candidates"]) == 1
+        assert mod.validate(reloaded) == []
+
+    def test_apply_skips_malformed_json_line_without_aborting_batch(self, tmp_path, capsys):
+        """A single malformed JSONL line must not raise/abort the whole
+        batch (amendment: json.loads() used to be unguarded, so one bad
+        emitted record lost the entire nightly/trickle merge instead of
+        just itself — mirrors apply_coding_record()'s skip-whole-record
+        semantics, but at the line-parsing boundary)."""
+        codebook_path, records_path = self._write_apply_fixtures(tmp_path)
+        good_line = records_path.read_text(encoding="utf-8")
+        records_path.write_text("{not valid json\n" + good_line, encoding="utf-8")
+
+        ret = mod.main(["apply", str(codebook_path), str(records_path)])
+        captured = capsys.readouterr()
+
+        assert ret == 0
+        assert "malformed JSON" in captured.err
+        assert "malformed_json=1" in captured.out
+        reloaded = mod.load(codebook_path)
+        entry = next(e for e in reloaded["entries"] if e["id"] == "entry-a")
+        assert len(entry["sightings"]) == 1  # the valid line still applied
         assert len(reloaded["candidates"]) == 1
         assert mod.validate(reloaded) == []
 

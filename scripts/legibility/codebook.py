@@ -562,10 +562,17 @@ def migrate_v1_to_v2(codebook: dict) -> dict:
     'yes' entries are verified-real-but-unfixed causes, which is exactly
     'open' semantics); every other v1 field, including sightings_2026_06,
     is retained verbatim; entry order is preserved. Top-level candidates
-    defaults to [] (only if absent). Output passes validate().
+    defaults to [] (only if absent). The top-level `updated` field (if
+    present) is DROPPED rather than retained or re-stamped: under the
+    sole-writer design dump()/apply_coding_record() never touch it, so a
+    retained value would freeze at the migration date and mislead readers
+    as sightings accumulate, while a mutable timestamp would break dump()'s
+    byte-stable no-change-night guarantee (PRD §6.7). Output passes
+    validate() (V2_SCHEMA never required `updated`).
     """
     result = copy.deepcopy(codebook)
     result["version"] = 2
+    result.pop("updated", None)
 
     for entry in result.get("entries", []):
         entry.setdefault("origin_phase", "unknown")
@@ -617,14 +624,28 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         "skipped_unknown_entry": 0,
         "candidates_applied": 0,
         "record_invalid": 0,
+        "malformed_json": 0,
     }
 
     with open(args.records, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
+        for lineno, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
             if not line:
                 continue
-            record = json.loads(line)
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                # Mirror apply_coding_record()'s skip-whole semantics for an
+                # invalid record: one malformed JSONL line is dropped and
+                # counted, never aborts the rest of the nightly/trickle
+                # batch (a JSON parse error happens before a record can
+                # ever reach apply_coding_record()'s own validation skip).
+                print(
+                    f"{args.records}:{lineno}: malformed JSON, skipping: {exc}",
+                    file=sys.stderr,
+                )
+                totals["malformed_json"] += 1
+                continue
             codebook, stats = apply_coding_record(codebook, record)
             totals["matched"] += stats["matched"]
             totals["skipped_unknown_entry"] += stats["skipped_unknown_entry"]
@@ -641,7 +662,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     print(
         "applied: matched={matched} candidates_applied={candidates_applied} "
         "skipped_unknown_entry={skipped_unknown_entry} "
-        "record_invalid={record_invalid}".format(**totals)
+        "record_invalid={record_invalid} malformed_json={malformed_json}".format(**totals)
     )
     return 0
 

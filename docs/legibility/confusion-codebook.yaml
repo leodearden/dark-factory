@@ -5,7 +5,6 @@
 # are appended by the deterministic merger's apply_coding_record(). Hand edits
 # will be normalized/overwritten on the next merge.
 version: 2
-updated: 2026-07-13
 entries:
 - id: one-shot-subagent-contract
   title: 'Claim-verification and run-review judge subsystems are silent no-ops: one-shot CLI agents handed contracts the harness doesn''t provide'
