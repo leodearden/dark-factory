@@ -50,6 +50,20 @@ HEADER = """\
 # will be normalized/overwritten on the next merge.
 """
 
+# Removal-directive markers a §7.3 coding record must never carry (PRD §8.3
+# never-delete). Presence of any top-level key, or any match op with one of
+# these actions, is rejected outright by apply_coding_record() before it
+# mutates anything.
+_REMOVAL_KEYS = {"delete", "remove", "retract", "drop"}
+_REMOVAL_ACTIONS = {"delete", "remove"}
+
+
+class NeverDeleteError(Exception):
+    """Raised when a coding record carries a deletion-shaped directive, or
+    when a merge result would drop a codebook entry or shrink an entry's
+    sighting history. The confusion codebook is append-only (PRD §6/§8.3):
+    entries are retired via status='retired', never removed."""
+
 # ---------------------------------------------------------------------------
 # v2 schema (structural). Strict on v2-relevant fields; permissive on v1
 # free-form fields (area/cause/fix/fix_where/affected/filed_tasks/
@@ -241,6 +255,62 @@ def _build_sighting(payload: dict, *, session: str, date: str, project: str) -> 
     return sighting
 
 
+def _reject_deletion_directive(record: dict) -> None:
+    """Raise NeverDeleteError if `record` is deletion-shaped: a top-level
+    delete/remove/retract/drop key, or a match carrying a delete/remove
+    action. Called before apply_coding_record touches anything."""
+    if not isinstance(record, dict):
+        return
+    for key in _REMOVAL_KEYS:
+        if key in record:
+            raise NeverDeleteError(
+                f"coding record carries a removal directive: top-level {key!r} key"
+            )
+    for match in record.get("matches", []) or []:
+        if isinstance(match, dict) and match.get("action") in _REMOVAL_ACTIONS:
+            raise NeverDeleteError(
+                f"coding record match carries a removal action: {match.get('action')!r}"
+            )
+
+
+def assert_no_deletion(before: dict, after: dict) -> None:
+    """Structural never-delete post-condition, independent of how `after`
+    was constructed: every entry id present in `before` must still be
+    present in `after`, and every session recorded in an entry's sightings
+    in `before` must still be present in that same entry's sightings in
+    `after`. Retirement (status -> 'retired') is unaffected — it changes a
+    field, not entry/sighting presence. Raises NeverDeleteError otherwise.
+    """
+    before_entries = {
+        e["id"]: e
+        for e in (before.get("entries", []) or [])
+        if isinstance(e, dict) and "id" in e
+    }
+    after_entries = {
+        e["id"]: e
+        for e in (after.get("entries", []) or [])
+        if isinstance(e, dict) and "id" in e
+    }
+
+    missing = set(before_entries) - set(after_entries)
+    if missing:
+        raise NeverDeleteError(f"entries dropped from codebook: {sorted(missing)!r}")
+
+    for entry_id, before_entry in before_entries.items():
+        before_sessions = {
+            s.get("session") for s in (before_entry.get("sightings", []) or [])
+        }
+        after_sessions = {
+            s.get("session")
+            for s in (after_entries[entry_id].get("sightings", []) or [])
+        }
+        if not before_sessions <= after_sessions:
+            raise NeverDeleteError(
+                f"entry {entry_id!r} lost sightings for session(s): "
+                f"{sorted(s for s in (before_sessions - after_sessions) if s is not None)!r}"
+            )
+
+
 def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
     """Apply one §7.3 coding record to a v2 codebook. Sole-writer merge.
 
@@ -258,7 +328,15 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
     matched entry only if no existing sighting on that entry already
     carries this session (dedup key: (session, entry_id), the entry being
     implicit in "that entry's sightings list").
+
+    Never-delete: a deletion-shaped `record` (top-level delete/remove/
+    retract/drop key, or a match with a delete/remove action) raises
+    NeverDeleteError immediately, before `codebook` is even copied.
+    `assert_no_deletion()` is also run as a construction-independent
+    safety net just before returning.
     """
+    _reject_deletion_directive(record)
+
     stats = {
         "matched": 0,
         "skipped_unknown_entry": 0,
@@ -271,6 +349,7 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
     record_errors = validate_coding_record(record)
     if record_errors:
         stats["record_invalid"] = True
+        assert_no_deletion(codebook, result)
         return result, stats
 
     session = record["session"]
@@ -328,6 +407,7 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
             )
         stats["candidates_applied"] += 1
 
+    assert_no_deletion(codebook, result)
     return result, stats
 
 
