@@ -15,7 +15,7 @@ from shared.cli_invoke import AllAccountsCappedException
 
 from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
-from orchestrator.workflow import WorkflowOutcome
+from orchestrator.workflow import StewardInterrupted, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -928,28 +928,24 @@ class TestAwaitStewardCompletion:
         queue.resolve.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_re_escalates_on_timeout(self):
-        detail = json.dumps([{'description': 'test suggestion'}])
-        esc = _make_escalation(detail=detail)
+    async def test_returns_interrupted_with_no_queue_side_effects_on_timeout(self):
+        """task 2248 (W9-delta): the in-method L1 re-escalation-on-timeout
+        block was removed from _await_steward_completion — on grace-timeout
+        it now just returns StewardInterrupted('timeout', ...) and never
+        touches the escalation queue itself. _mark_blocked's single
+        StewardOutcome branch (see test_workflow_e2e.py) owns the
+        escalate-vs-resume-plan decision instead."""
         queue = MagicMock()
-        queue.make_id.return_value = 'esc-42-1'
-        queue.get_by_task.return_value = [esc]
-
         wf = _make_workflow(escalation_queue=queue)
         wf.config.steward_completion_timeout = 0.1
-        wf._steward = MagicMock()  # steward must be running to wait
+        wf._steward_outcome_channel = asyncio.Queue()  # nothing published
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion()
 
-        queue.submit.assert_called_once()
-        reesc = queue.submit.call_args[0][0]
-        assert reesc.level == 1
-        assert 'Steward timeout' in reesc.summary
-
-        queue.resolve.assert_called_once()
-        resolve_args = queue.resolve.call_args
-        assert resolve_args[0][0] == 'esc-42-0'
-        assert resolve_args[1].get('dismiss') is True
+        assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
+        queue.submit.assert_not_called()
+        queue.resolve.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

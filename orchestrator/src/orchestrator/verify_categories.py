@@ -1,7 +1,7 @@
 """Declarative failure-category table (PRD: plans/verify-plan-prd.md task α).
 
-Single source of truth for every category ``verify._classify_failure`` can
-return. Replaces 4 hand-synced registries in verify.py (``_ARCHIVE_DENY_LIST``,
+Single source of truth for every category ``verify_classify.classify_failure``
+can return. Replaces 4 hand-synced registries in verify.py (``_ARCHIVE_DENY_LIST``,
 ``_CATEGORY_PRIORITY``, ``PREEXISTING_BREAK_SKIP_CATEGORIES``, the sweep
 infra-sentinel set) plus the ``endswith('_error')`` archive heuristic with one
 table: ``CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy]``.
@@ -24,7 +24,7 @@ from typing import cast
 
 
 class FailureCategory(StrEnum):
-    """The closed 12-value output domain of ``verify._classify_failure``."""
+    """The closed 12-value output domain of ``verify_classify.classify_failure``."""
 
     INFRA_TIMEOUT = 'infra_timeout'
     CARGO_CLI_ERROR = 'cargo_cli_error'
@@ -187,8 +187,9 @@ def should_archive(category: str) -> bool:
     Pure CATEGORY_POLICY table lookup — no ``endswith('_error')`` heuristic.
     A category outside the known 12 (e.g. a verify_runner UNSCOPED_TYPECHECK_*
     sentinel, or any other unrecognized string) defaults to False. See
-    ``verify._classify_failure``'s docstring for the closed-domain contract
-    that keeps this default from silently misfiring on a future category.
+    ``verify_classify.classify_failure``'s docstring for the closed-domain
+    contract that keeps this default from silently misfiring on a future
+    category.
     """
     try:
         member = FailureCategory(category)
@@ -203,7 +204,7 @@ def _assert_sentinels_disjoint(sentinels, enum_cls) -> None:
     Reusable, unit-testable guard mirroring ``_validate_exhaustive``: proves
     an out-of-band sentinel namespace (e.g. verify_runner's
     UNSCOPED_TYPECHECK_* gate signals, injected into ``VerifyResult.category``
-    but never produced by ``_classify_failure``) is provably separate from
+    but never produced by ``classify_failure``) is provably separate from
     ``FailureCategory``'s closed 12-value output domain, so a future
     accidental collision is caught fail-loud at import time instead of
     silently conflating a gate signal with a real classifier category.

@@ -37,6 +37,7 @@ os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
 from _orch_helpers import (  # noqa: E402
     drain_async_mock_coroutines,
+    idle_psi_sample,
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
 )
@@ -204,6 +205,90 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     """
     monkeypatch.delenv("ORCH_CONFIG_PATH", raising=False)
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the ``real_psi_reader`` opt-out marker (task 2418).
+
+    ``orchestrator/pyproject.toml``'s ``[tool.pytest.ini_options] markers``
+    list is outside this task's locked scope, so the marker used by the
+    ``_hermetic_psi_reader`` fixture below is registered here instead, via
+    the standard ``addinivalue_line`` hook. Without one of the two
+    registration paths, applying ``@pytest.mark.real_psi_reader`` would
+    raise ``PytestUnknownMarkWarning`` under a future ``--strict-markers``
+    addopts change, silently defeating the escape hatch — today's
+    ``addopts`` doesn't set that flag, so this is precautionary rather than
+    load-bearing yet.
+    """
+    config.addinivalue_line(
+        'markers',
+        'real_psi_reader: opt a test OUT of the autouse `_hermetic_psi_reader` '
+        'patch so it exercises the REAL `shared.psi.read_psi_sample` bound at '
+        'Scheduler construction instead of the deterministic idle-sample stub. '
+        'Default: autouse idle-PSI patch installed in conftest.py (task 2418).',
+    )
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_psi_reader(monkeypatch, request):
+    """Default every Scheduler's PSI reader to a deterministic idle sample.
+
+    Task 2418 — fix for the scheduler-test xdist flake where the dispatch-
+    admission gate (``psi_admission.enabled`` defaults True,
+    ``orchestrator.config.PsiAdmissionConfig``) reads REAL
+    ``/proc/pressure/*`` via ``self._read_psi_sample()`` once per
+    ``acquire_next()`` tick (scheduler.py).  Under host load (e.g. full
+    parallel ``pytest -n auto --dist loadgroup``) ``mem_some_avg10`` can
+    cross its configured threshold, non-deterministically deferring dispatch
+    of non-deterministic candidates in any bare-config test that calls
+    ``acquire_next()`` — flipping dispatch/skip/park/holder assertions.
+
+    Monkeypatches the module-level ``orchestrator.scheduler.read_psi_sample``
+    — the seam ``Scheduler.__init__`` binds to ``self._read_psi_sample`` by
+    default — to ``idle_psi_sample`` (``_orch_helpers.py``), a non-saturating
+    PsiSample (all metrics 0.0, ``read_ok=True``).  Every ``Scheduler``
+    constructed during a test therefore defaults to a deterministic,
+    non-saturating PSI reading regardless of host load. ``monkeypatch``
+    auto-reverts at teardown, so production is never touched.
+
+    Saturation tests (``test_scheduler_dispatch_admission.py``,
+    ``test_scheduler_psi_saturation_transition.py``) reassign
+    ``scheduler._read_psi_sample`` post-construction and are unaffected —
+    that per-instance assignment overrides this constructor-time default.
+
+    Mirrors ``_isolate_orch_config`` immediately above: both neutralize a
+    host/global dependency (project_root / PSI) so the suite is hermetic
+    under parallel execution.  Guard test:
+    ``test_scheduler_hermetic_psi.py::TestAutouseFixtureDefaultsToIdlePsi``.
+
+    **Suite-wide, not scheduler-scoped**: this fixture lives in the
+    top-level orchestrator conftest (like its siblings above/below —
+    ``_isolate_orch_config``, ``_no_dry_run_unblock``, etc.), so it patches
+    every test, not just scheduler ones. Narrowing it to an allowlist would
+    mean auditing every one of the ~28 files that call ``acquire_next()`` or
+    construct a ``Scheduler`` — most of which this task does not hold locks
+    for — so it stays broad-by-default with the escape hatches below; a full
+    opt-in restructuring remains a follow-up outside this task's locked
+    scope.
+
+    **Opt-out via ``real_psi_reader`` marker**: tests that specifically need
+    the real ``shared.psi.read_psi_sample`` bound at construction — e.g. to
+    assert reader identity, or to exercise genuine ``/proc/pressure/*``
+    reads — mark themselves with ``@pytest.mark.real_psi_reader`` to skip
+    the monkeypatch, restoring the real binding. Mirrors the
+    ``exercise_merge_verify`` opt-out pattern elsewhere in this file.
+    Registered via this file's ``pytest_configure`` hook above (not in
+    ``orchestrator/pyproject.toml``'s ``markers = [...]`` list, which
+    remains outside this task's locked scope), so the marker survives a
+    future ``--strict-markers`` addopts change instead of erroring at
+    collection. Guard test for this opt-out branch:
+    ``test_scheduler_hermetic_psi.py::test_real_psi_reader_marker_restores_real_reader``.
+    A test may instead reassign ``scheduler._read_psi_sample``
+    post-construction, as the saturation tests do.
+    """
+    if request.node.get_closest_marker('real_psi_reader'):
+        return
+    monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', idle_psi_sample)
 
 
 @pytest.fixture(autouse=True)

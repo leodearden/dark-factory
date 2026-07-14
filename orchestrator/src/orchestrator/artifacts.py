@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -125,6 +126,29 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
     return plan, modified
 
 
+_VALID_VERDICT_ROLE_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def _validate_verdict_role(role: str) -> None:
+    """Guard ``verdicts/<role>.json`` against escaping the ``verdicts/`` dir.
+
+    ``role`` is currently always the trusted ``--verdict-role`` CLI arg
+    (see verdict_tools.py's ``_artifacts_from_args``), so a path separator
+    or ``..`` can never reach here today. The guard exists so a future,
+    less-trusted caller can't turn an unsanitized role into a
+    write/read/clear outside ``verdicts/``.
+
+    Raises:
+        ValueError: if *role* contains anything other than letters, digits,
+            underscores, or hyphens.
+    """
+    if not _VALID_VERDICT_ROLE_RE.fullmatch(role):
+        raise ValueError(
+            f'invalid verdict role {role!r}: must match '
+            f'{_VALID_VERDICT_ROLE_RE.pattern!r}'
+        )
+
+
 @dataclass
 class ReviewAggregation:
     """Aggregated review results from all reviewers."""
@@ -217,6 +241,7 @@ class TaskArtifacts:
         """
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / 'reviews').mkdir(exist_ok=True)
+        (self.root / 'verdicts').mkdir(exist_ok=True)
 
         metadata = {
             'task_id': task_id,
@@ -711,6 +736,63 @@ class TaskArtifacts:
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning('Corrupt agent_session.json at %s: %s', path, exc)
             return None
+
+    # ──────────────────────────────────────────────────────────────────
+    # Verdict artifacts — written by the per-worktree verdict-tools MCP
+    # server (task 2481). One file per role under verdicts/<role>.json;
+    # the role-derived filename is authoritative (never an agent-supplied
+    # field), so a reviewer cannot misname its artifact onto a sibling's.
+    # ──────────────────────────────────────────────────────────────────
+
+    def write_verdict(self, role: str, envelope: dict) -> None:
+        """Write ``.task/verdicts/{role}.json``.
+
+        Best-effort: if the artifacts root has been removed (worktree gone
+        out-of-band), skip the write rather than raising — mirrors
+        ``write_review``'s root-gone guard. This method assumes ``init()``
+        has already created ``self.root``.
+
+        Raises:
+            ValueError: if *role* is invalid — see ``_validate_verdict_role``.
+        """
+        _validate_verdict_role(role)
+        if not self.root.is_dir():
+            logger.info(
+                'TaskArtifacts: skipping write_verdict %r — root %s no longer exists',
+                role, self.root,
+            )
+            return
+        verdict_path = self.root / 'verdicts' / f'{role}.json'
+        self._write_json(verdict_path, envelope)
+
+    def read_verdict(self, role: str) -> dict | None:
+        """Return parsed ``.task/verdicts/{role}.json``, or ``None`` if
+        missing/corrupt.
+
+        Raises:
+            ValueError: if *role* is invalid — see ``_validate_verdict_role``.
+        """
+        _validate_verdict_role(role)
+        path = self._read_path(f'verdicts/{role}.json')
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning('Corrupt verdicts/%s.json at %s: %s', role, path, exc)
+            return None
+
+    def clear_verdict(self, role: str) -> None:
+        """Remove ``.task/verdicts/{role}.json`` if present (idempotent).
+
+        Called before spawning a role's agent so a stale verdict from a
+        prior invocation never masquerades as this run's output.
+
+        Raises:
+            ValueError: if *role* is invalid — see ``_validate_verdict_role``.
+        """
+        _validate_verdict_role(role)
+        self._clear_path(f'verdicts/{role}.json')
 
     def lock_plan(self, session_id: str) -> bool:
         """Atomically acquire the plan lock.

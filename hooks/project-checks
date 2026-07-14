@@ -9,6 +9,11 @@ echo "pre-commit: linting (main branch)..."
 ALL_PACKAGES=(shared escalation fused-memory orchestrator dashboard)
 # Packages with [tool.pyright] config (pyright runs per-package from its directory)
 PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard)
+# Shared dependency packages imported by every PYRIGHT_PACKAGES package. These
+# aren't pyright-configured themselves, so a staged change here can't be
+# caught by the per-package prefix filter below — it must instead force a
+# full pyright sweep across all PYRIGHT_PACKAGES. See task 2551.
+DEP_PACKAGES=(shared escalation)
 
 DIRS=()
 for pkg in "${ALL_PACKAGES[@]}"; do
@@ -57,14 +62,52 @@ if [ -n "$staged_mm" ]; then
 fi
 
 # pyright (must run from each package directory to pick up [tool.pyright] config)
-for pkg in "${PYRIGHT_PACKAGES[@]}"; do
-    dir="$ROOT/$pkg"
-    [ -d "$dir" ] || continue
-    echo "  pyright: $pkg"
-    if ! (cd "$dir" && uv run pyright); then
-        echo "pre-commit: pyright failed in $pkg. Fix type errors before committing to main."
-        exit 1
-    fi
-done
+# Path-filtered: only run for packages with staged .py changes, so docs/plans-only
+# commits (and commits scoped to a single package) don't pay for an unconditional
+# 3x pyright run. A staged change under a DEP_PACKAGES dependency (shared,
+# escalation) forces a full sweep across all PYRIGHT_PACKAGES instead: those
+# packages aren't in PYRIGHT_PACKAGES themselves, so the per-package prefix
+# filter would otherwise match nothing and skip pyright everywhere, even
+# though fused-memory/orchestrator/dashboard all import from them. See task 2551.
+# -c core.quotepath=false stops git from quoting/escaping non-ASCII path
+# bytes (its default quoting only covers bytes >= 0x80; control characters and
+# literal quote/backslash bytes are always escaped regardless of this
+# setting). A path with an embedded newline or a leading double-quote could
+# still fail the ^${dep}/ / ^${pkg}/ prefix matches below and silently skip
+# pyright for a package that was actually staged — a pre-existing limitation
+# shared by the ruff/asyncmock/magicmock staged-file filters elsewhere in this
+# script (not a regression), accepted as low-likelihood given this repo's
+# file-naming conventions. See task 2551.
+staged_py_all="$(cd "$ROOT" && git -c core.quotepath=false diff --cached --name-only --diff-filter=ACMR | grep -E '\.py$' || true)"
+if [ -z "$staged_py_all" ]; then
+    echo "pre-commit: pyright skipped (no Python changes)"
+else
+    run_all=false
+    for dep in "${DEP_PACKAGES[@]}"; do
+        if printf '%s\n' "$staged_py_all" | grep -q "^${dep}/"; then
+            run_all=true
+            break
+        fi
+    done
+    # Note: a staged .py file that lives outside every DEP_PACKAGES and
+    # PYRIGHT_PACKAGES prefix (e.g. a repo-root script) leaves run_all=false
+    # and matches no ^${pkg}/ prefix below, so pyright is skipped everywhere
+    # for that commit. Accepted as an over-narrowing given this repo's layout
+    # (root-level Python is rare and itself unconfigured for pyright); if that
+    # changes, treat "staged .py matching no known package prefix" as its own
+    # run_all trigger. See task 2551.
+    for pkg in "${PYRIGHT_PACKAGES[@]}"; do
+        dir="$ROOT/$pkg"
+        [ -d "$dir" ] || continue
+        if [ "$run_all" = false ] && ! printf '%s\n' "$staged_py_all" | grep -q "^${pkg}/"; then
+            continue
+        fi
+        echo "  pyright: $pkg"
+        if ! (cd "$dir" && uv run pyright); then
+            echo "pre-commit: pyright failed in $pkg. Fix type errors before committing to main."
+            exit 1
+        fi
+    done
+fi
 
 echo "pre-commit: all checks passed."

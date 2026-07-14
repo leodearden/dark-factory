@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from pydantic import BaseModel
 from shared.config_models import AccountConfig, UsageCapConfig
+from shared.psi import PsiSample
 from shared.usage_gate import AccountState, UsageGate
 
 if TYPE_CHECKING:
@@ -100,6 +101,43 @@ _BASEMODEL_PROPS: frozenset[str] = frozenset(
     name for name, v in inspect.getmembers(BaseModel) if isinstance(v, property)
 )
 _BASEMODEL_ATTRS: frozenset[str] = frozenset(dir(BaseModel))
+
+
+def idle_psi_sample() -> PsiSample:
+    """Return the hermetic default PSI reading: idle and read_ok.
+
+    Task 2418 — fix for the scheduler-test xdist flake where the dispatch-
+    admission gate (``psi_admission.enabled`` defaults True, scheduler.py)
+    reads REAL ``/proc/pressure/*`` via ``self._read_psi_sample()`` once per
+    ``acquire_next()`` tick.  Under host load (e.g. full parallel ``pytest -n
+    auto``) ``mem_some_avg10`` can cross its configured threshold, so the
+    gate non-deterministically defers dispatch of non-deterministic
+    candidates in any bare-config test.
+
+    This is a non-saturating sample (all four metrics 0.0, well under every
+    configured threshold) with ``read_ok=True`` — it exercises the gate's
+    normal "healthy host" path rather than the ``read_ok=False`` fail-open
+    sentinel, so tests validate the real admission logic rather than a
+    short-circuit.  Mirrors the admission suite's own idle default,
+    ``test_scheduler_dispatch_admission.py``'s ``_psi(read_ok=True)`` (all
+    metrics 0.0).
+
+    Injected suite-wide as every ``Scheduler``'s default ``_read_psi_sample``
+    by conftest's autouse ``_hermetic_psi_reader`` fixture, which monkeypatches
+    the module-level ``orchestrator.scheduler.read_psi_sample`` (bound at
+    ``__init__`` time to ``self._read_psi_sample``).  Callable with no
+    arguments to match that call site (``self._read_psi_sample()``,
+    scheduler.py) exactly — tests that need a specific (e.g. saturated)
+    reading still reassign ``scheduler._read_psi_sample`` post-construction,
+    which overrides this default same as before.
+    """
+    return PsiSample(
+        cpu_some10=0.0,
+        mem_some10=0.0,
+        mem_full10=0.0,
+        io_some10=0.0,
+        read_ok=True,
+    )
 
 
 def drain_async_mock_coroutines() -> int:

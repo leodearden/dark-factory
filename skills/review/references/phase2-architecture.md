@@ -193,6 +193,20 @@ Trace how data structures transform as they cross module boundaries:
 - Missing transitive dependencies in `pyproject.toml`
 - Modules that import from internal paths of other packages (fragile coupling)
 
+## Step 5.5: Design-invariants audit
+
+### Detect and audit
+
+1. **Detect.** Check whether `docs/legibility/design-invariants.md` exists at project root. If absent, skip this step.
+
+2. **Read and audit.** If present, Read it and audit the modules in scope against each invariant's checkable question. The doc is normative — reference invariant slugs only; do not restate the invariant list here.
+
+3. **Classify severity.** Classify findings like stub findings in Step 2 (by blast radius): `severity` ∈ `{high, warning, info}` — the same vocabulary Step 2's classify table uses and Phase 3 triage's Priority mapping (`phase3-triage.md`) consumes.
+
+### Record findings
+
+Record findings under `invariant_findings` in the phase-2 JSON (schema in Step 8): `{"invariant": <slug>, "file": ..., "line": ..., "issue": ..., "severity": ...}`.
+
 ## Step 6: Dead code and orphan detection
 
 ### Delegate scanning to Sonnet agent
@@ -331,6 +345,17 @@ Write to `review/reports/phase2-{timestamp}.json`:
   },
   "test_coverage_gaps": {
     "findings": []
+  },
+  "invariant_findings": {
+    "findings": [
+      {
+        "invariant": "no-lockstep-duplication",
+        "file": "fused_memory/routing/classifier.py",
+        "line": 88,
+        "issue": "category table duplicated in classifier.py and router.py — no single source of truth",
+        "severity": "high"
+      }
+    ]
   }
 }
 ```
@@ -343,6 +368,7 @@ Write to `review/reports/phase2-{timestamp}.json`:
 - Stubs: 3 unintended (tasks claimed done), 2 known gaps, 1 accepted
 - Critical paths: 1 issue — classifier returns without calling Mem0 store
 - Cross-module: no issues
+- Design invariants: 1 finding (no-lockstep-duplication)
 - Dead code: 2 orphan modules
 - Test gaps: no integration test for cross-store search
 ```

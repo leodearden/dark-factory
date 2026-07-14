@@ -1,0 +1,25 @@
+# Cockpit orchestrator configuration
+# Scopes verification to cockpit's own venv and the full tests/ tree (not just
+# the files a task happens to touch) — tests marked @pytest.mark.smoke are
+# default-deselected via cockpit/pyproject.toml's `addopts = "-m 'not smoke'"`
+# (a marker-based rule that deselects regardless of location, not a
+# tests/smoke/ path convention; this worktree is the live DISPLAY=:0 host, so
+# routine unscoped runs must never spawn real X11 windows/tmux sessions).
+# Pinning the full tests/ tree keeps the selected set non-empty regardless of
+# which files a task touches, avoiding a pytest rc=5 ("no tests ran")
+# misclassification — see task 2446 / precedent 1852.
+
+# Verification commands
+test_command: "uv run --project cockpit --directory cockpit pytest tests/ --tb=short -q"
+# bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks).
+# NOTE: `--directory cockpit` scopes only the `uv run ruff` invocation; the
+# chained `python3 fused-memory/scripts/...` call is a separate process whose
+# relative paths (`fused-memory/scripts/...`, `cockpit/tests`) resolve against
+# the *verify runner's* cwd, not cockpit/. That cwd is always the worktree
+# root (orchestrator/src/orchestrator/verify.py's run_verification passes
+# cwd=worktree to every command, never a subdirectory), so this is safe as
+# long as lint_command keeps being invoked that way — same assumption
+# shared/orchestrator.yaml and dashboard/orchestrator.yaml make for their
+# identical chained check_bare_magicmock_config.py call.
+lint_command: "uv run --project cockpit --directory cockpit ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py cockpit/tests"
+type_check_command: "uv run --project cockpit --directory cockpit pyright src/ tests/"

@@ -961,3 +961,97 @@ class TestParseMetadataFailurePolicy:
     def test_non_object_blob_write_enforce_raises(self, blob):
         with pytest.raises((TypeError, ValueError)):
             parse_metadata(blob, direction='write', enforce=True)  # type: ignore[arg-type]
+
+
+class _CheckStub(BaseModel):
+    """Throwaway list-element sub-model standing in for capability_manifest's
+    future DeliveredCheckMeta registration under 'delivered_checks'."""
+
+    name: str
+
+
+class TestListValuedSubmodelSlice:
+    """Generic list-valued registered slice support in parse_metadata.
+
+    Pins the behavior needed by capability_manifest.DeliveredCheckMeta
+    (plans/capability-delivered-checks-prd.md §Contract) before that real
+    model is wired in: metadata.delivered_checks is a LIST, but the existing
+    splat `submodel(**parsed[key])` only handles mapping slices (a list
+    raises TypeError). dict-valued slices (milestone, deploy_state) must
+    stay on the byte-identical unchanged path.
+    """
+
+    _KEY = 'delivered_checks_stub'
+
+    def test_valid_list_slice_validated_and_typed_no_warnings(self):
+        register_metadata_submodel(self._KEY, _CheckStub)
+        model, warnings = parse_metadata(
+            {self._KEY: [{'name': 'a'}, {'name': 'b'}]}, direction='write'
+        )
+        assert warnings == []
+        slice_value = getattr(model, self._KEY)
+        assert isinstance(slice_value, list)
+        assert all(isinstance(item, _CheckStub) for item in slice_value)
+        assert [item.name for item in slice_value] == ['a', 'b']
+
+    def test_valid_list_slice_round_trips_as_plain_dicts(self):
+        register_metadata_submodel(self._KEY, _CheckStub)
+        model, warnings = parse_metadata(
+            {self._KEY: [{'name': 'a'}, {'name': 'b'}]}, direction='write'
+        )
+        assert warnings == []
+        dumped = model.model_dump()[self._KEY]
+        assert dumped == [{'name': 'a'}, {'name': 'b'}]
+        assert all(not isinstance(item, BaseModel) for item in dumped)
+
+    def test_empty_list_slice_validates_to_empty_list(self):
+        register_metadata_submodel(self._KEY, _CheckStub)
+        model, warnings = parse_metadata({self._KEY: []}, direction='write')
+        assert warnings == []
+        assert getattr(model, self._KEY) == []
+
+    def test_malformed_element_read_warns_and_retains_raw_list(self):
+        register_metadata_submodel(self._KEY, _CheckStub)
+        model, warnings = parse_metadata({self._KEY: [{'name': 'a'}, {}]}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == self._KEY
+        assert warnings[0].code == 'invalid_submodel'
+        assert model.model_dump()[self._KEY] == [{'name': 'a'}, {}]
+
+    def test_malformed_element_write_enforce_raises(self):
+        register_metadata_submodel(self._KEY, _CheckStub)
+        with pytest.raises(ValidationError):
+            parse_metadata({self._KEY: [{'name': 'a'}, {}]}, direction='write', enforce=True)
+
+    def test_malformed_element_write_warn_mode_accepts_raw_list(self):
+        register_metadata_submodel(self._KEY, _CheckStub)
+        model, warnings = parse_metadata({self._KEY: [{}]}, direction='write', enforce=False)
+        assert len(warnings) == 1
+        assert warnings[0].code == 'invalid_submodel'
+        assert model.model_dump()[self._KEY] == [{}]
+
+    def test_non_mapping_element_in_list_read_warns_never_raises(self):
+        register_metadata_submodel(self._KEY, _CheckStub)
+        model, warnings = parse_metadata({self._KEY: ['not-a-dict']}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].code == 'invalid_submodel'
+        assert model.model_dump()[self._KEY] == ['not-a-dict']
+
+    def test_non_mapping_element_in_list_write_enforce_raises(self):
+        register_metadata_submodel(self._KEY, _CheckStub)
+        with pytest.raises((ValidationError, TypeError)):
+            parse_metadata({self._KEY: ['not-a-dict']}, direction='write', enforce=True)
+
+    def test_existing_dict_slice_milestone_unaffected(self):
+        # Regression guard: dict-valued registered slices (e.g. milestone)
+        # must stay on the byte-identical submodel(**raw) path.
+        model, warnings = parse_metadata(
+            {'milestone': {'mode': 'delayed', 'after_secs': 604800}}, direction='write'
+        )
+        assert warnings == []
+        assert isinstance(model.milestone, Milestone)  # type: ignore[attr-defined]
+        assert model.model_dump()['milestone'] == {
+            'mode': 'delayed',
+            'at': None,
+            'after_secs': 604800,
+        }

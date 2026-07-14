@@ -14,8 +14,10 @@ split:
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
+import pytest
 from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import OrchestratorConfig
@@ -126,3 +128,71 @@ def test_merge_queue_reexports_identical_objects() -> None:
     )
     assert request.task_id == 't1'
     assert request.branch == '591'
+
+
+class TestQueuedBranch:
+    """Unit tests for QueuedBranch.parse (PRD merge-queue-reliability-prd.md
+    task mu, scope 5, DD7 — B9 boundary test, producer half).
+
+    parse(raw, branch_prefix) is the ONLY place branch-prefix logic lives
+    (parse-don't-validate): a bare id ('4778') and an already-prefixed name
+    ('task/4778') both collapse to the same canonical QueuedBranch value.
+    """
+
+    def test_parse_bare_raw(self) -> None:
+        """parse('4778', 'task/') -> bare_id='4778', full_name='task/4778'."""
+        from orchestrator.merge_types import QueuedBranch
+
+        qb = QueuedBranch.parse('4778', 'task/')
+        assert qb.bare_id == '4778'
+        assert qb.full_name == 'task/4778'
+
+    def test_parse_already_prefixed_raw(self) -> None:
+        """parse('task/4778', 'task/') yields the SAME shape as the bare form."""
+        from orchestrator.merge_types import QueuedBranch
+
+        qb = QueuedBranch.parse('task/4778', 'task/')
+        assert qb.bare_id == '4778'
+        assert qb.full_name == 'task/4778'
+
+    def test_bare_and_prefixed_raw_compare_equal(self) -> None:
+        """Mixed input shape collapses to one canonical value (value equality)."""
+        from orchestrator.merge_types import QueuedBranch
+
+        assert QueuedBranch.parse('4778', 'task/') == QueuedBranch.parse('task/4778', 'task/')
+
+    def test_parse_is_idempotent_round_trip(self) -> None:
+        """Re-parsing either derived field reproduces the same QueuedBranch."""
+        from orchestrator.merge_types import QueuedBranch
+
+        qb = QueuedBranch.parse('4778', 'task/')
+        assert QueuedBranch.parse(qb.full_name, 'task/') == qb
+        assert QueuedBranch.parse(qb.bare_id, 'task/') == qb
+
+    def test_parse_empty_prefix_is_noop(self) -> None:
+        """An empty branch_prefix leaves bare_id and full_name identical."""
+        from orchestrator.merge_types import QueuedBranch
+
+        qb = QueuedBranch.parse('4778', '')
+        assert qb.bare_id == '4778'
+        assert qb.full_name == '4778'
+
+    def test_incoherent_pair_raises_value_error(self) -> None:
+        """A hand-built (bare_id, full_name) pair that doesn't cohere is rejected.
+
+        parse() never produces this shape — full_name always ends with
+        bare_id — so this only trips on a direct, bypassing-parse
+        construction. Realizes "mixed shape unrepresentable" (PRD DD7).
+        """
+        from orchestrator.merge_types import QueuedBranch
+
+        with pytest.raises(ValueError):
+            QueuedBranch(bare_id='4778', full_name='wrong/9999')
+
+    def test_parse_result_is_frozen(self) -> None:
+        """A QueuedBranch produced by parse is immutable."""
+        from orchestrator.merge_types import QueuedBranch
+
+        qb = QueuedBranch.parse('4778', 'task/')
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            qb.bare_id = 'x'  # type: ignore[misc]

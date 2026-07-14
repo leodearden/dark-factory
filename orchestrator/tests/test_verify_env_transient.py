@@ -38,6 +38,8 @@ import pytest
 from orchestrator import verify
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_classify import classify_failure
+from orchestrator.verify_cmd import ToolKind
 
 
 class TestClassifyFailureEnvTransient:
@@ -49,7 +51,7 @@ class TestClassifyFailureEnvTransient:
     """
 
     def _classify(self, output: str, rc: int, timed_out: bool) -> str:
-        return verify._classify_failure(output, rc, timed_out)
+        return classify_failure(ToolKind.PYTEST, rc, output, timed_out)
 
     def test_xdist_usage_error_is_env_transient(self):
         """pytest usage error (rc=4) when the xdist plugin vanished mid-run.
@@ -484,7 +486,7 @@ class TestClassifyFailurePipWordBoundary:
     """
 
     def _classify(self, output: str, rc: int, timed_out: bool) -> str:
-        return verify._classify_failure(output, rc, timed_out)
+        return classify_failure(ToolKind.PYTEST, rc, output, timed_out)
 
     @pytest.mark.parametrize(
         'module_name',
@@ -545,7 +547,7 @@ class TestClassifyFailureXdistUsageErrorPytestScoped:
     """
 
     def _classify(self, output: str, rc: int, timed_out: bool) -> str:
-        return verify._classify_failure(output, rc, timed_out)
+        return classify_failure(ToolKind.PYTEST, rc, output, timed_out)
 
     def test_non_pytest_unrecognized_arguments_not_env_transient(self):
         """A different CLI tool's usage error must not be swept into

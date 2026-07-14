@@ -1,8 +1,10 @@
 """Tests for git operations — worktree lifecycle."""
 
 import asyncio
+import fcntl
 import json
 import logging
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -9120,3 +9122,366 @@ class TestWarmLaneRefIsDegenerate:
             f'Expected a WARNING log on the exception path, got: '
             f'{[r.getMessage() for r in warnings]}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2442 step-3/4 — GitOps._run_thin_warm_lane unit tests (§9.5 η)
+# ---------------------------------------------------------------------------
+
+
+def _write_thin_warm_lane_stub(scripts_dir: Path) -> None:
+    """Write a thin-warm-lane.sh stub into scripts_dir.
+
+    Mirrors _write_degenerate_ref_check_stub: appends the full argv (one
+    line) to ``<repo>/.test_thin_warm_lane_call_log`` and exits with the code
+    read from ``<repo>/.test_thin_warm_lane_exit`` (defaults to 0 when absent).
+    """
+    script = scripts_dir / 'thin-warm-lane.sh'
+    script.write_text(
+        '#!/usr/bin/env bash\n'
+        'set -euo pipefail\n'
+        'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+        'ROOT="$(dirname "$DIR")"\n'
+        'echo "$*" >> "$ROOT/.test_thin_warm_lane_call_log"\n'
+        'if [ -f "$ROOT/.test_thin_warm_lane_exit" ]; then\n'
+        '    rc=$(cat "$ROOT/.test_thin_warm_lane_exit")\n'
+        'else\n'
+        '    rc=0\n'
+        'fi\n'
+        'exit "${rc:-0}"\n'
+    )
+    script.chmod(0o755)
+
+
+def _set_thin_warm_lane_exit(repo: Path, code: int) -> None:
+    """Set the exit code the stub script will return on its next invocation."""
+    (repo / '.test_thin_warm_lane_exit').write_text(str(code))
+
+
+def _read_thin_warm_lane_call_log(repo: Path) -> list[str]:
+    log = repo / '.test_thin_warm_lane_call_log'
+    if not log.exists():
+        return []
+    return [line for line in log.read_text().splitlines() if line.strip()]
+
+
+@pytest.mark.asyncio
+class TestRunThinWarmLane:
+    """Unit tests for GitOps._run_thin_warm_lane (task 2442 step-4).
+
+    Fail-soft, never-raise wrapper around reify δ's
+    scripts/thin-warm-lane.sh (§9.5 η): an absent script, a benign
+    already-re-acquired skip (rc=75), and an unexpected exception must all
+    fail-soft (127 sentinel or pass-through); only genuine errors log at
+    WARNING — rc=75 is a benign skip and must NEVER warn (inv.11).
+    """
+
+    async def test_absent_script_returns_127_no_spawn(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """No scripts/ dir at all (fresh git_repo fixture) → fail-soft 127, no spawn."""
+        from unittest.mock import AsyncMock
+
+        lane = git_repo / '_lane-0'
+        lane.mkdir()
+        mock_run = AsyncMock(return_value=(0, '', ''))
+
+        with patch('orchestrator.git_ops._run', mock_run):
+            rc = await git_ops._run_thin_warm_lane(lane)
+
+        assert rc == 127
+        mock_run.assert_not_called()
+
+    async def test_exit_0_returns_0_and_invokes_expected_argv(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_thin_warm_lane_stub(scripts_dir)
+        _set_thin_warm_lane_exit(git_repo, 0)
+        lane = git_repo / '_lane-0'
+        lane.mkdir()
+
+        rc = await git_ops._run_thin_warm_lane(lane)
+
+        assert rc == 0
+        [line] = _read_thin_warm_lane_call_log(git_repo)
+        assert line == str(lane), (
+            f'expected argv to be exactly the lane_dir positional, got {line!r}'
+        )
+
+    async def test_exit_75_returns_75_and_no_warning(
+        self, git_ops: GitOps, git_repo: Path, caplog,
+    ):
+        """rc=75 (EX_TEMPFAIL — lane already re-acquired, flock held) is a
+        benign skip: returned as-is, but NEVER logged at WARNING (inv.11)."""
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_thin_warm_lane_stub(scripts_dir)
+        _set_thin_warm_lane_exit(git_repo, 75)
+        lane = git_repo / '_lane-0'
+        lane.mkdir()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            rc = await git_ops._run_thin_warm_lane(lane)
+
+        assert rc == 75
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warnings, (
+            f'rc=75 is a benign re-acquire skip and must never WARN; got '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+
+    async def test_exit_1_returns_1_and_logs_warning(
+        self, git_ops: GitOps, git_repo: Path, caplog,
+    ):
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_thin_warm_lane_stub(scripts_dir)
+        _set_thin_warm_lane_exit(git_repo, 1)
+        lane = git_repo / '_lane-0'
+        lane.mkdir()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            rc = await git_ops._run_thin_warm_lane(lane)
+
+        assert rc == 1
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('_run_thin_warm_lane' in r.getMessage() for r in warnings), (
+            f'Expected a WARNING naming _run_thin_warm_lane, got '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+
+    async def test_run_exception_returns_127_and_logs_warning(
+        self, git_ops: GitOps, git_repo: Path, caplog,
+    ):
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_thin_warm_lane_stub(scripts_dir)
+        _set_thin_warm_lane_exit(git_repo, 0)
+        lane = git_repo / '_lane-0'
+        lane.mkdir()
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+            patch('orchestrator.git_ops._run', side_effect=RuntimeError('boom')),
+        ):
+            rc = await git_ops._run_thin_warm_lane(lane)
+
+        assert rc == 127, 'an exception from _run must fail-soft to 127, never raise'
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('_run_thin_warm_lane' in r.getMessage() for r in warnings), (
+            f'Expected a WARNING naming _run_thin_warm_lane, got '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+
+    async def test_skipped_when_pool_in_use_and_storage_absent(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """pool_in_use() True and pool_storage_present() False → skipped
+        (returns 127, script not spawned) — mirrors
+        _run_warm_lane_gc_reclaim's pool-storage guard (task 2099)."""
+        from orchestrator.warm_lane_pool import WarmLanePool
+
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_thin_warm_lane_stub(scripts_dir)
+        _set_thin_warm_lane_exit(git_repo, 0)
+        lane = git_repo / '_lane-0'
+        lane.mkdir()
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
+        assert git_ops.pool_in_use()
+        assert not git_ops.pool_storage_present()
+
+        rc = await git_ops._run_thin_warm_lane(lane)
+
+        assert rc == 127
+        assert _read_thin_warm_lane_call_log(git_repo) == [], (
+            'script must not be spawned when pool storage is absent/unmounted'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 2442 amend — real flock contention for _run_thin_warm_lane's rc=75 path
+# (review: git_ops.py:2323 — the rc=75 benign-skip path was previously only
+# exercised via a forced stub exit code, never an actual flock conflict on
+# <lane_dir>.lock, the mechanism a concurrent re-acquire actually relies on)
+# ---------------------------------------------------------------------------
+
+
+def _write_thin_warm_lane_flock_stub(scripts_dir: Path) -> None:
+    """Write a thin-warm-lane.sh stub that mirrors the REAL T3 flock gate.
+
+    Unlike ``_write_thin_warm_lane_stub`` above (a configurable-exit stub
+    used to unit-test each branch of ``_run_thin_warm_lane`` in isolation
+    without caring *why* a given rc was produced), this stub reproduces the
+    shape of reify's actual ``scripts/thin-warm-lane.sh`` T3 block: it opens
+    ``<lane_dir>.lock`` (a sibling lock file, trailing slash stripped —
+    same convention as the real script) and acquires it via non-blocking
+    ``flock -n``, exiting 75 if — and only if — it genuinely cannot.
+    Otherwise it exits 0. This lets a test hold a real OS-level flock on
+    that same lock file from the test process and observe
+    ``_run_thin_warm_lane`` correctly propagate the rc=75 that real
+    contention produces, rather than one a stub was merely told to return.
+    """
+    script = scripts_dir / 'thin-warm-lane.sh'
+    script.write_text(
+        '#!/usr/bin/env bash\n'
+        'set -euo pipefail\n'
+        'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+        'ROOT="$(dirname "$DIR")"\n'
+        'LANE_DIR="${1%/}"\n'
+        'echo "$*" >> "$ROOT/.test_thin_warm_lane_call_log"\n'
+        'LANE_LOCK="${LANE_DIR}.lock"\n'
+        'exec 9>"$LANE_LOCK"\n'
+        'if ! flock -n 9; then\n'
+        '    exec 9>&-\n'
+        '    exit 75\n'
+        'fi\n'
+        'exit 0\n'
+    )
+    script.chmod(0o755)
+
+
+@pytest.mark.asyncio
+class TestRunThinWarmLaneFlockContention:
+    """rc=75 exercised against a REAL held flock, not a scripted exit code.
+
+    Amendment requested by the task 2442 code review (git_ops.py:2323):
+    ``TestRunThinWarmLane.test_exit_75_returns_75_and_no_warning`` only
+    proves ``_run_thin_warm_lane`` *interprets* rc=75 correctly once told to
+    return it — it says nothing about whether genuine contention on
+    ``<lane_dir>.lock`` (the T3 mechanism a concurrent re-acquire actually
+    relies on — see the "Flock contract" note on ``_run_thin_warm_lane``'s
+    docstring and reify PRD §9.3 invariant T3 / §9.5 inv.10) is observed
+    correctly end-to-end. These tests hold a genuine OS-level flock from the
+    test process itself, against a stub that performs the real ``flock -n``
+    gate, to close that gap.
+    """
+
+    async def test_contended_lock_yields_75_and_no_warning(
+        self, git_ops: GitOps, git_repo: Path, caplog,
+    ):
+        """Test process holds the lane's flock → the stub genuinely fails
+        to acquire it and exits 75 → wrapper propagates 75 and never WARNs
+        (inv.11: a benign re-acquire race is not a fault)."""
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_thin_warm_lane_flock_stub(scripts_dir)
+        lane = git_repo / '_lane-0'
+        lane.mkdir()
+        lock_path = Path(f'{lane}.lock')
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+                rc = await git_ops._run_thin_warm_lane(lane)
+
+            assert rc == 75, (
+                'a genuinely held flock on <lane_dir>.lock must surface as '
+                'rc=75, exactly like a concurrent re-acquire racing this '
+                'release would produce'
+            )
+            assert _read_thin_warm_lane_call_log(git_repo) == [str(lane)], (
+                'the script must actually have been spawned and attempted '
+                'the flock — this is real contention, not a skipped call'
+            )
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert not warnings, (
+                f'rc=75 from real contention must never WARN (inv.11); got '
+                f'{[r.getMessage() for r in warnings]}'
+            )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+    async def test_uncontended_lock_yields_0(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """Control for the above: with nobody holding the lock, the SAME
+        flock-real stub acquires it and exits 0 — proving the stub
+        genuinely discriminates on contention rather than being hardcoded
+        to 75, so the rc=75 assertion above is meaningful."""
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_thin_warm_lane_flock_stub(scripts_dir)
+        lane = git_repo / '_lane-1'
+        lane.mkdir()
+
+        rc = await git_ops._run_thin_warm_lane(lane)
+
+        assert rc == 0, (
+            'with no concurrent holder, the flock-real stub must acquire '
+            'the lock and exit 0 (thinned)'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 2442 amend (round 2) — pin that _seed_warm_lane does NOT take
+# <lane_dir>.lock (review: git_ops.py:2570 — the "never thinned while
+# ASSIGNED" safety argument holds only if the re-acquire side ALSO honors
+# the lane-lock contract; this proves the current DF Python layer provides
+# no such defense, so the coupling is auditable rather than assumed)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSeedWarmLaneDoesNotTakeLaneLock:
+    """Pins the lane-lock coupling gap flagged by the task 2442 code review.
+
+    ``_run_thin_warm_lane``'s rc=75 benign-skip protection (see its
+    "Lane-lock coupling gap" docstring note) only actually serializes a
+    concurrent re-acquire against release-thin if the re-acquire side ALSO
+    takes ``<lane_dir>.lock``. ``_seed_warm_lane`` (the re-acquire side's
+    CoW-seed step) does not: it only takes a *shared* flock on the separate
+    per-gen-dir lock file, scoped to protecting the shared CoW base during
+    copy. This test proves that concretely — a real, externally-held
+    ``<lane_dir>.lock`` does not block or influence ``_seed_warm_lane``'s
+    own progress at all — so nobody mistakes ``_run_thin_warm_lane``'s
+    "Flock contract (pinned)" note for DF-side enforcement it does not
+    provide. If this test ever starts failing, ``_seed_warm_lane``'s
+    locking model changed and the coupling-gap docstring note on both
+    methods must be revisited (the gap may be closed).
+    """
+
+    async def test_seed_proceeds_even_when_lane_lock_is_held(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        lane = git_repo / '_lane-0'
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True)
+        marker = lane / 'seeded.marker'
+        script = scripts_dir / 'seed-warm-lane.sh'
+        script.write_text(
+            f'#!/usr/bin/env bash\nset -euo pipefail\necho seeded > {marker}\nexit 0\n'
+        )
+        script.chmod(0o755)
+
+        # Simulate a concurrent release-thin holding <lane_dir>.lock for the
+        # duration of its rm -rf — the exact lock _run_thin_warm_lane's real
+        # script contends on (see TestRunThinWarmLaneFlockContention above).
+        lock_path = Path(f'{lane}.lock')
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            rc = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+
+            assert rc == 0, (
+                f'_seed_warm_lane must succeed regardless of <lane_dir>.lock '
+                f'contention (it never checks that lock), got rc={rc!r}'
+            )
+            assert marker.exists(), (
+                "seed-warm-lane.sh ran and wrote into the lane despite "
+                "<lane_dir>.lock being held by another process — proving "
+                "DF's Python layer provides no lane-lock defense of its "
+                "own; the entire \"never thinned while ASSIGNED\" argument "
+                "is delegated to a cross-repo contract this file cannot "
+                "verify (see _run_thin_warm_lane's \"Lane-lock coupling "
+                "gap\" note)"
+            )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)

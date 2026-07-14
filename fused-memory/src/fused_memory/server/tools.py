@@ -33,6 +33,7 @@ from fused_memory.middleware.lock_charter_guard import (
     extract_files,
     lock_charter_error,
 )
+from fused_memory.middleware.premise_lint_guard import premise_lint_error
 from fused_memory.middleware.task_interceptor import (
     TERMINAL_STATUSES,
     _is_ticket_id,
@@ -1202,10 +1203,12 @@ def create_mcp_server(
         procedural_knowledge). It does NOT query Graphiti.
 
         **Bounded enumeration:** Results are capped at *limit* records (default 1000).
-        If the total matching record count (from ``count_memories_by_metadata``) exceeds
-        *limit*, this tool silently returns only the first *limit* records.  Pass an
-        explicit *limit* value or cross-check the returned list length against the count
-        tool to detect truncation.
+        If the total matching record count exceeds *limit*, this tool still returns only
+        the first *limit* records — but the response now self-discloses this via
+        ``truncated`` (bool) and ``total`` (the true matching count).
+        ``count_memories_by_metadata`` is consulted to compute ``total`` only when the
+        returned list hits the *limit* cap (the only case truncation is possible), so
+        the common non-truncated path incurs no extra Qdrant round-trip.
 
         Primary use-case: enumerating stage1_flag_markers to detect orphans that have
         ``source='stage1_flag_marker'`` but are missing ``kind='stage1_flag_marker'``.
@@ -1227,8 +1230,9 @@ def create_mcp_server(
             limit: Maximum records to return (default 1000; service-level cap).
 
         Returns:
-            {'memories': [...], 'project_id': ..., 'filters': ..., 'limit': ...} on success,
-            or {'error': ..., 'error_type': ...} on failure.
+            {'memories': [...], 'project_id': ..., 'filters': ..., 'limit': ...,
+            'truncated': bool, 'total': int} on success, or {'error': ..., 'error_type': ...}
+            on failure.
         """
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:
@@ -1240,11 +1244,22 @@ def create_mcp_server(
             filters=filters,
             limit=limit,
         )
+        returned = len(memories) if isinstance(memories, list) else 0
+        if returned >= limit:
+            total = await memory_service.count_memories_by_metadata(
+                project_id=project_id,
+                filters=filters,
+            )
+        else:
+            total = returned
+        truncated = total > returned
         return {
             'memories': memories,
             'project_id': project_id,
             'filters': filters,
             'limit': limit,
+            'truncated': truncated,
+            'total': total,
         }
 
     @mcp.tool()
@@ -2663,6 +2678,13 @@ def create_mcp_server(
             ids: Optional list of task ids to filter to (unknown ids silently omitted).
                  Omit or pass null for all tasks.
             tag: Tag context (optional)
+
+        Shape note (deliberate asymmetry): this tool WRAPS its result under a
+        top-level ``'statuses'`` key (``{'statuses': {id: status}}``), unlike
+        ``get_external_statuses`` which intentionally returns a FLAT
+        ``{dep: status}`` dict for its scheduler contract (see CLAUDE.md's
+        "Cross-project task dependencies"; tasks 1799/1807). Do not assume the
+        two tools share an envelope shape.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -2693,6 +2715,13 @@ def create_mcp_server(
         - ``"unknown_project"`` — project_id not in the registry
         - ``"unknown_task"``    — project known, but no top-level task with that id
         - ``"malformed"``       — dep cannot be parsed as ``<project_id>:<int>``
+
+        Shape note (deliberate asymmetry): this tool returns a FLAT
+        ``{dep: status}`` dict — deliberately NOT wrapped, unlike
+        ``get_statuses`` which wraps its result under a top-level
+        ``'statuses'`` key (``{'statuses': {id: status}}``). This asymmetry is
+        deliberate and guard-defused (tasks 1799/1807); callers must not
+        assume a shared envelope shape between the two tools.
 
         Read-only: no reconciliation, no event emission, no task mutation.
 
@@ -3084,6 +3113,13 @@ def create_mcp_server(
             return _exec_err
         metadata = inject_execution_class(metadata)
 
+        # Premise-lint guard xi (task 2231/W5-xi) — see premise_lint_guard.py.
+        _premise_err = premise_lint_error(
+            description, agent_id, project_root, prompt=prompt, title=title, details=details
+        )
+        if _premise_err is not None:
+            return _premise_err
+
         return await task_interceptor.submit_task(
             project_root=project_root,
             prompt=prompt,
@@ -3312,6 +3348,12 @@ def create_mcp_server(
                 ``deferred`` to leave them parked, or ``cancelled`` to discard
                 the planned batch.  Other status values are rejected.
 
+        A ``pending`` commit also indexes the batch into the curator corpus
+        (best-effort) so ``search_tasks``/dup-detection can see these
+        planning_mode tasks immediately, instead of waiting on the one-shot
+        empty-corpus backfill. ``deferred``/``cancelled`` commits are never
+        indexed — an abandoned or discarded batch must not pollute the corpus.
+
         Returns ``{success, results: [{task_id, result: ...}, ...]}`` matching
         the multi-id ``set_task_status`` response shape.
         """
@@ -3372,11 +3414,23 @@ def create_mcp_server(
             if dirs:
                 return lock_charter_error(dirs, task_id=tid)
 
-        return await task_interceptor.set_task_status(
+        result = await task_interceptor.set_task_status(
             task_id=','.join(ids),
             status=target_status,
             project_root=project_root,
         )
+        if target_status == 'pending':
+            # Best-effort/never-raising (see index_committed_tasks docstring) —
+            # no extra guard needed here, and it must not alter the returned result.
+            # Indexes the whole tasks_data batch (fetched above, pre-flip)
+            # unconditionally — even if set_task_status failed to transition
+            # some ids — rather than intersecting with per-id success from
+            # `result`. This is intentional, not an oversight: search_tasks
+            # re-enriches every hit with its live status (see search_tasks),
+            # so a task whose flip failed merely becomes findable early; it
+            # is never reported with an incorrect status.
+            await task_interceptor.index_committed_tasks(list(tasks_data), project_root)
+        return result
 
     @mcp.tool()
     @mcp_tool_errors()

@@ -449,6 +449,111 @@ def _edge_to_dict(e: Any) -> dict:
     }
 
 
+# Defensive: resolve the embedding-provider's RateLimitError class at module
+# load. If the openai SDK is absent or its exception hierarchy is renamed,
+# _is_rate_limit_or_quota_error still works via its duck-typed fallback checks
+# below rather than raising an ImportError.
+try:
+    from openai import RateLimitError as _OpenAIRateLimitError
+except Exception:
+    _OpenAIRateLimitError = None
+
+
+def _is_rate_limit_or_quota_error(exc: BaseException) -> bool:
+    """Return True if *exc* represents an embedding-provider rate-limit or quota error.
+
+    Matches ANY ``openai.RateLimitError`` — this covers both hard quota
+    exhaustion (``insufficient_quota``, non-retryable) and transient
+    too-many-requests rate limiting (retryable); the two are not
+    distinguished. Also matches duck-typed equivalents — a
+    ``status_code == 429`` attribute (regardless of code/message), or
+    ``'insufficient_quota'`` appearing in the error's ``code`` attribute —
+    so callers (get_entity's degraded fallback) can classify this condition
+    without a hard dependency on the openai SDK's exact exception hierarchy
+    (e.g. if Graphiti wraps/re-raises the error, or a different embedding
+    provider is configured). As a last resort, ``'insufficient_quota'``
+    appearing in the exception's string message also matches, but ONLY when
+    the exception carries neither a ``status_code`` nor a ``code`` attribute
+    — a concrete (even if non-matching, e.g. ``status_code=500``) status or
+    code classification is trusted over the fuzzy message-substring guess,
+    so a wrapped/log-echo error that merely quotes an upstream
+    'insufficient_quota' message inside an otherwise-unrelated, already-
+    classified error does not get swallowed into the degraded fallback
+    (task 2448 review).
+
+    Callers that need to tell hard quota exhaustion apart from a
+    retryable transient rate limit must not rely on this predicate alone —
+    it deliberately treats both as one condition. get_entity's degraded
+    fallback is fine with that because it has no retry loop of its own: on
+    a match it degrades immediately rather than retrying, for either cause.
+
+    Never matches a bare BaseException (e.g. ``asyncio.CancelledError``,
+    ``KeyboardInterrupt``, ``SystemExit``) — those are structured-concurrency
+    shutdown signals, not application-level errors, and must always
+    propagate unchanged.
+    """
+    if not isinstance(exc, Exception):
+        return False
+    if _OpenAIRateLimitError is not None and isinstance(exc, _OpenAIRateLimitError):
+        return True
+    status_code = getattr(exc, 'status_code', None)
+    if status_code == 429:
+        return True
+    code = str(getattr(exc, 'code', '') or '')
+    if 'insufficient_quota' in code.lower():
+        return True
+    if status_code is None and not code:
+        return 'insufficient_quota' in str(exc).lower()
+    return False
+
+
+def _graphiti_degraded_entity_result() -> dict:
+    """Return get_entity's degraded-fallback superset dict.
+
+    Centralizes the {'nodes': [], 'edges': [], 'degraded': True,
+    'failed_stores': [...]} shape so get_entity's exact-match and
+    fuzzy-fallback degrade sites (see get_entity) cannot drift apart.
+    Deliberately NOT shared with search()'s degraded convention
+    (memory_service.py's SearchResults / search() failed_stores
+    construction): that path returns a SearchResults list-subclass, not a
+    plain dict, and the two shapes are intentionally different types.
+    """
+    return {
+        'nodes': [],
+        'edges': [],
+        'degraded': True,
+        'failed_stores': [SourceStore.graphiti.value],
+    }
+
+
+def _degrade_or_reraise(exc: Exception, name: str) -> dict:
+    """Classify *exc*: return get_entity's degraded superset dict, or re-raise.
+
+    Shared by get_entity's exact-match and fuzzy-fallback ``except`` blocks
+    (task 2448 review) so the classification guard, warning log, and
+    degraded-dict return can't drift apart between the two call sites.
+    Re-raises *exc* unchanged (same object, so callers still see the
+    original type/traceback) when ``_is_rate_limit_or_quota_error(exc)`` is
+    False.
+
+    The warning log deliberately does not hardcode "429": the
+    message-substring fallback branch of ``_is_rate_limit_or_quota_error``
+    can match an error that carries no ``status_code`` attribute at all, so
+    asserting 429 unconditionally would misdescribe that classification path
+    (task 2448 review). It logs the exception's actual
+    ``getattr(exc, 'status_code', None)`` instead.
+    """
+    if not _is_rate_limit_or_quota_error(exc):
+        raise exc
+    logger.warning(
+        'get_entity degraded: rate-limit/quota error for %r (status_code=%s): %s',
+        name,
+        getattr(exc, 'status_code', None),
+        exc,
+    )
+    return _graphiti_degraded_entity_result()
+
+
 class SearchResults(list):
     """list subclass returned by MemoryService.search carrying in-band degrade metadata.
 
@@ -2503,24 +2608,49 @@ class MemoryService:
         omitting edges found via search(); it became dark_factory task 2404,
         cancelled 2026-07-09 once the architect confirmed it was expected
         topological-vs-semantic divergence, not a bug.)
+
+        Degraded fallback: if an embedding-provider rate-limit or quota error
+        (openai.RateLimitError or a duck-typed equivalent — see
+        _is_rate_limit_or_quota_error) is raised by either the exact-match or
+        fuzzy-fallback Graphiti calls, this returns the degraded superset
+        dict {'nodes': [], 'edges': [], 'degraded': True, 'failed_stores':
+        ['graphiti']} instead of raising. The RESPONSE SHAPE mirrors
+        search()'s degraded/failed_stores convention, but the TRIGGER is
+        narrower than search()'s: search() degrades on ANY per-store
+        Exception (task 1812), whereas get_entity degrades ONLY on a
+        classified rate-limit/quota error — a Graphiti connection failure,
+        timeout, or other backend error still propagates as a hard
+        exception here, unlike search(). All other errors (including
+        asyncio.CancelledError, a BaseException that never reaches this
+        except clause) propagate unchanged.
         """
-        # See "Performance trade-off" above: this call is intentionally serial —
-        # its 0/1/many result decides whether the fuzzy gather runs at all.
-        exact = await self.graphiti.get_nodes_by_exact_name(name, group_id=project_id)
+        # NOTE: each try/except below wraps ONLY the awaited Graphiti calls, not
+        # the local dict-building that follows a successful gather (_node_to_dict/
+        # _edge_to_dict, the edge-dedup loop). Keeping that pure data-transformation
+        # code outside the guarded region means a bug there raises normally instead
+        # of risking mis-classification as a degraded quota error (see plan review).
+        try:
+            # See "Performance trade-off" above: this call is intentionally serial —
+            # its 0/1/many result decides whether the fuzzy gather runs at all.
+            exact = await self.graphiti.get_nodes_by_exact_name(name, group_id=project_id)
+            if exact:
+                uuids = [uuid for n in exact if (uuid := n.get('uuid'))]
+                # Two-tier check via gather_or_raise (fused_memory.utils.async_utils),
+                # mirroring the fuzzy fallback below: return_exceptions=True ensures a
+                # transient failure in one concurrent get_valid_edges_for_node call
+                # cannot leave sibling coroutines running as orphaned background
+                # tasks. Pass 1 re-raises structured-cancellation signals; Pass 2
+                # logs every exception, then raises the first (get_entity's local
+                # Pass-2 semantics — see async_utils docstring).
+                edge_results = await gather_or_raise(
+                    (self.graphiti.get_valid_edges_for_node(u, group_id=project_id) for u in uuids),
+                    label='get_entity: get_valid_edges_for_node failed',
+                    logger=logger,
+                )
+        except Exception as exc:
+            return _degrade_or_reraise(exc, name)
+
         if exact:
-            uuids = [uuid for n in exact if (uuid := n.get('uuid'))]
-            # Two-tier check via gather_or_raise (fused_memory.utils.async_utils),
-            # mirroring the fuzzy fallback below: return_exceptions=True ensures a
-            # transient failure in one concurrent get_valid_edges_for_node call
-            # cannot leave sibling coroutines running as orphaned background
-            # tasks. Pass 1 re-raises structured-cancellation signals; Pass 2
-            # logs every exception, then raises the first (get_entity's local
-            # Pass-2 semantics — see async_utils docstring).
-            edge_results = await gather_or_raise(
-                (self.graphiti.get_valid_edges_for_node(u, group_id=project_id) for u in uuids),
-                label='get_entity: get_valid_edges_for_node failed',
-                logger=logger,
-            )
             edge_lists = cast(list, edge_results)
             # Duplicate-name matches each contribute their own edges; dedup by
             # edge uuid so `edges` stays consistent with the (possibly
@@ -2539,30 +2669,33 @@ class MemoryService:
             edge_data = [_edge_to_dict(e) for e in edges]
             return {'nodes': node_data, 'edges': edge_data}
 
-        # Two-tier check via gather_or_raise (fused_memory.utils.async_utils).
-        # Both coroutines settle before either is inspected (no orphans).
-        # Pass 1: re-raises structured-cancellation signals (CancelledError,
-        #   KeyboardInterrupt, SystemExit) before any per-call logging —
-        #   cancellation takes precedence over application-level failures
-        #   regardless of position in the results list.
-        # Pass 2: logs each captured Exception and raises the first — these
-        #   are application-level failures from the Graphiti backend.
-        results = await gather_or_raise(
-            (
-                self.graphiti.search_nodes(
-                    query=name,
-                    group_ids=[project_id],
-                    max_nodes=5,
+        try:
+            # Two-tier check via gather_or_raise (fused_memory.utils.async_utils).
+            # Both coroutines settle before either is inspected (no orphans).
+            # Pass 1: re-raises structured-cancellation signals (CancelledError,
+            #   KeyboardInterrupt, SystemExit) before any per-call logging —
+            #   cancellation takes precedence over application-level failures
+            #   regardless of position in the results list.
+            # Pass 2: logs each captured Exception and raises the first — these
+            #   are application-level failures from the Graphiti backend.
+            results = await gather_or_raise(
+                (
+                    self.graphiti.search_nodes(
+                        query=name,
+                        group_ids=[project_id],
+                        max_nodes=5,
+                    ),
+                    self.graphiti.search(
+                        query=name,
+                        group_ids=[project_id],
+                        num_results=edge_limit,
+                    ),
                 ),
-                self.graphiti.search(
-                    query=name,
-                    group_ids=[project_id],
-                    num_results=edge_limit,
-                ),
-            ),
-            label='get_entity: Graphiti call failed',
-            logger=logger,
-        )
+                label='get_entity: Graphiti call failed',
+                logger=logger,
+            )
+        except Exception as exc:
+            return _degrade_or_reraise(exc, name)
 
         nodes = cast(list, results[0])
         edges = cast(list, results[1])

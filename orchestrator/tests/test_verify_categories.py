@@ -366,12 +366,17 @@ class TestShouldArchiveCategoryDelegatesToTable:
 
 
 class TestClassifierByteIdentityGolden:
-    """Defensive golden: ``_classify_failure``/``_worst_category`` keep
-    returning plain ``str`` (not ``FailureCategory`` instances), with
-    byte-identical ``json.dumps`` output. The rewire touches only registries
-    and equality/membership comparisons — never the classifier's return
-    type — so no ``FailureCategory`` instance ever reaches a serialized
-    field (F2 / verify_runner canonical-JSON Invariant 1).
+    """Defensive golden: byte-identical ``json.dumps`` output survives the
+    α→δ classifier evolution.
+
+    ``_worst_category`` is untouched by task δ and still returns a plain
+    ``str``. ``classify_failure`` — δ's tool-dispatched replacement for the
+    pre-δ ``_classify_failure`` this test originally exercised (task 2131
+    step-11) — returns a REAL ``FailureCategory`` instance rather than a
+    plain ``str``: the α-era ``type(category) is str`` characterization
+    migrates to ``isinstance(category, str)`` (``FailureCategory`` IS its
+    string value, a ``StrEnum``), but ``json.dumps`` output stays
+    byte-identical either way (F2 / verify_runner canonical-JSON Invariant 1).
     """
 
     @pytest.mark.parametrize(
@@ -392,10 +397,12 @@ class TestClassifierByteIdentityGolden:
     def test_classify_failure_returns_legacy_str_with_byte_identical_json(
         self, rc, output, timed_out, expected,
     ):
-        from orchestrator.verify import _classify_failure
-        category = _classify_failure(output, rc, timed_out)
+        from orchestrator.verify_classify import classify_failure  # noqa: PLC0415
+        from orchestrator.verify_cmd import ToolKind  # noqa: PLC0415
+
+        category = classify_failure(ToolKind.OPAQUE, rc, output, timed_out)
         assert category == expected
-        assert type(category) is str
+        assert isinstance(category, str)
         assert json.dumps({'category': category}) == json.dumps({'category': expected})
 
     def test_worst_category_returns_legacy_str_with_byte_identical_json(self):

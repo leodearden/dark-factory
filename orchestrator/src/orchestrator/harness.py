@@ -35,6 +35,7 @@ from orchestrator.config import (
 )
 from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps
 from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
@@ -45,6 +46,7 @@ from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import (
@@ -1604,6 +1606,15 @@ class Harness:
                         # if a code-touching merge has been debounced and the
                         # orchestrator is idle (no dispatched agents = quiet window).
                         await self._maybe_restart_stale_service(agents_idle=True)
+                        # Fleet-common merge-idle heartbeat (task 2395, α): written
+                        # in both rest branches so a saturated unit (steady-state
+                        # busy-wait branch below) still heartbeats.  Does NOT cover
+                        # a unit that is continuously dispatching with spare
+                        # semaphore headroom (never idle, never busy-waiting) — see
+                        # the docstring of _write_merge_heartbeat for why that gap
+                        # is accepted rather than closed with an unconditional
+                        # per-tick call.
+                        await self._write_merge_heartbeat()
                         await asyncio.sleep(self.config.idle_poll_secs)
                         continue
                     # Wait for any active task to complete, then retry.
@@ -1621,6 +1632,10 @@ class Harness:
                     # branches are mutually exclusive per tick and maybe_restart
                     # clears pending on fire, so there is no double-fire.
                     await self._maybe_restart_stale_service(agents_idle=False)
+                    # Fleet-common merge-idle heartbeat (task 2395, α): a
+                    # saturated unit steady-states in this busy-wait branch, so
+                    # it must heartbeat here too — see the idle branch above.
+                    await self._write_merge_heartbeat()
                     continue
 
                 await sem.acquire()
@@ -6959,12 +6974,32 @@ Output JSON matching the schema. Every task must appear in the output.
         counter = itertools.count()
 
         async def _systemd_run_restart_executor() -> None:
+            # transient_unit is computed once and reused below (both for the
+            # escalation detail text and the schedule_ call) — next(counter)
+            # must only advance once per fire, or the collision-avoidance unit
+            # numbering (see class docstring) would skip a number every fire.
+            transient_unit = f'orch-selfrestart-on-merge-{next(counter)}.service'
+            on_failure_escalation = (
+                EscalationSpec(
+                    queue_dir=str(self._escalation_queue.queue_dir),
+                    task_id='orchestrator-self-redeploy',
+                    summary='Orchestrator self-restart fire-time failure',
+                    detail=(
+                        f'systemd-run transient unit {transient_unit} exited '
+                        'non-zero at fire time (after registration already '
+                        f'returned). See: journalctl --user -u {transient_unit}'
+                    ),
+                )
+                if self._escalation_queue is not None
+                else None
+            )
             await schedule_detached_systemd_restart(
                 script=self.config.orchestrator_restart_script,
                 script_args=[],
                 project_root=self.config.project_root,
-                transient_unit=f'orch-selfrestart-on-merge-{next(counter)}.service',
+                transient_unit=transient_unit,
                 on_active_secs=max(self.config.orchestrator_restart_on_active_secs, 5),
+                on_failure_escalation=on_failure_escalation,
             )
 
         # Restart-safe rate cap on the self-redeploy (task 2371). The last-fire
@@ -7012,6 +7047,73 @@ Output JSON matching the schema. Every task must appear in the output.
             if await coord.maybe_restart(agents_idle=agents_idle):
                 any_fired = True
         return any_fired
+
+    async def _write_merge_heartbeat(self) -> None:
+        """Write this unit's fleet-common merge-idle heartbeat (task 2395, α).
+
+        Gathers ON the event loop: ``ORCH_UNIT`` (self-identification, same
+        env convention as ``deterministic_runner._default_resolve_own_unit``),
+        and ``merge_idle``/``queue_empty``/``depth`` from a SINGLE
+        ``self._merge_worker.snapshot()`` read (when a worker exists) using
+        the exact idle formula and fallback ``_merge_pipeline_idle`` uses
+        (``queue_empty and depth == 0``, missing ``'depth'`` treated as ``1``
+        i.e. active) — so idle-truth and the reported depth are always
+        mutually consistent and the worker is polled at most once per tick,
+        rather than once via ``_merge_pipeline_idle()`` and again here.
+        Offloads only the serialize+atomic-write to a thread
+        (``asyncio.to_thread``), mirroring
+        ``Scheduler._write_snapshot_best_effort``'s loop/thread split — all
+        asyncio/in-memory reads happen here, before the thread hop.
+
+        Called from BOTH run-loop rest branches (idle + busy-wait) so a
+        saturated unit — which steady-states in the busy-wait branch — still
+        heartbeats.  Fail-open: any exception (state read or disk write) is
+        swallowed and logged — a heartbeat write must never stop the run loop.
+
+        Known gap: a unit that is continuously dispatching with spare
+        semaphore headroom (an assignment ready every tick, ``sem`` never
+        full) loops through neither rest branch and will not refresh its
+        heartbeat while that lasts.  Closing this with an unconditional
+        per-outer-loop-iteration call was evaluated and reverted: it makes
+        every ``run()`` invocation write to the fleet-common path on its very
+        first tick, and several existing tests drive ``run()`` for real
+        without sandboxing ``ORCH_UNIT``/``ORCH_FLEET_DIR`` — verified to
+        clobber this host's real ``data/fleet/orchestrator-dark-factory.
+        service.json`` when this shell inherits ``ORCH_UNIT`` from the
+        systemd unit.  Fixing that would require test-isolation changes
+        outside this task's locked scope (harness.py only).  Readers (γ
+        drain gate, ε ``--report``) must therefore treat a stale/absent
+        heartbeat conservatively — i.e. NOT idle / restart-eligible only
+        after a grace period — the same fail-safe stance
+        ``_merge_pipeline_idle`` already takes on a read error.
+        """
+        try:
+            unit = os.environ.get('ORCH_UNIT', '')
+            queue_empty = self._merge_queue.empty()
+            worker = self._merge_worker
+            if worker is None:
+                # No pipeline to drain (bare / unit-test harness) — mirrors
+                # _merge_pipeline_idle's own worker-is-None short-circuit;
+                # no snapshot() call is involved on this branch.
+                merge_idle = self._merge_pipeline_idle()
+                depth = 0
+            else:
+                depth = int(worker.snapshot().get('depth', 1))
+                merge_idle = queue_empty and depth == 0
+            ts_epoch = time.time()
+            payload = build_heartbeat_payload(
+                unit=unit,
+                merge_idle=merge_idle,
+                depth=depth,
+                queue_empty=queue_empty,
+                ts_epoch=ts_epoch,
+            )
+            await asyncio.to_thread(write_heartbeat, resolve_fleet_dir(), unit, payload)
+        except Exception:
+            logger.warning(
+                'merge heartbeat write failed; continuing (fail-open)',
+                exc_info=True,
+            )
 
     def _build_task_status_lookup(self) -> Callable[[str], Awaitable[str | None]]:
         """Return an async callable (task_id) -> str|None backed by the scheduler.

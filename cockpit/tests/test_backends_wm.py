@@ -80,6 +80,103 @@ class TestWmBackendFocus:
         assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 
+class TestWmBackendFocusPrefersWindowId:
+    """Task 2510 (Fleet Cockpit C10 fix): focus() prefers the stable
+    wm_window_id over the churny wm_title, mirroring set_urgency/is_alive's
+    existing prefer-wm_window_id pattern.
+    """
+
+    def test_focus_prefers_wm_window_id_no_title_roundtrip(self):
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.wm import WmBackend
+
+        runner = ScriptedRunner()
+        backend = WmBackend(run=runner)
+        target = DisplayTarget(kind='wm', wm_title='session-a', wm_window_id='0x123')
+
+        result = backend.focus(target)
+
+        assert result.ok is True
+        assert runner.calls == [['wmctrl', '-i', '-a', '0x123']]
+
+    def test_focus_falls_back_to_title_when_window_id_activate_fails(self):
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.wm import WmBackend
+
+        runner = ScriptedRunner(
+            results={('wmctrl', '-i', '-a', '0x123'): CommandResult(returncode=1)}
+        )
+        backend = WmBackend(run=runner)
+        target = DisplayTarget(kind='wm', wm_title='session-a', wm_window_id='0x123')
+
+        result = backend.focus(target)
+
+        assert result.ok is True
+        assert ['wmctrl', '-i', '-a', '0x123'] in runner.calls
+        assert ['wmctrl', '-a', 'session-a'] in runner.calls
+
+    def test_focus_falls_back_to_xdotool_when_window_id_and_title_both_fail(self):
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.wm import WmBackend
+
+        runner = ScriptedRunner(
+            results={
+                ('wmctrl', '-i', '-a', '0x123'): CommandResult(returncode=1),
+                ('wmctrl', '-a', 'session-a'): CommandResult(returncode=1),
+            }
+        )
+        backend = WmBackend(run=runner)
+        target = DisplayTarget(kind='wm', wm_title='session-a', wm_window_id='0x123')
+
+        result = backend.focus(target)
+
+        assert result.ok is True
+        assert ['xdotool', 'search', '--name', 'session-a', 'windowactivate'] in runner.calls
+
+    def test_focus_only_window_id_no_title_succeeds(self):
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.wm import WmBackend
+
+        runner = ScriptedRunner()
+        backend = WmBackend(run=runner)
+        target = DisplayTarget(kind='wm', wm_window_id='0x123')
+
+        result = backend.focus(target)
+
+        assert result.ok is True
+        assert runner.calls == [['wmctrl', '-i', '-a', '0x123']]
+
+    def test_focus_only_window_id_activate_fails_no_title_or_xdotool_fallback(self, caplog):
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.wm import WmBackend
+
+        runner = ScriptedRunner(default=CommandResult(returncode=1))
+        backend = WmBackend(run=runner)
+        target = DisplayTarget(kind='wm', wm_window_id='0x123')
+
+        with caplog.at_level(logging.WARNING):
+            result = backend.focus(target)
+
+        assert result.ok is False
+        assert runner.calls == [['wmctrl', '-i', '-a', '0x123']]
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_focus_no_title_and_no_window_id_warns_without_invoking_runner(self, caplog):
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.wm import WmBackend
+
+        runner = ScriptedRunner()
+        backend = WmBackend(run=runner)
+        target = DisplayTarget(kind='wm')  # no wm_title, no wm_window_id
+
+        with caplog.at_level(logging.WARNING):
+            result = backend.focus(target)
+
+        assert result.ok is False
+        assert runner.calls == []
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
 class TestWmBackendSetUrgency:
     def test_sets_urgency_on_by_title(self):
         from cockpit.backends.base import DisplayTarget

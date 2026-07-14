@@ -20,7 +20,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
-from orchestrator.git_ops import MergeResult
+from orchestrator.git_ops import MergeResult, canonical_queued_branch_name
 from orchestrator.merge_disposition import MergeFailureDisposition
 from orchestrator.verify import VerifyResult
 
@@ -607,12 +607,109 @@ class WaiterRecord:
     """Git SHA of the branch tip at submit time (snapshot_tip), or None if unavailable."""
 
 
+@dataclass(frozen=True)
+class QueuedBranch:
+    """A merge-queue branch name in both its bare and full-ref shapes.
+
+    ``bare_id`` is the task id alone (e.g. ``'4778'``); ``full_name`` is the
+    branch name with the configured prefix applied (e.g. ``'task/4778'``).
+
+    :meth:`parse` is the ONLY place bare/full pairing logic lives
+    (parse-don't-validate, ``plans/merge-queue-reliability-prd.md`` DD7) —
+    construct instances through it rather than the dataclass constructor
+    directly. It delegates the actual prefix-prepend rule to
+    :func:`orchestrator.git_ops.canonical_queued_branch_name`, the existing
+    single source of truth for that rule, so the two never diverge. Git
+    refs should always be built from ``.full_name``; task/branch
+    bookkeeping keys should use ``.bare_id``.
+
+    Frozen (immutable) so two independently-parsed values compare equal by
+    field value (and hash identically), regardless of which shape the raw
+    input arrived in.
+
+    This type has no production consumer yet: it is deliberately the
+    *producer half* of ``plans/merge-queue-reliability-prd.md`` scope 5
+    (task μ; boundary test B9). The consumer half — repointing
+    :attr:`MergeRequest.branch` (below) onto ``QueuedBranch``, building refs
+    from ``.full_name``, and deleting ``canonical_queued_branch_name``, the
+    try-both ``resolve_queued_branch_ref``, and the ``merge_queue_store``
+    journal strip/re-add — is the PRD's next spine task (task ν, prereq: μ;
+    see PRD lines 218-220). Until ν lands, do not add further ad hoc
+    prefix-stripping/prepending call sites; route them through
+    :meth:`parse` instead.
+    """
+
+    bare_id: str
+    full_name: str
+
+    def __post_init__(self) -> None:
+        """Reject the grossest incoherent pairs: full_name must end with bare_id.
+
+        :meth:`parse` always produces this shape — ``full_name`` is always
+        ``branch_prefix + bare_id``, so ``full_name.endswith(bare_id)`` holds
+        for every prefix (including the empty-prefix case, where
+        ``full_name == bare_id``). This guard never rejects ``parse()``
+        output built from a non-empty raw id (the only kind any current
+        caller ever passes).
+
+        This is a partial, not complete, realization of "mixed shape
+        unrepresentable" (PRD DD7): ``__post_init__`` has no ``branch_prefix``
+        to check against, so it cannot enforce the stronger invariant
+        ``full_name == branch_prefix + bare_id`` — only the weaker
+        ``endswith`` consequence of it. A pathological hand-built pair can
+        still slip through, e.g. ``QueuedBranch(bare_id='778',
+        full_name='task/4778')`` satisfies ``endswith`` even though
+        ``bare_id`` is a truncation of the real id. ``parse()`` is the sole
+        intended constructor and always satisfies the stronger invariant;
+        this guard exists to catch gross incoherence (e.g. an unrelated or
+        wrongly-prefixed ``full_name``) in pairs built by bypassing it.
+
+        A degenerate empty ``bare_id`` is rejected outright rather than
+        left to the ``endswith`` check above, since every string trivially
+        ends with ``''`` — the ``endswith`` check alone cannot catch it.
+        This is reachable via ``parse('', branch_prefix)`` or
+        ``parse(branch_prefix, branch_prefix)`` (both strip to ``''``); no
+        current caller passes either, but an empty task id is meaningless,
+        so it is refused rather than silently producing a
+        ``QueuedBranch(bare_id='', full_name=branch_prefix)``.
+        """
+        if not self.bare_id:
+            raise ValueError(
+                f'QueuedBranch is incoherent: bare_id is empty '
+                f'(full_name={self.full_name!r})',
+            )
+        if not self.full_name.endswith(self.bare_id):
+            raise ValueError(
+                f'QueuedBranch is incoherent: full_name={self.full_name!r} '
+                f'does not end with bare_id={self.bare_id!r}',
+            )
+
+    @classmethod
+    def parse(cls, raw: str, branch_prefix: str) -> QueuedBranch:
+        """Parse *raw* (bare or already-prefixed) into a canonical QueuedBranch.
+
+        *raw* may arrive bare (``'4778'``) or already prefixed
+        (``'task/4778'``); both parse to the same value. ``full_name`` is
+        computed by delegating to
+        :func:`orchestrator.git_ops.canonical_queued_branch_name` — the
+        existing single source of truth for the prepend-unless-present rule
+        — rather than reimplementing it here; ``bare_id`` is then stripped
+        from it the same way the ``merge_queue_store.py`` journal
+        normalization does. This is the ONLY place branch-prefix *pairing*
+        logic should live — callers should not reimplement prefix
+        stripping/prepending elsewhere.
+        """
+        full_name = canonical_queued_branch_name(raw, branch_prefix)
+        bare_id = full_name.removeprefix(branch_prefix)
+        return cls(bare_id=bare_id, full_name=full_name)
+
+
 @dataclass
 class MergeRequest:
     """A request to merge a task branch into main."""
 
     task_id: str
-    branch: str  # e.g. "591" — without the task/ prefix
+    branch: str  # e.g. "591" — without the task/ prefix; becomes QueuedBranch at task ν (PRD scope 5, plans/merge-queue-reliability-prd.md:218)
     worktree: Path
     pre_rebased: bool
     task_files: list[str] | None

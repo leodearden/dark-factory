@@ -188,11 +188,18 @@ import logging
 import os
 import signal
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from shared.task_metadata import DoneProvenance
 
 from orchestrator import systemd_inspect
+from orchestrator.proc_supervision import (
+    EscalationSpec,
+    FreshPidVerify,
+    RestartDisposition,
+    RestartPlan,
+)
 from orchestrator.stop_instruction import detect_stop_instruction
 from orchestrator.systemd_inspect import inspect_systemd_unit
 from orchestrator.workflow import WorkflowOutcome
@@ -250,6 +257,20 @@ _INSPECT_TIMEOUT_SECS: float = systemd_inspect._INSPECT_TIMEOUT_SECS
 # same task_id (e.g. a starvation-watchdog filing) must never alias as this
 # runner's own dedup/quiescence/resolution-proof signal.
 DETERMINISTIC_AGENT_ROLE: str = 'orchestrator-deterministic'
+
+# Task 2238 (W10-δ): a guaranteed-non-self placeholder `own_unit` fed to
+# proc_supervision.RestartPlan.execute() on the cross-unit blocking deploy
+# path when the runner's own ORCH_UNIT-derived own_unit is falsy (the
+# fail-open case, ORCH_UNIT unset).  RestartPlan.execute()'s RP-1 fail-closed
+# guard refuses a blocking restart whenever own_unit is falsy — but the
+# runner only reaches the cross-unit branch AFTER its own `self_target` check
+# above has already ruled out a same-unit restart, so forcing a truthy,
+# provably-non-target own_unit here routes execute() into RP-2 (cross-unit
+# blocking + verify) instead of RP-1 (refuse), preserving the existing
+# fail-open-to-cross-unit behaviour (see test_env_unset_takes_cross_unit_path).
+# Not a valid systemd unit name (unit names never contain angle brackets), so
+# it can never collide with a real target_unit.
+_CROSS_UNIT_OWN_UNIT_SENTINEL: str = '<no-self-target-known>'
 
 
 def _build_done_provenance(kind: str, **fields: object) -> dict:
@@ -377,10 +398,18 @@ class DeterministicRunner:
     ) -> tuple[int, str]:
         """Schedule a detached systemd-run transient unit for a self-restart.
 
-        Uses a SINGLE ``--on-active`` transient unit whose payload is a
-        ``/bin/sh -c`` wrapper that runs the restart script and, *only if it
-        exits non-zero*, fires δ's escalation-submit CLI before re-raising the
-        original exit code (so journald records the unit as failed):
+        Thin ``proc_supervision.RestartPlan`` caller (task 2238/δ) — mirrors
+        ``service_restart.schedule_detached_systemd_restart``'s conversion
+        (task 2237/γ). Builds a same-unit, DETACHED ``RestartPlan``
+        (``target_unit == own_unit == transient_unit``, ``verify=None``,
+        ``transient_unit`` set) carrying an ``EscalationSpec`` for the RP-4
+        on-failure wrapper, and delegates the actual systemd-run registration
+        to ``plan.execute()``. ``RestartPlan.execute()``'s detached path
+        (``_execute_detached_systemd_run``) builds a SINGLE ``--on-active``
+        transient unit whose payload is a ``/bin/sh -c`` wrapper that runs the
+        restart script and, *only if it exits non-zero*, fires δ's
+        escalation-submit CLI before re-raising the original exit code (so
+        journald records the unit as failed):
 
             <script> <args>
             __rc=$?
@@ -404,13 +433,8 @@ class DeterministicRunner:
 
         Returns:
             (rc, tail) — rc=0 on successful registration; rc≠0 if registration
-            fails (tail carries the error output).
+            fails (tail carries the error detail).
         """
-        import shlex
-        import sys
-        from pathlib import Path
-
-        queue_dir = str(self.escalation_queue.queue_dir)
         target_unit = before_done.get('target_unit', 'unknown')
         script = before_done['script']
         args = before_done.get('args') or []
@@ -422,16 +446,20 @@ class DeterministicRunner:
         # before_done['cwd'] when the caller supplied one; otherwise fall back
         # to this process's own os.getcwd(), which is project_root because the
         # orchestrator's own systemd unit pins WorkingDirectory=project_root.
+        # RestartPlan.__post_init__ absolutizes a relative `script` against
+        # this `cwd` (RP-3), byte-identical to this method's prior inline
+        # absolutization.
         cwd = before_done.get('cwd') or os.getcwd()
 
         esc_summary = summary or (
             f'Self-restart fire-time failure: {target_unit}'
         )
 
-        # δ's escalation-submit CLI, run ONLY when the restart fails at fire time.
-        # sys.executable → python -m escalation submit (robust against PATH in the
-        # detached systemd user environment).  agent-role keeps the sentinel
-        # prefix so the file-backed CLI stamps a real born-at-L2 record.
+        # δ's escalation-submit CLI, fired ONLY when the restart fails at fire
+        # time — built here as data and handed to RestartPlan/EscalationSpec,
+        # which owns the RP-4 on-failure ``/bin/sh -c`` wrapper + the
+        # ``python -m escalation submit`` argv construction (byte-identical to
+        # this method's prior inline argv — see EscalationSpec.to_submit_argv).
         #
         # Deployment assumption: the `escalation` package must be importable from
         # sys.executable's interpreter (i.e. installed into site-packages, not
@@ -442,65 +470,40 @@ class DeterministicRunner:
         #   <sys.executable> -c "import escalation"
         # before deploying.  A marker-file fallback is intentionally not
         # implemented here to keep the failure path auditable via journald.
-        escalation_cmd = [
-            sys.executable, '-m', 'escalation', 'submit',
-            '--queue-dir', queue_dir,
-            '--task', task_id,
-            '--severity', 'critical',
-            '--category', 'infra_issue',
-            '--summary', esc_summary[:200],
-            '--agent-role', 'orchestrator-deterministic',
-            '--detail', (
+        escalation_spec = EscalationSpec(
+            queue_dir=str(self.escalation_queue.queue_dir),
+            task_id=task_id,
+            summary=esc_summary,
+            detail=(
                 f'Transient unit {transient_unit} fired and failed (task {task_id}). '
                 f'Check journald for restart output: '
                 f'journalctl --user -u {transient_unit}'
             ),
-        ]
-
-        # Wrap the restart payload so the escalation fires only on failure.  The
-        # exit code is preserved (`exit "$__rc"`) so journald records the failure.
-        # Note: --collect removes the unit from `systemctl --failed` after it
-        # exits (whether success or failure); journald retains the full log.
-        #
-        # Absolutize a relative script against cwd (mirrors service_restart.py's
-        # `target = Path(project_root) / script`): defense-in-depth so the script
-        # is still found even if --working-directory were ever ignored. Scripts
-        # already absolute are left unchanged (no double-join under cwd).
-        script_abs = script if Path(script).is_absolute() else str(Path(cwd) / script)
-        payload = ' '.join(shlex.quote(p) for p in [script_abs, *args])
-        on_failure = ' '.join(shlex.quote(p) for p in escalation_cmd)
-        wrapped = (
-            f'{payload}; __rc=$?; '
-            f'if [ "$__rc" -ne 0 ]; then {on_failure}; fi; '
-            f'exit "$__rc"'
+            severity='critical',
+            category='infra_issue',
+            agent_role=DETERMINISTIC_AGENT_ROLE,
         )
 
-        # --on-active=<N>: fires N seconds after this run() returns (manifest §53)
-        # and, crucially, does NOT execute at registration time — so the failure
-        # branch (and its escalation) is never reached on the success path.
-        main_argv = [
-            'systemd-run', '--user',
-            f'--on-active={on_active_secs}',
-            f'--unit={transient_unit}',
-            '--collect',
-            f'--working-directory={cwd}',
-            '/bin/sh', '-c', wrapped,
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *main_argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+        plan = RestartPlan(
+            script=Path(script),
+            args=list(args),
+            cwd=Path(cwd),
+            target_unit=transient_unit,
+            own_unit=transient_unit,
+            on_failure_escalation=escalation_spec,
+            verify=None,
+            transient_unit=transient_unit,
+            on_active_secs=on_active_secs,
         )
-        stdout, _ = await proc.communicate()
-        rc = proc.returncode or 0
-        tail = (stdout or b'').decode(errors='replace')[-2000:]
-        if rc != 0:
+        outcome = await plan.execute()
+        if outcome.disposition == RestartDisposition.REGISTRATION_FAILED:
             logger.warning(
                 'DeterministicRunner: failed to register restart transient unit %s '
-                '(rc=%d) for task %s',
-                transient_unit, rc, task_id,
+                'for task %s: %s',
+                transient_unit, task_id, outcome.detail,
             )
-        return rc, tail
+            return 1, outcome.detail
+        return 0, ''
 
     async def _default_inspect_unit(self, unit: str) -> dict:
         """Query systemctl for unit state fields needed for fresh-PID verify.
@@ -1704,19 +1707,23 @@ class DeterministicRunner:
                         detail=baseline_detail,
                     )
 
-                # Run the deploy script to completion (blocking, cross-unit).
-                # Task 2090 Layer B: wrap the call in an outer wall-clock guard
-                # that is UNCONDITIONAL — it does not depend on run_fn (or the
-                # subprocess it spawns) ever dying.  Layer A hardens the
-                # DEFAULT script_runner's own timeout handling, but an
-                # injected/custom seam could still hang forever or raise
-                # something unexpected; either way run() must reach
-                # _file_infra_issue_and_block rather than stranding the task
-                # with before_done_ran_at stamped and zero escalations filed
-                # (the exact task-2087 evidence).  The outer bound is strictly
-                # greater than before_done['timeout_secs'] so a well-behaved
-                # seam always flows through the rc!=0 path below first — this
-                # is a pure backstop, not a replacement for it.
+                # Run the deploy script + fresh-PID verify by delegating to
+                # proc_supervision.RestartPlan.execute() (task 2238/δ, RP-2/
+                # RP-5) instead of an inline run-then-reinspect block.  The
+                # runner still owns: the pre-flight baseline above, the outer
+                # wall-clock guard below (task 2090 Layer B — now bounding the
+                # WHOLE execute() call, run + verify, rather than only the
+                # run), and the disposition -> outcome mapping.
+                # proc_supervision owns the RP-2 blocking-run/RP-5 fresh-PID-
+                # verify mechanics.
+                #
+                # The subprocess RUN itself is routed through the runner's own
+                # task-2090-hardened script_runner/_default_run_script seam
+                # via a create_subprocess_exec-compatible SHIM below — NOT
+                # through execute()'s own bare (untimed, non-process-group-
+                # aware) spawn — so Layer A (process-group kill of leaked
+                # grandchildren) and the (before_done)->(rc, tail) seam
+                # contract are both preserved.
                 run_fn = self._script_runner or self._default_run_script
                 outer_timeout = before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
 
@@ -1739,21 +1746,87 @@ class DeterministicRunner:
                             f'outer guard): {exc!r}'
                         ) from exc
 
+                class _RunFnProcShim:
+                    """Adapts a (rc, tail) pair from run_fn into a
+                    create_subprocess_exec-compatible object for
+                    RestartPlan._execute_cross_unit_blocking's injectable
+                    `runner` seam (exposes .returncode + async communicate())."""
+
+                    def __init__(self, rc: int, tail: str) -> None:
+                        self.returncode = rc
+                        self._tail = tail
+
+                    async def communicate(self) -> tuple[bytes, None]:
+                        return self._tail.encode(errors='replace'), None
+
+                async def _shim_runner(*_args, **_kwargs):
+                    rc, tail = await _invoke_run_fn()
+                    return _RunFnProcShim(rc, tail)
+
+                # RestartOutcome carries only disposition/escalated/detail —
+                # not the verified MainPID/timestamp _writeback_deploy_success
+                # needs for done_provenance.  This wrapper stashes execute()'s
+                # single post-deploy re-inspect (via the SAME inspect_fn used
+                # for the baseline above) so the fresh unit state survives
+                # past plan.execute() without a second, wasteful/racy inspect.
+                captured: dict = {}
+
+                async def _capturing_inspector(unit: str, **_kwargs) -> dict:
+                    state = await inspect_fn(unit)
+                    captured['new_state'] = state
+                    return state
+
+                verify = FreshPidVerify(
+                    baseline_active_enter_monotonic=baseline.get(
+                        'ActiveEnterTimestampMonotonic', 0,
+                    ),
+                    baseline_main_pid=baseline.get('MainPID', 0),
+                    inspect_timeout_secs=self._inspect_timeout_secs,
+                )
+                plan = RestartPlan(
+                    script=Path(before_done['script']),
+                    args=list(before_done.get('args') or []),
+                    cwd=Path(before_done.get('cwd') or os.getcwd()).resolve(),
+                    target_unit=target_unit,
+                    # own_unit must be truthy and provably non-self here (this
+                    # branch is only reached when the runner's OWN self_target
+                    # check above already ruled out self-target), so
+                    # RestartPlan.execute() takes the RP-2 cross-unit-blocking
+                    # path — never RP-1's fail-closed refuse — even when
+                    # ORCH_UNIT is unset (own_unit == ''), preserving the
+                    # existing fail-open-to-cross-unit behaviour.
+                    own_unit=own_unit or _CROSS_UNIT_OWN_UNIT_SENTINEL,
+                    on_failure_escalation=None,
+                    verify=verify,
+                    transient_unit=None,
+                )
+
                 try:
-                    rc, out = await asyncio.wait_for(_invoke_run_fn(), timeout=outer_timeout)
+                    outcome = await asyncio.wait_for(
+                        plan.execute(runner=_shim_runner, inspector=_capturing_inspector),
+                        timeout=outer_timeout,
+                    )
                 except TimeoutError:
+                    # This guard now bounds the delegated plan.execute() call,
+                    # which runs BOTH the deploy subprocess and the post-deploy
+                    # verify re-inspect (_capturing_inspector -> inspect_fn) —
+                    # asyncio.wait_for cannot tell which of the two was still
+                    # pending when the timeout fired, so the message must not
+                    # pin the blame solely on "the subprocess".
                     timeout_detail = '\n'.join([
                         description,
                         f'Target unit: {target_unit}',
-                        f'Deploy run_fn exceeded the outer guard timeout ({outer_timeout}s = '
+                        f'Deploy run+verify exceeded the outer guard timeout ({outer_timeout}s = '
                         f"before_done['timeout_secs'] + run_timeout_grace_secs).",
-                        'The subprocess may be detached/unkillable — check the unit out-of-band '
-                        '(e.g. systemctl --user status, ps) before taking further action.',
+                        'The hang may be in the deploy subprocess itself or in the post-deploy '
+                        'unit inspect (verify) — the outer guard wraps both and cannot '
+                        'distinguish which was pending. Check the unit out-of-band (e.g. '
+                        'systemctl --user status, ps) before taking further action.',
                         'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,
-                        summary=f'Deploy run_fn timed out (subprocess hung): {target_unit}',
+                        summary=f'Deploy run+verify exceeded outer guard: {target_unit}',
                         detail=timeout_detail,
                     )
                 except Exception as exc:
@@ -1769,13 +1842,12 @@ class DeterministicRunner:
                         detail=error_detail,
                     )
 
-                if rc != 0:
+                if outcome.disposition == RestartDisposition.RESTART_FAILED:
                     # B7a: script failed — file infra_issue escalation, set blocked (B7a)
                     deploy_detail = '\n'.join([
                         description,
                         f'Target unit: {target_unit}',
-                        f'Script exit code: rc={rc}',
-                        f'Output:\n{out}',
+                        outcome.detail,
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,
@@ -1783,35 +1855,38 @@ class DeterministicRunner:
                         detail=deploy_detail,
                     )
 
-                # Re-inspect to verify a fresh MainPID + strictly-later monotonic timestamp
-                new_state = await inspect_fn(target_unit)
-                pid: int = new_state.get('MainPID', 0)
-                new_monotonic: int = new_state.get('ActiveEnterTimestampMonotonic', 0)
-                baseline_monotonic: int = baseline.get('ActiveEnterTimestampMonotonic', 0)
-                fresh: bool = (
-                    isinstance(pid, int)
-                    and pid > 0
-                    and new_monotonic > baseline_monotonic
-                )
-
-                if not fresh:
+                if outcome.disposition == RestartDisposition.VERIFY_FAILED:
                     # B7b: verify failed — file infra_issue escalation, set blocked
                     verify_detail = '\n'.join([
                         description,
                         f'Target unit: {target_unit}',
-                        (
-                            f'Verify failed: new MainPID={pid!r} '
-                            f'new_monotonic={new_monotonic} '
-                            f'baseline_monotonic={baseline_monotonic}'
-                        ),
-                        'Expected a fresh non-sentinel MainPID (>0) and a strictly-later '
-                        'ActiveEnterTimestampMonotonic after the deploy.',
+                        outcome.detail,
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,
                         summary=f'Deploy verify failed: {target_unit}',
                         detail=verify_detail,
                     )
+
+                if outcome.disposition != RestartDisposition.DEPLOYED_AND_VERIFIED:
+                    # Defensive: REFUSED is structurally unreachable from this
+                    # call site (own_unit is always forced truthy+non-self
+                    # above, so RP-1 never refuses here) — never silently
+                    # swallow an unexpected disposition rather than surfacing
+                    # it as an infra_issue.
+                    refused_detail = '\n'.join([
+                        description,
+                        f'Target unit: {target_unit}',
+                        f'Unexpected RestartPlan disposition: {outcome.disposition!r}',
+                        outcome.detail,
+                    ])
+                    return await self._file_infra_issue_and_block(
+                        task_id,
+                        summary=f'Deploy refused unexpectedly: {target_unit}',
+                        detail=refused_detail,
+                    )
+
+                new_state = captured.get('new_state', {})
 
                 if not always_escalates:
                     # Pure cross-unit deploy (B6): verified → set done with provenance.

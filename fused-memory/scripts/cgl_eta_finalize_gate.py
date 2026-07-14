@@ -9,6 +9,10 @@ Order matters and is deliberate:
   1. set_task_status(2273, done)  — terminal state FIRST, so there is never a
      blocked-without-open-escalation window for the stranded-blocked reconciler
      to reclaim + re-dispatch 2273 (which, as a pure gate, would just re-escalate).
+     Finalized with done_provenance kind='deterministic-gate' (see
+     _gate_done_provenance) — the pure-gate-resolved DoneProvenance kind the
+     MCP validator accepts commit-less and pid-less; a bare {'note': ...}
+     blob with no `kind` is unconditionally rejected as done_provenance_invalid.
   2. resolve_issue(esc-2273-1, close_only) — dismiss the stale escalation on the
      now-done task (`close_only` = no status effect; the done in step 1 is what
      matters). NB: no resolve *action* yields `done` (ACTION_EFFECTS maps
@@ -43,6 +47,19 @@ def _log(msg: str) -> None:
     print(f'[cgl-finalize] {msg}', flush=True)
 
 
+def _gate_done_provenance(note: str) -> dict:
+    """Build the `done_provenance` blob for finalizing a pure gate task.
+
+    kind='deterministic-gate' is the pure-gate-resolved DoneProvenance kind
+    (task 2331/2334, shared/src/shared/task_metadata.py) — accepted by the
+    MCP validator commit-less and pid-less, unlike a bare {'note': ...}
+    blob (no `kind`), which `_validate_done_provenance` unconditionally
+    rejects as done_provenance_invalid. That rejection is what stranded
+    task 2273 (the CGL-η 2273 stranding class).
+    """
+    return {'kind': 'deterministic-gate', 'note': note}
+
+
 async def main_async() -> int:
     note = (
         f'CGL-η Phase-1 bulk cross-graph migration auto-applied and post-verified '
@@ -55,7 +72,7 @@ async def main_async() -> int:
         async with McpClient(FUSED_URL) as fm:
             res = await fm.call_tool('set_task_status', {
                 'id': GATE_TASK, 'status': 'done', 'project_root': REPO,
-                'done_provenance': {'note': note},
+                'done_provenance': _gate_done_provenance(note),
             })
         _log(f'set_task_status({GATE_TASK}, done): {res}')
     except Exception as exc:

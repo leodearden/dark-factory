@@ -40,7 +40,20 @@ class ScoringItem:
 
 @dataclass(frozen=True)
 class Defaults:
-    """Fallback weights used when a severity/category/project key is unmapped."""
+    """Fallback weights used when a severity/category/project key is unmapped.
+
+    `severity` in particular is deliberately placed ABOVE the lowest rungs of
+    the bundled escalation vocabulary (severity_weights['info']/['low']),
+    not at or below them: an *unmapped* severity (every session, via
+    session_to_scoring_item -- including ones with a real pending question;
+    or a legacy decision filed before the F7 --severity flag existed) is a
+    missing-data signal, not the same thing as an operator explicitly
+    tagging a decision `severity='info'` (a deliberate "this is
+    lowest-priority" signal). Treating "unknown" as more urgent than an
+    explicit "info" park is intentional -- see priorities.default.yaml's
+    `defaults:` comment and TestSeverityVocabulary's ordering pin in
+    test_priority.py.
+    """
 
     severity: float
     category: float
@@ -79,11 +92,30 @@ class Priorities:
     def default(cls) -> Priorities:
         """Sane, non-negative hardcoded defaults (mirrored in priorities.default.yaml)."""
         return cls(
-            severity_weights={'critical': 5.0, 'high': 3.0, 'medium': 1.5, 'low': 0.5},
+            severity_weights={
+                # 'urgent'/'critical'/'blocking'/'info' are the escalation
+                # vocabulary (escalation/src/escalation/models.py) a real
+                # DecisionRecord.severity carries end to end via
+                # decision_to_scoring_item. 'high'/'medium'/'low' are
+                # legacy/test-only buckets: no production caller emits them
+                # (session_to_scoring_item always uses '', and no watcher
+                # files these) -- kept only so existing tests that construct
+                # a ScoringItem/priorities.yaml with them keep working. See
+                # priorities.default.yaml's mirrored comment.
+                'urgent': 6.0,
+                'critical': 5.0,
+                'high': 3.0,
+                'blocking': 2.5,
+                'medium': 1.5,
+                'low': 0.5,
+                'info': 0.25,
+            },
             category_weights={'security': 2.0, 'bug': 1.0, 'feature': 0.5, 'chore': 0.2},
             project_weights={},
+            # severity=1.0 sits between 'low' (0.5) and 'medium' (1.5) --
+            # above 'info' (0.25) by design. See Defaults' docstring.
             defaults=Defaults(severity=1.0, category=0.5, project=0.0),
-            age_curve=AgeCurve(max_bonus=2.0, saturation_seconds=float(7 * 24 * 3600)),
+            age_curve=AgeCurve(max_bonus=0.75, saturation_seconds=float(7 * 24 * 3600)),
             manual_boost=ManualBoostConfig(weight=1.0, min=-5, max=5),
         )
 
@@ -219,6 +251,41 @@ def _priorities_from_dict(data: dict[str, Any]) -> Priorities:
     )
 
 
+_ESCALATION_SEVERITIES = ('urgent', 'critical', 'blocking', 'info')
+
+
+def _warn_if_severity_weights_missing_escalation_vocabulary(
+    severity_weights: dict[str, float], source: Path
+) -> None:
+    """Log a WARNING if *severity_weights* (as loaded from *source*) omits any
+    of the escalation vocabulary (urgent/critical/blocking/info).
+
+    ``_weight_table`` only substitutes the bundled table when a section is
+    absent/non-mapping (see its docstring) -- an operator's own
+    already-materialized ``~/.claude/fleet/priorities.yaml``, written before
+    this vocabulary was added to ``Priorities.default()``, has its OWN
+    explicit ``severity_weights`` mapping, used verbatim, so the newly-added
+    keys are never top-up-merged into it. A decision carrying one of those
+    severities then silently falls back to ``defaults.severity``, so the
+    Fleet Cockpit F7 symptom (a stale content-less row swamping a real ask)
+    persists for that install even though the bundled defaults/code were
+    fixed. ``ensure_priorities_file`` never rewrites an existing file (by
+    design -- it must never clobber operator edits), so there is no
+    automatic migration; this warning is the stopgap that surfaces the gap.
+    """
+    missing = [s for s in _ESCALATION_SEVERITIES if s not in severity_weights]
+    if missing:
+        logger.warning(
+            'load_priorities: %s severity_weights is missing escalation-vocabulary '
+            'key(s) %s -- decisions with those severities fall back to '
+            'defaults.severity and may be outranked by stale content-less rows. '
+            'Add these keys (see priorities.default.yaml) to pick up the Fleet '
+            'Cockpit F7 ranking fix.',
+            source,
+            missing,
+        )
+
+
 def load_priorities(path: Path | None = None) -> Priorities:
     """Load Priorities from *path* (default ``~/.claude/fleet/priorities.yaml``).
 
@@ -226,6 +293,15 @@ def load_priorities(path: Path | None = None) -> Priorities:
     dependency): a missing user file silently falls back to the
     package-bundled defaults; a malformed user file falls back to the same
     defaults with a logged WARNING. This function never raises.
+
+    An existing user file is never migrated: its own explicit
+    ``severity_weights`` section (if present) is used verbatim (see
+    ``_weight_table``), not top-up-merged with newly-added bundled keys. If
+    that section is missing any of the escalation vocabulary
+    (urgent/critical/blocking/info), this logs a WARNING -- see
+    ``_warn_if_severity_weights_missing_escalation_vocabulary`` -- since a
+    decision with one of those severities would otherwise silently score at
+    ``defaults.severity`` instead of its real weight.
     """
     target = path if path is not None else _default_priorities_path()
 
@@ -245,7 +321,9 @@ def load_priorities(path: Path | None = None) -> Priorities:
             )
             return Priorities.default()
 
-        return _priorities_from_dict(data)
+        priorities = _priorities_from_dict(data)
+        _warn_if_severity_weights_missing_escalation_vocabulary(priorities.severity_weights, target)
+        return priorities
 
     return _priorities_from_dict(_load_bundled_defaults())
 

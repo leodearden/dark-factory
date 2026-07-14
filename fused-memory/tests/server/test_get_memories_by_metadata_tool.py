@@ -158,3 +158,71 @@ class TestGetMemoriesByMetadataTool:
         assert 'filters must not be empty' in result.get('error', ''), (
             f"Expected original error message in result: {result!r}"
         )
+
+
+class TestGetMemoriesByMetadataTruncationDisclosure:
+    """Truncation-disclosure tests (task 2562 item 2).
+
+    The response now self-discloses truncation via ``truncated``/``total``
+    instead of silently capping at ``limit`` with no way for the caller to
+    detect it happened.
+    """
+
+    @pytest.mark.asyncio
+    async def test_truncated_when_result_hits_limit_and_true_count_is_larger(self):
+        """Exactly `limit` records returned + a larger true count -> truncated=True."""
+        mock_service = AsyncMock()
+        three_records = [{'id': f'mem-{i}'} for i in range(3)]
+        mock_service.get_memories_by_metadata = AsyncMock(return_value=three_records)
+        mock_service.count_memories_by_metadata = AsyncMock(return_value=10)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'get_memories_by_metadata',
+            {'project_id': _PROJECT_ID, 'filters': _FILTERS, 'limit': 3},
+        )
+
+        assert result['truncated'] is True, f'Expected truncated=True, got: {result!r}'
+        assert result['total'] == 10, f"Expected total=10, got: {result!r}"
+        mock_service.count_memories_by_metadata.assert_called_once_with(
+            project_id=_PROJECT_ID,
+            filters=_FILTERS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_not_truncated_when_below_limit_skips_count_call(self):
+        """Fewer than `limit` records -> truncated=False, total=len(memories), and
+        count_memories_by_metadata is never called (no extra Qdrant round-trip)."""
+        mock_service = AsyncMock()
+        mock_service.get_memories_by_metadata = AsyncMock(return_value=_SAMPLE_MEMORIES)
+        mock_service.count_memories_by_metadata = AsyncMock(return_value=999)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'get_memories_by_metadata',
+            {'project_id': _PROJECT_ID, 'filters': _FILTERS},
+        )
+
+        assert result['truncated'] is False, f'Expected truncated=False, got: {result!r}'
+        assert result['total'] == len(_SAMPLE_MEMORIES), f'Expected total==2, got: {result!r}'
+        mock_service.count_memories_by_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_boundary_exact_limit_and_matching_count_not_truncated(self):
+        """Result length == limit AND true count == limit -> truncated=False."""
+        mock_service = AsyncMock()
+        mock_service.get_memories_by_metadata = AsyncMock(return_value=_SAMPLE_MEMORIES)
+        mock_service.count_memories_by_metadata = AsyncMock(return_value=len(_SAMPLE_MEMORIES))
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'get_memories_by_metadata',
+            {'project_id': _PROJECT_ID, 'filters': _FILTERS, 'limit': len(_SAMPLE_MEMORIES)},
+        )
+
+        assert result['truncated'] is False, f'Expected truncated=False, got: {result!r}'
+        assert result['total'] == len(_SAMPLE_MEMORIES), f'Expected total==2, got: {result!r}'
+        mock_service.count_memories_by_metadata.assert_called_once_with(
+            project_id=_PROJECT_ID,
+            filters=_FILTERS,
+        )

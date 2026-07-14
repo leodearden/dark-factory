@@ -18,7 +18,9 @@ from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
+from openai import RateLimitError
 from pydantic import BaseModel
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
@@ -642,3 +644,26 @@ async def poll_until(
         if loop.time() >= deadline:
             raise AssertionError(message or f'poll_until: condition not met within {timeout}s')
         await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
+# Shared quota/rate-limit error builder (task 2448)
+# ---------------------------------------------------------------------------
+#
+# De-duplicates the openai.RateLimitError builder that was previously
+# copy-pasted verbatim in test_memory_service.py and
+# tests/server/test_get_entity_tool.py (flagged by reviewer_comprehensive
+# amendment pass on task 2448) — a single copy avoids the two drifting apart
+# if the openai RateLimitError constructor signature ever changes.
+# ---------------------------------------------------------------------------
+
+
+def _make_rate_limit_error(
+    message: str = 'Rate limit exceeded.',
+    code: str = 'insufficient_quota',
+) -> RateLimitError:
+    """Build a real openai.RateLimitError (429 response) for quota-exhaustion tests."""
+    request = httpx.Request('POST', 'https://api.openai.com/v1/embeddings')
+    response = httpx.Response(429, request=request)
+    body = {'message': message, 'type': 'insufficient_quota', 'param': None, 'code': code}
+    return RateLimitError(message, response=response, body=body)

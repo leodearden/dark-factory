@@ -7,11 +7,16 @@ from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _fm_helpers import _make_rate_limit_error
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import Scope
 from fused_memory.services import memory_service
-from fused_memory.services.memory_service import MemoryService, _serialize_temporal
+from fused_memory.services.memory_service import (
+    MemoryService,
+    _is_rate_limit_or_quota_error,
+    _serialize_temporal,
+)
 
 
 @pytest.fixture
@@ -1856,6 +1861,81 @@ class TestGetEpisodeContent:
         assert result is None
 
 
+class TestIsRateLimitOrQuotaError:
+    """Classification contract for _is_rate_limit_or_quota_error (task 2448).
+
+    Pins which exceptions count as an embedding-provider rate-limit/quota
+    error (and therefore trigger get_entity's degraded fallback) versus
+    which must keep propagating as hard errors. Note the predicate matches
+    ANY openai.RateLimitError or duck-typed status_code==429 — it does not
+    distinguish hard quota exhaustion (insufficient_quota) from a transient,
+    retryable too-many-requests rate limit; both degrade get_entity the same
+    way since it has no retry loop of its own.
+    """
+
+    def test_real_openai_rate_limit_error_matches(self):
+        """A real openai.RateLimitError (429, code=insufficient_quota) matches."""
+        exc = _make_rate_limit_error()
+        assert _is_rate_limit_or_quota_error(exc) is True
+
+    def test_duck_typed_status_code_429_matches(self):
+        """A non-openai exception with a duck-typed status_code == 429 matches,
+        even with no insufficient_quota code/message — this predicate matches
+        transient/retryable 429s too, not just hard quota exhaustion."""
+
+        class FakeQuotaError(Exception):
+            status_code = 429
+
+        assert _is_rate_limit_or_quota_error(FakeQuotaError('rate limited')) is True
+
+    def test_message_containing_insufficient_quota_matches(self):
+        """An exception whose str() contains 'insufficient_quota' matches."""
+        exc = Exception('insufficient_quota: no credits left')
+        assert _is_rate_limit_or_quota_error(exc) is True
+
+    def test_runtime_error_does_not_match(self):
+        """A plain RuntimeError unrelated to rate-limits/quota does not match."""
+        assert _is_rate_limit_or_quota_error(RuntimeError('search failed')) is False
+
+    def test_value_error_does_not_match(self):
+        """A plain ValueError unrelated to rate-limits/quota does not match."""
+        assert _is_rate_limit_or_quota_error(ValueError('nope')) is False
+
+    def test_cancelled_error_does_not_match(self):
+        """asyncio.CancelledError (a BaseException, not an Exception) never matches.
+
+        Cancellation signals must never be classified as a rate-limit/quota
+        error — they are structured-concurrency shutdown signals, not
+        application failures.
+        """
+        assert _is_rate_limit_or_quota_error(asyncio.CancelledError()) is False
+
+    def test_message_substring_does_not_match_when_status_code_contradicts(self):
+        """A message merely quoting 'insufficient_quota' must NOT match when the
+        exception also carries a concrete, non-429 status_code — a definitive
+        status code contradicts the fuzzy message-substring fallback (e.g. a
+        wrapped/log-echo error that quotes an upstream message verbatim but is
+        itself a distinct, non-rate-limit failure) (task 2448 review)."""
+
+        class WrappedError(Exception):
+            status_code = 500
+
+        exc = WrappedError('upstream said: insufficient_quota, but this is a 500')
+        assert _is_rate_limit_or_quota_error(exc) is False
+
+    def test_message_substring_does_not_match_when_code_attribute_present(self):
+        """A message merely quoting 'insufficient_quota' must NOT match when the
+        exception already carries an unrelated, non-empty `code` attribute — a
+        concrete (even if non-matching) code classification takes precedence
+        over the fuzzy message-substring fallback (task 2448 review)."""
+
+        class WrappedError(Exception):
+            code = 'some_other_code'
+
+        exc = WrappedError('upstream said: insufficient_quota, but this is unrelated')
+        assert _is_rate_limit_or_quota_error(exc) is False
+
+
 class TestGetEntity:
     # ------------------------------------------------------------------
     # baseline success regression test
@@ -2437,6 +2517,166 @@ class TestGetEntity:
 
         service.graphiti.search.assert_awaited_once()
         assert service.graphiti.search.call_args.kwargs['num_results'] == 10
+
+    # ------------------------------------------------------------------
+    # exact-match-with-edges happy path through the restructured try/except
+    # (task 2448 review) — the degraded-fallback wrap below (test_degraded_
+    # fallback_on_exact_match_edge_fetch_quota_error) covers the failure
+    # branch of this exact same concurrent-edge code path; this test covers
+    # its success branch so a regression that silently dropped edges (or
+    # leaked degraded keys onto the clean path) inside the reworked
+    # `if exact:` block would be caught.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_exact_match_with_edges_happy_path_omits_degraded_keys(self, service):
+        """An exact-name hit whose edge fetch succeeds still returns real
+        nodes/edges through the try/except-wrapped exact-match branch, with
+        no 'degraded' or 'failed_stores' keys on the clean path."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=[{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': []}]
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[{'uuid': 'e-1', 'fact': 'Task 115 depends on Task 5', 'name': 'DEPENDS_ON'}]
+        )
+
+        result = await service.get_entity('Task 115', project_id='test')
+
+        assert 'degraded' not in result
+        assert 'failed_stores' not in result
+        assert result == {
+            'nodes': [{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': []}],
+            'edges': [{'uuid': 'e-1', 'fact': 'Task 115 depends on Task 5', 'temporal': None}],
+        }
+
+    # ------------------------------------------------------------------
+    # degraded fallback on embedding-provider rate-limit/quota errors
+    # (task 2448) — response SHAPE mirrors search()'s degraded/failed_stores
+    # convention, but the TRIGGER is narrower: search() degrades on any
+    # per-store Exception, get_entity only on a classified rate-limit/quota
+    # error (see _is_rate_limit_or_quota_error). Everything else still
+    # propagates — see test_non_quota_error_still_propagates below.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_degraded_fallback_on_fuzzy_search_quota_error(self, service):
+        """A quota/rate-limit error from graphiti.search (fuzzy fallback) degrades
+        instead of raising: returns the degraded superset dict, no exception."""
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(side_effect=_make_rate_limit_error())
+
+        result = await service.get_entity('entity', project_id='test')
+
+        assert result == {
+            'nodes': [],
+            'edges': [],
+            'degraded': True,
+            'failed_stores': ['graphiti'],
+        }
+
+    @pytest.mark.asyncio
+    async def test_degraded_fallback_on_message_substring_quota_error(self, service):
+        """A quota error classified ONLY via the message-substring fallback (no
+        status_code, no code attribute) also degrades through get_entity
+        end-to-end. The other degraded-fallback tests here all use either a
+        real openai.RateLimitError or a duck-typed status_code==429, leaving
+        this third classification branch of _is_rate_limit_or_quota_error
+        untested through get_entity itself (task 2448 review)."""
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(
+            side_effect=Exception('insufficient_quota: no credits')
+        )
+
+        result = await service.get_entity('entity', project_id='test')
+
+        assert result == {
+            'nodes': [],
+            'edges': [],
+            'degraded': True,
+            'failed_stores': ['graphiti'],
+        }
+
+    @pytest.mark.asyncio
+    async def test_degraded_fallback_on_fuzzy_search_nodes_duck_typed_quota_error(self, service):
+        """A duck-typed (non-openai) quota error from search_nodes also degrades —
+        the predicate isn't limited to the concrete openai.RateLimitError type."""
+
+        class FakeQuotaError(Exception):
+            status_code = 429
+
+        service.graphiti.search_nodes = AsyncMock(side_effect=FakeQuotaError('rate limited'))
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        result = await service.get_entity('entity', project_id='test')
+
+        assert result == {
+            'nodes': [],
+            'edges': [],
+            'degraded': True,
+            'failed_stores': ['graphiti'],
+        }
+
+    @pytest.mark.asyncio
+    async def test_degraded_fallback_on_exact_match_quota_error(self, service):
+        """A quota/rate-limit error from get_nodes_by_exact_name (exact-match path)
+        also degrades instead of raising."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            side_effect=_make_rate_limit_error()
+        )
+
+        result = await service.get_entity('Task 115', project_id='test')
+
+        assert result == {
+            'nodes': [],
+            'edges': [],
+            'degraded': True,
+            'failed_stores': ['graphiti'],
+        }
+
+    @pytest.mark.asyncio
+    async def test_degraded_fallback_on_exact_match_edge_fetch_quota_error(self, service):
+        """A quota/rate-limit error from get_valid_edges_for_node — reached only
+        after get_nodes_by_exact_name resolves a hit, via the exact-match
+        branch's gather_or_raise fan-out over resolved node uuids — also
+        degrades instead of raising. Distinct code path from the exact-name
+        lookup itself (test_degraded_fallback_on_exact_match_quota_error
+        above): that one fails before any uuid is resolved, this one fails
+        during the subsequent concurrent edge fetch."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=[{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': []}]
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            side_effect=_make_rate_limit_error()
+        )
+
+        result = await service.get_entity('Task 115', project_id='test')
+
+        assert result == {
+            'nodes': [],
+            'edges': [],
+            'degraded': True,
+            'failed_stores': ['graphiti'],
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_quota_error_still_propagates(self, service):
+        """A non-quota RuntimeError from the fuzzy fallback still propagates unchanged —
+        the degraded fallback is narrowly scoped to quota/rate-limit errors only."""
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with pytest.raises(RuntimeError, match='boom'):
+            await service.get_entity('entity', project_id='test')
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_still_propagates_not_degraded(self, service):
+        """asyncio.CancelledError must still propagate unchanged — cancellation is
+        never treated as a degraded-fallback condition."""
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await service.get_entity('entity', project_id='test')
 
 
 class TestEdgeToDict:

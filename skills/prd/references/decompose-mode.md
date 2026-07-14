@@ -35,6 +35,14 @@ Enumerate every task in the PRD's decomposition plan. For each:
 
 If any leaf task lacks a user-observable signal, **stop** and surface to the user. If any intermediate task has no named downstream consumer, surface it — typically the decomposition is missing an integration-gate task.
 
+### Step 2.3 — G7 walk (design invariants)
+
+Read `docs/legibility/design-invariants.md` — the single normative list; do not restate the invariants here beyond their slugs, per INV-5 (`no-lockstep-duplication`). Walk **every task in the batch** (not only leaves — violations attach to mechanisms, which intermediates introduce too) against each invariant's checkable question.
+
+Resolve any hit by redesigning the task, or by waiving it: record `G7 waiver: <slug> — <rationale>` in the PRD's decomposition-plan row AND stamp `metadata.g7_waivers: [{"invariant": <slug>, "rationale": <text>}]` on the filed task at Step 3. An unresolved, unwaived hit **blocks** the batch until Step 3.
+
+Calibration fixtures will live at `docs/legibility/design-invariants-fixtures.md` once sibling task ε lands (file not yet present as of this doc's landing).
+
 ### Step 2.5 — Capability manifest (mechanize G3 + G6; commit beside the PRD)
 
 Before filing, build the **capability manifest** (`gates.md` → *Capability Manifest — mechanizing G3 + G6 per leaf*). For each **leaf** task, enumerate the capabilities its signal asserts and bind each to evidence — `grep:file:line wired` / `producer:task-N upstream` / `grammar-fixture:path parses` / `floor:bound>X`. Any binding that resolves to `declared-only | test-only | producer-downstream | producer-absent | producer-extent-short | fixture-ERROR | bound≤floor | rejection-absent` **blocks the batch** — resolve it (rewrite to an existing capability, queue the prerequisite upstream + wire the dep, move the signal to the producing leaf, or relax the bound) **before** Step 3.
@@ -71,6 +79,7 @@ Modules touched: <list>
         "consumer_ref": "<consumer_ref>",
         "grammar_confirmed": True,   # or the overlay's substrate-confirmed flag name
         "modules": ["<module_path>", ...],
+        # "g7_waivers": [{"invariant": "<slug>", "rationale": "<text>"}],  # only if Step 2.3 recorded a waiver for this task
     },
 )
 task_id = result["task_id"]   # status == "deferred", planning_mode == True
