@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from orchestrator.config import GitConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WorktreeKind
+from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
 # step-1: WorktreeKind enum + E2 registration
@@ -298,3 +299,126 @@ class TestEphemeralWorktreeRetry:
         assert not remove_calls, (
             f'expected NO git worktree remove when add never succeeded; got {remove_calls}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-5: E1 — both probes route through the CM; the CM never prunes
+# ---------------------------------------------------------------------------
+
+
+def _make_config(tmp_path: Path) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        project_root=tmp_path,
+        max_concurrent_tasks=1,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+
+
+_PASSING_RESULT = VerifyResult(
+    passed=True, test_output='', lint_output='', type_output='',
+    summary='all checks passed',
+)
+
+
+class TestBothProbesRouteThroughEphemeralWorktree:
+    """step-5 (E1 — the hard-leaf, load-bearing incident-prevention signal
+    this task exists to add): both main-tip probes
+    (verify_failure_is_preexisting_on_main, run_main_tip_sweep — both in
+    verify.py) must build their throwaway worktree by calling
+    GitOps.ephemeral_worktree(), and neither may EVER issue
+    ``['git', 'worktree', 'prune']`` (DD5) — only a scoped
+    ``git worktree remove --force``.
+
+    RED today: both probes still build their own worktree inline (bespoke
+    path build + retry-add + finally-cleanup) and never call
+    ``git_ops.ephemeral_worktree`` — the spy sees 0 calls.
+    """
+
+    def test_verify_failure_is_preexisting_on_main_routes_through_cm(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        # A category/cause_hint combo unique to this test so its key can
+        # never collide with another test's entry in the process-wide
+        # (module-level) verify._PROBE_CACHE.
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='theta_e1_mainprobe_signal',
+            cause_hint='task theta E1 ephemeral_worktree routing signal (mainprobe)',
+            category='task_theta_e1_mainprobe',
+        )
+
+        calls: list[list[str]] = []
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification',
+                         new=AsyncMock(return_value=_PASSING_RESULT)),
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            patch.object(
+                git_ops, 'ephemeral_worktree', wraps=git_ops.ephemeral_worktree,
+            ) as spied_cm,
+        ):
+            asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], failing_result, git_ops,
+                )
+            )
+
+        assert spied_cm.call_count >= 1, (
+            'expected verify_failure_is_preexisting_on_main to build its probe '
+            'worktree via git_ops.ephemeral_worktree(); got 0 calls'
+        )
+        assert not any(
+            'worktree' in c and 'prune' in c for c in calls
+        ), f'probe must NEVER issue a prune argv (DD5/E1); got calls={calls}'
+        assert any(
+            'worktree' in c and 'remove' in c and '--force' in c for c in calls
+        ), f'expected a scoped "git worktree remove --force" argv; got calls={calls}'
+
+    def test_run_main_tip_sweep_routes_through_cm(self, tmp_path: Path) -> None:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        calls: list[list[str]] = []
+
+        async def _fake_full_verify(project_root, cfg, **kwargs) -> VerifyResult:
+            return _PASSING_RESULT
+
+        with (
+            patch.object(verify_module, 'run_full_verification', side_effect=_fake_full_verify),
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            patch.object(
+                git_ops, 'ephemeral_worktree', wraps=git_ops.ephemeral_worktree,
+            ) as spied_cm,
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is not None, f'expected a (sha, VerifyResult) tuple, got {result!r}'
+        assert spied_cm.call_count >= 1, (
+            'expected run_main_tip_sweep to build its sweep worktree via '
+            'git_ops.ephemeral_worktree(); got 0 calls'
+        )
+        assert not any(
+            'worktree' in c and 'prune' in c for c in calls
+        ), f'probe must NEVER issue a prune argv (DD5/E1); got calls={calls}'
+        assert any(
+            'worktree' in c and 'remove' in c and '--force' in c for c in calls
+        ), f'expected a scoped "git worktree remove --force" argv; got calls={calls}'
