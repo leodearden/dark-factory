@@ -57,9 +57,11 @@ outcomes, per the PRD's "direction, not frozen thresholds" (G6).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -68,7 +70,7 @@ from unittest.mock import patch
 import pytest
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.verify import run_verification
+from orchestrator.verify import run_full_verification, run_verification
 
 # ---------------------------------------------------------------------------
 # Shared sentinels + labelling (adapted from test_verify_admission_wiring.py)
@@ -179,6 +181,92 @@ class _RunCmdSpy:
             finally:
                 self.current -= 1
         return 0, '', False
+
+
+# ---------------------------------------------------------------------------
+# Deterministic instrumented stand-in for shared.verify_admission.acquire_task_slot
+# ---------------------------------------------------------------------------
+
+
+class _DeterministicAcquire:
+    """Stand-in for ``orchestrator.verify.acquire_task_slot`` (T1's real flock
+    semaphore) that replaces the real poll race with a test-controlled,
+    one-at-a-time grant order — used only where the real race's winner is
+    nondeterministic and the test must PROVE a specific interleave (PRD
+    scenario 3), rather than merely observe *a* valid one.
+
+    ``__call__`` matches T1's ``acquire_task_slot(role, *, slots_dir, n,
+    wait=True)`` signature and, like it, no-ops (yields ``False``
+    immediately, no bookkeeping) for any role other than ``'task'``/
+    ``'background'``. For those two roles, each call is assigned the next
+    0-based *occurrence* number for its role (mirroring ``_RunCmdSpy``'s
+    per-leg occurrence tracking) and returns a **sync** context manager —
+    matching T1's contract, since ``orchestrator.verify._admission_slot``
+    drives ``cm.__enter__``/``cm.__exit__`` from a worker thread via
+    ``run_in_executor`` — whose ``__enter__`` blocks the calling thread on
+    a ``threading.Event`` (not ``asyncio.Event``: this blocks in a real OS
+    thread, not on the event loop) obtained via :meth:`gate`. The test
+    drives the interleave by calling ``.set()`` on each occurrence's gate
+    in whatever order it wants grants to happen, one at a time, waiting for
+    each grant's acquire+release to appear in :attr:`log` before opening
+    the next — ``max_seen`` is real, honest accounting (incremented on
+    acquire, decremented on release, under :attr:`_lock`, since worker
+    threads call concurrently), not asserted-by-construction, so a bug that
+    opens two gates too early is still caught.
+    """
+
+    def __init__(self) -> None:
+        self.log: list[tuple[str, str]] = []
+        self.current = 0
+        self.max_seen = 0
+        self._lock = threading.Lock()
+        self._seen: dict[str, int] = {}
+        self._gates: dict[tuple[str, int], threading.Event] = {}
+
+    def gate(self, role: str, occurrence: int) -> threading.Event:
+        """Return (creating if needed) the Event gating *role*'s *occurrence*-th grant."""
+        event = self._gates.get((role, occurrence))
+        if event is None:
+            event = threading.Event()
+            self._gates[(role, occurrence)] = event
+        return event
+
+    def __call__(self, role: str, *, slots_dir: Path, n: int, wait: bool = True):
+        if role not in {'task', 'background'}:
+            @contextlib.contextmanager
+            def _noop():
+                yield False
+            return _noop()
+
+        occurrence = self._seen.get(role, 0)
+        self._seen[role] = occurrence + 1
+        gate = self.gate(role, occurrence)
+        return self._held(role, gate)
+
+    @contextlib.contextmanager
+    def _held(self, role: str, gate: threading.Event):
+        gate.wait()  # blocks the executor worker thread until the test releases it
+        with self._lock:
+            self.current += 1
+            self.max_seen = max(self.max_seen, self.current)
+            self.log.append((role, 'acquire'))
+        try:
+            yield True
+        finally:
+            with self._lock:
+                self.log.append((role, 'release'))
+                self.current -= 1
+
+
+async def _wait_for_log_len(acq: _DeterministicAcquire, want_len: int, *, timeout: float = 5.0) -> None:
+    """Poll (test-side, bounded) until *acq*'s log reaches *want_len* entries."""
+    deadline = time.monotonic() + timeout
+    while len(acq.log) < want_len and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert len(acq.log) >= want_len, (
+        f'expected at least {want_len} acquire-log entries within {timeout}s; '
+        f'got {acq.log!r}'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -371,3 +459,134 @@ class TestMergeNeverBlocks:
                 holder_gate.set()
                 holder_result = await holder_task
             assert holder_result.passed
+
+
+# ---------------------------------------------------------------------------
+# Scenario 3 — SWEEP YIELDS + INTERLEAVES
+# ---------------------------------------------------------------------------
+
+
+class TestSweepYieldsAndInterleaves:
+    """PRD Boundary-test sketch scenario 3: a background-role sweep
+    (``run_full_verification`` fanning out over ``config._module_configs``)
+    never monopolizes the sole slot for its full duration — each
+    subproject's admission is its own acquire/release pair — and a
+    contending task-role verify can be granted the slot BETWEEN two
+    sweep subprojects.
+
+    Uses :class:`_DeterministicAcquire` in place of the real T1 flock
+    semaphore: under the real poll race, which of several concurrent
+    waiters wins any given release is nondeterministic, so proving a
+    SPECIFIC interleave (background -> task -> background) against it
+    would be flaky (design_decisions[3]). The deterministic stand-in still
+    does real, honest max-held accounting — only the grant ORDER is
+    test-controlled.
+    """
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_task_verify_interleaves_between_two_background_subprojects(self, tmp_path):
+        project_root = tmp_path / 'proj'
+        project_root.mkdir()
+        task_worktree = tmp_path / 'wt-task'
+        task_worktree.mkdir()
+        slots_dir = tmp_path / 'slots'
+
+        config = OrchestratorConfig(
+            project_root=project_root,
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+        )
+        # Reuse path (task 2390/2391): run_full_verification(project_root, ...)
+        # only skips a fresh filesystem walk when project_root.resolve() ==
+        # config.project_root, which the field_validator above already
+        # resolved — so passing the same `project_root` object to both
+        # satisfies the reuse guard.
+        config._module_configs = {
+            'a': _module_config(prefix='a'),
+            'b': _module_config(prefix='b'),
+        }
+
+        acq = _DeterministicAcquire()
+        spy = _RunCmdSpy()
+        # Pre-register all three expected grants' gates up front — creating a
+        # gate does not release it, so this is safe regardless of which
+        # subproject's acquire call is assigned occurrence 0 vs 1.
+        bg_gate_0 = acq.gate('background', 0)
+        bg_gate_1 = acq.gate('background', 1)
+        task_gate_0 = acq.gate('task', 0)
+
+        with (
+            patch('orchestrator.verify.acquire_task_slot', new=acq),
+            patch('orchestrator.verify._run_cmd', new=spy),
+        ):
+            sweep_task = asyncio.create_task(
+                run_full_verification(project_root, config, role='background')
+            )
+
+            # 1st background subproject: grant, then wait for its full
+            # acquire+release pair before letting anything else proceed.
+            bg_gate_0.set()
+            await _wait_for_log_len(acq, 2)
+
+            # Contending task-role verify, started only now so its acquire
+            # attempt lands after the 1st background release.
+            task_task = asyncio.create_task(
+                run_verification(
+                    worktree=task_worktree,
+                    config=config,
+                    module_config=_module_config(),
+                    role='task',
+                    attempt_id=None,
+                )
+            )
+            task_gate_0.set()
+            await _wait_for_log_len(acq, 4)
+
+            # 2nd background subproject, granted last.
+            bg_gate_1.set()
+            await _wait_for_log_len(acq, 6)
+
+            sweep_result = await sweep_task
+            task_result = await task_task
+
+        # (c) interleave: task's grant lands BETWEEN the two background grants.
+        acquire_order = [role for role, event in acq.log if event == 'acquire']
+        assert acquire_order == ['background', 'task', 'background'], (
+            f'expected background -> task -> background grant order; got {acquire_order!r}'
+        )
+
+        # (b) per-subproject release — one acquire/release pair per
+        # subproject, never monopolized for the sweep's full duration — and
+        # the shared n=1 budget (task + background) never over-granted.
+        assert acq.log == [
+            ('background', 'acquire'), ('background', 'release'),
+            ('task', 'acquire'), ('task', 'release'),
+            ('background', 'acquire'), ('background', 'release'),
+        ]
+        assert acq.max_seen == 1, (
+            f'expected the shared n=1 slot to never be held by more than one '
+            f'role at a time; got max_seen={acq.max_seen}'
+        )
+
+        # (a) every sweep subproject's test leg is wrapped with the
+        # background nice tier. Both subprojects share worktree=project_root
+        # (run_full_verification's fan-out contract), while the contending
+        # task verify uses a distinct worktree — cwd distinguishes them.
+        background_test_calls = [
+            c for c in spy.calls
+            if c['leg'] == 'test' and c['cwd'] == project_root
+        ]
+        assert len(background_test_calls) == 2
+        expected_background_cmd = (
+            shlex.join(['nice', '-n', '19', 'ionice', '-c3'])
+            + ' /bin/bash -c '
+            + shlex.quote(_TEST_CMD)
+        )
+        assert all(c['cmd'] == expected_background_cmd for c in background_test_calls), (
+            f'expected both sweep subproject test legs wrapped with the '
+            f'background nice tier; got {[c["cmd"] for c in background_test_calls]!r}'
+        )
+
+        assert sweep_result.passed
+        assert task_result.passed
