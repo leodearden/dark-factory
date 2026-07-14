@@ -38,6 +38,7 @@ from orchestrator.workflow_types import (
     StewardInterrupted,
     StewardReescalatedL1,
     StewardResolved,
+    classify_failure,
 )
 
 if TYPE_CHECKING:
@@ -701,10 +702,16 @@ class TaskSteward:
                 backend=self.config.backends.triage,
             )
         except AllAccountsCappedException as e:
+            # BD-1: the reason text is single-sourced from the SAME
+            # classify_failure(e) table workflow.py/review_checkpoint.py/
+            # dry_run_unblock.py all consult for an AllAccountsCappedException
+            # — steward keeps its own distinct degraded control flow
+            # (fall back to inline triage) unchanged.
+            disp = classify_failure(e)
             logger.warning(
-                'Steward for task %s: pre-triage skipped — all accounts capped '
+                'Steward for task %s: pre-triage skipped — %s '
                 '(%d retries in %.1fs), falling back to inline triage',
-                self.task_id, e.retries, e.elapsed_secs,
+                self.task_id, disp.reason_prefix.lower(), e.retries, e.elapsed_secs,
             )
             return escalation
 

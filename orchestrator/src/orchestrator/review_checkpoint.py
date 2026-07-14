@@ -15,6 +15,7 @@ from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import DEEP_REVIEWER, submit_only_instructions
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyResult, run_full_verification
+from orchestrator.workflow_types import classify_failure
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -190,9 +191,15 @@ class ReviewCheckpoint:
                 backend=getattr(self.config.backends, 'deep_reviewer', 'claude'),
             )
         except AllAccountsCappedException as e:
+            # BD-1: the reason text is single-sourced from the SAME
+            # classify_failure(e) table workflow.py/steward.py/
+            # dry_run_unblock.py all consult for an AllAccountsCappedException
+            # — review_checkpoint keeps its own distinct degraded control
+            # flow (skip review, reset accumulators) unchanged.
+            disp = classify_failure(e)
             logger.warning(
-                'Review %s: skipped — all accounts capped (%d retries in %.1fs)',
-                review_id, e.retries, e.elapsed_secs,
+                'Review %s: skipped — %s (%d retries in %.1fs)',
+                review_id, disp.reason_prefix.lower(), e.retries, e.elapsed_secs,
             )
             # Reset accumulators so next trigger doesn't immediately re-fire
             self._last_review_at_merge = self._merge_count

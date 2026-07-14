@@ -60,8 +60,6 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
     GitOps,
     TrainMembership,
-    WarmLanePoolExhausted,
-    WarmLanePoolHardDown,
     WarmLaneRequeue,
     WorktreeConflictError,
     _run,
@@ -82,7 +80,7 @@ from orchestrator.task_status import (
     TERMINAL_STATUSES,
     WORKFLOW_PRESERVE_STATUSES,
 )
-from orchestrator.unblock_types import classify_block_reason
+from orchestrator.unblock_types import BlockClass, classify_block_reason
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import (
     VerifyInfraError,
@@ -93,7 +91,9 @@ from orchestrator.verify import (
 )
 from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES, FailureCategory
 from orchestrator.workflow_types import (  # noqa: F401  re-export shim
+    BlockDisposition,
     IllegalTransition,
+    RequeueKind,
     StewardBudgetExhausted,
     StewardInterrupted,
     StewardOutcome,
@@ -104,6 +104,7 @@ from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     WorkflowOutcome,
     WorkflowState,
     WorkflowStateMachine,
+    classify_failure,
     outcome_allows_status,
 )
 
@@ -2172,44 +2173,6 @@ class TaskWorkflow:
             self._enter_phase(WorkflowState.DONE)
             return await self._finalise_merged_done()
 
-        except AllAccountsCappedException as e:
-            logger.warning(
-                f'Task {self.task_id}: all accounts capped — '
-                f'{e.retries} retries in {e.elapsed_secs:.1f}s (label={e.label!r})'
-            )
-            return await self._mark_blocked(
-                f'All accounts capped: {e.label} — {e.retries} retries in {e.elapsed_secs:.1f}s',
-                suggested_action='cap_wait_exceeded_sanity_bound',
-            )
-
-        except _SessionBudgetExhausted as e:
-            last_role = self._last_completed_role or 'n/a'
-            budget_limit = self.config.usage_cap.session_budget_usd
-            # Use the gate's own cumulative figure for the summary — it is the
-            # value that actually exceeded the budget, whereas
-            # self.metrics.total_cost_usd only advances on successful returns
-            # and may lag the gate's running tally if a cap-retry or partial
-            # invocation contributed cost without completing.
-            reason = (
-                f'Session budget exhausted: ${e.cumulative_cost:.2f} spent of '
-                f'${budget_limit:.2f} budget (last completed role: {last_role})'
-            )
-            detail = (
-                f'budget_limit=${budget_limit:.2f}\n'
-                f'total_cost_usd=${self.metrics.total_cost_usd:.2f}\n'
-                f'cumulative_cost (gate)=${e.cumulative_cost:.2f}\n'
-                f'agent_invocations={self.metrics.agent_invocations}\n'
-                f'total_turns={self.metrics.total_turns}\n'
-                f'last_completed_role={last_role}'
-            )
-            # _mark_blocked logs "Task %s BLOCKED: %s" — only log the
-            # gate-specific cross-check figure that's unique to this call site.
-            logger.info(
-                'Task %s: session budget exhausted (gate cumulative $%.2f)',
-                self.task_id, e.cumulative_cost,
-            )
-            return await self._mark_blocked(reason, detail=detail)
-
         except SetTaskStatusRejected as exc:
             # Fast-path: a terminal-status rejection arrived out-of-band before
             # setup completed (either from the pre-empt live-status read or from
@@ -2268,52 +2231,39 @@ class TaskWorkflow:
             )
 
         except WarmLaneRequeue as e:
-            # Discriminate the subclass for the block-reason annotation so the
-            # requeue is traceable in metrics / steward review.
-            # WarmLanePoolExhausted → backpressure (all lanes ASSIGNED).
-            # WarmLaneDiskPressure  → transient infra (seed exited 75 EX_TEMPFAIL).
-            # FAULT (RuntimeError) is deliberately NOT caught here — it falls through
-            # to the broad except below → _mark_blocked → BLOCKED + L1.
+            # W9-ε: block_reason is now single-sourced from
+            # classify_failure(e) -> BlockDisposition instead of this
+            # clause's own inline isinstance(e, WarmLanePoolHardDown)/
+            # ...Exhausted/... triage — MRO resolution means a real subclass
+            # instance always matches its OWN _DISPOSITION_TABLE row first
+            # (e.g. WarmLanePoolHardDown before the WarmLaneRequeue base
+            # row), so this reproduces the old per-subclass strings exactly
+            # — including for a bare WarmLaneRequeue (no subclass matches):
+            # the base row is deliberately ALIASED to WarmLaneDiskPressure's
+            # disposition, mirroring the pre-refactor `else: #
+            # WarmLaneDiskPressure` fallback exactly (amendment,
+            # reviewer_comprehensive behavior-parity — see the base row's
+            # comment in workflow_types._disposition_table()).
+            # FAULT (RuntimeError) is deliberately NOT caught here — it falls
+            # through to the broad except below → _mark_blocked → BLOCKED + L1.
             #
-            # NOTE (Suggestion 2 / follow-up; extended for WarmLanePoolHardDown
-            # by reviewer_comprehensive resource_efficiency, task 2061 amendment
-            # pass): WarmLanePoolExhausted, WarmLaneDiskPressure, AND
-            # WarmLanePoolHardDown requeues all return WorkflowOutcome.REQUEUED
-            # here, which the harness counts against the per-task requeue_cap
-            # equally.  This is intentional for EXHAUSTED (genuine backpressure)
-            # but is undesirable for DISK_PRESSURE and HARD_DOWN (both transient
-            # infra): a persistent condition will tight-loop, burning the retry
-            # budget with no backoff.  HARD_DOWN's exposure is bounded relative
-            # to DISK_PRESSURE's, though: the scheduler's proactive per-tick
-            # watchdog (Scheduler._apply_warm_base_hard_down_watchdog) halts ALL
-            # new dispatch host-wide the moment it observes ABSENT, so once
-            # engaged a requeued task simply waits parked instead of being
-            # redispatched into the same failure — only a task that races ahead
-            # of the watchdog on the very first tick spends one requeue before
-            # the halt engages.  The block_reason discriminant is already set so
-            # a future scheduler change can special-case both
-            # 'warm_lane_disk_pressure (transient infra)' and
-            # 'warm_lane_pool_hard_down' to exclude these requeues from the cap
-            # (analogous to the HTTP-5xx transient exclusion in
-            # is_transient_api_requeue).  Touching scheduler.py's requeue-cap
-            # classifier for this is out of scope for this task; tracking as a
-            # follow-up is acceptable per reviewer_comprehensive.
-            #
-            # WarmLanePoolHardDown (task 2061) — the warm base is absent, a
-            # HOST-SCOPED pool condition (one base serves every lane).  Checked
-            # FIRST since one dispatched task hitting this is symptomatic of a
-            # host-wide condition the scheduler's warm-base hard-down watchdog
-            # is the primary defense for; this requeue is defense-in-depth for
-            # any task already in flight when the base vanished.
-            if isinstance(e, WarmLanePoolHardDown):
-                block_reason = 'warm_lane_pool_hard_down'
-            elif isinstance(e, WarmLanePoolExhausted):
-                block_reason = 'warm_lane_pool_exhausted'
-            else:  # WarmLaneDiskPressure
-                block_reason = 'warm_lane_disk_pressure (transient infra)'
+            # counts_against_requeue_cap is DECLARED once per warm-lane
+            # subclass in the table (EXHAUSTED=True — genuine backpressure;
+            # DISK_PRESSURE/HARD_DOWN=False — transient infra) — the single
+            # source of truth replacing the buried NOTE formerly here (see
+            # workflow_types._disposition_table()'s warm-lane rows for the
+            # full rationale). This clause still unconditionally returns
+            # REQUEUED for every WarmLaneRequeue subclass — routing that
+            # policy into the scheduler's transient requeue-cap bucket
+            # (record_requeue → is_transient_api_requeue) remains a tracked
+            # follow-up outside this task's module scope (scheduler.py /
+            # harness.py), so counts_against_requeue_cap is surfaced in the
+            # log below for observability only, not yet consumed.
+            disp = classify_failure(e)
+            block_reason = disp.reason_prefix
             logger.info(
-                'Task %s: warm-lane requeue (%s): %s',
-                self.task_id, block_reason, e,
+                'Task %s: warm-lane requeue (%s, counts_against_requeue_cap=%s): %s',
+                self.task_id, block_reason, disp.counts_against_requeue_cap, e,
             )
             # TerminalReport.phase is machine.state — this path never calls
             # _enter_phase, so it is the pre-existing working phase (PLAN,
@@ -2328,73 +2278,138 @@ class TaskWorkflow:
             )
             return WorkflowOutcome.REQUEUED
 
-        except VerifyInfraError as e:
-            # Infra-typed exception from the verify path that escaped the
-            # in-process retry wrapper (e.g. raised outside
-            # _run_scoped_verification_with_infra_retry).  Route to
-            # infra_issue with escalate_to_human rather than the generic
-            # 'Workflow error:' task_failure block below.
-            logger.warning(
-                'Task %s: VerifyInfraError escaped run() (phase=%r errno=%r) '
-                '— routing to infra_issue',
-                self.task_id, e.phase, e.errno,
-            )
-            reason = (
-                f'Verify infra failure (phase={e.phase!r} errno={e.errno}): {e}'
-            )
-            return await self._mark_blocked(
-                reason,
-                category='infra_issue',
-                escalate_to_human=True,
-            )
+        except Exception as e:
+            # W9-ε: every remaining block-kind failure (cap/budget/verify-
+            # infra/OSError/worktree-conflict/generic) is now classified by
+            # ONE classify_failure(e) -> BlockDisposition TABLE lookup
+            # instead of a per-exception-type except clause.  Each branch
+            # below still assembles its own reason/detail text — the table
+            # doesn't carry instance-specific data (retries/elapsed/label,
+            # phase/errno, cumulative_cost, ...) — but escalate_to_human and
+            # the BlockDisposition threaded into _mark_blocked are now
+            # single-sourced from disp.  Every disp.reason_prefix below is
+            # the SAME leading text the pre-W9-ε ladder hard-coded per
+            # exception, so the emitted reason strings stay byte-identical
+            # (behavior-preserving).  Branch order mirrors the pre-W9-ε
+            # ladder's except-clause order (most-specific first).
+            disp = classify_failure(e)
 
-        except OSError as e:
-            # Bare infra-class OSError (ENOSPC/EDQUOT/EROFS/EIO/EMFILE/ENFILE)
-            # escaping the verify path outside the VerifyInfraError wrapper
-            # (e.g. a log or marker write).  Route to infra_issue.
-            # Non-infra OSErrors (EACCES, ENOENT, etc.) fall through to the
-            # same generic handler as except Exception below — Python's
-            # exception model does not allow re-raise into a sibling except
-            # clause, so we duplicate the generic path here.
-            if _is_infra_oserror(e):
+            if isinstance(e, AllAccountsCappedException):
+                logger.warning(
+                    f'Task {self.task_id}: all accounts capped — '
+                    f'{e.retries} retries in {e.elapsed_secs:.1f}s (label={e.label!r})'
+                )
+                return await self._mark_blocked(
+                    f'{disp.reason_prefix}: {e.label} — {e.retries} retries in {e.elapsed_secs:.1f}s',
+                    suggested_action='cap_wait_exceeded_sanity_bound',
+                    escalate_to_human=disp.escalate_to_human,
+                    disposition=disp,
+                )
+
+            if isinstance(e, _SessionBudgetExhausted):
+                last_role = self._last_completed_role or 'n/a'
+                budget_limit = self.config.usage_cap.session_budget_usd
+                # Use the gate's own cumulative figure for the summary — it is
+                # the value that actually exceeded the budget, whereas
+                # self.metrics.total_cost_usd only advances on successful
+                # returns and may lag the gate's running tally if a cap-retry
+                # or partial invocation contributed cost without completing.
+                reason = (
+                    f'{disp.reason_prefix}: ${e.cumulative_cost:.2f} spent of '
+                    f'${budget_limit:.2f} budget (last completed role: {last_role})'
+                )
+                detail = (
+                    f'budget_limit=${budget_limit:.2f}\n'
+                    f'total_cost_usd=${self.metrics.total_cost_usd:.2f}\n'
+                    f'cumulative_cost (gate)=${e.cumulative_cost:.2f}\n'
+                    f'agent_invocations={self.metrics.agent_invocations}\n'
+                    f'total_turns={self.metrics.total_turns}\n'
+                    f'last_completed_role={last_role}'
+                )
+                # _mark_blocked logs "Task %s BLOCKED: %s" — only log the
+                # gate-specific cross-check figure that's unique to this call
+                # site.
+                logger.info(
+                    'Task %s: session budget exhausted (gate cumulative $%.2f)',
+                    self.task_id, e.cumulative_cost,
+                )
+                return await self._mark_blocked(
+                    reason, detail=detail,
+                    escalate_to_human=disp.escalate_to_human,
+                    disposition=disp,
+                )
+
+            if isinstance(e, VerifyInfraError):
+                # Infra-typed exception from the verify path that escaped the
+                # in-process retry wrapper (e.g. raised outside
+                # _run_scoped_verification_with_infra_retry).  Route to
+                # infra_issue with escalate_to_human rather than the generic
+                # 'Workflow error:' task_failure block below.
+                logger.warning(
+                    'Task %s: VerifyInfraError escaped run() (phase=%r errno=%r) '
+                    '— routing to infra_issue',
+                    self.task_id, e.phase, e.errno,
+                )
+                reason = f'{disp.reason_prefix} (phase={e.phase!r} errno={e.errno}): {e}'
+                return await self._mark_blocked(
+                    reason,
+                    category='infra_issue',
+                    escalate_to_human=disp.escalate_to_human,
+                    disposition=disp,
+                )
+
+            if isinstance(e, OSError) and _is_infra_oserror(e):
+                # Bare infra-class OSError (ENOSPC/EDQUOT/EROFS/EIO/EMFILE/
+                # ENFILE) escaping the verify path outside the
+                # VerifyInfraError wrapper (e.g. a log or marker write).
+                # Route to infra_issue.  Non-infra OSErrors (EACCES, ENOENT,
+                # etc.) fall through to the generic branch below — same as
+                # every other unclassified exception.
                 logger.warning(
                     'Task %s: bare infra OSError escaped run() (errno=%r) '
                     '— routing to infra_issue',
                     self.task_id, e.errno,
                 )
-                reason = f'Verify infra OSError (errno={e.errno}): {e}'
+                reason = f'{disp.reason_prefix} (errno={e.errno}): {e}'
                 return await self._mark_blocked(
                     reason,
                     category='infra_issue',
-                    escalate_to_human=True,
+                    escalate_to_human=disp.escalate_to_human,
+                    disposition=disp,
                 )
-            # Non-infra OSError — treat the same as the broad except below.
-            logger.exception(f'Task {self.task_id} workflow error: {e}')
-            return await self._mark_blocked(f'Workflow error: {e}')
 
-        except WorktreeConflictError as e:
-            # esc-2128-8: a WIP-save commit() (inter-iteration rebase, or the
-            # requeue-rebase reuse path) hit a worktree with unresolved
-            # (unmerged-index) conflicts and refused to stage/commit rather
-            # than snapshotting conflict markers verbatim.  Route to a
-            # targeted per-task BLOCKED + human L1 — the steward corrective
-            # loop cannot resolve a conflicted worktree, so skip it entirely
-            # (mirrors the VerifyInfraError/infra_issue handling above, not
-            # _submit_halt_escalation_and_wait, which is merge-queue-halt
-            # ownership and irrelevant to a task-worktree rebase).
-            logger.warning(
-                'Task %s: WorktreeConflictError escaped run() — %s',
-                self.task_id, e,
-            )
+            if isinstance(e, WorktreeConflictError):
+                # esc-2128-8: a WIP-save commit() (inter-iteration rebase, or the
+                # requeue-rebase reuse path) hit a worktree with unresolved
+                # (unmerged-index) conflicts and refused to stage/commit rather
+                # than snapshotting conflict markers verbatim.  Route to a
+                # targeted per-task BLOCKED + human L1 — the steward corrective
+                # loop cannot resolve a conflicted worktree, so skip it entirely
+                # (mirrors the VerifyInfraError/infra_issue handling above, not
+                # _submit_halt_escalation_and_wait, which is merge-queue-halt
+                # ownership and irrelevant to a task-worktree rebase).
+                logger.warning(
+                    'Task %s: WorktreeConflictError escaped run() — %s',
+                    self.task_id, e,
+                )
+                return await self._mark_blocked(
+                    f'{disp.reason_prefix} ({e})',
+                    category='wip_conflict',
+                    escalate_to_human=disp.escalate_to_human,
+                    disposition=disp,
+                )
+
+            # Generic fallback — every other exception, including a
+            # non-infra OSError (Python's exception model has no re-raise-
+            # into-a-sibling-clause, and classify_failure's OSError branch
+            # already returns the same _DEFAULT_BLOCK disposition for it as
+            # for a bare Exception, so one shared branch is correct here).
+            logger.exception(f'Task {self.task_id} workflow error: {e}')
             return await self._mark_blocked(
-                f'WIP-save aborted: unresolved conflict in worktree ({e})',
-                category='wip_conflict',
-                escalate_to_human=True,
+                f'{disp.reason_prefix}: {e}',
+                escalate_to_human=disp.escalate_to_human,
+                disposition=disp,
             )
-
-        except Exception as e:
-            logger.exception(f'Task {self.task_id} workflow error: {e}')
-            return await self._mark_blocked(f'Workflow error: {e}')
 
         finally:
             # Stop the claimant heartbeat loop FIRST — before any other
@@ -8411,6 +8426,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         dedupe_fingerprint: str | None = None,
         spawn_dry_run: bool = False,
         root_cause: str = '',
+        disposition: BlockDisposition | None = None,
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -8472,13 +8488,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             Captures ``self.machine.state`` AT CALL TIME — BLOCKED after
             ``_enter_phase(BLOCKED)`` for the block-return paths below, or
             DONE/etc. for the bypass/steward-resolved paths that never enter
-            BLOCKED.  W9-γ: TerminalReport.category stays None throughout
-            this task (see design decisions) — _mark_blocked's category=
-            parameter is an ESCALATION taxonomy, not FailureCategory.
+            BLOCKED.  W9-ε: TerminalReport.category is sourced from
+            *disposition*.category (a :class:`FailureCategory`) when the
+            caller supplied a :class:`BlockDisposition`; back-compat callers
+            with no disposition keep the pre-W9-ε hard ``None`` (see design
+            decisions) — _mark_blocked's category= parameter remains a
+            SEPARATE, caller-supplied ESCALATION taxonomy, not FailureCategory.
             """
             self._terminal_report = TerminalReport(
                 outcome=outcome, reason=reason, phase=self.machine.state,
-                detail=(detail or reason), category=None,
+                detail=(detail or reason),
+                category=(disposition.category if disposition is not None else None),
                 blocked_from_phase=pre_block_state,
             )
             return outcome
@@ -8498,7 +8518,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # Legitimate done — fall through; the existing post-steward
                 # flow below handles current==done by returning DONE.
             if _status_set_ok:
-                self._spawn_dry_run_unblock(reason, detail or reason)
+                self._spawn_dry_run_unblock(
+                    reason, detail or reason,
+                    block_class=(disposition.block_class if disposition is not None else None),
+                )
         elif spawn_dry_run:
             # Post-merge red-main class: merge_phase suppressed the status
             # transition and the spawn above, but this IS the mechanically
@@ -8532,7 +8555,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     f'that causes b3_gate to act on incorrect data.  Update '
                     f'this guard if adding a new post-advance class.'
                 )
-            self._spawn_dry_run_unblock(reason, detail or reason)
+            self._spawn_dry_run_unblock(
+                reason, detail or reason,
+                block_class=(disposition.block_class if disposition is not None else None),
+            )
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
 
         if self.escalation_queue and skip_escalation:
@@ -8920,13 +8946,23 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             self.task_id, esc.id,
         )
 
-    def _spawn_dry_run_unblock(self, reason: str, detail: str) -> None:
+    def _spawn_dry_run_unblock(
+        self, reason: str, detail: str,
+        block_class: BlockClass | None = None,
+    ) -> None:
         """Fire-and-forget: spawn an autonomous dry-run investigation.
 
         Skips when unblock_auto is disabled. Wraps asyncio.create_task so
         _mark_blocked never awaits the investigation — it is a pure side-effect.
         Any exception inside run_dry_run_unblock is caught there and written
         as a fallback proposal entry, so unhandled task exceptions are closed.
+
+        *block_class* (W9-ε) lets a disposition-aware caller supply the
+        typed BlockClass explicitly (``_mark_blocked`` passes
+        ``disposition.block_class`` when a :class:`BlockDisposition` was
+        given); when omitted (``None``, the back-compat default for the
+        ~55 disposition-less ``_mark_blocked`` callers), it is derived via
+        the ``classify_block_reason(reason)`` prose sniff exactly as before.
         """
         if not getattr(self.config, 'unblock_auto', None) or not self.config.unblock_auto.enabled:
             return
@@ -8946,7 +8982,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self.task_id,
             )
             return
-        block_class = classify_block_reason(reason)
+        if block_class is None:
+            block_class = classify_block_reason(reason)
         try:
             _task = asyncio.create_task(
                 run_dry_run_unblock(

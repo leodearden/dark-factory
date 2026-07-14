@@ -219,7 +219,12 @@ class TestTerminalReportPopulatedAtBlockPaths:
         assert report.reason.lower().startswith('all accounts capped')
         assert report.phase == workflow.machine.state
         assert report.detail
-        assert report.category is None
+        # W9-ε: this block path now routes through classify_failure ->
+        # BlockDisposition, so category is populated (FailureCategory.NONE
+        # — a cap hit is not a verify-check failure) instead of the
+        # pre-W9-ε hard None (see test_block_disposition.py for the
+        # dedicated classify_failure/_mark_blocked-disposition coverage).
+        assert report.category is FailureCategory.NONE
 
     async def test_warm_lane_requeue_populates_terminal_report(self, tmp_path: Path):
         """Warm-lane requeue (reuses test_workflow_warm_lane_requeue setup)."""
