@@ -181,6 +181,20 @@ def evaluate(
         )
     )
 
-    fire = cond_a or cond_b or cond_c
+    triggered = cond_a or cond_b or cond_c
+
+    floor_blocks = (
+        not never_censused and days_since is not None and days_since < config.floor_days
+    )
+    if floor_blocks:
+        reasons.append(
+            "floor: only {:.1f}d since last census (floor {}d) -> BLOCKS all conditions".format(
+                days_since, config.floor_days
+            )
+        )
+    elif never_censused:
+        reasons.append("floor: never censused -> exempt")
+
+    fire = triggered and not floor_blocks
 
     return Decision(fire=fire, reasons=reasons)
