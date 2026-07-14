@@ -345,7 +345,11 @@ class CockpitApp(App):
         Runs _scan_registry() (pure I/O, no widget access) on a background
         thread via Textual's @work(thread=True), then hands the result to
         _apply_scan on the main/UI thread via call_from_thread -- Textual
-        widgets are never safe to touch directly from a worker thread.
+        widgets are never safe to touch directly from a worker thread. Both
+        marshaling calls go through _call_from_thread_fail_soft (not
+        call_from_thread directly), which tolerates the app having already
+        fully shut down by the time this (possibly slow) scan finishes --
+        see its docstring.
 
         exit_on_error=False: a scan that raises (e.g. a transient disk
         error) must only fail this one tick, never take down the whole app
@@ -356,9 +360,35 @@ class CockpitApp(App):
         """
         try:
             records, decisions = self._scan_registry()
-            self.call_from_thread(self._apply_scan, records, decisions)
+            self._call_from_thread_fail_soft(self._apply_scan, records, decisions)
         finally:
-            self.call_from_thread(self._clear_scan_in_flight)
+            self._call_from_thread_fail_soft(self._clear_scan_in_flight)
+
+    def _call_from_thread_fail_soft(self, callback: Callable[..., None], *args: object) -> None:
+        """call_from_thread wrapper that tolerates the app having already shut down.
+
+        A scan finishing after the operator has already quit (app fully
+        shut down, its event loop cleared) would otherwise have
+        call_from_thread raise RuntimeError("App is not running") from this
+        worker thread -- an unhandled exception on a background thread that
+        is pure shutdown noise (the process is exiting either way), not a
+        real failure. Checking is_running first skips the call entirely in
+        the common case; the try/except RuntimeError below closes the
+        remaining check-then-call race (the loop stopping between the check
+        and the call itself). is_running is already False by the time
+        call_from_thread can raise this way -- App._shutdown flips
+        self._running False at its very start, strictly before the loop
+        reference call_from_thread depends on is cleared -- so re-checking
+        is_running after the catch reliably tells a genuine shutdown race
+        apart from any other RuntimeError, which still propagates.
+        """
+        if not self.is_running:
+            return
+        try:
+            self.call_from_thread(callback, *args)
+        except RuntimeError:
+            if self.is_running:
+                raise
 
     def _clear_scan_in_flight(self) -> None:
         """Main-thread-only: clear the drop-tick backpressure flag.
