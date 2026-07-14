@@ -413,6 +413,19 @@ class DecisionRecord:
 _SLUG_SANITIZE_RE = re.compile(r'[^A-Za-z0-9._-]')
 
 
+def sanitize_slug(raw: str) -> str:
+    """Map any character outside ``[A-Za-z0-9._-]`` in *raw* to ``'-'``.
+
+    The shared filesystem-safe-slug normalizer: ``build_session_slug`` calls
+    this on its joined segments, and ``session_hooks.hook_session_slug``
+    applies it to an externally-supplied slug token (``CLAUDE_SPAWN_SESSION_ID``)
+    so that value is always safe to use as a ``record_path_for_slug`` directory
+    name -- e.g. a stray ``/`` in an adversarial/malformed token can never
+    resolve outside ``sessions_dir``.
+    """
+    return _SLUG_SANITIZE_RE.sub('-', raw)
+
+
 def build_session_slug(
     role: str,
     project: str,
@@ -425,14 +438,15 @@ def build_session_slug(
     share role+project+task (PRD §4 decision 2); single-ownership is a
     separate concern (T7 leases), not encoded in the key. Any character
     outside ``[A-Za-z0-9._-]`` in any segment (or the joined whole) is
-    sanitized to ``'-'`` so the slug is always filesystem-safe.
+    sanitized to ``'-'`` (see ``sanitize_slug``) so the slug is always
+    filesystem-safe.
     """
     segments = [role, project]
     if task_id:
         segments.append(task_id)
     segments.append(str(launcher_pid))
     raw = '-'.join(segments)
-    return _SLUG_SANITIZE_RE.sub('-', raw)
+    return sanitize_slug(raw)
 
 
 def fleet_root(root: Path | str | None = None) -> Path:
