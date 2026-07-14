@@ -25,7 +25,7 @@ import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 # Self-bootstrap for standalone `python scripts/legibility/nightly.py` runs
@@ -37,7 +37,7 @@ from pathlib import Path
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import census_trigger, digest, inventory, sampling  # noqa: E402
+from legibility import census_trigger, codebook, coder, digest, inventory, sampling  # noqa: E402
 from legibility.config import LegibilityConfig, load_config  # noqa: E402
 
 logger = logging.getLogger('legibility.nightly')
@@ -431,6 +431,127 @@ def evaluate_census_step(
         logger.warning('legibility trickle: census launcher failed (best-effort): %s', exc)
 
     return line, True
+
+
+# ---------------------------------------------------------------------------
+# run_nightly — full pipeline assembly: inventory -> sample -> digest ->
+# code -> merge -> docs-only commit -> census (PRD §5.5). This step wires
+# the happy path only; the three decision-8 fail-loud triggers (extractor
+# crash, coder storm, commit failure) are layered on by later steps.
+# ---------------------------------------------------------------------------
+
+_CODEBOOK_RELPATH = Path('docs') / 'legibility' / 'confusion-codebook.yaml'
+
+DEFAULT_PROJECTS_ROOT = Path.home() / '.claude' / 'projects'
+
+
+@dataclass
+class NightlyResult:
+    """Outcome of one :func:`run_nightly` run.
+
+    ``exit_code`` is the authoritative pass/fail signal for the systemd
+    ExecStart / CLI caller: 0 on success (including a genuine no-change
+    night), non-zero on a fail-loud trigger (PRD decision 8, layered on by
+    later steps). ``applied`` is the total number of codebook mutations
+    (matched sightings + applied candidates) across every coding record
+    this run merged -- 0 on a dedup-only or empty-coding night, which is
+    exactly what gates the dump/commit below, giving a re-run its
+    idempotency for free (PRD §6.7/§8.8).
+    """
+
+    exit_code: int = 0
+    commit_made: bool = False
+    applied: int = 0
+    coder_status: str | None = None
+    census_line: str | None = None
+    census_fire: bool = False
+    escalated: bool = False
+    reason: str | None = None
+
+
+def run_nightly(
+    *,
+    config_path: Path | str | None = None,
+    project_id: str | None = None,
+    projects_root: Path | str | None = None,
+    target_date: date | None = None,
+    now: datetime | None = None,
+    invoke=None,
+    status_fetcher=None,
+    poster=None,
+    committer=None,
+) -> NightlyResult:
+    """Run one full nightly trickle pass for a single project (PRD §5.5).
+
+    *config_path* (preferred) or *project_id* (resolved via
+    :func:`resolve_config_path`) selects the project -- exactly one of the
+    two is expected to identify it, mirroring the ``nightly.py run`` CLI's
+    ``--config``/``--project-id`` pair. *target_date* defaults to
+    yesterday UTC; *projects_root* defaults to ``~/.claude/projects``.
+    *now* threads through to :func:`evaluate_census_step`'s clock seam.
+
+    Happy-path wiring only in this step: inventory+sample -> digest ->
+    code -> merge -> docs-only commit (only when the merge actually
+    applied something AND the dump changed the working tree -- a
+    dedup-only or empty-coding night therefore commits nothing) -> census
+    trigger evaluation. This step's happy path always returns
+    ``exit_code=0``; the decision-8 fail-loud triggers are added by later
+    steps.
+    """
+    if config_path is not None:
+        resolved_config_path = Path(config_path)
+    else:
+        if project_id is None:
+            raise ValueError('run_nightly requires either config_path or project_id')
+        resolved_config_path = resolve_config_path(project_id)
+    cfg = load_config(resolved_config_path)
+
+    if target_date is None:
+        target_date = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    if projects_root is None:
+        projects_root = DEFAULT_PROJECTS_ROOT
+    commit_fn = committer if committer is not None else _git_commit_docs_only
+
+    selected = select_digest_sessions(cfg, projects_root, target_date)
+    digests, extractor_failures = build_digests(selected)
+
+    codebook_path = Path(cfg.project_root) / _CODEBOOK_RELPATH
+    cb = codebook.load(codebook_path)
+
+    run = coder.code_digests(
+        digests, cb, project=cfg.project_id, model=cfg.models.trickle, invoke=invoke,
+    )
+
+    applied = 0
+    for record in run.records:
+        cb, stats = codebook.apply_coding_record(cb, record)
+        applied += stats['matched'] + stats['candidates_applied']
+
+    validation_errors = codebook.validate(cb)
+    if validation_errors:
+        logger.warning(
+            'legibility trickle: merged codebook failed validation, not dumped: %s',
+            '; '.join(validation_errors),
+        )
+
+    commit_made = False
+    if applied > 0 and not validation_errors:
+        codebook.dump(cb, codebook_path)
+        if _git_status_changed(cfg.project_root, _CODEBOOK_RELPATH):
+            message = f'legibility: nightly trickle sightings for {target_date.isoformat()}'
+            commit_result = commit_fn(cfg.project_root, [_CODEBOOK_RELPATH], message)
+            commit_made = bool(commit_result.ok)
+
+    census_line, census_fire = evaluate_census_step(cfg, now=now, status_fetcher=status_fetcher)
+
+    return NightlyResult(
+        exit_code=0,
+        commit_made=commit_made,
+        applied=applied,
+        coder_status=run.status,
+        census_line=census_line,
+        census_fire=census_fire,
+    )
 
 
 if __name__ == '__main__':
