@@ -949,3 +949,147 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     assert outcome.report_path == str(kwargs["report_path"])
     assert outcome.filed_task_ids == ["task-1"]
     assert outcome.stop_reason == "exhausted"
+
+
+# ---------------------------------------------------------------------------
+# step-21: RED — main(argv) CLI
+# ---------------------------------------------------------------------------
+
+def _write_legibility_yaml(config_path, *, project_id="dark_factory", project_root=None,
+                            escalation_port=8103, cwd_prefixes=None):
+    """Write a minimal valid legibility.yaml to *config_path* (any path —
+    the caller decides whether it lives at the default
+    <project-root>/docs/legibility/legibility.yaml location or elsewhere,
+    to exercise --config's override). Plain-text lines, not a yaml.safe_dump
+    round trip — mirrors test_legibility_nightly.py's _write_config, kept
+    independent of the module under test's own YAML writer."""
+    project_root = project_root if project_root is not None else config_path.parent
+    cwd_prefixes = cwd_prefixes if cwd_prefixes is not None else [str(project_root)]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"project_id: {project_id}",
+        f"project_root: {project_root}",
+        f"escalation_port: {escalation_port}",
+        "cwd_prefixes:",
+    ]
+    lines += [f"  - {prefix}" for prefix in cwd_prefixes]
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return config_path
+
+
+def _default_config_path(project_root):
+    return project_root / "docs" / "legibility" / "legibility.yaml"
+
+
+def _make_fake_main_run_census(outcome=None):
+    """Fake `run_census(**kwargs) -> CensusOutcome` seam for main()-level
+    tests — records every call's kwargs in `.calls`, never touches a real
+    seam. Defaults to a "done" outcome so a happy-path main() call has
+    something sensible to print/return."""
+    calls = []
+
+    def fake_run_census(**kwargs):
+        calls.append(kwargs)
+        return outcome or mod.CensusOutcome(
+            status="done", report_path="plans/confusion-census-2026-01-02.md",
+            filed_task_ids=["1234"], stop_reason="exhausted",
+        )
+
+    fake_run_census.calls = calls
+    return fake_run_census
+
+
+def test_main_force_bypasses_gate_and_calls_run_census(tmp_path, monkeypatch):
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    # proves --force never even reaches the gate
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 0
+    assert len(fake_run_census.calls) == 1
+    assert fake_run_census.calls[0]["force"] is True
+
+
+def test_main_without_force_no_fire_noops_with_exit_zero(tmp_path, monkeypatch, capsys):
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        return census_trigger.Decision(fire=False, reasons=["max-interval: not yet due"])
+
+    monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
+
+    exit_code = mod.main(["--project-root", str(tmp_path)])
+
+    assert exit_code == 0
+    assert fake_run_census.calls == [], "a no-fire decision must never call run_census"
+    out = capsys.readouterr().out
+    assert "no-fire" in out.lower(), "an explanatory stdout line naming the no-fire decision"
+    assert "max-interval: not yet due" in out
+
+
+def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        return census_trigger.Decision(fire=True, reasons=["max-interval: overdue -> FIRE"])
+
+    monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
+
+    exit_code = mod.main(["--project-root", str(tmp_path)])
+
+    assert exit_code == 0
+    assert len(fake_run_census.calls) == 1
+    assert fake_run_census.calls[0]["force"] is False
+
+
+def test_main_config_flag_overrides_default_path_and_date_flag_threads_through(tmp_path, monkeypatch):
+    # deliberately NOT at the default <project-root>/docs/legibility/legibility.yaml
+    # location, so this only passes if --config is actually honored.
+    alt_config = _write_legibility_yaml(tmp_path / "alt-legibility.yaml", project_root=tmp_path)
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main([
+        "--project-root", str(tmp_path),
+        "--config", str(alt_config),
+        "--force",
+        "--date", "2026-01-02",
+    ])
+
+    assert exit_code == 0
+    kwargs = fake_run_census.calls[0]
+    assert kwargs["date"] == "2026-01-02"
+    assert kwargs["project_id"] == "dark_factory"
+    assert kwargs["project_root"] == str(tmp_path)
+
+
+def test_main_missing_config_returns_nonzero(tmp_path, monkeypatch):
+    # no legibility.yaml written anywhere -- config.load_config must fail
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+    monkeypatch.setattr(mod, "run_census", _poison("run_census"))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code != 0
+
+
+def test_main_returns_nonzero_on_fail_loud_error(tmp_path, monkeypatch):
+    _write_legibility_yaml(_default_config_path(tmp_path))
+
+    def raising_run_census(**kwargs):
+        raise RuntimeError("codebook merge produced an invalid codebook")
+
+    monkeypatch.setattr(mod, "run_census", raising_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code != 0
