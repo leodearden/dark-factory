@@ -30,7 +30,6 @@ from orchestrator.verify import (
     run_full_verification,
     run_scoped_verification,
     run_verification,
-    scope_module_config,
 )
 from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import ToolKind
@@ -471,8 +470,7 @@ class TestResolveVerifyTimeout:
         """Global merge budget (7200) beats a per-module cold override (3000) when is_merge_verify=True.
 
         This exercises the documented precedence: config.merge_verify_cold_command_timeout_secs
-        wins *before* the per-module cold knob.  On the real merge path scope_module_config drops
-        per-module timeout fields anyway, but this test confirms the resolver itself honours the
+        wins *before* the per-module cold knob, confirming the resolver itself honours the
         global-beats-module invariant even when a module cold value is present.
         """
         from orchestrator.verify import _resolve_verify_timeout
@@ -1037,276 +1035,6 @@ class TestIsStructuralPythonFile:
         content = 'from typing import Dict, Protocol\nclass Foo(Dict[str, Protocol]):\n    pass\n'
         # The regex matches — this IS the documented false positive, not a bug.
         assert _is_structural_python_file('orchestrator/src/orchestrator/container.py', content) is True
-
-
-class TestScopeModuleConfigReturnsNone:
-    """`scope_module_config` returns None when no task_files match the prefix.
-
-    Callers must treat None as "skip this subproject" rather than falling
-    back to the full unscoped suite — running a subproject with zero
-    matching files was the root cause of the 2026-04-20 merge-queue stall
-    (a fused-memory/** merge ran the whole shared/ suite and hung).
-    """
-
-    def test_returns_none_when_no_files_under_prefix(self):
-        mc = ModuleConfig(
-            prefix='shared',
-            test_command='uv run pytest tests/',
-            lint_command='ruff check src/',
-            type_check_command='pyright',
-        )
-        result = scope_module_config(mc, ['fused-memory/src/foo.py'])
-        assert result is None
-
-    def test_returns_none_when_task_files_empty(self):
-        mc = ModuleConfig(prefix='shared', test_command='pytest')
-        result = scope_module_config(mc, [])
-        assert result is None
-
-    def test_returns_scoped_config_when_files_match(self):
-        mc = ModuleConfig(
-            prefix='shared',
-            test_command='uv run --directory shared pytest tests/',
-            lint_command='uv run --directory shared ruff check src/',
-        )
-        result = scope_module_config(mc, ['shared/tests/test_x.py', 'shared/src/y.py'])
-        assert result is not None
-        # The specific files should appear in the scoped commands.
-        assert result.test_command is not None
-        assert 'shared/tests/test_x.py' in result.test_command
-        assert result.lint_command is not None
-        assert 'shared/src/y.py' in result.lint_command
-
-    def test_conftest_only_uses_full_test_suite(self):
-        """conftest.py alone should return the full unscoped test_command.
-
-        conftest.py defines fixtures/hooks that affect every test in the
-        directory subtree, so the correct scope is the full unscoped suite
-        already expressed by mc.test_command.
-        """
-        mc = ModuleConfig(
-            prefix='orchestrator',
-            test_command='uv run --project orchestrator --directory orchestrator pytest tests/ --tb=short -q',
-            lint_command='uv run --directory orchestrator ruff check src/',
-        )
-        result = scope_module_config(mc, ['orchestrator/tests/conftest.py'])
-        assert result is not None
-        assert result.test_command == mc.test_command
-
-    def test_conftest_with_test_files_uses_full_suite(self):
-        """conftest.py mixed with test files should still use the full suite.
-
-        Even when a task touches both conftest.py and concrete test files,
-        the full unscoped suite is the correct scope — conftest may shadow
-        tests that aren't in the diff.
-        """
-        mc = ModuleConfig(
-            prefix='orchestrator',
-            test_command='uv run --project orchestrator --directory orchestrator pytest tests/',
-            lint_command='uv run --directory orchestrator ruff check src/',
-        )
-        result = scope_module_config(
-            mc,
-            ['orchestrator/tests/conftest.py', 'orchestrator/tests/test_foo.py'],
-        )
-        assert result is not None
-        assert result.test_command == mc.test_command
-
-    def test_structural_protocol_file_unscopes_type_check(self, tmp_path: Path):
-        """A Protocol-defining .py file must trigger verbatim unscoped type_check_command.
-
-        Mirrors test_conftest_only_uses_full_test_suite: when a changed file
-        carries cross-file invariants (Protocol/TypedDict), pyright must see the
-        full package so it can verify all implementors still conform.
-        The --directory flag must be preserved verbatim (NOT stripped) so uv can
-        resolve src/ and tests/ relative to the module subdirectory.
-        """
-        mc = ModuleConfig(
-            prefix='orchestrator',
-            type_check_command='uv run --project orchestrator --directory orchestrator pyright src/ tests/',
-            lint_command='uv run --directory orchestrator ruff check src/',
-        )
-        rel_path = 'orchestrator/src/orchestrator/interfaces.py'
-        (tmp_path / 'orchestrator' / 'src' / 'orchestrator').mkdir(parents=True)
-        (tmp_path / rel_path).write_text('class Fetcher(Protocol):\n    def fetch(self) -> str: ...\n')
-        result = scope_module_config(mc, [rel_path], worktree=tmp_path)
-        assert result is not None
-        assert result.type_check_command == mc.type_check_command
-
-    def test_structural_typeddict_file_unscopes_type_check(self, tmp_path: Path):
-        """A TypedDict-defining .py file must trigger verbatim unscoped type_check_command."""
-        mc = ModuleConfig(
-            prefix='orchestrator',
-            type_check_command='uv run --project orchestrator --directory orchestrator pyright src/ tests/',
-            lint_command='uv run --directory orchestrator ruff check src/',
-        )
-        rel_path = 'orchestrator/src/orchestrator/types.py'
-        (tmp_path / 'orchestrator' / 'src' / 'orchestrator').mkdir(parents=True)
-        (tmp_path / rel_path).write_text('class EdgeDict(TypedDict):\n    source: str\n    target: str\n')
-        result = scope_module_config(mc, [rel_path], worktree=tmp_path)
-        assert result is not None
-        assert result.type_check_command == mc.type_check_command
-
-    def test_non_structural_file_scopes_type_check(self, tmp_path: Path):
-        """A regular .py source file must still produce a SCOPED type_check_command.
-
-        Regression guard: structural detection must not widen type-check scope
-        for ordinary files.  The scoped form has --directory stripped and
-        contains the individual file path.
-        """
-        mc = ModuleConfig(
-            prefix='orchestrator',
-            type_check_command='uv run --project orchestrator --directory orchestrator pyright src/ tests/',
-            lint_command='uv run --directory orchestrator ruff check src/',
-        )
-        rel_path = 'orchestrator/src/orchestrator/utils.py'
-        (tmp_path / 'orchestrator' / 'src' / 'orchestrator').mkdir(parents=True)
-        (tmp_path / rel_path).write_text('def helper() -> None:\n    pass\n')
-        result = scope_module_config(mc, [rel_path], worktree=tmp_path)
-        assert result is not None
-        # Scoped form: individual file must appear and --directory must be stripped
-        assert rel_path in (result.type_check_command or '')
-        assert '--directory orchestrator' not in (result.type_check_command or '')
-
-    def test_mixed_structural_and_plain_files_unscopes_type_check(self, tmp_path: Path):
-        """When at least one structural file is present, type check must be unscoped."""
-        mc = ModuleConfig(
-            prefix='orchestrator',
-            type_check_command='uv run --project orchestrator --directory orchestrator pyright src/ tests/',
-            lint_command='uv run --directory orchestrator ruff check src/',
-        )
-        proto_path = 'orchestrator/src/orchestrator/proto.py'
-        plain_path = 'orchestrator/src/orchestrator/utils.py'
-        (tmp_path / 'orchestrator' / 'src' / 'orchestrator').mkdir(parents=True)
-        (tmp_path / proto_path).write_text('class Srv(Protocol):\n    pass\n')
-        (tmp_path / plain_path).write_text('def noop() -> None: pass\n')
-        result = scope_module_config(mc, [proto_path, plain_path], worktree=tmp_path)
-        assert result is not None
-        assert result.type_check_command == mc.type_check_command
-
-    def test_no_worktree_structural_file_still_scoped(self):
-        """Without worktree arg, no file content is read and type check stays scoped.
-
-        Backward-compat guard: the default path (worktree=None) must be unchanged
-        so that all existing callers that omit worktree continue to get scoped
-        type-check commands.
-        """
-        mc = ModuleConfig(
-            prefix='orchestrator',
-            type_check_command='uv run --project orchestrator --directory orchestrator pyright src/ tests/',
-            lint_command='uv run --directory orchestrator ruff check src/',
-        )
-        # Path looks structural but we don't pass worktree — no file read happens
-        rel_path = 'orchestrator/src/orchestrator/interfaces.py'
-        result = scope_module_config(mc, [rel_path])
-        assert result is not None
-        # Must still be scoped (file not read, so structural check is skipped)
-        assert rel_path in (result.type_check_command or '')
-        assert '--directory orchestrator' not in (result.type_check_command or '')
-
-
-class TestScopeModuleConfigOpaqueCommand:
-    """An unparseable/OPAQUE lint_command flows through UNSCOPED, not mangled.
-
-    Historical bug: the old string-surgery scoper (_scope_command) did a raw
-    substring search + prefix slice regardless of whether the result was
-    valid shell syntax, so a config command shlex can't even split got
-    silently mangled into an equally- (or more-) broken argv, with the
-    caller's scoped files blindly appended to the wreckage. The new model
-    classifies an unparseable prefix OPAQUE (P1) and leaves the ORIGINAL
-    command untouched — argv-equivalent to the raw input, no stranded
-    scoped-file tokens appended to a broken string.
-    """
-
-    #: Unbalanced quote (the `"` before `shared` never closes) makes this
-    #: unparseable by shlex — realistic as a typo'd `--directory` value.
-    _UNPARSEABLE_LINT_CMD = 'uv run --directory "shared ruff check src/'
-
-    def test_unparseable_lint_command_left_untouched(self):
-        mc = ModuleConfig(prefix='shared', lint_command=self._UNPARSEABLE_LINT_CMD)
-        result = scope_module_config(mc, ['shared/src/y.py'])
-        assert result is not None
-        assert result.lint_command == self._UNPARSEABLE_LINT_CMD, (
-            f'expected untouched passthrough, got {result.lint_command!r}'
-        )
-
-    def test_unrecognised_head_type_command_left_untouched(self):
-        """A type_check_command using an unrecognised tool (no 'pyright' keyword) is untouched."""
-        mc = ModuleConfig(prefix='shared', type_check_command='uv run --extra dev mypy src/')
-        result = scope_module_config(mc, ['shared/src/y.py'])
-        assert result is not None
-        assert result.type_check_command == 'uv run --extra dev mypy src/'
-
-
-class TestScopeModuleConfigDataModuleFallback:
-    """scope_module_config falls back to the full suite for non-test data modules under tests/.
-
-    A data module under tests/ (e.g. shared/tests/silent_fallthrough_allowlist.py)
-    satisfies _is_test_file (test-tree membership) but NOT _is_collectable_test_file
-    (pytest would collect zero tests → rc=5 → RED).  The fix mirrors has_conftest:
-    set test_cmd = mc.test_command (full owning-package suite).
-    """
-
-    def test_data_module_alone_uses_full_suite(self):
-        """A lone data module under tests/ must yield the full mc.test_command.
-
-        Before the fix, the scoped command was
-        'pytest shared/tests/silent_fallthrough_allowlist.py' → rc=5 → RED.
-        After the fix it must be mc.test_command (GREEN full suite).
-        """
-        mc = ModuleConfig(
-            prefix='shared',
-            test_command='uv run --directory shared pytest tests/',
-            lint_command='uv run --directory shared ruff check src/',
-        )
-        result = scope_module_config(mc, ['shared/tests/silent_fallthrough_allowlist.py'])
-        assert result is not None
-        assert result.test_command == mc.test_command, (
-            f'Expected full suite {mc.test_command!r}, got {result.test_command!r}'
-        )
-        assert 'silent_fallthrough_allowlist.py' not in (result.test_command or ''), (
-            'Data file must not appear in the pytest target'
-        )
-
-    def test_data_module_plus_real_test_file_uses_full_suite(self):
-        """A data module mixed with a real test file must still use the full suite.
-
-        Conftest-style precedence: has_test_data triggers the full suite
-        regardless of whether collectable tests are also present.
-        """
-        mc = ModuleConfig(
-            prefix='shared',
-            test_command='uv run --directory shared pytest tests/',
-            lint_command='uv run --directory shared ruff check src/',
-        )
-        result = scope_module_config(
-            mc,
-            ['shared/tests/silent_fallthrough_allowlist.py', 'shared/tests/test_x.py'],
-        )
-        assert result is not None
-        assert result.test_command == mc.test_command, (
-            f'Expected full suite {mc.test_command!r}, got {result.test_command!r}'
-        )
-
-    def test_real_test_file_alone_still_scopes(self):
-        """Control: a real test file alone must still produce a scoped pytest target.
-
-        The fix must not over-broaden scope for genuine test files — they should
-        still be targeted directly rather than triggering the full suite.
-        """
-        mc = ModuleConfig(
-            prefix='shared',
-            test_command='uv run --directory shared pytest tests/',
-            lint_command='uv run --directory shared ruff check src/',
-        )
-        result = scope_module_config(mc, ['shared/tests/test_x.py'])
-        assert result is not None
-        assert result.test_command != mc.test_command, (
-            'A real test file alone must produce a scoped command, not the full suite'
-        )
-        assert 'shared/tests/test_x.py' in (result.test_command or ''), (
-            f'Expected test_x.py in scoped command, got {result.test_command!r}'
-        )
 
 
 class TestRunScopedVerificationSkipsUntouched:
@@ -6857,8 +6585,9 @@ class TestMergeGuardModuleConfigs:
     """Integration: guard wires into the module_configs trivial-pass branch.
 
     Setup: config-only diff (orchestrator/config.yaml, no .py/.rs) with
-    module_configs=[ModuleConfig(prefix='orchestrator', ...)]. scope_module_config
-    returns None for .yaml files → scoped=[] → hits the trivial-pass branch.
+    module_configs=[ModuleConfig(prefix='orchestrator', ...)]. No .py/.rs
+    files means every module scopes to nothing → scoped=[] → hits the
+    trivial-pass branch.
     After step-6 wiring, guard exit 0 + role='merge' routes to per-subproject fan-out.
     """
 
@@ -7481,8 +7210,11 @@ class TestRunScopedVerificationPlan:
 
 
 class TestVerifyPlanClassificationDelegation:
-    """scope_module_config/_build_fallback_config source ALL file classification from
-    verify_plan.classify_file — classification happens exactly once (task γ)."""
+    """File classification is single-sourced in verify_plan.classify_file (task γ).
+
+    The module-config path consumes it directly (derive_verify_plan is the
+    sole decision tree — task κ deleted the hand-mirrored scope_module_config
+    twin); _build_fallback_config's predicates below still delegate to it too."""
 
     def test_is_conftest_delegates_to_verify_plan(self):
         assert verify._is_conftest is verify_plan._is_conftest

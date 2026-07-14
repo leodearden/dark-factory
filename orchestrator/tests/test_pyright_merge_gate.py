@@ -1,26 +1,29 @@
 """Behavioral regression guard: pyright is wired into the merge gate for all subprojects.
 
-The merge gate's scoped verification (orchestrator/src/orchestrator/verify.py:
-scope_module_config) builds the pyright command from ModuleConfig.type_check_command,
-loaded from each subproject's orchestrator.yaml via the _OVERRIDABLE_FIELDS loader
-(orchestrator/src/orchestrator/config.py:_discover_module_configs).
+The merge gate's scoped verification (orchestrator/src/orchestrator/verify_plan.py:
+derive_verify_plan, executed via verify.py:_executed_module_configs_from_plan — task κ,
+verify-scope-inversion-prd.md) builds the pyright command from
+ModuleConfig.type_check_command, loaded from each subproject's orchestrator.yaml via the
+_OVERRIDABLE_FIELDS loader (orchestrator/src/orchestrator/config.py:_discover_module_configs).
 
-This test drives the REAL loader (_discover_module_configs) and the REAL gate helper
-(scope_module_config) to assert the resolved/scoped type_check_command actually routes
-to pyright for each subproject.  It catches:
+This test drives the REAL loader (_discover_module_configs) and the REAL gate mechanism
+(derive_verify_plan + _executed_module_configs_from_plan) to assert the resolved/scoped
+type_check_command actually routes to pyright for each subproject.  It catches:
 
   - A subproject dropping type_check_command from its orchestrator.yaml.
   - type_check_command being dropped from _OVERRIDABLE_FIELDS (config.py:403-410),
     which leaves the YAML text intact but stops the field from being loaded into
     ModuleConfig, silently disabling pyright for that subproject.
-  - scope_module_config stopping its emission of the pyright command (verify.py:874-875).
+  - the plan-driven execution bridge stopping its emission of the pyright command
+    (verify.py:_executed_module_configs_from_plan, verify_plan.py:_derive_module_runs).
 
 The previous escalation/tests/test_pyright_merge_gate.py and
 shared/tests/test_pyright_merge_gate.py read orchestrator.yaml as TEXT and regex-matched
 its contents via _extract_type_check_command; they could NOT detect the _OVERRIDABLE_FIELDS
-or scope_module_config regressions above.  This test supersedes them.
+or plan/execution-bridge regressions above.  This test supersedes them.
 
-See task 1477 for full context.
+See task 1477 for full context (scope_module_config, task 1477's original gate helper, was
+deleted by task κ once derive_verify_plan became the sole scope decision tree).
 """
 
 from __future__ import annotations
@@ -29,8 +32,8 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, _discover_module_configs
-from orchestrator.verify import scope_module_config
 
 # Repo root (dark-factory/) — two levels above orchestrator/tests/.
 _REPO_ROOT = Path(__file__).parents[2]
@@ -58,13 +61,15 @@ def test_pyright_wired_via_real_loader_and_gate(prefix: str) -> None:
         (config.py:403-410) makes this assertion fail even when the YAML key
         is still present, because the loader would skip the field.
 
-    (2) GATE: scope_module_config(mc, [changed_test_file]) — the exact helper
-        verify.py calls at line 874-875 to build the scoped pyright command —
-        must return a ModuleConfig whose type_check_command is non-None,
-        contains 'pyright', and references the changed file.
-        A regression in _scope_command or scope_module_config would make this
-        assertion fail while (1) remains green, catching a class of regression
-        the YAML-text-pin approach cannot detect.
+    (2) GATE: derive_verify_plan([changed_test_file], [mc], ...) executed via
+        _executed_module_configs_from_plan([mc], plan) — the exact plan +
+        execution-bridge run_scoped_verification calls to build the scoped
+        pyright command — must yield a ModuleConfig whose type_check_command
+        is non-None, contains 'pyright', and references the changed file.
+        A regression in classify_file, derive_verify_plan, or
+        _executed_module_configs_from_plan would make this assertion fail
+        while (1) remains green, catching a class of regression the
+        YAML-text-pin approach cannot detect.
 
     If this test fails: pyright will SILENTLY stop running on changed test
     files in {prefix}/ during the merge gate, and type errors (like those
@@ -111,24 +116,32 @@ def test_pyright_wired_via_real_loader_and_gate(prefix: str) -> None:
     # -------------------------------------------------------------------
     # (2) GATE assertion
     # -------------------------------------------------------------------
+    # No real worktree/content is available for this synthetic probe path —
+    # a stub reader returning None is equivalent to the pre-task-κ gate
+    # helper's own worktree=None default: the probe file is COLLECTABLE_TEST
+    # by path pattern alone (classify_file's precedence checks that before
+    # STRUCTURAL, which is the only branch content ever affects), so no
+    # structural-content read is needed to resolve this test's scope_kind.
     probe_file = f'{prefix}/tests/test_pyright_gate_probe.py'
-    scoped: ModuleConfig | None = scope_module_config(mc, [probe_file])
+    plan = verify_plan.derive_verify_plan([probe_file], [mc], None, lambda _path: None)
+    executed = verify._executed_module_configs_from_plan([mc], plan)
 
-    assert scoped is not None, (
-        f"[task 1477] scope_module_config(configs['{prefix}'], ['{probe_file}']) returned None. "
-        "This means no .py files under '{prefix}/' were matched, which should not happen "
-        "since the probe file is directly under the prefix. Check scope_module_config's "
-        "prefix-matching logic in verify.py. See task 1477."
+    assert len(executed) == 1, (
+        f"[task 1477] derive_verify_plan(['{probe_file}'], [configs['{prefix}']], ...) executed "
+        f"via _executed_module_configs_from_plan dropped '{prefix}' entirely. This means no .py "
+        f"files under '{prefix}/' were matched, which should not happen since the probe file is "
+        "directly under the prefix. Check classify_file's prefix-matching logic in "
+        "verify_plan.py. See task 1477."
     )
 
-    scoped_cmd = scoped.type_check_command
+    scoped_cmd = executed[0].type_check_command
 
     assert scoped_cmd is not None, (
-        f"[task 1477] scope_module_config(configs['{prefix}'], ...).type_check_command is None. "
-        "The gate's _scope_command helper (verify.py:874-875) did not build a pyright command "
-        "for the scoped changed file. This means pyright would SILENTLY be skipped for "
-        "{prefix}'s changed test files in the merge gate. Check _scope_command and "
-        "scope_module_config in verify.py. See task 1477."
+        f"[task 1477] the plan-driven executed ModuleConfig for '{prefix}' has "
+        "type_check_command=None. The plan/execution bridge (verify_plan.derive_verify_plan + "
+        "verify._executed_module_configs_from_plan) did not build a pyright command for the "
+        f"scoped changed file. This means pyright would SILENTLY be skipped for {prefix}'s "
+        "changed test files in the merge gate. See task 1477."
     )
 
     assert 'pyright' in scoped_cmd, (
@@ -138,7 +151,7 @@ def test_pyright_wired_via_real_loader_and_gate(prefix: str) -> None:
 
     assert probe_file in scoped_cmd or probe_file.split('/', 1)[1] in scoped_cmd, (
         f"[task 1477] scoped type_check_command = {scoped_cmd!r} does not reference the "
-        f"changed file '{probe_file}'. scope_module_config must narrow the command to the "
-        "specific changed files; if the probe file path is absent, the gate is not actually "
-        "scoping pyright to the changed test file. See task 1477."
+        f"changed file '{probe_file}'. The plan/execution bridge must narrow the command to "
+        "the specific changed files; if the probe file path is absent, the gate is not "
+        "actually scoping pyright to the changed test file. See task 1477."
     )

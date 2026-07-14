@@ -185,21 +185,15 @@ class TestModuleConfigPlanAuthority:
         existing_files = [f for f in task_files if (tmp_path / f).exists()]
 
         mock_run_verification = _run_verification_spy()
-        with (
-            patch.object(verify, 'run_verification', new=mock_run_verification),
-            patch.object(
-                verify, 'scope_module_config', wraps=verify.scope_module_config,
-            ) as spy_scope_module_config,
-        ):
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
             result = await run_scoped_verification(
                 tmp_path, config, module_configs, task_files=task_files,
             )
 
-        # The plan-authoritative execution never consults the hand-mirrored
-        # scope_module_config decision tree — that IS the inversion (task κ).
-        # Fails today: scope_module_config is still what builds the executed
-        # ModuleConfig.
-        spy_scope_module_config.assert_not_called()
+        # The plan-authoritative execution never consults a hand-mirrored
+        # scope decision tree — that IS the inversion (task κ). The twin
+        # (scope_module_config) is deleted entirely (step-6); see
+        # TestDeleteTheTwinInvariant for that invariant directly.
 
         expected_plan = verify_plan.derive_verify_plan(
             existing_files, module_configs, config, _real_worktree_reader(tmp_path),
@@ -217,14 +211,17 @@ class TestModuleConfigPlanAuthority:
 
         pytest_run = by_tool[ToolKind.PYTEST]
         assert pytest_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED
+        assert pytest_run.cmd is not None
         assert executed_mc.test_command == render(pytest_run.cmd)
 
         ruff_run = by_tool[ToolKind.RUFF]
         assert ruff_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED
+        assert ruff_run.cmd is not None
         assert executed_mc.lint_command == render(ruff_run.cmd)
 
         pyright_run = by_tool[ToolKind.PYRIGHT]
         assert pyright_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED
+        assert pyright_run.cmd is not None
         assert executed_mc.type_check_command == render(pyright_run.cmd)
 
         # VerifyResult.plan is the plan that DROVE execution above, not an

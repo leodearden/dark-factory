@@ -240,15 +240,6 @@ def _derive_module_runs(
         for f in scoped
     }
 
-    # Drift note (task γ review, architecture finding): this trigger scan is
-    # mirrored BY HAND in verify.scope_module_config's
-    # has_structural/has_conftest/has_test_data loop, which consumes the same
-    # classify_file-derived predicates but does not read these triggers back
-    # — the two are independently maintained decision trees kept in sync only
-    # by convention. A new narrowing rule added to one must be mirrored in
-    # the other, or the VerifyResult.plan this function feeds can diverge
-    # from what scope_module_config actually scoped — see
-    # derive_verify_plan's "Fidelity" docstring paragraph.
     conftest_trigger = next((f for f, k in kinds.items() if k is FileKind.CONFTEST), None)
     test_data_trigger = next((f for f, k in kinds.items() if k is FileKind.TEST_DATA), None)
     structural_trigger = next((f for f, k in kinds.items() if k is FileKind.STRUCTURAL), None)
@@ -577,23 +568,23 @@ def derive_verify_plan(
     ``'__fallback__'`` module is derived from *config*'s global commands via
     :func:`_derive_fallback_runs`.
 
-    Fidelity: this is a decision record, not an execution trace — the two
-    branches above are independently derived from *existing_files* /
-    *module_configs* / *config*, not read back from whatever a caller
-    actually executed, so two known gaps can make the returned
-    :class:`VerifyPlan` diverge from what ran. (1) The fallback branch does
-    NOT model the subproject / mixed-root+subproject rescoping that
-    ``_build_fallback_config`` applies (see :func:`_derive_fallback_runs`'s
-    docstring) — a diff landing in a real subproject executes
-    ``cd <sub> && ...`` while the plan still records a flat
-    ``'__fallback__'`` run. (2) The module-config branch recomputes each
-    module's per-tool ``scope_kind`` from :func:`classify_file` independently
-    of ``scope_module_config`` rather than reading back its actual output —
-    the two are carefully kept in sync (both consume the same classify_file
-    predicates) but are not the same code path, so a future change to one
-    must be mirrored in the other to keep this record accurate. Callers that
-    need a faithful diagnostic record of what ran, not just why, should treat
-    the attached ``VerifyResult.plan`` accordingly.
+    Fidelity: for the module-config branch, this plan is no longer just a
+    decision record (task κ, verify-scope-inversion-prd.md) — the caller
+    (:func:`run_scoped_verification`) derives it once and EXECUTES it
+    directly (see :func:`_executed_module_configs_from_plan`), so the
+    attached ``VerifyResult.plan`` faithfully records what ran on that path.
+    The fallback branch (*module_configs* empty) remains a decision record,
+    not an execution trace: it is independently derived from
+    *existing_files* / *config*, not read back from what
+    ``_build_fallback_config`` actually executes, so one known gap can still
+    make the returned :class:`VerifyPlan` diverge from what ran there — the
+    fallback branch does NOT model the subproject / mixed-root+subproject
+    rescoping that ``_build_fallback_config`` applies (see
+    :func:`_derive_fallback_runs`'s docstring) — a diff landing in a real
+    subproject executes ``cd <sub> && ...`` while the plan still records a
+    flat ``'__fallback__'`` run. Callers that need a faithful record of what
+    ran on the fallback path, not just why, should treat the attached
+    ``VerifyResult.plan`` accordingly.
     """
     if not _has_source_files(existing_files):
         return VerifyPlan(
