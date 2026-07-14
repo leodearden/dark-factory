@@ -570,3 +570,85 @@ def test_invoke_cli_nonzero_exit_raises_invocation_error(tmp_path):
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=10,
         )
+
+
+# ---------------------------------------------------------------------------
+# step-17: RED — main(argv) end-to-end, LLM mocked via monkeypatch of
+# mod._invoke_cli (never a real subprocess)
+# ---------------------------------------------------------------------------
+
+def _write_main_digest(tmp_path, session_id, marker, name):
+    """Build a real digest file (via digest.build_digest, mirroring
+    _build_digest_text) and write it to tmp_path/name. Returns the Path."""
+    records = [_user_text(marker, session_id=session_id)]
+    transcript_path = _write_jsonl(tmp_path, records, name=f"{name}.transcript.jsonl")
+    text = digest_mod.build_digest(transcript_path, agent_class_override="interactive")
+    digest_path = tmp_path / f"{name}.md"
+    digest_path.write_text(text, encoding="utf-8")
+    return digest_path
+
+
+def test_main_happy_path_writes_valid_jsonl_and_returns_0(tmp_path, monkeypatch, capsys):
+    digest1 = _write_main_digest(tmp_path, "main-sess-1", "first session confusion", "d1")
+    digest2 = _write_main_digest(tmp_path, "main-sess-2", "second session confusion", "d2")
+
+    codebook_path = tmp_path / "codebook.yaml"
+    codebook_mod.dump(_tiny_codebook(), codebook_path)
+
+    def fake_invoke_cli(prompt, model, **kwargs):
+        return json.dumps({"matches": [], "candidates": []})
+
+    monkeypatch.setattr(mod, "_invoke_cli", fake_invoke_cli)
+
+    out_path = tmp_path / "out.jsonl"
+    rc = mod.main([
+        str(digest1), str(digest2),
+        "--codebook", str(codebook_path),
+        "--project", "dark_factory",
+        "--out", str(out_path),
+    ])
+
+    assert rc == 0
+    lines = [line for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == 2
+    sessions = set()
+    for line in lines:
+        record = json.loads(line)
+        assert codebook_mod.validate_coding_record(record) == []
+        sessions.add(record["session"])
+    assert sessions == {"main-sess-1", "main-sess-2"}
+
+    captured = capsys.readouterr()
+    assert "total=2" in captured.err
+    assert "failed=0" in captured.err
+
+
+def test_main_storm_writes_zero_records_and_returns_nonzero(tmp_path, monkeypatch, capsys):
+    digests = [
+        _write_main_digest(tmp_path, f"main-storm-{i}", f"session {i} confusion", f"storm{i}")
+        for i in range(3)
+    ]
+
+    codebook_path = tmp_path / "codebook.yaml"
+    codebook_mod.dump(_tiny_codebook(), codebook_path)
+
+    def fake_invoke_cli(prompt, model, **kwargs):
+        return "not parseable as json, sorry"
+
+    monkeypatch.setattr(mod, "_invoke_cli", fake_invoke_cli)
+
+    out_path = tmp_path / "out.jsonl"
+    rc = mod.main([
+        *[str(d) for d in digests],
+        "--codebook", str(codebook_path),
+        "--project", "dark_factory",
+        "--out", str(out_path),
+    ])
+
+    assert rc != 0
+    # zero downstream coding records written (PRD §8.6 storm fixture)
+    assert not out_path.exists() or out_path.read_text(encoding="utf-8").strip() == ""
+
+    captured = capsys.readouterr()
+    assert captured.err, "expected a failure summary on stderr"
+    assert "3/3" in captured.err or "failed=3" in captured.err
