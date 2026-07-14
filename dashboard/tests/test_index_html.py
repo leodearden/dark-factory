@@ -425,3 +425,62 @@ def test_load_order_assertion_passes_for_classic_scripts() -> None:
         before_label='marked',
         after_label='tab_tasks.jsx',
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: graph_layout.js must load BEFORE tab_tasks.jsx (task 2528)
+# ---------------------------------------------------------------------------
+
+_GRAPH_LAYOUT_PREFIX = '/static/redux/graph_layout.js'
+
+
+def test_graph_layout_js_loads_before_tab_tasks(index_html_body: str) -> None:
+    """graph_layout.js must load as a classic synchronous script BEFORE
+    tab_tasks.jsx.
+
+    tab_tasks.jsx destructures {computeTiers, partitionComponents, orderRows}
+    from window.DF_GRAPH_LAYOUT at top-level execution time — if graph_layout.js
+    loaded after (or not at all), that destructure would silently produce
+    undefined, and TaskGraph would throw the moment it tries to call one of
+    those functions.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _GRAPH_LAYOUT_PREFIX,
+        _TAB_TASKS_PREFIX,
+        before_label='graph_layout.js',
+        after_label='tab_tasks.jsx',
+        consumer_note=(
+            'tab_tasks.jsx destructures window.DF_GRAPH_LAYOUT at top level; '
+            'graph_layout.js must define it first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: all /static/redux/* cache-busters share one bumped version
+# ---------------------------------------------------------------------------
+
+
+def test_redux_cache_buster_bumped(index_html_body: str) -> None:
+    """All /static/redux/*?v= cache-busters must share a single version >= 27,
+    and graph_layout.js must be among the versioned assets.
+
+    Mirrors the existing single-shared-version guards in test_tab_escalations.py,
+    test_tab_scheduler.py, and test_scheduler_page.py, raising the floor to 27 to
+    prove the uniform bump landed alongside the new graph_layout.js script tag.
+    """
+    versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
+    assert len(versions) == 1, (
+        f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
+        'bump all of them uniformly to the same value.'
+    )
+    v = int(next(iter(versions)))
+    assert v >= 27, (
+        f'index.html cache-buster version is {v}, expected >= 27 (proves the '
+        'uniform bump from 26 alongside the new graph_layout.js script tag).'
+    )
+    assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
+        'graph_layout.js is not present among the versioned /static/redux/* '
+        'assets in index.html.'
+    )
