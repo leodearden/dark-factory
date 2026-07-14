@@ -411,6 +411,7 @@ class DecisionRecord:
 # ---------------------------------------------------------------------------
 
 _SLUG_SANITIZE_RE = re.compile(r'[^A-Za-z0-9._-]')
+_ALL_DOTS_RE = re.compile(r'^\.+$')
 
 
 def sanitize_slug(raw: str) -> str:
@@ -421,9 +422,25 @@ def sanitize_slug(raw: str) -> str:
     applies it to an externally-supplied slug token (``CLAUDE_SPAWN_SESSION_ID``)
     so that value is always safe to use as a ``record_path_for_slug`` directory
     name -- e.g. a stray ``/`` in an adversarial/malformed token can never
-    resolve outside ``sessions_dir``.
+    resolve outside ``sessions_dir`` as a path separator.
+
+    ``'.'`` is itself in the allowed set (kept for ordinary slugs), so the
+    character-class substitution alone does not stop a result that is
+    *entirely* dots (``'.'`` or ``'..'``): unlike any other sanitized value,
+    that would be handed to ``record_path_for_slug`` as a filesystem
+    traversal segment ("this directory" / "the parent directory") rather
+    than a literal directory name. Such an all-dots result is therefore
+    additionally collapsed (every ``'.'`` mapped to ``'-'``) so a ``'..'``
+    (or ``'.'``) token can never escape ``sessions_dir`` either -- closing
+    the one path-escape the regex substitution by itself cannot block. A
+    string that merely *contains* dots alongside other characters (e.g.
+    ``'..foo'``) is a literal, non-traversing directory name and is left
+    untouched.
     """
-    return _SLUG_SANITIZE_RE.sub('-', raw)
+    cleaned = _SLUG_SANITIZE_RE.sub('-', raw)
+    if _ALL_DOTS_RE.match(cleaned):
+        cleaned = cleaned.replace('.', '-')
+    return cleaned
 
 
 def build_session_slug(
@@ -1006,6 +1023,28 @@ def mark_orphaned_sessions_exited(
     detached/tmux one) keeps bumping its record's mtime via its own hooks,
     so it is never swept regardless of how long it has been non-terminal.
 
+    Known trade-off for DETACHED spawns (reviewer-flagged): spawn-claude.sh
+    itself exits once it hands off (its ``launcher_pid`` dies) while claude
+    keeps running standalone, so for the entire remaining life of a
+    detached session ``_pid_alive`` is already False -- the heartbeat
+    (record.json's mtime, bumped only by that session's own
+    Notification/Stop hooks after convergence) is the SOLE thing keeping it
+    unswept. A detached session that goes quieter than
+    ``NON_TERMINAL_HEARTBEAT_TTL`` (1h) between hook events -- e.g. one long
+    tool-heavy turn with no intervening Notification/Stop -- can therefore
+    be marked EXITED while genuinely still running, driven opportunistically
+    from every other spawn's ``_run_launching``/from ``reap`` (not just an
+    explicit CLI ``reap``, unlike before this task). This is self-correcting
+    -- its next hook event calls ``refresh_record`` and flips status back --
+    but there is a real window of an incorrectly-EXITED cockpit row. Reusing
+    the pre-existing ``NON_TERMINAL_HEARTBEAT_TTL`` (rather than introducing
+    a second, sweep-specific threshold) keeps this sweep's semantics
+    identical to the reaper's already-trusted ``stale_pid`` rule; widening
+    the TTL or tracking a detached session's actual claude pid instead of
+    its exited launcher would be a separate, broader design change (touching
+    session_hooks.py/spawn-claude.sh's pid bookkeeping) and is left as a
+    follow-up rather than folded into this sweep.
+
     Unlike ``reap_stale_records``, this does NOT delete anything -- it marks
     a matching record EXITED (exit_code=``ORPHAN_EXIT_CODE``), preserving
     every other field, and leaves its directory in place.
@@ -1548,6 +1587,18 @@ def _run_launching(env: Mapping[str, str]) -> str:
     drains. Wrapped in a fail-soft guard: a sweep fault must never raise
     here and must never write to stdout, or it would corrupt the printed
     record dir spawn-claude.sh captures into ``SESSION_RECORD_DIR``.
+
+    Cost model (reviewer-flagged): the sweep is O(N) in the number of
+    session directories -- one ``iterdir`` + one ``record.json`` parse per
+    peer, plus a second read+write for each record it actually marks -- and
+    runs synchronously in this call, so every spawn pays for scanning all
+    of its peers, not just its own write. This is a deliberate trade-off
+    given the sweep has no periodic/out-of-band driver to run on instead
+    (see above); it is bounded and self-limiting (the backlog this drains
+    only shrinks the cost over time), acceptable at today's fleet sizes, and
+    the right place to revisit if spawn latency ever becomes a problem is a
+    dedicated periodic timer (systemd/cron) rather than this synchronous
+    call -- out of this task's module scope (would touch harness/systemd).
     """
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
     prompt = env.get('CLAUDE_SPAWN_PROMPT', '') or ''
