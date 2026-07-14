@@ -6,12 +6,13 @@ import asyncio
 import logging
 import uuid
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.neutral_cwd import neutral_cli_cwd
 
+from fused_memory.backends.task_backend_errors import TaskmasterError, TaskNotFoundError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.middleware.task_curator import (
@@ -1352,6 +1353,71 @@ class TestCurateHappyPath:
 
 
 # ----------------------------------------------------------------------
+# _fetch_entry_for_neighbor — TaskNotFoundError exclusion (task 2521 RC2)
+# ----------------------------------------------------------------------
+
+
+class TestFetchEntryForNeighbor:
+    @pytest.mark.asyncio
+    async def test_not_found_excludes_neighbor(self):
+        """A definitively-deleted neighbor (get_task raises TaskNotFoundError)
+        is EXCLUDED from the pool — returns None — rather than fabricating a
+        thin entry from the stale Qdrant payload."""
+        config = _make_config()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            side_effect=TaskNotFoundError('42', tag='master'),
+        )
+        curator = TaskCurator(config=config, taskmaster=taskmaster)
+
+        entry = await curator._fetch_entry_for_neighbor(
+            '42', {'title': 'Orphan vector', 'task_id': '42'},
+            source='embedding', lock_depth=2, project_root='/x',
+        )
+        assert entry is None, (
+            'RED: a definitively-deleted neighbor must be excluded (None), '
+            'not fabricated into a thin pool entry'
+        )
+
+    @pytest.mark.asyncio
+    async def test_backend_unavailable_keeps_conservative_thin_entry(self):
+        """A transient outage (TASKMASTER_UNAVAILABLE) is inconclusive — keeps
+        the conservative thin entry (status='unknown', combine_eligible=False)
+        so a live task is never silently dropped from the pool."""
+        config = _make_config()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            side_effect=TaskmasterError('TASKMASTER_UNAVAILABLE', 'backend down'),
+        )
+        curator = TaskCurator(config=config, taskmaster=taskmaster)
+
+        entry = await curator._fetch_entry_for_neighbor(
+            '42', {'title': 'Maybe alive', 'task_id': '42'},
+            source='embedding', lock_depth=2, project_root='/x',
+        )
+        assert entry is not None
+        assert entry.task_id == '42'
+        assert entry.status == 'unknown'
+        assert entry.combine_eligible is False
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_keeps_conservative_thin_entry(self):
+        """Any other exception is also inconclusive — same conservative fallback."""
+        config = _make_config()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=RuntimeError('boom'))
+        curator = TaskCurator(config=config, taskmaster=taskmaster)
+
+        entry = await curator._fetch_entry_for_neighbor(
+            '42', {'title': 'Whatever', 'task_id': '42'},
+            source='embedding', lock_depth=2, project_root='/x',
+        )
+        assert entry is not None
+        assert entry.status == 'unknown'
+        assert entry.combine_eligible is False
+
+
+# ----------------------------------------------------------------------
 # Build-corpus integration (mocked taskmaster, skips embedder)
 # ----------------------------------------------------------------------
 
@@ -1455,6 +1521,52 @@ class TestBuildCorpus:
             )
         assert sizes['module'] == 0
         assert not any(e.task_id == '300' for e in pool)
+
+    @pytest.mark.asyncio
+    async def test_not_found_embedding_neighbor_excluded_from_pool(self):
+        """Acceptance #3 (task 2521 RC2): an embedding neighbor whose Qdrant
+        vector is an orphan for a definitively-removed task (get_task raises
+        TaskNotFoundError) must NOT appear in the returned pool — otherwise a
+        near-identical re-file would be dropped against a fabricated stale entry."""
+        config = _make_config()
+        orphan_id = '9999'
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            side_effect=TaskNotFoundError(orphan_id, tag='master'),
+        )
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+
+        curator = TaskCurator(config=config, taskmaster=taskmaster)
+
+        point = MagicMock()
+        point.payload = {
+            'task_id': orphan_id,
+            'title': 'Removed task orphan vector',
+            'description': '',
+            'files_to_modify': [],
+        }
+        results = MagicMock()
+        results.points = [point]
+
+        mock_client = AsyncMock()
+        mock_client.query_points = AsyncMock(return_value=results)
+
+        mock_embedder = AsyncMock()
+        mock_embedder.create = AsyncMock(return_value=[0.1] * 10)
+
+        with patch.object(curator, '_ensure_collection', return_value='task_curator_p'), \
+             patch.object(curator, '_get_embedder', return_value=mock_embedder), \
+             patch.object(curator, '_get_qdrant', return_value=mock_client):
+            pool, sizes = await curator._build_corpus(
+                CandidateTask(title='Near-identical re-file'),
+                project_id='p', project_root='/x',
+            )
+
+        assert sizes['embedding'] == 0
+        assert not any(e.task_id == orphan_id for e in pool), (
+            'RED: orphan neighbor for a removed task must be excluded from the pool'
+        )
 
 
 # ----------------------------------------------------------------------
