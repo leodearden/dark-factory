@@ -281,12 +281,14 @@ class TestRun:
     async def test_apply_updates_only_taggable_record_with_preserved_metadata(self):
         """--apply calls memory.mem0.update exactly once -- for the single
         'tag' record in the fixture -- passing (id, tagged_content, scope)
-        positionally and the record's FULL original metadata payload as the
-        metadata= kwarg, so provenance (src_project/kind/...) survives
-        mem0's payload-overwriting _update_memory. The 'skip:already_tagged'
-        and 'skip:no_src_project' fixture records must trigger no update at
-        all -- proven here by the single-call assertion covering the whole
-        fixture, not just the taggable record."""
+        positionally and the record's CUSTOM-provenance metadata subset (mem0-
+        owned keys like 'data' stripped per _MEM0_MANAGED_METADATA_KEYS) as the
+        metadata= kwarg, so provenance (src_project/kind/...) survives mem0's
+        payload-overwriting _update_memory without also forwarding a stale
+        copy of the content mem0 already owns. The 'skip:already_tagged' and
+        'skip:no_src_project' fixture records must trigger no update at all --
+        proven here by the single-call assertion covering the whole fixture,
+        not just the taggable record."""
         records = self._fixture_records()
         memory = self._make_memory(records)
         args = self._args(apply=True, project_id='dark_factory', scan_limit=10000)
@@ -302,7 +304,14 @@ class TestRun:
         assert call.args[2].project_id == 'dark_factory'
 
         taggable_record = next(r for r in records if r['id'] == 'm-taggable')
-        assert call.kwargs.get('metadata') == taggable_record['metadata']
+        expected_metadata = {
+            k: v for k, v in taggable_record['metadata'].items()
+            if k not in _mod._MEM0_MANAGED_METADATA_KEYS
+        }
+        assert call.kwargs.get('metadata') == expected_metadata
+        assert 'data' not in call.kwargs['metadata'], (
+            'mem0-owned data key (stale pre-tag content) must not be forwarded'
+        )
         assert call.kwargs['metadata']['src_project'] == 'reify'
         assert call.kwargs['metadata']['kind'] == _mod.CGL_ETA_REHOME_KIND
 

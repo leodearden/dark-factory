@@ -22,8 +22,11 @@ Unlike ``scripts/prune_recon_cycle_summaries.py`` and
 because their Mem0 path lacked an in-place payload-update primitive), this
 script edits IN PLACE via a metadata-forwarding ``Mem0Backend.update`` --
 preserving ``created_at`` and every custom metadata key (``src_project`` /
-``dst_project`` / ``kind`` / ``source_migration`` / ...) by passing the full
-existing payload back on update. See ``fused_memory.maintenance.rehome_scope_tag``
+``dst_project`` / ``kind`` / ``source_migration`` / ...) by passing the
+existing payload's custom-provenance subset back on update (mem0-owned keys
+like ``data``/``hash``/``created_at``/``updated_at`` are stripped first --
+mem0 re-derives them itself; see ``_MEM0_MANAGED_METADATA_KEYS``). See
+``fused_memory.maintenance.rehome_scope_tag``
 for the pure tagging helper (:func:`apply_scope_tag`) this script routes
 content through -- the same helper any future rehome path should reuse so
 new entries are gated from ever landing untagged.
@@ -215,6 +218,27 @@ def build_tag_report(
 
 
 # ---------------------------------------------------------------------------
+# mem0-owned metadata keys
+# ---------------------------------------------------------------------------
+
+# Keys mem0's AsyncMemory._update_memory (site-packages/mem0/memory/main.py,
+# ~line 2449) never trusts from a forwarded metadata dict: 'data'/'hash'/
+# 'created_at'/'updated_at' are unconditionally recomputed from the update
+# call's own arguments and the existing stored point, and 'user_id'/
+# 'agent_id'/'run_id'/'actor_id'/'role' are restored from the *currently
+# stored* payload (unconditionally for 'actor_id'; whenever absent from what
+# was forwarded for the rest). Forwarding stale copies of these currently
+# works only because mem0 keeps overwriting/re-deriving them -- an implicit
+# coupling to mem0 internals. Stripping them here makes the intent explicit:
+# preserve only this record's CUSTOM provenance keys (kind/src_project/
+# dst_project/src_entity/dst_entity/source_migration/...).
+_MEM0_MANAGED_METADATA_KEYS = frozenset({
+    'data', 'hash', 'created_at', 'updated_at',
+    'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
+})
+
+
+# ---------------------------------------------------------------------------
 # Live shell: apply_tags
 # ---------------------------------------------------------------------------
 
@@ -226,12 +250,13 @@ async def apply_tags(
     """Apply every ``'tag'`` decision via ``memory.mem0.update``, best-effort.
 
     For each project's decisions with ``action == 'tag'``, calls
-    ``memory.mem0.update(record_id, new_content, scope,
-    metadata=record['metadata'])`` -- passing the FULL scrolled payload back
-    so mem0's payload-overwriting ``_update_memory`` preserves the custom
-    provenance keys (``src_project``/``dst_project``/``kind``/
-    ``source_migration``/...) instead of wiping them; ``created_at`` is
-    preserved by mem0 regardless.
+    ``memory.mem0.update(record_id, new_content, scope, metadata=<custom
+    provenance subset of record['metadata']>)`` -- passing the scrolled
+    payload back with mem0-owned keys (see ``_MEM0_MANAGED_METADATA_KEYS``)
+    stripped, so mem0's payload-overwriting ``_update_memory`` preserves the
+    custom provenance keys (``src_project``/``dst_project``/``kind``/
+    ``source_migration``/...) instead of wiping them; ``created_at`` and the
+    other mem0-owned fields are (re)derived by mem0 itself regardless.
 
     Mirrors ``prune_recon_cycle_summaries.apply_prune``'s best-effort
     posture: each update is individually guarded by try/except so one bad
@@ -267,10 +292,14 @@ async def apply_tags(
             record = records_by_id.get(decision['id'])
             if record is None:
                 continue
+            provenance_metadata = {
+                k: v for k, v in record['metadata'].items()
+                if k not in _MEM0_MANAGED_METADATA_KEYS
+            }
             try:
                 await memory.mem0.update(
                     decision['id'], decision['new_content'], scope,
-                    metadata=record['metadata'],
+                    metadata=provenance_metadata,
                 )
             except Exception as exc:  # noqa: BLE001 -- best-effort, mirrors apply_prune
                 logger.warning(
