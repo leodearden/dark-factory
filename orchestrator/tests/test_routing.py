@@ -305,7 +305,7 @@ class TestProbeModelsStatusMappingAndDispatch:
             '{"type":"error","error":{"type":"not_found_error",'
             '"message":"model: sonnet"}}'
         )
-        overrides = {
+        overrides: dict[tuple[str, str], AgentResult | BaseException | type[BaseException]] = {
             ('sonnet', 'tok-x'): AgentResult(
                 success=False, api_error_status=404, output=not_found_body,
             ),
