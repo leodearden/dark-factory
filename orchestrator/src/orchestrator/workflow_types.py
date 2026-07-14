@@ -223,6 +223,8 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
 
     from orchestrator.git_ops import (
         InteractiveWorktreeLimitError,
+        MergeParkContentionError,
+        MergeParkError,
         MergeVerifyLeaseHeld,
         WarmLaneDiskPressure,
         WarmLanePoolExhausted,
@@ -345,6 +347,30 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Illegal usage-gate transition',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # advance_main's WIP-parking safety mechanism (task 2556) — both are
+        # permanent-halt conditions ("halting to preserve WIP" / "halting
+        # merge to prevent code loss", git_ops.py's advance_main), never
+        # caught by _drive()'s ladder (they're raised/caught entirely inside
+        # GitOps.advance_main), so these are BD-2-completeness-only rows —
+        # same category as WorktreeMissing/MergeVerifyLeaseHeld above.
+        # MergeParkContentionError IS-A MergeParkError but gets its own row
+        # (distinct cause/log text) rather than relying on MRO fallback.
+        MergeParkError: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='WIP park failed before advance_main',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        MergeParkContentionError: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Stale merge-park ref: refusing to overwrite',
             block_class=BlockClass.AGENT_FAILURE,
         ),
     }

@@ -27,6 +27,7 @@ import asyncio
 import dataclasses
 import inspect
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -81,7 +82,7 @@ class TestBlockDispositionShape:
         from orchestrator.unblock_types import BlockClass
         from orchestrator.verify_categories import FailureCategory
         from orchestrator.workflow_types import BlockDisposition, RequeueKind
-        kwargs = dict(
+        kwargs: dict[str, Any] = dict(
             category=FailureCategory.NONE,
             escalate_to_human=False,
             requeue_kind=RequeueKind.BLOCK,
@@ -430,6 +431,7 @@ class TestRunLevelBlockOutcomeKind:
         assert report.outcome == WorkflowOutcome.BLOCKED
         assert report.reason.lower().startswith('all accounts capped')
         assert report.category is FailureCategory.NONE
+        assert mark_blocked_spy.await_args is not None
         assert mark_blocked_spy.await_args.kwargs.get('escalate_to_human', False) is False
 
     async def test_verify_infra_error_blocks_and_escalates_to_human(
@@ -444,6 +446,7 @@ class TestRunLevelBlockOutcomeKind:
 
         assert report.outcome == WorkflowOutcome.BLOCKED
         assert report.category is FailureCategory.NONE
+        assert mark_blocked_spy.await_args is not None
         assert mark_blocked_spy.await_args.kwargs.get('escalate_to_human') is True
 
     async def test_worktree_conflict_error_blocks_and_escalates_to_human(
@@ -458,6 +461,7 @@ class TestRunLevelBlockOutcomeKind:
 
         assert report.outcome == WorkflowOutcome.BLOCKED
         assert report.category is FailureCategory.NONE
+        assert mark_blocked_spy.await_args is not None
         assert mark_blocked_spy.await_args.kwargs.get('escalate_to_human') is True
 
     async def test_bare_runtime_error_blocks_via_steward_path(
@@ -473,6 +477,7 @@ class TestRunLevelBlockOutcomeKind:
 
         assert report.outcome == WorkflowOutcome.BLOCKED
         assert report.category is FailureCategory.NONE
+        assert mark_blocked_spy.await_args is not None
         assert mark_blocked_spy.await_args.kwargs.get('escalate_to_human', False) is False
 
 
@@ -668,6 +673,7 @@ class TestMarkBlockedDispositionSourcedBlockClass:
 
         assert len(calls) == 1
         assert calls[0]['block_class'] is BlockClass.POST_MERGE_RED_MAIN
+        assert wf._terminal_report is not None
         assert wf._terminal_report.category is disp.category
 
     async def test_no_disposition_keeps_prose_sniff_back_compat(
@@ -680,6 +686,7 @@ class TestMarkBlockedDispositionSourcedBlockClass:
 
         assert len(calls) == 1
         assert calls[0]['block_class'] == classify_block_reason(reason)
+        assert wf._terminal_report is not None
         assert wf._terminal_report.category is None
 
 
