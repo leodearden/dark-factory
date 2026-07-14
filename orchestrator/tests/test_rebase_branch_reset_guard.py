@@ -307,6 +307,56 @@ class TestRebasePreservingTaskCommitsGuard:
             'the rebase (here, simulated reset) left it'
         )
 
+    @pytest.mark.parametrize(
+        ('cherry_rc', 'cherry_out'),
+        [
+            pytest.param(1, '', id='cherry-command-fails'),
+            pytest.param(0, '', id='cherry-empty-output'),
+        ],
+    )
+    async def test_guard_raises_when_cherry_check_is_unreliable(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        monkeypatch,
+        cherry_rc: int,
+        cherry_out: str,
+    ):
+        """Reviewer follow-up to test_guard_returns_true_on_patch_id_dedup_not_wipe:
+        the patch-id dedup exemption must only apply on a CONFIRMED all-'-'
+        ``git cherry`` result. If the ``git cherry`` check itself is
+        unreliable — the command fails (rc != 0) or produces no output —
+        the guard must NOT read that as a dedup; per its docstring, 'any
+        uncertainty in that determination... fails toward treating it as a
+        wipe'. This locks in the safety-critical direction of the branch:
+        a wipe still restores the pre-rebase HEAD and raises
+        BranchResetError even though the dedup check couldn't confirm
+        either way."""
+        wt_info = await git_ops.create_worktree('cherry-unreliable')
+        wt = wt_info.path
+        await _commit_unique_work(wt)
+        pre_head = await _head_sha(wt)
+        assert await _commits_over_main(wt) == 1
+
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', _wipe_via_reset)
+
+        import orchestrator.git_ops as git_ops_module
+
+        real_run = git_ops_module._run
+
+        async def _unreliable_cherry_run(cmd: list[str], cwd: Path | None = None):
+            if cmd[:2] == ['git', 'cherry']:
+                return cherry_rc, cherry_out, 'simulated: cherry check unreliable'
+            return await real_run(cmd, cwd=cwd)
+
+        monkeypatch.setattr(git_ops_module, '_run', _unreliable_cherry_run)
+
+        with pytest.raises(BranchResetError):
+            await git_ops.rebase_preserving_task_commits(wt)
+
+        assert await _head_sha(wt) == pre_head, 'pre-rebase HEAD must be restored'
+        assert await _commits_over_main(wt) == 1, 'task commit must survive'
+
     async def test_guard_branch_reset_error_reports_failed_restore(
         self, git_ops: GitOps, git_repo: Path, monkeypatch,
     ):
