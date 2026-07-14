@@ -11876,8 +11876,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         keep_worktrees=set(self._owned_merge_worktrees),
                     )
                     if gate is not None:
-                        if not req.result.done():
-                            req.result.set_result(gate)
+                        # task 2604: route through the unified terminal
+                        # chokepoint so _retire_item fires (mirrors the three
+                        # converted sites and the FAIL/skip branch). A raw
+                        # req.result.set_result() here left the registry entry
+                        # non-terminal (GATE_REVERIFY) in _live_items forever —
+                        # a ghost 'gate_reverify' item surfaced by
+                        # _finalizing_head_entry()/snapshot() whenever a rebased
+                        # request failed its post-rebase reverify gate. The
+                        # chokepoint already performs the not-done guard.
+                        self._resolve_or_drop_abandoned(req, gate)
                         return False
 
                     current_sha = rebased_sha
