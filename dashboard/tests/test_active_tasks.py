@@ -1524,6 +1524,52 @@ async def test_collect_active_tasks_live_prd_member_beyond_cap_is_exempted(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('active_status', ['blocked', 'pending', 'merge-deferred', 'deferred'])
+async def test_collect_active_tasks_live_prd_member_beyond_cap_exempted_for_other_active_statuses(
+    tmp_path, monkeypatch, dummy_client, active_status,
+):
+    """The live-PRD exemption keys on ANY _ACTIVE_STATUSES member, not just 'in-progress'.
+
+    Same shape as test_collect_active_tasks_live_prd_member_beyond_cap_is_exempted, but
+    the task keeping the PRD "live" is parametrized across the *other* members of
+    _ACTIVE_STATUSES. Guards against a regression that narrows "live" to just
+    'in-progress'.
+    """
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='statprd',
+        active_tasks=[
+            {'id': 1, 'title': 'active status-prd member', 'status': active_status,
+             'dependencies': [], 'metadata': {'prd_path': 'plans/status-prd.md'}},
+        ],
+        done_tasks=[
+            {'id': 2, 'title': 'status-prd done member', 'status': 'done',
+             'dependencies': [], 'metadata': {'prd_path': 'plans/status-prd.md'},
+             'updated_at': '2026-05-29T09:00:00+00:00'},
+            {'id': 3, 'title': 'no-prd done newest', 'status': 'done',
+             'dependencies': [], 'metadata': {},
+             'updated_at': '2026-05-29T12:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                            max_done_per_project=1)
+
+    ids = {t['id'] for t in active}
+    assert 'statprd/T-2' in ids, (
+        f'live-PRD done member must be exempted from the cap when kept live by a '
+        f'{active_status!r} member, not just "in-progress"'
+    )
+    assert 'statprd/T-3' in ids
+
+
+@pytest.mark.asyncio
 async def test_collect_active_tasks_fully_done_prd_not_exempted(
     tmp_path, monkeypatch, dummy_client,
 ):
