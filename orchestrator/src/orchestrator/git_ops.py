@@ -776,6 +776,16 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     English warning text; a non-C locale would produce translated output that
     the matcher cannot recognise, silently defeating the R3 ENOENT-tolerance
     fix for the 4892-class warm-lane FAULT.
+
+    Cancellation safety (task 2608): if the ``await proc.communicate()`` below
+    is cancelled — e.g. by a caller wrapping ``_run`` in
+    ``asyncio.wait_for(..., timeout=...)``, as delivered_checks.py's
+    ``_run_script_check`` does for script-kind delivered checks — the spawned
+    child would otherwise keep running as an orphan with its stdout/stderr
+    pipes open. For a persistently-hung script this recurred every scheduler
+    sweep, leaking a process and file descriptors. The child is now
+    best-effort killed and reaped before the triggering exception (including
+    ``asyncio.CancelledError``) is re-raised.
     """
     # Pre-flight: a missing cwd surfaces as a generic FileNotFoundError from
     # posix_spawn whose .filename is not reliably set.  Check explicitly so we
@@ -800,7 +810,23 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
         if cwd is not None and not Path(cwd).is_dir():
             raise WorktreeMissing(cwd) from e
         raise
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await proc.communicate()
+    except BaseException:
+        # The await was interrupted (most commonly asyncio.CancelledError from
+        # a caller-side asyncio.wait_for(..., timeout=...)) before the child
+        # exited. Best-effort kill + reap it so it doesn't leak as an orphan
+        # process with dangling stdout/stderr pipes, then propagate the
+        # original exception unchanged.
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass  # already exited
+        try:
+            await proc.wait()
+        except BaseException:
+            pass  # reap is best-effort; never let it mask the original error
+        raise
     return proc.returncode if proc.returncode is not None else 1, stdout.decode().strip(), stderr.decode().strip()
 
 
