@@ -19,10 +19,13 @@ primitives rather than reaching into another task's module).
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+
+from legibility.inventory import SessionRecord
 
 
 def _iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
@@ -318,3 +321,87 @@ def classify_agent_class(record: dict[str, Any] | None, path: Path) -> str:
     if any(marker in text.lower() for marker in _CURATOR_CLASSIFIER_SUBSTRING_MARKERS):
         return 'curator-classifier'
     return 'interactive'
+
+
+# ---------------------------------------------------------------------------
+# ScoredRecord, shape_fingerprint, dedupe_shapes — near-duplicate collapsing
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ScoredRecord:
+    """A :class:`~legibility.inventory.SessionRecord` enriched with its
+    signal score and agent-class stratum — the unit :func:`stratified_sample`
+    operates on. Produced by :func:`main` via
+    ``inventory.enumerate_sessions -> score_signals -> classify_agent_class``,
+    or constructed directly for pure in-memory testing (PRD §8.4).
+    """
+
+    session: SessionRecord
+    stratum: str
+    counts: SignalCounts
+    first_turn_text: str = ''
+
+    @property
+    def score(self) -> int:
+        return self.counts.total_signal
+
+    @property
+    def size_bytes(self) -> int:
+        return self.session.size_bytes
+
+    @property
+    def path(self) -> Path:
+        return self.session.path
+
+
+_DIGITS_RE = re.compile(r'\d+')
+
+
+def _normalize_first_turn(text: str, *, prefix_len: int = 80) -> str:
+    """Collapse whitespace, replace digit runs with '#', and cap length.
+
+    Normalizes away the parts of a recon/watcher clone's first turn that
+    vary run-to-run (dates, session-specific numbers) while keeping enough
+    of the structural prefix to distinguish a genuinely different prompt.
+    """
+    collapsed = ' '.join(text.split())
+    digitless = _DIGITS_RE.sub('#', collapsed)
+    return digitless[:prefix_len].lower()
+
+
+def shape_fingerprint(record: ScoredRecord) -> tuple[str, tuple[bool, ...], str]:
+    """A cheap, hashable near-duplicate key: (stratum, signal-shape, first-turn skeleton).
+
+    ``signal-shape`` is a boolean presence-per-class pattern (never exact
+    counts) — near-identical recon clones fire the same CLASSES of signal
+    night after night even when exact counts drift by one or two. The
+    first-turn skeleton (:func:`_normalize_first_turn`) absorbs
+    date/number drift between otherwise-identical clone runs.
+    """
+    counts = record.counts
+    signal_shape = (
+        bool(counts.tool_error),
+        bool(counts.not_found),
+        bool(counts.self_correct),
+        bool(counts.df_guard),
+        bool(counts.interrupt),
+    )
+    return (record.stratum, signal_shape, _normalize_first_turn(record.first_turn_text))
+
+
+def dedupe_shapes(records: Sequence[ScoredRecord]) -> list[ScoredRecord]:
+    """Collapse near-duplicate shapes, keeping the highest-scoring representative per fingerprint.
+
+    Returned survivors follow first-occurrence order of each fingerprint in
+    *records* (stable) — callers needing score order sort separately.
+    """
+    best: dict[tuple, ScoredRecord] = {}
+    order: list[tuple] = []
+    for record in records:
+        fingerprint = shape_fingerprint(record)
+        if fingerprint not in best:
+            order.append(fingerprint)
+            best[fingerprint] = record
+        elif record.score > best[fingerprint].score:
+            best[fingerprint] = record
+    return [best[fingerprint] for fingerprint in order]
