@@ -241,3 +241,63 @@ def render_matrix(matrix: dict[str, dict[str, int]]) -> str:
         for origin in origins
     ]
     return "\n".join([header, separator, *rows]) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# preflight_headroom — cheap usage-headroom probe (PRD decision 5: no
+# usage API assumed -- one tiny call, scan its reply for a banner)
+# ---------------------------------------------------------------------------
+
+_HEADROOM_BANNER_MARKERS = (
+    "usage limit",
+    "rate limit",
+    "please run /login",
+    "invalid api key",
+)
+"""Case-insensitive substrings that mark a usage-limit/auth banner reply
+from the headless `claude` CLI, rather than a genuine model response."""
+
+_HEADROOM_PROBE_PROMPT = "ping"
+"""The tiny probe prompt -- a cheap single round trip, not a real mining
+call. Its content doesn't matter; only whether the reply carries a banner
+marker or raises."""
+
+
+@dataclass
+class HeadroomResult:
+    """Verdict from ``preflight_headroom``: ``ok=True`` means the probe
+    round-tripped cleanly and mining may proceed; ``ok=False`` means it
+    should be deferred to the next trigger evaluation, with ``reason``
+    explaining why (a banner marker, or an invocation error)."""
+
+    ok: bool
+    reason: str | None = None
+
+
+def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
+    """Issue one tiny probe via ``invoke(prompt, model)`` and decide
+    whether the census has headroom to proceed.
+
+    No usage API is assumed to exist (PRD decision 5) -- this is a cheap
+    preflight probe, not a quota lookup. The reply is scanned
+    case-insensitively for a known usage-limit/auth banner marker
+    (``_HEADROOM_BANNER_MARKERS``); a match defers. An invocation error
+    raised by *invoke* (e.g. a ``CoderInvocationError``-shaped failure)
+    is also treated as a deferral -- fail-safe, never a crash, since a
+    probe failure is exactly the kind of "the model isn't reachable right
+    now" signal this preflight exists to catch. Makes no mining decisions
+    itself -- just the ok/deferred verdict + reason.
+    """
+    try:
+        reply = invoke(_HEADROOM_PROBE_PROMPT, model)
+    except Exception as exc:  # noqa: BLE001 - any probe failure must fail safe
+        return HeadroomResult(ok=False, reason=f"headroom probe invocation failed: {exc}")
+
+    lowered = (reply or "").lower()
+    for marker in _HEADROOM_BANNER_MARKERS:
+        if marker in lowered:
+            return HeadroomResult(
+                ok=False, reason=f"headroom probe reply carries a banner marker: {marker!r}",
+            )
+
+    return HeadroomResult(ok=True, reason=None)
