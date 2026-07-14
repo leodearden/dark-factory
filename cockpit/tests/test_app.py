@@ -2483,6 +2483,7 @@ class TestScanBackpressure:
 
             app._poll_registry()  # call #3: only runs if the flag was cleared
             await app.workers.wait_for_complete()
+            assert scanner.calls == 3
 
 
 class TestStaleScanSequenceGuard:
