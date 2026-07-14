@@ -460,3 +460,34 @@ class TestTickContextField:
         ctx2 = TickContext(tasks=[], status_map={}, tasks_by_id={})
         ctx1.delivered_check_cache['x'] = True
         assert ctx2.delivered_check_cache == {}
+
+
+# ---------------------------------------------------------------------------
+# TestDeliveredChecksConfig (task 2580 — step-9 RED / step-10 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestDeliveredChecksConfig:
+    """``DeliveredChecksConfig`` sub-model + its green-tier RELOADABLE_FIELDS
+    leaf.  Task 2580 (delta) owns only ``max_checks_per_tick`` — the sweep's
+    per-tick evaluation budget; task 2583 (epsilon) layers the remaining
+    knobs (enabled/grace_cycles/check_timeout_secs) onto this same
+    sub-model.
+    """
+
+    def test_default_max_checks_per_tick_is_50(self):
+        config = OrchestratorConfig()
+        assert config.delivered_checks.max_checks_per_tick == 50
+
+    def test_max_checks_per_tick_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            DeliveredChecksConfig(max_checks_per_tick=0)
+
+    def test_max_checks_per_tick_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            DeliveredChecksConfig(max_checks_per_tick=-1)
+
+    def test_max_checks_per_tick_is_hot_reloadable(self):
+        """The scheduler-tuning green tier: an operator may retune the sweep
+        budget via mcp__escalation__reload_config without a restart."""
+        assert 'delivered_checks.max_checks_per_tick' in RELOADABLE_FIELDS
