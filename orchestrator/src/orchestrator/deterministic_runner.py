@@ -43,7 +43,12 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
        (I1).  Auto-recovery is best-effort across an ORCHESTRATOR restart
        only — ``verify_baseline``'s monotonic clock resets on a MACHINE
        reboot, so a post-reboot re-verify conservatively yields
-       ``'unconfirmed'`` and still escalates to a human.
+       ``'unconfirmed'`` and still escalates to a human.  This is a
+       deliberate, narrowly-scoped exception to
+       ``_deterministic_deploy_health_verdict``'s documented "callers only
+       re-file/resolve an escalation, never flip status directly" contract
+       — see the sub-case (c) inline comment below for the accepted-risk
+       rationale.
 
 2. **before_done execution** (γ: ``before_done`` is not None):
    **Stop-instruction guard** (task 2509, reconciliation finding 0aac21b4):
@@ -1869,6 +1874,38 @@ class DeterministicRunner:
                 # reboot, so a post-reboot re-verify conservatively falls
                 # through to 'unconfirmed' (safe — never phantom-done; a
                 # reboot strand still resolves via a human, as today).
+                #
+                # Direct-completion note (reviewer_comprehensive, task 2618
+                # amendment): _deterministic_deploy_health_verdict's own
+                # docstring states its safety property rests on callers
+                # RE-FILING/resolving an escalation rather than flipping task
+                # status directly, so a wrong verdict surfaces via the
+                # normal escalation/watcher machinery instead of silently
+                # corrupting state. This call site is a deliberate, narrowly
+                # -scoped THIRD exception to that pattern: on 'healthy' it
+                # flips straight to done via _writeback_deploy_success
+                # instead of escalating for a human/watcher to confirm.
+                # Accepted risk, NOT closed by the RAN-phase/baseline gate
+                # above: a deploy that genuinely FAILED (script rc!=0, or
+                # never finished exec'ing) whose unit is SEPARATELY
+                # restarted to a fresh active state before this resume runs
+                # — an unrelated operator action, or systemd's own
+                # Restart=on-failure cycling it back up — would also read
+                # 'healthy' here and phantom-done, because none of
+                # phase==RAN, a persisted baseline, or a strict monotonic
+                # advance is evidence that THIS script's own run exited 0.
+                # Closing that gap needs a positive, independently-persisted
+                # "this run exited 0" signal (e.g. an rc stamped by
+                # proc_supervision.RestartPlan.execute() before its verify
+                # leg) — proc_supervision.py is outside this task's locked
+                # module scope, so that is intentionally deferred as a
+                # follow-up rather than bolted on here. Accepted for now:
+                # the alternative is task 2584's proven-in-production
+                # failure mode — an infinite reblock loop re-escalating on
+                # EVERY orchestrator restart with zero auto-recovery —
+                # against a narrow, comparatively rare false-positive
+                # window.
+                #
                 # reverify_note, when set, records that a live re-verify was
                 # attempted and came back non-healthy — enriches the
                 # escalation detail below so the operator sees the runner
