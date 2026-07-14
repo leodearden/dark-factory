@@ -324,6 +324,20 @@ def canonical_flag_type_family(flag_type: str) -> str:
 #: must reset this between cases -- see the
 #: ``_reset_flag_type_family_collision_warning_cache`` autouse fixture in
 #: test_flag_dedup.py.
+#:
+#: UNBOUNDED GROWTH (task 2503 amendment, reviewer_comprehensive
+#: robustness_resource): this set has no eviction and accumulates for the
+#: life of the process -- one entry per distinct ``(project_id, task_id,
+#: family)`` collision ever observed, never per reconciliation cycle or per
+#: flag filtered. Accepted as-is rather than capped (e.g. LRU/maxlen): actual
+#: cardinality is bounded by the number of distinct legacy/composite-seeded
+#: flag_type collisions across all suppression rows ever written, which is
+#: expected to be small (a collision is a data-quality signal, not the common
+#: case) -- and a size-based cap would let the WARNING re-fire for an evicted
+#: key on a later cycle, silently breaking the "once per process lifetime"
+#: contract this cache exists to provide, for exactly the long-lived-process
+#: case a cap would aim to help. Revisit with a bounded cache only if this
+#: assumption is ever observed to not hold in practice.
 _WARNED_FLAG_TYPE_FAMILY_COLLISIONS: set[tuple[str, str, str]] = set()
 
 
@@ -1011,6 +1025,28 @@ async def _existing_suppression_coverage(
     cross-project row (e.g. ``'2405,540,544'``). Coverage across multiple
     covering rows is aggregated (union): wildcard OR'd, families unioned.
 
+    KNOWN ASYMMETRY -- composite *tid* writes (task 2503 amendment,
+    reviewer_comprehensive efficiency_completeness): decomposition above is
+    applied only to ``row.task_id`` (existing rows), never to *tid* itself.
+    A single-id *tid* is therefore recognized as covered by a pre-existing
+    composite row, but the reverse does NOT hold -- when *tid* is ITSELF
+    composite (e.g. ``'2405,540'``), it is covered only by an existing row
+    whose (possibly-decomposed) task_id equals the FULL composite string; it
+    is NOT considered covered merely because every one of its own components
+    (``'2405'``, ``'540'``) already has separate matching single-id
+    suppression rows. In that (rare) case the composite write proceeds and
+    mints a fresh ledger row / Mem0 companion even though each component is
+    individually already suppressed elsewhere. This is an accepted,
+    deliberately out-of-scope edge case rather than a bug: composite task_ids
+    are a rare cross-project signature shape, and biasing toward one extra
+    companion record over risking a wrongly-skipped suppression matches this
+    function's fail-open philosophy (see the "Never raises" paragraph below
+    and task 2503's plan.json design_decisions). Closing this gap would mean
+    additionally decomposing *tid* itself and requiring every component to be
+    individually covered (by family) before treating the whole write as
+    covered -- left for a future task if composite-write sprawl is ever
+    observed in practice.
+
     Returns ``(False, set())`` -- no coverage -- when *ledger* is None.
 
     Never raises: a ``list_suppressions`` failure is caught and degrades to
@@ -1073,7 +1109,9 @@ async def write_suppression_record(
     ``recon_ledger`` UPSERT below already self-collapses EXACT (task_id,
     flag_type) identity, but the Mem0 mirror's ``add_memory`` NEVER upserts,
     so a flag_type wording variant previously minted a fresh Mem0 companion
-    on every write.
+    on every write. Coverage for a COMPOSITE *tid* is checked as a whole
+    string, not per-component -- see :func:`_existing_suppression_coverage`'s
+    "KNOWN ASYMMETRY" paragraph for the accepted edge case this leaves open.
 
     - If EVERY requested flag_type is already covered, BOTH the ledger
       upsert(s) AND the Mem0 mirror are skipped entirely: a structured
