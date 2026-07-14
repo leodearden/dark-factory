@@ -22,6 +22,25 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label
 
 
+_TRUTHY_SKIP_PERMS_TOKENS = frozenset({'true', '1', 'yes', 'on'})
+
+
+def default_skip_perms() -> bool:
+    """Config/env default for the cockpit spawn-bar's skip-perms toggle.
+
+    Reads $CLAUDE_SPAWN_SKIP_PERMS (stripped, case-insensitive); a value in
+    {'true', '1', 'yes', 'on'} resolves to True, everything else (including
+    unset) resolves to False. Replaces the old hardcoded skip_perms=false:
+    the operator who runs with bypass-perms sets this env var to inherit
+    that mode for cockpit-spawned sessions (AFK-durable), and/or flips the
+    per-spawn SpawnScreen toggle seeded from this default.
+    """
+    value = os.environ.get('CLAUDE_SPAWN_SKIP_PERMS')
+    if value is None:
+        return False
+    return value.strip().lower() in _TRUTHY_SKIP_PERMS_TOKENS
+
+
 def build_spawn_argv(
     script: os.PathLike[str] | str,
     cwd: str,
