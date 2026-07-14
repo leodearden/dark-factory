@@ -58,6 +58,7 @@ from shared.task_transitions import ActorClass, is_legal_transition, outcome_all
 # AgentStub's legacy-only TaskArtifacts writes are invisible to the
 # workflow's relocated meta_root, so a real run() never reaches DONE (rows
 # 5-6).
+from test_harness_warm_lane_wiring import _build_harness, _init_git_repo
 from test_workflow_e2e import (
     AgentStub,
     _build_workflow,
@@ -70,12 +71,13 @@ from test_workflow_warm_lane_requeue import _make_workflow as _make_warmlane_wor
 from orchestrator.agents.roles import _FAMILY_TOOL_PREFIXES, ROLES, AgentRole
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.harness import TaskReport
 from orchestrator.landed_outbox import MergeProvenance
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
-from orchestrator.workflow import TaskWorkflow, _PriorImplStatus
+from orchestrator.workflow import TaskWorkflow, WorkflowMetrics, _PriorImplStatus
 from orchestrator.workflow_types import (
     STATE_TO_STATUS,
     BlockDisposition,
@@ -607,3 +609,156 @@ class TestStateMachineLegalityAndConsistency:
         report = await workflow.run()
 
         assert report.outcome == WorkflowOutcome.DONE
+
+
+# ---------------------------------------------------------------------------
+# Boundary row 7 — TerminalReport (workflow.run() PRODUCER ↔ harness
+# _run_slot CONSUMER), TR-1.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHarnessConsumesTerminalReport:
+    """Boundary row 7 (PRD §9): ``TaskWorkflow.run()``'s returned
+    ``TerminalReport`` (PRODUCER) ↔ ``Harness._run_slot``'s consumed
+    ``TaskReport`` (CONSUMER), TR-1.
+    """
+
+    async def _run_stubbed_slot(
+        self, tmp_path: Path, report: TerminalReport, *, task_id: str,
+    ) -> TaskReport:
+        """Drive ``Harness._run_slot`` with ``TaskWorkflow`` patched to
+        return ``report`` directly from ``run()`` (no real agent/git work) —
+        mirrors test_workflow_terminal_report.py's ``_run_stubbed_slot``.
+        """
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+        config = OrchestratorConfig(project_root=repo, max_concurrent_tasks=1)
+        harness = _build_harness(config)
+        # `_build_harness` leaves `Scheduler` a bare MagicMock (only the
+        # liveness accessors are wired) — `is_deterministic` must be pinned
+        # False or the MagicMock auto-mock (truthy) would route this through
+        # `_run_deterministic_slot` instead of the TaskWorkflow path below.
+        harness.scheduler.is_deterministic.return_value = False  # type: ignore[attr-defined]
+        # `_apply_retry_cap` compares these against real ints from `config`
+        # (`count >= self.config.requeue_cap`) whenever outcome==REQUEUED —
+        # an unconfigured MagicMock return value would raise TypeError on
+        # that comparison and mask the finally block's real work.
+        harness.scheduler.record_requeue.return_value = 0  # type: ignore[attr-defined]
+        harness.scheduler.transient_requeue_count.return_value = 0  # type: ignore[attr-defined]
+
+        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+            mock_wf = MagicMock()
+            mock_wf.run = AsyncMock(return_value=report)
+            mock_wf._steward = None
+            mock_wf.metrics = WorkflowMetrics()
+            MockWorkflow.return_value = mock_wf
+
+            assignment = TaskAssignment(
+                task_id=task_id,
+                task={
+                    'id': task_id, 'title': 'Test task', 'status': 'pending',
+                    'metadata': {}, 'dependencies': [],
+                },
+                modules=[],
+            )
+            sem = asyncio.Semaphore(1)
+            result = await harness._run_slot(assignment, sem)
+
+        assert result is not None
+        return result
+
+    # -- Consumer: TaskReport.block_* maps from the returned TerminalReport --
+
+    async def test_row7_mark_blocked_exit_maps_block_phase_to_working_phase(
+        self, tmp_path: Path,
+    ):
+        """A ``_mark_blocked``-shape exit (``phase=BLOCKED``,
+        ``blocked_from_phase=VERIFY``) surfaces ``block_phase == 'verify'``
+        — the PRE-block WORKING phase, NOT the terminal ``phase``."""
+        report = TerminalReport(
+            outcome=WorkflowOutcome.BLOCKED,
+            reason='verify failed',
+            phase=WorkflowState.BLOCKED,
+            detail='d',
+            category=None,
+            blocked_from_phase=WorkflowState.VERIFY,
+        )
+        task_report = await self._run_stubbed_slot(tmp_path, report, task_id='701')
+
+        assert task_report.outcome == WorkflowOutcome.BLOCKED
+        assert task_report.block_reason == report.reason
+        assert task_report.block_detail == report.detail
+        assert task_report.block_phase == 'verify'
+
+    async def test_row7_warm_lane_requeued_exit_keeps_block_phase_plan(
+        self, tmp_path: Path,
+    ):
+        """A warm-lane REQUEUED exit (``blocked_from_phase=PLAN``, no BLOCKED
+        transition) keeps ``block_phase == 'plan'``."""
+        report = TerminalReport(
+            outcome=WorkflowOutcome.REQUEUED,
+            reason='warm_lane_pool_hard_down',
+            phase=WorkflowState.PLAN,
+            detail='d',
+            category=None,
+            blocked_from_phase=WorkflowState.PLAN,
+        )
+        task_report = await self._run_stubbed_slot(tmp_path, report, task_id='702')
+
+        assert task_report.outcome == WorkflowOutcome.REQUEUED
+        assert task_report.block_reason == report.reason
+        assert task_report.block_phase == 'plan'
+
+    async def test_row7_clean_done_exit_has_empty_block_phase(self, tmp_path: Path):
+        """A clean DONE exit (``blocked_from_phase`` defaults to ``None``)
+        maps to ``block_phase == ''``."""
+        report = TerminalReport(
+            outcome=WorkflowOutcome.DONE,
+            reason='',
+            phase=WorkflowState.DONE,
+            detail='',
+            category=None,
+        )
+        task_report = await self._run_stubbed_slot(tmp_path, report, task_id='703')
+
+        assert task_report.outcome == WorkflowOutcome.DONE
+        assert task_report.block_phase == ''
+
+    # -- Producer + TR-1 behavioral pin: no _last_block_* side channel --
+
+    async def test_row7_no_last_block_side_channel_survives_a_real_blocked_run(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """After a REAL blocked run (AllAccountsCappedException via
+        ``_build_workflow``+``AgentStub``), the ``TaskWorkflow`` instance
+        carries NO ``_last_block_reason``/``_last_block_detail``/
+        ``_last_block_phase`` attribute — the full block context is
+        reachable ONLY through the returned ``TerminalReport``."""
+        from shared.cli_invoke import AllAccountsCappedException
+
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        async def raise_cap_exc(*args, **kwargs):
+            raise AllAccountsCappedException(
+                retries=3, elapsed_secs=120.0, label='Task 42 [architect]',
+            )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', raise_cap_exc)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert not hasattr(workflow, '_last_block_reason')
+        assert not hasattr(workflow, '_last_block_detail')
+        assert not hasattr(workflow, '_last_block_phase')
+        # Full block context still reachable via the returned report alone.
+        assert report.reason.lower().startswith('all accounts capped')
+        assert report.detail
+        assert report.phase == workflow.machine.state
