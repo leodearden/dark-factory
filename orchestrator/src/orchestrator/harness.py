@@ -27,6 +27,13 @@ from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.background_service import (
+    BackgroundService,
+    BackoffPolicy,
+    DEFAULT_BACKOFF_SECS,
+    LifecycleRegistry,
+    ManagedService,
+)
 from orchestrator.config import (
     TASK_META_DIRNAME,
     OrchestratorConfig,
@@ -186,6 +193,32 @@ _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
 # tight-spin on a pass that fails immediately, even if the configured interval
 # is non-numeric (task 1907).
 _BG_LOOP_FAILURE_BACKOFF_SECS: float = 60.0
+
+# LifecycleRegistry stop-bound constants (task 2241, W10-η — PRD §5.3 LR-2).
+# No prior code bounded these stops at all: every existing _stop_* simply
+# awaited cancellation unconditionally, which is exactly the unbounded-hang
+# shape this task exists to make structurally impossible.  These are
+# therefore deliberately generous new bounds, not a retuning of any existing
+# knob (Open-Q Q5 parity concerns only intervals/backoff, which are carried
+# verbatim into each BackgroundService registration below).
+#
+# _LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS bounds the seven BackgroundService
+# sweeps, whose pass_fns are lightweight/cooperative and cancel almost
+# instantly.  _LIFECYCLE_SERVICE_STOP_TIMEOUT_SECS bounds the four bespoke
+# ManagedService adapters, whose teardown can involve more (aiohttp server
+# shutdown, a worker's own internal drain, subprocess supervision) — merge
+# worker's SpeculativeMergeWorker.stop() already self-bounds at 5s
+# internally, so 15s leaves headroom above that.
+_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS: float = 10.0
+_LIFECYCLE_SERVICE_STOP_TIMEOUT_SECS: float = 15.0
+
+# Bounded-failure-log cap shared by every migrated BackgroundService sweep
+# (task 1907's bounded-logging discipline is now a BackgroundService
+# property — see background_service.py).  Three of the seven sweeps
+# (orphan-l0-reaper, terminal-status-watcher, stranded-reconcile) previously
+# logged via unbounded logger.exception on every failure; this is the new,
+# uniform cap all seven share.
+_BG_LOOP_MAX_FAILURE_LOGS: int = 5
 
 # agent_role values eligible for Source-B re-validation (deterministic-recon-sweep,
 # task 2074): the runner's own sentinel role for deploy infra_issue escalations,
@@ -912,7 +945,17 @@ class Harness:
         self._escalation_queue: EscalationQueue | None = None
         self._escalation_events: dict[str, asyncio.Event] = {}
         self._escalation_task: asyncio.Task | None = None
-        self._orphan_reaper_task: asyncio.Task | None = None
+
+        # Unified lifecycle seam (task 2241, W10-η — PRD §5.3 LR-1/2/3):
+        # the eleven background-loop/service lifecycles below register into
+        # ONE ordered LifecycleRegistry instead of eleven hand-rolled
+        # _start_*/_stop_*/_*_loop triplets.  None until
+        # _build_lifecycle_registry() first runs (lazily, at the top of
+        # run() — idempotent, so a test may pre-build + monkeypatch it
+        # before driving run()).  A None _lifecycle is a safe no-op for the
+        # finally-block's stop_all() guard if run() raises before startup
+        # ever reaches it.
+        self._lifecycle: LifecycleRegistry | None = None
         # Fire-and-forget async tasks (strong refs prevent GC mid-flight).
         # Mirrors the active-set + add_done_callback(discard) idiom at line ~856.
         self._background_tasks: set[asyncio.Task] = set()
@@ -959,13 +1002,6 @@ class Harness:
         # soft→hard cancel threshold (config.terminal_status_hard_cancel_polls).
         self._terminal_cancel_counts: dict[str, int] = {}
 
-        # Background poll: periodically check fused-memory for active tasks
-        # whose status has flipped to terminal out-of-band (typically a human
-        # marking a task done via /unblock).  When detected, set the cancel
-        # event so the workflow exits cleanly without churning escalations.
-        # See zombie-escalation fix Step 5.
-        self._terminal_status_watcher_task: asyncio.Task | None = None
-
         # Escalation-watcher-auto subprocess supervisor (task 1326).
         # Keeps a fresh escalation-watcher-auto agent alive via invoke_with_cap_retry
         # across multi-day AFK windows with rotation, exponential backoff, and a
@@ -980,17 +1016,6 @@ class Harness:
         # ('watcher_misconfigured' vs 'watcher_crashloop') is unambiguous.
         self._watcher_degenerate_clean_exits: deque[float] = deque()
 
-        # Background sweep: periodic re-run of the startup
-        # ``_reconcile_stranded_in_progress`` pass during a long run, so
-        # tasks stranded by transient backend failures get unstrandred
-        # without waiting for the next orchestrator restart.  See Fix 4.
-        self._stranded_reconcile_task: asyncio.Task | None = None
-
-        # Main-tip integrity sweep — task 1832.
-        # Periodic full-suite sweep of the current main tip in a throwaway
-        # detached worktree; escalates L1 on drift.  Completely off the merge
-        # hot-path (per-merge latency untouched).
-        self._main_tip_sweep_task: asyncio.Task | None = None
         # Last main SHA successfully swept; used to skip the expensive full
         # verify when main has not advanced since the previous pass.
         self._last_swept_main_sha: str | None = None
@@ -1000,7 +1025,6 @@ class Harness:
         # BLOCKED by a past occurrence (task 2059) and re-validation of
         # already-open deterministic-deploy escalations against live systemd
         # unit state.  See harness.py's deterministic-recon-sweep section.
-        self._deterministic_recon_sweep_task: asyncio.Task | None = None
         # Injectable unit-inspector seam (mirrors DeterministicRunner's
         # constructor-injected unit_inspector); None uses the module-level
         # default _recon_inspect_unit.  Injected in tests to avoid real systemd.
@@ -1015,17 +1039,9 @@ class Harness:
             window_samples=config.no_landings_breaker_window_samples,
             disk_free_floor_bytes=config.no_landings_breaker_disk_free_floor_bytes,
         )
-        self._no_landings_breaker_task: asyncio.Task | None = None
         # One-shot flag: log a WARNING if disk_free_floor_bytes exceeds the
         # volume's total capacity (making disk-recovery auto-resume unreachable).
         self._no_landings_floor_capacity_warned: bool = False
-
-        # Warm-lane auto-GC cadence loop — task 1926.
-        # Periodic unconditional invocation of git_ops._run_warm_lane_gc_reclaim()
-        # to bound FREE _lane-*/_spec-* target/ re-accretion independent of
-        # acquire traffic or pool exhaustion.  Mirrors the no-landings-breaker
-        # task field.
-        self._warm_lane_gc_task: asyncio.Task | None = None
 
         # Per-task consecutive-failure counter for the reconcile sweep —
         # cleared on any successful mark_done, used to gate L1 escalation.
