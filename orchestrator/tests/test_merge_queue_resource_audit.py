@@ -508,11 +508,14 @@ class TestFinalizeHeadSpeculativeAccounting:
         permit and contributes 0 — else the ledger-only invariant would be
         broken and could mask a genuine imbalance.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
-        worker._finalizing_head = self._make_finalizing_entry(tmp_path, speculative=False)
+        worker._register_item(
+            self._make_finalizing_entry(tmp_path, speculative=False),
+            initial=ItemLifecycleState.FINALIZING,
+        )
 
         assert worker._inflight_speculative_count() == 0
         assert worker.speculation_accounting_violations() == []
@@ -615,11 +618,14 @@ class TestDispatchGapSpeculativeAccounting:
         contributes 0 — else the ledger-only invariant would be broken and
         could mask a genuine imbalance.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
-        worker._dispatching_item = _make_spec_item(tmp_path, speculative=False)  # type: ignore[attr-defined]
+        worker._register_item(
+            _make_spec_item(tmp_path, speculative=False),
+            initial=ItemLifecycleState.DISPATCHING,
+        )
 
         assert worker._inflight_speculative_count() == 0
         assert worker.speculation_accounting_violations() == []

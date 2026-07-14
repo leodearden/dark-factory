@@ -367,9 +367,10 @@ class TestMergerDrainRegistersAndTransitions:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """``_live_items`` must hold the MergeRequest, and the registry must
-        read MERGING, WHILE the still-present ``_inflight_req`` transient
-        field is set to that same request — the two must agree during the
-        additive (fields-kept) phase of this task.
+        read MERGING, throughout the dequeue-time merge window (task 2169
+        step-3; task 2435 kappa-b dropped the former field-vs-registry
+        agreement check now that the transient ``_inflight_req`` field is
+        gone — the registry is the sole source of truth).
         """
         from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
 
@@ -380,23 +381,26 @@ class TestMergerDrainRegistersAndTransitions:
         worker = SpeculativeMergeWorker(git_ops, queue)
         req = _make_request('kappa-merging', 'kappa-merging', wt, config)
 
-        captured: list[tuple[Any, Any, bool]] = []
+        captured: list[tuple[Any, Any]] = []
         original_get_main_sha = git_ops.get_main_sha
         fired = False
 
         async def _spying_get_main_sha() -> str:
             nonlocal fired
-            # Gate on worker._inflight_req (mirrors
+            # Gate on the registry (task 2435 kappa-b: formerly
+            # worker._inflight_req is not None — mirrors
             # test_merge_queue.py::test_merger_exception_resolves_inflight_future's
             # fault-injection rationale): recompute_suffix_conflict_graph()
-            # also calls get_main_sha() before dequeue, when _inflight_req
-            # is still None — skip those, and fire only once.
-            if worker._inflight_req is not None and not fired:
+            # also calls get_main_sha() before dequeue, when the registry is
+            # not yet at MERGING — skip those, and fire only once.
+            if (
+                worker._lifecycle.current(req.request_id) == ItemLifecycleState.MERGING
+                and not fired
+            ):
                 fired = True
                 captured.append((
                     worker._lifecycle.current(req.request_id),
                     worker._live_items.get(req.request_id),
-                    worker._inflight_req is req,
                 ))
             return await original_get_main_sha()
 
@@ -410,11 +414,10 @@ class TestMergerDrainRegistersAndTransitions:
             outcome = await asyncio.wait_for(req.result, timeout=60)
             assert outcome.status == 'done', f'{outcome}'
 
-        assert fired, 'expected the get_main_sha gate to fire while _inflight_req was set'
-        observed_state, observed_live_obj, inflight_matches = captured[0]
+        assert fired, 'expected the get_main_sha gate to fire while the registry read MERGING'
+        observed_state, observed_live_obj = captured[0]
         assert observed_state == ItemLifecycleState.MERGING
         assert observed_live_obj is req
-        assert inflight_matches is True
 
         await worker.stop()
         await worker_task
@@ -760,9 +763,10 @@ class TestVerifierDispatchFillRegistersDispatching:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """``_live_items`` must hold the SpeculativeItem, and the registry
-        must read DISPATCHING, WHILE the still-present ``_dispatching_item``
-        transient field is set to that same item — the two must agree
-        during the additive (fields-kept) phase of this task.
+        must read DISPATCHING, throughout the dispatch window (task 2169
+        step-7; task 2435 kappa-b dropped the former field-vs-registry
+        agreement check now that the transient ``_dispatching_item`` field
+        is gone — the registry is the sole source of truth).
         """
         from orchestrator.merge_queue import (
             ItemLifecycleState,
@@ -779,18 +783,22 @@ class TestVerifierDispatchFillRegistersDispatching:
             'kappa-dispatching-window', 'kappa-dispatching-window', wt, config,
         )
 
-        captured: list[tuple[Any, Any, bool]] = []
+        captured: list[tuple[Any, Any]] = []
         original_get_main_sha = git_ops.get_main_sha
         fired = False
 
         async def _spying_get_main_sha() -> str:
             nonlocal fired
-            if worker._dispatching_item is not None and not fired:
+            # Gate on the registry (task 2435 kappa-b: formerly
+            # worker._dispatching_item is not None).
+            if (
+                worker._lifecycle.current(req.request_id) == ItemLifecycleState.DISPATCHING
+                and not fired
+            ):
                 fired = True
                 captured.append((
                     worker._lifecycle.current(req.request_id),
                     worker._live_items.get(req.request_id),
-                    worker._dispatching_item is worker._live_items.get(req.request_id),
                 ))
             return await original_get_main_sha()
 
@@ -804,11 +812,10 @@ class TestVerifierDispatchFillRegistersDispatching:
             outcome = await asyncio.wait_for(req.result, timeout=60)
             assert outcome.status == 'done', f'{outcome}'
 
-        assert fired, 'expected the get_main_sha gate to fire while _dispatching_item was set'
-        observed_state, observed_live_obj, matches = captured[0]
+        assert fired, 'expected the get_main_sha gate to fire while the registry read DISPATCHING'
+        observed_state, observed_live_obj = captured[0]
         assert observed_state == ItemLifecycleState.DISPATCHING
         assert isinstance(observed_live_obj, RealMergeItem)
-        assert matches is True
 
         await worker.stop()
         await worker_task
@@ -1091,9 +1098,10 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """``_live_items`` must hold the InflightEntry, and the registry must
-        read FINALIZING, WHILE the still-present ``_finalizing_head``
-        transient field is set to that same entry — the two must agree
-        during the additive (fields-kept) phase of this task.
+        read FINALIZING, throughout the finalize window (task 2169 step-9;
+        task 2435 kappa-b dropped the former field-vs-registry agreement
+        check now that the transient ``_finalizing_head`` field is gone —
+        the registry is the sole source of truth).
 
         Mirrors test_merge_queue.py::TestEntryPhaseDuringFinalize's direct
         ``_finalize_inflight()`` drive (compat-shim entry, verify_task=None,
@@ -1135,14 +1143,13 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             merge_wt=item.merge_wt, was_speculative=False,
         )
 
-        captured: list[tuple[Any, Any, bool]] = []
+        captured: list[tuple[Any, Any]] = []
         original_advance = git_ops.advance_main
 
         async def _capturing_advance(*args: Any, **kwargs: Any) -> Any:
             captured.append((
                 worker._lifecycle.current(req.request_id),
                 worker._live_items.get(req.request_id),
-                worker._finalizing_head is worker._live_items.get(req.request_id),
             ))
             return await original_advance(*args, **kwargs)
 
@@ -1155,12 +1162,11 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
 
         assert advanced is True, f'Expected True (advanced); got: {advanced}'
         assert len(captured) >= 1, 'advance_main must have been called at least once'
-        observed_state, observed_live_obj, matches = captured[0]
+        observed_state, observed_live_obj = captured[0]
         assert observed_state == ItemLifecycleState.FINALIZING, (
             f'expected the registry to read FINALIZING while advance_main ran: {observed_state!r}'
         )
         assert observed_live_obj is entry
-        assert matches is True, '_finalizing_head and _live_items must agree during the window'
 
         assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.TERMINAL
         assert req.request_id not in worker._live_items
@@ -1765,12 +1771,13 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
     boundary asymmetry (an undrained raw-``_queue`` item would legitimately
     show up in snapshot() before it is registered).
 
-    The DISPATCHING window is the one EXCEPTION: ``_dispatching_item`` is
+    The DISPATCHING window WAS the one exception: ``_dispatching_item`` was
     documented as census-only, deliberately absent from
-    ``snapshot()['entries']`` (task 2068) — a pre-existing gap outside
-    kappa step-11/12's scope, closed as a side effect of steps 13-14
-    repointing snapshot() onto the registry. That sample asserts the
-    (weaker, currently-true) superset relationship instead of equality.
+    ``snapshot()['entries']`` (task 2068) — a pre-existing gap outside kappa
+    step-11/12's scope. Task 2435 (kappa-b) closes it by repointing
+    snapshot()'s registry-sourced entry loop to surface DISPATCHING, so the
+    DISPATCHING sample below now asserts equality too, exactly like every
+    other sampling point in this class.
     """
 
     async def test_agreement_at_merging_window(
@@ -1791,7 +1798,12 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
 
         async def _spying_get_main_sha() -> str:
             nonlocal fired
-            if worker._inflight_req is not None and not fired:
+            # Gate on the registry (task 2435 kappa-b: formerly
+            # worker._inflight_req is not None).
+            if (
+                worker._lifecycle.current(req.request_id) == ItemLifecycleState.MERGING
+                and not fired
+            ):
                 fired = True
                 snap_ids = {e['request_id'] for e in worker.snapshot()['entries']}
                 registry_ids = {
@@ -1822,20 +1834,16 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
         await worker.stop()
         await worker_task
 
-    async def test_dispatching_window_registry_is_a_strict_superset_of_snapshot(
+    async def test_dispatching_window_registry_equals_snapshot(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """The DISPATCHING window is a KNOWN, pre-existing exception to the
-        equal-sets rule proven by the other sampling points: ``_dispatching_item``
-        is census-only and deliberately NOT surfaced in ``snapshot()['entries']``
-        (task 2068), so a plain equality assertion here would fail for a
-        reason kappa's step-11/12 does not (and is not scoped to) fix — that
-        gap closes as a side effect of steps 13-14 repointing snapshot()
-        onto the registry directly. Until then, the registry must still see
-        the item (it is the STRICTLY MORE COMPLETE source) while snapshot()
-        stays blind to it — proven here as an explicit regression guard
-        instead of silently relying on an equality assertion that cannot
-        hold yet.
+        """The DISPATCHING window now agrees exactly between the registry and
+        snapshot() (task 2435 kappa-b): snapshot()'s registry-sourced entry
+        loop now surfaces DISPATCHING directly, closing the task-2068 census
+        gap that used to make this sampling point a strict-superset
+        exception. Mirrors the equality idiom already used by
+        ``test_agreement_at_merging_window``/``test_agreement_at_finalizing_window``
+        above.
         """
         from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
 
@@ -1854,7 +1862,12 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
 
         async def _spying_get_main_sha() -> str:
             nonlocal fired
-            if worker._dispatching_item is not None and not fired:
+            # Gate on the registry (task 2435 kappa-b: formerly
+            # worker._dispatching_item is not None).
+            if (
+                worker._lifecycle.current(req.request_id) == ItemLifecycleState.DISPATCHING
+                and not fired
+            ):
                 fired = True
                 snap_ids = {e['request_id'] for e in worker.snapshot()['entries']}
                 registry_ids = {
@@ -1876,16 +1889,11 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
 
         assert fired, 'expected the get_main_sha gate to fire while DISPATCHING'
         snap_ids, registry_ids = captured[0]
-        assert req.request_id in registry_ids, (
-            'the registry must see the item while DISPATCHING even though '
-            'snapshot() (task 2068) does not'
+        assert req.request_id in registry_ids
+        assert snap_ids == registry_ids, (
+            f'registry/snapshot disagree at DISPATCHING sample: '
+            f'snapshot only={snap_ids - registry_ids}, registry only={registry_ids - snap_ids}'
         )
-        assert req.request_id not in snap_ids, (
-            'snapshot() unexpectedly surfaced a DISPATCHING entry — if task '
-            '2068 was fixed independently, tighten this to an equality '
-            'assertion like the MERGING/FINALIZING sampling points'
-        )
-        assert registry_ids - snap_ids == {req.request_id}
 
         await worker.stop()
         await worker_task

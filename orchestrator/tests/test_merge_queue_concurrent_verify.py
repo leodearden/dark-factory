@@ -4803,7 +4803,11 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
     async def test_speculation_accounting_clean_throughout_speculative_finalize_head_await(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult
+        from orchestrator.merge_queue import (
+            InflightEntry,
+            InflightVerifyResult,
+            ItemLifecycleState,
+        )
         from orchestrator.verify_runner import HostLease
 
         gate = asyncio.Event()
@@ -4853,13 +4857,21 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
             permit=await worker._speculation_ledger.acquire(),
         )
 
+        # Register at VERIFYING before invoking _finalize_inflight directly —
+        # mirrors what the real _inflight_append chokepoint already does before
+        # any entry reaches _finalize_inflight in production (task 2435
+        # kappa-b: the finalize-head is now derived from _live_items via
+        # _finalizing_head_entry(), not the deleted _finalizing_head field, so
+        # the entry must be tracked in the registry to be discoverable).
+        worker._register_item(entry, initial=ItemLifecycleState.VERIFYING)
+
         # Launch _finalize_inflight; it will pause at `await entry.verify_task`.
         fin = asyncio.ensure_future(worker._finalize_inflight(entry))
         await asyncio.sleep(0)  # yield to let _finalize_inflight reach the await
 
-        assert worker._finalizing_head is entry, (  # type: ignore[attr-defined]
-            f'Expected worker._finalizing_head is entry after yield; '
-            f'got {worker._finalizing_head!r}.'
+        assert worker._finalizing_head_entry() is entry, (
+            f'Expected worker._finalizing_head_entry() is entry after yield; '
+            f'got {worker._finalizing_head_entry()!r}.'
         )
 
         violations_mid_await = worker.speculation_accounting_violations()
@@ -4880,9 +4892,9 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
         gate.set()
         await fin
 
-        assert worker._finalizing_head is None, (  # type: ignore[attr-defined]
-            f'Expected worker._finalizing_head is None after _finalize_inflight; '
-            f'got {worker._finalizing_head!r}.'
+        assert worker._finalizing_head_entry() is None, (
+            f'Expected worker._finalizing_head_entry() is None after _finalize_inflight; '
+            f'got {worker._finalizing_head_entry()!r}.'
         )
         assert req.result.done(), 'Expected req.result to be resolved after FAIL path.'
         assert worker.speculation_accounting_violations() == [], (

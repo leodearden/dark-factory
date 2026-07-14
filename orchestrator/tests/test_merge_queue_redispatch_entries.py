@@ -15,6 +15,13 @@ this closes the matching entries-visibility gap.
 FIX: snapshot() gains a new section (1c) iterating self._redispatch,
 mirroring the existing _remerging_item transient-window entry, emitting a
 'state': 'awaiting_host' entry per parked item.
+
+Stale-field note (task 2435 kappa-b): _finalizing_head, _remerging_item, and
+_inflight_req above are historical — describing what snapshot()['entries']
+read from when this file's tests were written. All four transient side-fields
+are since deleted; snapshot() now derives the same windows directly from the
+ItemLifecycle registry (see merge_queue.py's _REGISTRY_STATE_TO_WIRE /
+_finalizing_head_entry() / _resolve_merging_requests()).
 """
 
 from __future__ import annotations

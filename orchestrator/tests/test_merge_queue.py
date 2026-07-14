@@ -3255,11 +3255,14 @@ class TestSpeculativeMergeWorker:
         log, never raise into the loop body).  A plain "raise on the first call"
         fault is therefore swallowed there and never reaches the merger-loop body
         that this test means to exercise.  We instead fault get_main_sha ONLY when an
-        in-flight request is set (worker._inflight_req is not None) — i.e. when called
-        from the loop body at the merge step (merge_queue.py:8271), after
-        _inflight_req=req is set (:8243) but before the SpeculativeItem is enqueued —
-        which is exactly the regression point.
+        in-flight request is set (a registry entry at ItemLifecycleState.MERGING —
+        formerly worker._inflight_req is not None, task 2435 kappa-b) — i.e. when
+        called from the loop body at the merge step, after the dequeue-time
+        MERGING transition but before the SpeculativeItem is enqueued — which is
+        exactly the regression point.
         """
+        from orchestrator.merge_queue import ItemLifecycleState
+
         wt_n = await _make_branch_with_file(
             git_ops, 'mef-n', 'file_mef_n.py', 'n = 1\n',
         )
@@ -3271,16 +3274,24 @@ class TestSpeculativeMergeWorker:
         worker = SpeculativeMergeWorker(git_ops, queue)
         worker_task = asyncio.create_task(worker.run())
 
+        def _merger_has_inflight_request() -> bool:
+            """True while some registry entry is at MERGING (task 2435 kappa-b:
+            replaces the deleted worker._inflight_req is not None gate)."""
+            return any(
+                state == ItemLifecycleState.MERGING
+                for state in worker._lifecycle.non_terminal_items().values()
+            )
+
         # get_main_sha raises RuntimeError on the FIRST loop-body call (i.e. once an
-        # in-flight request is set), and succeeds otherwise.  Gating on
-        # worker._inflight_req keeps the fail-open recompute/bounce calls (which run
-        # before _inflight_req is set) from absorbing the fault.
+        # in-flight request is set), and succeeds otherwise.  Gating on the registry's
+        # MERGING state keeps the fail-open recompute/bounce calls (which run before
+        # the dequeue-time MERGING transition) from absorbing the fault.
         original_get_main_sha = git_ops.get_main_sha
         loop_body_fault_fired = False
 
         async def failing_get_main_sha():  # type: ignore[no-untyped-def]
             nonlocal loop_body_fault_fired
-            if worker._inflight_req is not None and not loop_body_fault_fired:
+            if _merger_has_inflight_request() and not loop_body_fault_fired:
                 loop_body_fault_fired = True
                 raise RuntimeError('Simulated get_main_sha failure')
             return await original_get_main_sha()
@@ -3380,10 +3391,12 @@ class TestSpeculativeMergeWorker:
         eventually resumes and pushes a SpeculativeItem, the verifier is gone —
         the caller's Future is never resolved.
 
-        With fix (step-35): after asyncio.wait() returns, stop() checks
-        self._inflight_req.  If set and Future not done, resolves it as 'blocked'.
-        The caller's Future is guaranteed to be resolved even if the merger was
-        mid-operation when stop() was called.
+        With fix (step-35): after asyncio.wait() returns, stop() scans the
+        registry (_live_items) for a MergeRequest still at ItemLifecycleState.MERGING
+        (task 2435 kappa-b: formerly a self._inflight_req field check). If found
+        and Future not done, resolves it as 'blocked'. The caller's Future is
+        guaranteed to be resolved even if the merger was mid-operation when
+        stop() was called.
 
         Covers review issue [race_condition_unresolved_future] at stop() ~line 350.
         """
@@ -3419,11 +3432,11 @@ class TestSpeculativeMergeWorker:
 
             # stop() will time out (asyncio.wait) since merger is blocked.
             # Without fix: req.result is NOT done after stop() returns.
-            # With fix: stop() checks _inflight_req and resolves it.
+            # With fix: stop() scans the registry for a MERGING entry and resolves it.
             await worker.stop()
 
         assert req.result.done(), (
-            'Future must be resolved by stop() via _inflight_req check, '
+            'Future must be resolved by stop() via the registry MERGING scan, '
             'even when merger was mid-operation'
         )
         assert req.result.result().status == 'blocked'
@@ -21883,12 +21896,21 @@ class TestSnapshotInflightCollection:
     async def test_snapshot_remerge_window_visible(
         self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps,
     ) -> None:
-        """Item being remerged appears in snapshot() as a 'remerging' entry.
+        """Item being remerged (registry MERGING, off every container) appears
+        in snapshot() as a 'merging' entry (task 2435 kappa-b: DD6 collapses
+        the historical 'remerging' wire-string into 'merging' now that the
+        entry is registry-sourced rather than field-sourced).
 
-        During the remerge window the item is popped from the queue but has not
-        yet been appended to _inflight.  Without _remerging_item it would be
-        invisible to all observability (suggestion 2 from amendment review).
+        During the dispatch-time remerge window the item is popped from
+        _redispatch/_verifier_queue but has not yet been appended to
+        _inflight — the registry (transitioned DISPATCHING -> MERGING by the
+        real call site, mq:11095) is the ONLY surviving source of truth for
+        this window now that _remerging_item is gone. Without a
+        registry-derived entry it would be invisible to all observability
+        (suggestion 2 from amendment review).
         """
+        from orchestrator.merge_queue import ItemLifecycleState
+
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
 
@@ -21896,25 +21918,74 @@ class TestSnapshotInflightCollection:
         wt.mkdir()
 
         req = _make_request('remerge-task', 'remerge-task', wt, config)
-        # Simulate the start of the remerge window: _inflight is empty, but
-        # _remerging_item is set (as _dispatch_item does before await _remerge).
-        worker._remerging_item = req
+        # Simulate the dispatch-time remerge window: the item is off every
+        # container, and the registry holds it at MERGING (mirrors the real
+        # _note_transition(..., DISPATCHING, MERGING, ...) call immediately
+        # preceding the dispatch-time remerge at mq:11095).
+        rid = worker._register_item(req, initial=ItemLifecycleState.MERGING)
 
         snap = worker.snapshot()
 
-        remerging = [e for e in snap['entries'] if e['state'] == 'remerging']
-        assert len(remerging) == 1, (
-            f'Expected 1 remerging entry; got: {remerging}'
+        merging = [e for e in snap['entries'] if e['state'] == 'merging']
+        assert len(merging) == 1, (
+            f'Expected 1 merging entry; got: {merging}'
         )
-        assert remerging[0]['task_id'] == 'remerge-task'
+        assert merging[0]['task_id'] == 'remerge-task'
 
-        # Clearing _remerging_item (as _dispatch_item does after _remerge returns)
-        # must remove the synthetic entry.
-        worker._remerging_item = None
+        # Retiring the item (as happens once the request's lifecycle resolves)
+        # must remove the registry-derived entry.
+        worker._retire_item(rid)
         snap2 = worker.snapshot()
-        remerging2 = [e for e in snap2['entries'] if e['state'] == 'remerging']
-        assert len(remerging2) == 0, (
-            f'remerging entry must vanish after _remerging_item cleared; got: {remerging2}'
+        merging2 = [e for e in snap2['entries'] if e['state'] == 'merging']
+        assert len(merging2) == 0, (
+            f'merging entry must vanish after _retire_item; got: {merging2}'
+        )
+
+    async def test_snapshot_dispatching_window_visible(
+        self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps,
+    ) -> None:
+        """A SpeculativeItem registered at DISPATCHING (off every container)
+        surfaces in snapshot() as a 'dispatching' entry (task 2435 kappa-b:
+        closes the task-2068 census gap).
+
+        DISPATCHING brackets `await self._dispatch_item(item)` (mq:9203-9214,
+        9571-9580) — the item is off _redispatch/_verifier_queue but not yet
+        appended to _inflight. Historically this window was covered only by
+        the census-only `_dispatching_item` field, which snapshot()'s
+        'entries' section never read (task 2068 gap). Now that DISPATCHING
+        is a registry state surfaced by the registry-sourced entry loop, the
+        gap is closed structurally.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+
+        req = _make_request('dispatch-task', 'dispatch-task', wt, config)
+        item = DecidedItem(
+            request=req,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
+            base_sha='abc123',
+            speculative=False,
+        )
+        rid = worker._register_item(item, initial=ItemLifecycleState.DISPATCHING)
+
+        snap = worker.snapshot()
+
+        dispatching = [e for e in snap['entries'] if e['state'] == 'dispatching']
+        assert len(dispatching) == 1, (
+            f'Expected 1 dispatching entry; got: {dispatching}'
+        )
+        assert dispatching[0]['task_id'] == 'dispatch-task'
+
+        worker._retire_item(rid)
+        snap2 = worker.snapshot()
+        dispatching2 = [e for e in snap2['entries'] if e['state'] == 'dispatching']
+        assert len(dispatching2) == 0, (
+            f'dispatching entry must vanish after _retire_item; got: {dispatching2}'
         )
 
     async def test_snapshot_uniform_entry_schema(
