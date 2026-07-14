@@ -10999,13 +10999,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 speculative=item.speculative,
             ))
             # task 2420 (DEFECT 1, split from 2357; extends #1728): no-progress
-            # budget seed.  LOCAL-only — a REMOTE lease's verify runs on the
-            # remote host and writes nothing to this local merge_wt, so a
-            # content-mtime budget would false-abort a healthy remote verify
-            # (remote verify-hang is task 2362's ssh-keepalive territory, not
-            # this trigger's).  newest_content_mtime never stats merge_wt's
-            # own root inode, so the #1728 alpha owner-heartbeat's
-            # os.utime(merge_wt) can never mask a dead verify here.
+            # budget seed.  Content-mtime is LOCAL-only — a REMOTE lease's
+            # verify runs on the remote host and writes nothing to this local
+            # merge_wt, so a content-mtime budget would be blind to remote
+            # progress.  task 2566 covers the REMOTE case instead via
+            # RemoteRunner.dispatch_in_flight, branched in the poll loop
+            # below (Abort trigger 3).  newest_content_mtime never stats
+            # merge_wt's own root inode, so the #1728 alpha owner-heartbeat's
+            # os.utime(merge_wt) can never mask a dead LOCAL verify here.
             _last_content_mtime = newest_content_mtime(merge_wt) if lease.is_local else None
             # task 2420 amend (reviewer finding, robustness): time.monotonic(),
             # not time.time(), for _last_progress_at/_last_probe_at/_now below
@@ -11098,19 +11099,34 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         merge_wt=None,
                         status=InflightStatus.REQUEUED,
                     )
-                # Abort trigger 3 — LOCAL-only no in-flight verify progress
-                # budget (task 2420 DEFECT 1, split from 2357; extends
-                # #1728): terminate a deterministically dead/hung LOCAL
-                # verify and RE-QUEUE, mirroring the operator-halt branch
-                # above.  Checked last so abandon/halt precedence (triggers
-                # 1/2) is preserved when they land on the same poll.  Gated
-                # on lease.is_local — a REMOTE lease is never
-                # progress-aborted (scope fence: task 2362 owns remote
-                # verify-hang detection via ssh keepalive).  Content
-                # progress under merge_wt resets the clock, so a genuinely
-                # long-running healthy cold verify is never false-killed.
+                # Abort trigger 3 — no in-flight verify progress budget
+                # (task 2420 DEFECT 1, split from 2357; extends #1728;
+                # un-gated to cover REMOTE leases by task 2566, closing the
+                # latent 7200s-coast gap): terminate a deterministically
+                # dead/hung verify and RE-QUEUE, mirroring the operator-halt
+                # branch above.  Checked last so abandon/halt precedence
+                # (triggers 1/2) is preserved when they land on the same
+                # poll.
+                #
+                # PROGRESS signal is branched by lease type:
+                #   LOCAL  — content progress under merge_wt (throttled by
+                #            _progress_probe_secs) resets the clock, so a
+                #            genuinely long-running healthy cold verify is
+                #            never false-killed.
+                #   REMOTE — RemoteRunner.dispatch_in_flight (task 2566):
+                #            a live ssh dispatch is progress (its death is
+                #            owned by task 2362's ssh keepalive, never
+                #            touched here) and resets the clock every poll;
+                #            once the dispatch has returned (or never
+                #            started) while the lease is still held, the
+                #            clock is left running so this trigger can
+                #            resolve a coasting lease — e.g. the ssh child
+                #            already exited, or a post-dispatch probe hangs
+                #            (reify-5067). getattr(..., True) fails safe: a
+                #            runner not exposing the property is treated as
+                #            live and never progress-aborted.
+                _now = time.monotonic()
                 if lease.is_local:
-                    _now = time.monotonic()
                     if _now - _last_probe_at >= _progress_probe_secs:
                         _last_probe_at = _now
                         _cur_content_mtime = newest_content_mtime(merge_wt)
@@ -11120,66 +11136,68 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         ):
                             _last_content_mtime = _cur_content_mtime
                             _last_progress_at = _now
-                    _no_progress_secs = _now - _last_progress_at
-                    if _no_progress_secs >= self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:
-                        # Busy-loop guard (task 2420): count CONSECUTIVE
-                        # no-progress aborts per task_id.  Once the count
-                        # reaches MAX_INFLIGHT_DEAD_VERIFY_ABORTS, stop
-                        # re-queuing and resolve terminally instead —
-                        # converting a deterministically-hanging verify into
-                        # a loud 'blocked' escalation rather than an
-                        # unbounded churn of the same dead slot.  Cleared on
-                        # a successful verify for this task (see the `out is
-                        # None` pass path below).
-                        _dead_abort_n = self._inflight_dead_verify_aborts.get(req.task_id, 0) + 1
-                        self._inflight_dead_verify_aborts[req.task_id] = _dead_abort_n
-                        _busy_loop_capped = _dead_abort_n >= self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS
-                        logger.warning(
-                            'Task %s: no in-flight verify progress for %.0fs '
-                            '(budget=%.0fs) — %s (%d/%d consecutive dead aborts)',
-                            req.task_id,
-                            _no_progress_secs,
-                            self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS,
-                            'abandoning without re-queue' if _busy_loop_capped
-                            else 'aborting and re-queuing merge for re-verify',
-                            _dead_abort_n,
-                            self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS,
+                elif getattr(lease.runner, 'dispatch_in_flight', True):
+                    _last_progress_at = _now
+                _no_progress_secs = _now - _last_progress_at
+                if _no_progress_secs >= self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:
+                    # Busy-loop guard (task 2420): count CONSECUTIVE
+                    # no-progress aborts per task_id.  Once the count
+                    # reaches MAX_INFLIGHT_DEAD_VERIFY_ABORTS, stop
+                    # re-queuing and resolve terminally instead —
+                    # converting a deterministically-hanging verify into
+                    # a loud 'blocked' escalation rather than an
+                    # unbounded churn of the same dead slot.  Cleared on
+                    # a successful verify for this task (see the `out is
+                    # None` pass path below).
+                    _dead_abort_n = self._inflight_dead_verify_aborts.get(req.task_id, 0) + 1
+                    self._inflight_dead_verify_aborts[req.task_id] = _dead_abort_n
+                    _busy_loop_capped = _dead_abort_n >= self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS
+                    logger.warning(
+                        'Task %s: no in-flight verify progress for %.0fs '
+                        '(budget=%.0fs) — %s (%d/%d consecutive dead aborts)',
+                        req.task_id,
+                        _no_progress_secs,
+                        self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS,
+                        'abandoning without re-queue' if _busy_loop_capped
+                        else 'aborting and re-queuing merge for re-verify',
+                        _dead_abort_n,
+                        self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS,
+                    )
+                    await self._abort_remote_verify(lease, req.task_id)
+                    verify_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await verify_task
+                    await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+                    if _busy_loop_capped:
+                        # task 2420 amend (reviewer finding #2): the
+                        # counter has served its purpose once the
+                        # request resolves terminally — pop it so a
+                        # later re-submission/re-dispatch of this SAME
+                        # task_id (e.g. after an operator resolves the
+                        # 'blocked' outcome) gets a fresh dead-verify
+                        # budget instead of immediately re-tripping the
+                        # cap on its very first abort. Also bounds the
+                        # dict to live/in-flight task_ids instead of
+                        # growing unboundedly for permanently-blocked
+                        # tasks.
+                        self._inflight_dead_verify_aborts.pop(req.task_id, None)
+                        err_outcome = MergeOutcome(
+                            'blocked',
+                            reason=(
+                                'repeated dead/hung in-flight verify (no '
+                                f'progress for budget) x{_dead_abort_n}'
+                            ),
                         )
-                        await self._abort_remote_verify(lease, req.task_id)
-                        verify_task.cancel()
-                        with contextlib.suppress(BaseException):
-                            await verify_task
-                        await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
-                        if _busy_loop_capped:
-                            # task 2420 amend (reviewer finding #2): the
-                            # counter has served its purpose once the
-                            # request resolves terminally — pop it so a
-                            # later re-submission/re-dispatch of this SAME
-                            # task_id (e.g. after an operator resolves the
-                            # 'blocked' outcome) gets a fresh dead-verify
-                            # budget instead of immediately re-tripping the
-                            # cap on its very first abort. Also bounds the
-                            # dict to live/in-flight task_ids instead of
-                            # growing unboundedly for permanently-blocked
-                            # tasks.
-                            self._inflight_dead_verify_aborts.pop(req.task_id, None)
-                            err_outcome = MergeOutcome(
-                                'blocked',
-                                reason=(
-                                    'repeated dead/hung in-flight verify (no '
-                                    f'progress for budget) x{_dead_abort_n}'
-                                ),
-                            )
-                            if not req.result.done():
-                                req.result.set_result(err_outcome)
-                            return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
-                        self._queue.put_nowait(req)
-                        self._request_ledger.on_requeued(req.request_id)
-                        return InflightVerifyResult(
-                            outcome=None,
-                            merge_wt=None,
-                            status=InflightStatus.REQUEUED,
-                        )
+                        if not req.result.done():
+                            req.result.set_result(err_outcome)
+                        return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
+                    self._queue.put_nowait(req)
+                    self._request_ledger.on_requeued(req.request_id)
+                    return InflightVerifyResult(
+                        outcome=None,
+                        merge_wt=None,
+                        status=InflightStatus.REQUEUED,
+                    )
         except RunnerUnavailable as exc:
             # Remote transport failure: do NOT clean merge_wt — the item will
             # be re-dispatched on a free host (local fallback) with its worktree
