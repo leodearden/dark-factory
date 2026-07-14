@@ -58,6 +58,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+import shutil
 import subprocess
 from enum import StrEnum
 from pathlib import Path
@@ -254,6 +255,11 @@ class TestVerifyCmdRoundTrip:
         assert shlex.split(render(cmd)) == shlex.split(raw)
 
     # ── scenario 1b / Row 1: producer<->runner scoped-pytest drive ──────────
+    @pytest.mark.skipif(
+        shutil.which('uv') is None,
+        reason='requires uv on PATH (and a synced orchestrator venv) to exec the real scoped pytest command',
+    )
+    @pytest.mark.slow  # heavyweight: real `uv run ... pytest` subprocess; deselect with -m "not slow"
     def test_scoped_pytest_producer_and_runner_agree_on_scope(self, tmp_path):
         """scope_to's structured output (producer) IS what render+exec (runner) runs.
 
@@ -263,6 +269,21 @@ class TestVerifyCmdRoundTrip:
         root with an absolute probe path) and ACTUALLY EXECUTE it via
         `bash -c` — if the two sides disagreed on what "scoped" means, this
         would either fail to launch or collect more than the one scoped test.
+
+        This is the only scenario in the module that shells a real external
+        toolchain (uv + a synced orchestrator venv) instead of driving the
+        decision layer in-process, so it is environment-coupled: marked
+        ``@pytest.mark.slow`` for deselection (``-m "not slow"``) and skipped
+        outright when `uv` isn't on PATH, rather than flaking a fast/offline
+        run. The in-process argv assertions above (scenario 1a) already prove
+        producer<->runner scope agreement and remain the always-run portion.
+        The `slow` marker is intentionally left unregistered in
+        orchestrator/pyproject.toml's `markers` list — that file is outside
+        this task's locked scope (orchestrator/tests/test_verify_plan_integration.py
+        only) — mirroring test_plan_tools_startup_load.py's identical
+        unregistered-marker precedent; today's addopts doesn't set
+        --strict-markers, so this only emits a PytestUnknownMarkWarning, not
+        a failure.
         """
         probe = tmp_path / 'test_verify_cmd_scope_probe.py'
         probe.write_text('def test_probe_passes():\n    assert True\n')
