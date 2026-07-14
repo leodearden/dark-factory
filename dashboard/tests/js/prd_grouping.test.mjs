@@ -16,8 +16,13 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 import grouping from '../../src/dashboard/static/redux/prd_grouping.js';
+// orderPrdGroups takes computeTiers as an injected parameter (see the plan's
+// design decisions) — the node suite imports it straight from graph_layout.js,
+// same as the browser injects window.DF_GRAPH_LAYOUT.computeTiers.
+import layout from '../../src/dashboard/static/redux/graph_layout.js';
 
-const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd } = grouping;
+const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = grouping;
+const { computeTiers } = layout;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/prd_grouping.js';
 const EXPECTED_FUNCTION_NAMES = [
@@ -25,6 +30,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'aggregatePrdStatus',
   'summarizePrdMembers',
   'groupTasksByPrd',
+  'orderPrdGroups',
 ];
 
 // Builds a minimal task fixture — only the fields prd_grouping.js's
@@ -232,4 +238,86 @@ test('groupTasksByPrd: all-null input yields a single flagged no-PRD group', () 
   assert.equal(groups.length, 1);
   assert.equal(groups[0].noPrd, true);
   assert.deepEqual(groups[0].tasks.map(t => t.id), ['A', 'B']);
+});
+
+// ---------------------------------------------------------------------------
+// orderPrdGroups — condenses cross-PRD dep edges into a PRD-level mini-DAG,
+// tiers it with the INJECTED computeTiers (a PRD consuming another PRD's
+// tasks sits below it), tiebreaks within a tier by activity
+// (blocked+in-progress count desc, then pending count desc), falls back to
+// stable insertion order, and always force-appends the "no PRD" group last.
+// ---------------------------------------------------------------------------
+
+test('orderPrdGroups: a cross-PRD dep tiers the upstream PRD before the downstream one, overriding insertion order', () => {
+  // B1 (prd B) depends on A1 (prd A) — B "consumes" A's task. B1 is listed
+  // FIRST in the input so groupTasksByPrd's first-seen order is [B, A];
+  // orderPrdGroups must still reorder to [A, B] via the mini-DAG tiering.
+  const tasks = [
+    mkTask('B1', { prd: 'B', deps: ['A1'] }),
+    mkTask('A1', { prd: 'A' }),
+  ];
+  const groups = groupTasksByPrd(tasks);
+  assert.deepEqual(groups.map(g => g.prd), ['B', 'A'], 'sanity: first-seen insertion order is B before A');
+
+  const ordered = orderPrdGroups(groups, computeTiers);
+  assert.deepEqual(ordered.map(g => g.prd), ['A', 'B']);
+});
+
+test('orderPrdGroups: within a tier, higher (blocked+in-progress) count sorts first', () => {
+  const tasks = [
+    mkTask('X1', { prd: 'X', status: 'pending' }),
+    mkTask('Y1', { prd: 'Y', status: 'blocked' }),
+    mkTask('Y2', { prd: 'Y', status: 'in-progress' }),
+  ];
+  const groups = groupTasksByPrd(tasks);
+  const ordered = orderPrdGroups(groups, computeTiers);
+  assert.deepEqual(ordered.map(g => g.prd), ['Y', 'X']);
+});
+
+test('orderPrdGroups: equal (blocked+in-progress), higher pending count sorts first as secondary tiebreak', () => {
+  const tasks = [
+    mkTask('P1', { prd: 'P', status: 'pending' }),
+    mkTask('Q1', { prd: 'Q', status: 'pending' }),
+    mkTask('Q2', { prd: 'Q', status: 'pending' }),
+  ];
+  const groups = groupTasksByPrd(tasks);
+  const ordered = orderPrdGroups(groups, computeTiers);
+  assert.deepEqual(ordered.map(g => g.prd), ['Q', 'P']);
+});
+
+test('orderPrdGroups: equal tier/activity/pending falls back to stable insertion order', () => {
+  const tasks = [
+    mkTask('M1', { prd: 'M', status: 'done' }),
+    mkTask('N1', { prd: 'N', status: 'done' }),
+  ];
+  const groups = groupTasksByPrd(tasks);
+  const ordered = orderPrdGroups(groups, computeTiers);
+  assert.deepEqual(ordered.map(g => g.prd), ['M', 'N']);
+});
+
+test('orderPrdGroups: the "no PRD" group is always last, regardless of tier/activity', () => {
+  // The no-PRD group's sole member is 'blocked' (maximal activity) and the
+  // other PRD's sole member is 'done' (minimal) — if noPrd were ordered like
+  // any other group it would sort FIRST; it must still come last.
+  const tasks = [
+    mkTask('Z1', { prd: null, status: 'blocked' }),
+    mkTask('W1', { prd: 'W', status: 'done' }),
+  ];
+  const groups = groupTasksByPrd(tasks);
+  const ordered = orderPrdGroups(groups, computeTiers);
+  assert.deepEqual(ordered.map(g => g.prd), ['W', null]);
+  assert.equal(ordered[ordered.length - 1].noPrd, true);
+});
+
+test('orderPrdGroups: deterministic across repeated calls on identical input', () => {
+  const tasks = [
+    mkTask('B1', { prd: 'B', deps: ['A1'] }),
+    mkTask('A1', { prd: 'A' }),
+    mkTask('N1', { prd: null }),
+  ];
+  const groups = groupTasksByPrd(tasks);
+  const first = orderPrdGroups(groups, computeTiers);
+  const second = orderPrdGroups(groups, computeTiers);
+  assert.deepEqual(first.map(g => g.prd), second.map(g => g.prd));
+  assert.deepEqual(first.map(g => g.prd), ['A', 'B', null]);
 });
