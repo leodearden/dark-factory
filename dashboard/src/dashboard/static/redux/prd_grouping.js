@@ -93,7 +93,68 @@ function groupTasksByPrd(tasks) {
   return groups;
 }
 
-const API = { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd };
+// Literal (not status-bucket) activity counts used only by orderPrdGroups'
+// tiebreak — deliberately narrower than summarizePrdMembers/aggregatePrdStatus:
+// 'merge-deferred' is NOT folded into blocked+in-progress here, and 'deferred'
+// is NOT folded into pending, per the plan's explicit wording.
+function prdActivity(tasks) {
+  let blockedOrInProgress = 0;
+  let pending = 0;
+  for (const t of tasks) {
+    if (t.status === 'blocked' || t.status === 'in-progress') blockedOrInProgress++;
+    else if (t.status === 'pending') pending++;
+  }
+  return { blockedOrInProgress, pending };
+}
+
+// ── Order PRD groups for box layout ──
+// Splits off the "no PRD" group (if any) before tiering, builds a
+// taskId->prd map across the remaining (non-null) groups, and synthesizes
+// one mini-DAG node per PRD whose deps are the OTHER prds any of its tasks
+// consume (a dep whose task isn't in any group — filtered out, or itself
+// null-prd — has no resolvable prd and is simply ignored, mirroring
+// graph_layout.js's "dep outside the known set" convention). The injected
+// computeTiers tiers that mini-DAG; groups are then sorted by
+// (tier asc, blocked+in-progress desc, pending desc, stable insertion index),
+// and the "no PRD" group (if present) is force-appended last regardless of
+// its own tasks' tier/activity.
+function orderPrdGroups(groups, computeTiers) {
+  const nonNullGroups = groups.filter(g => !g.noPrd);
+  const noPrdGroup = groups.find(g => g.noPrd);
+
+  const prdByTaskId = new Map();
+  for (const g of nonNullGroups) {
+    for (const t of g.tasks) prdByTaskId.set(t.id, g.prd);
+  }
+
+  const syntheticNodes = nonNullGroups.map(g => {
+    const upstream = new Set();
+    for (const t of g.tasks) {
+      for (const d of (t.deps || [])) {
+        const depPrd = prdByTaskId.get(d.id);
+        if (depPrd != null && depPrd !== g.prd) upstream.add(depPrd);
+      }
+    }
+    return { id: g.prd, deps: Array.from(upstream, id => ({ id })) };
+  });
+  const tiers = computeTiers(syntheticNodes);
+
+  const ordered = nonNullGroups
+    .map((g, index) => ({ g, index, tier: tiers.get(g.prd) || 0, activity: prdActivity(g.tasks) }))
+    .sort((a, b) => {
+      if (a.tier !== b.tier) return a.tier - b.tier;
+      if (a.activity.blockedOrInProgress !== b.activity.blockedOrInProgress) {
+        return b.activity.blockedOrInProgress - a.activity.blockedOrInProgress;
+      }
+      if (a.activity.pending !== b.activity.pending) return b.activity.pending - a.activity.pending;
+      return a.index - b.index; // stable insertion-order final tiebreak
+    })
+    .map(entry => entry.g);
+
+  return noPrdGroup ? [...ordered, noPrdGroup] : ordered;
+}
+
+const API = { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = API;
