@@ -20,6 +20,7 @@ import pytest
 SCRIPT = Path(__file__).parent.parent / "deploy" / "flip-reify-gate-exclude-heavy.sh"
 CONFIG_FILE = "orchestrator.yaml"
 KNOB = "REIFY_GATE_EXCLUDE_HEAVY"
+KNOB_RUN_ALL = "REIFY_RUN_ALL_EXCLUDE_HOST_INFRA"
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +144,11 @@ def _head_files(repo):
 # ---------------------------------------------------------------------------
 
 def test_apply_inserts_knob_and_commits(tmp_path):
-    """Default (no-arg) apply mode inserts the knob as the first child of
-    verify_env:, preserves the surrounding comments/children, commits the
-    change in the reify repo, and exits 0."""
+    """Default (no-arg) apply mode inserts BOTH consolidated knobs as the
+    first two children of verify_env: (last-applied knob lands first: GATE
+    is applied first, then RUN_ALL is inserted ahead of it), preserves the
+    surrounding comments/children, commits the change in the reify repo,
+    and exits 0."""
     repo = _make_fake_reify_repo(tmp_path)
     before_commits = _commit_count(repo)
 
@@ -158,12 +161,25 @@ def test_apply_inserts_knob_and_commits(tmp_path):
 
     lines = _read_config(repo).splitlines()
     verify_env_idx = lines.index("verify_env:")
-    assert lines[verify_env_idx + 1] == f'  {KNOB}: "1"', (
-        f"Expected the knob as the first child right after verify_env:; "
+    assert lines[verify_env_idx + 1] == f'  {KNOB_RUN_ALL}: "1"', (
+        f"Expected {KNOB_RUN_ALL} as the first child right after "
+        f"verify_env: (last-applied knob lands first); "
+        f"got: {lines[verify_env_idx:verify_env_idx + 3]!r}"
+    )
+    assert lines[verify_env_idx + 2] == f'  {KNOB}: "1"', (
+        f"Expected {KNOB} as the second child right after verify_env:; "
         f"got: {lines[verify_env_idx:verify_env_idx + 3]!r}"
     )
 
     config_text = _read_config(repo)
+    assert config_text.count(KNOB_RUN_ALL) == 1, (
+        f"Expected exactly one occurrence of {KNOB_RUN_ALL}; got "
+        f"{config_text.count(KNOB_RUN_ALL)}\nconfig:\n{config_text}"
+    )
+    assert config_text.count(KNOB) == 1, (
+        f"Expected exactly one occurrence of {KNOB}; got "
+        f"{config_text.count(KNOB)}\nconfig:\n{config_text}"
+    )
     assert "RUSTC_WRAPPER: sccache" in config_text, "pre-existing child dropped"
     assert "CARGO_INCREMENTAL is required alongside sccache" in config_text, (
         "pre-existing comment dropped"
