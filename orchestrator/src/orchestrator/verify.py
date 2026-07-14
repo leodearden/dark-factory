@@ -570,9 +570,14 @@ def _failure_anchored_excerpt(output: str, *, cap: int = 3000, window: int = 10)
     tail-truncation, so a "strong" structured marker (FAILED <path>::<test>,
     trailing "... FAILED", Traceback, panicked, error[E..]:, INTERNALERROR>)
     is preferred to survive the cap.
+
+    Short-circuit: when *output* already fits within *cap*, it is returned
+    unchanged (byte-identical to today's tail slice, which is a no-op for
+    anything shorter than the cap) — windowing only matters once *output*
+    is long enough to need trimming in the first place.
     """
-    if not output:
-        return output[-cap:]
+    if len(output) <= cap:
+        return output
 
     lines = output.split('\n')
     strong_idxs = {i for i, ln in enumerate(lines) if _STRONG_FAILURE_MARKER_RE.search(ln)}
@@ -2224,8 +2229,9 @@ class VerifyResult:
                 for p in self.archive_log_paths:
                     log_lines.append(f'- {p}')
             sections.append('\n'.join(log_lines))
-        if self.test_output and 'FAILED' in self.test_output:
-            sections.append(f'## Test Failures\n\n```\n{self.test_output[-3000:]}\n```')
+        if self.test_output and _FAILURE_MARKER_RE.search(self.test_output):
+            excerpt = _failure_anchored_excerpt(self.test_output, cap=3000)
+            sections.append(f'## Test Failures\n\n```\n{excerpt}\n```')
         if self.lint_output and self.lint_output.strip():
             sections.append(f'## Lint Issues\n\n```\n{self.lint_output[-2000:]}\n```')
         if self.type_output and 'error' in self.type_output.lower():
