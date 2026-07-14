@@ -322,6 +322,96 @@ class TestSpawnForwardsOriginIsLocal:
 
 
 # ---------------------------------------------------------------------------
+# Task 2565 step-7 (RED): _run_post_merge_verify must derive origin_is_local
+# from the `runner` it receives and forward it into _spawn_main_health_probe
+# on the DEFERRED path — a REMOTE runner (is_local=False) means
+# origin_is_local=False; runner=None (local) means origin_is_local=True.
+# Fails today: the call site passes no origin_is_local kwarg.
+# ---------------------------------------------------------------------------
+
+
+class TestRunPostMergeVerifyDerivesOriginIsLocal:
+    """_run_post_merge_verify must derive origin_is_local from `runner` and
+    forward it into _spawn_main_health_probe on the DEFERRED path (task 2565)."""
+
+    def test_remote_runner_derives_origin_is_local_false(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('42', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        # MagicMock(is_local=False) is a REMOTE runner double.  `.name` is
+        # set post-construction (not via the `name=` constructor kwarg,
+        # which Mock reserves for its own repr) so VerifyRunnerPool's
+        # eligible_remote() quarantine-membership check works.
+        remote_runner = MagicMock(is_local=False)
+        remote_runner.name = 'laptop'
+        remote_runner.run_merge_verify = AsyncMock(return_value=COMPILE_ERROR_RESULT)
+
+        spy = MagicMock(return_value=False)
+
+        async def _run() -> None:
+            handles = _MainHealthProbeHandles(background_tasks=set())
+            with patch('orchestrator.merge_queue._spawn_main_health_probe', new=spy):
+                await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    main_health_probe_handles=handles,
+                    runner=remote_runner,
+                )
+
+        asyncio.run(_run())
+
+        assert spy.call_count == 1
+        kwargs = spy.call_args.kwargs
+        assert kwargs.get('origin_is_local') is False, f'kwargs={kwargs}'
+
+    def test_none_runner_derives_origin_is_local_true(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('42', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        spy = MagicMock(return_value=False)
+
+        async def _run() -> None:
+            handles = _MainHealthProbeHandles(background_tasks=set())
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
+                ),
+                patch('orchestrator.merge_queue._spawn_main_health_probe', new=spy),
+            ):
+                await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    main_health_probe_handles=handles,
+                    runner=None,
+                )
+
+        asyncio.run(_run())
+
+        assert spy.call_count == 1
+        kwargs = spy.call_args.kwargs
+        assert kwargs.get('origin_is_local') is True, f'kwargs={kwargs}'
+
+
+# ---------------------------------------------------------------------------
 # Step-9 (RED): _run_deferred_main_health_probe happy path — files a dedup'd
 # preexisting_main_break escalation and emits the main_health_red signal for
 # a confirmed pre-existing break; a negative or raising probe files nothing.
