@@ -7,6 +7,7 @@ loop over a pluggable ``(corpus, scorer, executor_model, heuristics_block)``.
 
 from __future__ import annotations
 
+from orchestrator.evals.prompt_opt.curator_scorer import CuratorActionScorer
 from orchestrator.evals.prompt_opt.engine import LoopResult, run_optimization_loop
 from orchestrator.evals.prompt_opt.optimizer import propose_heuristics_edit
 from orchestrator.evals.prompt_opt.scorer import ProposeFn, RolloutFn, ScoredItem, Scorer
@@ -22,6 +23,7 @@ from orchestrator.evals.prompt_opt.variance import (
 __all__ = [
     'AcceptanceRecord',
     'CorpusSplit',
+    'CuratorActionScorer',
     'LoopResult',
     'ProposeFn',
     'RolloutFn',
