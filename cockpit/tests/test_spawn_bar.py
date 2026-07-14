@@ -159,3 +159,17 @@ class TestDefaultSkipPerms:
         monkeypatch.setenv('CLAUDE_SPAWN_SKIP_PERMS', 'yes')
 
         assert default_skip_perms() is True
+
+    def test_env_on_resolves_to_true(self, monkeypatch):
+        from cockpit.panes.spawn_bar import default_skip_perms
+
+        monkeypatch.setenv('CLAUDE_SPAWN_SKIP_PERMS', 'on')
+
+        assert default_skip_perms() is True
+
+    def test_env_unrecognized_value_resolves_to_false(self, monkeypatch):
+        from cockpit.panes.spawn_bar import default_skip_perms
+
+        monkeypatch.setenv('CLAUDE_SPAWN_SKIP_PERMS', 'enabled')
+
+        assert default_skip_perms() is False
