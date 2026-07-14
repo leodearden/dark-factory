@@ -460,7 +460,7 @@ class ReconReportState:
         category: str,
         description: str,
         suggested_action: str,
-        actionable: bool = True,
+        actionable: bool | None = None,
         task_id: str | None = None,
         flag_type: str | None = None,
     ) -> dict[str, Any]:
@@ -472,6 +472,17 @@ class ReconReportState:
         original finding_id — Stage 2 can then attach citations to that finding
         rather than creating a redundant row.  Cross-run isolation is preserved:
         findings from a different run_id are never considered.
+
+        ``actionable`` (task-2432 bullet 1a) is a COMPUTED default: when the
+        caller omits it (leaves it ``None``), it resolves to
+        ``not (task_id is None or category.startswith('cross_project'))`` —
+        i.e. False for a null-task_id finding or a ``cross_project*``
+        category (both are informational/routing findings, not directly
+        actionable), True otherwise. An explicit ``True``/``False`` from the
+        caller is always honored regardless of task_id/category. The None
+        check uses the raw ``task_id`` parameter (equivalent to the
+        canonicalized form, since only ``None`` coerces to ``None``); the
+        prefix check uses the POST-truncation ``category``.
 
         A null/missing ``flag_type`` on a re-raise of an already-flagged
         ``task_id`` inherits that task's single established flag_type before
@@ -588,6 +599,8 @@ class ReconReportState:
                     return _duplicate_finding_error(existing_id, warnings)
 
         finding_id = str(uuid.uuid4())
+        if actionable is None:
+            actionable = not (task_id is None or category.startswith('cross_project'))
         finding = _Finding(
             finding_id=finding_id,
             severity=severity,

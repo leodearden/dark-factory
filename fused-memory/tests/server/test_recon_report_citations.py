@@ -782,10 +782,16 @@ class TestCiteTaskInRunCitedTaskDedup:
         assert 'error' not in cite_mc, cite_mc
 
         state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        # actionable=True is explicit (task-2432): this null-task_id/
+        # cross_project finding would otherwise pick up the new computed
+        # default of False, which would trip the unrelated Fix-1 read-time
+        # suppression (its lone citation is a subset of f_mc's) and hide it
+        # from report_recon below for a reason orthogonal to what this test
+        # verifies (write-time fold-anchor isolation across stages).
         f_recon = state.add_finding(
             run_id='run-1', severity='low', category='cross_project',
             description='recon desc', suggested_action='a',
-            task_id=None, flag_type='recon_flag',
+            actionable=True, task_id=None, flag_type='recon_flag',
         )
         fid_recon = f_recon['finding_id']
         cite_recon = await state.cite_task('run-1', fid_recon, 'dark_factory', '2405')
