@@ -1012,6 +1012,152 @@ def test_reap_continues_sweep_when_one_directory_fails_to_remove(
 
 
 # ---------------------------------------------------------------------------
+# Task 2511 step-5: mark_orphaned_sessions_exited (liveness sweep, Part 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'status',
+    [sr.Status.LAUNCHING, sr.Status.RUNNING, sr.Status.IDLE, sr.Status.AWAITING_INPUT],
+)
+def test_mark_orphaned_marks_non_terminal_dead_pid_past_heartbeat_ttl(
+    status: sr.Status, tmp_path: Path
+) -> None:
+    r = _make_record(session_slug='orphan-1', status=status, launcher_pid=_DEAD_PID, exit_code=None)
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+    assert {m.session_slug for m in marked} == {'orphan-1'}
+    assert record_path.parent.is_dir()  # marked, NOT deleted (reap_stale_records' job)
+    assert record_path.is_file()
+    reloaded = sr.read_record('orphan-1', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+
+
+def test_mark_orphaned_keeps_non_terminal_live_pid_regardless_of_age(tmp_path: Path) -> None:
+    r = _make_record(session_slug='kept-live', status=sr.Status.RUNNING, launcher_pid=os.getpid())
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, timedelta(days=30))  # past both TTLs
+
+    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+    assert marked == []
+    assert sr.read_record('kept-live', root=tmp_path).status == sr.Status.RUNNING
+
+
+def test_mark_orphaned_keeps_non_terminal_dead_pid_within_heartbeat_ttl(tmp_path: Path) -> None:
+    r = _make_record(session_slug='kept-recent', status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID)
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL - timedelta(minutes=1))
+
+    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+    assert marked == []
+    assert sr.read_record('kept-recent', root=tmp_path).status == sr.Status.LAUNCHING
+
+
+def test_mark_orphaned_leaves_already_terminal_record_untouched(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='already-exited', status=sr.Status.EXITED, exit_code=0, launcher_pid=_DEAD_PID
+    )
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(days=2))
+
+    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+    assert marked == []
+    reloaded = sr.read_record('already-exited', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == 0  # NOT re-stamped with ORPHAN_EXIT_CODE
+
+
+def test_mark_orphaned_preserves_all_other_fields(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='orphan-fields',
+        status=sr.Status.RUNNING,
+        launcher_pid=_DEAD_PID,
+        role='unblock',
+        project='df',
+        task_id='2085',
+        result_file='/tmp/whatever/result.md',
+        start_ts='2026-07-07T00:00:00+00:00',
+    )
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+    reloaded = sr.read_record('orphan-fields', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+    assert reloaded.role == 'unblock'
+    assert reloaded.project == 'df'
+    assert reloaded.task_id == '2085'
+    assert reloaded.result_file == '/tmp/whatever/result.md'
+    assert reloaded.launcher_pid == _DEAD_PID
+    assert reloaded.start_ts == '2026-07-07T00:00:00+00:00'
+
+
+def test_mark_orphaned_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
+    marked_orphan = _make_record(
+        session_slug='will-be-marked', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID
+    )
+    kept_live = _make_record(
+        session_slug='kept-live-mix', status=sr.Status.RUNNING, launcher_pid=os.getpid()
+    )
+    kept_recent = _make_record(
+        session_slug='kept-recent-mix', status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID
+    )
+    kept_terminal = _make_record(
+        session_slug='kept-terminal-mix',
+        status=sr.Status.EXITED,
+        exit_code=0,
+        launcher_pid=_DEAD_PID,
+    )
+    for r in (marked_orphan, kept_live, kept_recent, kept_terminal):
+        sr.write_record(r, root=tmp_path)
+
+    _set_mtime(
+        sr.record_path_for_slug('will-be-marked', root=tmp_path),
+        _NOW,
+        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+    )
+    _set_mtime(
+        sr.record_path_for_slug('kept-live-mix', root=tmp_path),
+        _NOW,
+        timedelta(days=30),
+    )
+    _set_mtime(
+        sr.record_path_for_slug('kept-recent-mix', root=tmp_path),
+        _NOW,
+        sr.NON_TERMINAL_HEARTBEAT_TTL - timedelta(minutes=1),
+    )
+    _set_mtime(
+        sr.record_path_for_slug('kept-terminal-mix', root=tmp_path),
+        _NOW,
+        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(days=2),
+    )
+
+    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+    assert {m.session_slug for m in marked} == {'will-be-marked'}
+    assert sr.read_record('will-be-marked', root=tmp_path).status == sr.Status.EXITED
+    assert sr.read_record('kept-live-mix', root=tmp_path).status == sr.Status.RUNNING
+    assert sr.read_record('kept-recent-mix', root=tmp_path).status == sr.Status.LAUNCHING
+    reloaded_terminal = sr.read_record('kept-terminal-mix', root=tmp_path)
+    assert reloaded_terminal.status == sr.Status.EXITED
+    assert reloaded_terminal.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
 # Step-9: CLI + fail-soft
 # ---------------------------------------------------------------------------
 
