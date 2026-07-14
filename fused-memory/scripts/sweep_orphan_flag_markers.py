@@ -525,26 +525,73 @@ async def run(
 
 
 # ---------------------------------------------------------------------------
+# Deterministic exit-code predicate
+# ---------------------------------------------------------------------------
+
+def backlog_verdict(after_total_source: int, max_backlog: int) -> int:
+    """Deterministic exit-code predicate: does the residual backlog hold?
+
+    Mirrors ``scripts/check_merge_flakiness.sh``'s exit-code-only contract
+    (the orchestrator reads the exit code only, never stdout) so this script
+    is directly usable as a ``task_kind='deterministic'``
+    ``before_done.script`` predicate (``--apply --check --max-backlog N``).
+
+    Pure, sync, no I/O.
+
+    Args:
+        after_total_source: Residual stage1_flag_marker count — the
+            report's ``after.total_source`` on ``--apply``, or
+            ``before.total_source`` for a dry-run/``--check``-only
+            invocation.
+        max_backlog: Ceiling the residual count must not exceed.
+
+    Returns:
+        ``0`` if ``after_total_source <= max_backlog`` (holds), else ``1``
+        (violated).
+    """
+    return 0 if after_total_source <= max_backlog else 1
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main() -> int:
-    """Parse CLI args, build a live MemoryService, and run the sweep."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s %(name)s %(levelname)s %(message)s',
-    )
+def _split_comma_ids(raw: str) -> list[str]:
+    """argparse ``type=`` callback for ``--delete-ids``.
+
+    Splits *raw* on ``','`` and strips surrounding whitespace from each
+    component, dropping any empty components. Pure, sync, no I/O.
+
+    Args:
+        raw: Raw ``--delete-ids`` CLI value, e.g. ``'eb92453f, a07972e7'``.
+
+    Returns:
+        List of stripped, non-empty id strings, e.g.
+        ``['eb92453f', 'a07972e7']``.
+    """
+    return [part.strip() for part in raw.split(',') if part.strip()]
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the sweep's argparse parser.
+
+    Factored out of :func:`main` (task 2596) so the CLI surface — including
+    the new ``--max-age-days``, ``--delete-ids``, ``--terminal-drain``,
+    ``--check``, and ``--max-backlog`` flags — is testable without any live
+    I/O.
+    """
     parser = argparse.ArgumentParser(
         description=(
-            'Detect (and optionally delete) stage1_flag_marker records missing '
-            'kind or task_id.'
+            'Detect (and optionally delete) dead-weight stage1_flag_marker '
+            'records: missing kind/task_id, stale by age, referencing only '
+            'terminal tasks, or explicitly targeted for correction.'
         ),
     )
     parser.add_argument(
         '--apply', action='store_true', default=False,
         help=(
-            'Commit deletions of stage1_flag_marker records missing kind or '
-            'task_id (default: dry-run only).'
+            'Commit deletions of dead-weight stage1_flag_marker records '
+            '(default: dry-run only).'
         ),
     )
     parser.add_argument(
@@ -556,6 +603,84 @@ def main() -> int:
         help='Maximum records to enumerate per scroll (default: 1000). '
              'Increase if count_memories_by_metadata shows >1000 source markers.',
     )
+    parser.add_argument(
+        '--max-age-days', dest='max_age_days', type=int, default=14,
+        help='Age cutoff in days for find_stale_markers (default: 14). '
+             'Use 0 to drain every dated dead-weight record.',
+    )
+    parser.add_argument(
+        '--delete-ids', dest='delete_ids', type=_split_comma_ids, default=[],
+        help='Comma-separated marker ids to force-delete regardless of '
+             'age/terminal/orphan status (targeted correction; default: none).',
+    )
+    parser.add_argument(
+        '--terminal-drain', dest='terminal_drain', action='store_true', default=False,
+        help='Best-effort resolve terminal-status (done/cancelled) task ids '
+             'via the configured task backend and additionally sweep markers '
+             'that reference only such tasks (default: off, age-only sweep — '
+             'no taskmaster dependency unless this flag is passed).',
+    )
+    parser.add_argument(
+        '--check', action='store_true', default=False,
+        help="Exit 0 if the residual backlog is within --max-backlog, else "
+             "1 — usable as a task_kind='deterministic' before_done "
+             'predicate (mirrors scripts/check_merge_flakiness.sh).',
+    )
+    parser.add_argument(
+        '--max-backlog', dest='max_backlog', type=int, default=0,
+        help='Residual stage1_flag_marker ceiling checked by --check (default: 0).',
+    )
+    return parser
+
+
+async def _resolve_terminal_task_ids() -> set[str]:
+    """Best-effort resolve terminal-status task ids for ``--terminal-drain``.
+
+    Mirrors
+    ``fused_memory.reconciliation.stages.task_knowledge_sync._resolve_terminal_task_ids``'s
+    fail-safe posture: any failure (task backend not configured, backend
+    error) degrades to an empty set — the age-only sweep — rather than
+    raising, logged at WARNING. Only called when ``--terminal-drain`` is
+    passed, so the default run path has no taskmaster dependency at all.
+
+    Returns:
+        Set of task_id strings whose status is terminal (``done`` or
+        ``cancelled`` per ``shared.task_statuses.TERMINAL``); empty set on
+        any failure or unconfigured taskmaster.
+    """
+    try:
+        from shared.task_statuses import TERMINAL as TERMINAL_STATUSES  # noqa: PLC0415
+
+        from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        if config.taskmaster is None:
+            return set()
+        backend = SqliteTaskBackend(config.taskmaster)
+        await backend.start()
+        try:
+            statuses = await backend.get_statuses(config.taskmaster.project_root)
+        finally:
+            await backend.close()
+        return {
+            str(tid) for tid, status in statuses.items() if status in TERMINAL_STATUSES
+        }
+    except Exception:
+        logger.warning(
+            'sweep_orphan_flag_markers: --terminal-drain status resolution '
+            'failed; falling back to age-only sweep (terminal_task_ids=set()).',
+        )
+        return set()
+
+
+def main() -> int:
+    """Parse CLI args, build a live MemoryService, and run the sweep."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(name)s %(levelname)s %(message)s',
+    )
+    parser = _build_parser()
     args = parser.parse_args()
 
     async def _run_live() -> dict:
@@ -564,15 +689,31 @@ def main() -> int:
 
         config = FusedMemoryConfig()
         memory = MemoryService(config)
+        now_dt = datetime.now(UTC)
+        terminal_task_ids = (
+            await _resolve_terminal_task_ids() if args.terminal_drain else set()
+        )
         try:
             await memory.initialize()
-            return await run(args, memory)
+            return await run(
+                args, memory, now=now_dt, terminal_task_ids=terminal_task_ids,
+            )
         finally:
             if hasattr(memory, 'close'):
                 await memory.close()
 
-    report = asyncio.run(_run_live())
+    try:
+        report = asyncio.run(_run_live())
+    except Exception:
+        logger.exception('sweep_orphan_flag_markers: fatal error during sweep')
+        return 2
+
     print(json.dumps(report, indent=2))
+
+    if args.check:
+        after = report.get('after', report['before'])
+        return backlog_verdict(after['total_source'], args.max_backlog)
+
     return 0
 
 
