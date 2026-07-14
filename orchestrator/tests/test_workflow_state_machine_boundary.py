@@ -41,18 +41,39 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import pydantic_spec
+from shared.task_statuses import TaskStatus
+from shared.task_transitions import ActorClass, is_legal_transition, outcome_allows_status
 
 # Cross-module reuse — conftest.py injects orchestrator/tests onto sys.path
 # (see test_workflow_terminal_report.py for the same precedent). ``_make``
 # and ``_bind_landed_row`` carry no module-level lock of their own, so they
 # are imported directly rather than duplicated (rows 1-4).
+#
+# ``_derive_meta_root_like_production`` is imported (not just the plain
+# helpers) because it is an autouse fixture in test_workflow_e2e.py — autouse
+# only auto-applies within a module where pytest can SEE the fixture, and a
+# plain `from test_workflow_e2e import AgentStub, ...` does not pull that in
+# (see test_workflow_terminal_report.py for the same precedent). Without it,
+# AgentStub's legacy-only TaskArtifacts writes are invisible to the
+# workflow's relocated meta_root, so a real run() never reaches DONE (rows
+# 5-6).
+from test_workflow_e2e import (
+    AgentStub,
+    _build_workflow,
+    _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see above
+    _init_repo,
+)
 from test_workflow_merge_provenance import _bind_landed_row, _make
+from test_workflow_warm_lane_requeue import _make_workflow as _make_warmlane_workflow
 
-from _orch_helpers import pydantic_spec
-
-from orchestrator.agents.roles import ROLES, AgentRole, _FAMILY_TOOL_PREFIXES
+from orchestrator.agents.roles import _FAMILY_TOOL_PREFIXES, ROLES, AgentRole
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps
 from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.scheduler import TaskAssignment
 from orchestrator.unblock_types import BlockClass
+from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.workflow import TaskWorkflow, _PriorImplStatus
 from orchestrator.workflow_types import (
@@ -72,8 +93,6 @@ from orchestrator.workflow_types import (
     _lookup_disposition,
     classify_failure,
 )
-from shared.task_statuses import TaskStatus
-from shared.task_transitions import ActorClass, is_legal_transition, outcome_allows_status
 
 
 @pytest.fixture(autouse=True)
@@ -302,3 +321,289 @@ class TestGuardCollapseEquivalence:
         assert f.wf._merge_recovery_basis is None
         assert f.wf.state == WorkflowState.PLAN
         f.mark_done.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Boundary rows 5-6 — state-machine legality + run()-exit outcome<->status
+# consistency (WorkflowStateMachine/STATE_TO_STATUS PRODUCER ↔
+# shared.task_transitions W2 AUTHORITY, and a REAL TaskWorkflow.run() CONSUMER).
+# ---------------------------------------------------------------------------
+
+# e2e-style fixtures for row 6's real run() drivers — duplicated verbatim
+# rather than imported (established repo convention, mirrors
+# test_workflow_terminal_report.py / test_repend_state_machine.py: these are
+# plain, unlocked fixtures with no shared module-level state, so each
+# dependent test file keeps its own copy instead of coupling to
+# test_workflow_e2e.py's fixture graph).
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    """A bare-minimum git repo with an initial commit (mirrors test_workflow_e2e.py)."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_init_repo(repo))
+    return repo
+
+
+@pytest.fixture
+def config(git_repo: Path) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        project_root=git_repo,
+        max_concurrent_tasks=1,
+        max_execute_iterations=5,
+        max_verify_attempts=3,
+        max_review_cycles=2,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+
+
+@pytest.fixture
+def git_ops(config: OrchestratorConfig) -> GitOps:
+    return GitOps(config.git, config.project_root)
+
+
+@pytest.fixture
+def task_assignment() -> TaskAssignment:
+    return TaskAssignment(
+        task_id='42',
+        task={
+            'id': '42',
+            'title': 'Add farewell function',
+            'description': 'Add a farewell(name) function to lib.py with tests',
+            'status': 'pending',
+            'metadata': {'files': ['lib']},
+            'dependencies': [],
+        },
+        modules=['lib'],
+    )
+
+
+@pytest.mark.asyncio
+class TestStateMachineLegalityAndConsistency:
+    """Boundary rows 5-6 (PRD §9): ``WorkflowStateMachine``/``STATE_TO_STATUS``
+    (PRODUCER) ↔ ``shared.task_transitions`` — the W2 AUTHORITY — plus a REAL
+    ``TaskWorkflow.run()`` exit as CONSUMER of both.
+    """
+
+    # -- Row 5 (SM-1): terminal absorption + never-a-fourth-table delegation --
+
+    async def test_row5_done_to_blocked_raises_and_state_unchanged(self):
+        """The workflow.py:7744 'already DONE, ignoring late blocked' case,
+        as a pure ``WorkflowStateMachine`` property."""
+        machine = WorkflowStateMachine(WorkflowState.DONE)
+        with pytest.raises(IllegalTransition):
+            machine.transition(WorkflowState.BLOCKED)
+        assert machine.state == WorkflowState.DONE
+
+    @pytest.mark.parametrize('absorbing', [WorkflowState.DONE, WorkflowState.CANCELLED])
+    @pytest.mark.parametrize('to', [
+        WorkflowState.BLOCKED, WorkflowState.PLAN, WorkflowState.EXECUTE,
+    ])
+    async def test_row5_absorbing_states_reject_every_out_transition(self, absorbing, to):
+        """DONE and CANCELLED are BOTH absorbing — every out-transition raises."""
+        machine = WorkflowStateMachine(absorbing)
+        with pytest.raises(IllegalTransition):
+            machine.transition(to)
+        assert machine.state == absorbing
+
+    @pytest.mark.parametrize('absorbing', [WorkflowState.DONE, WorkflowState.CANCELLED])
+    async def test_row5_absorbing_same_state_is_a_legal_noop(self, absorbing):
+        machine = WorkflowStateMachine(absorbing)
+        machine.transition(absorbing)
+        assert machine.state == absorbing
+
+    @pytest.mark.parametrize(('frm', 'to'), [
+        # Linear phase advance / completion (same-projected-status or a
+        # legal working -> DONE move).
+        (WorkflowState.PLAN, WorkflowState.EXECUTE),
+        (WorkflowState.MERGE, WorkflowState.DONE),
+        # Block / unblock from a working phase.
+        (WorkflowState.PLAN, WorkflowState.BLOCKED),
+        (WorkflowState.BLOCKED, WorkflowState.CANCELLED),
+        # Terminal absorption (row 5's own case, re-verified via delegation).
+        (WorkflowState.DONE, WorkflowState.BLOCKED),
+        (WorkflowState.CANCELLED, WorkflowState.PLAN),
+        # Non-terminal but genuinely absent from the shared union.
+        (WorkflowState.MERGE_DEFERRED, WorkflowState.EXECUTE),
+    ])
+    async def test_row5_transition_raises_iff_shared_table_says_illegal(self, frm, to):
+        """Proves ``transition`` DELEGATES to ``is_legal_transition`` over the
+        ``STATE_TO_STATUS``-projected pair — the machine consumes W2's table,
+        never a fourth (G4 decision #1)."""
+        expected_legal = is_legal_transition(
+            STATE_TO_STATUS[frm], STATE_TO_STATUS[to], ActorClass.ORCHESTRATOR,
+        )
+        machine = WorkflowStateMachine(frm)
+        if expected_legal:
+            machine.transition(to)
+            assert machine.state == to
+        else:
+            with pytest.raises(IllegalTransition):
+                machine.transition(to)
+            assert machine.state == frm
+
+    # -- Row 6 (SM-2): real run()-exit outcome<->status + phase==machine.state --
+
+    async def test_row6_done_run_is_consistent_and_phase_matches_machine(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """Clean merged-DONE run (mirrors test_workflow_e2e.TestHappyPath)."""
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        report = await workflow.run()
+
+        last_status = await scheduler.get_status(workflow.task_id)
+        assert last_status == 'done'
+        assert outcome_allows_status(report.outcome, last_status)
+        assert report.phase == workflow.machine.state
+
+    async def test_row6_allaccountscapped_blocked_run_is_consistent(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """Blocked run via the AllAccountsCappedException path (e2e:5638)."""
+        from shared.cli_invoke import AllAccountsCappedException
+
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        async def raise_cap_exc(*args, **kwargs):
+            raise AllAccountsCappedException(
+                retries=3, elapsed_secs=120.0, label='Task 42 [architect]',
+            )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', raise_cap_exc)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+
+        report = await workflow.run()
+
+        last_status = await scheduler.get_status(workflow.task_id)
+        assert last_status == 'blocked'
+        assert outcome_allows_status(report.outcome, last_status)
+        assert report.phase == workflow.machine.state
+
+    async def test_row6_warmlane_requeued_run_is_consistent(self, tmp_path: Path):
+        """REQUEUED run (reuses test_workflow_warm_lane_requeue setup)."""
+        from orchestrator.git_ops import WarmLanePoolHardDown
+
+        wf = _make_warmlane_workflow(tmp_path=tmp_path)
+        wf.git_ops.create_worktree = AsyncMock(  # type: ignore[method-assign]
+            side_effect=WarmLanePoolHardDown(
+                "warm-lane base absent (host-scoped pool hard-down) for branch "
+                "'1859'; requeue",
+            ),
+        )
+        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+
+        report = await wf.run()
+
+        last_status = await wf.scheduler.get_status(wf.task_id)
+        assert last_status == 'pending'
+        assert outcome_allows_status(report.outcome, last_status)
+        assert report.phase == wf.machine.state
+        mark_blocked.assert_not_awaited()
+
+    async def test_row6_outcome_status_divergence_raises_loudly_naming_both(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """NEGATIVE: DB row says 'done' while the actual exit is BLOCKED.
+
+        The pre-empt check at the top of ``_drive()`` also calls
+        ``scheduler.get_status`` — it must see a NON-terminal status there,
+        or the task exits CANCELLED before ever reaching the AllAccountsCapped
+        block path. Only the SECOND call (SM-2's own read, after ``_drive()``
+        returns) sees the injected 'done', simulating a stale/incorrect DB
+        row at the terminal boundary.
+        """
+        from shared.cli_invoke import AllAccountsCappedException
+
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        calls = {'n': 0}
+
+        async def fake_get_status(task_id):
+            calls['n'] += 1
+            return 'pending' if calls['n'] == 1 else 'done'
+
+        monkeypatch.setattr(scheduler, 'get_status', fake_get_status)
+
+        async def raise_cap_exc(*args, **kwargs):
+            raise AllAccountsCappedException(
+                retries=3, elapsed_secs=120.0, label='Task 42 [architect]',
+            )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', raise_cap_exc)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+
+        with pytest.raises((AssertionError, ValueError)) as exc_info:
+            await workflow.run()
+
+        message = str(exc_info.value).lower()
+        assert 'blocked' in message
+        assert 'done' in message
+
+    async def test_row6_none_status_does_not_crash_normal_run(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """Fail-safe guard: a None (unreadable) status must not crash run()."""
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+        monkeypatch.setattr(scheduler, 'get_status', AsyncMock(return_value=None))
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.DONE
+
+    async def test_row6_out_of_vocabulary_status_does_not_crash_normal_run(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """Fail-safe guard: an out-of-vocabulary status string must not crash
+        run() either — ``outcome_allows_status`` raises ``ValueError`` on it,
+        which the run()-exit guard must catch rather than let escape."""
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+        monkeypatch.setattr(
+            scheduler, 'get_status', AsyncMock(return_value='not-a-real-status'),
+        )
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.DONE
