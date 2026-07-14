@@ -283,6 +283,73 @@ class TestReconcileOneStrandedGroundTruthMarkDone:
 
 
 # ---------------------------------------------------------------------------
+# task 2243 (W10-θ2) step-5 — the REVERT_TO_PENDING signal.
+#
+# _reconcile_one_stranded dispatches on TaskGroundTruth.recovery_for's
+# classification: a stranded in-progress task with no live claimant and no
+# on-main landing evidence (_RECOVERY rows c/d — BranchStateKind
+# EXISTS_OFF_MAIN or GONE_NO_MARKER) resolves to RecoveryAction.
+# REVERT_TO_PENDING, dispatched straight to
+# _revert_in_progress_if_no_live_claimant.  Both cases already produced this
+# outcome pre-migration (the applier's own plan.lock liveness check is
+# unchanged), so — like G2 above — these are parity/regression pins for the
+# new explicit dispatch, not novel-behavior RED cases.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestReconcileOneStrandedGroundTruthRevert:
+    async def test_c_exists_off_main_no_live_claimant_reverts(
+        self, harness: Harness,
+    ):
+        """Branch ref still exists but is not an ancestor of main (no landing
+        evidence) — recovery_for classifies REVERT_TO_PENDING; the task is
+        reverted to pending and mark_done is never called."""
+        tid = '9003'
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'in-progress', 'metadata': {}},
+        )
+        # Fixture defaults already produce EXISTS_OFF_MAIN: is_ancestor=False,
+        # resolve_branch_sha=<a sha> (ref exists, not an ancestor). Restated
+        # explicitly here so the scenario is self-contained.
+        harness.git_ops.is_ancestor = AsyncMock(return_value=False)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(  # type: ignore[attr-defined]
+            return_value='deadbeef' + 'a' * 32,
+        )
+
+        result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'pending',
+        )
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 1
+
+    async def test_d_gone_no_marker_no_live_claimant_reverts(
+        self, harness: Harness,
+    ):
+        """Branch ref gone, no journal row, no merge marker on main (no
+        landing evidence) — recovery_for classifies REVERT_TO_PENDING; the
+        task is reverted to pending and mark_done is never called."""
+        tid = '9004'
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'in-progress', 'metadata': {}},
+        )
+        harness.git_ops.is_ancestor = AsyncMock(return_value=False)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+
+        result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'pending',
+        )
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 1
+
+
+# ---------------------------------------------------------------------------
 # _reconcile_stranded_in_progress tests
 # ---------------------------------------------------------------------------
 
