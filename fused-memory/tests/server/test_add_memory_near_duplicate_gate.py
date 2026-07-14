@@ -71,7 +71,8 @@ class TestAddMemoryNearDuplicateGate:
         call memory_service.add_memory.
         """
         mock_service = AsyncMock()
-        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
+        matched = _near_duplicate_result(id_='m1', score=0.97)
+        mock_service.search.return_value = [matched]
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -102,6 +103,12 @@ class TestAddMemoryNearDuplicateGate:
         )
         assert isinstance(result.get('similarity'), int | float), (
             f'Expected a numeric similarity, got: {result!r}'
+        )
+        assert result.get('matched_excerpt') == matched.content[:200], (
+            f'Expected matched_excerpt=matched content[:200], got: {result!r}'
+        )
+        assert result.get('threshold') == 0.92, (
+            f'Expected default threshold 0.92 echoed, got: {result!r}'
         )
         assert result.get('hint'), f'Expected a non-empty hint, got: {result!r}'
         mock_service.add_memory.assert_not_called()
@@ -207,6 +214,42 @@ class TestAddMemoryNearDuplicateGate:
             f'A search failure must not block the write; got: {result!r}'
         )
         mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_wiring_error_from_search_is_not_silently_absorbed(self):
+        """A TypeError from memory_service.search must surface, not fail open.
+
+        Unlike a transient backend failure (TimeoutError, see
+        test_fails_open_when_search_raises), a TypeError here signals a
+        wiring/programming bug -- e.g. a future refactor renaming the
+        search() stores/categories kwargs. The guard must not swallow this
+        into fail-open (which would silently disable the guard behind
+        nothing but a WARNING log); it must propagate to the standard
+        @mcp_tool_errors() error-dict response instead, and the write must
+        NOT proceed.
+        """
+        mock_service = AsyncMock()
+        mock_service.search.side_effect = TypeError(
+            "search() got an unexpected keyword argument 'stores'"
+        )
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error_type') == 'TypeError', (
+            f'A wiring-level TypeError must surface as an error, not be '
+            f'silently absorbed into fail-open; got: {result!r}'
+        )
+        mock_service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_allows_write_when_search_returns_empty(self):

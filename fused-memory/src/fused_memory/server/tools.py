@@ -975,6 +975,12 @@ def create_mcp_server(
         ):
             near_dup_threshold = resolve_near_dup_threshold(memory_service)
             try:
+                # NOTE: this is an extra semantic search round-trip (embedding +
+                # vector query) on every explicit category='procedural_knowledge'
+                # write -- a deliberate cost to prevent duplicates landing. If
+                # procedural_knowledge write volume ever makes this matter,
+                # procedural_knowledge_near_dup_guard_enabled=False (see
+                # ReconciliationConfig) is the existing escape hatch.
                 near_dup_results = await memory_service.search(
                     query=content,
                     project_id=project_id,
@@ -982,9 +988,19 @@ def create_mcp_server(
                     stores=['mem0'],
                     limit=5,
                 )
+            except (TypeError, AttributeError, NameError):
+                # These indicate a wiring/programming bug (e.g. a future
+                # memory_service.search signature change renaming the
+                # stores/categories kwargs) rather than a transient backend
+                # failure -- re-raise so it surfaces loudly via the
+                # @mcp_tool_errors() wrapper (full traceback + a structured
+                # error response) instead of being silently absorbed into
+                # fail-open, which would quietly disable the guard in
+                # production behind nothing but a WARNING log.
+                raise
             except Exception:
-                # Fail-open: a pre-check search failure/timeout must never
-                # block a write. Degrade to the pre-existing behavior.
+                # Fail-open: a transient pre-check search failure/timeout must
+                # never block a write. Degrade to the pre-existing behavior.
                 logger.warning(
                     'near-duplicate pre-check search failed; failing open', exc_info=True
                 )
