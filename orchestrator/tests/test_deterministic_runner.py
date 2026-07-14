@@ -1629,6 +1629,60 @@ class TestCrossUnitWritebackResilience:
             == verified_calls[0].args[1]['before_done_verified_at']
         )
 
+    async def test_illegal_source_phase_falls_back_to_stamp_only_write(
+        self, tmp_path: Path,
+    ):
+        """Reviewer amendment (task 2240, error_handling): the up-front
+        _compute_deploy_phase_advance(...VERIFIED) call sits OUTSIDE the
+        retry loop and is unguarded — if metadata.deploy_state were
+        corrupted/unexpected (an illegal source phase for VERIFIED, e.g.
+        'escalated'), it must not raise straight out of the method. The
+        deploy already succeeded by this point, so the writeback must fall
+        back to a stamp-only payload (no deploy_state key) and still
+        converge to done, with the illegal edge still filed loudly as an L2
+        escalation (file-before-raise, DS-2)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        # 'escalated' is not a legal source phase for VERIFIED (only 'ran'
+        # is) — simulates corrupted/unexpected deploy_state metadata.
+        task = _deploy_task(task_id='2240', target_unit='orchestrator-reify.service', phase='escalated')
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._writeback_deploy_success(
+            '2240',
+            task['metadata'],
+            _FRESH_UNIT_STATE,
+            'orchestrator-reify.service',
+            'Cross-unit deploy of the reify worker',
+        )
+
+        assert outcome == WorkflowOutcome.DONE, (
+            'the deploy already succeeded — an illegal deploy_state advance '
+            'must not strand a successful deploy'
+        )
+        verified_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and 'before_done_verified_at' in c.args[1]
+        ]
+        assert len(verified_calls) == 1
+        assert 'deploy_state' not in verified_calls[0].args[1], (
+            'the illegal advance must fall back to a stamp-only write, not a '
+            'deploy_state payload built from a state that never persisted'
+        )
+        # DS-2 loudness: the illegal edge still files a born-at-L2
+        # escalation (file-before-raise), even though the raise itself is
+        # swallowed here.
+        illegal_escs = [
+            e for e in queue.get_by_task('2240')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert len(illegal_escs) == 1
+        scheduler.set_task_status.assert_awaited_once()
+        assert scheduler.set_task_status.call_args.args[1] == 'done'
+
 
 # ---------------------------------------------------------------------------
 # Default seam: _default_run_script env merge
@@ -2734,6 +2788,60 @@ class TestFileInfraIssueEscalatedAdvanceFailureConverges:
             if c.args[1] == 'done'
         ]
         assert len(done_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Reviewer amendment (task 2240, robustness): _file_infra_issue_and_block's
+# best-effort ESCALATED advance must not attempt a pinned-illegal self-loop
+# (ESCALATED->ESCALATED / DONE->ESCALATED) when the deploy is already at
+# that phase — that would file a spurious born-at-L2
+# illegal_deploy_transition escalation on top of the infra_issue one.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestFileInfraIssueSkipsRedundantEscalatedAdvance:
+    """On the rare crash-resume edge where deploy_state.phase is already
+    ESCALATED (or DONE) but resolution could not be proven, execution can
+    reach the unknown-crash infra_issue path again. The best-effort advance
+    must skip rather than re-attempt an illegal self-loop."""
+
+    @pytest.mark.parametrize('seeded_phase', ['escalated', 'done'])
+    async def test_no_illegal_transition_escalation_when_already_at_target(
+        self, tmp_path: Path, seeded_phase: str,
+    ) -> None:
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2240', phase=seeded_phase)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._file_infra_issue_and_block(
+            '2240',
+            summary='Deploy state unknown after crash: orchestrator-reify.service',
+            detail='crash detail',
+            metadata=task['metadata'],
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        # The infra_issue itself is still filed — the skip only affects the
+        # redundant phase advance, not the loud signal for this crash.
+        infra_escs = [e for e in queue.get_by_task('2240') if e.category == 'infra_issue']
+        assert len(infra_escs) == 1
+        # No spurious illegal_deploy_transition escalation was filed.
+        illegal_escs = [
+            e for e in queue.get_by_task('2240')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+        # No redundant deploy_state write was even attempted.
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls == []
+        assert task['metadata']['deploy_state']['phase'] == seeded_phase
 
 
 # ---------------------------------------------------------------------------

@@ -194,7 +194,13 @@ from typing import TYPE_CHECKING
 from shared.task_metadata import DoneProvenance
 
 from orchestrator import systemd_inspect
-from orchestrator.deploy_state import DeployPhase, DeployState, VerifyBaseline, enforce_transition
+from orchestrator.deploy_state import (
+    DeployPhase,
+    DeployState,
+    IllegalDeployTransition,
+    VerifyBaseline,
+    enforce_transition,
+)
 from orchestrator.proc_supervision import (
     EscalationSpec,
     FreshPidVerify,
@@ -651,7 +657,16 @@ class DeterministicRunner:
         never passes it), best-effort advances ``deploy_state.phase`` to
         ``ESCALATED`` too (ζ DS-1) — same tolerate-a-severed-connection
         posture as the trailing blocked-status write below, since the
-        escalation above is already durable regardless.
+        escalation above is already durable regardless. Skipped entirely
+        (reviewer amendment, task 2240) when the CURRENT phase is already
+        ``ESCALATED`` or ``DONE``: on the rare crash-resume edge where the
+        deploy already reached one of those phases but resolution could not
+        be proven (e.g. the runner's own escalation record is missing or
+        expired), a bare re-advance would attempt a pinned-illegal
+        self-loop, filing a spurious ``illegal_deploy_transition`` L2 on top
+        of the ``infra_issue`` one filed above — the skip avoids that noise
+        without weakening DS-2 loudness, since the phase is already at (or
+        past) the target.
 
         Consequence of that phase advance failing (reviewer amendment, task
         2240): if it raises transiently — e.g. the SAME severed connection
@@ -701,18 +716,40 @@ class DeterministicRunner:
             )
 
         if metadata is not None and metadata.get('before_done') is not None:
-            try:
-                await self._advance_deploy_phase(
-                    task_id, metadata, DeployPhase.ESCALATED,
-                    phase_timestamp=datetime.now(UTC).isoformat(),
+            _current_deploy_state = DeployState.from_metadata(metadata)
+            if _current_deploy_state is not None and _current_deploy_state.phase in (
+                DeployPhase.ESCALATED, DeployPhase.DONE,
+            ):
+                # Reviewer amendment (task 2240): already at (or past)
+                # ESCALATED — e.g. this is the rare crash-resume edge where
+                # phase==ESCALATED but resolution_proven is false (the
+                # runner's own escalation record is missing/expired), so
+                # execution reaches this unknown-crash infra_issue path
+                # again. A bare re-advance would attempt an illegal
+                # ESCALATED->ESCALATED (or DONE->ESCALATED) self-loop —
+                # neither edge is in _LEGAL — filing a SPURIOUS born-at-L2
+                # illegal_deploy_transition escalation on top of the
+                # infra_issue one just filed above. Skip the redundant
+                # advance; the infra_issue escalation is already the loud
+                # signal for this crash.
+                logger.debug(
+                    'DeterministicRunner: task %s deploy_state already at '
+                    'phase=%s — skipping redundant ESCALATED advance',
+                    task_id, _current_deploy_state.phase,
                 )
-            except Exception as exc:
-                logger.warning(
-                    'DeterministicRunner: task %s deploy_state phase-escalated '
-                    'advance failed (%s: %s) — the infra_issue escalation above '
-                    'is already durable regardless',
-                    task_id, type(exc).__name__, exc,
-                )
+            else:
+                try:
+                    await self._advance_deploy_phase(
+                        task_id, metadata, DeployPhase.ESCALATED,
+                        phase_timestamp=datetime.now(UTC).isoformat(),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        'DeterministicRunner: task %s deploy_state phase-escalated '
+                        'advance failed (%s: %s) — the infra_issue escalation above '
+                        'is already durable regardless',
+                        task_id, type(exc).__name__, exc,
+                    )
 
         try:
             await self.scheduler.set_task_status(task_id, 'blocked')
@@ -1043,7 +1080,12 @@ class DeterministicRunner:
         two writes.  The done-write below intentionally does NOT also advance
         phase to ``done`` — ``verified -> done`` is a real DS-2-legal edge,
         but leaving the PERSISTED phase at ``verified`` avoids a third write
-        (verified already proves success; done tasks are never swept).
+        (verified already proves success; done tasks are never swept). If
+        computing that advance raises ``IllegalDeployTransition`` (reviewer
+        amendment, task 2240 — corrupted/unexpected ``deploy_state``), the
+        writeback falls back to a stamp-only payload (no ``deploy_state``
+        key) so the already-succeeded deploy still converges to done instead
+        of the raise propagating out of ``run()``.
 
         On budget exhaustion (fused-memory never recovers in-window), files a
         durable local ``infra_issue`` escalation (disk-backed, connection-
@@ -1059,11 +1101,33 @@ class DeterministicRunner:
         pid = new_state.get('MainPID', 0)
         active_enter_timestamp = new_state.get('ActiveEnterTimestamp', '')
 
-        verified_deploy_state = self._compute_deploy_phase_advance(
-            task_id, metadata, DeployPhase.VERIFIED,
-            phase_timestamp=verified_iso,
-        )
-        deploy_state_payload = verified_deploy_state.to_metadata()
+        # Reviewer amendment (task 2240): _compute_deploy_phase_advance is
+        # pure computation (no I/O) but still enforces DS-2 — an illegal
+        # source phase (metadata.deploy_state corrupted or otherwise
+        # unexpected) makes enforce_transition file a loud L2 escalation and
+        # then raise. This call sits OUTSIDE the retry loop below and the
+        # deploy has ALREADY succeeded by this point, so letting the raise
+        # propagate out of run() would violate the "run() always returns
+        # BLOCKED, never a raw exception" contract at exactly the moment the
+        # task would otherwise land neither done nor cleanly blocked. Fall
+        # back to a stamp-only write (no deploy_state payload) so the
+        # verified deploy still converges to done — the escalation sink
+        # already made the anomaly loud (file-before-raise).
+        try:
+            verified_deploy_state = self._compute_deploy_phase_advance(
+                task_id, metadata, DeployPhase.VERIFIED,
+                phase_timestamp=verified_iso,
+            )
+            deploy_state_payload = verified_deploy_state.to_metadata()
+        except IllegalDeployTransition as exc:
+            logger.warning(
+                'DeterministicRunner: task %s deploy_state phase-advance to '
+                'VERIFIED failed (%s) — an L2 illegal_deploy_transition '
+                'escalation was filed; falling back to a stamp-only '
+                'writeback so the verified deploy still converges to done',
+                task_id, exc,
+            )
+            deploy_state_payload = {}
 
         stamped = False
         for attempt in range(self._writeback_max_attempts):
@@ -1077,7 +1141,7 @@ class DeterministicRunner:
                     },
                     metadata_mode='merge',
                 ))
-                if stamped:
+                if stamped and 'deploy_state' in deploy_state_payload:
                     metadata['deploy_state'] = deploy_state_payload['deploy_state']
                 if not stamped:
                     logger.warning(
