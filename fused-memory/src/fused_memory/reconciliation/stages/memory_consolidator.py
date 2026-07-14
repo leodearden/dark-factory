@@ -319,8 +319,9 @@ class MemoryConsolidator(BaseStage):
 
             # ── Flag-marker acknowledgment (task-2029 scenario a) ──────────────────
             # Flags DROPPED anywhere in the chain above (terminal task, false-absence,
-            # or stale-snapshot correction) have a moot requested action; reclaim any
-            # persisted stage1_flag_marker for them best-effort.  Computed as a
+            # stale-snapshot correction, or already-tracked systemic-pattern) have a
+            # moot requested action; reclaim any persisted stage1_flag_marker for them
+            # best-effort.  Computed as a
             # signature diff against the survivors rather than threading a "dropped"
             # list through each filter, so none of the filters' contracts change.
             # suppressed_signatures (computed above) is explicitly subtracted out —
