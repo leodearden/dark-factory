@@ -254,6 +254,77 @@ class TestReconReportInRunDedup:
 
 
 # ---------------------------------------------------------------------------
+# task-2432 step-5/6 (bullet 4): comma-joined task_id normalization — RED
+# until step-6 adds a canonicalization helper (split/strip/sort/dedupe/
+# rejoin) applied to add_finding's task_id before the dedup signature is
+# computed, so a comma-joined task_id whose components are reordered between
+# two calls collapses onto the same signature.
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportCommaJoinedTaskIdNormalization:
+    """Verify a comma-joined top-level task_id normalizes for dedup purposes,
+    independent of component order, and that single-value task_id dedup
+    (already-supported) keeps working."""
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        return state
+
+    def _finding(self, state, task_id, flag_type, **kwargs):
+        defaults = dict(
+            run_id='r1',
+            severity='moderate',
+            category='memory_stale',
+            description='d',
+            suggested_action='a',
+            task_id=task_id,
+            flag_type=flag_type,
+        )
+        defaults.update(kwargs)
+        return state.add_finding(**defaults)
+
+    def test_comma_joined_task_id_different_order_dedups(self):
+        """A comma-joined top-level task_id normalizes so a second call with
+        the same components in a different order collapses as a duplicate."""
+        state = self._make_state()
+        first = self._finding(state, task_id='5040,5149', flag_type='dedup_order_test')
+        assert 'finding_id' in first, first
+        id1 = first['finding_id']
+
+        second = self._finding(
+            state, task_id='5149,5040', flag_type='dedup_order_test',
+            description='different text still same sig',
+        )
+        assert second.get('error') == 'duplicate_finding'
+        assert second.get('existing_finding_id') == id1
+
+        report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report is not None
+        matches = [f for f in report['flagged_items'] if f['flag_type'] == 'dedup_order_test']
+        assert len(matches) == 1
+
+    def test_single_value_task_id_still_dedups(self):
+        """Regression guard: a plain single-value task_id keeps dedupping
+        (this already works today; must not regress)."""
+        state = self._make_state()
+        first = self._finding(state, task_id='5040', flag_type='dedup_single_test')
+        assert 'finding_id' in first, first
+        id1 = first['finding_id']
+
+        second = self._finding(
+            state, task_id='5040', flag_type='dedup_single_test',
+            description='different text still same sig',
+        )
+        assert second.get('error') == 'duplicate_finding'
+        assert second.get('existing_finding_id') == id1
+
+
+# ---------------------------------------------------------------------------
 # task-2432 step-1/2 (bullet 1a, state level): actionable computed default —
 # RED until step-2 changes ReconReportState.add_finding's `actionable`
 # parameter from `bool = True` to a `bool | None = None` sentinel and
