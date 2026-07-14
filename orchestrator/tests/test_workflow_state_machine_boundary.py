@@ -70,8 +70,7 @@ from test_workflow_e2e import (
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see above
     _init_repo,
 )
-from _workflow_helpers import _bind_landed_row, _make
-from test_workflow_warm_lane_requeue import _make_workflow as _make_warmlane_workflow
+from _workflow_helpers import _bind_landed_row, _make, _make_warmlane_workflow
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import _FAMILY_TOOL_PREFIXES, ROLES, AgentRole

@@ -33,7 +33,7 @@ from test_workflow_e2e import (
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see above
     _init_repo,
 )
-from test_workflow_warm_lane_requeue import _make_workflow as _make_warmlane_workflow
+from _workflow_helpers import _make_warmlane_workflow
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
