@@ -49,6 +49,11 @@ from fused_memory.reconciliation.task_filter import (
     is_mixed_temporal_framing,
 )
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
+from fused_memory.server.near_duplicate_guard import (
+    _DEFAULT_NEAR_DUP_THRESHOLD,
+    build_near_duplicate_block,
+    find_near_duplicate_memory,
+)
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
@@ -934,6 +939,20 @@ def create_mcp_server(
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
+        if category == 'procedural_knowledge':
+            near_dup_results = await memory_service.search(
+                query=content,
+                project_id=project_id,
+                categories=['procedural_knowledge'],
+                limit=5,
+            )
+            near_dup_match = find_near_duplicate_memory(
+                near_dup_results, _DEFAULT_NEAR_DUP_THRESHOLD
+            )
+            if near_dup_match is not None:
+                return build_near_duplicate_block(
+                    agent_id, content, near_dup_match, _DEFAULT_NEAR_DUP_THRESHOLD
+                )
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
         result = await memory_service.add_memory(
             content=content,
