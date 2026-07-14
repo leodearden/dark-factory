@@ -78,14 +78,20 @@ from orchestrator import (
 )
 from orchestrator.b3_gate import ABORT, FRESH, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WorktreeKind, _run
 from orchestrator.merge_queue import (
     MergeRequest,
     _DryRunInvestigationHandles,
     _run_post_merge_verify,
 )
 from orchestrator.unblock_types import BlockClass, BlockRecord
-from orchestrator.verify import CheckRun, VerifyAttempt, VerifyResult
+from orchestrator.verify import (
+    CheckRun,
+    VerifyAttempt,
+    VerifyResult,
+    run_main_tip_sweep,
+    verify_failure_is_preexisting_on_main,
+)
 from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, _validate_exhaustive
 from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import (
