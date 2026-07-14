@@ -44,6 +44,8 @@ from pathlib import Path
 
 import yaml
 
+from legibility import codebook
+
 logger = logging.getLogger("legibility.census_trigger")
 
 
@@ -451,3 +453,71 @@ def default_status_fetcher(project_root: str | Path):
             ) from exc
 
     return _fetch
+
+
+# ---------------------------------------------------------------------------
+# decide_for_project — high-level assembly (config + state + codebook signal)
+# ---------------------------------------------------------------------------
+
+def decide_for_project(
+    project_root: str | Path,
+    *,
+    now: datetime | None = None,
+    status_fetcher=None,
+) -> Decision:
+    """Assemble the full §6/§8.5 census-trigger Decision for `project_root`:
+    loads the `census:` config (§7.4), the census state (§7.5, extended),
+    and the codebook novelty signal (task γ), computes the tasks-landed
+    delta via `status_fetcher`, and calls the pure `evaluate()` core. This
+    is what task ε's nightly trickle imports and what the `evaluate` CLI
+    subcommand below calls.
+
+    `now` defaults to the current UTC time. A malformed census state
+    short-circuits to a fail-safe `Decision(fire=False, ...)` immediately
+    (before touching the codebook or `status_fetcher`) -- `load_census_state`
+    has already logged its one WARNING, so nothing else needs to.
+    """
+    project_root = Path(project_root)
+    now = now if now is not None else datetime.now(timezone.utc)
+
+    config = load_census_config(project_root)
+
+    state_status, state = load_census_state(
+        project_root / "docs" / "legibility" / "census-state.json"
+    )
+    if state_status == "malformed":
+        return Decision(
+            fire=False,
+            reasons=["census state is malformed -- failing safe (no fire)"],
+        )
+
+    never_censused = state_status == "missing"
+
+    codebook_path = project_root / "docs" / "legibility" / "confusion-codebook.yaml"
+    try:
+        codebook_data = codebook.load(codebook_path)
+        if not isinstance(codebook_data, dict):
+            raise ValueError(f"expected a YAML mapping, got {type(codebook_data).__name__}")
+        earliest_sighting, candidate_first_seens = codebook_signal(codebook_data)
+    except Exception as exc:  # noqa: BLE001 - a bad codebook must fail safe, not crash
+        logger.warning("codebook at %s is unreadable: %s", codebook_path, exc)
+        earliest_sighting, candidate_first_seens = None, []
+
+    if never_censused:
+        last_census_at = earliest_sighting
+    else:
+        raw_last_census_at = (state or {}).get("last_census_at")
+        last_census_at = (
+            datetime.fromisoformat(raw_last_census_at) if raw_last_census_at else None
+        )
+
+    tasks_landed = compute_tasks_landed(state=state, status_fetcher=status_fetcher)
+
+    return evaluate(
+        now=now,
+        last_census_at=last_census_at,
+        never_censused=never_censused,
+        tasks_landed=tasks_landed,
+        candidate_first_seens=candidate_first_seens,
+        config=config,
+    )
