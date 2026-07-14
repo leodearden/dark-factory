@@ -33,6 +33,7 @@ that is epsilon/gamma's job.
 """
 from __future__ import annotations
 
+import json
 import re
 
 import yaml
@@ -158,4 +159,60 @@ def build_prompt(digest_text: str, codebook_index: str) -> str:
         '{"matches": [], "candidates": []}.\n\n'
         "=== CODEBOOK INDEX ===\n" + codebook_index + "\n\n"
         "=== SESSION DIGEST ===\n" + digest_text
+    )
+
+
+# ---------------------------------------------------------------------------
+# parse_coder_output — raw LLM stdout -> judgment dict
+# ---------------------------------------------------------------------------
+
+_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.DOTALL)
+
+
+def parse_coder_output(raw: str) -> dict:
+    """Parse the trickle coder LLM's raw stdout into a judgment dict.
+
+    Tries, in order: (1) the whole string as JSON; (2) stripping a
+    ```/```json fence and retrying; (3) — only if neither (1) nor (2)
+    parsed as JSON at all — slicing from the first ``{`` to the last
+    ``}`` and retrying (the "object embedded in surrounding prose" case).
+
+    A candidate that parses cleanly to a NON-dict JSON value (a top-level
+    array or scalar) fails immediately rather than falling through to
+    brace-slicing: brace-slicing exists to rescue an object buried in
+    prose noise, not to dig a nested object out of an already
+    well-formed-but-wrong-shaped JSON value (e.g. slicing the first
+    ``{...}`` out of a top-level ``[{...}]`` array would silently accept
+    array-shaped output, which must instead raise). Output that never
+    parses to a dict at all raises CoderParseError. Never returns a
+    fabricated default.
+    """
+    primary_candidates = [raw]
+    fence_match = _FENCE_RE.search(raw)
+    if fence_match:
+        primary_candidates.append(fence_match.group(1))
+
+    for candidate in primary_candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+        raise CoderParseError(
+            f"coder output parsed as {type(parsed).__name__}, expected a JSON object"
+        )
+
+    first_brace = raw.find("{")
+    last_brace = raw.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        try:
+            sliced = json.loads(raw[first_brace : last_brace + 1])
+        except json.JSONDecodeError:
+            sliced = None
+        if isinstance(sliced, dict):
+            return sliced
+
+    raise CoderParseError(
+        f"could not parse a JSON object from coder output: {raw[:200]!r}"
     )
