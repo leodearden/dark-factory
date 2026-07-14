@@ -6,8 +6,8 @@ schema defined by ``shared.capability_manifest.DeliveredCheckMeta``, task
 alpha) and returns a :class:`DeliveredCheckResult`. Two kinds:
 
 - ``grep`` — evaluated against the COMMITTED tree at *ref* (default
-  ``'main'``) via ``git -C <project_root> grep -E <pattern> <ref>``. This
-  is the PRIMARY kind: it reads exactly what's on ``main``, immune to
+  ``'main'``) via ``git -C <project_root> grep -E -e <pattern> <ref>``.
+  This is the PRIMARY kind: it reads exactly what's on ``main``, immune to
   working-checkout dirtiness.
 - ``script`` — evaluated against the WORKING CHECKOUT (PRD Open-Q 2
   DECIDED: a documented approximation, not a temp-tree materialization of
@@ -101,14 +101,20 @@ async def _run_grep_check(
     ref: str,
     runner: _Runner,
 ) -> DeliveredCheckResult:
-    """``git -C <project_root> grep -E <pattern> <ref> [-- <paths...>]``.
+    """``git -C <project_root> grep -E -e <pattern> <ref> [-- <paths...>]``.
 
     rc==0 (match) / rc==1 (no match) are both valid outcomes; rc>=2 is a
     git error (ERRORED). Which of match/no-match is DELIVERED depends on
     ``meta.expect``: ``'present'`` wants a match, ``'absent'`` wants no
     match.
+
+    The explicit ``-e`` separator (reviewer_comprehensive amendment) keeps
+    a pattern beginning with ``'-'`` from being parsed as a ``git grep``
+    option instead of the search pattern — without it, such a pattern
+    would fail with a git error (rc>=2, ERRORED) rather than being used
+    literally.
     """
-    argv = ['git', '-C', str(project_root), 'grep', '-E', meta.pattern, ref]
+    argv = ['git', '-C', str(project_root), 'grep', '-E', '-e', meta.pattern, ref]
     if meta.paths:
         argv.append('--')
         argv.extend(meta.paths)
@@ -138,6 +144,17 @@ async def _run_script_check(
     from the outer guard, ``OSError`` for a missing/non-executable script)
     propagates to :func:`run_delivered_check`'s catch-all, which maps it to
     :attr:`DeliveredCheckResult.ERRORED`.
+
+    Known limitation (reviewer_comprehensive amendment; the fix is outside
+    this task's locked-file scope): on timeout, ``asyncio.wait_for``
+    cancels the ``runner`` coroutine, but ``orchestrator.git_ops._run``
+    does not kill its spawned subprocess when ``proc.communicate()`` is
+    cancelled. A script that hangs past ``timeout_secs`` still correctly
+    maps to ERRORED here, but the orphaned child process (and its pipes)
+    can be left running — recurring every sweep for a persistently-hung
+    script. Fixing this requires a try/finally (kill + reap) around
+    ``proc.communicate()`` in ``git_ops._run``, which this task does not
+    hold a lock for; tracked for follow-up via ``escalate_info``.
     """
     assert meta.script is not None  # enforced by the script cross-field validator
     assert meta.timeout_secs is not None  # enforced by the script cross-field validator

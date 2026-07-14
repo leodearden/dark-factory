@@ -61,7 +61,7 @@ class TestRunnerGrepKind:
         await run_delivered_check(check, project_root='/proj', ref='main', runner=runner)
 
         assert calls == [
-            ['git', '-C', '/proj', 'grep', '-E', 'FooBar', 'main', '--', 'src/a.py', 'src/b.py']
+            ['git', '-C', '/proj', 'grep', '-E', '-e', 'FooBar', 'main', '--', 'src/a.py', 'src/b.py']
         ]
 
     @pytest.mark.asyncio
@@ -71,7 +71,7 @@ class TestRunnerGrepKind:
 
         await run_delivered_check(check, project_root='/proj', ref='main', runner=runner)
 
-        assert calls == [['git', '-C', '/proj', 'grep', '-E', 'FooBar', 'main']]
+        assert calls == [['git', '-C', '/proj', 'grep', '-E', '-e', 'FooBar', 'main']]
 
     @pytest.mark.asyncio
     async def test_default_ref_is_main(self):
@@ -81,7 +81,19 @@ class TestRunnerGrepKind:
         # ref= omitted entirely — default must be 'main'.
         await run_delivered_check(check, project_root='/proj', runner=runner)
 
-        assert calls == [['git', '-C', '/proj', 'grep', '-E', 'FooBar', 'main']]
+        assert calls == [['git', '-C', '/proj', 'grep', '-E', '-e', 'FooBar', 'main']]
+
+    @pytest.mark.asyncio
+    async def test_pattern_starting_with_dash_is_not_parsed_as_an_option(self):
+        """reviewer_comprehensive amendment: a pattern beginning with '-'
+        must be passed as the literal search pattern (via the ``-e``
+        separator), never mistaken by ``git grep`` for another option."""
+        runner, calls = self._fake_runner(rc=0)
+        check = {'name': 'cap', 'kind': 'grep', 'pattern': '-foo', 'expect': 'present'}
+
+        await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert calls == [['git', '-C', '/proj', 'grep', '-E', '-e', '-foo', 'main']]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -775,12 +787,23 @@ class TestComputeDeliveredCheckCache:
         assert scheduler._streak_delivered_hold.value('10') == 0
         assert self._held_events(scheduler) == []
 
-    # --- (e) budget: max_checks_per_tick=1, 2-check dep -> deferred --------
+    # --- (e) budget: the first dep this sweep is guaranteed to resolve -----
 
     @pytest.mark.asyncio
-    async def test_budget_defers_second_check_of_a_two_check_dep(
-        self, scheduler: Scheduler, monkeypatch
+    async def test_first_dep_exceeding_budget_runs_to_completion_and_warns(
+        self, scheduler: Scheduler, monkeypatch, caplog
     ):
+        """reviewer_comprehensive amendment: without a forward-progress
+        guarantee, a dep whose OWN check count exceeds
+        max_checks_per_tick would hit `over_budget` at the same relative
+        position every single sweep (since `used` resets to 0 each tick)
+        and could never resolve — permanently starving its dependent. The
+        first dep a sweep actually evaluates (not served from cache) is
+        therefore always run to completion regardless of budget, and
+        exceeding the budget this way logs a bounded WARNING so an
+        under-sized max_checks_per_tick is operator-visible."""
+        import logging
+
         scheduler.config.delivered_checks.max_checks_per_tick = 1
         scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
         fake_runner, calls = self._fake_runner({
@@ -793,11 +816,55 @@ class TestComputeDeliveredCheckCache:
         status_map = {'20': 'done'}
         tasks_by_id = {'20': dep, '10': task}
 
-        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler._compute_delivered_check_cache(
+                [task], status_map, tasks_by_id
+            )
 
-        assert result == {}
-        assert calls == ['cap-a'], 'the second check must NOT run once the budget is spent'
-        assert ('20', 'sha1') not in scheduler._delivered_check_cache
+        assert result == {'20': True}, (
+            'the first (and only) dep this sweep must fully resolve despite exceeding budget'
+        )
+        assert calls == ['cap-a', 'cap-b'], 'both checks must run — forward progress is guaranteed'
+        assert ('20', 'sha1') in scheduler._delivered_check_cache
+        assert scheduler._delivered_check_cache[('20', 'sha1')] is True
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            'exceeding the per-tick budget for the guaranteed-progress dep must log a WARNING'
+        )
+
+    # --- (e2) budget still defers a later, non-first dep in the sweep ------
+
+    @pytest.mark.asyncio
+    async def test_budget_still_defers_a_later_non_first_dep(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """The forward-progress guarantee applies ONLY to the first dep a
+        sweep actually evaluates; a second dep sharing the same tick's
+        budget is still deferred exactly as before once the budget is
+        spent, preserving the sweep's per-tick worst-case cost bound."""
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({
+            'cap-a': DeliveredCheckResult.DELIVERED,
+            'cap-one': DeliveredCheckResult.DELIVERED,
+        })
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task_a = self._dependent(task_id='10', dep_id='20')
+        dep_a = self._dep(
+            dep_id='20',
+            checks=[{'name': 'cap-a', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}],
+        )
+        task_b = self._dependent(task_id='11', dep_id='21')
+        dep_b = self._dep(dep_id='21')  # default _ONE_CHECK, named 'cap-one'
+        status_map = {'20': 'done', '21': 'done'}
+        tasks_by_id = {'20': dep_a, '21': dep_b, '10': task_a, '11': task_b}
+
+        result = await scheduler._compute_delivered_check_cache(
+            [task_a, task_b], status_map, tasks_by_id
+        )
+
+        assert result == {'20': True}
+        assert calls == ['cap-a'], 'the second dep must NOT be evaluated once the budget is spent'
+        assert ('21', 'sha1') not in scheduler._delivered_check_cache
 
     # --- (f) cache hit: same-sha re-sweep does NOT re-invoke the runner ----
 
