@@ -213,6 +213,59 @@ def _assistant_text_blocks(
     return found
 
 
+DECOY_MARKER = '# decoy-fail'
+"""Inline same-line sentinel: a fixture/test author appends this to a line
+to explicitly declare "this is not a real signal, don't count it", without
+having to relocate the string out of its otherwise-native carrier. Matched
+case-insensitively, like every other pattern in this module."""
+
+
+def _strip_decoy_lines(text: str) -> str:
+    """Return *text* with every line containing DECOY_MARKER removed.
+
+    Applied before pattern matching in the text-pattern signal detectors
+    (not_found, df_guard, self_correct) so a same-line decoy marker
+    suppresses only that line's occurrence -- other lines in the same
+    carrier are unaffected.
+    """
+    marker = DECOY_MARKER.lower()
+    lines = [line for line in text.split('\n') if marker not in line.lower()]
+    return '\n'.join(lines)
+
+
+def _signal_text_sources(
+    records: list[dict[str, Any]],
+    *,
+    tool_result: bool = False,
+    assistant_text: bool = False,
+    user_text: bool = False,
+) -> list[tuple[int, str]]:
+    """Yield (record_index, text) pairs from the requested NATIVE carriers
+    only: tool_result content, assistant 'text' blocks, and non-sidechain
+    user-turn text (incl. isMeta system injections). Carriers are opt-in
+    per call, since each text-pattern detector is scoped to its own subset.
+
+    NEVER includes the ``input`` of a Write/Edit/MultiEdit/NotebookEdit (or
+    any) tool_use block -- an assistant-authored file mutation is not a
+    native signal carrier, so a decoy string planted there is structurally
+    excluded rather than merely filtered (the core of the decoy-FAIL
+    suppression decision, PRD Sec 13.2).
+    """
+    sources: list[tuple[int, str]] = []
+    if tool_result:
+        for index, block in _iter_tool_result_blocks(records):
+            sources.append((index, _content_to_text(block.get('content'))))
+    if assistant_text:
+        sources.extend(_assistant_text_blocks(records))
+    if user_text:
+        for index, record in enumerate(records):
+            if record.get('type') == 'user' and not record.get('isSidechain'):
+                text = _user_turn_text(_message_content(record))
+                if text:
+                    sources.append((index, text))
+    return sources
+
+
 def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect curated self-correction markers in assistant TEXT blocks only.
 
@@ -220,11 +273,13 @@ def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]
     a Write/Edit/MultiEdit/NotebookEdit tool_use input (an agent authoring
     test data, not a real correction) is never scanned -- restricting the
     scan to assistant 'text' blocks (see :func:`_assistant_text_blocks`)
-    structurally excludes both.
+    structurally excludes both. A same-line ``# decoy-fail`` sentinel
+    suppresses an otherwise-matching line.
     """
     hits = []
-    for index, text in _assistant_text_blocks(records):
-        lowered = text.lower()
+    for index, text in _signal_text_sources(records, assistant_text=True):
+        stripped = _strip_decoy_lines(text)
+        lowered = stripped.lower()
         for pattern in SELF_CORRECTION_PATTERNS:
             pos = lowered.find(pattern)
             if pos == -1:
@@ -232,7 +287,7 @@ def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]
             hits.append({
                 'index': index,
                 'pattern': pattern,
-                'context': _line_context(text, pos),
+                'context': _line_context(stripped, pos),
             })
     return hits
 
@@ -268,10 +323,14 @@ INTERRUPT_PATTERN = 'request interrupted by user'
 
 
 def iter_not_found(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Detect NOT_FOUND_PATTERNS in tool_result content only."""
+    """Detect NOT_FOUND_PATTERNS in tool_result content only.
+
+    A same-line ``# decoy-fail`` sentinel suppresses an otherwise-matching
+    line (PRD Sec 13.2 decoy-FAIL suppression).
+    """
     hits = []
-    for index, block in _iter_tool_result_blocks(records):
-        lowered = _content_to_text(block.get('content')).lower()
+    for index, text in _signal_text_sources(records, tool_result=True):
+        lowered = _strip_decoy_lines(text).lower()
         for pattern in NOT_FOUND_PATTERNS:
             if pattern in lowered:
                 hits.append({'index': index, 'pattern': pattern})
@@ -281,20 +340,16 @@ def iter_not_found(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def iter_df_guards(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect DF_GUARD_PATTERNS (real trip literals) in their native carriers:
     tool_result content, assistant text, and user-turn text (incl. isMeta
-    system injections, excluding isSidechain subagent turns)."""
-    sources: list[tuple[int, str]] = []
-    for index, block in _iter_tool_result_blocks(records):
-        sources.append((index, _content_to_text(block.get('content'))))
-    sources.extend(_assistant_text_blocks(records))
-    for index, record in enumerate(records):
-        if record.get('type') == 'user' and not record.get('isSidechain'):
-            text = _user_turn_text(_message_content(record))
-            if text:
-                sources.append((index, text))
+    system injections, excluding isSidechain subagent turns).
 
+    A same-line ``# decoy-fail`` sentinel suppresses an otherwise-matching
+    line (PRD Sec 13.2 decoy-FAIL suppression).
+    """
     hits = []
-    for index, text in sources:
-        lowered = text.lower()
+    for index, text in _signal_text_sources(
+        records, tool_result=True, assistant_text=True, user_text=True,
+    ):
+        lowered = _strip_decoy_lines(text).lower()
         for pattern in DF_GUARD_PATTERNS:
             if pattern in lowered:
                 hits.append({'index': index, 'pattern': pattern})
