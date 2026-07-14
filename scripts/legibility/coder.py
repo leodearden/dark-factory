@@ -33,11 +33,14 @@ that is epsilon/gamma's job.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import yaml
 
@@ -444,3 +447,111 @@ def code_digests(
         status=status, records=records, failures=failures,
         total=total, succeeded=succeeded, failed=failed,
     )
+
+
+# ---------------------------------------------------------------------------
+# main(argv) — CLI: digests + codebook -> JSONL of §7.3 coding records.
+# Fail-loud: a storm (code_digests status="failure") writes ZERO records and
+# returns non-zero, so epsilon can escalate and skip the merge (PRD §8.6).
+# ---------------------------------------------------------------------------
+
+def _print_summary(result: RunResult, *, matched: int, candidates: int, file) -> None:
+    print(
+        f"coder: status={result.status} total={result.total} "
+        f"succeeded={result.succeeded} failed={result.failed} "
+        f"matched={matched} candidates={candidates}",
+        file=file,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: code one or more digests against a codebook.
+
+    Reads each digest file (positional args and/or every file in a
+    ``--digests`` directory), loads the codebook via ``codebook.load``,
+    and calls ``code_digests``. On a run-level ``"ok"`` status, writes
+    every successful record as a JSONL line to ``--out`` (or stdout) and
+    returns 0. On a run-level ``"failure"`` status (storm, PRD §8.6),
+    writes ZERO coding records — ``--out`` is left untouched — prints a
+    failure summary to stderr, and returns 1 (fail-loud), so a driving
+    script (epsilon) can escalate and skip the merge. Either way, a
+    one-line status summary is printed to stderr.
+    """
+    parser = argparse.ArgumentParser(
+        prog="coder",
+        description=(
+            "Haiku trickle coder: confusion digest -> strict-JSON section 7.3 "
+            "coding record."
+        ),
+    )
+    parser.add_argument(
+        "digest_files", nargs="*", metavar="DIGEST",
+        help="One or more confusion digest files (alpha/digest.py output)",
+    )
+    parser.add_argument(
+        "--digests", dest="digests_dir", default=None, metavar="DIR",
+        help="A directory of confusion digest files, combined with any "
+        "positional DIGEST files given",
+    )
+    parser.add_argument(
+        "--codebook", required=True, help="Path to the v2 codebook YAML file",
+    )
+    parser.add_argument(
+        "--project", required=True,
+        help="Project id stamped into each coding record's deterministic header",
+    )
+    parser.add_argument(
+        "--model", default="haiku", help="LLM model tier (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--out", default=None,
+        help="Write coding records as JSONL to this file instead of stdout",
+    )
+    args = parser.parse_args(argv)
+
+    digest_paths = [Path(p) for p in args.digest_files]
+    if args.digests_dir:
+        digest_paths.extend(sorted(Path(args.digests_dir).iterdir()))
+
+    if not digest_paths:
+        print(
+            "coder: no digest files given (positional DIGEST args or --digests DIR)",
+            file=sys.stderr,
+        )
+        return 1
+
+    codebook = codebook_mod.load(args.codebook)
+    digests = [p.read_text(encoding="utf-8") for p in digest_paths]
+
+    result = code_digests(digests, codebook, project=args.project, model=args.model)
+
+    matched = sum(len(r.get("matches") or []) for r in result.records)
+    candidates = sum(len(r.get("candidates") or []) for r in result.records)
+
+    if result.status == "failure":
+        print(
+            f"coder: FAILURE - {result.failed}/{result.total} digests failed "
+            "coding (storm threshold exceeded) -- zero coding records written",
+            file=sys.stderr,
+        )
+        for session, reason in result.failures:
+            print(f"  session={session!r}: {reason}", file=sys.stderr)
+        _print_summary(result, matched=matched, candidates=candidates, file=sys.stderr)
+        return 1
+
+    lines = [json.dumps(record) for record in result.records]
+    output = "\n".join(lines)
+    if output:
+        output += "\n"
+
+    if args.out:
+        Path(args.out).write_text(output, encoding="utf-8")
+    else:
+        sys.stdout.write(output)
+
+    _print_summary(result, matched=matched, candidates=candidates, file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
