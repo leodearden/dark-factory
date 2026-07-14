@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, TypeVar
 
@@ -717,7 +717,7 @@ class CancellationScope:
     def __init__(
         self,
         cancel_event: asyncio.Event,
-        on_terminal: list[OnTerminalEntry],
+        on_terminal: Sequence[OnTerminalEntry],
     ) -> None:
         self._cancel_event = cancel_event
         self._on_terminal = on_terminal
@@ -734,10 +734,27 @@ class CancellationScope:
         waiter = asyncio.create_task(self._cancel_event.wait())
         kind: Literal['hard', 'soft'] | None = None
         try:
-            done, _pending = await asyncio.wait(
-                {body, waiter}, return_when=asyncio.FIRST_COMPLETED,
-            )
+            try:
+                done, _pending = await asyncio.wait(
+                    {body, waiter}, return_when=asyncio.FIRST_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                # This coroutine's own await was cancelled — the harness's
+                # task.cancel() (or any other outer cancellation).  body and
+                # waiter are untouched by asyncio.wait()'s own cancellation
+                # (it never cancels its member futures on our behalf), so
+                # both are handled uniformly by the finally below.
+                kind = 'hard'
+                raise WorkflowCancelled('hard') from None
             if body in done:
+                if body.cancelled():
+                    # The body itself raised CancelledError spontaneously
+                    # (a shutdown-race teardown) — matches the old exc_info
+                    # sniff, which caught ANY CancelledError propagating
+                    # through the finally, not just an externally-injected
+                    # one.
+                    kind = 'hard'
+                    raise WorkflowCancelled('hard')
                 exc = body.exception()
                 if exc is not None:
                     raise exc
@@ -757,6 +774,30 @@ class CancellationScope:
             await self._run_on_terminal(kind)
 
     async def _run_on_terminal(self, kind: Literal['hard', 'soft'] | None) -> None:
-        """Run every ``on_terminal`` entry, in order, passing *kind*."""
-        for _name, fn in self._on_terminal:
-            await fn(kind)
+        """Run every ``on_terminal`` entry, in order, passing *kind*.
+
+        Runs the whole ordered list as a background task shielded behind a
+        retry loop, so it survives being cancelled REPEATEDLY (the harness's
+        ``hard_cancel_workflow`` polls, calling ``task.cancel()`` more than
+        once on the same slot task): each ``asyncio.shield`` only ever
+        detaches OUR await from the background task, never cancels the
+        background task itself, so a second (or third) cancel here can
+        never truncate an in-flight cleanup entry.
+        """
+        async def _run_all() -> None:
+            for _name, fn in self._on_terminal:
+                await fn(kind)
+
+        task = asyncio.ensure_future(_run_all())
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+        if task.cancelled():
+            raise asyncio.CancelledError()
+        exc = task.exception()
+        if exc is not None:
+            raise exc
