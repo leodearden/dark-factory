@@ -917,13 +917,28 @@ async def _invoke_pi(
             f.unlink(missing_ok=True)
 
 
-def _write_pi_mcp_config(config_path: Path, mcp_config: dict) -> None:
+def _write_pi_mcp_config(config_path: Path, mcp_config: dict | None) -> None:
     """Write pi's MCP server config in .mcp.json shape, injecting
     ``"directTools": true`` on every server (spike Q3 — required so each
     MCP tool is individually allowlistable via --tools/--exclude-tools;
-    without it, pi-mcp-adapter exposes only the proxy `mcp` tool).
+    without it, pi-mcp-adapter exposes only the proxy `mcp` tool). A
+    None/empty *mcp_config* writes an empty-servers config rather than
+    raising.
+
+    ⚠ CRITICAL GOTCHA (spike Q3, not handled by this function): direct-tools
+    registration also needs a pre-built metadata cache
+    (``~/.pi/agent/mcp-cache.json``). Until that cache is populated for a
+    given server, pi-mcp-adapter exposes only the proxy `mcp` tool and the
+    ``directTools``-generated ``--tools``/``--exclude-tools`` names for that
+    server don't resolve — the call silently falls back to proxy (or fails
+    the allowlist) even though this file is correctly shaped. The cache is
+    populated by one real adapter *connection* (e.g. a proxy
+    ``mcp({search})`` call, or the adapter connecting on first use) —
+    running `pi-mcp-adapter init` alone does not reliably warm it for a
+    project-local server. Callers relying on a fresh server's direct-tool
+    names should ensure the cache has been warmed at least once first.
     """
-    servers = mcp_config.get('mcpServers', {})
+    servers = (mcp_config or {}).get('mcpServers', {})
     out_servers = {name: {**cfg, 'directTools': True} for name, cfg in servers.items()}
     config_path.write_text(json.dumps({'mcpServers': out_servers}, indent=2))
 
