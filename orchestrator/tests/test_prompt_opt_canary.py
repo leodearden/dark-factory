@@ -12,6 +12,7 @@ verdict against documented thresholds.
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -42,14 +43,13 @@ def _explicit_thresholds(**overrides: object) -> CanaryThresholds:
     starting points are not something a deterministic unit test should
     assert against (see plan design decision on explicit thresholds).
     """
-    kwargs: dict[str, object] = dict(
+    base = CanaryThresholds(
         cost_per_done_task_rel_tol=0.2, cost_per_done_task_abs_floor=1.0,
         requeue_rate_rel_tol=0.2, requeue_rate_abs_floor=0.05,
         mean_review_cycles_rel_tol=0.2, mean_review_cycles_abs_floor=1.0,
         mean_verify_attempts_rel_tol=0.2, mean_verify_attempts_abs_floor=1.0,
     )
-    kwargs.update(overrides)
-    return CanaryThresholds(**kwargs)
+    return replace(base, **overrides)
 
 
 def _make_runs_db(path: Path, rows: list[dict]) -> None:
