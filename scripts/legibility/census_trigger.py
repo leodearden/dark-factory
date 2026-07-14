@@ -35,9 +35,11 @@ standalone CLI; task ε injects the real MCP-backed fetcher.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -521,3 +523,48 @@ def decide_for_project(
         candidate_first_seens=candidate_first_seens,
         config=config,
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI — `evaluate --project-root <path>` (always exits 0; fail-safe, never
+# crashes the nightly trickle that calls this at the end of a run -- PRD
+# task ε)
+# ---------------------------------------------------------------------------
+
+def _cmd_evaluate(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root)
+    status_fetcher = default_status_fetcher(project_root)
+    decision = decide_for_project(project_root, status_fetcher=status_fetcher)
+
+    print(f"DECISION: {'FIRE' if decision.fire else 'NO-FIRE'}")
+    for reason in decision.reasons:
+        print(reason)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="census_trigger",
+        description="Legibility periodic-census trigger evaluator "
+        "(plans/confusion-reduction-prd.md §6/§8.5). Always exits 0 -- "
+        "fail-safe, never crashes the nightly trickle.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    evaluate_parser = subparsers.add_parser(
+        "evaluate", help="evaluate whether the periodic census should fire"
+    )
+    evaluate_parser.add_argument("--project-root", default=".")
+    evaluate_parser.set_defaults(func=_cmd_evaluate)
+
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except Exception as exc:  # noqa: BLE001 - never crash the nightly trickle
+        logger.warning("census_trigger evaluate failed unexpectedly: %s", exc)
+        print(f"DECISION: NO-FIRE (evaluator error: {exc})")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
