@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -120,37 +121,97 @@ class BackgroundService:
             self._task = None
 
 
+@runtime_checkable
+class LifecycleService(Protocol):
+    """Structural contract every LifecycleRegistry member satisfies.
+
+    Both ``BackgroundService`` and ``ManagedService`` satisfy this shape
+    without explicitly inheriting from it — ``LifecycleRegistry`` stays
+    duck-typed (LR-3); this Protocol exists only to give ``register()`` and
+    ``services`` a precise type instead of ``Any``.
+
+    ``start()`` is typed ``Awaitable[None] | None`` rather than requiring a
+    coroutine function: ``BackgroundService.start()`` is deliberately plain
+    sync (fire-and-forget ``asyncio.create_task``, nothing to await —
+    step-4), while ``ManagedService.start()`` wraps bespoke async setup
+    (e.g. building an aiohttp server) and must be awaited before the next
+    service starts. ``LifecycleRegistry.start_all()`` awaits the result
+    only when it is itself awaitable, so either shape conforms.
+    """
+
+    name: str
+    stop_timeout_secs: float
+
+    def start(self) -> Awaitable[None] | None: ...
+
+    async def stop(self) -> None: ...
+
+
+@dataclass
+class ManagedService:
+    """Thin adapter wrapping a bespoke lifecycle service's existing
+    ``_start_*``/``_stop_*`` methods so it registers in the same
+    ``LifecycleRegistry`` as ``BackgroundService``, internals unchanged.
+
+    The four bespoke harness services (merge-worker, offline-lane,
+    escalation-server, watcher-supervisor) have custom build/teardown that
+    doesn't fit the uniform ``BackgroundService`` pass_fn/interval shape
+    (stateful backoff, aiohttp server, lockfile release, coordinator
+    construction — see plan.json design_decisions). This adapter gives them
+    the same ordered-start / bounded-reverse-stop contract (LR-1/2/3)
+    without rewriting their internals.
+    """
+
+    name: str
+    start_fn: Callable[[], Awaitable[None]]
+    stop_fn: Callable[[], Awaitable[None]]
+    stop_timeout_secs: float
+
+    async def start(self) -> None:
+        await self.start_fn()
+
+    async def stop(self) -> None:
+        await self.stop_fn()
+
+
 class LifecycleRegistry:
     """Ordered registry of lifecycle services with a bounded start/stop ladder.
 
     PRD §5.3 (LR-3): ``register(svc)`` appends in declared order and
     ``start_all()`` awaits each service's ``start()`` in that same order.
-    ``stop_all()`` (step-12) walks the REVERSE of registration order,
-    bounding each ``stop()`` so one wedging service can never hang shutdown
-    (LR-2 / S1).
+    ``stop_all()`` walks the REVERSE of registration order, bounding each
+    ``stop()`` so one wedging service can never hang shutdown (LR-2 / S1).
 
-    Services are duck-typed (the eventual ``LifecycleService`` Protocol —
-    name, async start(), async stop(), stop_timeout_secs — lands in
-    step-14); both ``BackgroundService`` and the step-14 ``ManagedService``
-    adapter satisfy this shape.
+    Services satisfy the ``LifecycleService`` Protocol structurally; both
+    ``BackgroundService`` and ``ManagedService`` do so without explicit
+    inheritance.
     """
 
     def __init__(self) -> None:
-        self._services: list[Any] = []
+        self._services: list[LifecycleService] = []
 
     @property
-    def services(self) -> list[Any]:
+    def services(self) -> list[LifecycleService]:
         """The registered services, in declared (start) order."""
         return list(self._services)
 
-    def register(self, service: Any) -> None:
+    def register(self, service: LifecycleService) -> None:
         """Append ``service`` to the registry, in declared order."""
         self._services.append(service)
 
     async def start_all(self) -> None:
-        """Await each registered service's start(), in registration order."""
+        """Await each registered service's start(), in registration order.
+
+        ``start()`` may be a plain sync call (``BackgroundService``) or a
+        coroutine function (``ManagedService``) — see ``LifecycleService``.
+        The result is awaited only when it is itself awaitable, so a
+        service's start-up work (if any) still fully completes before the
+        next service's start() begins (LR-3).
+        """
         for service in self._services:
-            await service.start()
+            result = service.start()
+            if inspect.isawaitable(result):
+                await result
 
     async def stop_all(self) -> None:
         """Stop every registered service in REVERSE registration order.
