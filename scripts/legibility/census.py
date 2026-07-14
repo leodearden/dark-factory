@@ -42,13 +42,17 @@ and ``codebook.assert_no_deletion()`` confirm the write is safe.
 """
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import logging
 import os
+import random
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 # Self-bootstrap for standalone `python scripts/legibility/census.py` runs
@@ -65,6 +69,7 @@ import coder  # noqa: E402
 import config  # noqa: E402
 import digest  # noqa: E402
 import inventory  # noqa: E402
+import sampling  # noqa: E402
 from legibility import census_trigger  # noqa: E402
 
 logger = logging.getLogger("legibility.census")
@@ -785,3 +790,426 @@ def run_census(
         filed_task_ids=filed_task_ids,
         stop_reason=mining_result.stop_reason,
     )
+
+
+# ---------------------------------------------------------------------------
+# Real default seams for the standalone CLI -- every one of these is
+# ALWAYS replaced by a fake in this module's own test suite; nothing here
+# is unit-tested directly (integration-only, exercised by a live --force
+# run per this task's acceptance criterion). Mirrors nightly.py's /
+# census_trigger.py's identical "module-level default_* builders behind
+# the real subprocess/httpx boundary" convention.
+# ---------------------------------------------------------------------------
+
+DEFAULT_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+"""Root of the encoded ~/.claude/projects session-transcript tree that
+inventory.enumerate_sessions scans -- distinct from a censused project's
+OWN project_root (which only ever holds that project's docs/legibility/
+state, not any transcripts)."""
+
+_DEFAULT_CENSUS_LOOKBACK_DAYS = 30
+"""Fallback mining-window length (days) when a project has never been
+censused before (no last_census_at anchor to start the window from) -- a
+first-ever census must not attempt to mine the dawn of time."""
+
+_DEFAULT_CENSUS_BATCH_SIZE = 20
+"""Sessions per mine_to_saturation batch for the real batch_source."""
+
+
+def _census_window_dates(project_root, *, now: datetime) -> list[date]:
+    """The list of calendar dates to enumerate sessions for: from the last
+    census's `last_census_at` (read via census_trigger.load_census_state)
+    through *now*, inclusive -- falling back to a fixed
+    `_DEFAULT_CENSUS_LOOKBACK_DAYS`-day lookback when never censused or the
+    state is malformed/unparseable (fail-safe: a bounded window, never an
+    unbounded one)."""
+    state_path = Path(project_root) / "docs" / "legibility" / "census-state.json"
+    status, state = census_trigger.load_census_state(state_path)
+
+    start_date = None
+    if status == "ok" and state and state.get("last_census_at"):
+        try:
+            start_date = datetime.fromisoformat(state["last_census_at"]).date()
+        except (TypeError, ValueError):
+            start_date = None
+    if start_date is None:
+        start_date = (now - timedelta(days=_DEFAULT_CENSUS_LOOKBACK_DAYS)).date()
+
+    end_date = now.date()
+    span_days = (end_date - start_date).days
+    if span_days < 0:
+        return [end_date]
+    return [start_date + timedelta(days=offset) for offset in range(span_days + 1)]
+
+
+def _stratified_random_order(by_stratum: dict, *, rng: random.Random) -> list:
+    """Interleave *by_stratum* (``{stratum: [ScoredRecord, ...]}``)
+    round-robin, each stratum's own list independently shuffled first, so
+    every batch mine_to_saturation draws is a representative random
+    cross-section of every active stratum rather than front-loading one
+    stratum's sessions ahead of another's (the "stratified-RANDOM"
+    sampling this task's design decisions call for)."""
+    queues = [list(records) for records in by_stratum.values()]
+    for queue in queues:
+        rng.shuffle(queue)
+
+    order = []
+    while any(queues):
+        for queue in queues:
+            if queue:
+                order.append(queue.pop())
+    return order
+
+
+def default_batch_source(cfg, *, projects_root, now: datetime,
+                          batch_size: int = _DEFAULT_CENSUS_BATCH_SIZE, rng=None):
+    """Real stratified-RANDOM batch_source: enumerate every session across
+    the census window (:func:`_census_window_dates`) under *projects_root*
+    matching *cfg*'s ``cwd_prefixes``, score + classify each (mirrors
+    ``nightly.select_scored_records``'s one-pass loop), interleave into a
+    random cross-stratum order, and lazily render each session to a digest
+    via ``digest.build_digest`` one ``batch_size``-sized batch at a time.
+
+    A generator: NOTHING here executes until the mining loop actually
+    iterates it, so a caller than never reaches the happy path (e.g. a
+    headroom-preflight defer) never enumerates a single session. A single
+    session whose digest fails to render is logged and skipped -- it never
+    aborts the whole batch (mirrors ``nightly.build_digests``'s per-record
+    isolation).
+    """
+    rng = rng if rng is not None else random.Random()
+
+    scored = []
+    for target_date in _census_window_dates(cfg.project_root, now=now):
+        for session in inventory.enumerate_sessions(projects_root, cfg.cwd_prefixes, target_date):
+            counts, first_turn = sampling._score_and_find_first_turn(session.path)
+            stratum = sampling.classify_agent_class(first_turn, session.path)
+            scored.append(sampling.ScoredRecord(session=session, stratum=stratum, counts=counts))
+
+    by_stratum: dict[str, list] = {}
+    for record in scored:
+        by_stratum.setdefault(record.stratum, []).append(record)
+    ordered = _stratified_random_order(by_stratum, rng=rng)
+
+    for start in range(0, len(ordered), batch_size):
+        chunk = ordered[start:start + batch_size]
+        digests = []
+        for record in chunk:
+            try:
+                digests.append(
+                    digest.build_digest(record.path, agent_class_override=record.stratum)
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate one bad transcript, keep mining
+                logger.warning("census: failed to build digest for %s: %s", record.path, exc)
+        if digests:
+            yield digests
+
+
+def _verify_prompt(cluster: dict, *, project_root: str) -> str:
+    """Prompt for the real Sonnet verify_fn: confirm-or-refute one novel
+    cluster against *project_root*'s current main via targeted file reads.
+    Absolute paths only -- this function never sets a subprocess cwd, so a
+    relative path in the model's own tool calls would resolve against
+    whatever directory the CLI process happens to inherit. Asks for an
+    OBSERVATION, never a diagnosis (codebook lesson
+    guards-assert-unverified-diagnoses)."""
+    return (
+        "You are the periodic-census verifier for the dark-factory "
+        "agent-confusion codebook (plans/confusion-reduction-prd.md "
+        "section 5.7). A trickle miner flagged the confusion cluster below "
+        "as novel. Using targeted reads of " + str(project_root) + " "
+        "(ABSOLUTE paths only), confirm whether this is still an "
+        "OBSERVABLE fact about the CURRENT state of that tree -- never a "
+        "diagnosis or a guess about root cause you cannot directly "
+        "verify.\n\n"
+        "Respond with STRICT JSON ONLY (no prose, no markdown fences), "
+        'exactly this shape: {"verified": true|false, "reason": "..."}.\n\n'
+        "=== CLUSTER ===\n" + json.dumps(cluster)
+    )
+
+
+def _synthesis_prompt(verified: list) -> str:
+    """Prompt for the real Fable synthesize_fn: cluster + write prose for
+    the dated census report from the VERIFIED findings only."""
+    return (
+        "You are the periodic-census synthesis writer for the dark-factory "
+        "agent-confusion codebook (plans/confusion-reduction-prd.md "
+        "section 5.7). Cluster the VERIFIED confusion findings below and "
+        "write clear, factual prose for a dated census report -- "
+        "observations only, never a diagnosis that was not itself "
+        "verified.\n\n"
+        "=== VERIFIED CLUSTERS ===\n" + json.dumps(verified)
+    )
+
+
+def _build_default_verify_fn(project_root: str, invoke):
+    """Build the real ``verify_fn(clusters, *, model)`` seam: one Sonnet
+    call per cluster via *invoke* (default ``coder._invoke_cli`` --
+    headless ``claude -p --model``), parsed via ``coder.parse_coder_output``.
+    Any per-cluster failure (invocation error, unparseable output) rejects
+    that cluster rather than crashing the whole census -- a conservative
+    fail-closed default for an unverifiable claim. This default never
+    reports a "fixed" entry (a stronger claim than a per-cluster verify
+    prompt is designed to elicit)."""
+    def _verify_fn(clusters, *, model):
+        verified, rejected = [], []
+        for cluster in clusters:
+            prompt = _verify_prompt(cluster, project_root=project_root)
+            try:
+                raw = invoke(prompt, model)
+                verdict = coder.parse_coder_output(raw)
+            except Exception as exc:  # noqa: BLE001 - an unverifiable claim rejects, never crashes
+                logger.warning(
+                    "census: verify failed for cluster %r: %s", cluster.get("title"), exc,
+                )
+                rejected.append(cluster)
+                continue
+            (verified if verdict.get("verified") else rejected).append(cluster)
+        return {"verified": verified, "rejected": rejected, "fixed": []}
+
+    return _verify_fn
+
+
+def _build_default_synthesize_fn(invoke):
+    """Build the real ``synthesize_fn(verified, *, model)`` seam: one
+    Fable call via *invoke* clustering + writing prose for the verified
+    findings. An empty *verified* list is handled without a model call --
+    there is nothing to synthesize."""
+    def _synthesize_fn(verified, *, model):
+        if not verified:
+            return "No novel, verified confusion clusters this census."
+        return invoke(_synthesis_prompt(verified), model)
+
+    return _synthesize_fn
+
+
+_FUSED_MEMORY_URL_ENV_VAR = "FUSED_MEMORY_MCP_URL"
+_DEFAULT_FUSED_MEMORY_URL = "http://localhost:8002"
+"""Mirrors census_trigger.default_status_fetcher's identical env
+var/default -- submit_task lives on the same fused-memory MCP server this
+project's get_statuses call already targets."""
+
+
+def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
+    """POST one JSON-RPC ``tools/call`` envelope to *url* and unwrap the
+    result via ``census_trigger._extract_tool_result`` (reused rather than
+    reimplemented -- the same MCP envelope shape applies everywhere in this
+    codebase). ``httpx`` is imported lazily since it is not a ``scripts/``
+    dependency (mirrors ``census_trigger.default_status_fetcher`` /
+    ``nightly._default_poster``)."""
+    import httpx
+
+    response = httpx.post(
+        url,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments},
+        },
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    return census_trigger._extract_tool_result(response.json())
+
+
+def default_submit_fn(**kwargs) -> dict:
+    """Real curator-path ``submit_task`` poster (fused-memory MCP server) --
+    build_task_payloads' payloads are forwarded verbatim as this call's
+    arguments."""
+    url = os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL) + "/mcp"
+    return _post_mcp_tool_call(url, "submit_task", kwargs)
+
+
+def _build_default_escalate_fn(cfg):
+    """Build the real info-escalation poster (this project's escalation
+    server, PRD decision 8's poster pattern -- mirrors
+    ``nightly.post_escalation``'s envelope shape): a synthetic ``task_id``
+    labels the census as its source, since it is a CLI-driven run, not a
+    Taskmaster task. Best-effort -- any failure is logged and swallowed,
+    since ``run_census``'s own defer path already logs loudly and the
+    CLI's own exit code is the authoritative signal regardless of whether
+    this POST succeeds."""
+    def _escalate_fn(**kwargs) -> dict:
+        url = f"http://localhost:{cfg.escalation_port}/mcp"
+        arguments = {
+            "task_id": f"legibility-census-{cfg.project_id}",
+            "agent_role": "legibility-census",
+            **kwargs,
+        }
+        try:
+            return _post_mcp_tool_call(url, "escalate_info", arguments)
+        except Exception as exc:  # noqa: BLE001 - best-effort; run_census already logged loudly
+            logger.warning("census: escalation post failed (best-effort): %s", exc)
+            return {}
+
+    return _escalate_fn
+
+
+def _build_default_commit(project_root):
+    """Build the real best-effort git-commit seam: ``git commit --only
+    <paths> -m message`` in *project_root* (CLAUDE.md's scoped-commit
+    convention -- never a bare ``git commit``, never ``git stash``). A path
+    git has never tracked before (this run's first-ever census-state.json
+    / dated report) makes ``--only`` fail with "did not match any file";
+    that one case is retried once after a scoped ``git add -- <paths>``
+    (mirrors ``nightly._git_commit_docs_only``'s identical fallback).
+    Raises on any other failure -- ``run_census`` already wraps this call
+    in a best-effort try/except."""
+    def _commit(*, paths, message) -> None:
+        str_paths = [str(p) for p in paths]
+
+        def _run():
+            return subprocess.run(
+                ["git", "-C", str(project_root), "commit", "--only", *str_paths, "-m", message],
+                capture_output=True, text=True,
+            )
+
+        result = _run()
+        if result.returncode != 0 and "did not match any file" in (result.stderr or "").lower():
+            subprocess.run(
+                ["git", "-C", str(project_root), "add", "--", *str_paths],
+                capture_output=True, text=True,
+            )
+            result = _run()
+        if result.returncode != 0:
+            raise RuntimeError(f"git commit failed: {(result.stderr or '').strip()}")
+
+    return _commit
+
+
+# ---------------------------------------------------------------------------
+# main(argv) -- CLI: `python scripts/legibility/census.py [--force]`
+# ---------------------------------------------------------------------------
+
+def _parse_cli_date(value: str) -> date:
+    return date.fromisoformat(value)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint.
+
+    Unless ``--force``, gates on ``census_trigger.decide_for_project``
+    (belt-and-braces for a manual/operator run -- the production caller,
+    task epsilon's nightly trickle, only launches this entrypoint when
+    zeta already fired) and no-ops -- prints the NO-FIRE reasons, exit 0 --
+    when it would not fire. ``--force`` bypasses the gate entirely and is
+    recorded in the report header as operator-initiated (``run_census``'s
+    own ``force`` parameter).
+
+    Otherwise builds the real default seams (headless-CLI ``invoke`` for
+    mining/verify/synthesis, MCP posters for ``submit_fn``/``escalate_fn``,
+    ``census_trigger.default_status_fetcher`` for the done-count baseline,
+    a stratified-random ``batch_source`` over the mining window, and a
+    scoped git-commit helper) and runs the full pipeline via
+    ``run_census``.
+
+    Returns non-zero only on a genuine fail-loud error (a config-load
+    failure, or an uncaught exception from ``run_census``) -- a deferred
+    (headroom-preflight) outcome still exits 0, mirroring
+    ``census_trigger``'s own CLI contract of reserving a non-zero exit for
+    an operator-facing failure, not an expected defer/no-fire outcome.
+    """
+    parser = argparse.ArgumentParser(
+        prog="census",
+        description="Legibility periodic-census runner "
+        "(plans/confusion-reduction-prd.md section 5.7, task eta).",
+    )
+    parser.add_argument(
+        "--project-root", default=".",
+        help="Root of the project being censused (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--config", default=None,
+        help="Path to the project's legibility.yaml "
+        "(default: <project-root>/docs/legibility/legibility.yaml).",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Bypass the census_trigger gate (operator-initiated run).",
+    )
+    parser.add_argument(
+        "--date", default=None, type=_parse_cli_date,
+        help="Census date YYYY-MM-DD (default: today UTC).",
+    )
+    args = parser.parse_args(argv)
+
+    project_root = Path(args.project_root)
+    config_path = (
+        Path(args.config) if args.config
+        else project_root / "docs" / "legibility" / "legibility.yaml"
+    )
+
+    try:
+        cfg = config.load_config(config_path)
+    except Exception as exc:  # noqa: BLE001 - a broken/missing config fails loud at CLI startup
+        print(f"census: failed to load config at {config_path}: {exc}", file=sys.stderr)
+        return 1
+
+    now = datetime.now(timezone.utc)
+    date_str = args.date.isoformat() if args.date is not None else now.date().isoformat()
+    status_fetcher = census_trigger.default_status_fetcher(project_root)
+
+    if not args.force:
+        decision = census_trigger.decide_for_project(
+            project_root, now=now, status_fetcher=status_fetcher,
+        )
+        if not decision.fire:
+            print(f"census: NO-FIRE for {cfg.project_id} -- pass --force to run anyway")
+            for reason in decision.reasons:
+                print(f"  {reason}")
+            return 0
+
+    codebook_path = project_root / "docs" / "legibility" / "confusion-codebook.yaml"
+    census_state_path = project_root / "docs" / "legibility" / "census-state.json"
+    report_path = project_root / "plans" / f"confusion-census-{date_str}.md"
+
+    try:
+        codebook_dict = codebook.load(codebook_path)
+    except FileNotFoundError:
+        logger.info(
+            "census: no codebook at %s yet, starting from an empty v2 document", codebook_path,
+        )
+        codebook_dict = {"version": 2, "entries": [], "candidates": []}
+
+    invoke = coder._invoke_cli
+
+    try:
+        outcome = run_census(
+            batch_source=default_batch_source(
+                cfg, projects_root=DEFAULT_PROJECTS_ROOT, now=now,
+            ),
+            invoke=invoke,
+            verify_fn=_build_default_verify_fn(str(project_root), invoke),
+            synthesize_fn=_build_default_synthesize_fn(invoke),
+            submit_fn=default_submit_fn,
+            escalate_fn=_build_default_escalate_fn(cfg),
+            status_fetcher=status_fetcher,
+            commit=_build_default_commit(project_root),
+            codebook_dict=codebook_dict,
+            config=cfg,
+            project_root=str(project_root),
+            project_id=cfg.project_id,
+            codebook_path=codebook_path,
+            census_state_path=census_state_path,
+            report_path=report_path,
+            date=date_str,
+            force=args.force,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail loud: non-zero exit, never a silent crash
+        print(f"census: FAILED -- {exc}", file=sys.stderr)
+        return 1
+
+    if outcome.status == "deferred":
+        print(f"census: deferred -- {outcome.reason}")
+        return 0
+
+    print(
+        f"census: done -- report={outcome.report_path} "
+        f"filed_tasks={len(outcome.filed_task_ids)} stop_reason={outcome.stop_reason}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
