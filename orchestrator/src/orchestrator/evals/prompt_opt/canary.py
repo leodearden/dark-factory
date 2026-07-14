@@ -73,18 +73,29 @@ def compute_window_metrics(rows: Iterable[Any]) -> WindowMetrics:
     ``outcome == 'done'`` rows, matching
     ``dashboard.data.performance.get_loop_histograms``'s done-filter
     convention.
+
+    Division-safe: an empty window (``n_rows == 0``) yields
+    ``requeue_rate == 0.0``, and a window with no done rows
+    (``n_done == 0``) yields ``cost_per_done_task is None`` and
+    ``mean_review_cycles == mean_verify_attempts == 0.0`` — no
+    ``ZeroDivisionError`` in either case.
     """
     rows = list(rows)
     n_rows = len(rows)
     n_requeued = sum(1 for r in rows if _field(r, 'outcome') == 'requeued')
-    requeue_rate = n_requeued / n_rows
+    requeue_rate = n_requeued / n_rows if n_rows else 0.0
 
     done_rows = [r for r in rows if _field(r, 'outcome') == 'done']
     n_done = len(done_rows)
-    total_cost = sum(_field(r, 'cost_usd') + _field(r, 'steward_cost_usd') for r in rows)
-    cost_per_done_task = total_cost / n_done
-    mean_review_cycles = sum(_field(r, 'review_cycles') for r in done_rows) / n_done
-    mean_verify_attempts = sum(_field(r, 'verify_attempts') for r in done_rows) / n_done
+    if n_done:
+        total_cost = sum(_field(r, 'cost_usd') + _field(r, 'steward_cost_usd') for r in rows)
+        cost_per_done_task = total_cost / n_done
+        mean_review_cycles = sum(_field(r, 'review_cycles') for r in done_rows) / n_done
+        mean_verify_attempts = sum(_field(r, 'verify_attempts') for r in done_rows) / n_done
+    else:
+        cost_per_done_task = None
+        mean_review_cycles = 0.0
+        mean_verify_attempts = 0.0
 
     return WindowMetrics(
         n_rows=n_rows,
