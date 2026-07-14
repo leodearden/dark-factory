@@ -12,6 +12,7 @@ resolve under pytest's --import-mode=importlib.
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
@@ -595,3 +596,101 @@ def test_assert_no_deletion_allows_retirement_via_status_change():
     assert after["entries"][0]["status"] == "retired"
     assert len(after["entries"]) == 1
     assert mod.validate(after) == []
+
+
+# ---------------------------------------------------------------------------
+# step-15: RED — main(argv) CLI end-to-end (tmp_path/capsys)
+# ---------------------------------------------------------------------------
+
+class TestMainCLI:
+    def test_validate_good_file_returns_zero(self, tmp_path):
+        path = tmp_path / "codebook.yaml"
+        mod.dump(_minimal_v2(), path)
+
+        ret = mod.main(["validate", str(path)])
+
+        assert ret == 0
+
+    def test_validate_broken_file_returns_nonzero_and_prints_errors(self, tmp_path, capsys):
+        codebook = _minimal_v2()
+        codebook["version"] = 1  # broken: v2 validator requires version == 2
+        path = tmp_path / "codebook.yaml"
+        mod.dump(codebook, path)
+
+        ret = mod.main(["validate", str(path)])
+        captured = capsys.readouterr()
+
+        assert ret != 0
+        assert captured.err.strip() != ""
+
+    def test_migrate_rewrites_v1_file_to_v2_in_place(self, tmp_path):
+        v1 = _v1_fixture()
+        path = tmp_path / "codebook.yaml"
+        mod.dump(v1, path)
+
+        ret = mod.main(["migrate", str(path)])
+
+        assert ret == 0
+        reloaded = mod.load(path)
+        assert reloaded["version"] == 2
+        assert reloaded["candidates"] == []
+        assert all("sightings" in e for e in reloaded["entries"])
+        assert mod.validate(reloaded) == []
+
+    def test_migrate_is_idempotent(self, tmp_path):
+        v1 = _v1_fixture()
+        path = tmp_path / "codebook.yaml"
+        mod.dump(v1, path)
+
+        first = mod.main(["migrate", str(path)])
+        second = mod.main(["migrate", str(path)])
+
+        assert first == 0
+        assert second == 0
+        assert mod.validate(mod.load(path)) == []
+
+    def _write_apply_fixtures(self, tmp_path):
+        codebook = _codebook_with_entry_a()
+        codebook_path = tmp_path / "codebook.yaml"
+        mod.dump(codebook, codebook_path)
+
+        record = _match_record()
+        record["candidates"] = [
+            {
+                "title": "novel shape",
+                "cause": "...",
+                "area": "...",
+                "origin_phase": "architect",
+                "manifested_phase": "verify",
+                "evidence_quote": "...",
+            }
+        ]
+        records_path = tmp_path / "records.jsonl"
+        records_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        return codebook_path, records_path
+
+    def test_apply_applies_match_and_candidate_and_rewrites_file(self, tmp_path):
+        codebook_path, records_path = self._write_apply_fixtures(tmp_path)
+
+        ret = mod.main(["apply", str(codebook_path), str(records_path)])
+
+        assert ret == 0
+        reloaded = mod.load(codebook_path)
+        entry = next(e for e in reloaded["entries"] if e["id"] == "entry-a")
+        assert len(entry["sightings"]) == 1
+        assert len(reloaded["candidates"]) == 1
+        assert mod.validate(reloaded) == []
+
+    def test_apply_is_idempotent_at_file_level(self, tmp_path):
+        codebook_path, records_path = self._write_apply_fixtures(tmp_path)
+
+        first = mod.main(["apply", str(codebook_path), str(records_path)])
+        second = mod.main(["apply", str(codebook_path), str(records_path)])
+
+        assert first == 0
+        assert second == 0
+        reloaded = mod.load(codebook_path)
+        entry = next(e for e in reloaded["entries"] if e["id"] == "entry-a")
+        assert len(entry["sightings"]) == 1
+        assert len(reloaded["candidates"]) == 1
+        assert mod.validate(reloaded) == []
