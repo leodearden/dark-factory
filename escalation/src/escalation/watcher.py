@@ -113,6 +113,12 @@ def _read_exclude_file(path: Path | None) -> frozenset[str]:
     Fails open (returns an empty frozenset) when path is None or the file
     is missing/unreadable — a transient miss is retried on the next poll
     rather than treated as a fatal error.
+
+    Re-read in full on every poll, so a caller appending a new id mid-run
+    should do so as a single short-line append (e.g. `echo esc-id >> file`),
+    which is atomic on POSIX filesystems. A poll racing a non-atomic,
+    multi-write append could observe a partially-written final line; this is
+    self-healing since the next poll re-reads the completed file.
     """
     if path is None:
         return frozenset()
@@ -209,14 +215,23 @@ def main() -> None:
     def current_excludes() -> frozenset[str]:
         return static_exclude | baseline_ids | _read_exclude_file(exclude_file_path)
 
-    # ARM inotify first so no events are missed between scan and watch.
+    # Baseline is frozen ONCE here, BEFORE inotify is armed, so the race
+    # window falls on the safe side: an escalation filed between this
+    # snapshot and add_watch() below is absent from the snapshot (so it is
+    # not permanently excluded) and, since no watch is armed yet, generates
+    # no inotify event either -- but it is still on disk by the time the
+    # initial scan below runs, so the scan's own directory glob picks it up
+    # and fires on it normally. Snapshotting AFTER add_watch() instead would
+    # let such an item be captured by the snapshot (permanently excluded)
+    # while ALSO queuing an inotify event that gets silently dropped as an
+    # excluded id -- i.e. a genuinely new item swallowed for the run's
+    # lifetime. Unlike --exclude-file, the baseline is never re-read.
+    baseline_ids = _snapshot_pending_ids(queue_dir) if args.baseline else frozenset()
+
+    # ARM inotify so no events are missed between the scan and the watch.
     inotify = INotify()
     watch_flags = flags.CREATE | flags.MOVED_TO
     inotify.add_watch(str(queue_dir), watch_flags)
-
-    # Baseline is frozen ONCE here (right after arming inotify, before the
-    # initial scan) -- unlike --exclude-file, it is never re-read.
-    baseline_ids = _snapshot_pending_ids(queue_dir) if args.baseline else frozenset()
 
     # Initial scan: emit any already-pending escalation and exit immediately.
     match = _initial_scan(queue_dir, args.task_id, args.level, current_excludes())
