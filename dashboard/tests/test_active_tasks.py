@@ -293,7 +293,7 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
         'id': 'solo/T-1', 'project': 'solo', 'title': 'lonely',
         'description': '', 'details': '', 'status': 'pending', 'agent': None,
         'started': 0, 'loops': 0, 'attempts': 0, 'deps': [],
-        'meta_files': [], 'train': None, 'external_deps': [],
+        'meta_files': [], 'train': None, 'external_deps': [], 'prd': None,
     }]
 
 
@@ -677,6 +677,147 @@ def test_build_task_row_external_deps_ignores_non_str_and_empty():
             'metadata': {'external_deps': ['', 'dark_factory:13', '', None, 42]}}
     row = _build_task_row('p', task, 1, {}, 'p/T-1')
     assert row['external_deps'] == [{'id': 'dark_factory:13', 'status': 'unknown'}]
+
+
+# ---------------------------------------------------------------------------
+# prd field coalescing on task rows (step-1 / step-2)
+# ---------------------------------------------------------------------------
+
+
+def test_build_task_row_prd_field_from_prd_path():
+    """_build_task_row coalesces metadata.prd_path into row['prd'] verbatim."""
+    task = {
+        'id': 1, 'title': 'x', 'status': 'pending',
+        'metadata': {'prd_path': 'plans/dashboard-taskgraph-legibility-prd.md'},
+    }
+    row = _build_task_row('p', task, 1, {}, 'p/T-1')
+    assert row['prd'] == 'plans/dashboard-taskgraph-legibility-prd.md'
+
+
+def test_build_task_row_prd_field_strips_anchor_suffix():
+    """A trailing '#anchor' fragment on prd_path is stripped."""
+    task = {
+        'id': 1, 'title': 'x', 'status': 'pending',
+        'metadata': {'prd_path': 'plans/foo-prd.md#implementation-notes'},
+    }
+    row = _build_task_row('p', task, 1, {}, 'p/T-1')
+    assert row['prd'] == 'plans/foo-prd.md'
+
+
+def test_build_task_row_prd_field_strips_section_suffix():
+    """A trailing '§section' fragment on prd_path is stripped."""
+    task = {
+        'id': 1, 'title': 'x', 'status': 'pending',
+        'metadata': {'prd_path': 'plans/foo-prd.md§Contract'},
+    }
+    row = _build_task_row('p', task, 1, {}, 'p/T-1')
+    assert row['prd'] == 'plans/foo-prd.md'
+
+
+def test_build_task_row_prd_field_trims_whitespace():
+    """Surrounding whitespace on prd_path is trimmed."""
+    task = {
+        'id': 1, 'title': 'x', 'status': 'pending',
+        'metadata': {'prd_path': '  plans/foo-prd.md  '},
+    }
+    row = _build_task_row('p', task, 1, {}, 'p/T-1')
+    assert row['prd'] == 'plans/foo-prd.md'
+
+
+def test_build_task_row_prd_field_legacy_prd_key():
+    """Legacy 'prd' key is coalesced when prd_path is absent."""
+    task = {
+        'id': 1, 'title': 'x', 'status': 'pending',
+        'metadata': {'prd': 'docs/legacy-prd.md'},
+    }
+    row = _build_task_row('p', task, 1, {}, 'p/T-1')
+    assert row['prd'] == 'docs/legacy-prd.md'
+
+
+def test_build_task_row_prd_field_legacy_prd_ref_key():
+    """Legacy 'prd_ref' key is coalesced when prd_path and prd are absent."""
+    task = {
+        'id': 1, 'title': 'x', 'status': 'pending',
+        'metadata': {'prd_ref': 'docs/legacy-ref-prd.md'},
+    }
+    row = _build_task_row('p', task, 1, {}, 'p/T-1')
+    assert row['prd'] == 'docs/legacy-ref-prd.md'
+
+
+def test_build_task_row_prd_field_precedence_prd_path_over_prd_and_ref():
+    """When multiple provenance keys are present, prd_path wins over prd and prd_ref."""
+    task = {
+        'id': 1, 'title': 'x', 'status': 'pending',
+        'metadata': {
+            'prd_path': 'plans/winner-prd.md',
+            'prd': 'plans/loser-prd.md',
+            'prd_ref': 'plans/loser-ref-prd.md',
+        },
+    }
+    row = _build_task_row('p', task, 1, {}, 'p/T-1')
+    assert row['prd'] == 'plans/winner-prd.md'
+
+
+def test_build_task_row_prd_field_empty_prd_path_falls_through_to_prd():
+    """An empty-string prd_path is skipped in favor of a non-empty prd."""
+    task = {
+        'id': 1, 'title': 'x', 'status': 'pending',
+        'metadata': {'prd_path': '', 'prd': 'plans/fallback-prd.md'},
+    }
+    row = _build_task_row('p', task, 1, {}, 'p/T-1')
+    assert row['prd'] == 'plans/fallback-prd.md'
+
+
+def test_build_task_row_prd_field_suffix_only_prd_path_falls_through():
+    """A prd_path that is ONLY a suffix (cleans to '') falls through to the next key."""
+    task = {
+        'id': 1, 'title': 'x', 'status': 'pending',
+        'metadata': {'prd_path': '#just-an-anchor', 'prd': 'plans/fallback-prd.md'},
+    }
+    row = _build_task_row('p', task, 1, {}, 'p/T-1')
+    assert row['prd'] == 'plans/fallback-prd.md'
+
+
+def test_build_task_row_prd_field_none_when_no_provenance_keys():
+    """row['prd'] is None when no prd_path/prd/prd_ref keys are present."""
+    task = {'id': 1, 'title': 'x', 'status': 'pending', 'metadata': {}}
+    row = _build_task_row('p', task, 1, {}, 'p/T-1')
+    assert row['prd'] is None
+
+
+def test_build_task_row_prd_field_non_string_values_skipped():
+    """Non-string prd_path values (int, None) are skipped, yielding None."""
+    task = {
+        'id': 1, 'title': 'x', 'status': 'pending',
+        'metadata': {'prd_path': 123},
+    }
+    row = _build_task_row('p', task, 1, {}, 'p/T-1')
+    assert row['prd'] is None
+
+    task_none = {
+        'id': 1, 'title': 'x', 'status': 'pending',
+        'metadata': {'prd_path': None},
+    }
+    row_none = _build_task_row('p', task_none, 1, {}, 'p/T-1')
+    assert row_none['prd'] is None
+
+
+def test_build_task_row_prd_kwarg_overrides_metadata_coalescing():
+    """An explicit prd= kwarg wins verbatim over metadata coalescing.
+
+    Callers that already ran _coalesce_prd (e.g. the terminal-bucket loop, to
+    decide live-PRD membership) pass the result through instead of paying for
+    the split/strip work a second time; this proves the passthrough is used
+    rather than silently re-deriving from metadata.
+    """
+    task = {
+        'id': 1, 'title': 'x', 'status': 'pending',
+        'metadata': {'prd_path': 'plans/metadata-derived-prd.md'},
+    }
+    row = _build_task_row('p', task, 1, {}, 'p/T-1', prd='plans/explicit-prd.md')
+    assert row['prd'] == 'plans/explicit-prd.md', (
+        'an explicit prd kwarg must win over metadata coalescing'
+    )
 
 
 @pytest.mark.asyncio
@@ -1310,3 +1451,375 @@ async def test_collect_tasks_with_counts_resolve_external_offline_marker(
             f"expected status='offline' for dep {entry['id']!r} when MCP is offline, "
             f"got: {entry['status']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# live-PRD terminal-member exemption (step-3 / step-4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_live_prd_member_beyond_cap_is_exempted(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """A done member of a live (still-active) PRD is emitted even beyond max_done_per_project.
+
+    Project has:
+    - 1 active task (id=1) tagged metadata.prd_path='plans/x-prd.md' (keeps the PRD "live").
+    - A done x-prd member (id=2) OLDER than a no-prd done task (id=4), with a done
+      dependency (id=3) present in the task list.
+    - A no-prd done task (id=4), NEWER than id=2, which is the top-1 cap pick.
+
+    With max_done_per_project=1, the cap alone would only keep id=4. The x-prd
+    done member (id=2) must ALSO appear because its prd is still live, with
+    populated deps (resolved via by_id) and the usual terminal-row fields. The
+    no-prd top-1 row (id=4) is unaffected: deps==[].
+    """
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='xprd',
+        active_tasks=[
+            {'id': 1, 'title': 'active x-prd member', 'status': 'in-progress',
+             'dependencies': [], 'metadata': {'prd_path': 'plans/x-prd.md'}},
+        ],
+        done_tasks=[
+            {'id': 2, 'title': 'x-prd done member', 'status': 'done',
+             'dependencies': [3], 'metadata': {'prd_path': 'plans/x-prd.md'},
+             'updated_at': '2026-05-29T09:00:00+00:00'},
+            {'id': 3, 'title': 'x-prd done dep', 'status': 'done',
+             'dependencies': [], 'metadata': {},
+             'updated_at': '2026-05-29T08:00:00+00:00'},
+            {'id': 4, 'title': 'no-prd done newest', 'status': 'done',
+             'dependencies': [], 'metadata': {},
+             'updated_at': '2026-05-29T12:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                            max_done_per_project=1)
+
+    by_id = {t['id']: t for t in active}
+    assert 'xprd/T-2' in by_id, (
+        'live-PRD done member (id=2) must be emitted despite being beyond the top-1 cap'
+    )
+    row = by_id['xprd/T-2']
+    assert row['started'] == 0
+    assert row['completed'] == '2026-05-29T09:00:00+00:00'
+    assert row['deps'] == [{'id': 'xprd/T-3', 'title': 'x-prd done dep', 'done': True}]
+
+    # The no-prd top-1 row (id=4) is unaffected: still capped-in, still deps==[].
+    assert 'xprd/T-4' in by_id
+    assert by_id['xprd/T-4']['deps'] == []
+
+    # The dep task itself (id=3): no prd metadata, older than id=4 → stays excluded.
+    assert 'xprd/T-3' not in by_id, (
+        'the dep task itself (id=3, no prd, older, beyond cap) should stay excluded'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('active_status', ['blocked', 'pending', 'merge-deferred', 'deferred'])
+async def test_collect_active_tasks_live_prd_member_beyond_cap_exempted_for_other_active_statuses(
+    tmp_path, monkeypatch, dummy_client, active_status,
+):
+    """The live-PRD exemption keys on ANY _ACTIVE_STATUSES member, not just 'in-progress'.
+
+    Same shape as test_collect_active_tasks_live_prd_member_beyond_cap_is_exempted, but
+    the task keeping the PRD "live" is parametrized across the *other* members of
+    _ACTIVE_STATUSES. Guards against a regression that narrows "live" to just
+    'in-progress'.
+    """
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='statprd',
+        active_tasks=[
+            {'id': 1, 'title': 'active status-prd member', 'status': active_status,
+             'dependencies': [], 'metadata': {'prd_path': 'plans/status-prd.md'}},
+        ],
+        done_tasks=[
+            {'id': 2, 'title': 'status-prd done member', 'status': 'done',
+             'dependencies': [], 'metadata': {'prd_path': 'plans/status-prd.md'},
+             'updated_at': '2026-05-29T09:00:00+00:00'},
+            {'id': 3, 'title': 'no-prd done newest', 'status': 'done',
+             'dependencies': [], 'metadata': {},
+             'updated_at': '2026-05-29T12:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                            max_done_per_project=1)
+
+    ids = {t['id'] for t in active}
+    assert 'statprd/T-2' in ids, (
+        f'live-PRD done member must be exempted from the cap when kept live by a '
+        f'{active_status!r} member, not just "in-progress"'
+    )
+    assert 'statprd/T-3' in ids
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_fully_done_prd_not_exempted(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """A done member of a PRD with NO active member stays subject to the cap.
+
+    'plans/y-prd.md' has no task in _ACTIVE_STATUSES, so it is not a "live" PRD:
+    its done member does not get the terminal-member exemption and, being older
+    than the capped-in row, is excluded entirely.
+    """
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='yprd',
+        active_tasks=[],
+        done_tasks=[
+            {'id': 10, 'title': 'y-prd done member', 'status': 'done',
+             'dependencies': [], 'metadata': {'prd_path': 'plans/y-prd.md'},
+             'updated_at': '2026-05-29T09:00:00+00:00'},
+            {'id': 11, 'title': 'other done newest', 'status': 'done',
+             'dependencies': [], 'metadata': {},
+             'updated_at': '2026-05-29T12:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                            max_done_per_project=1)
+
+    ids = {t['id'] for t in active}
+    assert 'yprd/T-10' not in ids, (
+        'done member of a fully-done PRD (no active member) must NOT be exempted from the cap'
+    )
+    assert 'yprd/T-11' in ids
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_live_prd_member_within_cap_no_duplicate(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """A live-PRD done member that is ALSO within the top-N cap appears exactly once.
+
+    Single-pass emission must not double-emit a task that satisfies both the
+    capped_ids membership AND the is_live_member exemption, and it must carry
+    the populated-deps treatment either way.
+    """
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='zprd',
+        active_tasks=[
+            {'id': 1, 'title': 'active z-prd member', 'status': 'in-progress',
+             'dependencies': [], 'metadata': {'prd_path': 'plans/z-prd.md'}},
+        ],
+        done_tasks=[
+            {'id': 2, 'title': 'z-prd done member newest', 'status': 'done',
+             'dependencies': [3], 'metadata': {'prd_path': 'plans/z-prd.md'},
+             'updated_at': '2026-05-29T12:00:00+00:00'},
+            {'id': 3, 'title': 'z-prd done dep', 'status': 'done',
+             'dependencies': [], 'metadata': {},
+             'updated_at': '2026-05-29T08:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                            max_done_per_project=1)
+
+    matches = [t for t in active if t['id'] == 'zprd/T-2']
+    assert len(matches) == 1, f'expected exactly 1 row for the live-PRD member, got {len(matches)}'
+    assert matches[0]['deps'] == [{'id': 'zprd/T-3', 'title': 'z-prd done dep', 'done': True}]
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_live_prd_cancelled_member_beyond_cap_is_exempted(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """Cancelled-bucket symmetry: a cancelled member of a live PRD is exempted from
+    max_cancelled_per_project the same way a done member is exempted from
+    max_done_per_project.
+    """
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='cprd',
+        active_tasks=[
+            {'id': 1, 'title': 'active c-prd member', 'status': 'in-progress',
+             'dependencies': [], 'metadata': {'prd_path': 'plans/c-prd.md'}},
+        ],
+        done_tasks=[
+            {'id': 2, 'title': 'c-prd cancelled member', 'status': 'cancelled',
+             'dependencies': [3], 'metadata': {'prd_path': 'plans/c-prd.md'},
+             'updated_at': '2026-05-29T09:00:00+00:00'},
+            {'id': 3, 'title': 'c-prd cancelled dep', 'status': 'done',
+             'dependencies': [], 'metadata': {},
+             'updated_at': '2026-05-29T08:00:00+00:00'},
+            {'id': 4, 'title': 'no-prd cancelled newest', 'status': 'cancelled',
+             'dependencies': [], 'metadata': {},
+             'updated_at': '2026-05-29T12:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                            max_cancelled_per_project=1)
+
+    by_id = {t['id']: t for t in active}
+    assert 'cprd/T-2' in by_id, (
+        'live-PRD cancelled member (id=2) must be emitted despite being beyond the top-1 cap'
+    )
+    row = by_id['cprd/T-2']
+    assert row['started'] == 0
+    assert row['completed'] == '2026-05-29T09:00:00+00:00'
+    assert row['deps'] == [{'id': 'cprd/T-3', 'title': 'c-prd cancelled dep', 'done': True}]
+
+    assert 'cprd/T-4' in by_id
+    assert by_id['cprd/T-4']['deps'] == []
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_no_provenance_terminal_row_stays_capped(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """A terminal task with no prd metadata (sharing no live PRD) stays subject to
+    the cap and keeps deps==[] — the live-PRD exemption must not apply to it.
+    """
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='noprd',
+        active_tasks=[
+            {'id': 1, 'title': 'active, no prd', 'status': 'in-progress',
+             'dependencies': [], 'metadata': {}},
+        ],
+        done_tasks=[
+            {'id': 2, 'title': 'done newest, no prd', 'status': 'done',
+             'dependencies': [], 'metadata': {},
+             'updated_at': '2026-05-29T12:00:00+00:00'},
+            {'id': 3, 'title': 'done oldest, no prd', 'status': 'done',
+             'dependencies': [], 'metadata': {},
+             'updated_at': '2026-05-29T09:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                            max_done_per_project=1)
+
+    ids = {t['id'] for t in active}
+    assert 'noprd/T-3' not in ids, (
+        'no-provenance done row beyond the cap must stay excluded (no exemption applies)'
+    )
+    assert 'noprd/T-2' in ids
+    row = next(t for t in active if t['id'] == 'noprd/T-2')
+    assert row['deps'] == []
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_live_prd_exemption_warns_when_unusually_large(
+    tmp_path, monkeypatch, dummy_client, caplog,
+):
+    """A pathological PRD with far more live terminal members than the warn
+    threshold logs a warning — but still emits every member; the exemption
+    never silently drops rows, it only gains defensive visibility for an
+    unusually large count.
+    """
+    import dashboard.data.active_tasks as active_tasks_mod
+
+    n = active_tasks_mod._LIVE_PRD_EXEMPTION_WARN_THRESHOLD + 5
+    done_tasks = [
+        {'id': 100 + i, 'title': f'huge-prd done member {i}', 'status': 'done',
+         'dependencies': [], 'metadata': {'prd_path': 'plans/huge-prd.md'},
+         'updated_at': f'2026-05-29T09:{i % 60:02d}:00+00:00'}
+        for i in range(n)
+    ]
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='hugeprd',
+        active_tasks=[
+            {'id': 1, 'title': 'active huge-prd member', 'status': 'in-progress',
+             'dependencies': [], 'metadata': {'prd_path': 'plans/huge-prd.md'}},
+        ],
+        done_tasks=done_tasks,
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    with caplog.at_level('WARNING', logger='dashboard.data.active_tasks'):
+        active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                                max_done_per_project=1)
+
+    done_rows = [t for t in active if t['status'] == 'done']
+    assert len(done_rows) == n, (
+        'the exemption must still emit every live member even when the count is huge'
+    )
+    assert any(
+        'live-PRD exemption' in rec.message and 'hugeprd' in rec.message
+        for rec in caplog.records
+    ), 'an unusually large exemption count should log a warning'
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_live_prd_exemption_no_warning_under_threshold(
+    tmp_path, monkeypatch, dummy_client, caplog,
+):
+    """A normal-sized live-PRD exemption (well under the threshold) logs nothing."""
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='smallprd',
+        active_tasks=[
+            {'id': 1, 'title': 'active small-prd member', 'status': 'in-progress',
+             'dependencies': [], 'metadata': {'prd_path': 'plans/small-prd.md'}},
+        ],
+        done_tasks=[
+            {'id': 2, 'title': 'small-prd done member', 'status': 'done',
+             'dependencies': [], 'metadata': {'prd_path': 'plans/small-prd.md'},
+             'updated_at': '2026-05-29T09:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    with caplog.at_level('WARNING', logger='dashboard.data.active_tasks'):
+        active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                                max_done_per_project=1)
+
+    assert any(t['id'] == 'smallprd/T-2' for t in active)
+    assert not any('live-PRD exemption' in rec.message for rec in caplog.records), (
+        'a small exemption count must not trigger the pathological-case warning'
+    )
