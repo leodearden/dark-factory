@@ -1159,7 +1159,7 @@ async def _run_deferred_main_health_probe(
     try:
         current_main_sha = await git_ops.get_main_sha()
     except Exception:
-        logger.info(
+        logger.warning(
             'Task %s: deferred main-health probe: get_main_sha() re-resolve '
             'failed; skipping escalation (stale-check fail safe)',
             req.task_id,
