@@ -2151,6 +2151,87 @@ class TestGetAssembledReportNonActionableEchoSuppression:
 
 
 # ---------------------------------------------------------------------------
+# task-2453 step-1: cross_project_routing taxonomy guard — RED until step-2
+# wires _apply_cross_project_routing_guard into get_assembled_report.
+# ---------------------------------------------------------------------------
+
+
+class TestCrossProjectRoutingTaxonomyGuard:
+    """Verify get_assembled_report downgrades an anchor-less cross_project_routing
+    finding to category='other'/flag_type='cross_project_info'.
+
+    A non-empty cited_tasks list is the only machine-checkable proof that a
+    cite_task -> get_task routing check actually ran (recon_report.py:1075).
+    Without that anchor, category='cross_project_routing' is an unverified
+    claim and must be downgraded at read time rather than surfaced to
+    operators as a routing finding.
+    """
+
+    def _build_state(self):
+        """Build a ReconReportState with 'reify' registered and task_interceptor."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.server.recon_report import ReconReportState
+
+        task_interceptor = AsyncMock()
+        task_interceptor.get_task = AsyncMock(return_value={
+            'title': 'Task from reify project',
+            'data': {},
+        })
+
+        state = ReconReportState(
+            ttl_seconds=3600,
+            clock=lambda: 0.0,
+            task_interceptor=task_interceptor,
+        )
+        state.known_projects['reify'] = '/tmp/reify'
+        return state
+
+    @pytest.mark.asyncio
+    async def test_cross_project_routing_without_cited_tasks_is_downgraded(self):
+        """A cross_project_routing finding with no cite_task anchor is downgraded
+        to category='other'/flag_type='cross_project_info' — it is NOT dropped,
+        and all other fields (finding_id/description/actionable/task_id) are
+        unchanged."""
+        state = self._build_state()
+        run_id = 'r2453-no-anchor'
+
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id,
+            severity='moderate',
+            category='cross_project_routing',
+            description='informational cross-project note',
+            suggested_action='FYI only, no routing check performed',
+            actionable=False,
+            task_id=None,
+            flag_type='cross_project',
+        )
+        assert 'error' not in r, f'add_finding failed: {r}'
+        finding_id = r['finding_id']
+        # Deliberately do NOT call cite_task — cited_tasks stays empty, so
+        # there is no machine-checkable proof of a routing check.
+
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None, 'get_assembled_report returned None'
+        items = assembled['flagged_items']
+        assert len(items) == 1, f'Expected 1 finding, got {len(items)}'
+        item = items[0]
+
+        assert item['finding_id'] == finding_id
+        assert item['category'] == 'other', (
+            f'Expected category downgraded to "other", got {item["category"]!r}'
+        )
+        assert item['flag_type'] == 'cross_project_info', (
+            f'Expected flag_type downgraded to "cross_project_info", got {item["flag_type"]!r}'
+        )
+        assert item['description'] == 'informational cross-project note'
+        assert item['actionable'] is False
+        assert item['task_id'] is None
+        assert item['cited_tasks'] == []
+
+
+# ---------------------------------------------------------------------------
 # task-1966 step-8: get_findings_for_run — RED until step-9 adds the method
 # ---------------------------------------------------------------------------
 
