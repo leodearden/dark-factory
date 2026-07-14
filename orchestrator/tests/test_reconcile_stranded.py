@@ -2241,9 +2241,10 @@ async def test_one_task_rejection_does_not_kill_sweep(harness: Harness, caplog):
     # Both tasks attempted; only one succeeded.
     assert call_count == 2
     assert result == 1  # only task 101 marked done
-    # Failure counter incremented for the rejecting task.
-    assert harness._reconcile_failure_counts.get('100') == 1
-    assert '101' not in harness._reconcile_failure_counts
+    # Per-tid failure counter retired (task 2243, W10-θ2 step-13/14): a
+    # rejection now escalates directly instead of being tallied toward a
+    # threshold — see test_rejection_escalates_immediately_no_counter_threshold.
+    assert not hasattr(harness, '_reconcile_failure_counts')
     # Honest log mentions the error_code, not "marked done".
     assert any(
         'failed to mark task 100 done' in r.getMessage()
@@ -2253,13 +2254,15 @@ async def test_one_task_rejection_does_not_kill_sweep(harness: Harness, caplog):
 
 
 @pytest.mark.asyncio
-async def test_n_strikes_escalates_to_l1(harness: Harness):
-    """After MAX_RECONCILE_FAILURES rejections, an L1 is filed.
+async def test_rejection_escalates_immediately_no_counter_threshold(harness: Harness):
+    """A SetTaskStatusRejected escalates on the FIRST occurrence.
 
-    Subsequent strikes (already-escalated) reset the counter to avoid
-    re-escalating on every sweep.
+    Task 2243, W10-θ2 step-13/14: the per-tid ``_reconcile_failure_counts``
+    dedup counter and its ``MAX_RECONCILE_FAILURES``-strikes threshold gate
+    are retired — recovery_for's caller now escalates directly on every
+    persistent rejection instead of silently swallowing it behind a
+    multi-sweep tally.
     """
-    from orchestrator.harness import MAX_RECONCILE_FAILURES
     from orchestrator.scheduler import DoneGateRejection
 
     # Inject a stub escalation queue to capture submissions.
@@ -2293,20 +2296,26 @@ async def test_n_strikes_escalates_to_l1(harness: Harness):
 
     harness.scheduler.mark_done = AsyncMock(side_effect=_always_reject)  # type: ignore[attr-defined]
 
-    # Run MAX_RECONCILE_FAILURES sweeps — escalation fires on the Nth.
-    for _ in range(MAX_RECONCILE_FAILURES):
-        await harness._reconcile_stranded_in_progress()
+    # A single sweep is enough — there is no strikes-threshold to climb.
+    await harness._reconcile_stranded_in_progress()
 
     assert len(submissions) == 1, (
-        f'expected exactly one L1 submission after {MAX_RECONCILE_FAILURES} '
-        f'consecutive rejections, got {len(submissions)}'
+        f'expected exactly one L1 submission after a single rejection, '
+        f'got {len(submissions)}'
     )
     esc = submissions[0]
     assert esc.task_id == '200'
     assert esc.severity == 'blocking'
     assert esc.category == 'reconcile_persistent_rejection'
-    # Counter reset after escalation so the next sweep starts a fresh count.
-    assert '200' not in harness._reconcile_failure_counts
+    assert not hasattr(harness, '_reconcile_failure_counts')
+
+    # A second consecutive rejection escalates AGAIN — there is no per-tid
+    # dedup counter left to suppress it.
+    await harness._reconcile_stranded_in_progress()
+    assert len(submissions) == 2, (
+        f'expected a second L1 submission on the next rejection (no dedup '
+        f'counter remains), got {len(submissions)}'
+    )
 
 
 # test_reconcile_persistent_citation_miss_escalates_l1,
@@ -2325,34 +2334,14 @@ async def test_n_strikes_escalates_to_l1(harness: Harness):
 # step-7/8. See the design decision on task 2243's plan and esc-2243-4.
 
 
-@pytest.mark.asyncio
-async def test_failure_counter_resets_on_success(harness: Harness):
-    """A successful mark_done clears the per-tid failure counter."""
-    from orchestrator.scheduler import DoneGateRejection
-
-    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
-    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
-        {'300': 'in-progress'}, None,
-    )
-
-    # First sweep: reject.
-    async def _reject(tid, *, kind, sha, note=None):
-        raise DoneGateRejection(
-            task_id=tid, missing_files=['x.py'],
-            raw='done_gate_missing_files',
-        )
-    harness.scheduler.mark_done = AsyncMock(side_effect=_reject)  # type: ignore[attr-defined]
-    await harness._reconcile_stranded_in_progress()
-    assert harness._reconcile_failure_counts.get('300') == 1
-
-    # Second sweep: succeed.
-    async def _succeed(tid, *, kind, sha, note=None):
-        await harness.scheduler.set_task_status(
-            tid, 'done', done_provenance={'kind': kind, 'commit': sha},
-        )
-    harness.scheduler.mark_done = AsyncMock(side_effect=_succeed)  # type: ignore[attr-defined]
-    await harness._reconcile_stranded_in_progress()
-    assert '300' not in harness._reconcile_failure_counts
+# test_failure_counter_resets_on_success was removed (task 2243, W10-θ2
+# step-13/14): it asserted that a successful mark_done cleared the per-tid
+# `_reconcile_failure_counts` counter — that counter (and its
+# MAX_RECONCILE_FAILURES threshold gate) is retired entirely, so there is no
+# longer any counter state to reset. See
+# test_rejection_escalates_immediately_no_counter_threshold above for the
+# replacement parity coverage (a rejection now escalates directly, with no
+# per-tid tally to clear on the next success).
 
 
 # ---------------------------------------------------------------------------
