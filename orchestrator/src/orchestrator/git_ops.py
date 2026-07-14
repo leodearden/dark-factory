@@ -1197,7 +1197,7 @@ class GitOps:
 
     @contextlib.asynccontextmanager
     async def ephemeral_worktree(
-        self, kind: WorktreeKind, sha: str,
+        self, kind: WorktreeKind, sha: str, *, warm_seed: bool = False,
     ) -> AsyncIterator[Path]:
         """Mint a throwaway detached worktree pinned at *sha*, with
         GUARANTEED scoped cleanup on exit (task θ, verify-plan PRD).
@@ -1228,6 +1228,30 @@ class GitOps:
                 :data:`PROTECTED_PREFIXES` key, so the reaper never
                 reclaims it mid-run).
             sha: Commit-ish to pin the detached worktree at.
+            warm_seed: When True AND the warm-lane CoW seed base is
+                resolvable (:meth:`_warm_lane_base_resolvable` returns
+                :attr:`WarmBaseHealth.OK`), CoW-seeds the minted
+                worktree's ``target/`` from the shared warm base via
+                :meth:`_seed_warm_lane` (mode ``'--fresh-checkout'``,
+                ``take_lane_lock=False`` since this CM already holds
+                ``<lane_dir>.lock`` for its own lifetime — see the Note
+                below) after a successful add and BEFORE the body runs,
+                turning a cold from-scratch build into a warm incremental
+                one. Any non-zero seed rc (absent script, disk pressure,
+                generic fault) is logged and the CM proceeds COLD — a
+                seed fault never breaks the probe (fail-soft, mirrors
+                :meth:`create_interactive_worktree`'s
+                seed-then-retain-cold-on-fault contract). The whole gate
+                (base-health check + seed call) is also wrapped in a
+                broad ``except Exception`` so this holds even if an
+                unexpected exception escapes those helpers — the gate
+                runs before the ``git worktree remove --force`` cleanup
+                below, so an unsuppressed raise here would leak the
+                registered worktree instead of degrading to cold. A
+                non-resolvable base (ABSENT/INDETERMINATE) skips the seed
+                subprocess entirely. Default ``False`` keeps
+                ``run_main_tip_sweep`` (``MAIN_SWEEP``) byte-identical to
+                before this parameter existed.
 
         Yields:
             The minted worktree path, already checked out at *sha*.
@@ -1329,6 +1353,51 @@ class GitOps:
                 with contextlib.suppress(Exception):
                     shutil.rmtree(tmp_path, ignore_errors=True)
                 raise
+
+            # task 2567: optionally CoW-seed the freshly-added worktree's
+            # target/ from the shared warm-lane base before the body runs,
+            # so a probe/sweep opted into warm_seed starts from a pre-built
+            # main instead of a cold from-scratch recompile. Fail-soft: any
+            # non-zero seed rc just logs and proceeds COLD — never raises,
+            # never removes the worktree. take_lane_lock=False because this
+            # CM already holds <lane_dir>.lock (above) for its entire
+            # lifetime; re-taking it inside _seed_warm_lane would
+            # self-deadlock against the identical path (see that method's
+            # take_lane_lock docstring note).
+            #
+            # task 2567 amendment: the whole gate is wrapped in a broad
+            # except so the never-raise contract is structural rather than
+            # relying on _warm_lane_base_resolvable() (catches only
+            # OSError) and _seed_warm_lane() (catches Exception) each
+            # behaving today. This runs BEFORE the `try: yield ... finally:
+            # git worktree remove --force` block below, so an unsuppressed
+            # raise here would skip that scoped cleanup entirely — leaking
+            # a registered git worktree that DD5 forbids reclaiming via a
+            # broad `git worktree prune`.
+            if worktree_added and warm_seed:
+                try:
+                    if self._warm_lane_base_resolvable() is WarmBaseHealth.OK:
+                        seed_rc = await self._seed_warm_lane(
+                            tmp_path, '--fresh-checkout', take_lane_lock=False,
+                        )
+                        if seed_rc != 0:
+                            logger.info(
+                                'ephemeral_worktree(%s): warm seed failed (rc=%d) '
+                                'for %s — proceeding COLD (fail-soft)',
+                                kind.name, seed_rc, tmp_path,
+                            )
+                    else:
+                        logger.debug(
+                            'ephemeral_worktree(%s): warm base not resolvable — '
+                            'skipping seed, proceeding COLD for %s',
+                            kind.name, tmp_path,
+                        )
+                except Exception:
+                    logger.warning(
+                        'ephemeral_worktree(%s): warm-seed gate raised '
+                        'unexpectedly for %s — proceeding COLD (fail-soft)',
+                        kind.name, tmp_path, exc_info=True,
+                    )
 
             try:
                 yield tmp_path
@@ -2568,7 +2637,9 @@ class GitOps:
                 globs, artifact_dir, exc_info=True,
             )
 
-    async def _seed_warm_lane(self, lane_dir: Path, mode: str) -> int:
+    async def _seed_warm_lane(
+        self, lane_dir: Path, mode: str, *, take_lane_lock: bool = True,
+    ) -> int:
         """Run seed-warm-lane.sh to CoW-seed the lane's target/ from the warm base.
 
         Invokes ``<lane_dir>/scripts/seed-warm-lane.sh <base_target> <lane_dir> <mode>``
@@ -2602,6 +2673,20 @@ class GitOps:
         re-acquire's seed can no longer both proceed against the same
         ``target/`` at once — see that method's "Lane-lock coupling gap"
         docstring note for the full race analysis (now closed).
+
+        **``take_lane_lock`` (task 2567)**: when ``False``, the OUTER
+        ``flock -x <lane_dir>.lock`` wrapper described above is omitted
+        entirely — only the INNER per-gen-dir ``flock -s <gen>.lock``
+        (symlink branch only; a different path) is still taken. Callers
+        that already hold ``<lane_dir>.lock`` themselves for the whole
+        call (e.g. :meth:`GitOps.ephemeral_worktree`'s CM-lifetime flock,
+        task 2507) MUST pass ``take_lane_lock=False`` — re-acquiring the
+        IDENTICAL path from the same process would self-deadlock against
+        the bounded wait below, timing out at
+        ``_SEED_WARM_LANE_LOCK_TIMEOUT_RC`` after
+        ``_SEED_WARM_LANE_LOCK_WAIT_SECS`` on every call. Default ``True``
+        keeps every other existing caller (``acquire_warm_lane``,
+        ``create_interactive_worktree``, recycle) byte-identical.
 
         **Bounded wait, not unbounded (task 2599 amendment)**: seeding runs
         on the latency-sensitive warm-lane acquisition hot path, so the
@@ -2657,12 +2742,16 @@ class GitOps:
             # distinct, diagnosable rc instead of stalling this hot path
             # forever.
             lane_lock = lane_dir.with_name(lane_dir.name + '.lock')
-            lane_lock_flock = [
-                'flock', '-x',
-                '-w', str(_SEED_WARM_LANE_LOCK_WAIT_SECS),
-                '-E', str(_SEED_WARM_LANE_LOCK_TIMEOUT_RC),
-                str(lane_lock),
-            ]
+            lane_lock_flock = (
+                [
+                    'flock', '-x',
+                    '-w', str(_SEED_WARM_LANE_LOCK_WAIT_SECS),
+                    '-E', str(_SEED_WARM_LANE_LOCK_TIMEOUT_RC),
+                    str(lane_lock),
+                ]
+                if take_lane_lock
+                else []
+            )
             base_path = self.warm_lane_base_target_path
             if base_path.is_symlink():
                 # D8: resolve relative-sibling symlink (target -> .gen.N) to the

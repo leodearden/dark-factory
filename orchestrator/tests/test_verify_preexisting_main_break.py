@@ -19,7 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import GitOps, WorktreeKind
 from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
@@ -468,4 +468,152 @@ class TestVerifyFailureIsPreexistingIntegration:
         assert main_sha_after == main_sha_before, (
             f'main SHA changed from {main_sha_before} to {main_sha_after}; '
             f'helper must never modify the repo or task worktree'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — task 2567: probe warm-seeds its target/ via ephemeral_worktree
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyFailureProbeWarmSeed:
+    """task 2567: the probe's ephemeral_worktree call passes warm_seed=True
+    (CoW-seeding target/ from the shared warm-lane base instead of a cold
+    from-scratch build), stays in the warm verify-timeout tier (no .task/,
+    is_merge_verify not forced True), and degrades fail-soft to cold on a
+    seed fault without changing the verdict.
+
+    RED today: verify.py's probe CM call passes no warm_seed kwarg, so the
+    spy sees warm_seed absent (falls back to ephemeral_worktree's own
+    warm_seed=False default) instead of True.
+    """
+
+    def test_probe_calls_ephemeral_worktree_with_warm_seed_true(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification',
+                         new=AsyncMock(return_value=SAME_RESULT)),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(
+                git_ops, 'ephemeral_worktree', wraps=git_ops.ephemeral_worktree,
+            ) as spied_cm,
+        ):
+            asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], FAILING_RESULT, git_ops,
+                )
+            )
+
+        assert spied_cm.call_count == 1, (
+            f'expected exactly 1 ephemeral_worktree call; got {spied_cm.call_count}'
+        )
+        call_args = spied_cm.call_args.args
+        call_kwargs = spied_cm.call_args.kwargs
+        assert call_args and call_args[0] is WorktreeKind.MAIN_PROBE, (
+            f'expected the probe to mint a MAIN_PROBE-kind worktree; got args={call_args!r}'
+        )
+        assert call_kwargs.get('warm_seed') is True, (
+            f'expected verify_failure_is_preexisting_on_main to call '
+            f'ephemeral_worktree(..., warm_seed=True); got kwargs={call_kwargs!r}'
+        )
+
+    def test_probe_stays_in_warm_timeout_tier(self, tmp_path: Path) -> None:
+        """Warm-tier regression: no .task/ dir and is_merge_verify is not
+        forced True, so the probe resolves the WARM verify-timeout budget
+        (matching its now-warm-seeded build) rather than the cold one."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        captured: dict[str, object] = {}
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        async def _capturing_verify(worktree_arg, *args, **kwargs) -> VerifyResult:
+            captured['worktree'] = worktree_arg
+            captured['kwargs'] = kwargs
+            return SAME_RESULT
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', side_effect=_capturing_verify),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+        ):
+            asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], FAILING_RESULT, git_ops,
+                )
+            )
+
+        assert 'worktree' in captured, 'expected run_scoped_verification to have been called'
+        captured_worktree = captured['worktree']
+        assert isinstance(captured_worktree, Path)
+        assert verify_module._is_verify_cold(captured_worktree, None) is False, (
+            'expected the probe worktree (no .task/ dir) to resolve WARM in '
+            '_is_verify_cold — a future edit must not flip this to cold'
+        )
+        captured_kwargs = captured['kwargs']
+        assert isinstance(captured_kwargs, dict)
+        assert captured_kwargs.get('is_merge_verify') is not True, (
+            'expected the probe to NOT force is_merge_verify=True (that would '
+            'push it onto the cold verify-timeout tier)'
+        )
+
+    def test_probe_verdict_unchanged_when_seed_fails_soft(self, tmp_path: Path) -> None:
+        """End-to-end fail-soft: base resolvable OK on disk, but
+        _seed_warm_lane itself faults (rc=75) — the probe must still
+        degrade to cold and produce the SAME verdict as before this task
+        (same-signature main -> (True, MAIN_SHA))."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        # A resolvable warm base on disk (OK), so the seed subprocess is
+        # actually attempted rather than short-circuited by the base gate.
+        base = git_ops.warm_lane_base_target_path
+        base.mkdir(parents=True, exist_ok=True)
+        (base / 'sentinel').write_text('base content')
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification',
+                         new=AsyncMock(return_value=SAME_RESULT)),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(git_ops, '_seed_warm_lane', new=AsyncMock(return_value=75)) as mock_seed,
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], FAILING_RESULT, git_ops,
+                )
+            )
+
+        mock_seed.assert_awaited_once()
+        assert result == (True, MAIN_SHA), (
+            f'expected the verdict to be unchanged by a seed fault '
+            f'(fail-soft to cold); got {result!r}'
         )

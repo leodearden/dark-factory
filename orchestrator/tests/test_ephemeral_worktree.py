@@ -42,7 +42,7 @@ from unittest.mock import AsyncMock, call, patch
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WorktreeKind
+from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WarmBaseHealth, WorktreeKind
 from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
@@ -916,3 +916,300 @@ class TestEphemeralWorktreeErrorDisposition:
         assert disposition.counts_against_requeue_cap is True
         assert disposition.block_class is BlockClass.AGENT_FAILURE
         assert disposition.reason_prefix == 'Ephemeral probe worktree add failed after retries'
+
+
+# ---------------------------------------------------------------------------
+# task 2567 step-1: GitOps._seed_warm_lane gains take_lane_lock
+# ---------------------------------------------------------------------------
+
+
+class TestSeedWarmLaneLaneLock:
+    """task 2567 step-1: pins the new ``take_lane_lock`` param on
+    ``GitOps._seed_warm_lane`` — the deadlock-avoidance seam for
+    ``ephemeral_worktree``'s upcoming CM-routed seed (task 2567's
+    LOAD-BEARING correctness fix: the CM already holds ``<lane_dir>.lock``
+    for its entire lifetime, so a naive seed call would self-deadlock
+    against the SAME lock path and time out after
+    ``_SEED_WARM_LANE_LOCK_WAIT_SECS``).
+
+    RED today: ``_seed_warm_lane`` has no ``take_lane_lock`` kwarg, so any
+    call passing it raises ``TypeError``.
+    """
+
+    @staticmethod
+    def _make_plain_base_and_script(git_ops: GitOps, lane: Path) -> None:
+        base = git_ops.warm_lane_base_target_path
+        base.mkdir(parents=True, exist_ok=True)
+        (base / 'sentinel').write_text('base content')
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / 'seed-warm-lane.sh').write_text('#!/usr/bin/env bash\nexit 0\n')
+
+    def test_take_lane_lock_false_omits_outer_flock(self, tmp_path: Path) -> None:
+        """(a): take_lane_lock=False -> argv[0] is the script path and
+        '<lane_dir>.lock' appears nowhere in argv."""
+        git_ops = GitOps(GitConfig(), tmp_path)
+        lane = tmp_path / '_lane-0'
+        self._make_plain_base_and_script(git_ops, lane)
+        calls: list[list[str]] = []
+
+        async def _fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return (0, '', '')
+
+        with patch('orchestrator.git_ops._run', side_effect=_fake_run):
+            rc = asyncio.run(
+                git_ops._seed_warm_lane(lane, '--fresh-checkout', take_lane_lock=False)
+            )
+
+        assert rc == 0, f'expected rc=0 from the fake script; got {rc}'
+        assert len(calls) == 1, f'expected exactly 1 subprocess call; got {calls}'
+        cmd = calls[0]
+        script_path = str(lane / 'scripts' / 'seed-warm-lane.sh')
+        lane_lock = str(lane) + '.lock'
+        assert cmd[0] == script_path, (
+            f'expected argv[0] to be the script path when take_lane_lock=False; got {cmd!r}'
+        )
+        assert lane_lock not in cmd, (
+            f'expected {lane_lock!r} to be absent from argv; got {cmd!r}'
+        )
+
+    def test_default_take_lane_lock_true_includes_outer_flock(self, tmp_path: Path) -> None:
+        """(b): default (take_lane_lock=True) -> argv begins with
+        'flock -x -w 30 -E 124 <lane_dir>.lock' then the script."""
+        git_ops = GitOps(GitConfig(), tmp_path)
+        lane = tmp_path / '_lane-0'
+        self._make_plain_base_and_script(git_ops, lane)
+        calls: list[list[str]] = []
+
+        async def _fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return (0, '', '')
+
+        with patch('orchestrator.git_ops._run', side_effect=_fake_run):
+            rc = asyncio.run(git_ops._seed_warm_lane(lane, '--fresh-checkout'))
+
+        assert rc == 0, f'expected rc=0 from the fake script; got {rc}'
+        assert len(calls) == 1, f'expected exactly 1 subprocess call; got {calls}'
+        cmd = calls[0]
+        lane_lock = str(lane) + '.lock'
+        script_path = str(lane / 'scripts' / 'seed-warm-lane.sh')
+        assert cmd[:6] == ['flock', '-x', '-w', '30', '-E', '124'], (
+            f'expected the outer flock -x -w 30 -E 124 prefix; got {cmd!r}'
+        )
+        assert cmd[6] == lane_lock, (
+            f'expected the lane lock path right after the flock flags; got {cmd!r}'
+        )
+        assert cmd[7] == script_path, (
+            f'expected the script path right after the outer flock argv; got {cmd!r}'
+        )
+
+    def test_symlink_base_take_lane_lock_false_keeps_inner_gen_flock(
+        self, tmp_path: Path,
+    ) -> None:
+        """(c): a symlink base (target -> .gen.N) with take_lane_lock=False
+        still includes the INNER 'flock -s <gen>.lock' wrapper — only the
+        OUTER lane lock is dropped."""
+        base_dir = tmp_path / 'bases'
+        base_dir.mkdir()
+        gen_dir = base_dir / '.gen.0'
+        gen_dir.mkdir()
+        (gen_dir / 'sentinel').write_text('gen content')
+        target_symlink = base_dir / 'target'
+        target_symlink.symlink_to('.gen.0')
+        (base_dir / '.gen.0.lock').touch()
+
+        config = GitConfig(warm_lane_base_target_dir=str(target_symlink))
+        git_ops = GitOps(config, tmp_path)
+        lane = tmp_path / '_lane-1'
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / 'seed-warm-lane.sh').write_text('#!/usr/bin/env bash\nexit 0\n')
+
+        calls: list[list[str]] = []
+
+        async def _fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return (0, '', '')
+
+        with patch('orchestrator.git_ops._run', side_effect=_fake_run):
+            rc = asyncio.run(
+                git_ops._seed_warm_lane(lane, '--fresh-checkout', take_lane_lock=False)
+            )
+
+        assert rc == 0, f'expected rc=0 from the fake script; got {rc}'
+        assert len(calls) == 1, f'expected exactly 1 subprocess call; got {calls}'
+        cmd = calls[0]
+        lane_lock = str(lane) + '.lock'
+        gen_lock = str(gen_dir) + '.lock'
+        assert lane_lock not in cmd, (
+            f'expected the OUTER lane lock to be absent from argv; got {cmd!r}'
+        )
+        assert cmd[:3] == ['flock', '-s', gen_lock], (
+            f'expected the INNER flock -s <gen_dir>.lock prefix to remain; got {cmd!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2567 step-3: GitOps.ephemeral_worktree gains warm_seed
+# ---------------------------------------------------------------------------
+
+
+class TestEphemeralWorktreeWarmSeed:
+    """task 2567 step-3: pins the new ``warm_seed`` param on
+    ``ephemeral_worktree`` — the reflink-seed integration point for the
+    main-health probe. When True and the warm-lane CoW seed base is
+    resolvable, the CM seeds the minted worktree's ``target/`` from the
+    shared base (via ``_seed_warm_lane(..., take_lane_lock=False)``, since
+    the CM already holds ``<lane_dir>.lock``) before the body runs. Any
+    seed fault is fail-soft (proceed COLD, body still runs); a
+    non-resolvable base skips the seed subprocess entirely; default False
+    keeps ``run_main_tip_sweep`` (MAIN_SWEEP) byte-identical.
+
+    RED today: ``ephemeral_worktree`` has no ``warm_seed`` kwarg, so any
+    call passing it raises ``TypeError``.
+    """
+
+    def test_warm_seed_true_and_base_ok_seeds_fresh_checkout_without_lane_lock(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        entered_paths: list[Path] = []
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(
+                WorktreeKind.MAIN_PROBE, MAIN_SHA, warm_seed=True,
+            ) as p:
+                entered_paths.append(p)
+                assert p.exists(), 'expected the minted path to exist inside the CM body'
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            patch.object(git_ops, '_seed_warm_lane', new=AsyncMock(return_value=0)) as mock_seed,
+            patch.object(git_ops, '_warm_lane_base_resolvable', return_value=WarmBaseHealth.OK),
+        ):
+            asyncio.run(_body())
+
+        assert len(entered_paths) == 1, 'expected the CM body to run exactly once'
+        mock_seed.assert_awaited_once_with(
+            entered_paths[0], '--fresh-checkout', take_lane_lock=False,
+        )
+
+    @pytest.mark.parametrize('seed_rc', [75, 127])
+    def test_warm_seed_fails_soft_on_nonzero_seed_rc(
+        self, tmp_path: Path, seed_rc: int,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        entered = False
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(
+                WorktreeKind.MAIN_PROBE, MAIN_SHA, warm_seed=True,
+            ):
+                entered = True
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            patch.object(git_ops, '_seed_warm_lane', new=AsyncMock(return_value=seed_rc)),
+            patch.object(git_ops, '_warm_lane_base_resolvable', return_value=WarmBaseHealth.OK),
+        ):
+            asyncio.run(_body())  # must not raise
+
+        assert entered, 'expected the CM body to still run (fail-soft) on a seed fault'
+        remove_calls = [c for c in calls if 'worktree' in c and 'remove' in c]
+        assert len(remove_calls) == 1, f'expected cleanup remove to still run; got {remove_calls}'
+
+    @pytest.mark.parametrize('raiser', ['_warm_lane_base_resolvable', '_seed_warm_lane'])
+    def test_warm_seed_gate_exception_is_structural_fail_soft(
+        self, tmp_path: Path, raiser: str,
+    ) -> None:
+        """task 2567 amendment: an unexpected exception escaping the
+        warm-seed gate (not just a non-zero seed rc) must not propagate
+        out of the CM and must not skip the scoped ``git worktree remove
+        --force`` cleanup. The gate is wrapped in its own broad
+        ``except Exception`` so this is structural, not merely dependent
+        on ``_warm_lane_base_resolvable``/``_seed_warm_lane`` each
+        catching everything internally today.
+        """
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        entered = False
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(
+                WorktreeKind.MAIN_PROBE, MAIN_SHA, warm_seed=True,
+            ):
+                entered = True
+
+        patches = [
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            patch.object(git_ops, '_warm_lane_base_resolvable', return_value=WarmBaseHealth.OK),
+            patch.object(git_ops, '_seed_warm_lane', new=AsyncMock(return_value=0)),
+        ]
+        if raiser == '_warm_lane_base_resolvable':
+            patches[1] = patch.object(
+                git_ops, '_warm_lane_base_resolvable', side_effect=RuntimeError('boom'),
+            )
+        else:
+            patches[2] = patch.object(
+                git_ops, '_seed_warm_lane', new=AsyncMock(side_effect=RuntimeError('boom')),
+            )
+
+        with patches[0], patches[1], patches[2]:
+            asyncio.run(_body())  # must not raise
+
+        assert entered, 'expected the CM body to still run (fail-soft) on a gate exception'
+        remove_calls = [c for c in calls if 'worktree' in c and 'remove' in c]
+        assert len(remove_calls) == 1, f'expected cleanup remove to still run; got {remove_calls}'
+
+    @pytest.mark.parametrize('health', [WarmBaseHealth.ABSENT, WarmBaseHealth.INDETERMINATE])
+    def test_warm_seed_skipped_when_base_not_ok(
+        self, tmp_path: Path, health: WarmBaseHealth,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        entered = False
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(
+                WorktreeKind.MAIN_PROBE, MAIN_SHA, warm_seed=True,
+            ):
+                entered = True
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            patch.object(git_ops, '_seed_warm_lane', new=AsyncMock(return_value=0)) as mock_seed,
+            patch.object(git_ops, '_warm_lane_base_resolvable', return_value=health),
+        ):
+            asyncio.run(_body())
+
+        mock_seed.assert_not_awaited()
+        assert entered, 'expected the CM body to still run cold when the base is not OK'
+
+    @pytest.mark.parametrize('kind', [WorktreeKind.MAIN_PROBE, WorktreeKind.MAIN_SWEEP])
+    def test_default_warm_seed_false_never_seeds(
+        self, tmp_path: Path, kind: WorktreeKind,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        entered = False
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(kind, MAIN_SHA):
+                entered = True
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            patch.object(git_ops, '_seed_warm_lane', new=AsyncMock(return_value=0)) as mock_seed,
+            patch.object(git_ops, '_warm_lane_base_resolvable', return_value=WarmBaseHealth.OK),
+        ):
+            asyncio.run(_body())
+
+        mock_seed.assert_not_awaited()
+        assert entered, 'expected the CM body to run normally'
