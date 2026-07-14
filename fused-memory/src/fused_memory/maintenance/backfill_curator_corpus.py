@@ -212,6 +212,46 @@ async def run_backfill(
         )
 
 
+async def run_prune(
+    config_path: str | None = None,
+    project_root: str = '.',
+) -> PruneReport:
+    """Load config, open the task backend, run the orphan-vector prune sweep, and close resources.
+
+    This is the CLI-callable entrypoint for curator corpus RC1 Layer C. It:
+    1. Loads FusedMemoryConfig (honouring CONFIG_PATH env var or config_path arg).
+    2. Creates a SqliteTaskBackend from config.taskmaster and connects it.
+    3. Creates a TaskCurator and runs BackfillManager.prune().
+    4. Returns a PruneReport with the live-task count and prune outcome.
+
+    Args:
+        config_path: Optional path to the YAML config file.  When given it is
+                     set as CONFIG_PATH before constructing FusedMemoryConfig.
+        project_root: Absolute path to the project root directory.
+
+    Returns:
+        PruneReport with live-task count and prune outcome.
+    """
+    async with maintenance_service(config_path) as (config, _service):
+        if config.taskmaster is not None:
+            tm_config = config.taskmaster.model_copy(update={'project_root': project_root})
+        else:
+            tm_config = TaskmasterConfig(project_root=project_root)
+        taskmaster = SqliteTaskBackend(config=tm_config)
+        await taskmaster.start()
+
+        curator = TaskCurator(config=config, taskmaster=taskmaster)
+
+        try:
+            manager = BackfillManager(config=config, taskmaster=taskmaster, curator=curator)
+            report = await manager.prune(project_root=project_root)
+        finally:
+            await curator.close()
+            await taskmaster.close()
+
+        return report
+
+
 if __name__ == '__main__':
     import argparse
 
