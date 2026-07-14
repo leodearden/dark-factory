@@ -522,6 +522,20 @@ def run_nightly(
         digests, cb, project=cfg.project_id, model=cfg.models.trickle, invoke=invoke,
     )
 
+    if run.status == 'failure':
+        # >50% of digests failed to code (PRD §5.3/§6.8 storm threshold):
+        # fail loud (decision 8) and skip merge/dump/commit entirely -- the
+        # codebook is left untouched rather than partially applied.
+        summary = f'legibility trickle coder storm: {run.failed}/{run.total} digests failed'
+        detail = '; '.join(f'{session}: {reason}' for session, reason in run.failures)
+        escalated = post_escalation(cfg, summary, detail, poster=poster)
+        return NightlyResult(
+            exit_code=1,
+            coder_status=run.status,
+            escalated=escalated,
+            reason=summary,
+        )
+
     applied = 0
     for record in run.records:
         cb, stats = codebook.apply_coding_record(cb, record)
