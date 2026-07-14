@@ -631,3 +631,64 @@ class TestSignalCountsAndScore:
             single_signal = dict(zero)
             single_signal[key] = 1
             assert one_user_turn_score > mod.score_signals(single_signal, n_user_turns=0)
+
+
+# ---------------------------------------------------------------------------
+# classify_agent_class — best-effort marker heuristics grounded in real
+# system-prompt/injection literals, with an 'unknown' empty-transcript
+# fallback and 'interactive' as the no-marker-matched default. A caller
+# override always wins verbatim (beta owns the authoritative class).
+# ---------------------------------------------------------------------------
+
+class TestClassifyAgentClass:
+    def test_empty_transcript_is_unknown(self):
+        assert mod.classify_agent_class([]) == 'unknown'
+
+    def test_task_id_worktree_injection_is_orchestrated_task(self):
+        # Literal orchestrator task-briefing preamble
+        # (orchestrator/src/orchestrator/dry_run_unblock.py).
+        records = [_meta_user(
+            'Task ID: 2572\nWorktree: /home/leo/src/dark-factory/.worktrees/2572\n'
+        )]
+
+        assert mod.classify_agent_class(records) == 'orchestrated-task'
+
+    def test_recon_stage_marker_is_recon(self):
+        # Shared phrase across all reconciliation stage system prompts
+        # (fused_memory/reconciliation/prompts/stage{1,2,3}.py).
+        records = [_assistant(_text(
+            'You are a Memory Consolidator agent operating in sleep mode.'
+        ))]
+
+        assert mod.classify_agent_class(records) == 'recon'
+
+    def test_watcher_marker_is_watcher(self):
+        # Canonical auto-watcher identity string
+        # (escalation/src/escalation/authority.py: _WATCHER_AUTO_IDENTITY).
+        records = [_tool_result('tu-1', 'resolved_by=orchestrator-escalation-watcher-auto')]
+
+        assert mod.classify_agent_class(records) == 'watcher'
+
+    def test_curator_classifier_marker_is_curator_classifier(self):
+        # Literal task-curator system-prompt fragment
+        # (fused_memory/middleware/task_curator.py).
+        records = [_assistant(_text(
+            'You are the task curator for the dark-factory orchestrator.'
+        ))]
+
+        assert mod.classify_agent_class(records) == 'curator-classifier'
+
+    def test_no_marker_falls_back_to_interactive(self):
+        records = [_user_text('just a normal conversation, please fix this bug')]
+
+        assert mod.classify_agent_class(records) == 'interactive'
+
+    def test_override_returned_verbatim_even_with_a_marker_present(self):
+        records = [_assistant(_text('operating in sleep mode'))]
+
+        result = mod.classify_agent_class(records, override='beta-authoritative-class')
+
+        assert result == 'beta-authoritative-class'
+
+    def test_override_wins_even_on_empty_transcript(self):
+        assert mod.classify_agent_class([], override='custom') == 'custom'
