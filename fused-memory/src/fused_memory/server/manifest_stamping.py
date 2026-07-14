@@ -1,0 +1,101 @@
+"""fused_memory.server.manifest_stamping — commit_planning capability-manifest stamper.
+
+Implements task γ of the capability-delivered-checks PRD
+(``plans/capability-delivered-checks-prd.md``): at ``commit_planning``, for
+each batch task whose metadata carries both ``prd_path`` and
+``prd_task_label``, locate the capability-manifest sidecar
+(``<prd-stem>.capability-manifest.yaml``), stamp the real ``task_id`` onto
+the matching label entry (written back to disk — the decompose session
+commits it, this module never does), and copy that label's MECHANICAL
+``delivered_checks`` (``grep``/``script`` kinds only — never ``manual``)
+into the producer task's ``metadata.delivered_checks`` via the interceptor's
+per-project write lock.
+
+Fail-soft, loud: no sidecar on disk is a complete no-op (``None`` — the
+caller attaches no ``manifest_stamping`` key, keeping the legacy response
+byte-identical); a malformed sidecar or absent labels populate
+``report['errors']`` but never raise and never block the ``commit_planning``
+status flip that called this helper.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from shared.capability_manifest import DeliveredCheckMeta, parse_capability_manifest
+
+_SIDECAR_SUFFIX = '.capability-manifest.yaml'
+
+
+async def stamp_capability_manifests(
+    *,
+    project_root: str,
+    ids: list[str],
+    tasks_data: list[Any],
+    task_interceptor: Any,
+    agent_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Stamp task_ids and copy mechanical delivered_checks for a commit_planning batch.
+
+    Args:
+        project_root: Absolute project root (matches ``commit_planning``'s
+            already-normalized value); sidecar paths resolve under this.
+        ids: The batch's task ids, id-aligned with ``tasks_data`` (same
+            ordering ``commit_planning`` used for its ``asyncio.gather``
+            read).
+        tasks_data: The already-fetched ``get_task``-shaped dicts for
+            ``ids`` — reused as-is, no extra reads. Non-dict entries (e.g.
+            unconfigured mocks in unit tests) are skipped.
+        task_interceptor: The live ``TaskInterceptor`` — ``update_task`` is
+            called per stamped label that carries mechanical checks.
+        agent_id: Forwarded to ``task_interceptor.update_task`` for
+            provenance.
+
+    Returns:
+        ``None`` when no batch task carries both a non-empty ``prd_path``
+        and ``prd_task_label``, or when the derived sidecar file doesn't
+        exist on disk — a complete no-op in both cases. Otherwise a
+        structured report ``{path, stamped, missing_labels, errors}``
+        (``path`` relative to ``project_root``).
+    """
+    # 1. Build the manifest-bearing set: (task_id, prd_task_label, derived
+    #    sidecar rel path) for batch tasks whose metadata carries BOTH a
+    #    non-empty prd_path and prd_task_label. The sidecar path is derived
+    #    STRICTLY via regex substitution — drift-immune vs the historically
+    #    drifting .md filename.
+    manifest_tasks: list[tuple[str, str, str]] = []
+    for tid, task in zip(ids, tasks_data, strict=False):
+        if not isinstance(task, dict):
+            continue
+        meta = task.get('metadata')
+        if not isinstance(meta, dict):
+            continue
+        prd_path = meta.get('prd_path')
+        prd_task_label = meta.get('prd_task_label')
+        if not prd_path or not prd_task_label:
+            continue
+        rel = re.sub(r'\.md$', '', prd_path) + _SIDECAR_SUFFIX
+        manifest_tasks.append((tid, prd_task_label, rel))
+
+    if not manifest_tasks:
+        return None
+
+    # 2. Keep only distinct rel paths (insertion order) whose file actually
+    #    exists on disk under project_root.
+    root = Path(project_root)
+    seen_rel_paths: list[str] = []
+    for _tid, _label, rel in manifest_tasks:
+        if rel not in seen_rel_paths:
+            seen_rel_paths.append(rel)
+    existing_rel_paths = sorted(rel for rel in seen_rel_paths if (root / rel).is_file())
+    if not existing_rel_paths:
+        return None
+
+    # TODO(step-4): load/validate the sidecar, stamp task_ids, write it back,
+    # and copy mechanical delivered_checks into producer metadata.
+    return None
