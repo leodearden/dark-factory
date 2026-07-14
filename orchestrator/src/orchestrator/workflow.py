@@ -2237,7 +2237,13 @@ class TaskWorkflow:
             # ...Exhausted/... triage — MRO resolution means a real subclass
             # instance always matches its OWN _DISPOSITION_TABLE row first
             # (e.g. WarmLanePoolHardDown before the WarmLaneRequeue base
-            # row), so this reproduces the old per-subclass strings exactly.
+            # row), so this reproduces the old per-subclass strings exactly
+            # — including for a bare WarmLaneRequeue (no subclass matches):
+            # the base row is deliberately ALIASED to WarmLaneDiskPressure's
+            # disposition, mirroring the pre-refactor `else: #
+            # WarmLaneDiskPressure` fallback exactly (amendment,
+            # reviewer_comprehensive behavior-parity — see the base row's
+            # comment in workflow_types._disposition_table()).
             # FAULT (RuntimeError) is deliberately NOT caught here — it falls
             # through to the broad except below → _mark_blocked → BLOCKED + L1.
             #
