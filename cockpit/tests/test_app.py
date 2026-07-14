@@ -2484,4 +2484,56 @@ class TestScanBackpressure:
             app._poll_registry()  # call #3: only runs if the flag was cleared
             await app.workers.wait_for_complete()
 
+
+class TestStaleScanSequenceGuard:
+    """esc-2517-1 (task 2517 verify) / task 2606: a stale threaded-poll scan
+    result must never regress the view below whatever a fresher scan already
+    applied. The real hazard is a call_from_thread hand-off landing out of
+    order -- a genuine thread race, and thus inherently timing-dependent to
+    reproduce with real poll ticks (see TestPollRefresh's docstring, which
+    hits the identical hazard and, for the same reason, drives
+    refresh_registry() directly instead of racing the poll timer). This test
+    pins the guard deterministically at the _apply_scan seam instead, with
+    hand-chosen sequence numbers standing in for "which scan read the
+    registry first".
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_stale_scan_result_is_ignored_by_apply_scan(self, tmp_path):
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            # FRESH: seq 100 applies cleanly.
+            fresh = [
+                _make_record(session_slug='fresh-1', status=sr.Status.RUNNING),
+                _make_record(session_slug='fresh-2', status=sr.Status.RUNNING),
+            ]
+            app._apply_scan(fresh, [], 100)
+            await pilot.pause()
+            assert table.row_count == 2
+
+            # STALE: seq 50 (< the 100 high-water mark) read the registry
+            # earlier and must be dropped -- not clobber fresh's 2 rows back
+            # down to 1.
+            stale = [_make_record(session_slug='stale-1', status=sr.Status.RUNNING)]
+            app._apply_scan(stale, [], 50)
+            await pilot.pause()
+            assert table.row_count == 2
+
+            # NEWER: seq 101 (> the 100 high-water mark) still applies --
+            # the guard blocks only stale results, never freezes the view.
+            newer = [
+                _make_record(session_slug='newer-1', status=sr.Status.RUNNING),
+                _make_record(session_slug='newer-2', status=sr.Status.RUNNING),
+                _make_record(session_slug='newer-3', status=sr.Status.RUNNING),
+            ]
+            app._apply_scan(newer, [], 101)
+            await pilot.pause()
+            assert table.row_count == 3
+
             assert scanner.calls == 3
