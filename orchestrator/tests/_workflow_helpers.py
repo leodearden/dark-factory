@@ -400,6 +400,57 @@ def _bind_landed_row(tmp_path: Path, *, task_id: str, advanced_sha: str) -> None
 
 
 # ---------------------------------------------------------------------------
+# Warm-lane workflow factory (moved from test_workflow_warm_lane_requeue.py —
+# task 2610, Group B — renamed from the bare `_make_workflow` since that name
+# is reused ~30x across the tests dir with different signatures).
+# ---------------------------------------------------------------------------
+
+
+def _make_warmlane_workflow(*, tmp_path: Path, task_id: str = '1859') -> TaskWorkflow:
+    """Build a minimal TaskWorkflow with mocked deps for create_worktree tests.
+
+    Unlike the _make_workflow in test_workflow_worktree_missing.py, this one
+    does NOT pre-populate wf.worktree — we want run() to call create_worktree
+    so the exception raised there propagates through run()'s exception handlers.
+    """
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = {'id': task_id, 'title': 'Test task', 'description': 'desc'}
+    assignment.modules = []  # empty → _resolve_module_configs returns [] cleanly
+
+    _spec = pydantic_spec(OrchestratorConfig)
+    config = MagicMock(spec_set=_spec)
+    config.fused_memory.project_id = 'dark_factory'
+    config.fused_memory.url = 'http://localhost:8002'
+    config.max_review_cycles = 2
+    config.max_amendment_rounds = 1
+    config.lock_depth = 2
+    config.steward_completion_timeout = 300.0
+    config.project_root = tmp_path / 'proj'
+    # worktree_identity_guard_enabled is read inside _setup_worktree_and_artifacts
+    # before create_worktree; let MagicMock return a truthy value (the default).
+
+    scheduler = MagicMock()
+    # get_status: return 'pending' so the pre-empt check doesn't raise TerminalExitRejection
+    scheduler.get_status = AsyncMock(return_value='pending')
+    scheduler.set_task_status = AsyncMock()
+
+    git_ops = MagicMock()
+    # create_worktree will be configured per-test
+
+    wf = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,
+        briefing=MagicMock(),
+        mcp=MagicMock(),
+    )
+    # Do NOT set wf.worktree — keep it None so run() calls create_worktree.
+    return wf
+
+
+# ---------------------------------------------------------------------------
 # Protocol-conformance assertion (static-only; never executes at runtime).
 # Mirrors the if TYPE_CHECKING / SchedulerFacade conformance block near the
 # bottom of test_workflow_e2e.py.
