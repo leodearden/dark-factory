@@ -105,6 +105,49 @@ async def inspect_systemd_unit(
     return result
 
 
+# Task 2611 (esc-2584-1): terminal ActiveState values accepted as proof that
+# an empty-baseline (no persistent MainPID) deploy actually activated its
+# target. An ALLOWLIST, not a ``('', 'failed')`` blocklist — a
+# transient/mid-transition state (``'activating'``, ``'deactivating'``,
+# ``'reloading'``), the wedged empty-string sentinel, and a missing/
+# malformed ``ActiveState`` (``None``) are all rejected, not just the
+# failed/wedged pair. ``'active'`` covers a ``.timer`` or a
+# ``RemainAfterExit=yes`` oneshot; ``'inactive'`` covers a plain
+# ``Type=oneshot`` service that ran to completion and settled back down.
+_EMPTY_BASELINE_TERMINAL_STATES = frozenset({'active', 'inactive'})
+
+
+def _empty_baseline_fresh(
+    baseline_monotonic: int, live_monotonic: object, active_state: object,
+) -> bool:
+    """Empty-baseline (``baseline_main_pid == 0``) freshness predicate (task 2611).
+
+    Shared by :func:`_deterministic_deploy_health_verdict` below (the
+    recon-sweep classifier) and ``proc_supervision.RestartPlan.
+    _execute_cross_unit_blocking`` (the live cross-unit verify leg) so the
+    empty-baseline freshness rule lives in exactly one place — task 2611
+    fixed the ``pid > 0`` false-block symmetrically at both sites, and a
+    single shared predicate stops them from silently diverging if the rule
+    ever changes again (program seam table: "never a second copy").
+
+    A ``.timer`` unit or a ``Type=oneshot`` service never reports a
+    persistent MainPID — even once genuinely active — so when the pre-deploy
+    baseline observed no main process (``baseline_main_pid == 0``),
+    freshness instead requires: ``live_monotonic`` (the live
+    ``ActiveEnterTimestampMonotonic``) is an int that has strictly advanced
+    past ``baseline_monotonic``, AND ``active_state`` has settled into
+    :data:`_EMPTY_BASELINE_TERMINAL_STATES` (``'active'`` or ``'inactive'``).
+    Everything else — ``'failed'``, the wedged ``''`` sentinel, a
+    transient/mid-transition state, or ``None`` (a missing ``ActiveState``
+    key on a malformed/partial inspect result) — is rejected.
+    """
+    return (
+        isinstance(live_monotonic, int)
+        and live_monotonic > baseline_monotonic
+        and active_state in _EMPTY_BASELINE_TERMINAL_STATES
+    )
+
+
 def _deterministic_deploy_health_verdict(
     inspect_result: dict | None,
     verify_baseline: VerifyBaseline | Mapping | None = None,
@@ -134,12 +177,14 @@ def _deterministic_deploy_health_verdict(
       ``.timer`` unit, a ``Type=oneshot`` service, or a unit that simply was
       not running yet — none of which can ever report a live MainPID, even
       once genuinely active. Requiring MainPID>0 here would permanently
-      misclassify a healthy install as 'unconfirmed', so it is dropped:
-      'healthy' iff the live ActiveEnterTimestampMonotonic has advanced
-      STRICTLY PAST the (zero) baseline's AND ActiveState is not in
-      ``('', 'failed')`` — the activation clock advancing, without the unit
-      ending up failed, is the fallback liveness signal when no persistent
-      PID is possible.
+      misclassify a healthy install as 'unconfirmed', so it is dropped in
+      favor of :func:`_empty_baseline_fresh`: 'healthy' iff the live
+      ActiveEnterTimestampMonotonic has advanced STRICTLY PAST the (zero)
+      baseline's AND ActiveState has settled into ``'active'`` or
+      ``'inactive'`` (an ALLOWLIST, not a ``('', 'failed')`` blocklist — a
+      transient/mid-transition state like ``'activating'`` or
+      ``'deactivating'``, and a missing/malformed ``ActiveState`` (``None``),
+      are rejected too, not just the failed/wedged pair).
 
     ``verify_baseline`` accepts either a ``VerifyBaseline`` instance or a
     plain ``Mapping`` (the ``to_metadata()``-shaped
@@ -187,12 +232,12 @@ def _deterministic_deploy_health_verdict(
             isinstance(live_monotonic, int) and live_monotonic > baseline_monotonic
         )
         if baseline_pid == 0:
-            # Empty baseline (task 2611): fall back to activation-clock
-            # advance + non-failed ActiveState — pid>0 can never be
-            # satisfied for a .timer/Type=oneshot target, so it is not
-            # required in this mode.
+            # Empty baseline (task 2611): pid>0 can never be satisfied for a
+            # .timer/Type=oneshot target, so freshness falls back to the
+            # shared _empty_baseline_fresh predicate (activation-clock
+            # advance + a settled, non-transient, non-failed ActiveState).
             active_state = inspect_result.get('ActiveState')
-            if monotonic_advanced and active_state not in ('', 'failed'):
+            if _empty_baseline_fresh(baseline_monotonic, live_monotonic, active_state):
                 return 'healthy'
             return 'unconfirmed'
         if pid_live and monotonic_advanced:

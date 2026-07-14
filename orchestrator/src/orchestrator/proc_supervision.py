@@ -25,7 +25,12 @@ invariants (RP-1..5, PRD Sec 5.1):
 IMPORTS :func:`orchestrator.systemd_inspect.inspect_systemd_unit` — never a
 second copy of the ``systemctl --user show`` subprocess call (program seam
 table: "never a second copy"; systemd_inspect.py's own module doc
-anticipates this import).
+anticipates this import). Also imports
+:func:`orchestrator.systemd_inspect._empty_baseline_fresh` (task 2611) for
+the same reason: the empty-baseline (``baseline_main_pid == 0`` —
+install-fresh ``.timer``/``Type=oneshot`` target) freshness rule is shared
+verbatim with ``systemd_inspect._deterministic_deploy_health_verdict``'s
+recon-sweep classifier rather than reimplemented here.
 
 Deliberately carries NO orchestrator-instance state (no
 DeterministicRunner/Harness/EscalationQueue handle) — mirrors
@@ -60,7 +65,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from orchestrator.systemd_inspect import inspect_systemd_unit
+from orchestrator.systemd_inspect import _empty_baseline_fresh, inspect_systemd_unit
 
 if TYPE_CHECKING:
     from escalation.models import Escalation
@@ -214,11 +219,14 @@ class FreshPidVerify:
       or a ``Type=oneshot`` service, both of which ALWAYS report MainPID=0
       even when genuinely active — esc-2584-1): a persistent PID can never
       be observed for these, so ``pid > 0`` is the wrong signal. Freshness
-      instead requires ``ActiveEnterTimestampMonotonic`` strictly later than
-      ``baseline_active_enter_monotonic`` AND ``ActiveState`` not in
-      ``('', 'failed')`` — the activation clock advancing, without the unit
-      having ended up failed, is the real "this deploy activated the unit"
-      proof when no persistent PID is possible.
+      instead defers to the shared ``systemd_inspect._empty_baseline_fresh``
+      predicate: ``ActiveEnterTimestampMonotonic`` strictly later than
+      ``baseline_active_enter_monotonic`` AND ``ActiveState`` settled into
+      ``'active'`` or ``'inactive'`` (an ALLOWLIST — a transient/
+      mid-transition state, a wedged/missing ``ActiveState``, and ``'failed'``
+      are all rejected) — the activation clock advancing, without the unit
+      having ended up failed or stuck mid-transition, is the real "this
+      deploy activated the unit" proof when no persistent PID is possible.
     """
 
     baseline_active_enter_monotonic: int
@@ -474,12 +482,17 @@ class RestartPlan:
         service, or a unit that simply was not running yet — none of which
         can ever report a live MainPID, even once genuinely active. In that
         case ``pid > 0`` is the wrong freshness signal entirely, so it is
-        dropped: freshness instead requires ``new_monotonic >
-        baseline_monotonic`` AND ``ActiveState not in ('', 'failed')`` — the
-        activation clock strictly advancing, without the unit ending up
-        failed, is the real "this deploy activated the unit" proof when no
-        persistent PID is possible. See ``FreshPidVerify``'s docstring for
-        the full two-mode contract.
+        dropped in favor of the shared ``systemd_inspect._empty_baseline_fresh``
+        predicate: freshness instead requires ``new_monotonic >
+        baseline_monotonic`` AND ``ActiveState`` settled into ``'active'`` or
+        ``'inactive'`` (an ALLOWLIST, not a ``('', 'failed')`` blocklist — a
+        transient/mid-transition state and a missing/malformed ``ActiveState``
+        are rejected too) — the activation clock strictly advancing, without
+        the unit ending up failed or stuck mid-transition, is the real "this
+        deploy activated the unit" proof when no persistent PID is possible.
+        See ``FreshPidVerify``'s docstring for the full two-mode contract, and
+        ``_empty_baseline_fresh`` for why this is a shared predicate rather
+        than a second copy of the rule.
         """
         assert self.verify is not None, 'router only calls this when wants_blocking'
 
@@ -521,17 +534,16 @@ class RestartPlan:
         # process was observed at the pre-deploy baseline inspect — inferred
         # to be a .timer/Type=oneshot target (or a unit not yet running),
         # neither of which can ever report a live MainPID. `pid>0` would be
-        # unsatisfiable there, so it is dropped in favor of the activation
-        # clock advancing without the unit ending up failed. A
-        # persistent-PID baseline (baseline_pid>0) keeps the original,
-        # stronger identity check unchanged.
+        # unsatisfiable there, so it is dropped in favor of the shared
+        # _empty_baseline_fresh predicate (activation clock advancing, with
+        # ActiveState settled into a terminal non-failed state — see that
+        # function's docstring in systemd_inspect.py for the full contract,
+        # shared verbatim with the recon-sweep classifier). A persistent-PID
+        # baseline (baseline_pid>0) keeps the original, stronger identity
+        # check unchanged.
         empty_baseline = baseline_pid == 0
         if empty_baseline:
-            fresh = (
-                isinstance(new_monotonic, int)
-                and new_monotonic > baseline_monotonic
-                and active_state not in ('', 'failed')
-            )
+            fresh = _empty_baseline_fresh(baseline_monotonic, new_monotonic, active_state)
         else:
             fresh = (
                 isinstance(pid, int)
@@ -547,7 +559,8 @@ class RestartPlan:
                     f'new ActiveState={active_state!r} new_monotonic={new_monotonic} '
                     f'baseline_monotonic={baseline_monotonic}. Expected a '
                     f'strictly-later ActiveEnterTimestampMonotonic after the '
-                    f'restart and a non-failed, non-wedged ActiveState (a '
+                    f'restart and ActiveState settled to \'active\' or '
+                    f'\'inactive\' (not failed, wedged, or mid-transition; a '
                     f'persistent MainPID is never required in this mode).'
                 )
             else:

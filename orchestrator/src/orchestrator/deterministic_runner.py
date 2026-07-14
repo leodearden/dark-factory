@@ -119,9 +119,12 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      was EMPTY (``baseline_main_pid == 0`` — a ``.timer`` unit or a
      ``Type=oneshot`` service, neither of which ever reports a live MainPID,
      even once genuinely active — task 2611/esc-2584-1), the ``MainPID>0``
-     requirement is dropped: freshness instead requires the
+     requirement is dropped: freshness instead defers to the shared
+     ``systemd_inspect._empty_baseline_fresh`` predicate, requiring the
      ``ActiveEnterTimestampMonotonic`` to have strictly advanced past the
-     baseline AND ``ActiveState`` not in ``('', 'failed')``.
+     baseline AND ``ActiveState`` to have settled into ``'active'`` or
+     ``'inactive'`` (an allowlist — a transient/mid-transition state, a
+     wedged/missing ``ActiveState``, and ``'failed'`` are all rejected).
    - If ``always_escalates=False``: hand off to ``_writeback_deploy_success``
      (task 2066), which stamps ``before_done_verified_at`` (the positive proof
      the resume path requires) and then sets the task to ``done`` with
