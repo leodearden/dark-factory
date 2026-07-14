@@ -138,6 +138,14 @@ mcp__fused-memory__commit_planning(
 
 If a single bulk call is rejected (e.g. payload-size cap), split into the smallest number of bulk calls that fit — still never one-at-a-time.
 
+### Step 5.5 — Stamp + commit the sidecar
+
+`commit_planning` is also the mechanical Greek-label → real-task-id mapping point: for every task in the batch carrying `metadata.prd_path` + `metadata.prd_task_label`, it locates the YAML sidecar from Step 2.5, stamps the matching label's `task_id`, writes the file back, and copies that label's mechanical (`grep`/`script`) `delivered_check`s into the producer task's `metadata.delivered_checks` (`manual` checks are never copied — they stay sidecar-only, excluded from the dispatch gate). The response carries a structured `manifest_stamping` report (`{path, stamped: [...], missing_labels: [...], errors: [...]}`); no sidecar on disk is a no-op — every non-manifest batch is byte-identical to today.
+
+The decompose session then commits the stamped sidecar — `git commit --only <sidecar>` in the same skill turn — mirroring how the `.md` manifest is committed beside the PRD (see CLAUDE.md "Working in the main checkout" for the `--only` rationale: it avoids sweeping up unrelated concurrent state in a machine-operated checkout).
+
+> **Interim reality.** Until sibling task γ lands, `commit_planning` does not yet perform this stamp. Hand-stamp `task_id` into the sidecar and commit it yourself, matching the committed exemplar's file header.
+
 ### Step 6 — Verify
 
 ```
@@ -157,6 +165,7 @@ State:
 - Number of tasks filed.
 - Number of intra-batch and out-of-batch dependencies wired.
 - The committed **capability-manifest** path, and any bindings that had to be resolved (re-scoped / re-homed / bound relaxed) to clear the gate.
+- The **YAML sidecar** path, whether `commit_planning` stamped it (or it was hand-stamped per the Step 5.5 interim note), and which producer tasks now carry `metadata.delivered_checks`.
 - Any tasks that came back `combined` (and into what).
 - A note that the orchestrator does **not** currently read `user_observable_signal` / `consumer_ref` / the substrate-confirmed flag — this metadata is substrate for a future tracking-infra session.
 
