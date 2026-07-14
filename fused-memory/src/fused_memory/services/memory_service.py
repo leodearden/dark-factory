@@ -2873,10 +2873,21 @@ class MemoryService:
         check Stage 3 uses instead of relying solely on the best-effort Mem0
         mirror.
 
-        NOTE: this revision assumes a wired ``recon_ledger`` — the
-        unwired/None case is handled by a follow-up guard.
+        Returns an INCONCLUSIVE ``{'present': False, 'ledger_available':
+        False, ...}`` when no ledger is wired — mirrors
+        ``write_cycle_summary`` returning ``False`` when unwired. Callers
+        must not read that as a definitive absence.
         """
-        record = await self.recon_ledger.get_by_identity(
+        ledger = getattr(self, 'recon_ledger', None)
+        if ledger is None:
+            return {
+                'present': False,
+                'ledger_available': False,
+                'project_id': project_id,
+                'run_id': run_id,
+                'stage': stage,
+            }
+        record = await ledger.get_by_identity(
             project_id,
             record_kind='cycle_summary',
             task_id='',
