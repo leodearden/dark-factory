@@ -2943,12 +2943,20 @@ class TestGetMergeQueue:
         independently and wait correctly" — i.e. the halt is recovered by a
         FRESH request (new request_id/future) hitting the barrier again, not
         by resuming this one, so retiring THIS request_id is correct and
-        expected. Assertions (3)-(4) below would RED if the terminal branch
-        regressed to a raw ``set_result()`` (the pre-2604 leak); assertions
-        (2)&(5) prove ``is_wip_halted``/``_lane_halt`` is untouched by
-        retirement (``_retire_item``/``_resolve_or_drop_abandoned`` mutate
-        only ``_live_items``/``_lifecycle``; the lane-halt flag is mutated
-        exclusively by the halt-lane methods).
+        expected.
+
+        The load-bearing regression guards here are assertions (3)-(4): they
+        would RED if the terminal branch regressed to a raw ``set_result()``
+        (the pre-2604 leak) that leaves the entry stuck non-terminal in
+        ``_live_items``. Assertions (2)&(5) are weaker than a "proves
+        untouched by retirement" framing implies — ``_retire_item``/
+        ``_resolve_or_drop_abandoned`` mutate only ``_live_items``/
+        ``_lifecycle``, and the lane-halt flag is mutated exclusively by the
+        halt-lane methods, so retirement structurally cannot reach it; a
+        hypothetical retirement-clears-halt bug is not what these two
+        assertions are positioned to catch. They instead document the
+        combined halted+retired end-state and confirm the halt reverses
+        cleanly via ``unhalt_wip()``.
         """
         import asyncio
         import types
