@@ -174,6 +174,43 @@ class TestExtractTriageVerdict:
 
 
 # ---------------------------------------------------------------------------
+# TRIAGE AgentRole — verdict-tools submit_triage tool grant
+#
+# Local (function-scope) import, matching the TestExtractTriageVerdict
+# convention above: TRIAGE does not exist yet, so importing it at module
+# level would turn this RED test into a collection-time ImportError for
+# every other test in the file.
+# ---------------------------------------------------------------------------
+
+class TestTriageRole:
+    def test_name_is_triage(self):
+        from orchestrator.agents.triage import TRIAGE
+
+        assert TRIAGE.name == 'triage'
+
+    def test_allowed_tools_include_submit_triage_and_read_tools(self):
+        from orchestrator.agents.triage import TRIAGE
+
+        assert 'mcp__verdict-tools__submit_triage' in TRIAGE.allowed_tools
+        assert 'Read' in TRIAGE.allowed_tools
+        assert 'Glob' in TRIAGE.allowed_tools
+        assert 'Grep' in TRIAGE.allowed_tools
+        assert 'mcp__fused-memory__get_tasks' in TRIAGE.allowed_tools
+        assert 'mcp__fused-memory__search' in TRIAGE.allowed_tools
+
+    def test_mcp_families_satisfy_post_init_capability_assertion(self):
+        # Importing TRIAGE constructs the module-level AgentRole immediately,
+        # so AgentRole.__post_init__ already ran by the time this import
+        # returns. A wrong mcp_families declaration (missing 'orchestrator'
+        # for the fused-memory tools, or 'verdict_tools' for submit_triage)
+        # would have raised ValueError at import time, failing this test
+        # with an error rather than an assertion failure.
+        from orchestrator.agents.triage import TRIAGE
+
+        assert TRIAGE.mcp_families == frozenset({'orchestrator', 'verdict_tools'})
+
+
+# ---------------------------------------------------------------------------
 # format_pretriaged_detail
 # ---------------------------------------------------------------------------
 
