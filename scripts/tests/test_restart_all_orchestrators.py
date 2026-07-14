@@ -286,3 +286,94 @@ def test_idle_unit_restarts_transparently_with_no_defer_line(tmp_path):
     assert ["--user", "restart", UNIT_R] in state["calls"], (
         f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-9: RED -- I4 (fail-toward-convergence), stale/absent branch
+# ---------------------------------------------------------------------------
+
+def test_absent_heartbeat_restarts_after_zero_grace(tmp_path):
+    """ABSENT (I4 fail-toward-convergence): a unit with no heartbeat file at
+    all still restarts once ORCH_DRAIN_UNKNOWN_GRACE_SECS elapses -- here 0,
+    so immediately."""
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    # No heartbeat file written for UNIT_R at all.
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_UNKNOWN_GRACE_SECS": "0",
+        },
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
+    )
+
+
+def test_stale_heartbeat_restarts_after_zero_grace(tmp_path):
+    """STALE (I4 fail-toward-convergence): a unit whose heartbeat exists but
+    is older than the freshness window still restarts once
+    ORCH_DRAIN_UNKNOWN_GRACE_SECS elapses -- here 0, so immediately."""
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, merge_idle=True, ts_epoch=time.time() - 99999)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_UNKNOWN_GRACE_SECS": "0",
+            "ORCH_DRAIN_FRESH_WINDOW_SECS": "120",
+        },
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
+    )
+
+
+def test_unknown_grace_withholds_restart_while_absent(tmp_path):
+    """Proves the unknown-grace wait is a REAL bounded wait, not an instant
+    fail-open: an absent heartbeat with a large ORCH_DRAIN_UNKNOWN_GRACE_SECS
+    is NOT restarted before the test's own short subprocess timeout fires.
+    This is the opposite fail-direction from the busy/defer path (which
+    protects an in-flight merge), but unknown status still gets a bounded
+    grace rather than restarting on the very first check."""
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    # No heartbeat file written for UNIT_R at all.
+
+    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+        _run_script(
+            bin_dir, state_path, fleet_dir, "--drain",
+            env={
+                "RESTART_VERIFY_TIMEOUT": "5",
+                "ORCH_DRAIN_UNKNOWN_GRACE_SECS": "99999",
+                "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            },
+            timeout=3,
+        )
+
+    stdout = _decode(exc_info.value.stdout)
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT_R] not in state["calls"], (
+        f"restart must NOT have been recorded yet; got calls={state['calls']!r} "
+        f"stdout={stdout!r}"
+    )
