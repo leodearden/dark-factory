@@ -20,8 +20,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import DeliveredChecksConfig, OrchestratorConfig, RELOADABLE_FIELDS
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.scheduler import Scheduler, TickContext
 
