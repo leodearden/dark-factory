@@ -7941,6 +7941,37 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             base_commit=base_commit,
         )
 
+    async def _branch_work_landed_on_main(
+        self, branch_head: str, main_sha: str, *, wt_head: str | None,
+    ) -> bool:
+        """True iff branch_head is an ancestor of main AND there is prior
+        implementation work — i.e. the branch's work genuinely landed, not
+        an empty/stale branch whose base trivially satisfies the ancestor
+        check.
+
+        Extracted from :meth:`_recover_before_merge` (task 2504), which
+        already implemented this ``is_ancestor AND has_work`` predicate
+        correctly, to share it with the ESCALATED-resume guard in
+        :meth:`_drive`, whose prior raw ``is_ancestor``-only check false-
+        positived on an empty branch (``wt_head == base_commit`` is
+        trivially an ancestor of main) and skipped implementer resume
+        entirely.
+
+        ``wt_head`` selects the :meth:`_has_prior_implementation` has-work
+        mode and is a parameter (not computed internally) because the two
+        call sites need different modes: the resume site passes its
+        reliable post-execution HEAD for the SHA-primary signal (an empty
+        branch correctly resolves ``has_work=False``); ``_recover_before_merge``
+        passes ``wt_head=None`` for the iteration-log fallback, because the
+        merge phase runs after a rebase where a post-rebase HEAD may
+        coincide with base_commit even on a genuinely-implemented branch.
+        See :meth:`_has_prior_implementation`'s docstring for the full
+        trade-off analysis of both modes.
+        """
+        if not await self.git_ops.is_ancestor(branch_head, main_sha):
+            return False
+        return self._has_prior_implementation(wt_head=wt_head).has_work
+
     async def _finalise_recovery_done(
         self, *, basis: str, sha: str, kind: str, note: str,
         files: list[str] | None = None,
