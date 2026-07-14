@@ -171,3 +171,49 @@ class TestAddMemoryNearDuplicateGate:
             f'Override must bypass the guard; got: {result!r}'
         )
         mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_fails_open_when_search_raises(self):
+        """A search error must never block the write — fail-open, not fail-closed."""
+        mock_service = AsyncMock()
+        mock_service.search.side_effect = TimeoutError('search backend unavailable')
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'procedural_knowledge_near_duplicate_write_blocked', (
+            f'A search failure must not block the write; got: {result!r}'
+        )
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_allows_write_when_search_returns_empty(self):
+        """No candidate results at all → no match → write proceeds."""
+        mock_service = AsyncMock()
+        mock_service.search.return_value = []
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'procedural_knowledge_near_duplicate_write_blocked', (
+            f'Empty search results must not block the write; got: {result!r}'
+        )
+        mock_service.add_memory.assert_called_once()
