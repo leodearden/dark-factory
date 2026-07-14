@@ -195,6 +195,85 @@ class TestRevertInProgressInfraHoldGuard:
 
 
 # ---------------------------------------------------------------------------
+# Task 2243 (W10-θ2) step-15/16: the applier no longer re-derives plan.lock
+# owner_pid liveness — TaskGroundTruth.recovery_for's live_claimant has
+# already established "no live claimant" before REVERT_TO_PENDING reaches
+# this applier, so the plan.lock-owner_pid re-check here is redundant.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestRevertInProgressLivenessGateRetired:
+    """_revert_in_progress_if_no_live_claimant no longer re-derives plan.lock
+    owner_pid liveness to decide whether to revert (task 2243, W10-θ2
+    step-16) — that determination now belongs entirely to
+    TaskGroundTruth.recovery_for, which has already ruled out a live
+    claimant before dispatching REVERT_TO_PENDING to this applier.
+    """
+
+    async def test_live_looking_lock_no_longer_blocks_revert(
+        self, harness: Harness,
+    ):
+        """A plan.lock recording a live owner_pid — the shape that used to
+        short-circuit this function with ``None`` (left intact) — no longer
+        blocks the revert: worktree cleaned up, lock unlinked, task flipped
+        to pending.
+        """
+        tid = '1889'
+        wt = _make_worktree(harness, tid, with_lock=True)
+        lock_path = wt / '.task' / 'plan.lock'
+        assert lock_path.exists(), 'Precondition: lock file must be seeded'
+
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid,
+            'status': 'in-progress',
+            'metadata': {},
+        })
+
+        result = await harness._revert_in_progress_if_no_live_claimant(
+            tid, mid_run=False,
+        )
+
+        assert result == 'reverted', (
+            f'A live-looking plan.lock must no longer block the revert — '
+            f'the resolver already established no live claimant before '
+            f'REVERT_TO_PENDING was dispatched here; got {result!r}'
+        )
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]
+        assert not lock_path.exists(), 'stale lock must be unlinked on revert'
+
+    async def test_live_looking_lock_preserved_worktree_still_reverts(
+        self, harness: Harness,
+    ):
+        """Same live-looking lock, but tid is in _preserved_worktrees: the
+        worktree survives (retention preserved) yet the task still reverts
+        to pending and the lock is still unlinked.
+        """
+        tid = '1890'
+        wt = _make_worktree(harness, tid, with_lock=True)
+        lock_path = wt / '.task' / 'plan.lock'
+        harness._preserved_worktrees.add(tid)
+
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid,
+            'status': 'in-progress',
+            'metadata': {},
+        })
+
+        result = await harness._revert_in_progress_if_no_live_claimant(
+            tid, mid_run=False,
+        )
+
+        assert result == 'reverted', (
+            f'A live-looking plan.lock must no longer block the revert even '
+            f'when the worktree is preserved; got {result!r}'
+        )
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        assert wt.exists(), 'preserved worktree must survive the revert'
+        assert not lock_path.exists(), 'stale lock must still be unlinked'
+
+
+# ---------------------------------------------------------------------------
 # Step 15: _on_escalation_resolved — infra_hold → resume-at-verify, NOT pending
 # ---------------------------------------------------------------------------
 
