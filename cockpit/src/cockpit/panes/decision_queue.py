@@ -194,6 +194,37 @@ class QueueItem:
     escalation_id: str | None
 
 
+_ID_PLACEHOLDER = '(none)'
+
+
+def format_copy_payload(item: QueueItem) -> str:
+    """Render *item* as a labeled multi-line clipboard payload (the copy
+    affordance, task 2517).
+
+    Mirrors detail_pane.render_detail's 'label: value' line style, so the
+    clipboard block matches what the detail pane already shows the
+    operator. Pure, no clock/IO. Fail-soft (PRD §2): a None task_id/
+    escalation_id degrades to a placeholder, never the literal string
+    'None'. The trailing id line is derived from item.kind/item.key --
+    'decision_id: <id>' for a decision, or 'session: <slug>' for a
+    session (slug = item.key after its 'session:' prefix).
+    """
+    if item.kind == 'session':
+        slug = item.key.split(':', 1)[1] if ':' in item.key else item.key
+        id_line = f'session: {slug}'
+    else:
+        id_line = f'decision_id: {item.decision_id}'
+    return '\n'.join(
+        [
+            f'question: {item.question or _QUESTION_PLACEHOLDER}',
+            f'project: {item.project}',
+            f'task_id: {item.task_id or _ID_PLACEHOLDER}',
+            f'escalation_id: {item.escalation_id or _ID_PLACEHOLDER}',
+            id_line,
+        ]
+    )
+
+
 def _to_display_target(display: Display | None) -> DisplayTarget | None:
     if display is None:
         return None
