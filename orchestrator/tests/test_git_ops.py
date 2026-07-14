@@ -3165,6 +3165,56 @@ class TestUnmergedDetection:
 
 
 @pytest.mark.asyncio
+class TestMergeParkRef:
+    """Tests for the _park_wip_on_private_ref helper (task 2556).
+
+    Parks pre-advance WIP on a private ref (refs/dark-factory/merge-park)
+    the merge worker exclusively owns, never the shared stash stack — see
+    MERGE_PARK_REF's docstring in git_ops.py.
+    """
+
+    async def test_park_wip_on_private_ref_uses_private_ref_not_stack(
+        self, git_ops: GitOps,
+    ):
+        """_park_wip_on_private_ref parks WIP on the private ref, not refs/stash."""
+        # Dirty a TRACKED file with known WIP content.
+        wip_content = '# WIP parked via private ref\n'
+        (git_ops.project_root / 'README.md').write_text(wip_content)
+
+        await git_ops._park_wip_on_private_ref('lbl')
+
+        # (1) The private ref was created.
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', 'refs/dark-factory/merge-park'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, 'expected refs/dark-factory/merge-park to resolve after park'
+
+        # (2) The parked commit's tree carries the WIP content.
+        _, shown, _ = await _run(
+            ['git', 'show', 'refs/dark-factory/merge-park:README.md'],
+            cwd=git_ops.project_root,
+        )
+        assert shown.strip() == wip_content.strip()
+
+        # (3) The shared stash stack was NOT touched.
+        _, stash_list, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_list.strip() == ''
+
+        # (4) The working tree is clean at HEAD after park (WIP moved off tree).
+        _, unstaged, _ = await _run(
+            ['git', 'diff', '--name-only'], cwd=git_ops.project_root,
+        )
+        _, staged, _ = await _run(
+            ['git', 'diff', '--name-only', '--cached'], cwd=git_ops.project_root,
+        )
+        assert not unstaged.strip(), f'expected clean working tree, unstaged: {unstaged}'
+        assert not staged.strip(), f'expected clean working tree, staged: {staged}'
+
+
+@pytest.mark.asyncio
 class TestSafeStashPopWithRecovery:
     """Tests for the _safe_stash_pop_with_recovery helper."""
 

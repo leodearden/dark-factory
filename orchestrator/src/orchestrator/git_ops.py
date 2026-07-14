@@ -135,6 +135,38 @@ def is_wip_safety_commit(subject: str) -> bool:
     return subject.strip().startswith(WIP_SAFETY_COMMIT_PREFIXES)
 
 
+# Single source of truth for the private ref advance_main uses to park
+# pre-advance WIP (task 2556).  Exclusively owned by the merge worker —
+# never the shared refs/stash stack, which a human or other session in
+# project_root can race (incident 13674d3c68: the worker popped/dropped a
+# human's stash).  See GitOps._park_wip_on_private_ref and
+# _safe_stash_pop_with_recovery.
+MERGE_PARK_REF = 'refs/dark-factory/merge-park'
+
+
+class MergeParkError(Exception):
+    """Base class for failures parking pre-advance WIP on MERGE_PARK_REF.
+
+    Raised by :meth:`GitOps._park_wip_on_private_ref` when the ``git stash
+    create`` / ``git update-ref`` infra sequence itself fails (not a
+    contention condition — see :class:`MergeParkContentionError` for that).
+    ``advance_main`` catches this and returns the existing
+    ``AdvanceResult 'stash_failed'`` code (loud CRITICAL log + permanent
+    halt to prevent code loss).
+    """
+
+
+class MergeParkContentionError(MergeParkError):
+    """Raised when MERGE_PARK_REF already exists at park time.
+
+    The merge worker is serialized, so a stale ref here is either an
+    invariant violation or a crash-leftover holding real, unrecovered WIP.
+    Never overwritten — :meth:`GitOps._park_wip_on_private_ref` raises this
+    instead so the caller can halt loudly rather than silently destroying
+    the preserved work.
+    """
+
+
 class TrainMembership(TypedDict, total=False):
     """Train metadata passed from task.metadata.train.
 
