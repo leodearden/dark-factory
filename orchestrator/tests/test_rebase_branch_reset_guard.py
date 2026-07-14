@@ -386,6 +386,16 @@ class TestRequeueReuseSitesRouteThroughGuard:
     ``rebase_preserving_task_commits`` so a wipe raises BranchResetError
     and preserves the branch's commit instead of silently losing it.
 
+    The warm-lane path is covered twice, deliberately: the unit-level
+    ``test_reuse_warm_lane_raises_on_wipe`` proves ``_reuse_warm_lane``
+    itself propagates the guard's exception in isolation, while
+    ``test_acquire_warm_lane_propagates_branch_reset`` drives the wipe
+    through the REAL production entry point (``acquire_warm_lane`` via the
+    disk-backstop reuse route) — proving the guard's typed exception isn't
+    flattened into ``WarmLaneUnavailable.FAULT`` by
+    ``_acquire_warm_lane_impl``'s broad ``except Exception`` on its way out
+    (step-8's ``except BranchResetError: raise`` re-raise).
+
     RED today (step-3): both sites still call the unguarded
     ``rebase_onto_main`` directly (rewired to the guard in step-4).
     """
@@ -444,6 +454,81 @@ class TestRequeueReuseSitesRouteThroughGuard:
 
         assert await _commits_over_main(lane) == 1, (
             'branch commit must survive the live-requeue (warm-lane) reuse rebase'
+        )
+
+    async def test_acquire_warm_lane_propagates_branch_reset(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """BranchResetError must PROPAGATE out of the production entry point
+        ``acquire_warm_lane`` — not be flattened into
+        ``WarmLaneUnavailable.FAULT`` by ``_acquire_warm_lane_impl``'s broad
+        ``except Exception`` (git_ops.py:4073).
+
+        ``test_reuse_warm_lane_raises_on_wipe`` above calls
+        ``_reuse_warm_lane`` directly, bypassing that broad handler, so it
+        cannot by itself prove the wipe reaches the branch_reset escalation
+        end-to-end. This test drives the wipe through the disk-backstop
+        reuse route (route 2) — the same route proven by
+        test_git_ops.py's ``TestAcquireDiskBackstopReuseDetachedRebind``
+        (test_git_ops.py:8523) — so ``_reuse_warm_lane``'s BranchResetError
+        must escape ``_acquire_warm_lane_impl``'s try/except rather than
+        being swallowed into a FAULT enum.
+
+        RED (step-7): the broad ``except Exception`` at git_ops.py:4073
+        still catches BranchResetError, so ``acquire_warm_lane`` returns
+        ``WarmLaneUnavailable.FAULT`` instead of raising, and
+        ``pytest.raises`` fails. GREEN after step-8 adds a targeted
+        ``except BranchResetError: raise`` clause before the broad handler.
+        """
+        import json as _json
+
+        _seed_default_warm_base(git_repo)
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        warm_config = GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+        warm_git_ops = GitOps(warm_config, git_repo, warm_lane_pool_size=1)
+
+        info = await warm_git_ops.acquire_warm_lane('WLW', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        lane = info.path
+
+        # Write .task/plan.json with task_id='WLW' — forces the disk-backstop
+        # route on re-acquire below.
+        task_dir = lane / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text(_json.dumps({'task_id': 'WLW'}))
+
+        await _commit_unique_work(lane, filename='wlw_feature.txt')
+        assert await _commits_over_main(lane) == 1
+
+        # Advance main with an UNRELATED sibling commit so a reset-to-main
+        # collapse would zero the branch.
+        (git_repo / 'main_advance.txt').write_text('main advance\n')
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'advance main'], cwd=git_repo)
+        _, main_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        main_head = main_head_raw.strip()
+
+        # release_warm_lane: detach + retain task/WLW (WIP > 0) + FREE.
+        await warm_git_ops.release_warm_lane(lane, 'WLW')
+
+        monkeypatch.setattr(warm_git_ops, 'rebase_onto_main', _wipe_via_reset)
+
+        with pytest.raises(BranchResetError):
+            await warm_git_ops.acquire_warm_lane('WLW', main_head)
+
+        assert await _commits_over_main(lane) == 1, (
+            "the guard's restore must preserve the committed work even when "
+            'routed through the production acquire_warm_lane entry'
         )
 
 
