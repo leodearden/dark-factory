@@ -2168,7 +2168,10 @@ class TestCrossProjectRoutingTaxonomyGuard:
     """
 
     def _build_state(self):
-        """Build a ReconReportState with 'reify' registered and task_interceptor."""
+        """Build a ReconReportState with 'reify' registered, task_interceptor,
+        and a fake memory_service (so both cite_task and cite_entity work —
+        the latter is needed to pin the cited_tasks-specific discriminator;
+        see test_cross_project_routing_with_only_cited_entity_is_still_downgraded)."""
         from unittest.mock import AsyncMock
 
         from fused_memory.server.recon_report import ReconReportState
@@ -2179,10 +2182,15 @@ class TestCrossProjectRoutingTaxonomyGuard:
             'data': {},
         })
 
+        class _FakeMemSvc:
+            async def get_entity(self, name: str, project_id: str) -> dict:
+                return {'nodes': [{'uuid': 'aaaa-bbbb', 'name': name}]}
+
         state = ReconReportState(
             ttl_seconds=3600,
             clock=lambda: 0.0,
             task_interceptor=task_interceptor,
+            memory_service=_FakeMemSvc(),
         )
         state.known_projects['reify'] = '/tmp/reify'
         return state
@@ -2276,6 +2284,56 @@ class TestCrossProjectRoutingTaxonomyGuard:
         assert len(item['cited_tasks']) == 1, (
             f'Expected 1 cited_task, got {item["cited_tasks"]!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_cross_project_routing_with_only_cited_entity_is_still_downgraded(self):
+        """A cross_project_routing finding with a cite_entity citation but NO
+        cite_task anchor is still downgraded — cited_entities is explicitly
+        NOT proof of a routing check (see _apply_cross_project_routing_guard's
+        docstring). Pins the cited_tasks-specific discriminator: a regression
+        that loosened the guard's condition to "all cited_* are empty" would
+        pass every other test in this class (they either leave every cited_*
+        list empty, or populate cited_tasks) but would fail here, since this
+        finding has a non-empty cited_entities with an empty cited_tasks."""
+        state = self._build_state()
+        run_id = 'r2453-entity-only-anchor'
+
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id,
+            severity='moderate',
+            category='cross_project_routing',
+            description='informational cross-project note citing an entity only',
+            suggested_action='FYI only, no get_task routing check performed',
+            actionable=False,
+            task_id=None,
+            flag_type='cross_project',
+        )
+        assert 'error' not in r, f'add_finding failed: {r}'
+        finding_id = r['finding_id']
+
+        cite_result = await state.cite_entity(
+            run_id=run_id, finding_id=finding_id, name='SomeEntity',
+        )
+        assert 'error' not in cite_result, f'cite_entity failed: {cite_result}'
+
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None
+        items = assembled['flagged_items']
+        assert len(items) == 1, f'Expected 1 finding, got {len(items)}'
+        item = items[0]
+
+        assert item['category'] == 'other', (
+            f'A cited_entities-only anchor must NOT satisfy the routing-check '
+            f'requirement; expected downgrade to "other", got {item["category"]!r}'
+        )
+        assert item['flag_type'] == 'cross_project_info', (
+            f'Expected flag_type downgraded to "cross_project_info", got {item["flag_type"]!r}'
+        )
+        assert len(item['cited_entities']) == 1, (
+            f'Expected the cite_entity citation to still be recorded, got {item["cited_entities"]!r}'
+        )
+        assert item['cited_tasks'] == []
 
     @pytest.mark.asyncio
     async def test_guard_is_category_scoped_other_categories_unaffected(self):
