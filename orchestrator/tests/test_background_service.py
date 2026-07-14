@@ -39,7 +39,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -276,3 +276,63 @@ class TestBackgroundServiceLoop:
         # path routes through BackoffPolicy rather than the plain interval.
         assert recording_sleep.delays.count(42.0) == 5
         assert recording_sleep.delays.count(0) >= 1
+
+
+class TestBackgroundServiceStop:
+    """step-7: BackgroundService.stop() contract."""
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_suppresses_and_clears_slot(self) -> None:
+        blocker = asyncio.Event()
+
+        async def pass_fn() -> None:
+            await blocker.wait()
+
+        svc = _make_service(pass_fn, interval_secs=0)
+        svc.start()
+        assert svc._task is not None
+
+        await asyncio.wait_for(svc.stop(), timeout=5)
+
+        assert svc._task is None
+
+    @pytest.mark.asyncio
+    async def test_stop_is_idempotent(self) -> None:
+        blocker = asyncio.Event()
+
+        async def pass_fn() -> None:
+            await blocker.wait()
+
+        svc = _make_service(pass_fn, interval_secs=0)
+        svc.start()
+
+        await svc.stop()
+        assert svc._task is None
+
+        # Second stop(): clean no-op, must not raise.
+        await svc.stop()
+        assert svc._task is None
+
+    @pytest.mark.asyncio
+    async def test_stop_never_started_is_noop(self) -> None:
+        svc = _make_service(AsyncMock())
+
+        await svc.stop()
+
+        assert svc._task is None
+
+    @pytest.mark.asyncio
+    async def test_stop_well_behaved_task_finishes_promptly(self) -> None:
+        """A loop mid-pass on a cooperative (non-blocking) pass_fn stops
+        promptly under cancellation — the bounded-stop contract that
+        LifecycleRegistry.stop_all's wait_for relies on (S1)."""
+
+        async def pass_fn() -> None:
+            await asyncio.sleep(0)
+
+        svc = _make_service(pass_fn, interval_secs=1000)
+        svc.start()
+
+        await asyncio.wait_for(svc.stop(), timeout=1)
+
+        assert svc._task is None
