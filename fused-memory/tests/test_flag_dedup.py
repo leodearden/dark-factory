@@ -666,6 +666,79 @@ async def test_dedup_flags_multiple_flags_one_ledger_failure_does_not_poison_bat
 
 
 # ---------------------------------------------------------------------------
+# canonical_flag_type_family helper (task 2503 step-1/step-2)
+# ---------------------------------------------------------------------------
+
+
+class TestCanonicalFlagTypeFamily:
+    """Tests for canonical_flag_type_family(flag_type) -> str.
+
+    Pure, sync, no-I/O helper that collapses case/separator/whitespace/
+    word-order variants of a flag_type into one deterministic family key —
+    used by filter_suppressed (reader) and write_suppression_record's
+    pre-write coverage check (writer) to recognize a reworded/reordered
+    flag_type as the same underlying finding (task 2503, causes #2/#3 of the
+    stage1_flag_suppression companion-record sprawl).
+
+    No literal-key pinning beyond the empty case — assertions compare
+    equality/inequality between inputs so the tests stay robust to the
+    exact canonicalization algorithm.
+    """
+
+    def test_case_variant_maps_to_same_family(self):
+        """'Missing_Deliverable' and 'missing_deliverable' collapse to the same key."""
+        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
+
+        assert canonical_flag_type_family('Missing_Deliverable') == canonical_flag_type_family(
+            'missing_deliverable'
+        )
+
+    def test_separator_variants_map_to_same_family(self):
+        """Hyphen, underscore, and space separators all collapse to the same key."""
+        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
+
+        underscore = canonical_flag_type_family('missing_deliverable')
+        hyphen = canonical_flag_type_family('missing-deliverable')
+        space = canonical_flag_type_family('missing deliverable')
+        assert underscore == hyphen == space
+
+    def test_word_order_variant_maps_to_same_family(self):
+        """Reordered tokens ('deliverable_missing') collapse to the same
+        family key as 'missing_deliverable' — the core fix for a reworded
+        flag_type evading exact-string suppression matching."""
+        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
+
+        assert canonical_flag_type_family('deliverable_missing') == canonical_flag_type_family(
+            'missing_deliverable'
+        )
+
+    def test_distinct_findings_stay_distinct(self):
+        """Genuinely different flag_types must NOT collapse to the same family."""
+        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
+
+        assert canonical_flag_type_family('missing_deliverable') != canonical_flag_type_family(
+            'stale_metadata'
+        )
+
+    @pytest.mark.parametrize('value', ['', '   ', '___', '---'])
+    def test_degenerate_input_collapses_to_empty_string(self, value):
+        """Empty/whitespace/all-separator input collapses to ''."""
+        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
+
+        assert canonical_flag_type_family(value) == ''
+
+    def test_idempotent(self):
+        """Applying the helper to its own output is a no-op — the output is
+        already lowercase, sorted, and '_'-joined."""
+        from fused_memory.reconciliation.flag_dedup import canonical_flag_type_family
+
+        for value in ('missing_deliverable', 'Missing-Deliverable Foo', ''):
+            once = canonical_flag_type_family(value)
+            twice = canonical_flag_type_family(once)
+            assert once == twice
+
+
+# ---------------------------------------------------------------------------
 # TestFilterSuppressed (task-1186 step-1; rewritten onto the ledger at task
 # 2227 step-4) — filter_suppressed reads the ReconLedgerStore's indexed
 # list_suppressions(project_id) query; no Mem0 search.
