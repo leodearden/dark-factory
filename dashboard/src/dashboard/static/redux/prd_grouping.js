@@ -62,7 +62,38 @@ function summarizePrdMembers(tasks) {
   return counts;
 }
 
-const API = { prdTitle, aggregatePrdStatus, summarizePrdMembers };
+// ── Bucket tasks by their `prd` field into ordered {prd, tasks, noPrd} groups ──
+// Non-null prds are bucketed in first-seen input order, each group's tasks
+// preserving input order (a Map preserves insertion order for its keys).
+// All prd===null (or missing) tasks are collected separately and, if any
+// exist, appended as a single trailing group flagged `noPrd: true` — always
+// last, regardless of where in the input those tasks appeared.
+function groupTasksByPrd(tasks) {
+  const order = [];
+  const byPrd = new Map();
+  const noPrdTasks = [];
+
+  for (const t of tasks) {
+    const prd = t.prd != null ? t.prd : null;
+    if (prd === null) {
+      noPrdTasks.push(t);
+      continue;
+    }
+    if (!byPrd.has(prd)) {
+      byPrd.set(prd, []);
+      order.push(prd);
+    }
+    byPrd.get(prd).push(t);
+  }
+
+  const groups = order.map(prd => ({ prd, tasks: byPrd.get(prd), noPrd: false }));
+  if (noPrdTasks.length > 0) {
+    groups.push({ prd: null, tasks: noPrdTasks, noPrd: true });
+  }
+  return groups;
+}
+
+const API = { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = API;
