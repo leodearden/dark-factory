@@ -10,19 +10,24 @@ test_config_psi_admission_reload.py's stated rationale).
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 
-import orchestrator.routing as routing_module
 import pytest
 import yaml
 from click.testing import CliRunner
 from pydantic import ValidationError
+from shared.cli_invoke import AgentResult
+from shared.config_models import AccountConfig, UsageCapConfig
 
+import orchestrator.routing as routing_module
 from orchestrator.cli import main
 from orchestrator.config import (
     RELOADABLE_FIELDS,
+    BackendsConfig,
     ModelsConfig,
     OrchestratorConfig,
     RoutingConfig,
+    UnblockAutoConfig,
     apply_reload,
 )
 from orchestrator.routing import (
@@ -32,8 +37,6 @@ from orchestrator.routing import (
     probe_models,
     render_probe_artifact,
 )
-from shared.cli_invoke import AgentResult
-from shared.config_models import AccountConfig, UsageCapConfig
 
 
 class TestRoutingConfigDefaults:
@@ -62,7 +65,7 @@ class TestAllowlistFailFastValidation:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError) as exc_info:
-            OrchestratorConfig(models={'architect': 'sonnett'})
+            OrchestratorConfig(models=ModelsConfig(architect='sonnett'))
         message = str(exc_info.value)
         assert 'architect' in message
         assert 'sonnett' in message
@@ -70,14 +73,14 @@ class TestAllowlistFailFastValidation:
     def test_all_in_allowlist_config_constructs_ok(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        cfg = OrchestratorConfig(models={'architect': 'haiku'})
+        cfg = OrchestratorConfig(models=ModelsConfig(architect='haiku'))
         assert cfg.models.architect == 'haiku'
 
     def test_unblock_auto_model_outside_allowlist_raises(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError) as exc_info:
-            OrchestratorConfig(unblock_auto={'model': 'bogus-model-9'})
+            OrchestratorConfig(unblock_auto=UnblockAutoConfig(model='bogus-model-9'))
         message = str(exc_info.value)
         assert 'unblock_auto' in message or 'model' in message
         assert 'bogus-model-9' in message
@@ -94,8 +97,8 @@ class TestNonClaudeBackendScopeBoundary:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         cfg = OrchestratorConfig(
-            backends={'reviewer': 'gemini'},
-            models={'reviewer': 'gemini-2.5-pro'},
+            backends=BackendsConfig(reviewer='gemini'),
+            models=ModelsConfig(reviewer='gemini-2.5-pro'),
         )
         assert cfg.models.reviewer == 'gemini-2.5-pro'
         assert cfg.backends.reviewer == 'gemini'
@@ -233,7 +236,7 @@ class _ScriptedProbeCli:
 
     async def __call__(self, **kwargs: object) -> AgentResult:
         self.calls.append(kwargs)
-        key = (kwargs.get('model'), kwargs.get('oauth_token'))
+        key = cast('tuple[str, str]', (kwargs.get('model'), kwargs.get('oauth_token')))
         return self._overrides.get(key, AgentResult(success=True, output='ok'))
 
 
