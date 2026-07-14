@@ -200,43 +200,47 @@ def maybe_suppress_escalation(esc):
 
 ### PRD-leaf-shaped (`INV-5-PRD`)
 
-> Add a retry-backoff schedule to the new webhook-delivery task:
-> hand-copy the existing `BACKOFF_SECONDS = [1, 2, 5, 10, 30]` list from
-> `orchestrator/src/orchestrator/retry.py` into a new
-> `webhooks/src/webhooks/retry.py` instead of importing the shared
-> constant — justified in the row as "a different subsystem, easier to
-> keep separate."
+> Add event-type validation to the new webhook-delivery task: hand-copy
+> the list of allowed event types (`task.created, task.done,
+> task.blocked, escalation.filed`) into a new validator module instead of
+> importing the canonical list from the existing event-emitter module —
+> justified in the row as "the webhook subsystem is self-contained."
 
 **Expected disposition**: `flag: no-lockstep-duplication`
 
-**Redesign that clears it**: Extract `BACKOFF_SECONDS` into a shared
-module (e.g. `shared/src/shared/retry.py`) and import it from both call
-sites, per the extract-helper house pattern; add a drift/pinning test if
-the two ever need to diverge intentionally.
+**Redesign that clears it**: Extract `ALLOWED_EVENT_TYPES` into a shared
+module (or import it directly from the event-emitter) so both the
+emitter and the new validator reference the one list, per the
+extract-helper house pattern; add a drift/pinning test if the two ever
+need to diverge intentionally.
 
 ### Code-snippet-shaped (`INV-5-CODE`)
 
 This fixture is deliberately distinct from the classifier.py/router.py
 category-table example in phase2-architecture.md's own Step 8 sample, so
-it is a genuine calibration rather than an echo of the doc's sample.
+it is a genuine calibration rather than an echo of the doc's sample. (It
+is also deliberately NOT about a retry/backoff schedule — a duplicated
+retry-absorb mechanism would read as an INV-4 `storm-escape-required`
+concern too and defeat the single-invariant requirement below.)
 
-File `orchestrator/src/orchestrator/retry.py` (existing, upstream):
+File `orchestrator/src/orchestrator/events.py` (existing, upstream —
+illustrative, not a real file in this repo):
 
 ```python
-BACKOFF_SECONDS = [1, 2, 5, 10, 30]
+ALLOWED_EVENT_TYPES = ["task.created", "task.done", "task.blocked", "escalation.filed"]
 ```
 
-File `webhooks/src/webhooks/retry.py` (new, the violation):
+File `webhooks/src/webhooks/validator.py` (new, the violation):
 
 ```python
-# hand-copied from orchestrator/src/orchestrator/retry.py, kept "in sync" manually
-BACKOFF_SECONDS = [1, 2, 5, 10, 30]
+# hand-copied from orchestrator/src/orchestrator/events.py, kept "in sync" manually
+ALLOWED_EVENT_TYPES = ["task.created", "task.done", "task.blocked", "escalation.filed"]
 ```
 
 **Expected `invariant_findings` entry**:
 
 ```json
-{"invariant": "no-lockstep-duplication", "file": "webhooks/src/webhooks/retry.py", "line": 2, "issue": "BACKOFF_SECONDS hand-copied from orchestrator/src/orchestrator/retry.py (line 1) — no shared helper or import ties the two lists together, so they must be kept byte-for-byte identical by hand", "severity": "warning"}
+{"invariant": "no-lockstep-duplication", "file": "webhooks/src/webhooks/validator.py", "line": 2, "issue": "ALLOWED_EVENT_TYPES hand-copied from orchestrator/src/orchestrator/events.py (line 1) — no shared helper or import ties the two lists together, so they must be kept byte-for-byte identical by hand", "severity": "warning"}
 ```
 
 ## Rehearsal verdict table
