@@ -276,6 +276,25 @@ _XPY_FAILURE = VerifyResult(
     category='test_failure',
 )
 
+# A timed-out verify: no test/lint/type output and no cause_hint (mirrors how
+# a wall-clock timeout short-circuits before any command produces file-shaped
+# output). _extract_failing_tests_and_candidate_files degrades to an empty
+# candidate-file set on this input, so classify_merge_failure_disposition
+# returns INDETERMINATE before ever issuing a git log call (Amendment,
+# reviewer_comprehensive round 3: pins this cheap degrade so a future
+# refactor of the extraction ordering can't silently start classifying
+# timeout noise).
+_TIMED_OUT_FAILURE = VerifyResult(
+    passed=False,
+    test_output='',
+    lint_output='',
+    type_output='',
+    summary='verify timed out',
+    cause_hint='',
+    category='',
+    timed_out=True,
+)
+
 
 class TestClassifyDispositionForOutcome:
     """_classify_disposition_for_outcome(verify, *, req, merge_base_sha,
@@ -514,6 +533,52 @@ class TestRunPostMergeVerifyDispositionWiring:
         assert outcome is not None
         assert outcome.disposition == MergeFailureDisposition.BRANCH_BUG, (
             f'Expected BRANCH_BUG; got {outcome.disposition!r}'
+        )
+        assert outcome.failure_diagnostic is None
+        assert 'port landed commit' not in outcome.reason
+        assert outcome.reason.startswith('Post-merge verification failed'), outcome.reason
+
+    def test_base_facts_supplied_timed_out_verify_stays_indeterminate(
+        self, tmp_path: Path,
+    ) -> None:
+        """A timed-out verify (empty test_output/cause_hint) yields no
+        candidate files, so classify_merge_failure_disposition degrades to
+        INDETERMINATE before ever issuing a git log call — even though base
+        facts ARE supplied and classification genuinely runs (unlike the
+        merge_base_sha/main_sha=None skip-classification-entirely case
+        below). Pins the cheap fail-open degrade so a future refactor of the
+        extraction ordering can't silently start classifying timeout noise
+        (Amendment, reviewer_comprehensive round 3)."""
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        task_wt = tmp_path / 'task-wt'
+        task_wt.mkdir()
+        req = _make_req('2381', task_wt, config)
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=_TIMED_OUT_FAILURE),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(return_value=(False, '')),
+                ),
+            ):
+                return await _drive_verify_with_base_facts(
+                    req, merge_wt, git_ops,
+                    merge_base_sha='deadbeef',
+                    main_sha='beadfeed',
+                )
+
+        outcome = asyncio.run(_run())
+        assert outcome is not None
+        assert outcome.disposition == MergeFailureDisposition.INDETERMINATE, (
+            f'Expected INDETERMINATE for a timed-out verify with no '
+            f'candidate files; got {outcome.disposition!r}'
         )
         assert outcome.failure_diagnostic is None
         assert 'port landed commit' not in outcome.reason

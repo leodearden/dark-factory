@@ -11687,6 +11687,22 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # (test_merge_skew_end_to_end.py) pins that contract — widening
                 # this guard to include INDETERMINATE is a deliberate,
                 # separately-reviewed semantics change, not a drive-by fix.
+                #
+                # Amendment (reviewer_comprehensive, round 3): BRANCH_BUG is
+                # the COMMON case whenever the caller supplies dispatch-time
+                # base facts (2357), so this guard is not just an
+                # INDETERMINATE-vs-not distinction — it introduces a NET-NEW
+                # merge_attempt row on the ordinary post-merge-verify-fail
+                # path. Before β, the single-task verify-FAILURE finalize
+                # branch emitted no merge_attempt row at all; the only other
+                # `verify_failed` emit in this module is the train path
+                # (~:3686), which is unaffected by this guard. Intended (it
+                # is 2384's disposition denominator), but a consumer counting
+                # merge_attempt rows or computing latency percentiles
+                # (duration_ms is stamped here) over this event kind will see
+                # new volume/outliers starting with this task — future
+                # readers should not assume the speculative verify-fail path
+                # was already emitting these rows pre-β.
                 if vr.outcome.disposition in (
                     MergeFailureDisposition.INTEGRATION_SKEW,
                     MergeFailureDisposition.BRANCH_BUG,
