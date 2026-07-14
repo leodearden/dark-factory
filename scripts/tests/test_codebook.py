@@ -623,6 +623,80 @@ def test_assert_no_deletion_allows_retirement_via_status_change():
 
 
 # ---------------------------------------------------------------------------
+# amendment: assert_no_deletion() must cover top-level candidates
+# symmetrically with entries — candidates hold real mined signal (pending
+# novel causes awaiting promotion), so a merge regression that drops or
+# shrinks them must trip the same construction-independent safety net.
+# ---------------------------------------------------------------------------
+
+def _codebook_with_candidate() -> dict:
+    codebook = _codebook_with_entry_a()
+    codebook["candidates"] = [
+        {
+            "id": "cand-20260714-1",
+            "title": "novel shape",
+            "first_seen": "2026-07-14",
+            "disposition": "pending",
+            "sightings": [
+                {
+                    "date": "2026-07-14",
+                    "project": "dark_factory",
+                    "session": "sess-1",
+                    "origin_phase": "architect",
+                    "manifested_phase": "verify",
+                }
+            ],
+        }
+    ]
+    return codebook
+
+
+def test_assert_no_deletion_raises_when_candidate_missing():
+    before = _codebook_with_candidate()
+    after = copy.deepcopy(before)
+    after["candidates"] = []
+
+    with pytest.raises(mod.NeverDeleteError):
+        mod.assert_no_deletion(before, after)
+
+
+def test_assert_no_deletion_raises_when_candidate_sighting_shrinks():
+    before = _codebook_with_candidate()
+    after = copy.deepcopy(before)
+    after["candidates"][0]["sightings"] = []
+
+    with pytest.raises(mod.NeverDeleteError):
+        mod.assert_no_deletion(before, after)
+
+
+def test_assert_no_deletion_allows_candidate_growth():
+    before = _codebook_with_candidate()
+    after = copy.deepcopy(before)
+    after["candidates"][0]["sightings"].append(
+        {
+            "date": "2026-07-15",
+            "project": "dark_factory",
+            "session": "sess-2",
+            "origin_phase": "architect",
+            "manifested_phase": "verify",
+        }
+    )
+
+    mod.assert_no_deletion(before, after)  # must not raise
+
+
+def test_assert_no_deletion_allows_candidate_promotion_via_disposition_change():
+    before = _codebook_with_candidate()
+    after = copy.deepcopy(before)
+    after["candidates"][0]["disposition"] = "promoted"
+
+    mod.assert_no_deletion(before, after)  # must not raise
+
+    assert len(after["candidates"]) == 1
+    assert mod.validate(after) == []
+
+
+# ---------------------------------------------------------------------------
 # step-15: RED — main(argv) CLI end-to-end (tmp_path/capsys)
 # ---------------------------------------------------------------------------
 

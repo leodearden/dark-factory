@@ -336,8 +336,12 @@ def assert_no_deletion(before: dict, after: dict) -> None:
     was constructed: every entry id present in `before` must still be
     present in `after`, and every session recorded in an entry's sightings
     in `before` must still be present in that same entry's sightings in
-    `after`. Retirement (status -> 'retired') is unaffected — it changes a
-    field, not entry/sighting presence. Raises NeverDeleteError otherwise.
+    `after`. The same two checks apply to top-level `candidates` — id
+    presence and per-candidate sighting sessions — since candidates hold
+    real mined signal (pending novel causes awaiting promotion) and must
+    be covered by the same construction-independent safety net as entries.
+    Retirement (status -> 'retired') is unaffected — it changes a field,
+    not entry/sighting presence. Raises NeverDeleteError otherwise.
     """
     before_entries = {
         e["id"]: e
@@ -365,6 +369,37 @@ def assert_no_deletion(before: dict, after: dict) -> None:
         if not before_sessions <= after_sessions:
             raise NeverDeleteError(
                 f"entry {entry_id!r} lost sightings for session(s): "
+                f"{sorted(s for s in (before_sessions - after_sessions) if s is not None)!r}"
+            )
+
+    before_candidates = {
+        c["id"]: c
+        for c in (before.get("candidates", []) or [])
+        if isinstance(c, dict) and "id" in c
+    }
+    after_candidates = {
+        c["id"]: c
+        for c in (after.get("candidates", []) or [])
+        if isinstance(c, dict) and "id" in c
+    }
+
+    missing_candidates = set(before_candidates) - set(after_candidates)
+    if missing_candidates:
+        raise NeverDeleteError(
+            f"candidates dropped from codebook: {sorted(missing_candidates)!r}"
+        )
+
+    for cand_id, before_candidate in before_candidates.items():
+        before_sessions = {
+            s.get("session") for s in (before_candidate.get("sightings", []) or [])
+        }
+        after_sessions = {
+            s.get("session")
+            for s in (after_candidates[cand_id].get("sightings", []) or [])
+        }
+        if not before_sessions <= after_sessions:
+            raise NeverDeleteError(
+                f"candidate {cand_id!r} lost sightings for session(s): "
                 f"{sorted(s for s in (before_sessions - after_sessions) if s is not None)!r}"
             )
 
