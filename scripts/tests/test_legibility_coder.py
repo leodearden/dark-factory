@@ -417,3 +417,86 @@ def test_code_digest_empty_judgment_is_success_not_failure():
     assert result.record["matches"] == []
     assert result.record["candidates"] == []
     assert codebook_mod.validate_coding_record(result.record) == []
+
+
+# ---------------------------------------------------------------------------
+# step-13: RED — code_digests() batch + storm threshold
+# ---------------------------------------------------------------------------
+
+def _make_batch_invoke(fail_sessions):
+    """Fake invoke: returns unparseable garbage for any digest whose
+    prompt embeds a session id in `fail_sessions`, else a valid empty
+    judgment. Session ids are looked up as substrings of the prompt,
+    which embeds the digest text (and therefore its frontmatter
+    `session: "..."` line) verbatim."""
+    def fake_invoke(prompt, model):
+        for session_id in fail_sessions:
+            if session_id in prompt:
+                return "not parseable as json, sorry"
+        return json.dumps({"matches": [], "candidates": []})
+    return fake_invoke
+
+
+def _batch_digests(n):
+    return [_hand_digest(f"batch-sess-{i}", f"body marker {i}") for i in range(n)]
+
+
+def test_code_digests_all_succeed_batch_status_ok():
+    digests = _batch_digests(3)
+    codebook = _tiny_codebook()
+
+    result = mod.code_digests(
+        digests, codebook, project="dark_factory", model="haiku",
+        invoke=_make_batch_invoke(fail_sessions=set()),
+    )
+
+    assert result.status == "ok"
+    assert result.total == 3
+    assert result.succeeded == 3
+    assert result.failed == 0
+    assert len(result.records) == 3
+    assert result.failures == []
+    for record in result.records:
+        assert codebook_mod.validate_coding_record(record) == []
+
+
+def test_code_digests_majority_failure_batch_status_failure():
+    digests = _batch_digests(4)
+    codebook = _tiny_codebook()
+    fail_sessions = {"batch-sess-0", "batch-sess-1", "batch-sess-2"}
+
+    result = mod.code_digests(
+        digests, codebook, project="dark_factory", model="haiku",
+        invoke=_make_batch_invoke(fail_sessions),
+    )
+
+    assert result.status == "failure"
+    assert result.total == 4
+    assert result.succeeded == 1
+    assert result.failed == 3
+    assert len(result.records) == 1
+    assert len(result.failures) == 3
+    failure_sessions = {session for session, _reason in result.failures}
+    assert failure_sessions == fail_sessions
+    for _session, reason in result.failures:
+        assert reason
+
+
+def test_code_digests_exactly_half_failure_is_not_a_storm():
+    digests = _batch_digests(4)
+    codebook = _tiny_codebook()
+    fail_sessions = {"batch-sess-0", "batch-sess-1"}
+
+    result = mod.code_digests(
+        digests, codebook, project="dark_factory", model="haiku",
+        invoke=_make_batch_invoke(fail_sessions),
+    )
+
+    assert result.status == "ok"
+    assert result.total == 4
+    assert result.succeeded == 2
+    assert result.failed == 2
+    assert len(result.records) == 2
+    assert len(result.failures) == 2
+    failure_sessions = {session for session, _reason in result.failures}
+    assert failure_sessions == fail_sessions
