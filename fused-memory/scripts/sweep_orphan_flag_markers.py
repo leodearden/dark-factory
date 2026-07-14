@@ -60,6 +60,7 @@ import asyncio
 import json
 import logging
 import sys
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
@@ -160,6 +161,65 @@ def classify_marker_task_id(tid: Any) -> str:
     if len(components) >= 2 and all(part.strip().isdigit() for part in components):
         return 'comma_joined'
     return 'null_or_invalid'
+
+
+def _assume_utc(dt: datetime) -> datetime:
+    """Return *dt* with UTC timezone attached if it is naive; unchanged otherwise.
+
+    Local copy of the convention centralised in
+    ``fused_memory.reconciliation.stages.task_knowledge_sync._assume_utc``
+    ("naive datetimes from our journal/Mem0 are UTC") — duplicated here
+    rather than imported so this script's pure predicates stay decoupled
+    from the heavier reconciliation-stage module.
+    """
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+
+
+def find_stale_markers(
+    members: list[dict],
+    now: datetime,
+    max_age_days: int = 14,
+) -> list[dict]:
+    """Return members whose ``created_at`` is strictly older than the cutoff.
+
+    Restores the age-drain semantics of the retired
+    ``_sweep_stale_flag_markers`` (task 1944; deleted by task 2228 W5-κ),
+    mirroring ``_sweep_stale_persistence_markers``'s cutoff logic: a member
+    is stale when ``created_at < now - max_age_days``. Members with a
+    missing, ``None``, or unparseable ``created_at`` are always KEPT
+    (never returned) — a fail-safe KEEP-on-uncertainty posture shared with
+    every other age-based sweep in this codebase.
+
+    ``max_age_days=0`` sets the cutoff to *now* itself, draining every
+    dated member strictly older than *now* — the operator lever to force
+    the whole dead-weight population toward zero.
+
+    Pure, sync, no I/O.
+
+    Args:
+        members: List of scroll-shaped dicts ``{'id', 'created_at', 'metadata'}``,
+            as returned by ``MemoryService.get_memories_by_metadata``.
+        now: Reference "current time" for the cutoff calculation. Callers
+            inject a fixed value in tests; ``main()`` passes
+            ``datetime.now(UTC)``.
+        max_age_days: Staleness cutoff in days (default 14).
+
+    Returns:
+        Subset of *members* that are stale. Order is preserved.
+    """
+    cutoff = _assume_utc(now) - timedelta(days=max_age_days)
+    stale: list[dict] = []
+    for m in members:
+        raw = m.get('created_at')
+        if raw is None:
+            continue
+        try:
+            created_at = _assume_utc(datetime.fromisoformat(raw))
+        except (ValueError, TypeError):
+            continue
+        if created_at < cutoff:
+            stale.append(m)
+    return stale
 
 
 # ---------------------------------------------------------------------------
