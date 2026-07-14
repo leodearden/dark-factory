@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from escalation.queue import EscalationQueue
 from test_merge_queue_main_health import (
     COMPILE_ERROR_RESULT,
     MAIN_SHA,
@@ -30,14 +31,14 @@ from test_merge_queue_main_health import (
     _make_req,
 )
 
-from escalation.queue import EscalationQueue
 from orchestrator.event_store import EventStore
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
+    MergeOutcome,
     RealMergeItem,
     SpeculativeMergeWorker,
-    _MainHealthProbeHandles,
     _main_health_fingerprint,
+    _MainHealthProbeHandles,
     _run_deferred_main_health_probe,
     _run_post_merge_verify,
     _spawn_main_health_probe,
@@ -192,7 +193,7 @@ class TestNoneHandlesSpawnsNothing:
 
         create_task_spy = MagicMock()
 
-        async def _run() -> object:
+        async def _run() -> MergeOutcome | None:
             with (
                 patch(
                     'orchestrator.merge_queue.run_scoped_verification',

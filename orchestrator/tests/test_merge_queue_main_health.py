@@ -22,9 +22,9 @@ from orchestrator.merge_queue import (
     TRANSIENT_INFRA_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
-    _MainHealthProbeHandles,
     _build_main_health_outcome,
     _main_health_fingerprint,
+    _MainHealthProbeHandles,
     _run_post_merge_verify,
 )
 from orchestrator.verify import _PROBE_CACHE, VerifyResult
