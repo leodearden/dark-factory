@@ -353,7 +353,19 @@ function computeNeighborhood(tasks, selectedId) {
   return set;
 }
 
-const API = { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood };
+// ── Filter a task list down to the selected task's neighborhood ──
+// Returns `tasks` unchanged when nothing is selected (full-view passthrough);
+// otherwise the subset of `tasks` whose id is a member of
+// computeNeighborhood(tasks, selectedId), preserving input order. This is the
+// exact array TaskGraph is fed in focus mode — tiers/ordering recompute over
+// it unchanged.
+function focusSubset(tasks, selectedId) {
+  if (!selectedId) return tasks;
+  const nb = computeNeighborhood(tasks, selectedId);
+  return tasks.filter(t => nb.has(t.id));
+}
+
+const API = { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = API;
