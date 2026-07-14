@@ -27,7 +27,7 @@ import asyncio
 import dataclasses
 import inspect
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -590,3 +590,94 @@ class TestRunLevelRequeueOutcomeKindSingleSourced:
         )
         assert report.outcome == WorkflowOutcome.REQUEUED
         assert report.reason == 'SENTINEL_hard_down'
+
+
+# ---------------------------------------------------------------------------
+# step-11: _mark_blocked threads disposition.block_class into the dry-run
+# investigation (replacing the classify_block_reason(reason) prose sniff)
+# and disposition.category into TerminalReport.category.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMarkBlockedDispositionSourcedBlockClass:
+    """``_mark_blocked``'s ``disposition=`` kwarg sources the dry-run
+    investigation's ``block_class`` from ``disposition.block_class`` — not
+    the ``classify_block_reason(reason)`` prose sniff — and sources
+    ``TerminalReport.category`` from ``disposition.category``.
+
+    Reuses test_workflow_dry_run_hook's ``_make_workflow``/``_Scheduler``
+    harness, patching ``orchestrator.workflow.run_dry_run_unblock`` (the
+    actual coroutine ``_spawn_dry_run_unblock`` schedules via
+    ``asyncio.create_task``) to capture the kwargs it is invoked with — the
+    most precise interception point for the ``block_class`` value that
+    ultimately reaches the dry-run proposal entry (mirrors test_workflow_
+    dry_run_hook.py's own ``TestMarkBlockedSpawnsFireAndForget`` technique).
+
+    RED today: ``_spawn_dry_run_unblock`` takes no ``block_class`` param and
+    always computes ``classify_block_reason(reason)`` itself, so a supplied
+    disposition's ``block_class`` (POST_MERGE_RED_MAIN below) never reaches
+    ``run_dry_run_unblock`` — the captured kwarg is AGENT_FAILURE (the prose
+    sniff's default for a reason string matching none of the 4 canonical
+    merge_gates prefixes) instead. Turns GREEN in step-12.
+    """
+
+    async def _mark_blocked_and_capture(
+        self, tmp_path: Path, reason: str, **mark_blocked_kwargs,
+    ):
+        from test_workflow_dry_run_hook import _make_workflow
+
+        wf, _scheduler = _make_workflow(tmp_path=tmp_path, task_id='2249', enabled=True)
+
+        calls = []
+
+        async def _spy_dry_run(**kwargs):
+            calls.append(kwargs)
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._mark_blocked(reason, **mark_blocked_kwargs)
+            await asyncio.sleep(0)  # let the background task register its call
+            pending = list(wf._background_tasks)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        return wf, calls
+
+    async def test_disposition_block_class_reaches_dry_run_not_prose_sniff(
+        self, tmp_path: Path,
+    ):
+        from orchestrator.unblock_types import BlockClass, classify_block_reason
+        from orchestrator.workflow_types import BlockDisposition, RequeueKind
+
+        reason = 'some reason'
+        # Sanity: the prose sniff would NOT classify this as POST_MERGE_RED_MAIN
+        # — proves the two are genuinely distinguishable in this test.
+        assert classify_block_reason(reason) is BlockClass.AGENT_FAILURE
+
+        disp = BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Some disposition',
+            block_class=BlockClass.POST_MERGE_RED_MAIN,
+        )
+        wf, calls = await self._mark_blocked_and_capture(
+            tmp_path, reason, disposition=disp,
+        )
+
+        assert len(calls) == 1
+        assert calls[0]['block_class'] is BlockClass.POST_MERGE_RED_MAIN
+        assert wf._terminal_report.category is disp.category
+
+    async def test_no_disposition_keeps_prose_sniff_back_compat(
+        self, tmp_path: Path,
+    ):
+        from orchestrator.unblock_types import classify_block_reason
+
+        reason = 'some reason'
+        wf, calls = await self._mark_blocked_and_capture(tmp_path, reason)
+
+        assert len(calls) == 1
+        assert calls[0]['block_class'] == classify_block_reason(reason)
+        assert wf._terminal_report.category is None
