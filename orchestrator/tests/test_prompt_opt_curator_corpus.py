@@ -12,12 +12,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from _curator_replay_fixtures import make_synthetic_tickets_db
 
 from orchestrator.evals.prompt_opt.curator_corpus import (
     CuratorCorpusManifest,
     CuratorReplayItem,
+    FrontierLabel,
     RecordedDecision,
+    _parse_frontier_label,
+    build_curator_corpus,
     read_curator_decisions,
     recover_recorded_action,
     select_spot_check_subset,
@@ -347,3 +351,122 @@ class TestCuratorItemSplitAssignment:
         assert not (by_split['train'] & by_split['selection'])
         assert not (by_split['train'] & by_split['test'])
         assert not (by_split['selection'] & by_split['test'])
+
+
+class TestParseFrontierLabel:
+    """_parse_frontier_label -- pure mapping from a frontier structured-output
+    dict to a FrontierLabel, never raising on malformed input."""
+
+    def test_valid_data_maps_to_frontier_label(self) -> None:
+        label = _parse_frontier_label({
+            'action': 'combine', 'target_fingerprint': 'X', 'target_id': 'Y',
+            'justification': 'why',
+        })
+        assert label == FrontierLabel(
+            action='combine', target_fingerprint='X', target_id='Y', justification='why',
+        )
+
+    def test_create_action_with_no_target_fields(self) -> None:
+        label = _parse_frontier_label({'action': 'create', 'justification': 'new work'})
+        assert label == FrontierLabel(action='create', justification='new work')
+
+    def test_missing_action_key_returns_none(self) -> None:
+        assert _parse_frontier_label({'not_action': 'x'}) is None
+
+    def test_invalid_action_value_returns_none(self) -> None:
+        assert _parse_frontier_label({'action': 'bogus', 'justification': 'x'}) is None
+
+    def test_non_dict_input_returns_none(self) -> None:
+        assert _parse_frontier_label('not a dict') is None
+        assert _parse_frontier_label(None) is None
+        assert _parse_frontier_label(['issues']) is None
+
+
+async def _fake_frontier_proposer(candidate: dict) -> FrontierLabel:
+    """Deterministic fake: ALWAYS proposes 'drop' at a synthetic target,
+    regardless of what the ticket's live curator historically recorded.
+    Proves gold labels come from the injected proposer, never the recorded
+    decision (PRD D-6: decisions != ground truth)."""
+    return FrontierLabel(action='drop', target_id='synthetic-target-1', justification='fake-frontier')
+
+
+class TestBuildCuratorCorpus:
+    @pytest.mark.asyncio
+    async def test_returns_manifest_with_frontier_gold_labels_not_recorded_actions(
+        self, tmp_path: Path,
+    ) -> None:
+        rows = [
+            {'ticket_id': f't{i}', 'status': 'created', 'task_id': f'task-{i}'}
+            for i in range(20)
+        ] + [
+            {
+                'ticket_id': f'c{i}', 'status': 'combined',
+                'result': {'id': f'task-c{i}', 'action': 'combine', 'target_fingerprint': f'Target {i}'},
+            }
+            for i in range(10)
+        ]
+        db_path = make_synthetic_tickets_db(tmp_path / 'tickets.db', rows)
+
+        manifest, log = await build_curator_corpus(
+            db_path, n=20, seed=1, spot_check_size=10, frontier_proposer=_fake_frontier_proposer,
+        )
+
+        assert 0 < len(manifest.items) <= 20
+        # Gold label ALWAYS comes from the fake proposer ('drop'), never the
+        # recorded decision -- and at least one item's recorded action was
+        # NOT 'drop', so this also proves gold != recorded in practice.
+        assert all(item.gold_action == 'drop' for item in manifest.items)
+        assert all(item.gold_target_id == 'synthetic-target-1' for item in manifest.items)
+        assert any(item.recorded_action != item.gold_action for item in manifest.items)
+
+    @pytest.mark.asyncio
+    async def test_every_item_gets_a_2_1_7_split(self, tmp_path: Path) -> None:
+        rows = [{'ticket_id': f't{i}', 'status': 'created', 'task_id': f'task-{i}'} for i in range(30)]
+        db_path = make_synthetic_tickets_db(tmp_path / 'tickets.db', rows)
+
+        manifest, _log = await build_curator_corpus(
+            db_path, n=30, seed=1, spot_check_size=10, frontier_proposer=_fake_frontier_proposer,
+        )
+
+        assert all(item.split in ('train', 'selection', 'test') for item in manifest.items)
+
+    @pytest.mark.asyncio
+    async def test_flags_a_non_empty_human_spot_check_subset(self, tmp_path: Path) -> None:
+        rows = [{'ticket_id': f't{i}', 'status': 'created', 'task_id': f'task-{i}'} for i in range(30)]
+        db_path = make_synthetic_tickets_db(tmp_path / 'tickets.db', rows)
+
+        _manifest, log = await build_curator_corpus(
+            db_path, n=30, seed=1, spot_check_size=10, frontier_proposer=_fake_frontier_proposer,
+        )
+
+        assert log.spot_check_subset()
+
+    @pytest.mark.asyncio
+    async def test_adjudication_log_covers_every_item(self, tmp_path: Path) -> None:
+        rows = [{'ticket_id': f't{i}', 'status': 'created', 'task_id': f'task-{i}'} for i in range(30)]
+        db_path = make_synthetic_tickets_db(tmp_path / 'tickets.db', rows)
+
+        manifest, log = await build_curator_corpus(
+            db_path, n=30, seed=1, spot_check_size=10, frontier_proposer=_fake_frontier_proposer,
+        )
+
+        coverage = log.coverage(item.ticket_id for item in manifest.items)
+        assert coverage.ok
+
+    @pytest.mark.asyncio
+    async def test_no_real_db_or_llm_touched_beyond_the_injected_fake(self, tmp_path: Path) -> None:
+        """Fully hermetic: only the passed-in synthetic db_path is read, and
+        the only 'frontier' call is the injected fake (no real invoke_agent)."""
+        rows = [{'ticket_id': 't1', 'status': 'created', 'task_id': 'task-1'}]
+        db_path = make_synthetic_tickets_db(tmp_path / 'tickets.db', rows)
+        calls = []
+
+        async def _tracking_proposer(candidate: dict) -> FrontierLabel:
+            calls.append(candidate)
+            return await _fake_frontier_proposer(candidate)
+
+        manifest, _log = await build_curator_corpus(
+            db_path, n=10, seed=1, spot_check_size=10, frontier_proposer=_tracking_proposer,
+        )
+
+        assert len(calls) == len(manifest.items) == 1
