@@ -16,6 +16,7 @@ state.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -193,6 +194,15 @@ class _TrackingBatchSource:
         for i, batch in enumerate(self._batches):
             self.pulled.append(i)
             yield batch
+
+
+def _poison(name):
+    """A seam fake that raises if ever called -- used to prove a code path
+    (e.g. run_census's DEFER branch) never reaches a given seam."""
+    def _fn(*args, **kwargs):
+        raise AssertionError(f"{name} must never be called on this path")
+
+    return _fn
 
 
 # ---------------------------------------------------------------------------
@@ -710,3 +720,64 @@ def test_render_report_is_deterministic_no_clock():
         cost_note="cost",
     )
     assert mod.render_report(**kwargs) == mod.render_report(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# step-17: RED — run_census() DEFER path (headroom banner)
+# ---------------------------------------------------------------------------
+
+def _run_census_kwargs(tmp_path, **overrides):
+    kwargs = dict(
+        batch_source=None,
+        invoke=_make_fake_invoke(default="pong"),
+        verify_fn=_poison("verify_fn"),
+        synthesize_fn=_poison("synthesize_fn"),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_poison("commit"),
+        codebook_dict=_minimal_v2_codebook(),
+        config=config_mod.LegibilityConfig(
+            project_id="dark_factory",
+            project_root=str(tmp_path),
+            escalation_port=8103,
+            cwd_prefixes=[str(tmp_path)],
+        ),
+        project_root=str(tmp_path),
+        project_id="dark_factory",
+        codebook_path=tmp_path / "confusion-codebook.yaml",
+        census_state_path=tmp_path / "census-state.json",
+        report_path=tmp_path / "confusion-census-2026-07-14.md",
+        date="2026-07-14",
+        force=False,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_run_census_defers_on_headroom_banner(tmp_path, caplog):
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(default="You have reached your usage limit for this period."),
+        batch_source=_poison("batch_source"),
+    )
+    fake_submit_fn = kwargs["submit_fn"]
+    fake_escalate_fn = kwargs["escalate_fn"]
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "deferred"
+    assert outcome.reason
+
+    assert len(fake_escalate_fn.calls) == 1
+    call = fake_escalate_fn.calls[0]
+    assert call.get("category") in ("infra_issue", "risk_identified")
+    assert call.get("summary"), "a loud summary naming the deferral"
+
+    assert sum(1 for r in caplog.records if r.levelno >= logging.WARNING) >= 1
+
+    assert fake_submit_fn.calls == []
+    assert not kwargs["codebook_path"].exists()
+    assert not kwargs["census_state_path"].exists()
+    assert not kwargs["report_path"].exists()
