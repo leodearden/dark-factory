@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json
 
+import yaml
+
 import digest as mod
 
 
@@ -692,3 +694,88 @@ class TestClassifyAgentClass:
 
     def test_override_wins_even_on_empty_transcript(self):
         assert mod.classify_agent_class([], override='custom') == 'custom'
+
+
+# ---------------------------------------------------------------------------
+# render_frontmatter — hand-rendered '---'-delimited YAML block, PRD Sec 7.2
+# key order verbatim (session, cwd, encoded_dir, agent_class, date,
+# size_bytes, score, signal_counts), signal_counts nested in order
+# (tool_error, self_correct, not_found, df_guard, interrupt). Must round-trip
+# via yaml.safe_load -- NOT yaml.safe_dump (design decision: fixed key order,
+# explicit formatting, deterministic byte-stable output).
+# ---------------------------------------------------------------------------
+
+def _frontmatter_meta():
+    return {
+        'session': 'sess-abc123',
+        'cwd': '/home/leo/src/dark-factory',
+        'encoded_dir': '-home-leo-src-dark-factory',
+        'agent_class': 'interactive',
+        'date': '2026-07-14',
+        'size_bytes': 512,
+        'score': 12.5,
+        'signal_counts': {
+            'tool_error': 1,
+            'self_correct': 2,
+            'not_found': 3,
+            'df_guard': 4,
+            'interrupt': 5,
+        },
+    }
+
+
+class TestRenderFrontmatter:
+    def test_starts_and_ends_with_dash_delimiter(self):
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        lines = block.splitlines()
+
+        assert lines[0] == '---'
+        assert lines[-1] == '---'
+
+    def test_top_level_keys_in_contract_order(self):
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        body = block.splitlines()[1:-1]
+        top_level_keys = [
+            line.split(':', 1)[0] for line in body if not line.startswith(' ')
+        ]
+
+        assert top_level_keys == [
+            'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
+            'size_bytes', 'score', 'signal_counts',
+        ]
+
+    def test_signal_counts_nested_in_contract_order(self):
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        body = block.splitlines()[1:-1]
+        nested_keys = [
+            line.strip().split(':', 1)[0] for line in body if line.startswith(' ')
+        ]
+
+        assert nested_keys == [
+            'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
+        ]
+
+    def test_round_trips_via_yaml_safe_load(self):
+        meta = _frontmatter_meta()
+        block = mod.render_frontmatter(meta)
+
+        inner = '\n'.join(block.splitlines()[1:-1])
+        loaded = yaml.safe_load(inner)
+
+        assert loaded == meta
+
+    def test_date_round_trips_as_string_not_a_yaml_date_object(self):
+        # A bare unquoted 2026-07-14 is resolved by PyYAML's implicit
+        # timestamp resolver to a datetime.date, not a string -- the
+        # renderer must explicitly quote it (or otherwise dodge this) so
+        # downstream consumers always see a plain string.
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        inner = '\n'.join(block.splitlines()[1:-1])
+        loaded = yaml.safe_load(inner)
+
+        assert loaded['date'] == '2026-07-14'
+        assert isinstance(loaded['date'], str)
