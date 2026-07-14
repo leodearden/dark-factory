@@ -14,7 +14,7 @@ import { createRequire } from 'node:module';
 
 import layout from '../../src/dashboard/static/redux/graph_layout.js';
 
-const { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood } = layout;
+const { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset } = layout;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/graph_layout.js';
 const EXPECTED_FUNCTION_NAMES = [
@@ -23,6 +23,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'orderRows',
   'countCrossings',
   'computeNeighborhood',
+  'focusSubset',
 ];
 
 // Builds a minimal task fixture matching the dep edge shape the dashboard
@@ -628,4 +629,39 @@ test('computeNeighborhood: a dep id outside the input list is ignored (no throw,
   const nb = computeNeighborhood(tasks, 'A');
   assert.deepEqual([...nb].sort(), ['A', 'B']);
   assert.ok(!nb.has('OUTSIDE_OF_LIST'));
+});
+
+// ---------------------------------------------------------------------------
+// focusSubset — the tasks array filtered down to computeNeighborhood's
+// members (input order preserved), or the input unchanged when selectedId is
+// null. Encodes the focus-mode user signal ("graph containing exactly its
+// ancestors+descendants") as the exact array TaskGraph is fed.
+// ---------------------------------------------------------------------------
+
+test('focusSubset: selectedId null returns the input array unchanged (full-view passthrough)', () => {
+  const tasks = [mkTask('A'), mkTask('B', ['A'])];
+  assert.equal(focusSubset(tasks, null), tasks);
+  assert.equal(focusSubset(tasks, undefined), tasks);
+  assert.equal(focusSubset(tasks), tasks);
+});
+
+test('focusSubset: two disjoint chains focused on a mid-node returns only its own chain, in input order', () => {
+  const tasks = [mkTask('A'), mkTask('B', ['A']), mkTask('C', ['B']), mkTask('X'), mkTask('Y', ['X'])];
+  const result = focusSubset(tasks, 'B');
+  assert.deepEqual(idsOf(result), ['A', 'B', 'C']);
+});
+
+test('focusSubset: diamond focused on a mid-tier node excludes its co-parent, preserving input order', () => {
+  const tasks = [mkTask('A'), mkTask('B', ['A']), mkTask('C', ['A']), mkTask('D', ['B', 'C'])];
+  const result = focusSubset(tasks, 'B');
+  assert.deepEqual(idsOf(result), ['A', 'B', 'D']);
+});
+
+test('focusSubset: result preserves input order and contains only tasks present in `tasks`', () => {
+  const tasks = [mkTask('X'), mkTask('A'), mkTask('B', ['A']), mkTask('Y', ['X'])];
+  const result = focusSubset(tasks, 'A');
+  assert.deepEqual(idsOf(result), ['A', 'B']);
+  const resultIds = new Set(idsOf(result));
+  const taskIds = new Set(idsOf(tasks));
+  for (const id of resultIds) assert.ok(taskIds.has(id), `${id} in result should be present in the input tasks`);
 });
