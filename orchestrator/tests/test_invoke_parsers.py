@@ -9,7 +9,12 @@ import logging
 import pytest
 from shared.cli_invoke import _SubprocessResult
 
-from orchestrator.agents.invoke import _parse_codex_output, _parse_gemini_output, _pi_tool_name
+from orchestrator.agents.invoke import (
+    _parse_codex_output,
+    _parse_gemini_output,
+    _parse_pi_output,
+    _pi_tool_name,
+)
 from orchestrator.config import PriceEntry
 
 
@@ -247,3 +252,24 @@ class TestPiToolName:
         direct-tool name — callers drop it from --tools (with a logged
         warning; see TestInvokePiFlags)."""
         assert _pi_tool_name('mcp__jcodemunch__*') is None
+
+
+class TestParsePiEmptyOutput:
+    """`_parse_pi_output` on empty stdout mirrors _parse_codex_output's
+    empty-output branch (deliverable #1)."""
+
+    def test_empty_stdout_is_error_empty_output(self):
+        result = _make_subprocess_result(stdout='', stderr='', returncode=0)
+        agent_result = _parse_pi_output(result, 'anthropic/claude-haiku-4-5')
+        assert agent_result.success is False
+        assert agent_result.subtype == 'error_empty_output'
+        assert 'no output' in agent_result.output.lower()
+
+    def test_empty_stdout_propagates_timed_out(self):
+        """timed_out propagates on the empty-stdout path too (a timeout
+        with nothing captured yet still routes through this branch)."""
+        result = _SubprocessResult(
+            stdout='', stderr='timeout', returncode=1, duration_ms=100, timed_out=True,
+        )
+        agent_result = _parse_pi_output(result, 'anthropic/claude-haiku-4-5')
+        assert agent_result.timed_out is True
