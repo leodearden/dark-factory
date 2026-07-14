@@ -128,6 +128,36 @@ class TestFindNearDuplicateMemoryGroupsClustering:
         assert all_ids == {'m1', 'm2'}
 
 
+class TestFindNearDuplicateMemoryGroupsProductionThreshold:
+    """Every other test in this module pins threshold=_THRESHOLD (0.75), but
+    the production default (function signature + --threshold CLI arg) is
+    0.85. Guard the value the sweep actually runs with, so a real-world
+    duplicate rewrite drifting below 0.85 would be caught here first instead
+    of silently clustering nothing in production."""
+
+    def test_venv_gotcha_variants_cluster_at_production_default_threshold(self):
+        memories = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-12T00:00:00+00:00'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00'),
+            _memory('m3', _VENV_GOTCHA_C, created_at='2026-07-13T01:00:00+00:00'),
+        ]
+        result = find_near_duplicate_memory_groups(memories, threshold=0.85)
+        assert len(result) == 1
+        assert {m['id'] for m in result[0]} == {'m1', 'm2', 'm3'}
+
+    def test_build_sweep_plan_clusters_at_production_default_threshold(self):
+        # build_sweep_plan(memories) with no explicit threshold arg exercises
+        # the exact default the CLI and callers get when they don't override it.
+        memories = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-12T00:00:00+00:00'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00'),
+            _memory('m3', _VENV_GOTCHA_C, created_at='2026-07-13T01:00:00+00:00'),
+        ]
+        plan = build_sweep_plan(memories)
+        assert plan['clusters_total'] == 1
+        assert set(plan['near_duplicate_groups'][0]['member_ids']) == {'m1', 'm2', 'm3'}
+
+
 class TestFindNearDuplicateMemoryGroupsDeterminism:
     """Deterministic ordering (groups by min id, members by id) + non-mutation."""
 
