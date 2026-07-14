@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+from unittest.mock import patch
 
 import pytest
 
@@ -81,6 +83,16 @@ def _make_service(pass_fn, **overrides):
     }
     kwargs.update(overrides)
     return BackgroundService(**kwargs)
+
+
+class _RecordingSleep:
+    """Async-callable ``asyncio.sleep`` stand-in recording each delay."""
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+
+    async def __call__(self, delay: float) -> None:
+        self.delays.append(delay)
 
 
 class TestBackgroundServiceStart:
@@ -156,3 +168,103 @@ class TestBackgroundServiceStart:
         second_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await second_task
+
+
+class TestBackgroundServiceLoop:
+    """step-5: BackgroundService loop contract (S2 / LR-1)."""
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_from_pass_fn_propagates(self) -> None:
+        async def pass_fn() -> None:
+            raise asyncio.CancelledError()
+
+        svc = _make_service(pass_fn, interval_secs=0)
+        svc.start()
+        assert svc._task is not None
+
+        with pytest.raises(asyncio.CancelledError):
+            await svc._task
+
+        assert svc._task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_pass_runs_after_interval_sleep_each_iteration(self) -> None:
+        """Sleep-first: each iteration sleeps BEFORE running the pass."""
+        order: list[str] = []
+        done_event = asyncio.Event()
+
+        async def fake_sleep(_delay: float) -> None:
+            order.append('sleep')
+
+        async def pass_fn() -> None:
+            order.append('pass')
+            if order.count('pass') >= 3:
+                done_event.set()
+
+        svc = _make_service(pass_fn, interval_secs=5.0)
+
+        with patch('orchestrator.background_service.asyncio.sleep', new=fake_sleep):
+            svc.start()
+            assert svc._task is not None
+            await asyncio.wait_for(done_event.wait(), timeout=5)
+            svc._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await svc._task
+
+        assert order[:6] == ['sleep', 'pass', 'sleep', 'pass', 'sleep', 'pass']
+
+    @pytest.mark.asyncio
+    async def test_plain_exception_bounded_logged_backs_off_then_recovers(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Failures log at most max_failure_logs consecutive ERRORs (no
+        traceback), back off, and a later success resets the counter so a
+        fresh failure streak logs again."""
+        from orchestrator.background_service import BackoffPolicy
+
+        # 4 consecutive fails (exceeds max_failure_logs=3) -> 1 success
+        # (resets the counter) -> 1 more fail (must log again, proving reset).
+        outcomes = ['fail', 'fail', 'fail', 'fail', 'ok', 'fail']
+        calls: list[int] = []
+        done_event = asyncio.Event()
+        hang_forever = asyncio.Event()
+
+        async def scripted_pass() -> None:
+            idx = len(calls)
+            calls.append(idx)
+            if idx >= len(outcomes):
+                done_event.set()
+                await hang_forever.wait()
+                return
+            if outcomes[idx] == 'fail':
+                raise RuntimeError(f'boom-{idx}')
+
+        svc = _make_service(
+            scripted_pass,
+            interval_secs=0,
+            backoff=BackoffPolicy(42.0),
+            max_failure_logs=3,
+        )
+        recording_sleep = _RecordingSleep()
+
+        with (
+            patch('orchestrator.background_service.asyncio.sleep', new=recording_sleep),
+            caplog.at_level(logging.ERROR, logger='orchestrator.background_service'),
+        ):
+            svc.start()
+            assert svc._task is not None
+            await asyncio.wait_for(done_event.wait(), timeout=5)
+            svc._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await svc._task
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_records) == 4
+        for record in error_records:
+            assert record.exc_info is None, 'must use logger.error, never logger.exception'
+
+        # Backoff delay (42.0) follows each of the 5 failing passes;
+        # interval (0) follows the 1 successful pass — proves the failure
+        # path routes through BackoffPolicy rather than the plain interval.
+        assert recording_sleep.delays.count(42.0) == 5
+        assert recording_sleep.delays.count(0) >= 1
