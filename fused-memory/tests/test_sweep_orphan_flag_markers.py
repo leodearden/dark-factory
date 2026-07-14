@@ -528,12 +528,26 @@ class TestDeleteOrphanMarkers:
 # ===========================================================================
 
 class TestRun:
-    """Tests for async run(args, memory_service)."""
+    """Tests for async run(args, memory_service, *, now=None, terminal_task_ids=None)."""
 
-    def _args(self, apply: bool = False, project_id: str = 'dark_factory'):
+    # Matches _member()'s hardcoded default created_at ('2026-01-01T00:00:00Z').
+    # Pre-existing tests below inject this as `now` so the new age-based stale
+    # sweep (task 2596) never fires for their fixtures regardless of the real
+    # wall-clock date the suite happens to run on — cutoff (now - 14 days)
+    # falls well before every fixture's created_at.
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(
+        self,
+        apply: bool = False,
+        project_id: str = 'dark_factory',
+        max_age_days: int = 14,
+    ):
         """Build a minimal args namespace."""
         import types as _types
-        return _types.SimpleNamespace(apply=apply, project_id=project_id)
+        return _types.SimpleNamespace(
+            apply=apply, project_id=project_id, max_age_days=max_age_days,
+        )
 
     @pytest.mark.asyncio
     async def test_dry_run_does_not_call_delete(self):
@@ -551,7 +565,9 @@ class TestRun:
         ])
         memory_service.delete_memory = AsyncMock(return_value=None)
 
-        report = await _mod.run(self._args(apply=False), memory_service)
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
 
         # delete must NOT be called in dry-run mode
         memory_service.delete_memory.assert_not_called()
@@ -578,7 +594,9 @@ class TestRun:
         ])
         memory_service.delete_memory = AsyncMock(return_value=None)
 
-        report = await _mod.run(self._args(apply=True), memory_service)
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
 
         assert memory_service.delete_memory.call_count == 2
         assert report['dry_run'] is False
@@ -606,7 +624,9 @@ class TestRun:
             side_effect=[RuntimeError('Qdrant timeout'), None]
         )
 
-        report = await _mod.run(self._args(apply=True), memory_service)
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
 
         assert report['dry_run'] is False
         # Both orphans were found
@@ -631,7 +651,9 @@ class TestRun:
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
         memory_service.search = AsyncMock()
 
-        await _mod.run(self._args(apply=False), memory_service)
+        await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
 
         memory_service.get_memories_by_metadata.assert_called_once()
         call_kwargs = memory_service.get_memories_by_metadata.call_args.kwargs
@@ -663,7 +685,9 @@ class TestRun:
         dry_service.get_memories_by_metadata = AsyncMock(return_value=members)
         dry_service.delete_memory = AsyncMock(return_value=None)
 
-        report = await _mod.run(self._args(apply=False), dry_service)
+        report = await _mod.run(
+            self._args(apply=False), dry_service, now=self._NEUTRAL_NOW,
+        )
 
         dry_service.delete_memory.assert_not_called()
         assert set(report['orphan_ids']) == {'t1', 'o1', 'b1'}, (
@@ -680,7 +704,9 @@ class TestRun:
         apply_service.get_memories_by_metadata = AsyncMock(return_value=members)
         apply_service.delete_memory = AsyncMock(return_value=None)
 
-        apply_report = await _mod.run(self._args(apply=True), apply_service)
+        apply_report = await _mod.run(
+            self._args(apply=True), apply_service, now=self._NEUTRAL_NOW,
+        )
 
         assert apply_service.delete_memory.call_count == 3, (
             'Expected exactly 3 deletes (b1 deduped, not double-deleted): '
@@ -691,3 +717,78 @@ class TestRun:
         }
         assert deleted_ids == {'t1', 'o1', 'b1'}, f'Expected no v1, got: {deleted_ids!r}'
         assert apply_report['taskless_orphan_count'] == 2
+
+    @pytest.mark.asyncio
+    async def test_run_sweeps_stale_and_terminal_members_too(self):
+        """run() additionally sweeps the age-stale and terminal-task-referenced
+        predicates (task 2596), unioned with the existing kind-orphan/taskless
+        predicates and deduped by id. A member matched by BOTH the stale and
+        terminal predicates (overlap1) is deleted exactly once. Report gains
+        per-bucket counts (classify_marker_task_id) over the final union.
+        """
+        now = datetime(2026, 7, 14, tzinfo=UTC)
+
+        valid_fresh = _member('v1', task_id='1970')
+        valid_fresh['created_at'] = '2026-07-10T00:00:00Z'
+        orphan = _orphan('o1')
+        orphan['created_at'] = '2026-07-10T00:00:00Z'
+        stale_only = _member('stale1', task_id='9001')
+        stale_only['created_at'] = '2026-01-01T00:00:00Z'
+        terminal_only = _member('term1', task_id='2440')
+        terminal_only['created_at'] = '2026-07-10T00:00:00Z'
+        overlap = _member('overlap1', task_id='2440')
+        overlap['created_at'] = '2026-01-01T00:00:00Z'
+
+        members = [valid_fresh, orphan, stale_only, terminal_only, overlap]
+        expected_bucket_counts = {
+            'numeric': 4, 'fp_hash': 0, 'comma_joined': 0, 'null_or_invalid': 0,
+        }
+
+        # --- Dry run ---
+        dry_service = AsyncMock()
+        dry_service.count_memories_by_metadata = AsyncMock(side_effect=[5, 3])
+        dry_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        dry_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(apply=False, max_age_days=14),
+            dry_service,
+            now=now,
+            terminal_task_ids={'2440'},
+        )
+
+        dry_service.delete_memory.assert_not_called()
+        assert set(report['orphan_ids']) == {'o1', 'stale1', 'term1', 'overlap1'}, (
+            f'Expected o1/stale1/term1/overlap1 swept, got: {report["orphan_ids"]!r}'
+        )
+        assert report['orphan_count'] == 4, f"Expected 4, got: {report['orphan_count']!r}"
+        assert report['bucket_counts'] == expected_bucket_counts, (
+            f"Expected {expected_bucket_counts!r}, got: {report['bucket_counts']!r}"
+        )
+
+        # --- Apply: overlap1 (stale AND terminal) deleted exactly once ---
+        apply_service = AsyncMock()
+        apply_service.count_memories_by_metadata = AsyncMock(side_effect=[5, 3, 1, 1])
+        apply_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        apply_service.delete_memory = AsyncMock(return_value=None)
+
+        apply_report = await _mod.run(
+            self._args(apply=True, max_age_days=14),
+            apply_service,
+            now=now,
+            terminal_task_ids={'2440'},
+        )
+
+        assert apply_service.delete_memory.call_count == 4, (
+            'Expected exactly 4 deletes (overlap1 deduped, not double-deleted): '
+            f'{apply_service.delete_memory.call_args_list!r}'
+        )
+        deleted_ids = {
+            c.kwargs.get('memory_id') for c in apply_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'o1', 'stale1', 'term1', 'overlap1'}, (
+            f'Expected no v1, got: {deleted_ids!r}'
+        )
+        assert apply_report['bucket_counts'] == expected_bucket_counts
+        assert 'after' in apply_report
+        assert apply_report['after']['total_source'] == 1
