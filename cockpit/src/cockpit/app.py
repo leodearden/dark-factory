@@ -839,7 +839,9 @@ class CockpitApp(App):
             return
         table = self.query_one('#session-table', SessionTable)
         if event.data_table is table:
-            self._focus_slug(event.row_key.value, self._records)
+            slug = event.row_key.value
+            if slug is not None:
+                self._focus_slug(slug, self._records)
 
     def _persist_ui_config(self) -> None:
         """Write the cockpit's own UI state -- its ONLY write target (PRD §2/§5).
