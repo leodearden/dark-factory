@@ -661,6 +661,43 @@ def _split_comma_ids(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(',') if part.strip()]
 
 
+def _non_negative_int(raw: str) -> int:
+    """argparse ``type=`` callback for ``--max-age-days``.
+
+    Rejects negative values at parse time. ``find_stale_markers`` computes
+    its cutoff as ``now - timedelta(days=max_age_days)``; a negative
+    ``max_age_days`` pushes that cutoff into the FUTURE, which would
+    silently drain every dated member (not just stale ones) — the same
+    effect as the documented ``--max-age-days 0`` ("drain everything")
+    lever, but reached by what reads as a typo rather than the deliberate,
+    explicit ``0`` (task 2596 amendment, reviewer_comprehensive #2). This
+    script's ``--apply`` path performs irreversible deletes, so a footgun
+    like this is rejected outright rather than silently honoured.
+
+    Args:
+        raw: Raw ``--max-age-days`` CLI value.
+
+    Returns:
+        The parsed non-negative int.
+
+    Raises:
+        argparse.ArgumentTypeError: If *raw* does not parse as an int, or
+            parses to a negative value. argparse turns this into a
+            ``parser.error()`` call (exit code 2), matching its handling of
+            any other malformed ``type=int`` argument.
+    """
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'invalid int value: {raw!r}') from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(
+            f'--max-age-days must be >= 0 (got {value}); use 0 to '
+            'explicitly drain every dated dead-weight record.'
+        )
+    return value
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the sweep's argparse parser.
 
@@ -693,9 +730,11 @@ def _build_parser() -> argparse.ArgumentParser:
              'Increase if count_memories_by_metadata shows >1000 source markers.',
     )
     parser.add_argument(
-        '--max-age-days', dest='max_age_days', type=int, default=14,
+        '--max-age-days', dest='max_age_days', type=_non_negative_int, default=14,
         help='Age cutoff in days for find_stale_markers (default: 14). '
-             'Use 0 to drain every dated dead-weight record.',
+             'Use 0 to drain every dated dead-weight record. Negative '
+             'values are rejected (they would push the cutoff into the '
+             'future and drain everything, not just stale records).',
     )
     parser.add_argument(
         '--delete-ids', dest='delete_ids', type=_split_comma_ids, default=[],

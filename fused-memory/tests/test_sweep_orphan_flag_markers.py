@@ -1226,6 +1226,23 @@ class TestBuildParser:
         args = parser.parse_args(['--max-age-days', '30'])
         assert args.max_age_days == 30
 
+    def test_max_age_days_zero_is_accepted(self):
+        """0 is the documented, explicit 'drain everything' lever and must
+        be accepted (task 2596 amendment, reviewer_comprehensive #2)."""
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--max-age-days', '0'])
+        assert args.max_age_days == 0
+
+    def test_max_age_days_negative_is_rejected_at_parse_time(self):
+        """A negative --max-age-days sets find_stale_markers's cutoff to a
+        FUTURE instant, which would silently drain every dated member (not
+        just stale ones) — the same effect as 0 but reached by what reads
+        as a typo. This must be rejected at parse time, not accepted and
+        silently misbehave (task 2596 amendment, reviewer_comprehensive #2)."""
+        parser = _mod._build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(['--max-age-days', '-1'])
+
     def test_delete_ids_comma_split(self):
         """--delete-ids splits a comma-joined string into a list of ids."""
         parser = _mod._build_parser()
