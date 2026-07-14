@@ -333,3 +333,85 @@ class TestRun:
         assert report['dry_run'] is False
         assert report['totals']['taggable'] == 0
         assert report['totals']['tagged'] == 0
+
+
+# ===========================================================================
+# Tests: scroll-truncation surface (non-aborting, unlike prune)
+# ===========================================================================
+
+class TestScanTruncationSurface:
+    """Unlike prune_recon_cycle_summaries (which hard-aborts on a truncated
+    scan because its deletes are irreversible), this script's in-place tag
+    is idempotent and non-destructive, so a truncated scan is surfaced as a
+    report-level flag rather than an abort (see plan design_decisions #5)."""
+
+    def _make_memory(self, records: list[dict]) -> MagicMock:
+        memory = MagicMock()
+        mem0 = MagicMock()
+        mem0.scroll_by_metadata = AsyncMock(return_value=records)
+        mem0.count_by_metadata = AsyncMock(return_value=len(records))
+        mem0.update = AsyncMock(return_value={'message': 'Memory updated successfully!'})
+        memory.mem0 = mem0
+        return memory
+
+    def _args(self, apply=False, project_id='dark_factory', scan_limit=2) -> argparse.Namespace:
+        return argparse.Namespace(apply=apply, project_id=project_id, scan_limit=scan_limit)
+
+    def _known_map(self, pid='dark_factory') -> dict:
+        return {pid: '/some/path'}
+
+    @pytest.mark.asyncio
+    async def test_scroll_at_scan_limit_flags_truncation_but_still_applies(self):
+        """A scroll returning exactly scan_limit records is the ambiguous
+        at-the-limit case (the true pool may be larger) -- the report must
+        carry a truthy possibly_truncated flag naming the affected project,
+        so a bounded scan is never silently mistaken for full coverage.
+        Unlike prune, this must NOT abort: classification proceeds over what
+        was scanned, and --apply still updates the taggable record found in
+        that (possibly partial) scan. A subsequent re-run over the
+        now-tagged data -- still pinned at scan_limit -- keeps the flag
+        (coverage still isn't proven) but performs zero further updates,
+        i.e. idempotent re-run remains safe even in the truncated case."""
+        records = [_rehome_record('m1'), _rehome_record('m2', src_project=None)]
+        memory = self._make_memory(records)
+        args = self._args(apply=True, scan_limit=2)
+
+        report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        assert not report.get('aborted')
+        assert report.get('possibly_truncated') is True
+        assert 'dark_factory' in (report.get('truncated_projects') or [])
+        assert report['projects']['dark_factory']['scanned'] == 2
+        memory.mem0.update.assert_awaited_once()
+        assert report['projects']['dark_factory']['tagged'] == 1
+
+        rerun_records = [
+            _rehome_record(
+                'm1',
+                data='[reify:task 948] Stage 2 should re-escalate task 948 after remediation.',
+            ),
+            _rehome_record('m2', src_project=None),
+        ]
+        memory2 = self._make_memory(rerun_records)
+        report2 = await _mod.run(
+            self._args(apply=True, scan_limit=2), memory=memory2,
+            known_projects_map=self._known_map(),
+        )
+
+        assert report2.get('possibly_truncated') is True
+        memory2.mem0.update.assert_not_awaited()
+
+
+# ===========================================================================
+# Tests: build_parser() defaults
+# ===========================================================================
+
+class TestArgparse:
+    """build_parser() constructs the CLI parser used by main()."""
+
+    def test_defaults(self):
+        args = _mod.build_parser().parse_args([])
+        assert args.apply is False
+        assert args.project_id is None
+        assert isinstance(args.scan_limit, int)
+        assert args.scan_limit > 0
