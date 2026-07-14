@@ -55,6 +55,58 @@ def _canonical_sig_field(value: Any) -> str | None:
     return None if value is None else str(value)
 
 
+def _split_task_id_parts(value: str) -> set[str]:
+    """Return the set of individual task-id parts within *value*.
+
+    ``value`` is a (possibly comma-joined) canonical task_id string, e.g.
+    ``'5040,5149'`` -> ``{'5040', '5149'}`` and ``'5040'`` -> ``{'5040'}``.
+    Each part is stripped of surrounding whitespace; empty parts (from
+    leading/trailing/doubled commas) are dropped.
+
+    Used both by :func:`_canonicalize_task_id_string` (dedup-signature
+    normalization, task-2432 bullet 4) and by the entity-scoped cite_task
+    fold's subset-membership eligibility gate (task-2432 bullets 1b/2/3).
+    """
+    return {p.strip() for p in value.split(',') if p.strip()}
+
+
+def _task_id_part_sort_key(part: str) -> tuple[int, Any]:
+    """Sort key for a single task-id part: numeric parts by int value (and
+    ordered before non-numeric parts), non-numeric parts lexically.
+
+    A stable, deterministic ordering is all that's required for dedup
+    purposes — the exact numeric-before-lexical grouping is not itself load
+    -bearing, only that two calls describing the same set of parts always
+    sort to the same joined string.
+    """
+    try:
+        return (0, int(part))
+    except ValueError:
+        return (1, part)
+
+
+def _canonicalize_task_id_string(value: str) -> str:
+    """Canonicalize a top-level ``task_id`` string for dedup-signature purposes.
+
+    Splits *value* on ``','``, strips whitespace from each part, drops empty
+    parts, sorts (numeric parts by int value, non-numeric parts lexically —
+    see :func:`_task_id_part_sort_key`), dedupes, and rejoins with ``','``.
+    A single-value input canonicalizes to itself (e.g. ``'5040'`` ->
+    ``'5040'``); an input with no non-empty parts (e.g. ``''``) is returned
+    unchanged.
+
+    This ensures a comma-joined task_id whose components are reordered (or
+    duplicated) between two ``add_finding`` calls collapses onto the same
+    dedup signature (task-2432 bullet 4) — mirrors
+    ``reconciliation.flag_dedup.compute_flag_signature``'s sorted-comma
+    -joined convention for its ``cited_tasks`` fallback.
+    """
+    parts = _split_task_id_parts(value)
+    if not parts:
+        return value
+    return ','.join(sorted(parts, key=_task_id_part_sort_key))
+
+
 # ---------------------------------------------------------------------------
 # Fix 1 helpers — citation identity + same-run echo suppression (task-1654)
 # ---------------------------------------------------------------------------
@@ -490,6 +542,18 @@ class ReconReportState:
         collapses onto the canonical finding instead of allocating a distinct
         ``(task_id, None)`` row.
 
+        A comma-joined ``task_id`` (e.g. ``'5040,5149'``) is canonicalized
+        via :func:`_canonicalize_task_id_string` (task-2432 bullet 4) BEFORE
+        the dedup signature is computed and BEFORE it is stored on the
+        resulting ``_Finding`` — split/stripped/deduped/sorted and rejoined,
+        so two calls describing the same set of task ids in a different
+        order (or with duplicated parts) collapse onto the same signature.
+        A single-value ``task_id`` canonicalizes to itself, so this is a
+        strict generalization of the pre-existing single-value dedup.
+        Because the stored ``finding.task_id`` is already canonical,
+        :meth:`_purge_finding` recomputes an identical signature from it —
+        delete/refile stays consistent with no separate change there.
+
         ``description``/``suggested_action``/``category`` are truncated to
         ``_MAX_FINDING_TEXT_CHARS`` BEFORE dedup hashing (task-2410;
         see :func:`_truncate_field`).  One consequence for the null-null
@@ -551,6 +615,8 @@ class ReconReportState:
         # The two namespaces are kept separate so a null-null finding with description
         # 'd' never collides with a real-signature finding that shares description 'd'.
         c_task_id = _canonical_sig_field(task_id)
+        if c_task_id is not None:
+            c_task_id = _canonicalize_task_id_string(c_task_id)
         c_flag_type = _canonical_sig_field(flag_type)
 
         # Flag-type inheritance (task-2318): a re-raise that omits flag_type
