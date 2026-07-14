@@ -264,3 +264,93 @@ def test_load_census_state_valid_file_is_ok_with_no_warning(tmp_path, caplog):
     assert data["last_census_report"] == "plans/confusion-census-2026-07-01.md"
     assert data["last_census_done_count"] == 500
     assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# step-13: RED — codebook_signal() + load_census_config()
+# ---------------------------------------------------------------------------
+
+def _sighting(date, session="s"):
+    return {
+        "date": date,
+        "project": "dark_factory",
+        "session": session,
+        "origin_phase": "unknown",
+        "manifested_phase": "unknown",
+    }
+
+
+def test_codebook_signal_empty_codebook_returns_none_and_empty_list():
+    codebook = {"version": 2, "entries": [], "candidates": []}
+    earliest, first_seens = ct.codebook_signal(codebook)
+    assert earliest is None
+    assert first_seens == []
+
+
+def test_codebook_signal_collects_earliest_across_entries_and_candidates():
+    codebook = {
+        "version": 2,
+        "entries": [
+            {
+                "id": "entry-a",
+                "title": "t",
+                "severity": "low",
+                "status": "open",
+                "origin_phase": "unknown",
+                "manifested_phase": "unknown",
+                "sightings": [_sighting("2026-06-20", "s1"), _sighting("2026-07-01", "s2")],
+            }
+        ],
+        "candidates": [
+            {
+                "id": "cand-20260705-1",
+                "title": "x",
+                "first_seen": "2026-07-05",
+                "disposition": "pending",
+                "sightings": [_sighting("2026-07-06", "s3")],
+            },
+            {
+                "id": "cand-20260710-1",
+                "title": "y",
+                "first_seen": "2026-07-10",
+                "disposition": "pending",
+                "sightings": [],
+            },
+        ],
+    }
+    earliest, first_seens = ct.codebook_signal(codebook)
+    assert earliest == datetime.fromisoformat("2026-06-20")
+    assert first_seens == [
+        datetime.fromisoformat("2026-07-05"),
+        datetime.fromisoformat("2026-07-10"),
+    ]
+
+
+def test_load_census_config_absent_file_returns_defaults(tmp_path):
+    config = ct.load_census_config(tmp_path)
+    assert config == ct.CensusConfig()
+
+
+def test_load_census_config_partial_override_merges_over_defaults(tmp_path):
+    legibility_dir = tmp_path / "docs" / "legibility"
+    legibility_dir.mkdir(parents=True)
+    (legibility_dir / "legibility.yaml").write_text(
+        "census:\n  max_interval_days: 3\n  novelty_spike:\n    count: 9\n",
+        encoding="utf-8",
+    )
+    config = ct.load_census_config(tmp_path)
+    assert config.max_interval_days == 3
+    assert config.novelty_spike_count == 9
+    assert config.floor_days == 5  # untouched -- still default
+
+
+def test_load_census_config_malformed_file_returns_defaults_with_one_warning(tmp_path, caplog):
+    legibility_dir = tmp_path / "docs" / "legibility"
+    legibility_dir.mkdir(parents=True)
+    (legibility_dir / "legibility.yaml").write_text("{", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        config = ct.load_census_config(tmp_path)
+
+    assert config == ct.CensusConfig()
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
