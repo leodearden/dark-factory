@@ -20,6 +20,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ __all__ = [
     'compare_windows',
     'compute_window_metrics',
     'load_window_rows',
+    'run_canary',
 ]
 
 
@@ -313,3 +315,40 @@ def compare_windows(
         baseline_n=baseline.n_rows,
         post_n=post.n_rows,
     )
+
+
+def run_canary(
+    db_path: Path,
+    deploy_at_iso: str,
+    *,
+    baseline_days: int,
+    post_days: int,
+    project_id: str,
+    thresholds: CanaryThresholds,
+) -> CanaryVerdict:
+    """End-to-end T8 canary: derive the baseline/post windows around
+    *deploy_at_iso*, load + aggregate each from the ``runs.db`` at
+    *db_path*, and compare them.
+
+    The baseline window is the half-open range
+    ``[deploy_at - baseline_days, deploy_at)`` (the rolling pre-deploy
+    window); the post window is ``[deploy_at, deploy_at + post_days)``. In
+    practice this coincides with "or now()" (per the PRD T8 analysis):
+    a live ``runs.db`` has no rows beyond the current time, so setting
+    *post_days* to comfortably span "now" and re-running the canary as
+    more post-deploy data accumulates gets the same effect without this
+    function needing its own notion of the current time — it is a pure
+    function of *deploy_at_iso*/*baseline_days*/*post_days* and whatever
+    rows already exist in *db_path*.
+    """
+    deploy_at = datetime.fromisoformat(deploy_at_iso)
+    baseline_start_iso = (deploy_at - timedelta(days=baseline_days)).isoformat()
+    post_end_iso = (deploy_at + timedelta(days=post_days)).isoformat()
+
+    baseline_rows = load_window_rows(db_path, baseline_start_iso, deploy_at_iso, project_id)
+    post_rows = load_window_rows(db_path, deploy_at_iso, post_end_iso, project_id)
+
+    baseline_metrics = compute_window_metrics(baseline_rows)
+    post_metrics = compute_window_metrics(post_rows)
+
+    return compare_windows(baseline_metrics, post_metrics, thresholds)
