@@ -1240,9 +1240,18 @@ class GitOps:
                 # call), but fail safe rather than proceed unprotected.
                 # `acquired` stays False, so the outer finally below closes
                 # our fd WITHOUT unlinking the foreign holder's lock file.
+                # Deliberately catches bare OSError too, not just
+                # BlockingIOError/EWOULDBLOCK: ANY flock failure here means
+                # we cannot safely assert liveness, so we fail safe either
+                # way. But a bare OSError (e.g. EINTR/EIO/EBADF) is not
+                # necessarily lock contention, so the message carries the
+                # underlying exception class + text rather than asserting
+                # "live consumer" unconditionally — lets an operator tell
+                # genuine EWOULDBLOCK contention apart from an OS-level fault.
                 raise EphemeralWorktreeError(
                     f'ephemeral_worktree({kind.name}): flock LOCK_NB denied on '
-                    f'{lock_path} — live consumer holds it; skipping'
+                    f'{lock_path} ({e.__class__.__name__}: {e}) — likely a live '
+                    f'consumer holds it (could also be a lock-fault); skipping'
                 ) from e
 
             try:
@@ -1295,17 +1304,27 @@ class GitOps:
                     # left an empty skeleton.
                     shutil.rmtree(tmp_path, ignore_errors=True)
         finally:
-            # Release the advisory lock (closing the fd drops our flock)
-            # and — ONLY when this call was the one that acquired it — best-
-            # effort unlink the lock file, mirroring gc.sh's own `rm -f
-            # "$orphan_lock"` (gc.sh:606) on removal. Never unlink a lock we
-            # did not acquire: that would delete a foreign holder's lock
-            # file out from under it.
-            with contextlib.suppress(Exception):
-                os.close(lock_fd)
+            # Release the advisory lock and — ONLY when this call was the
+            # one that acquired it — best-effort unlink the lock file,
+            # mirroring gc.sh's own `rm -f "$orphan_lock"` (gc.sh:606) on
+            # removal. Never unlink a lock we did not acquire: that would
+            # delete a foreign holder's lock file out from under it.
+            #
+            # Unlink BEFORE closing the fd — i.e. while we still hold the
+            # flock — rather than after. This mirrors gc.sh, which performs
+            # its own analogous `rm -f` while still holding ITS flock, and
+            # it closes a window that a close-then-unlink ordering would
+            # leave open: between releasing the flock and removing the
+            # directory entry, a new contender could open+flock the same
+            # (about-to-be-deleted) path, only to have our unlink yank the
+            # file out from under it. Unlinking first means any contender
+            # that opens the path afterward necessarily creates a fresh
+            # inode, so it can never observe a lock we are about to drop.
             if acquired:
                 with contextlib.suppress(Exception):
                     os.unlink(lock_path)
+            with contextlib.suppress(Exception):
+                os.close(lock_fd)
 
     def pool_in_use(self) -> bool:
         """True iff a warm or spec lane pool is configured on this host (task 2099).
