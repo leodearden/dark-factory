@@ -867,3 +867,199 @@ class TestAutoHealMainHealthDeferredGuards:
             'escalation_queue=None must route to escalate-only and never halt'
         )
         worker._spawn_main_health_fix_task.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Step-21 (RED): probe -> auto_heal routing.
+#
+# _run_deferred_main_health_probe has no `auto_heal` param yet — on a
+# confirmed still-fresh break it unconditionally calls
+# _file_main_health_escalation (the steps 9-14 escalation-only behaviour).
+# This pins the routing contract step-22 must add: when an `auto_heal`
+# callback is supplied, a confirmed break is routed to it
+# (``await auto_heal(outcome, req)``) INSTEAD of the escalation-only
+# fallback; the main_health_red signal is still emitted either way; and
+# auto_heal is invoked ONLY for a confirmed, still-fresh break — never for a
+# negative/raising/stale probe. Every assertion below currently fails with a
+# TypeError (unexpected keyword argument 'auto_heal') until step-22 adds the
+# param and the routing branch.
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredProbeRoutesToAutoHeal:
+    def test_confirmed_break_routes_to_auto_heal_and_still_emits_signal(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)  # get_main_sha AsyncMock -> MAIN_SHA
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        event_store = MagicMock(spec=EventStore)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        auto_heal = AsyncMock()
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, MAIN_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, event_store=event_store,
+                    auto_heal=auto_heal,
+                )
+
+        asyncio.run(_run())
+
+        auto_heal.assert_awaited_once()
+        call = auto_heal.await_args
+        assert call is not None, 'auto_heal was not awaited'
+        outcome_arg, req_arg = call.args
+        assert outcome_arg.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'Expected the routed outcome reason to start with '
+            f'{MAIN_HEALTH_RED_REASON_PREFIX!r}; got {outcome_arg.reason!r}'
+        )
+        expected_fp = _main_health_fingerprint(
+            COMPILE_ERROR_RESULT.category or '', COMPILE_ERROR_RESULT.cause_hint, MAIN_SHA,
+        )
+        assert outcome_arg.dedupe_fingerprint == expected_fp, (
+            f'Expected the routed outcome dedupe_fingerprint={expected_fp!r}; '
+            f'got {outcome_arg.dedupe_fingerprint!r}'
+        )
+        assert req_arg is req, (
+            f'Expected auto_heal to be awaited with the SAME req instance; '
+            f'got {req_arg!r}'
+        )
+
+        # The probe must not ALSO file the escalation-only fallback when
+        # routing to auto_heal — that becomes auto_heal's responsibility.
+        assert escalation_queue.get_pending() == [], (
+            'Routing to auto_heal must not ALSO file the escalation-only '
+            'fallback'
+        )
+
+        calls = event_store.emit.call_args_list
+        main_health_calls = [
+            c for c in calls
+            if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
+        ]
+        assert len(main_health_calls) >= 1, (
+            f'Expected the main_health_red signal to still be emitted when '
+            f'routing to auto_heal; event_store.emit calls: {calls}'
+        )
+
+    def test_auto_heal_none_still_files_escalation_only(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression guard for steps 9-14: auto_heal=None (the default,
+        every bare/test caller) must keep filing exactly one escalation via
+        the pre-existing escalation-only fallback."""
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, MAIN_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, auto_heal=None,
+                )
+
+        asyncio.run(_run())
+
+        pending = escalation_queue.get_pending()
+        assert len(pending) == 1, (
+            f'Expected auto_heal=None to keep filing exactly one escalation '
+            f'(escalation-only fallback); got {pending}'
+        )
+        assert pending[0].category == 'preexisting_main_break', (
+            f'Expected category=preexisting_main_break; got '
+            f'{pending[0].category!r}'
+        )
+
+    def test_negative_probe_does_not_invoke_auto_heal(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        auto_heal = AsyncMock()
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(False, '')),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, auto_heal=auto_heal,
+                )
+
+        asyncio.run(_run())
+        auto_heal.assert_not_awaited()
+        assert escalation_queue.get_pending() == [], (
+            'A negative (non-preexisting) probe must file no escalation, '
+            'even when auto_heal is supplied'
+        )
+
+    def test_raising_probe_does_not_invoke_auto_heal(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        auto_heal = AsyncMock()
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(side_effect=RuntimeError('boom')),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, auto_heal=auto_heal,
+                )
+
+        asyncio.run(_run())  # must not raise
+        auto_heal.assert_not_awaited()
+        assert escalation_queue.get_pending() == [], (
+            'A raising probe must file no escalation, even when auto_heal '
+            'is supplied'
+        )
+
+    def test_stale_main_does_not_invoke_auto_heal(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)  # get_main_sha AsyncMock -> MAIN_SHA
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        auto_heal = AsyncMock()
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, STALE_PROBE_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, auto_heal=auto_heal,
+                )
+
+        asyncio.run(_run())
+        auto_heal.assert_not_awaited()
+        assert escalation_queue.get_pending() == [], (
+            'A stale-main probe verdict must file no escalation and must '
+            'not invoke auto_heal'
+        )
