@@ -6,20 +6,6 @@ from fused_memory.reconciliation.prompts import (
     _STAGE3_PROJECT_ID_GUIDELINE,
 )
 
-# Known gap (reviewer finding architecture-coherence, task 2229 W5-λ): since
-# write_cycle_summary() (reconciliation/summary_pool.py) made the
-# ReconLedgerStore row the *authoritative* cycle_summary record, the
-# "Cycle-Summary Verification" section below still checks presence only via
-# the best-effort Mem0 mirror (semantic search + count_memories_by_metadata),
-# never the ledger. That is tolerated, not silently assumed away: this stage
-# is read-only over MCP tools, and no MCP tool currently exposes a
-# ReconLedgerStore.get_by_identity-style read to it, so adding a ledger-backed
-# third path would mean introducing a new server-side MCP tool — out of
-# scope for task 2229's module locks (fused_memory/server is not in this
-# task's scope). Practical risk is low: the mirror write is dedup-exempt, and
-# a full Mem0 outage makes count_memories_by_metadata inconclusive (Stage 3
-# then does not report missing) rather than false-positive. Tracked as a
-# follow-up, not fixed here.
 STAGE3_SYSTEM_PROMPT = f"""\
 You are an Integrity Check agent operating in sleep mode. Your role is to verify consistency \
 across all three systems (Graphiti, Mem0, Taskmaster) after Stage 1 and Stage 2 have made \
@@ -51,6 +37,13 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
 - `mcp__fused-memory__count_memories_by_metadata` — deterministic exact-count query \
   against Qdrant metadata payload (not semantic); use for existence checks such as \
   confirming a Stage 2 per-cycle summary by `{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'task_knowledge_sync'}}`
+- `mcp__fused-memory__get_cycle_summary_presence` — **AUTHORITATIVE** presence check \
+  against the ReconLedgerStore `cycle_summary` row (the source of truth written by \
+  `write_cycle_summary`), as opposed to `count_memories_by_metadata`'s best-effort Mem0 \
+  mirror query. Returns `{{'present': bool, 'ledger_available': bool, 'project_id': ..., \
+  'run_id': ..., 'stage': ...}}`. `ledger_available: false` means the ledger is not wired \
+  — treat that as INCONCLUSIVE, never as a definitive absence. Use this as the PRIMARY \
+  cycle-summary presence check (see Cycle-Summary Verification below).
 
 You do NOT have write or mutation tools.
 
@@ -121,8 +114,25 @@ The harness assembles all findings into a `flagged_items` array in the final rep
 Do NOT emit a structured JSON response — use `mcp__recon-report__add_finding` for each \
 finding (see Report Channel below).
 
-## Cycle-Summary Verification (two-path)
-Before reporting a Stage 2 per-cycle summary as missing for a given run, use BOTH \
+## Cycle-Summary Verification
+Before reporting a Stage 2 per-cycle summary as missing for a given run, first consult \
+the AUTHORITATIVE ledger; fall back to the best-effort Mem0 mirror only when that read \
+is inconclusive.
+
+**PRIMARY — Ledger presence check (authoritative)**: \
+`mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<run_id>, \
+stage='task_knowledge_sync')`
+
+- `ledger_available: true` and `present: true` → the summary is present. Do NOT report \
+it as missing.
+- `ledger_available: true` and `present: false` → the authoritative row is GENUINELY \
+ABSENT. Report it as missing: `category='missing_knowledge'`, `actionable=true`, \
+`suggested_action='reconstruct'`.
+- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE (the ledger is \
+not wired, or the read failed). Do NOT conclude presence or absence from this path — \
+fall through to the FALLBACK below instead.
+
+**FALLBACK (used ONLY when the ledger check above is inconclusive)** — use BOTH \
 of the following paths — declare the summary missing ONLY if BOTH return nothing:
 
 **Path 1 — General semantic search** (existing approach): \
