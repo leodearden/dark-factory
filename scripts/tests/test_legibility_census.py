@@ -634,3 +634,79 @@ def test_advance_census_state_atomic_replace_no_partial_left_behind(tmp_path):
 
     leftovers = [p for p in tmp_path.iterdir() if p.name != "census-state.json"]
     assert leftovers == [], "no partial/temp file left behind"
+
+
+# ---------------------------------------------------------------------------
+# step-15: RED — render_report() dated markdown assembly
+# ---------------------------------------------------------------------------
+
+def _sample_mining_result():
+    return mod.MiningResult(
+        records=[],
+        batch_stats=[
+            mod.BatchStats(index=0, total=10, succeeded=10, failed=0, dup_rate=0.5, saturated=False),
+            mod.BatchStats(index=1, total=10, succeeded=10, failed=0, dup_rate=0.9, saturated=True),
+        ],
+        stop_reason="saturated",
+    )
+
+
+def test_render_report_contains_dated_header_and_all_sections():
+    report = mod.render_report(
+        date="2026-07-14",
+        project_id="dark_factory",
+        force=False,
+        matrix_md="| origin \\ manifested | merge |\n| --- | --- |\n| implement | 2 |\n",
+        mining_result=_sample_mining_result(),
+        synthesis_md="Fable synthesis prose goes here.",
+        filed_task_ids=["1234", "1235"],
+        cost_note="~$3.42 across 20 Sonnet calls + 1 Fable call.",
+    )
+
+    assert "# confusion census 2026-07-14" in report
+    assert "dark_factory" in report
+    # matrix embedded verbatim
+    assert "| origin \\ manifested | merge |\n| --- | --- |\n| implement | 2 |\n" in report
+    # saturation-stats section: batch count, per-batch dup rates, stop_reason
+    assert "saturated" in report
+    assert "2" in report  # batch count
+    assert "0.5" in report
+    assert "0.9" in report
+    # filed task ids
+    assert "1234" in report
+    assert "1235" in report
+    # cost note
+    assert "~$3.42 across 20 Sonnet calls + 1 Fable call." in report
+    # synthesis prose
+    assert "Fable synthesis prose goes here." in report
+    # no force marker on a non-forced run
+    assert "--force" not in report
+
+
+def test_render_report_force_marker_present_when_forced():
+    report = mod.render_report(
+        date="2026-07-14",
+        project_id="dark_factory",
+        force=True,
+        matrix_md="matrix",
+        mining_result=_sample_mining_result(),
+        synthesis_md="prose",
+        filed_task_ids=[],
+        cost_note="cost",
+    )
+    assert "--force" in report
+    assert "operator-initiated" in report.lower()
+
+
+def test_render_report_is_deterministic_no_clock():
+    kwargs = dict(
+        date="2026-07-14",
+        project_id="dark_factory",
+        force=False,
+        matrix_md="matrix",
+        mining_result=_sample_mining_result(),
+        synthesis_md="prose",
+        filed_task_ids=["1"],
+        cost_note="cost",
+    )
+    assert mod.render_report(**kwargs) == mod.render_report(**kwargs)
