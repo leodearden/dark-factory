@@ -248,6 +248,80 @@ class TestNoneHandlesSpawnsNothing:
 
 
 # ---------------------------------------------------------------------------
+# Task 2565 step-5 (RED): _spawn_main_health_probe must forward
+# origin_is_local into the spawned _run_deferred_main_health_probe
+# coroutine, defaulting to True (local) when the caller omits it — so a
+# future _run_post_merge_verify caller's HOST-AFFINITY signal actually
+# reaches the probe. Fails today: origin_is_local is an unknown kwarg of
+# _spawn_main_health_probe (TypeError).
+# ---------------------------------------------------------------------------
+
+
+class TestSpawnForwardsOriginIsLocal:
+    """_spawn_main_health_probe must forward its origin_is_local kwarg into
+    the spawned _run_deferred_main_health_probe coroutine (task 2565)."""
+
+    def test_forwards_explicit_origin_is_local_false(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('42', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        spy = AsyncMock(return_value=None)
+
+        async def _run() -> None:
+            handles = _MainHealthProbeHandles(background_tasks=set())
+            with patch(
+                'orchestrator.merge_queue._run_deferred_main_health_probe',
+                new=spy,
+            ):
+                _spawn_main_health_probe(
+                    handles, git_ops, req, COMPILE_ERROR_RESULT,
+                    origin_is_local=False,
+                )
+                pending = set(handles.background_tasks)
+                for t in pending:
+                    await t
+
+        asyncio.run(_run())
+
+        assert spy.call_count == 1
+        kwargs = spy.call_args.kwargs
+        assert kwargs.get('origin_is_local') is False, f'kwargs={kwargs}'
+
+    def test_defaults_to_origin_is_local_true_when_omitted(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('42', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        spy = AsyncMock(return_value=None)
+
+        async def _run() -> None:
+            handles = _MainHealthProbeHandles(background_tasks=set())
+            with patch(
+                'orchestrator.merge_queue._run_deferred_main_health_probe',
+                new=spy,
+            ):
+                _spawn_main_health_probe(
+                    handles, git_ops, req, COMPILE_ERROR_RESULT,
+                )
+                pending = set(handles.background_tasks)
+                for t in pending:
+                    await t
+
+        asyncio.run(_run())
+
+        assert spy.call_count == 1
+        kwargs = spy.call_args.kwargs
+        assert kwargs.get('origin_is_local') is True, f'kwargs={kwargs}'
+
+
+# ---------------------------------------------------------------------------
 # Step-9 (RED): _run_deferred_main_health_probe happy path — files a dedup'd
 # preexisting_main_break escalation and emits the main_health_red signal for
 # a confirmed pre-existing break; a negative or raising probe files nothing.
