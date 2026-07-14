@@ -102,6 +102,36 @@ class TestGetCycleSummaryPresenceTool:
             await store.close()
 
     @pytest.mark.asyncio
+    async def test_inconclusive_when_ledger_not_wired(self, mock_config):
+        """A real MemoryService with NO recon_ledger wired reports a clean
+        inconclusive dict (present=False, ledger_available=False) — NOT an
+        @mcp_tool_errors error dict. Mirrors write_cycle_summary returning
+        False when unwired: absence of the ledger is inconclusive, not a
+        definitive absent."""
+        service = MemoryService(mock_config)
+        assert service.recon_ledger is None
+
+        server = create_mcp_server(service)
+        result = await server._tool_manager.call_tool(
+            'get_cycle_summary_presence',
+            {
+                'project_id': _PROJECT_ID,
+                'run_id': 'any-run',
+                'stage': _STAGE,
+            },
+        )
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}: {result!r}'
+        assert 'error' not in result, f'Unexpected error in result: {result!r}'
+        assert result.get('present') is False, f'Expected present=False, got: {result!r}'
+        assert result.get('ledger_available') is False, (
+            f'Expected ledger_available=False, got: {result!r}'
+        )
+        assert result.get('project_id') == _PROJECT_ID
+        assert result.get('run_id') == 'any-run'
+        assert result.get('stage') == _STAGE
+
+    @pytest.mark.asyncio
     async def test_invalid_project_id_returns_validation_error_without_calling_service(self):
         """Invalid project_id (contains unsafe chars) returns a validation error
         dict and does NOT call the service."""
