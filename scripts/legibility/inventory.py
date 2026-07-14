@@ -33,8 +33,9 @@ def encode_cwd(cwd: str) -> str:
 
     Both ``/`` and ``.`` map to ``-`` — this is the same best-effort
     mirror of Claude Code's own ``~/.claude/projects/<enc>`` naming, kept
-    in lockstep with the canonical implementation at
-    ``orchestrator/src/orchestrator/session_registry.py:451-459``.
+    in lockstep with the canonical implementation,
+    ``orchestrator.session_registry.transcript_path_for_cwd`` (named, not
+    line-cited, so this docstring doesn't drift as that file evolves).
     """
     return cwd.replace('/', '-').replace('.', '-')
 
