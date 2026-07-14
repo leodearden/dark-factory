@@ -231,6 +231,49 @@ class TestAddMemoryNearDuplicateGate:
         )
         mock_service.add_memory.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_pre_check_search_pins_to_mem0_store(self):
+        """The guard's pre-check search must pin stores=['mem0'].
+
+        procedural_knowledge lives only in Mem0, but memory_service.search
+        defaults to text-based routing (see routing/router.py): content
+        containing temporal keywords like "before"/"after" is classified
+        QueryType.temporal and routed graphiti-only, so _search_mem0 never
+        runs and the guard would silently fail open on exactly the gotcha
+        phrasing it exists to catch. Passing stores=['mem0'] short-circuits
+        that routing decision via router.route()'s stores_override branch,
+        regardless of how the content is phrased.
+        """
+        mock_service = AsyncMock()
+        mock_service.search.return_value = []
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+        content = (
+            'Before writing to write_queue.db verify the path; the merge '
+            'worker consumes the stash after advance'
+        )
+
+        await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': content,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        mock_service.search.assert_called_once()
+        kwargs = mock_service.search.call_args.kwargs
+        assert kwargs.get('stores') == ['mem0'], (
+            f"Expected pre-check search pinned to stores=['mem0'], got call_args: "
+            f'{mock_service.search.call_args!r}'
+        )
+        assert kwargs.get('query') == content
+        assert kwargs.get('project_id') == _PROJECT_ID
+        assert kwargs.get('categories') == ['procedural_knowledge']
+        assert kwargs.get('limit') == 5
+
 
 class TestAddMemoryNearDuplicateGateConfig:
     """The guard's enable flag and threshold are read from config at call time."""
