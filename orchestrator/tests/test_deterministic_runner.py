@@ -5610,6 +5610,36 @@ class TestSelfRestartActThenAskGate:
         assert deploy_state_calls
         assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
 
+    async def test_full_phase_sequence_ran_scheduled_escalated(self, tmp_path: Path):
+        """Reviewer amendment (task 2240, test_coverage): the specific reason
+        the two new _LEGAL edges (ran->scheduled, scheduled->escalated) were
+        added — a self-restart act-then-ask deploy traverses BOTH within a
+        single dispatch. Assert the FULL ordered sequence (not just the
+        final call): the shared before_done_ran_at write lands 'ran', the
+        self-restart stamp lands 'scheduled', and the gate filing lands
+        'escalated'."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        phases = [c.args[1]['deploy_state']['phase'] for c in deploy_state_calls]
+        assert phases == ['ran', 'scheduled', 'escalated'], (
+            f'expected the phase machine to traverse ran -> scheduled -> '
+            f'escalated in order within a single dispatch, got {phases}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step-13 (ε): robustness_crash_resume + always_escalates=True
