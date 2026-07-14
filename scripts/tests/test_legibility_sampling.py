@@ -414,6 +414,48 @@ class TestStratifiedSampleBoundary:
         assert result.per_stratum_counts == {'recon': 2, 'watcher': 1, 'interactive': 2}
 
 
+class TestStratifiedSampleReserveExceedsBudget:
+    """When per-stratum reserve floors collectively exceed the byte budget
+    (a real ~/.claude/projects scenario found via manual acceptance
+    testing: session sizes can dwarf a conservative daily budget), the
+    OVERALL cap must still hold — cheapest stratum floor first, so budget
+    pressure falls on the priciest stratum rather than the cap being
+    silently blown."""
+
+    def _config(self, max_bytes):
+        return config_mod.LegibilityConfig(
+            project_id='dark_factory',
+            project_root='/home/leo/src/dark-factory',
+            escalation_port=8103,
+            cwd_prefixes=['/home/leo/src/dark-factory'],
+            budgets=config_mod.Budgets(max_daily_digest_bytes=max_bytes),
+            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
+        )
+
+    def _build_records(self):
+        return [
+            # "recon" floor: expensive (200_000 bytes each -> 400_000 total).
+            _scored('recon-1', 'recon', mod.SignalCounts(tool_error=10), 'recon a', 200_000),
+            _scored('recon-2', 'recon', mod.SignalCounts(tool_error=9), 'recon b', 200_000),
+            # "interactive" floor: cheap (1_000 bytes each -> 2_000 total).
+            _scored('interactive-1', 'interactive', mod.SignalCounts(tool_error=2), 'human a', 1_000),
+            _scored('interactive-2', 'interactive', mod.SignalCounts(tool_error=1), 'human b', 1_000),
+        ]
+
+    def test_total_never_exceeds_budget_even_when_floors_alone_would(self):
+        # Both floors together (402_000) exceed a 3_000-byte budget.
+        result = mod.stratified_sample(self._build_records(), self._config(3_000))
+        assert sum(r.size_bytes for r in result.selected) <= 3_000
+        assert result.bytes_used <= 3_000
+
+    def test_cheap_stratum_preferred_when_budget_cannot_fit_both(self):
+        result = mod.stratified_sample(self._build_records(), self._config(3_000))
+        selected_ids = {r.path.stem for r in result.selected}
+        assert {'interactive-1', 'interactive-2'} <= selected_ids
+        assert 'recon-1' not in selected_ids
+        assert 'recon-2' not in selected_ids
+
+
 class TestRenderManifest:
     def test_emits_one_json_object_per_line(self):
         records = [

@@ -18,16 +18,26 @@ primitives rather than reaching into another task's module).
 """
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import re
+import sys
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from collections.abc import Iterator, Sequence
 
-from legibility.config import LegibilityConfig
-from legibility.inventory import SessionRecord
+# Self-bootstrap for standalone `python scripts/legibility/sampling.py` runs
+# — must run BEFORE the `legibility.*` imports below, since a direct script
+# invocation puts only scripts/legibility/ (not scripts/) on sys.path.
+# Skipped under pytest/normal package import: __name__ is 'legibility.sampling'.
+if __name__ == '__main__':
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from legibility.config import LegibilityConfig, load_config  # noqa: E402
+from legibility.inventory import SessionRecord, enumerate_sessions  # noqa: E402
 
 
 def _iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
@@ -434,15 +444,21 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
     size, including zero-signal/clone records, not just the survivors —
     otherwise a heavily-noisy stratum would sample far less than intended
     of its real signal); (5) RESERVE each non-empty stratum's top
-    ``min(per_stratum_min, len(candidates))`` into the selection first —
-    accumulated BEFORE any cross-stratum score comparison, so a stratum of
-    huge high-score sessions elsewhere can never evict this floor (the §8.4
-    "big sessions can't evict a whole stratum" postcondition); (6) fill the
-    remaining ``max_daily_digest_bytes`` from the leftover (non-reserved)
-    candidates across ALL strata, in global score-descending order,
-    stopping outright at the first candidate that would exceed the budget
-    (a strict greedy halt, not a skip-ahead bin-pack). The final selection
-    is returned in score-descending order.
+    ``min(per_stratum_min, len(candidates))`` as a GROUP, cheapest
+    stratum-floor (by total bytes) first — accumulated BEFORE any
+    cross-stratum score comparison, so a stratum of huge high-score
+    sessions elsewhere can never evict a cheaper stratum's floor (the §8.4
+    "big sessions can't evict a whole stratum" postcondition). The overall
+    byte budget still governs even the reserve phase: a stratum's floor is
+    skipped whole (never partially) if it would push the running total
+    over budget — real ``~/.claude/projects`` session sizes can dwarf a
+    conservative daily budget, so "budget-protected" floors must still
+    respect the cap, never silently exceed it; (6) fill the remaining
+    budget from the leftover (non-reserved) candidates across ALL strata,
+    in global score-descending order, stopping outright at the first
+    candidate that would exceed the budget (a strict greedy halt, not a
+    skip-ahead bin-pack). The final selection is returned in
+    score-descending order.
     """
     top_fraction = config.sampling.top_fraction
     per_stratum_min = config.sampling.per_stratum_min
@@ -453,7 +469,7 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
         by_stratum.setdefault(record.stratum, []).append(record)
 
     zero_signal_dropped = 0
-    reserved: list[ScoredRecord] = []
+    reserved_groups: list[list[ScoredRecord]] = []
     leftover: list[ScoredRecord] = []
 
     for stratum_records in by_stratum.values():
@@ -471,14 +487,18 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
         candidates = survivors[:candidate_count]
 
         reserve_count = min(per_stratum_min, len(candidates))
-        reserved.extend(candidates[:reserve_count])
+        if reserve_count:
+            reserved_groups.append(candidates[:reserve_count])
         leftover.extend(candidates[reserve_count:])
 
     selected: list[ScoredRecord] = []
     bytes_used = 0
-    for record in reserved:
-        selected.append(record)
-        bytes_used += record.size_bytes
+    for group in sorted(reserved_groups, key=lambda g: sum(r.size_bytes for r in g)):
+        group_bytes = sum(r.size_bytes for r in group)
+        if bytes_used + group_bytes > max_bytes:
+            continue
+        selected.extend(group)
+        bytes_used += group_bytes
 
     for record in sorted(leftover, key=lambda r: r.score, reverse=True):
         if bytes_used + record.size_bytes > max_bytes:
@@ -498,3 +518,116 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
         zero_signal_dropped=zero_signal_dropped,
         bytes_used=bytes_used,
     )
+
+
+# ---------------------------------------------------------------------------
+# render_manifest + main — CLI acceptance surface
+# ---------------------------------------------------------------------------
+
+def render_manifest(selected: Sequence[ScoredRecord]) -> str:
+    """Render *selected* as JSONL, one ``{session, stratum, score, size}`` object per line.
+
+    ``session`` is the session's transcript path (as a string). Empty
+    input yields an empty string (no trailing newline either way — callers
+    ``print()`` the result, which adds the final newline).
+    """
+    lines = [
+        json.dumps({
+            'session': str(record.path),
+            'stratum': record.stratum,
+            'score': record.score,
+            'size': record.size_bytes,
+        })
+        for record in selected
+    ]
+    return '\n'.join(lines)
+
+
+def _find_first_user_turn(path: Path) -> dict[str, Any] | None:
+    """Find a session's first non-sidechain, non-meta user-turn record.
+
+    Returns the raw record dict (as :func:`classify_agent_class` expects),
+    or None if the transcript has no such turn. Malformed/unreadable input
+    degrades to None rather than raising.
+    """
+    try:
+        for record in _iter_json_lines(path):
+            if record.get('type') != 'user':
+                continue
+            if record.get('isSidechain') or record.get('isMeta'):
+                continue
+            return record
+    except OSError:
+        return None
+    return None
+
+
+def main(argv: Sequence[str]) -> int:
+    """CLI entry point: the full inventory -> score -> classify -> sample -> render pipeline.
+
+    Wires ``config.load_config -> inventory.enumerate_sessions ->
+    score_signals -> classify_agent_class -> stratified_sample ->
+    render_manifest``. Prints the JSONL manifest to stdout and a
+    per-stratum-counts / zero-signal-drops / budget-accounting summary to
+    stderr. This is the CLI acceptance surface — a manual run against live
+    ``~/.claude/projects`` is the observable, not a pytest.
+    """
+    default_config = Path(__file__).resolve().parent.parent.parent / 'docs' / 'legibility' / 'legibility.yaml'
+    parser = argparse.ArgumentParser(
+        description='Sample yesterday\'s confusion-signal sessions for the nightly digest.'
+    )
+    parser.add_argument(
+        '--config', default=str(default_config),
+        help='Path to legibility.yaml (default: %(default)s)',
+    )
+    parser.add_argument(
+        '--projects-root', default=str(Path.home() / '.claude' / 'projects'),
+        help='Root of the ~/.claude/projects tree (default: %(default)s)',
+    )
+    parser.add_argument(
+        '--date', default=None,
+        help='UTC date to sample, YYYY-MM-DD (default: yesterday UTC).',
+    )
+    args = parser.parse_args(argv)
+
+    cfg = load_config(args.config)
+    target_date = (
+        date.fromisoformat(args.date) if args.date
+        else (datetime.now(UTC) - timedelta(days=1)).date()
+    )
+
+    sessions = enumerate_sessions(args.projects_root, cfg.cwd_prefixes, target_date)
+
+    scored: list[ScoredRecord] = []
+    for session in sessions:
+        counts = score_signals(session.path)
+        first_turn = _find_first_user_turn(session.path)
+        stratum = classify_agent_class(first_turn, session.path)
+        scored.append(
+            ScoredRecord(
+                session=session,
+                stratum=stratum,
+                counts=counts,
+                first_turn_text=_first_user_turn_text(first_turn),
+            )
+        )
+
+    result = stratified_sample(scored, cfg)
+
+    print(render_manifest(result.selected))
+
+    summary = ['=== legibility sampler summary ===', '']
+    summary.append(f'sessions enumerated: {len(sessions)}')
+    summary.append(f'zero-signal dropped: {result.zero_signal_dropped}')
+    for stratum in sorted(result.per_stratum_counts):
+        summary.append(f'  {stratum}: {result.per_stratum_counts[stratum]} selected')
+    summary.append(
+        f'bytes used: {result.bytes_used} / {cfg.budgets.max_daily_digest_bytes}'
+    )
+    print('\n'.join(summary), file=sys.stderr)
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
