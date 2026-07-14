@@ -71,6 +71,41 @@ def find_near_duplicate_memory(
     return max(qualifying, key=lambda r: r.relevance_score)
 
 
+def resolve_near_dup_threshold(memory_service: Any) -> float:
+    """Read the near-dup similarity threshold from *memory_service*'s config.
+
+    Navigates ``memory_service.config.reconciliation.procedural_knowledge_near_dup_threshold``
+    defensively via ``getattr`` at each hop, returning the module default
+    (:data:`_DEFAULT_NEAR_DUP_THRESHOLD`) whenever any hop is missing, ``None``,
+    or the leaf value is not a real ``float``/``int`` (this also excludes
+    ``bool``, which is an ``int`` subclass, and any Mock attribute an
+    unspecced test double might auto-generate).
+    """
+    value = _reconciliation_attr(memory_service, 'procedural_knowledge_near_dup_threshold')
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return _DEFAULT_NEAR_DUP_THRESHOLD
+
+
+def resolve_near_dup_guard_enabled(memory_service: Any) -> bool:
+    """Read the near-dup guard enable flag from *memory_service*'s config.
+
+    Same defensive ``getattr`` navigation as :func:`resolve_near_dup_threshold`,
+    falling back to :data:`_DEFAULT_NEAR_DUP_GUARD_ENABLED` unless the leaf
+    value is a real ``bool``.
+    """
+    value = _reconciliation_attr(memory_service, 'procedural_knowledge_near_dup_guard_enabled')
+    if isinstance(value, bool):
+        return value
+    return _DEFAULT_NEAR_DUP_GUARD_ENABLED
+
+
+def _reconciliation_attr(memory_service: Any, attr: str) -> Any:
+    config = getattr(memory_service, 'config', None)
+    reconciliation = getattr(config, 'reconciliation', None)
+    return getattr(reconciliation, attr, None)
+
+
 def build_near_duplicate_block(
     agent_id: str | None,
     content: str,

@@ -50,9 +50,10 @@ from fused_memory.reconciliation.task_filter import (
 )
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
 from fused_memory.server.near_duplicate_guard import (
-    _DEFAULT_NEAR_DUP_THRESHOLD,
     build_near_duplicate_block,
     find_near_duplicate_memory,
+    resolve_near_dup_guard_enabled,
+    resolve_near_dup_threshold,
 )
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.services.memory_service import MemoryService
@@ -942,7 +943,12 @@ def create_mcp_server(
         allow_near_duplicate = (
             isinstance(metadata, dict) and metadata.get('allow_near_duplicate') is True
         )
-        if category == 'procedural_knowledge' and not allow_near_duplicate:
+        if (
+            category == 'procedural_knowledge'
+            and not allow_near_duplicate
+            and resolve_near_dup_guard_enabled(memory_service)
+        ):
+            near_dup_threshold = resolve_near_dup_threshold(memory_service)
             try:
                 near_dup_results = await memory_service.search(
                     query=content,
@@ -957,12 +963,10 @@ def create_mcp_server(
                     'near-duplicate pre-check search failed; failing open', exc_info=True
                 )
                 near_dup_results = []
-            near_dup_match = find_near_duplicate_memory(
-                near_dup_results, _DEFAULT_NEAR_DUP_THRESHOLD
-            )
+            near_dup_match = find_near_duplicate_memory(near_dup_results, near_dup_threshold)
             if near_dup_match is not None:
                 return build_near_duplicate_block(
-                    agent_id, content, near_dup_match, _DEFAULT_NEAR_DUP_THRESHOLD
+                    agent_id, content, near_dup_match, near_dup_threshold
                 )
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
         result = await memory_service.add_memory(
