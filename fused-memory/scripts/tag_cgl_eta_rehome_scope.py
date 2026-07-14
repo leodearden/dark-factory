@@ -70,6 +70,7 @@ import asyncio
 import json
 import logging
 import sys
+from datetime import UTC, datetime
 from typing import Any
 
 from fused_memory.maintenance.rehome_scope_tag import (
@@ -193,3 +194,152 @@ def build_tag_report(
         'totals': totals,
         'changes': changes,
     }
+
+
+# ---------------------------------------------------------------------------
+# Pure helper: project selection
+# ---------------------------------------------------------------------------
+
+def select_projects(
+    known_map: dict[str, str],
+    project_id_filter: str | None,
+) -> list[str]:
+    """Return the sorted list of project_ids to process.
+
+    Mirrors ``prune_recon_cycle_summaries.select_projects``.
+
+    Parameters
+    ----------
+    known_map:
+        ``{project_id: project_root}`` from ``build_known_projects_map``.
+    project_id_filter:
+        When given, restrict to this single project_id. Raises ValueError
+        with the list of known ids if the filter is not recognised.
+
+    Returns
+    -------
+    Sorted list of project_ids.
+    """
+    if project_id_filter is None:
+        return sorted(known_map.keys())
+    if project_id_filter not in known_map:
+        known_ids = sorted(known_map.keys())
+        raise ValueError(
+            f'Unknown project_id {project_id_filter!r}. '
+            f'Known project ids: {known_ids}'
+        )
+    return [project_id_filter]
+
+
+# ---------------------------------------------------------------------------
+# Live shell: run
+# ---------------------------------------------------------------------------
+
+async def run(
+    args: argparse.Namespace,
+    *,
+    memory: Any,
+    known_projects_map: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Scan every selected project's CGL-eta ``cross_target_rehome`` entries,
+    classify each as tag/skip, and report.
+
+    Enumerates each selected project's ``cgl_eta_cross_target_rehome``
+    entries via ``memory.mem0.scroll_by_metadata(scope, {'kind':
+    CGL_ETA_REHOME_KIND}, limit=args.scan_limit)`` -- a deterministic
+    Qdrant payload-filtered scroll -- classifies each record via
+    :func:`classify_rehome_record`, and assembles the report via
+    :func:`build_tag_report`. See the module docstring for the two-phase
+    (dry-run default / ``--apply``) model.
+
+    Parameters
+    ----------
+    args:
+        Parsed ``argparse.Namespace`` (apply, project_id, scan_limit).
+    memory:
+        Live (or mock) MemoryService instance.
+    known_projects_map:
+        Optional override for the project registry (used in tests to inject
+        a fixture map without reading env vars / filesystem).
+
+    Returns
+    -------
+    The tag report dict (see :func:`build_tag_report`), or an abort payload
+    (``{'aborted': True, ...}``) if an unknown ``--project-id`` was given.
+    """
+    generated_at = datetime.now(UTC).isoformat()
+
+    if known_projects_map is None:
+        from fused_memory.config.schema import FusedMemoryConfig as _FMC  # noqa: PLC0415
+        from fused_memory.models.scope import build_known_projects_map  # noqa: PLC0415
+        cfg = _FMC()
+        known_projects_map = build_known_projects_map(
+            cfg.taskmaster.project_root if cfg.taskmaster else '',
+        )
+        if len(known_projects_map) <= 1:
+            logger.warning(
+                'tag_cgl_eta_rehome_scope: known-projects map resolved to only '
+                '%s. If you expected the full project registry, run with the '
+                'fused-memory service environment (PROJECT_ROOT + '
+                'DASHBOARD_KNOWN_PROJECT_ROOTS) -- otherwise this scan '
+                'silently skips every other project.',
+                sorted(known_projects_map),
+            )
+
+    try:
+        project_ids = select_projects(known_projects_map, args.project_id)
+    except ValueError as exc:
+        abort_payload: dict[str, Any] = {
+            'error': str(exc),
+            'aborted': True,
+            'dry_run': not args.apply,
+            'generated_at': generated_at,
+        }
+        print(json.dumps(abort_payload, indent=2, default=str))
+        print(
+            f'ABORT: unknown --project-id {args.project_id!r}; '
+            f'known: {sorted(known_projects_map)}',
+            file=sys.stderr,
+        )
+        return abort_payload
+
+    # Scan + classify every selected project.
+    decisions_by_project: dict[str, list[dict[str, Any]]] = {}
+    for pid in project_ids:
+        scope = Scope(project_id=pid)
+        scrolled = await memory.mem0.scroll_by_metadata(
+            scope, {'kind': CGL_ETA_REHOME_KIND}, limit=args.scan_limit,
+        )
+        if not isinstance(scrolled, list):
+            logger.warning(
+                'tag_cgl_eta_rehome_scope: mem0.scroll_by_metadata returned a '
+                'non-list result for project %s; treating as empty. got: %s',
+                pid, repr(scrolled)[:200],
+            )
+            scrolled = []
+
+        decisions_by_project[pid] = [classify_rehome_record(r) for r in scrolled]
+
+    # Apply or dry-run.
+    applied_ids: set[str] = set()
+
+    report = build_tag_report(
+        decisions_by_project=decisions_by_project,
+        applied_ids=applied_ids,
+        dry_run=not args.apply,
+        generated_at=generated_at,
+    )
+
+    # JSON report goes to stdout (machine-readable); summary to stderr.
+    print(json.dumps(report, indent=2, default=str))
+    print(
+        f"CGL-eta rehome-scope tag report "
+        f"({'DRY RUN' if not args.apply else 'APPLIED'}) at {generated_at}: "
+        f"scanned={report['totals']['scanned']} "
+        f"taggable={report['totals']['taggable']} "
+        f"tagged={report['totals']['tagged']} "
+        f"skipped={report['totals']['skipped']}",
+        file=sys.stderr,
+    )
+
+    return report
