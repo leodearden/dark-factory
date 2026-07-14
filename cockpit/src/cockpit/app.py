@@ -825,14 +825,23 @@ class CockpitApp(App):
         'enter' binding, or a same-row click) to action_focus_selected.
 
         SessionTable also posts RowSelected (same message namespace, same
-        disambiguation idiom as on_data_table_row_highlighted above) --
-        selecting a session-table row has no focus action of its own, so
-        that case is simply ignored here.
+        disambiguation idiom as on_data_table_row_highlighted above) -- a
+        session-table selection resolves the row's SessionRecord to its
+        Display and focuses it via _focus_slug against the live
+        self._records (the exact set the table renders), matching the
+        spawn tree's own Enter path (PRD §1: "Pressing Enter on a row
+        raises that terminal"). Fail-soft is inherited from _focus_slug.
+        Any other/foreign DataTable is a no-op.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
-        if event.data_table is not queue:
+        if event.data_table is queue:
+            self.action_focus_selected()
             return
-        self.action_focus_selected()
+        table = self.query_one('#session-table', SessionTable)
+        if event.data_table is table:
+            slug = event.row_key.value
+            if slug is not None:
+                self._focus_slug(slug, self._records)
 
     def _persist_ui_config(self) -> None:
         """Write the cockpit's own UI state -- its ONLY write target (PRD §2/§5).
