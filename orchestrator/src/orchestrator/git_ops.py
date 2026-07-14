@@ -296,6 +296,22 @@ PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: str = '_offline-deep'
 # I1). See InteractiveWorktreeInfo / InteractiveWorktreeLimitError /
 # GitOps.create_interactive_worktree below for the full contract.
 
+class WorktreeKind(Enum):
+    """Ephemeral main-tip probe/sweep worktree kinds minted by
+    :meth:`GitOps.ephemeral_worktree` (task θ, verify-plan PRD).
+
+    Each member's value IS both the directory-name prefix
+    ``ephemeral_worktree`` mints under ``worktree_base`` (e.g.
+    ``_mainprobe-<hex>``) AND the :data:`PROTECTED_PREFIXES` registry key
+    that keeps the reaper from ever reclaiming it mid-run — making the enum
+    the single source of truth for both so naming and protection cannot
+    drift apart.
+    """
+
+    MAIN_PROBE = '_mainprobe-'
+    MAIN_SWEEP = '_mainsweep-'
+
+
 # Band-ownership registry for worktree_base's ephemeral-worktree namespace
 # (gitops-chokepoints PRD, Mechanism 3 / task ε).  Maps a band TOKEN to an
 # owner tag identifying the subsystem that mints/reaps it.  A key ending in
@@ -316,6 +332,11 @@ PROTECTED_PREFIXES: dict[str, str] = {
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: 'persistent-offline-deep',
     LANE_STATE_DIRNAME: 'warm-lane-lifecycle',
     TASK_META_DIRNAME: 'task-artifacts',
+    # Ephemeral verify-probe bands minted by GitOps.ephemeral_worktree() —
+    # keyed by WorktreeKind.*.value so this registry cannot drift from the
+    # CM's own naming (task θ).
+    WorktreeKind.MAIN_PROBE.value: 'verify-main-probe',
+    WorktreeKind.MAIN_SWEEP.value: 'verify-main-sweep',
 }
 
 
