@@ -65,6 +65,35 @@ tasks:
           pattern: 'something'
 """
 
+_MISSING_LABEL_AND_MANUAL_SIDECAR_YAML = """\
+prd: plans/bar-prd.md
+schema_version: 1
+tasks:
+  - label: alpha
+    task_id: null
+    title: Mechanical task
+    capabilities:
+      - name: grep_check
+        binding: 'grep for the marker'
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'TODO(alpha)'
+          expect: absent
+          paths:
+            - src/foo.py
+  - label: beta
+    task_id: null
+    title: Manual-only task
+    capabilities:
+      - name: manual_check
+        binding: 'eyeball the UI'
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: 'no automated check available'
+"""
+
 
 @pytest.mark.asyncio
 async def test_no_prd_metadata_returns_none(tmp_path):
@@ -210,3 +239,53 @@ async def test_malformed_sidecar_is_fail_soft(tmp_path):
     # The sidecar on disk is byte-identical — no partial task_id stamp.
     assert sidecar_path.read_text(encoding='utf-8') == _MALFORMED_SIDECAR_YAML
     task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_missing_label_and_manual_only(tmp_path):
+    """A batch label absent from the sidecar is reported; a manual-only label
+    still gets its task_id stamped but writes no metadata."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'bar-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_MISSING_LABEL_AND_MANUAL_SIDECAR_YAML, encoding='utf-8')
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+    ids = ['301', '302', '303']
+    tasks_data = [
+        {
+            'id': '301',
+            'metadata': {'prd_path': 'plans/bar-prd.md', 'prd_task_label': 'alpha'},
+        },
+        {
+            'id': '302',
+            'metadata': {'prd_path': 'plans/bar-prd.md', 'prd_task_label': 'beta'},
+        },
+        {
+            'id': '303',
+            'metadata': {'prd_path': 'plans/bar-prd.md', 'prd_task_label': 'zeta'},
+        },
+    ]
+
+    report = await stamp_capability_manifests(
+        project_root=str(tmp_path),
+        ids=ids,
+        tasks_data=tasks_data,
+        task_interceptor=task_interceptor,
+    )
+
+    assert report == {
+        'path': 'plans/bar-prd.capability-manifest.yaml',
+        'stamped': ['alpha', 'beta'],
+        'missing_labels': ['zeta'],
+        'errors': [],
+    }
+
+    reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+    by_label = {t['label']: t['task_id'] for t in reloaded['tasks']}
+    assert by_label == {'alpha': 301, 'beta': 302}
+
+    task_interceptor.update_task.assert_called_once()
+    call = task_interceptor.update_task.call_args
+    assert call.args[0] == '301'
