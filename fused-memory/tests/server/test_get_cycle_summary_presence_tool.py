@@ -102,6 +102,74 @@ class TestGetCycleSummaryPresenceTool:
             await store.close()
 
     @pytest.mark.asyncio
+    async def test_stage_disambiguates_rows_sharing_run_id(self, mock_config, tmp_path):
+        """Stage 1 (memory_consolidator) and Stage 2 (task_knowledge_sync) can
+        each write a cycle_summary row under the SAME run_id (identity also
+        includes flag_type). A presence query for each stage must return only
+        that stage's own row — the exact collision the stage->flag_type
+        mapping exists to prevent — and a third, never-written stage under the
+        same run_id must independently report present=False."""
+        service = MemoryService(mock_config)
+        store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await store.initialize()
+        service.set_recon_ledger(store)
+
+        run_id = 'run-shared-1'
+        written_stages = ('memory_consolidator', 'task_knowledge_sync')
+        for flag_type in written_stages:
+            await store.upsert(
+                ReconLedgerRecord(
+                    project_id=_PROJECT_ID,
+                    record_kind='cycle_summary',
+                    task_id='',
+                    flag_type=flag_type,
+                    run_id=run_id,
+                    payload_json='{}',
+                    state='active',
+                    created_at='2026-07-01T00:00:00+00:00',
+                )
+            )
+
+        try:
+            server = create_mcp_server(service)
+
+            for flag_type in written_stages:
+                result = await server._tool_manager.call_tool(
+                    'get_cycle_summary_presence',
+                    {
+                        'project_id': _PROJECT_ID,
+                        'run_id': run_id,
+                        'stage': flag_type,
+                    },
+                )
+                assert isinstance(result, dict), f'Expected dict, got {type(result)}: {result!r}'
+                assert 'error' not in result, f'Unexpected error in result: {result!r}'
+                assert result.get('present') is True, (
+                    f'Expected present=True for stage={flag_type!r} (own row), got: {result!r}'
+                )
+                assert result.get('ledger_available') is True
+                assert result.get('stage') == flag_type
+
+            unwritten_result = await server._tool_manager.call_tool(
+                'get_cycle_summary_presence',
+                {
+                    'project_id': _PROJECT_ID,
+                    'run_id': run_id,
+                    'stage': 'some_other_stage',
+                },
+            )
+            assert 'error' not in unwritten_result, (
+                f'Unexpected error in result: {unwritten_result!r}'
+            )
+            assert unwritten_result.get('present') is False, (
+                f'Expected present=False for unwritten stage sharing run_id, '
+                f'got: {unwritten_result!r}'
+            )
+            assert unwritten_result.get('ledger_available') is True
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
     async def test_inconclusive_when_ledger_not_wired(self, mock_config):
         """A real MemoryService with NO recon_ledger wired reports a clean
         inconclusive dict (present=False, ledger_available=False) — NOT an
