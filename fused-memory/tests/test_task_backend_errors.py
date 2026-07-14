@@ -12,6 +12,7 @@ from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     StatusWriteAuthorityError,
     TaskmasterError,
+    TaskNotFoundError,
     done_provenance_via_update_task_error,
     status_via_update_task_error,
 )
@@ -85,3 +86,35 @@ def test_done_provenance_write_authority_error_is_taskmaster_error():
     assert isinstance(err, TaskmasterError)
     assert err.code == 'TASKMASTER_TOOL_ERROR'
     assert 'set_task_status' in err.message
+
+
+# ── TaskNotFoundError — definitive zero-row absence (task 2521 RC2) ──────
+
+
+def test_task_not_found_error_is_taskmaster_error():
+    """isinstance(err, TaskmasterError) so existing `except TaskmasterError`
+    sites keep catching it unchanged — discrimination is by type only."""
+    err = TaskNotFoundError('7', tag='master')
+    assert isinstance(err, TaskmasterError)
+
+
+def test_task_not_found_error_code_and_message_unchanged():
+    """code and message stay byte-identical to the generic not-found raise
+    so code-branch and message-phrase consumers keep working."""
+    err = TaskNotFoundError('7', tag='master')
+    assert err.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'No tasks found for ID(s): 7' in err.message
+    assert 'No tasks found for ID(s): 7' in str(err)
+
+
+def test_task_not_found_error_attributes():
+    """Carries task_id and tag so the (id, tag) absence scope is self-documenting."""
+    err = TaskNotFoundError('7', tag='master')
+    assert err.task_id == '7'
+    assert err.tag == 'master'
+
+
+def test_task_not_found_error_tag_defaults_to_none():
+    err = TaskNotFoundError('7')
+    assert err.task_id == '7'
+    assert err.tag is None
