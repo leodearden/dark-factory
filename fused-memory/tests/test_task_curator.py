@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -5281,4 +5282,36 @@ class TestEvictTask:
         points_selector = call_kwargs.get('points_selector')
         assert isinstance(points_selector, PointIdsList)
         assert points_selector.points == [_expected_point_id('proj', '292')]
+
+    @pytest.mark.asyncio
+    async def test_evict_task_best_effort_on_qdrant_error(self, caplog):
+        """evict_task() swallows Qdrant errors (logs WARNING) and no-ops when
+        the collection doesn't exist — never fails task removal."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        # Qdrant error during delete: must not raise, must log a WARNING.
+        mock_client = AsyncMock()
+        mock_client.collection_exists = AsyncMock(return_value=True)
+        mock_client.delete = AsyncMock(side_effect=RuntimeError('qdrant down'))
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client):
+            with caplog.at_level(
+                logging.WARNING, logger='fused_memory.middleware.task_curator',
+            ):
+                result = await curator.evict_task('proj', '7')
+
+        assert result is None
+        assert any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        ), f'expected a WARNING log, got: {[(r.levelno, r.message) for r in caplog.records]}'
+
+        # Missing collection: delete must not even be attempted (no-op).
+        mock_client_missing = AsyncMock()
+        mock_client_missing.collection_exists = AsyncMock(return_value=False)
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client_missing):
+            await curator.evict_task('proj', '7')
+
+        mock_client_missing.delete.assert_not_called()
 
