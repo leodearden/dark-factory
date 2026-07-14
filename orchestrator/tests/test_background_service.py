@@ -36,8 +36,6 @@ sharing that class) — mirrors test_merge_queue_resource_audit.py.
 
 from __future__ import annotations
 
-import pytest
-
 
 class TestBackoffPolicy:
     """step-1: BackoffPolicy constant-delay contract."""
