@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -49,7 +50,7 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     # get_statuses(); get_task() follows automatically.
     def _default_get_task(tid: str) -> dict | None:
         try:
-            statuses, _err = h.scheduler.get_statuses.return_value
+            statuses, _err = cast(AsyncMock, h.scheduler.get_statuses).return_value
         except (TypeError, ValueError):
             return None
         status = statuses.get(tid) if isinstance(statuses, dict) else None

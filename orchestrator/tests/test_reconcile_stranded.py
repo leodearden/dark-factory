@@ -9,6 +9,7 @@ import shutil
 import time as _time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -188,7 +189,7 @@ def harness(tmp_path: Path, mock_orch_config):
     # responsible for including a matching 'status' key themselves.
     def _default_get_task(tid: str) -> dict | None:
         try:
-            statuses, _err = h.scheduler.get_statuses.return_value
+            statuses, _err = cast(AsyncMock, h.scheduler.get_statuses).return_value
         except (TypeError, ValueError):
             return None
         status = statuses.get(tid) if isinstance(statuses, dict) else None
