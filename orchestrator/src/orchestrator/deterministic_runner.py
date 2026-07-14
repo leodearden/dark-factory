@@ -1124,13 +1124,24 @@ class DeterministicRunner:
                 esc.id, task_id,
             )
 
-        # Stamp gate_escalated_at AFTER successful escalation submit.
+        # Stamp gate_escalated_at AFTER successful escalation submit.  ζ: on the
+        # DEPLOY path (before_done set — this helper is also reached from the
+        # self-restart and cross-unit act-then-ask fallthroughs, and the
+        # self-restart crash-resume re-file), this atomically advances
+        # deploy_state.phase to ESCALATED too (DS-1). A pure gate
+        # (before_done=None) is not a deploy and gets no deploy_state.
         now_iso = datetime.now(UTC).isoformat()
-        await self.scheduler.update_task(
-            task_id,
-            {'gate_escalated_at': now_iso},
-            metadata_mode='merge',
-        )
+        if metadata.get('before_done') is not None:
+            await self._advance_deploy_phase(
+                task_id, metadata, DeployPhase.ESCALATED,
+                evidence={'gate_escalated_at': now_iso},
+            )
+        else:
+            await self.scheduler.update_task(
+                task_id,
+                {'gate_escalated_at': now_iso},
+                metadata_mode='merge',
+            )
 
         # Set status to blocked — gate awaits human decision.  Best-effort, same
         # as _file_infra_issue_and_block (reviewer amendment): the escalation +
@@ -1752,15 +1763,16 @@ class DeterministicRunner:
                     # was successfully registered.  If the orchestrator crashes between
                     # this stamp and the done write, the resume path (sub-case b-self
                     # above) drives to done with scheduled provenance instead of
-                    # re-escalating as a generic crash-window.
-                    await self.scheduler.update_task(
-                        task_id,
-                        {'before_done_scheduled_at': {
+                    # re-escalating as a generic crash-window.  ζ: this is also the
+                    # ran->scheduled phase advance, atomically merged in the SAME
+                    # update_task call (DS-1).
+                    await self._advance_deploy_phase(
+                        task_id, metadata, DeployPhase.SCHEDULED,
+                        evidence={'before_done_scheduled_at': {
                             'at': datetime.now(UTC).isoformat(),
                             'transient_unit': transient_unit,
                             'fire_delay_secs': on_active_secs,
                         }},
-                        metadata_mode='merge',
                     )
 
                     if not always_escalates:
