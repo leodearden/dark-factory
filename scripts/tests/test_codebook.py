@@ -268,6 +268,29 @@ def test_migrate_v1_to_v2_does_not_mutate_input():
     assert v1 == original
 
 
+def test_migrate_v1_to_v2_maps_yaml_boolean_true_status_to_open():
+    """PyYAML's default (YAML-1.1) resolver coerces an unquoted `status: yes`
+    to the Python bool True, not the string "yes" — confirmed empirically
+    against the real docs/legibility/confusion-codebook.yaml (both of its
+    `status: yes` entries load as status=True). migrate_v1_to_v2 must treat
+    the loaded bool True the same as the string "yes" and map it to 'open'."""
+    v1 = {
+        "version": 1,
+        "entries": [
+            {
+                "id": "bool-coerced-yes",
+                "title": "A v1 entry whose status was unquoted `yes` in YAML",
+                "severity": "medium",
+                "status": True,
+                "sightings_2026_06": 3,
+            }
+        ],
+    }
+    result = mod.migrate_v1_to_v2(v1)
+    assert result["entries"][0]["status"] == "open"
+    assert mod.validate(result) == []
+
+
 # ---------------------------------------------------------------------------
 # step-7: RED — validate_coding_record() against §7.3 schema
 # ---------------------------------------------------------------------------

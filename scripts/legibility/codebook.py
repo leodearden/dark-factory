@@ -481,7 +481,12 @@ def migrate_v1_to_v2(codebook: dict) -> dict:
         entry.setdefault("origin_phase", "unknown")
         entry.setdefault("manifested_phase", "unknown")
         entry.setdefault("sightings", [])
-        if entry.get("status") == "yes":
+        # YAML 1.1 (PyYAML's default resolver) coerces an unquoted `yes` to
+        # the Python bool True, so a real v1 file's `status: yes` loads as
+        # True, not the string "yes" (confirmed against the live
+        # docs/legibility/confusion-codebook.yaml) -- both spellings map to
+        # 'open'.
+        if entry.get("status") in ("yes", True):
             entry["status"] = "open"
 
     result.setdefault("candidates", [])
