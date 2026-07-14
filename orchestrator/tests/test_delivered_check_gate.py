@@ -20,10 +20,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from _recording_event_store import _RecordingEventStore
 from pydantic import ValidationError
 
 from orchestrator.config import DeliveredChecksConfig, OrchestratorConfig, RELOADABLE_FIELDS
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
+from orchestrator.event_store import EventType
 from orchestrator.scheduler import Scheduler, TickContext
 
 # ---------------------------------------------------------------------------
@@ -491,3 +493,87 @@ class TestDeliveredChecksConfig:
         """The scheduler-tuning green tier: an operator may retune the sweep
         budget via mcp__escalation__reload_config without a restart."""
         assert 'delivered_checks.max_checks_per_tick' in RELOADABLE_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# TestNoteDeliveredHold (task 2580 — step-11 RED / step-12 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestNoteDeliveredHold:
+    """``Scheduler._note_delivered_hold`` — hold-visibility event on a
+    dedicated ``_streak_delivered_hold`` counter.  Mirrors
+    ``_note_external_hold``'s bump-then-emit shape, but WITHOUT threshold
+    gating: task 2580 (delta) has no grace_cycles config yet (task 2583/
+    epsilon layers threshold-gated escalation on top with its own counter),
+    so every held tick emits ``EventType.delivered_check_gate_held`` with
+    the running streak count.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+        scheduler.finish_startup()
+        return scheduler
+
+    def _held_events(self, scheduler: Scheduler) -> list[tuple[str, dict]]:
+        _event_store = scheduler.event_store
+        assert _event_store is not None
+        return [
+            (evt, data)
+            for evt, data in _event_store.events  # type: ignore[attr-defined]
+            if evt == str(EventType.delivered_check_gate_held)
+        ]
+
+    def test_first_call_bumps_streak_to_one_and_emits_event(self, scheduler: Scheduler):
+        detail = {'name': 'cap-one', 'dep_id': '20', 'main_sha': 'abc123', 'kind': 'grep'}
+
+        scheduler._note_delivered_hold('T', detail=detail)
+
+        assert scheduler._streak_delivered_hold.value('T') == 1
+        events = self._held_events(scheduler)
+        assert len(events) == 1
+        _evt_type, evt_data = events[0]
+        assert evt_data['task_id'] == 'T'
+        assert evt_data['data'].get('ticks') == 1
+        assert evt_data['data'].get('detail') == detail
+
+    def test_repeated_calls_increment_streak_and_emit_every_tick(self, scheduler: Scheduler):
+        """Unlike _note_external_hold, delta has no threshold — every call
+        both bumps the streak AND emits (pure per-tick visibility)."""
+        detail = {'name': 'cap-one', 'dep_id': '20', 'main_sha': 'abc123', 'kind': 'grep'}
+
+        for _ in range(3):
+            scheduler._note_delivered_hold('T', detail=detail)
+
+        assert scheduler._streak_delivered_hold.value('T') == 3
+        events = self._held_events(scheduler)
+        assert [data['data'].get('ticks') for _evt, data in events] == [1, 2, 3]
+
+    def test_detail_names_the_failed_check(self, scheduler: Scheduler):
+        """The payload detail dict must name the failed check (name/dep_id/
+        main_sha/kind) for epsilon (task 2583) to consume when layering
+        grace-streak escalation on top."""
+        detail = {'name': 'cap-two', 'dep_id': '30', 'main_sha': 'deadbeef', 'kind': 'script'}
+
+        scheduler._note_delivered_hold('T2', detail=detail)
+
+        events = self._held_events(scheduler)
+        assert events[0][1]['data']['detail'] == detail
+
+    def test_detail_defaults_to_none(self, scheduler: Scheduler):
+        """detail is optional — omitting it still bumps the streak and emits."""
+        scheduler._note_delivered_hold('T3')
+
+        assert scheduler._streak_delivered_hold.value('T3') == 1
+        events = self._held_events(scheduler)
+        assert events[0][1]['data'].get('detail') is None
+
+    def test_independent_task_ids_have_independent_streaks(self, scheduler: Scheduler):
+        scheduler._note_delivered_hold('A')
+        scheduler._note_delivered_hold('A')
+        scheduler._note_delivered_hold('B')
+
+        assert scheduler._streak_delivered_hold.value('A') == 2
+        assert scheduler._streak_delivered_hold.value('B') == 1
