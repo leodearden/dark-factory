@@ -2151,6 +2151,273 @@ class TestGetAssembledReportNonActionableEchoSuppression:
 
 
 # ---------------------------------------------------------------------------
+# task-2453 step-1: cross_project_routing taxonomy guard — RED until step-2
+# wires _apply_cross_project_routing_guard into get_assembled_report.
+# ---------------------------------------------------------------------------
+
+
+class TestCrossProjectRoutingTaxonomyGuard:
+    """Verify get_assembled_report downgrades an anchor-less cross_project_routing
+    finding to category='other'/flag_type='cross_project_info'.
+
+    A non-empty cited_tasks list is the only machine-checkable proof that a
+    cite_task -> get_task routing check actually ran (recon_report.py:1075).
+    Without that anchor, category='cross_project_routing' is an unverified
+    claim and must be downgraded at read time rather than surfaced to
+    operators as a routing finding.
+    """
+
+    def _build_state(self):
+        """Build a ReconReportState with 'reify' registered, task_interceptor,
+        and a fake memory_service (so both cite_task and cite_entity work —
+        the latter is needed to pin the cited_tasks-specific discriminator;
+        see test_cross_project_routing_with_only_cited_entity_is_still_downgraded)."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.server.recon_report import ReconReportState
+
+        task_interceptor = AsyncMock()
+        task_interceptor.get_task = AsyncMock(return_value={
+            'title': 'Task from reify project',
+            'data': {},
+        })
+
+        class _FakeMemSvc:
+            async def get_entity(self, name: str, project_id: str) -> dict:
+                return {'nodes': [{'uuid': 'aaaa-bbbb', 'name': name}]}
+
+        state = ReconReportState(
+            ttl_seconds=3600,
+            clock=lambda: 0.0,
+            task_interceptor=task_interceptor,
+            memory_service=_FakeMemSvc(),
+        )
+        state.known_projects['reify'] = '/tmp/reify'
+        return state
+
+    @pytest.mark.asyncio
+    async def test_cross_project_routing_without_cited_tasks_is_downgraded(self):
+        """A cross_project_routing finding with no cite_task anchor is downgraded
+        to category='other'/flag_type='cross_project_info' — it is NOT dropped,
+        and all other fields (finding_id/description/actionable/task_id) are
+        unchanged."""
+        state = self._build_state()
+        run_id = 'r2453-no-anchor'
+
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id,
+            severity='moderate',
+            category='cross_project_routing',
+            description='informational cross-project note',
+            suggested_action='FYI only, no routing check performed',
+            actionable=False,
+            task_id=None,
+            flag_type='cross_project',
+        )
+        assert 'error' not in r, f'add_finding failed: {r}'
+        finding_id = r['finding_id']
+        # Deliberately do NOT call cite_task — cited_tasks stays empty, so
+        # there is no machine-checkable proof of a routing check.
+
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None, 'get_assembled_report returned None'
+        items = assembled['flagged_items']
+        assert len(items) == 1, f'Expected 1 finding, got {len(items)}'
+        item = items[0]
+
+        assert item['finding_id'] == finding_id
+        assert item['category'] == 'other', (
+            f'Expected category downgraded to "other", got {item["category"]!r}'
+        )
+        assert item['flag_type'] == 'cross_project_info', (
+            f'Expected flag_type downgraded to "cross_project_info", got {item["flag_type"]!r}'
+        )
+        assert item['description'] == 'informational cross-project note'
+        assert item['actionable'] is False
+        assert item['task_id'] is None
+        assert item['cited_tasks'] == []
+
+    @pytest.mark.asyncio
+    async def test_cross_project_routing_with_cited_tasks_is_unchanged(self):
+        """(B) A cross_project_routing finding WITH a cite_task anchor keeps its
+        category/flag_type — the routing-check evidence is present, so no
+        downgrade fires. Mirrors
+        test_recon_cross_cycle_dedup_citations.py::test_cross_project_finding_carries_cited_tasks,
+        co-located here with the guard it pins."""
+        state = self._build_state()
+        run_id = 'r2453-with-anchor'
+
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id,
+            severity='moderate',
+            category='cross_project_routing',
+            description='Work belongs to reify/3803 — orphaned edge needs cleanup',
+            suggested_action='Route to reify project for manual resolution',
+            actionable=False,
+            task_id=None,
+            flag_type='cross_project',
+        )
+        assert 'error' not in r, f'add_finding failed: {r}'
+        finding_id = r['finding_id']
+
+        cite_result = await state.cite_task(
+            run_id=run_id, finding_id=finding_id, project_id='reify', task_id='3803'
+        )
+        assert 'error' not in cite_result, f'cite_task failed: {cite_result}'
+
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None
+        items = assembled['flagged_items']
+        assert len(items) == 1, f'Expected 1 finding, got {len(items)}'
+        item = items[0]
+
+        assert item['category'] == 'cross_project_routing', (
+            f'category must NOT be downgraded when a cited_tasks anchor is present; '
+            f'got {item["category"]!r}'
+        )
+        assert item['flag_type'] == 'cross_project', (
+            f'flag_type must NOT be downgraded when a cited_tasks anchor is present; '
+            f'got {item["flag_type"]!r}'
+        )
+        assert len(item['cited_tasks']) == 1, (
+            f'Expected 1 cited_task, got {item["cited_tasks"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cross_project_routing_with_only_cited_entity_is_still_downgraded(self):
+        """A cross_project_routing finding with a cite_entity citation but NO
+        cite_task anchor is still downgraded — cited_entities is explicitly
+        NOT proof of a routing check (see _apply_cross_project_routing_guard's
+        docstring). Pins the cited_tasks-specific discriminator: a regression
+        that loosened the guard's condition to "all cited_* are empty" would
+        pass every other test in this class (they either leave every cited_*
+        list empty, or populate cited_tasks) but would fail here, since this
+        finding has a non-empty cited_entities with an empty cited_tasks."""
+        state = self._build_state()
+        run_id = 'r2453-entity-only-anchor'
+
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id,
+            severity='moderate',
+            category='cross_project_routing',
+            description='informational cross-project note citing an entity only',
+            suggested_action='FYI only, no get_task routing check performed',
+            actionable=False,
+            task_id=None,
+            flag_type='cross_project',
+        )
+        assert 'error' not in r, f'add_finding failed: {r}'
+        finding_id = r['finding_id']
+
+        cite_result = await state.cite_entity(
+            run_id=run_id, finding_id=finding_id, name='SomeEntity',
+        )
+        assert 'error' not in cite_result, f'cite_entity failed: {cite_result}'
+
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None
+        items = assembled['flagged_items']
+        assert len(items) == 1, f'Expected 1 finding, got {len(items)}'
+        item = items[0]
+
+        assert item['category'] == 'other', (
+            f'A cited_entities-only anchor must NOT satisfy the routing-check '
+            f'requirement; expected downgrade to "other", got {item["category"]!r}'
+        )
+        assert item['flag_type'] == 'cross_project_info', (
+            f'Expected flag_type downgraded to "cross_project_info", got {item["flag_type"]!r}'
+        )
+        assert len(item['cited_entities']) == 1, (
+            f'Expected the cite_entity citation to still be recorded, got {item["cited_entities"]!r}'
+        )
+        assert item['cited_tasks'] == []
+
+    @pytest.mark.asyncio
+    async def test_guard_is_category_scoped_other_categories_unaffected(self):
+        """(C) The guard fires ONLY on category=='cross_project_routing'. A
+        memory_stale finding (real task_id, no citations) and a null-null
+        systemic_pattern finding both read back with category/flag_type
+        UNCHANGED, proving the guard is category-scoped rather than a
+        blanket empty-cited_tasks rule."""
+        state = self._build_state()
+        run_id = 'r2453-scoped'
+
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+
+        r_stale = state.add_finding(
+            run_id=run_id,
+            severity='moderate',
+            category='memory_stale',
+            description='Memory entry is stale',
+            suggested_action='Refresh the memory entry',
+            actionable=True,
+            task_id='42',
+            flag_type='orphaned_knowledge',
+        )
+        assert 'error' not in r_stale, f'add_finding failed: {r_stale}'
+
+        r_systemic = state.add_finding(
+            run_id=run_id,
+            severity='low',
+            category='systemic_pattern',
+            description='Recurring pattern observed across the run',
+            suggested_action='Investigate the recurrence',
+            actionable=False,
+            task_id=None,
+            flag_type=None,
+        )
+        assert 'error' not in r_systemic, f'add_finding failed: {r_systemic}'
+
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None
+        items = {item['finding_id']: item for item in assembled['flagged_items']}
+        assert len(items) == 2, f'Expected 2 findings, got {len(items)}'
+
+        stale_item = items[r_stale['finding_id']]
+        assert stale_item['category'] == 'memory_stale'
+        assert stale_item['flag_type'] == 'orphaned_knowledge'
+        assert stale_item['cited_tasks'] == []
+
+        systemic_item = items[r_systemic['finding_id']]
+        assert systemic_item['category'] == 'systemic_pattern'
+        assert systemic_item['flag_type'] is None
+        assert systemic_item['cited_tasks'] == []
+
+    @pytest.mark.asyncio
+    async def test_downgrade_is_idempotent_across_repeated_reads(self):
+        """Repeated get_assembled_report calls yield the identical downgraded
+        category/flag_type — the guard mutates only the returned projection,
+        never the stored _Finding, so re-reads cannot compound or drift."""
+        state = self._build_state()
+        run_id = 'r2453-idempotent'
+
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id,
+            severity='moderate',
+            category='cross_project_routing',
+            description='informational cross-project note',
+            suggested_action='FYI only, no routing check performed',
+            actionable=False,
+            task_id=None,
+            flag_type='cross_project',
+        )
+        assert 'error' not in r, f'add_finding failed: {r}'
+
+        first = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        second = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert first is not None and second is not None
+
+        first_item = first['flagged_items'][0]
+        second_item = second['flagged_items'][0]
+        assert first_item['category'] == second_item['category'] == 'other'
+        assert first_item['flag_type'] == second_item['flag_type'] == 'cross_project_info'
+
+
+# ---------------------------------------------------------------------------
 # task-1966 step-8: get_findings_for_run — RED until step-9 adds the method
 # ---------------------------------------------------------------------------
 
