@@ -1089,6 +1089,17 @@ def create_server(
                 if resolved_tip is not None
                 else None
             )
+            # SYNC CONTRACT (reviewer follow-up on step-4): this payload shape —
+            # keys 'passed' / 'base_sha' / 'branch', task_id-keyed — MUST stay
+            # byte-identical to the orchestrator's own emission at
+            # workflow.py:1724-1733, since merge_disposition._branch_pre_merge_verify_green
+            # reads both call sites as one logical event stream.  A shared
+            # canonical constructor (e.g. an `emit_workflow_verify(...)` helper)
+            # would remove this manual-sync risk, but its natural home is
+            # orchestrator (workflow.py would need to call it too) — out of
+            # this task's locked scope (escalation/server.py + tests +
+            # skills/{merge-queue,unblock}/SKILL.md only).  Deferred as a
+            # follow-up rather than expanding this task's file locks.
             event_store.emit(
                 EventType.workflow_verify,
                 task_id=task_id,
