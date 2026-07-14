@@ -914,3 +914,85 @@ class TestExcludeFile:
 
         mock_exit.assert_not_called()
         assert capsys.readouterr().out == ''
+
+
+class TestBaseline:
+    """--baseline flag: snapshot pending esc-ids at launch; fire only on
+    items NOT present in that launch-time snapshot."""
+
+    def test_baseline_launch_pending_never_fires(self, tmp_path, capsys):
+        """A pending escalation present at launch is excluded from BOTH the
+        initial scan and the event loop for the lifetime of this run."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc = Escalation(
+            id='esc-40-1', task_id='40', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='pending-at-launch',
+        )
+        _write_esc(queue_dir, esc)
+
+        mock_event = MagicMock()
+        mock_event.name = f'{esc.id}.json'
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.exit') as mock_exit,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir), '--baseline',
+            ]),
+        ):
+            mock_inotify = MockINotify.return_value
+            mock_inotify.read.side_effect = [[mock_event], KeyboardInterrupt]
+
+            from escalation.watcher import main
+
+            with contextlib.suppress(KeyboardInterrupt):
+                main()
+
+        mock_exit.assert_not_called()
+        assert capsys.readouterr().out == ''
+
+    def test_baseline_new_item_fires(self, tmp_path, capsys):
+        """An escalation filed AFTER launch (absent from the baseline
+        snapshot) still fires normally."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        baselined_esc = Escalation(
+            id='esc-40-1', task_id='40', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='pending-at-launch',
+        )
+        _write_esc(queue_dir, baselined_esc)
+
+        new_esc = Escalation(
+            id='esc-40-2', task_id='40', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='filed-after-launch',
+        )
+
+        mock_event = MagicMock()
+        mock_event.name = f'{new_esc.id}.json'
+
+        def _read_side_effect(*args, **kwargs):
+            # Absent from the queue dir at launch -> absent from the
+            # baseline snapshot -> must still fire.
+            _write_esc(queue_dir, new_esc)
+            return [mock_event]
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir), '--baseline',
+            ]),
+            patch('escalation.watcher._initial_scan', return_value=None),
+        ):
+            mock_inotify = MockINotify.return_value
+            mock_inotify.read.side_effect = _read_side_effect
+
+            from escalation.watcher import main
+
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+            assert exc_info.value.code == 0
+
+        captured = capsys.readouterr()
+        assert new_esc.id in captured.out
