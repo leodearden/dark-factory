@@ -240,6 +240,44 @@ def find_stale_markers(
     return stale
 
 
+def find_undated_markers(members: list[dict]) -> list[dict]:
+    """Return members ``find_stale_markers`` can never drain, at any age cutoff.
+
+    A member is "undated" when its ``created_at`` is missing, ``None``, or
+    fails ``datetime.fromisoformat`` parsing — exactly the conditions
+    ``find_stale_markers`` fail-safe KEEPs, regardless of ``max_age_days``
+    (including ``0``). These members set a floor on the residual backlog
+    that no amount of age-draining can reach below; ``run()`` surfaces this
+    count via ``undated_kept_count`` plus a WARNING log so an operator
+    running ``--check --max-backlog 0`` understands why the backlog can
+    floor above zero (task 2596 amendment, reviewer_comprehensive #1/#2).
+
+    Pure, sync, no I/O. Deliberately duplicates ``find_stale_markers``'s
+    parse-and-skip logic rather than having that function report both sets,
+    so its existing return contract (the stale subset only) stays unchanged
+    for existing callers/tests.
+
+    Args:
+        members: List of scroll-shaped dicts ``{'id', 'created_at', 'metadata'}``,
+            as returned by ``MemoryService.get_memories_by_metadata``.
+
+    Returns:
+        Subset of *members* whose ``created_at`` is missing, ``None``, or
+        unparseable. Order is preserved. An all-dated input returns ``[]``.
+    """
+    undated: list[dict] = []
+    for m in members:
+        raw = m.get('created_at')
+        if raw is None:
+            undated.append(m)
+            continue
+        try:
+            datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            undated.append(m)
+    return undated
+
+
 def find_terminal_task_markers(
     members: list[dict],
     terminal_task_ids: set[str],
@@ -408,6 +446,12 @@ async def run(
               Overlaps with the kind-orphan predicate for members missing
               BOTH kind and task_id, so it does not subtract cleanly from
               orphan_count — see the inline NOTE above its assignment.
+            - undated_kept_count (int): raw len(find_undated_markers(...)) —
+              diagnostic only, never part of the delete set. Counts
+              enumerated members find_stale_markers can never drain
+              regardless of max_age_days (missing/unparseable created_at),
+              so operators can see why the residual backlog floors above
+              zero under --check/--max-backlog (task 2596 amendment).
             - bucket_counts (dict): count of the final union broken down by
               classify_marker_task_id bucket — always all four keys
               ('numeric', 'fp_hash', 'comma_joined', 'null_or_invalid'),
@@ -465,6 +509,24 @@ async def run(
     taskless = find_taskless_markers(members)
     stale = find_stale_markers(members, now_dt, max_age_days=max_age_days)
     terminal = find_terminal_task_markers(members, terminal_ids)
+
+    # Diagnostic only — never added to the delete set. Surfaces the subset of
+    # `members` find_stale_markers can never drain regardless of
+    # --max-age-days (task 2596 amendment, reviewer_comprehensive #1/#2): an
+    # operator wiring --check --max-backlog 0 against a population with a
+    # nonzero undated_kept_count would otherwise see a perpetual violation
+    # with no visibility into why the residual floors above zero.
+    undated_kept = find_undated_markers(members)
+    if undated_kept:
+        logger.warning(
+            'sweep_orphan_flag_markers: %d of %d enumerated markers have a '
+            'missing/unparseable created_at and are permanently kept by '
+            'find_stale_markers regardless of --max-age-days (even 0) — '
+            'this sets a floor on the residual backlog that age-draining '
+            'alone cannot reach below for --check/--max-backlog. Use '
+            '--delete-ids or --terminal-drain to remove them if warranted.',
+            len(undated_kept), len(members),
+        )
     # Best-effort: an id in delete_ids that doesn't match any enumerated
     # member is simply absent from `targeted` — never a crash.
     targeted = [m for m in members if m['id'] in delete_ids]
@@ -503,6 +565,7 @@ async def run(
         'orphan_count': len(orphans),
         'orphan_ids': orphan_ids,
         'taskless_orphan_count': len(taskless),
+        'undated_kept_count': len(undated_kept),
         'bucket_counts': bucket_counts,
         'targeted_correction_ids': targeted_correction_ids,
     }
@@ -669,9 +732,14 @@ async def _resolve_terminal_task_ids() -> set[str]:
             str(tid) for tid, status in statuses.items() if status in TERMINAL_STATUSES
         }
     except Exception:
+        # exc_info=True (task 2596 amendment, reviewer_comprehensive #3): a
+        # genuine wiring failure (wrong attr, backend import error) must
+        # carry a stack trace so it is distinguishable in logs from the
+        # unconfigured-taskmaster no-op above, which never reaches here.
         logger.warning(
             'sweep_orphan_flag_markers: --terminal-drain status resolution '
             'failed; falling back to age-only sweep (terminal_task_ids=set()).',
+            exc_info=True,
         )
         return set()
 

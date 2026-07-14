@@ -6,6 +6,7 @@ without sys.path pollution — mirrors the pattern in test_cleanup_count_snapsho
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 import types
 from datetime import UTC, datetime
@@ -381,6 +382,78 @@ class TestFindStaleMarkers:
         """Empty input list returns empty list."""
         result = _mod.find_stale_markers([], self._NOW, max_age_days=14)
         assert result == []
+
+
+# ===========================================================================
+# Tests: find_undated_markers
+# ===========================================================================
+
+class TestFindUndatedMarkers:
+    """Tests for the pure function find_undated_markers(members) (task 2596
+    amendment, reviewer_comprehensive #1/#2): the diagnostic mirror of
+    find_stale_markers' fail-safe KEEP conditions — surfaces exactly the
+    members no --max-age-days value (including 0) can ever drain.
+    """
+
+    @staticmethod
+    def _dated(id: str, created_at: str | None) -> dict:
+        """Build a minimal member dict with an explicit (or missing) created_at."""
+        member: dict = {'id': id, 'metadata': {'source': 'stage1_flag_marker'}}
+        if created_at is not None:
+            member['created_at'] = created_at
+        return member
+
+    def test_missing_created_at_key_is_undated(self):
+        """A marker with no created_at key at all is undated."""
+        missing = self._dated('missing1', None)
+        result = _mod.find_undated_markers([missing])
+        assert result == [missing], f'Expected [missing1], got: {result!r}'
+
+    def test_none_created_at_is_undated(self):
+        """A marker with created_at explicitly None is undated."""
+        member = {'id': 'none1', 'created_at': None, 'metadata': {}}
+        result = _mod.find_undated_markers([member])
+        assert result == [member], f'Expected [none1], got: {result!r}'
+
+    def test_unparseable_created_at_is_undated(self):
+        """A marker with an unparseable created_at string is undated."""
+        member = {'id': 'bad1', 'created_at': 'not-a-date', 'metadata': {}}
+        result = _mod.find_undated_markers([member])
+        assert result == [member], f'Expected [bad1], got: {result!r}'
+
+    def test_valid_dated_marker_is_not_undated(self):
+        """A marker with a well-formed, parseable created_at is not undated,
+        regardless of how old or fresh it is."""
+        old = self._dated('old1', '2026-01-01T00:00:00+00:00')
+        fresh = self._dated('fresh1', '2026-07-10T00:00:00+00:00')
+        result = _mod.find_undated_markers([old, fresh])
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_mixed_returns_only_undated(self):
+        """Only members with a missing/None/unparseable created_at are returned."""
+        dated = self._dated('dated1', '2026-01-01T00:00:00+00:00')
+        missing = self._dated('missing1', None)
+        bad = {'id': 'bad1', 'created_at': 'garbage', 'metadata': {}}
+        members = [dated, missing, bad]
+        result = _mod.find_undated_markers(members)
+        ids = [m['id'] for m in result]
+        assert sorted(ids) == ['bad1', 'missing1'], f'Expected bad1/missing1, got: {ids!r}'
+
+    def test_empty_input_returns_empty(self):
+        """Empty input list returns empty list."""
+        result = _mod.find_undated_markers([])
+        assert result == []
+
+    def test_preserves_order_and_identity(self):
+        """Returned dicts are the same objects, in input order."""
+        missing_a = self._dated('missing_a', None)
+        dated = self._dated('dated1', '2026-01-01T00:00:00+00:00')
+        missing_b = self._dated('missing_b', None)
+        members = [missing_a, dated, missing_b]
+        result = _mod.find_undated_markers(members)
+        assert result == [missing_a, missing_b], f'Expected [missing_a, missing_b], got: {result!r}'
+        assert result[0] is missing_a, 'Expected same object identity'
+        assert result[1] is missing_b, 'Expected same object identity'
 
 
 # ===========================================================================
@@ -793,6 +866,73 @@ class TestRun:
         assert 'after' in apply_report
         assert apply_report['after']['total_source'] == 1
 
+    @pytest.mark.asyncio
+    async def test_undated_members_are_kept_and_reported_with_warning(self, caplog):
+        """Members with a missing/unparseable created_at are never swept (no
+        predicate matches them) but are counted in undated_kept_count and
+        trigger a WARNING log so operators can see why the backlog floors
+        above zero (task 2596 amendment, reviewer_comprehensive #1/#2)."""
+        dated_stale = _member('stale1', task_id='9001')
+        dated_stale['created_at'] = '2026-01-01T00:00:00Z'
+        undated_missing = {
+            'id': 'undated1',
+            'metadata': {'source': 'stage1_flag_marker', 'kind': 'stage1_flag_marker',
+                          'task_id': '9002'},
+        }
+        undated_bad = {
+            'id': 'undated2',
+            'created_at': 'not-a-date',
+            'metadata': {'source': 'stage1_flag_marker', 'kind': 'stage1_flag_marker',
+                          'task_id': '9003'},
+        }
+        members = [dated_stale, undated_missing, undated_bad]
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[3, 3])
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False, max_age_days=14),
+                memory_service,
+                now=datetime(2026, 7, 14, tzinfo=UTC),
+            )
+
+        # Undated members are never in the delete set (no predicate matches them).
+        assert set(report['orphan_ids']) == {'stale1'}
+        assert report['undated_kept_count'] == 2
+        assert any(
+            'missing/unparseable created_at' in record.message
+            and '2 of 3' in record.message  # count of undated / total enumerated
+            and record.levelno == logging.WARNING
+            for record in caplog.records
+        ), f'Expected a WARNING mentioning the undated count, got: {[r.message for r in caplog.records]}'
+
+    @pytest.mark.asyncio
+    async def test_no_undated_members_yields_zero_count_and_no_warning(self, caplog):
+        """All-dated members: undated_kept_count is 0 and no WARNING is logged."""
+        valid_fresh = _member('v1', task_id='1970')
+        valid_fresh['created_at'] = '2026-07-10T00:00:00Z'
+        members = [valid_fresh]
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1])
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False),
+                memory_service,
+                now=self._NEUTRAL_NOW,
+            )
+
+        assert report['undated_kept_count'] == 0
+        assert not any(
+            'missing/unparseable created_at' in record.message for record in caplog.records
+        )
+
 
 # ===========================================================================
 # Tests: targeted correction (--delete-ids)
@@ -1059,3 +1199,78 @@ class TestBuildParser:
         parser = _mod._build_parser()
         args = parser.parse_args(['--terminal-drain'])
         assert args.terminal_drain is True
+
+
+# ===========================================================================
+# Tests: _resolve_terminal_task_ids (task 2596 amendment, reviewer_comprehensive #3)
+# ===========================================================================
+
+class TestResolveTerminalTaskIds:
+    """Tests for the async _resolve_terminal_task_ids() fail-safe resolver.
+
+    A genuine wiring failure (wrong attr, backend import error) must still
+    fail safe to an empty set — --terminal-drain degrades to an age-only
+    sweep rather than crashing — but the WARNING must now carry exc_info
+    so a real mis-wiring is distinguishable in logs from the unconfigured-
+    taskmaster no-op, which returns early and never logs at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_taskmaster_returns_empty_set_without_warning(
+        self, monkeypatch, caplog
+    ):
+        """config.taskmaster is None (no taskmaster configured): returns
+        set() with no WARNING logged — the clean, expected no-op path."""
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            lambda: types.SimpleNamespace(taskmaster=None),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            result = await _mod._resolve_terminal_task_ids()
+
+        assert result == set()
+        assert not any(
+            record.name == 'sweep_orphan_flag_markers' for record in caplog.records
+        ), f'Expected no WARNING logs, got: {[r.message for r in caplog.records]}'
+
+    @pytest.mark.asyncio
+    async def test_backend_wiring_failure_fails_safe_with_exc_info(
+        self, monkeypatch, caplog
+    ):
+        """A stubbed backend that raises on construction (simulating a real
+        mis-wiring, e.g. a bad attribute or import error) must not propagate
+        — _resolve_terminal_task_ids returns set() — but the WARNING it logs
+        must carry exc_info=True so the failure is distinguishable from the
+        unconfigured-taskmaster no-op above."""
+
+        class _BoomBackend:
+            def __init__(self, *_args, **_kwargs):
+                raise RuntimeError('boom: backend wiring is broken')
+
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            lambda: types.SimpleNamespace(taskmaster=object()),
+        )
+        monkeypatch.setattr(
+            'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend',
+            _BoomBackend,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            result = await _mod._resolve_terminal_task_ids()
+
+        assert result == set()
+        matching = [
+            record for record in caplog.records
+            if record.name == 'sweep_orphan_flag_markers' and record.levelno == logging.WARNING
+        ]
+        assert matching, f'Expected a WARNING log, got: {[r.message for r in caplog.records]}'
+        assert any(record.exc_info for record in matching), (
+            f'Expected exc_info attached to the WARNING so the failure is '
+            f'distinguishable from the unconfigured no-op, got: '
+            f'{[(r.message, r.exc_info) for r in matching]}'
+        )
+        assert 'RuntimeError' in caplog.text and 'boom' in caplog.text, (
+            f'Expected the traceback text in caplog output, got: {caplog.text!r}'
+        )
