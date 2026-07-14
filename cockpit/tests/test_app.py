@@ -906,6 +906,63 @@ class TestDropRemovesAndPersists:
             assert reread.status == sr.Status.AWAITING_INPUT
 
 
+class TestCopyAction:
+    @pytest.mark.timeout(10)
+    async def test_copy_highlighted_decision_puts_question_and_ids_on_clipboard(self, tmp_path):
+        """'y' (the copy affordance, task 2517 / esc-2303-1 F4) copies the
+        highlighted DecisionQueue row's question text + ids onto the system
+        clipboard via Textual's in-app OSC 52 App.copy_to_clipboard --
+        terminal-native, no xclip/wl-copy subprocess -- and is strictly
+        READ-ONLY, never touching sessions/ or decisions/ (mirrors
+        TestWriteDiscipline's before/after _snapshot_tree diff).
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        decision = sr.DecisionRecord(
+            id='dec-1',
+            project='df',
+            text='Which port do we bind?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            task_id='2517',
+            escalation_id='esc-42',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        awaiting = _make_record(
+            session_slug='awaiting-1',
+            status=sr.Status.AWAITING_INPUT,
+            question=sr.Question(text='Which host?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 2
+
+            queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
+            await pilot.pause()
+
+            before = _snapshot_tree(tmp_path)
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            # (a) the row's question + ids landed on the clipboard.
+            assert app._clipboard
+            assert 'Which port do we bind?' in app._clipboard
+            assert 'esc-42' in app._clipboard
+            assert '2517' in app._clipboard
+
+            # (b) strictly read-only -- no sessions/ or decisions/ write.
+            after = _snapshot_tree(tmp_path)
+            assert after == before
+
+
 class TestDeferResetsAge:
     @pytest.mark.timeout(10)
     async def test_defer_resets_age_live_without_writing_registry(self, tmp_path):
