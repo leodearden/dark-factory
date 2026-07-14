@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 import pytest
 from shared.cli_invoke import _SubprocessResult
@@ -300,7 +301,7 @@ class TestParsePiSuccess:
     assistant message's joined text."""
 
     def _build_stdout(self, *, with_deltas: bool = False) -> str:
-        events = [
+        events: list[dict[str, Any]] = [
             {'type': 'session', 'id': 'sess-abc'},
             {'type': 'agent_start'},
             {'type': 'turn_start'},
@@ -427,7 +428,7 @@ class TestParsePiCostFallback:
     and non-zero, it wins and the price table is not consulted."""
 
     def _build_stdout(self, *, cost_total: float | None) -> str:
-        usage = {'input': 400, 'output': 200, 'totalTokens': 600}
+        usage: dict[str, Any] = {'input': 400, 'output': 200, 'totalTokens': 600}
         if cost_total is not None:
             usage['cost'] = {'total': cost_total}
         message = {

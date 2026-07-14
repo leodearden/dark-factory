@@ -625,7 +625,7 @@ class TestInvokePiFlags:
         pi_result = _SubprocessResult(
             stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
         )
-        kwargs = dict(
+        kwargs: dict = dict(
             prompt='hello', system_prompt='sys', cwd=tmp_path,
             model='anthropic/claude-haiku-4-5', max_budget_usd=1.0,
             allowed_tools=None, disallowed_tools=None, mcp_config=None,
