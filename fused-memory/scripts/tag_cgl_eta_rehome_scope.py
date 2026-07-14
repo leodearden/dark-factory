@@ -82,6 +82,8 @@ from fused_memory.models.scope import Scope
 
 logger = logging.getLogger('tag_cgl_eta_rehome_scope')
 
+_DEFAULT_SCAN_LIMIT = 10000
+
 
 # ---------------------------------------------------------------------------
 # Pure core: classify_rehome_record
@@ -132,6 +134,7 @@ def build_tag_report(
     applied_ids: set[str],
     dry_run: bool,
     generated_at: str,
+    truncated_projects: set[str] | list[str] | None = None,
 ) -> dict[str, Any]:
     """Assemble the structured JSON-serialisable tag report.
 
@@ -145,14 +148,24 @@ def build_tag_report(
         applied_ids: Set of memory ids actually updated (empty on dry-run).
         dry_run: True when no writes were made.
         generated_at: ISO timestamp string.
+        truncated_projects: project_ids whose scroll came back at/over
+            ``--scan-limit`` (possible truncation -- the true pool may be
+            larger than what was scanned). Unlike
+            ``prune_recon_cycle_summaries`` (which hard-aborts on this
+            condition because its deletes are irreversible), this in-place
+            tag is idempotent and non-destructive, so truncation is only
+            ever surfaced as a report flag -- it never blocks scanning or
+            ``--apply``.
 
     Returns:
-        Dict with keys: dry_run, generated_at, projects, totals, changes.
-        ``projects`` nests ``{project_id: {scanned, taggable, tagged,
-        skipped}}``. ``changes`` is a deterministically-ordered list of
-        ``{project_id, id, action, applied}`` dicts -- one entry per 'tag'
-        decision (skips never appear, mirroring build_prune_report's
-        deletions-only 'deletions' list).
+        Dict with keys: dry_run, generated_at, projects, totals, changes,
+        possibly_truncated, truncated_projects. ``projects`` nests
+        ``{project_id: {scanned, taggable, tagged, skipped}}``. ``changes``
+        is a deterministically-ordered list of ``{project_id, id, action,
+        applied}`` dicts -- one entry per 'tag' decision (skips never
+        appear, mirroring build_prune_report's deletions-only 'deletions'
+        list). ``possibly_truncated`` is true iff ``truncated_projects`` is
+        non-empty; ``truncated_projects`` is always a sorted list.
     """
     projects: dict[str, dict[str, Any]] = {}
     changes: list[dict[str, Any]] = []
@@ -187,12 +200,16 @@ def build_tag_report(
         'skipped': sum(p['skipped'] for p in projects.values()),
     }
 
+    sorted_truncated = sorted(truncated_projects) if truncated_projects else []
+
     return {
         'dry_run': dry_run,
         'generated_at': generated_at,
         'projects': projects,
         'totals': totals,
         'changes': changes,
+        'possibly_truncated': bool(sorted_truncated),
+        'truncated_projects': sorted_truncated,
     }
 
 
@@ -375,6 +392,7 @@ async def run(
     # Scan + classify every selected project.
     decisions_by_project: dict[str, list[dict[str, Any]]] = {}
     records_by_project: dict[str, list[dict[str, Any]]] = {}
+    truncated_projects: set[str] = set()
     for pid in project_ids:
         scope = Scope(project_id=pid)
         scrolled = await memory.mem0.scroll_by_metadata(
@@ -387,6 +405,22 @@ async def run(
                 pid, repr(scrolled)[:200],
             )
             scrolled = []
+
+        # A scroll that comes back at/over scan_limit is ambiguous -- the
+        # true pool may be larger than what was scanned (Qdrant's scroll
+        # fills up to `limit` in one pass). Unlike prune_recon_cycle_summaries
+        # (irreversible deletes -- hard-abort), this in-place tag is
+        # idempotent and non-destructive, so surface it as a report flag
+        # and keep going: a follow-up re-run with a larger --scan-limit
+        # safely completes coverage.
+        if args.scan_limit and len(scrolled) >= args.scan_limit:
+            truncated_projects.add(pid)
+            logger.warning(
+                'tag_cgl_eta_rehome_scope: scan for project %s hit '
+                '--scan-limit=%s; results may be incomplete -- re-run with '
+                'a larger --scan-limit for full coverage.',
+                pid, args.scan_limit,
+            )
 
         records_by_project[pid] = scrolled
         decisions_by_project[pid] = [classify_rehome_record(r) for r in scrolled]
@@ -401,6 +435,7 @@ async def run(
         applied_ids=applied_ids,
         dry_run=not args.apply,
         generated_at=generated_at,
+        truncated_projects=truncated_projects,
     )
 
     # JSON report goes to stdout (machine-readable); summary to stderr.
@@ -414,5 +449,86 @@ async def run(
         f"skipped={report['totals']['skipped']}",
         file=sys.stderr,
     )
+    if report['possibly_truncated']:
+        print(
+            f"NOTE: scan possibly truncated for projects "
+            f"{report['truncated_projects']} (hit --scan-limit="
+            f"{args.scan_limit}); re-run with a larger --scan-limit for "
+            f"full coverage. This is a coverage warning only -- tagging is "
+            f"idempotent and non-destructive, so nothing was blocked.",
+            file=sys.stderr,
+        )
 
     return report
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI argument parser for this script.
+
+    Extracted from ``main()`` so tests can assert flag defaults without
+    invoking the live ``main()`` entry point (mirrors
+    ``prune_recon_cycle_summaries.build_parser``).
+    """
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        '--apply', action='store_true', default=False,
+        help='Commit the scope-tag updates (default: dry-run, report only)',
+    )
+    parser.add_argument(
+        '--project-id', dest='project_id', default=None,
+        help='Restrict the scan/tag to a single project_id',
+    )
+    parser.add_argument(
+        '--scan-limit', dest='scan_limit', type=int, default=_DEFAULT_SCAN_LIMIT,
+        help='Per-project Mem0 scan window: max cgl_eta_cross_target_rehome '
+             'points enumerated via the metadata-filtered scroll '
+             f'(default: {_DEFAULT_SCAN_LIMIT}).',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to a fused-memory config file (sets CONFIG_PATH before loading).',
+    )
+    return parser
+
+
+def main() -> int:
+    """CLI entry point: parse args, build a live MemoryService, run, report.
+
+    Mirrors ``prune_recon_cycle_summaries.main`` (live-service construction,
+    exit code derived from ``report.get('aborted')``), plus the ``--config``
+    -> ``CONFIG_PATH`` env passthrough from ``migrate_cross_graph_leak.main``.
+    """
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.config:
+        import os  # noqa: PLC0415
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    async def _run_live() -> int:
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        memory = MemoryService(config)
+        await memory.initialize()
+        try:
+            report = await run(args, memory=memory)
+        finally:
+            if hasattr(memory, 'close'):
+                await memory.close()
+        return 1 if report.get('aborted') else 0
+
+    return asyncio.run(_run_live())
+
+
+if __name__ == '__main__':
+    sys.exit(main())
