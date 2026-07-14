@@ -33,6 +33,18 @@ that is epsilon/gamma's job.
 """
 from __future__ import annotations
 
+import re
+
+import yaml
+
+
+class CoderParseError(Exception):
+    """Raised when the coder cannot parse a digest's frontmatter or the
+    LLM's raw output into a usable structure. Never silently defaulted —
+    callers must treat this as a hard per-digest failure (never-fabricate
+    contract)."""
+
+
 # ---------------------------------------------------------------------------
 # build_codebook_index — compact codebook index (id + title + one-line cause)
 # ---------------------------------------------------------------------------
@@ -79,3 +91,33 @@ def build_codebook_index(codebook: dict) -> str:
         else:
             lines.append(f"- {entry_id}: {title}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# parse_frontmatter — digest's leading YAML frontmatter -> meta dict
+# ---------------------------------------------------------------------------
+
+_FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
+
+
+def parse_frontmatter(digest_text: str) -> dict:
+    """Extract and parse a digest's leading ``---``...``---`` YAML
+    frontmatter block (PRD §7.2), returning the meta dict (at minimum
+    session/date/agent_class — the deterministic coding-record header
+    fields). Raises CoderParseError if the delimiters are absent or the
+    parsed block isn't a mapping — never silently defaults.
+    """
+    match = _FRONTMATTER_RE.match(digest_text)
+    if not match:
+        raise CoderParseError(
+            "digest text has no leading '---'...'---' frontmatter block"
+        )
+    try:
+        meta = yaml.safe_load(match.group(1))
+    except yaml.YAMLError as exc:
+        raise CoderParseError(f"frontmatter block is not valid YAML: {exc}") from exc
+    if not isinstance(meta, dict):
+        raise CoderParseError(
+            f"frontmatter block did not parse to a mapping, got {type(meta).__name__}"
+        )
+    return meta
