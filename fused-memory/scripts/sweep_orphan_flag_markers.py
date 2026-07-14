@@ -1,7 +1,25 @@
 #!/usr/bin/env python3
-"""One-shot sweep: detect and optionally delete stage1_flag_marker records in Mem0/Qdrant
-that are missing the ``kind='stage1_flag_marker'`` metadata key (task-1659 orphans) or
-that lack a usable ``task_id`` (task-2108 orphans).
+"""Sweep: detect and optionally delete dead-weight stage1_flag_marker records in
+Mem0/Qdrant — records missing the ``kind='stage1_flag_marker'`` metadata key
+(task-1659 orphans), lacking a usable ``task_id`` (task-2108 orphans), stale by age
+(task-1944 precedent), or referencing only terminal tasks (task-2103/2150 precedent).
+
+Task 2596 background
+---------------------
+Task 2406 retired the Mem0 marker WRITE path entirely — ``flag_dedup.dedup_flags``
+now persists markers only to the ``recon_ledger`` SQLite table. Task 2228 (W5-κ)
+then deleted the two Mem0 sweeps (``_sweep_stale_flag_markers``,
+``_sweep_terminal_task_flag_markers``) that used to drain the legacy Mem0 marker
+population, since the ledger's own ``gc()`` pass reaps ledger rows directly. Nothing
+was left to drain the pre-2406 Mem0 records, which are pure dead weight (nothing
+reads them — see ``find_stale_markers``/``find_terminal_task_markers`` docstrings).
+This script's ``find_stale_markers`` and ``find_terminal_task_markers`` restore
+those two sweeps' semantics here, as a standalone, deterministic, exit-code-driven
+tool usable as a ``task_kind='deterministic'`` ``before_done.script`` (see
+``backlog_verdict`` / ``--check``).
+
+Original background (task-1659/2108)
+-------------------------------------
 
 Background
 ----------
@@ -333,32 +351,64 @@ async def delete_orphan_markers(
 # Orchestration
 # ---------------------------------------------------------------------------
 
-async def run(args: Any, memory_service: Any) -> dict:
-    """Enumerate orphan markers and optionally delete them.
+async def run(
+    args: Any,
+    memory_service: Any,
+    *,
+    now: datetime | None = None,
+    terminal_task_ids: set[str] | None = None,
+) -> dict:
+    """Enumerate dead-weight markers and optionally delete them.
+
+    The delete set is the id-deduplicated, order-preserving UNION of four
+    independent predicates (task 2596 restores the two age/terminal drains
+    deleted by task 2228 W5-κ alongside the pre-existing orphan/taskless
+    ones — see module docstring):
+        - ``find_orphan_markers``: missing/mismatched ``kind`` (task 1659).
+        - ``find_taskless_markers``: missing/empty ``task_id`` (task 2108).
+        - ``find_stale_markers``: ``created_at`` older than ``max_age_days``.
+        - ``find_terminal_task_markers``: references only terminal tasks.
+    A member matched by more than one predicate is deleted exactly once.
 
     Args:
         args: argparse.Namespace (or SimpleNamespace) with at least:
             - apply (bool): commit deletions if True, dry-run otherwise
             - project_id (str): project to sweep
+            - max_age_days (int, optional): forwarded to find_stale_markers
+              (default 14 when absent).
         memory_service: Live (or mock) MemoryService instance.
+        now: Reference "current time" for the age cutoff. Defaults to
+            ``datetime.now(UTC)``; tests inject a fixed value.
+        terminal_task_ids: Task ids whose status is terminal (e.g. from
+            ``flag_dedup.TERMINAL_STATUSES``). Injected by the caller — this
+            function performs no taskmaster I/O itself. Defaults to an empty
+            set, which makes find_terminal_task_markers a no-op (age-only
+            sweep).
 
     Returns:
         JSON-serialisable report dict:
             - dry_run (bool)
             - before (dict with total_source and total_with_kind counts)
-            - orphan_count (int): size of the deduplicated union of
-              find_orphan_markers + find_taskless_markers — the actual
-              number of records deleted (or that would be deleted).
+            - orphan_count (int): size of the deduplicated union of all four
+              predicates — the actual number of records deleted (or that
+              would be deleted).
             - orphan_ids (list[str])
             - taskless_orphan_count (int): raw len(find_taskless_markers(...)).
               Overlaps with the kind-orphan predicate for members missing
               BOTH kind and task_id, so it does not subtract cleanly from
               orphan_count — see the inline NOTE above its assignment.
+            - bucket_counts (dict): count of the final union broken down by
+              classify_marker_task_id bucket — always all four keys
+              ('numeric', 'fp_hash', 'comma_joined', 'null_or_invalid'),
+              even when a bucket's count is 0.
             - deleted (int, only when apply=True)
             - failed (list[str], only when apply=True)
             - after (dict with counts, only when apply=True)
     """
     project_id: str = getattr(args, 'project_id', 'dark_factory')
+    now_dt: datetime = now if now is not None else datetime.now(UTC)
+    terminal_ids: set[str] = terminal_task_ids if terminal_task_ids else set()
+    max_age_days: int = getattr(args, 'max_age_days', 14)
 
     # --- Before counts (deterministic Qdrant payload-filter, not semantic) ---
     source_filter = {'source': MARKER_SOURCE}
@@ -387,21 +437,36 @@ async def run(args: Any, memory_service: Any) -> dict:
             '--limit value to ensure all orphans are covered.',
             len(members), total_source, scroll_limit,
         )
-    # Orphans are the id-deduplicated, order-preserving union of the two
-    # independent orphan predicates: missing kind (find_orphan_markers) and
-    # missing task_id (find_taskless_markers, task 2108). A member missing
-    # BOTH is caught by each predicate but must be deleted exactly once.
+    # Orphans are the id-deduplicated, order-preserving union of four
+    # independent predicates: missing kind (find_orphan_markers), missing
+    # task_id (find_taskless_markers, task 2108), age-stale
+    # (find_stale_markers, task 2596 restoring task 1944), and
+    # terminal-task-referenced (find_terminal_task_markers, task 2596
+    # restoring task 2103/2150). A member caught by more than one predicate
+    # is deleted exactly once.
     kind_orphans = find_orphan_markers(members)
     taskless = find_taskless_markers(members)
+    stale = find_stale_markers(members, now_dt, max_age_days=max_age_days)
+    terminal = find_terminal_task_markers(members, terminal_ids)
 
     orphans: list[dict] = []
     seen_ids: set = set()
-    for m in (*kind_orphans, *taskless):
+    for m in (*kind_orphans, *taskless, *stale, *terminal):
         if m['id'] not in seen_ids:
             seen_ids.add(m['id'])
             orphans.append(m)
 
     orphan_ids = [o['id'] for o in orphans]
+
+    # Per-bucket counts over the final union (task 2596): makes the sweep's
+    # action observable by task_id shape without changing orphan_count's
+    # meaning (still the total delete-set size).
+    bucket_counts: dict[str, int] = {
+        'numeric': 0, 'fp_hash': 0, 'comma_joined': 0, 'null_or_invalid': 0,
+    }
+    for o in orphans:
+        tid = (o.get('metadata') or {}).get('task_id')
+        bucket_counts[classify_marker_task_id(tid)] += 1
 
     # NOTE: taskless_orphan_count is the raw size of the taskless predicate
     # (find_taskless_markers), not a "taskless-only" diagnostic — it includes
@@ -415,6 +480,7 @@ async def run(args: Any, memory_service: Any) -> dict:
         'orphan_count': len(orphans),
         'orphan_ids': orphan_ids,
         'taskless_orphan_count': len(taskless),
+        'bucket_counts': bucket_counts,
     }
 
     if args.apply:
