@@ -409,6 +409,11 @@ class TestPlanGoldenDataModule:
 # Reconstructed verbatim from test_verify_plan.py's own golden fixture.
 STRUCTURAL_DIFF: list[str] = ['orchestrator/src/orchestrator/interfaces.py']
 
+# STRUCTURAL is only detected when a type_check_command is configured (so
+# content is actually read); seed the canned Protocol-bearing content this
+# scenario needs into the shared fake-reader backing dict.
+_FAKE_FILE_CONTENTS[STRUCTURAL_DIFF[0]] = 'class Foo(Protocol):\n    def m(self) -> None: ...\n'
+
 
 class TestPlanGoldenStructural:
     """Scenario 5 — GOLDEN D2: a Protocol-bearing source file widens pyright
