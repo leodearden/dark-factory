@@ -37,6 +37,7 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     RealMergeItem,
     SpeculativeMergeWorker,
+    _build_main_health_outcome,
     _main_health_fingerprint,
     _MainHealthProbeHandles,
     _run_deferred_main_health_probe,
@@ -45,6 +46,7 @@ from orchestrator.merge_queue import (
 )
 from orchestrator.verify import _PROBE_CACHE, VerifyResult
 from orchestrator.verify_runner import HostLease
+from shared.task_metadata import RetryLedger
 
 
 @pytest.fixture(autouse=True)
@@ -596,4 +598,114 @@ class TestShutdownDrainsMainHealthProbeTask:
             'A main-health-probe-<id> task registered in '
             'worker._background_tasks must be cancelled by the worker '
             'shutdown drain'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-17 (RED): worker-side auto-heal HAPPY PATH.
+#
+# SpeculativeMergeWorker._auto_heal_main_health_deferred does not exist yet.
+# Mirrors test_merge_queue_auto_heal.py:444-507's happy-path shape (signal a:
+# confirmed red halts the 'normal' lane, registers the halt owner, records
+# the attempt, and spawns a HIGH-lane fix task) but drives a REAL
+# SpeculativeMergeWorker directly rather than a TaskWorkflow with a mocked
+# merge_worker — this is the worker-side mirror the deferred probe path
+# (which has no TaskWorkflow instance available) must call into.
+# ---------------------------------------------------------------------------
+
+
+class TestAutoHealMainHealthDeferredHappyPath:
+    """Signal a (worker-side mirror): confirmed red halts the 'normal' lane,
+    registers the halt owner, records the attempt, and spawns a HIGH-lane fix
+    task — driven directly against a real SpeculativeMergeWorker."""
+
+    def test_happy_path_halts_lane_registers_owner_and_spawns_fix(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(),
+            escalation_queue=escalation_queue, mcp=MagicMock(),
+        )
+
+        spawned_args: list[list[dict]] = []
+
+        async def _fake_post_submit(arguments_list: list[dict]) -> None:
+            spawned_args.append(arguments_list)
+
+        worker._post_submit_tasks = _fake_post_submit  # type: ignore[method-assign]
+
+        outcome = _build_main_health_outcome(COMPILE_ERROR_RESULT, MAIN_SHA)
+
+        assert worker.is_lane_halted('normal') is False, (
+            "Precondition: the 'normal' lane must start un-halted"
+        )
+
+        asyncio.run(worker._auto_heal_main_health_deferred(outcome, req))
+
+        pending = escalation_queue.get_pending()
+        assert len(pending) == 1, (
+            f'Expected exactly one pending preexisting_main_break escalation; '
+            f'got {pending}'
+        )
+        esc = pending[0]
+        assert esc.category == 'preexisting_main_break', (
+            f'Expected category=preexisting_main_break; got {esc.category!r}'
+        )
+        assert esc.dedupe_fingerprint == outcome.dedupe_fingerprint, (
+            f'Expected the filed escalation dedupe_fingerprint to match the '
+            f'outcome; got {esc.dedupe_fingerprint!r} vs '
+            f'{outcome.dedupe_fingerprint!r}'
+        )
+        esc_id = esc.id
+
+        sig = RetryLedger.compute_merge_outcome_signature(
+            'compile_error', outcome.failure_cause_hint, outcome.reason,
+        )
+
+        assert worker.is_lane_halted('normal') is True, (
+            "Expected the 'normal' lane to be halted after the happy-path "
+            "auto-heal"
+        )
+        assert worker.lane_owned_by(esc_id) == 'normal', (
+            f"Expected lane 'normal' to be owned by {esc_id!r}; got "
+            f'{worker.lane_owned_by(esc_id)!r}'
+        )
+        assert worker.auto_heal_registry.attempts(sig) == 1, (
+            f'Expected attempts(sig)==1 after the happy path; got '
+            f'{worker.auto_heal_registry.attempts(sig)}'
+        )
+
+        assert spawned_args, (
+            'Expected _post_submit_tasks to be called with fix task args'
+        )
+        fix_task_args = spawned_args[0][0]
+        assert fix_task_args.get('title', '').startswith('fix main:'), (
+            f'Fix task title must start with "fix main:"; got '
+            f'{fix_task_args.get("title")!r}'
+        )
+        assert fix_task_args.get('priority') == 'high', (
+            f'Fix task must have priority=high; got '
+            f'{fix_task_args.get("priority")!r}'
+        )
+        metadata = fix_task_args.get('metadata', {})
+        assert metadata.get('merge_lane') == 'high', (
+            f'Fix task must be tagged merge_lane=high; got {metadata!r}'
+        )
+        assert metadata.get('spawn_context') == 'main_health_auto_heal', (
+            f'Fix task must have spawn_context=main_health_auto_heal; got '
+            f'{metadata!r}'
+        )
+        assert metadata.get('main_health_signature') == sig, (
+            f'Fix task must carry main_health_signature=={sig!r}; got '
+            f'{metadata!r}'
+        )
+        assert metadata.get('main_health_escalation_id') == esc_id, (
+            f'Fix task must carry main_health_escalation_id=={esc_id!r}; got '
+            f'{metadata!r}'
         )
