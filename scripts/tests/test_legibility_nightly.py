@@ -306,6 +306,61 @@ def test_git_commit_docs_only_never_invokes_stash(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# step-9/10: escalation (_build_escalation_arguments, post_escalation)
+# ---------------------------------------------------------------------------
+
+def test_build_escalation_arguments_shape(tmp_path):
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    arguments = nightly._build_escalation_arguments(cfg, 'summary text', 'detail text')
+
+    assert arguments == {
+        'task_id': 'legibility-trickle-proj_a',
+        'agent_role': 'legibility-trickle',
+        'category': 'infra_issue',
+        'severity': 'info',
+        'summary': 'summary text',
+        'detail': 'detail text',
+    }
+
+
+def test_post_escalation_calls_poster_with_mcp_envelope(tmp_path):
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', escalation_port=8199))
+    calls = []
+
+    def fake_poster(url, envelope):
+        calls.append((url, envelope))
+
+    ok = nightly.post_escalation(cfg, 'summary text', 'detail text', poster=fake_poster)
+
+    assert ok is True
+    assert len(calls) == 1
+    url, envelope = calls[0]
+    assert url == 'http://localhost:8199/mcp'
+    assert envelope['method'] == 'tools/call'
+    assert envelope['params']['name'] == 'escalate_info'
+    assert envelope['params']['arguments'] == {
+        'task_id': 'legibility-trickle-proj_a',
+        'agent_role': 'legibility-trickle',
+        'category': 'infra_issue',
+        'severity': 'info',
+        'summary': 'summary text',
+        'detail': 'detail text',
+    }
+
+
+def test_post_escalation_is_best_effort_on_poster_failure(tmp_path):
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def raising_poster(url, envelope):
+        raise RuntimeError('escalation server unreachable')
+
+    ok = nightly.post_escalation(cfg, 'summary text', 'detail text', poster=raising_poster)
+
+    assert ok is False
+
+
+# ---------------------------------------------------------------------------
 # step-1/2: resolve_config_path
 # ---------------------------------------------------------------------------
 
