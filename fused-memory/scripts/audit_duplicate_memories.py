@@ -45,8 +45,12 @@ Usage
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import difflib
+import json
 import logging
+import sys
 from datetime import datetime
 from typing import Any
 
@@ -278,3 +282,128 @@ async def fetch_procedural_memories(
             'metadata': payload,
         })
     return normalized
+
+
+# ---------------------------------------------------------------------------
+# I/O layer: apply (thin, mock-tested)
+# ---------------------------------------------------------------------------
+
+async def apply_deletions(
+    memory: Any,
+    project_id: str,
+    plan: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> dict[str, int]:
+    """Delete the plan's ``delete_candidates`` from Mem0 (best-effort).
+
+    Dry-run performs no ``delete_memory`` calls and returns zero counts.
+    Otherwise, each candidate is deleted individually in a try/except so a
+    single failure does not abort the remaining deletes (best-effort partial
+    progress) — mirrors ``audit_duplicate_tasks.apply_changes``.
+
+    Returns:
+        Dict with ``deleted`` and ``delete_errors`` counts.
+    """
+    if dry_run:
+        return {'deleted': 0, 'delete_errors': 0}
+
+    deleted = 0
+    delete_errors = 0
+    for memory_id in plan.get('delete_candidates', []):
+        try:
+            await memory.delete_memory(memory_id, store='mem0', project_id=project_id)
+            logger.info('Deleted near-duplicate memory %s', memory_id)
+            deleted += 1
+        except Exception as exc:
+            logger.error('Failed to delete memory %s: %s', memory_id, exc)
+            delete_errors += 1
+
+    return {'deleted': deleted, 'delete_errors': delete_errors}
+
+
+# ---------------------------------------------------------------------------
+# CLI / main
+# ---------------------------------------------------------------------------
+
+async def _run(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+
+    import os  # noqa: PLC0415
+
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    config = FusedMemoryConfig()
+    memory = MemoryService(config)
+    await memory.initialize()
+    try:
+        records = await fetch_procedural_memories(
+            memory, args.project_id, scan_limit=args.scan_limit,
+        )
+        logger.info('Fetched %d procedural_knowledge memory/memories', len(records))
+
+        plan = build_sweep_plan(records, threshold=args.threshold)
+        print(json.dumps(plan, indent=2, default=str))
+
+        if not args.apply:
+            logger.info('Dry run — nothing was modified. Use --apply to commit.')
+            return 0
+
+        # Irreversible-deletion guards: never apply against an empty or
+        # suspected-truncated scan (mirrors prune_recon_cycle_summaries.py's
+        # scan-completeness guard).
+        if not records:
+            logger.error('ABORT: scan returned 0 records — refusing to apply on an empty scan.')
+            return 1
+        if len(records) >= args.scan_limit:
+            logger.error(
+                'ABORT: scan returned %d records >= --scan-limit=%d — scan looks '
+                'truncated; refusing to apply. Re-run with a higher --scan-limit.',
+                len(records), args.scan_limit,
+            )
+            return 1
+
+        result = await apply_deletions(memory, args.project_id, plan, dry_run=False)
+        logger.info(
+            'Applied: deleted %d/%d memory/memories; %d error(s)',
+            result['deleted'], len(plan['delete_candidates']), result['delete_errors'],
+        )
+        return 1 if result['delete_errors'] > 0 else 0
+    finally:
+        await memory.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        '--project-id', dest='project_id', required=True,
+        help='Project id to scan for near-duplicate procedural_knowledge memories',
+    )
+    parser.add_argument(
+        '--threshold', type=float, default=0.85,
+        help='Near-duplicate similarity threshold (default: 0.85)',
+    )
+    parser.add_argument(
+        '--scan-limit', dest='scan_limit', type=int, default=5000,
+        help='Maximum number of procedural_knowledge memories to scan (default: 5000)',
+    )
+    parser.add_argument(
+        '--apply', action='store_true',
+        help='Commit deletions (default: dry-run, report only)',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to fused-memory config file (sets CONFIG_PATH env var)',
+    )
+    args = parser.parse_args()
+    return asyncio.run(_run(args))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
