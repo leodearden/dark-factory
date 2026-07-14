@@ -57,6 +57,7 @@ outcomes, per the PRD's "direction, not frozen thresholds" (G6).
 from __future__ import annotations
 
 import asyncio
+import shlex
 import subprocess
 import sys
 import time
@@ -281,3 +282,92 @@ class TestGlobalCap:
             f'expected all {m} verifies to pass; got '
             f'{[r.passed for r in results]!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 2 — MERGE NEVER BLOCKS
+# ---------------------------------------------------------------------------
+
+
+class TestMergeNeverBlocks:
+    """PRD Boundary-test sketch scenario 2: a merge-role verify's test leg
+    runs immediately — no acquire, no wait — even while the sole task slot
+    is held by a task-role verify (T1's merge no-op: ``acquire_task_slot``
+    never attempts acquisition for ``role='merge'``, always yielding
+    ``held=False``).
+    """
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_merge_verify_runs_unblocked_while_task_slot_held(self, tmp_path):
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+        )
+        holder_worktree = tmp_path / 'wt-holder'
+        holder_worktree.mkdir()
+        merge_worktree = tmp_path / 'wt-merge'
+        merge_worktree.mkdir()
+
+        spy = _RunCmdSpy()
+        # Gate the holder's (leg='test', occurrence 0) call open indefinitely
+        # so it keeps the sole task slot held for the test's duration. The
+        # call is only recorded — proving acquisition already happened,
+        # since _run_cmd is invoked strictly after _admission_slot acquires
+        # — once it reaches this gate, so it blocks *after* acquiring, never
+        # before.
+        holder_gate = spy.gate('test', 0)
+
+        with patch('orchestrator.verify._run_cmd', new=spy):
+            holder_task = asyncio.create_task(
+                run_verification(
+                    worktree=holder_worktree,
+                    config=config,
+                    module_config=_module_config(),
+                    role='task',
+                    attempt_id=None,
+                )
+            )
+            try:
+                deadline = time.monotonic() + 5.0
+                while len(spy.calls) < 1 and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                assert len(spy.calls) == 1, (
+                    'expected the task-role holder to acquire the sole slot '
+                    'and reach its gated test leg within 5s'
+                )
+
+                merge_result = await run_verification(
+                    worktree=merge_worktree,
+                    config=config,
+                    module_config=_module_config(),
+                    role='merge',
+                    attempt_id=None,
+                )
+
+                # run_verification(role='merge') runs test -> lint -> type
+                # sequentially (concurrent_verify=False) before returning, so
+                # spy.calls also holds merge's lint/type entries by now;
+                # isolate the 'test' leg specifically. Its call is the 2nd
+                # 'test'-leg entry (occurrence 1) — proven to have completed
+                # *while the holder is still gated/blocked*, by construction:
+                # holder_gate is not released until after this assertion
+                # block, in the `finally` below.
+                test_calls = [c for c in spy.calls if c['leg'] == 'test']
+                assert len(test_calls) == 2
+                merge_call = test_calls[1]
+                expected_cmd = (
+                    shlex.join(['nice', '-n', '5'])
+                    + ' /bin/bash -c '
+                    + shlex.quote(_TEST_CMD)
+                )
+                assert merge_call['cmd'] == expected_cmd, (
+                    f'expected the merge test leg wrapped with the nice -n 5 '
+                    f'tier; got {merge_call["cmd"]!r}'
+                )
+                assert merge_result.passed
+            finally:
+                holder_gate.set()
+                holder_result = await holder_task
+            assert holder_result.passed
