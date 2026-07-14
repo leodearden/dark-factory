@@ -254,6 +254,179 @@ class TestReconReportInRunDedup:
 
 
 # ---------------------------------------------------------------------------
+# task-2432 step-5/6 (bullet 4): comma-joined task_id normalization — RED
+# until step-6 adds a canonicalization helper (split/strip/sort/dedupe/
+# rejoin) applied to add_finding's task_id before the dedup signature is
+# computed, so a comma-joined task_id whose components are reordered between
+# two calls collapses onto the same signature.
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportCommaJoinedTaskIdNormalization:
+    """Verify a comma-joined top-level task_id normalizes for dedup purposes,
+    independent of component order, and that single-value task_id dedup
+    (already-supported) keeps working."""
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        return state
+
+    def _finding(self, state, task_id, flag_type, **kwargs):
+        defaults = dict(
+            run_id='r1',
+            severity='moderate',
+            category='memory_stale',
+            description='d',
+            suggested_action='a',
+            task_id=task_id,
+            flag_type=flag_type,
+        )
+        defaults.update(kwargs)
+        return state.add_finding(**defaults)
+
+    def test_comma_joined_task_id_different_order_dedups(self):
+        """A comma-joined top-level task_id normalizes so a second call with
+        the same components in a different order collapses as a duplicate."""
+        state = self._make_state()
+        first = self._finding(state, task_id='5040,5149', flag_type='dedup_order_test')
+        assert 'finding_id' in first, first
+        id1 = first['finding_id']
+
+        second = self._finding(
+            state, task_id='5149,5040', flag_type='dedup_order_test',
+            description='different text still same sig',
+        )
+        assert second.get('error') == 'duplicate_finding'
+        assert second.get('existing_finding_id') == id1
+
+        report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report is not None
+        matches = [f for f in report['flagged_items'] if f['flag_type'] == 'dedup_order_test']
+        assert len(matches) == 1
+
+    def test_single_value_task_id_still_dedups(self):
+        """Regression guard: a plain single-value task_id keeps dedupping
+        (this already works today; must not regress)."""
+        state = self._make_state()
+        first = self._finding(state, task_id='5040', flag_type='dedup_single_test')
+        assert 'finding_id' in first, first
+        id1 = first['finding_id']
+
+        second = self._finding(
+            state, task_id='5040', flag_type='dedup_single_test',
+            description='different text still same sig',
+        )
+        assert second.get('error') == 'duplicate_finding'
+        assert second.get('existing_finding_id') == id1
+
+
+# ---------------------------------------------------------------------------
+# task-2432 step-1/2 (bullet 1a, state level): actionable computed default —
+# RED until step-2 changes ReconReportState.add_finding's `actionable`
+# parameter from `bool = True` to a `bool | None = None` sentinel and
+# resolves it in the body when omitted:
+# `not (task_id is None or category.startswith('cross_project'))`.
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportActionableComputedDefault:
+    """Verify add_finding's *actionable* default is computed (not a static
+    True) when the caller omits it, and that an explicit True/False from the
+    caller is always honored regardless of task_id/category."""
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        return state
+
+    def _actionable_for(self, state, finding_id):
+        report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report is not None
+        matches = [item for item in report['flagged_items'] if item['finding_id'] == finding_id]
+        assert len(matches) == 1, f'expected exactly one flagged item for {finding_id!r}, got {matches}'
+        return matches[0]['actionable']
+
+    def test_null_task_id_omitted_actionable_defaults_false(self):
+        state = self._make_state()
+        result = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='memory_stale',
+            description='a null-task finding',
+            suggested_action='investigate',
+            task_id=None,
+            flag_type='orphaned_knowledge',
+        )
+        assert 'finding_id' in result, result
+        assert self._actionable_for(state, result['finding_id']) is False
+
+    def test_cross_project_category_omitted_actionable_defaults_false(self):
+        state = self._make_state()
+        result = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='cross_project_routing',
+            description='a cross-project finding',
+            suggested_action='investigate',
+            task_id='123',
+            flag_type='cross_project',
+        )
+        assert 'finding_id' in result, result
+        assert self._actionable_for(state, result['finding_id']) is False
+
+    def test_normal_finding_omitted_actionable_defaults_true(self):
+        state = self._make_state()
+        result = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='memory_stale',
+            description='a normal finding',
+            suggested_action='investigate',
+            task_id='123',
+            flag_type='orphaned_knowledge',
+        )
+        assert 'finding_id' in result, result
+        assert self._actionable_for(state, result['finding_id']) is True
+
+    def test_explicit_true_with_null_task_id_stays_true(self):
+        state = self._make_state()
+        result = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='memory_stale',
+            description='explicit true override',
+            suggested_action='investigate',
+            actionable=True,
+            task_id=None,
+            flag_type='orphaned_knowledge',
+        )
+        assert 'finding_id' in result, result
+        assert self._actionable_for(state, result['finding_id']) is True
+
+    def test_explicit_false_with_normal_task_id_stays_false(self):
+        state = self._make_state()
+        result = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='memory_stale',
+            description='explicit false override',
+            suggested_action='investigate',
+            actionable=False,
+            task_id='456',
+            flag_type='orphaned_knowledge',
+        )
+        assert 'finding_id' in result, result
+        assert self._actionable_for(state, result['finding_id']) is False
+
+
+# ---------------------------------------------------------------------------
 # step-7: complete() idempotence — RED until step-8 implements it
 # ---------------------------------------------------------------------------
 
@@ -892,6 +1065,88 @@ class TestCreateReconReportServer:
         assert report is not None
         assert report['summary'] == 'done'
         assert len(report['flagged_items']) == 1
+
+
+# ---------------------------------------------------------------------------
+# task-2432 step-3/4 (bullet 1a, FastMCP wrapper): actionable computed
+# default via mcp._tool_manager.call_tool — RED until step-4 changes the
+# registered add_finding tool wrapper's `actionable` parameter from
+# `bool = True` to a `bool | None = None` sentinel passed through unchanged
+# to state.add_finding.
+# ---------------------------------------------------------------------------
+
+
+class TestAddFindingWrapperActionableDefault:
+    """Verify the registered add_finding FastMCP tool applies the SAME
+    computed actionable default as ReconReportState.add_finding when the
+    caller omits `actionable` from the call_tool arguments dict — a static
+    wrapper default of True would silently override the state method's
+    computed default before it ever sees `None`.
+    """
+
+    def _make(self):
+        from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        mcp = create_recon_report_server(state)
+        return state, mcp
+
+    async def _actionable_via_call_tool(self, state, mcp, **finding_kwargs):
+        tm = mcp._tool_manager
+        await tm.call_tool('start_report', {
+            'run_id': 'r1', 'stage': 'memory_consolidator', 'project_id': 'dark_factory',
+        })
+        args = dict(
+            run_id='r1',
+            severity='moderate',
+            category='memory_stale',
+            description='d',
+            suggested_action='a',
+        )
+        args.update(finding_kwargs)
+        result = await tm.call_tool('add_finding', args)
+        assert 'finding_id' in result, result
+        report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report is not None
+        matches = [item for item in report['flagged_items'] if item['finding_id'] == result['finding_id']]
+        assert len(matches) == 1
+        return matches[0]['actionable']
+
+    @pytest.mark.asyncio
+    async def test_null_task_id_omitted_actionable_defaults_false(self):
+        state, mcp = self._make()
+        actionable = await self._actionable_via_call_tool(
+            state, mcp, task_id=None, flag_type='orphaned_knowledge',
+        )
+        assert actionable is False
+
+    @pytest.mark.asyncio
+    async def test_cross_project_category_omitted_actionable_defaults_false(self):
+        state, mcp = self._make()
+        actionable = await self._actionable_via_call_tool(
+            state, mcp,
+            category='cross_project_routing',
+            task_id='123',
+            flag_type='cross_project',
+        )
+        assert actionable is False
+
+    @pytest.mark.asyncio
+    async def test_normal_finding_omitted_actionable_defaults_true(self):
+        state, mcp = self._make()
+        actionable = await self._actionable_via_call_tool(
+            state, mcp, task_id='123', flag_type='orphaned_knowledge',
+        )
+        assert actionable is True
+
+    @pytest.mark.asyncio
+    async def test_explicit_true_with_null_task_id_stays_true(self):
+        state, mcp = self._make()
+        actionable = await self._actionable_via_call_tool(
+            state, mcp, actionable=True, task_id=None, flag_type='orphaned_knowledge',
+        )
+        assert actionable is True
 
 
 # ---------------------------------------------------------------------------

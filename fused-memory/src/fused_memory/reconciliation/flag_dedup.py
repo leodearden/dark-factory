@@ -895,35 +895,72 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     Falsy-but-valid values like ``task_id=0`` or ``flag_type=''`` are accepted
     — only ``None`` (absent key) triggers a ``None`` return.
 
-    **cited_tasks fallback (PRD γ §9.3):** when the top-level ``task_id`` key
-    is absent (``None``), the function derives a deterministic signature from the
-    *sorted set* of all ``task_id`` values in ``cited_tasks``, comma-joined.
-    This ensures multi-task findings produce the same signature regardless of
-    citation order, and prevents two findings that share only the first cited
-    task from colliding (reviewer finding dedup_correctness).  Callers that need
-    precise single-task dedup should always set the top-level ``task_id``
-    explicitly — the fallback is a best-effort heuristic for findings that omit
-    it.
+    **cited_tasks union (task-2432 bullets 3/4; supersedes the PRD γ §9.3
+    fallback):** whenever ``cited_tasks`` is a non-empty list, the task
+    component is the *sorted set* of the UNION of {the top-level
+    ``task_id``'s comma-split parts, if it is set} ∪ {every ``task_id`` value
+    in ``cited_tasks``}, comma-joined — using the same plain ``sorted(str(...))``
+    convention as before (lexicographic, not numeric-aware). This collapses a
+    shape mismatch between calls that describe the same task set differently:
+    a null top-level task_id (the original fallback case), a single value
+    equal to one of the cited tasks, or an already comma-joined top-level
+    value all produce the SAME signature once cited_tasks agrees. It also
+    prevents two findings that share only some of their cited tasks from
+    colliding (reviewer finding dedup_correctness). When ``cited_tasks`` is
+    absent (or not a non-empty list), the top-level ``task_id`` passes
+    through UNCHANGED — single, comma-joined, or ``None`` — so this path
+    stays exactly as before for callers that never set cited_tasks. Callers
+    that need precise single-task dedup should always set the top-level
+    ``task_id`` explicitly.
+
+    **Sort-order independence (reviewer finding consistency):** the union's
+    comma-join above uses a plain lexicographic ``sorted()``, which is *not*
+    the same ordering as ``recon_report._canonicalize_task_id_string``'s
+    numeric-aware sort (that helper sorts numeric parts by ``int`` value).
+    The two conventions are deliberately independent: each subsystem is
+    internally consistent among its own callers, and a signature computed
+    here is never compared against a canonicalized string from
+    ``recon_report`` — the in-run (server) and cross-cycle (reconciliation)
+    dedup layers run at different boundaries and each recomputes its own
+    signature fresh rather than persisting and cross-comparing. So the
+    differing order is not a correctness bug, only a reminder not to assume
+    the two are interchangeable if a future caller ever bridges them.
+
+    **Upgrade-boundary note (reviewer finding backward_compatibility):**
+    widening this union to apply whenever ``cited_tasks`` is non-empty
+    (rather than only when the top-level ``task_id`` is ``None``) changes
+    the signature for any pre-existing finding that had BOTH a set top-level
+    ``task_id`` and ``cited_tasks`` — e.g. ``task_id='5040', cited=[5040]``
+    and ``task_id='5040', cited=[5040, 5149]`` used to collapse to the same
+    signature and are now distinct. A ledger suppression marker written
+    under the old signature will therefore miss once immediately after
+    deploy; this is self-healing (the very next cycle writes suppression
+    under the new signature), so no marker migration or dual-key lookup is
+    required.
 
     Returns ``None`` for flags without enough signal to deduplicate — these are
     passed through unchanged by :func:`dedup_flags`.
     """
     task_id = flag.get('task_id')
 
-    # Best-effort fallback: derive task_id from cited_tasks when the top-level
-    # field is absent.  flag_type is still required at the top level.
-    # Uses sorted(all task_ids) — not just the first — so multi-task findings
-    # dedup deterministically regardless of citation order.
-    if task_id is None:
-        cited_tasks = flag.get('cited_tasks')
-        if cited_tasks and isinstance(cited_tasks, list):
-            task_ids = sorted(
-                str(c['task_id'])
-                for c in cited_tasks
-                if isinstance(c, dict) and c.get('task_id') is not None
-            )
-            if task_ids:
-                task_id = ','.join(task_ids)
+    # cited_tasks union (task-2432): whenever cited_tasks is present, the
+    # task component is the sorted union of the top-level task_id's
+    # comma-split parts (if any) and every cited task_id — not just consulted
+    # when the top-level task_id is absent, so a SET top-level task_id no
+    # longer produces a different signature than a None or comma-joined one
+    # naming the same task set.  flag_type is still required at the top level.
+    cited_tasks = flag.get('cited_tasks')
+    if cited_tasks and isinstance(cited_tasks, list):
+        task_id_parts: set[str] = set()
+        if task_id is not None:
+            task_id_parts.update(part.strip() for part in str(task_id).split(',') if part.strip())
+        task_id_parts.update(
+            str(c['task_id'])
+            for c in cited_tasks
+            if isinstance(c, dict) and c.get('task_id') is not None
+        )
+        if task_id_parts:
+            task_id = ','.join(sorted(task_id_parts))
 
     flag_type = flag.get('flag_type')
     if task_id is None or flag_type is None:

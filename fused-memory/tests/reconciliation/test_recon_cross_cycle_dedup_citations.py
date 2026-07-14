@@ -234,6 +234,47 @@ class TestSignaturePathCrossCycleDedup:
             f'Expected ("3803", "cross_project") via cited_tasks fallback, got {result!r}'
         )
 
+    def test_compute_flag_signature_identical_across_top_level_task_id_shapes(self):
+        """task-2432 bullets 3/4: compute_flag_signature must return the SAME
+        signature regardless of whether the top-level task_id is a single
+        value, None (cited_tasks fallback), or a comma-joined string --
+        whenever cited_tasks names the same task set. Fails today because
+        the cited_tasks union is only consulted when the top-level task_id
+        is None (flag_dedup.py:917): a SET top-level task_id ('5040')
+        ignores cited_tasks entirely, so flag A's signature stays ('5040',
+        'X') while flag B's (top-level None) becomes ('5040,5149', 'X') via
+        the existing fallback -- a shape mismatch between A and B.
+        """
+        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+
+        shared_cited_tasks = [
+            {'project_id': 'reify', 'task_id': '5040'},
+            {'project_id': 'reify', 'task_id': '5149'},
+        ]
+        flag_a = {'task_id': '5040', 'flag_type': 'X', 'cited_tasks': shared_cited_tasks}
+        flag_b = {'task_id': None, 'flag_type': 'X', 'cited_tasks': shared_cited_tasks}
+        flag_c = {'task_id': '5040,5149', 'flag_type': 'X', 'cited_tasks': shared_cited_tasks}
+
+        result_a = compute_flag_signature(flag_a)
+        result_b = compute_flag_signature(flag_b)
+        result_c = compute_flag_signature(flag_c)
+
+        assert result_a == ('5040,5149', 'X'), result_a
+        assert result_b == ('5040,5149', 'X'), result_b
+        assert result_c == ('5040,5149', 'X'), result_c
+        assert result_a == result_b == result_c
+
+    def test_compute_flag_signature_backward_compat_no_cited_tasks(self):
+        """BACKWARD-COMPAT (stay green): a set top-level task_id with NO
+        cited_tasks at all is unaffected by the union change -- still
+        returns the plain top-level signature.
+        """
+        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+
+        flag = {'task_id': '5040', 'flag_type': 'X'}
+        result = compute_flag_signature(flag)
+        assert result == ('5040', 'X'), result
+
     @pytest.mark.asyncio
     async def test_dedup_flags_cycle1_miss_writes_marker_keyed_by_cited_task(
         self, ledger_memory_service

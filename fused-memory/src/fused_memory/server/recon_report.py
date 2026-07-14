@@ -55,6 +55,68 @@ def _canonical_sig_field(value: Any) -> str | None:
     return None if value is None else str(value)
 
 
+def _split_task_id_parts(value: str) -> set[str]:
+    """Return the set of individual task-id parts within *value*.
+
+    ``value`` is a (possibly comma-joined) canonical task_id string, e.g.
+    ``'5040,5149'`` -> ``{'5040', '5149'}`` and ``'5040'`` -> ``{'5040'}``.
+    Each part is stripped of surrounding whitespace; empty parts (from
+    leading/trailing/doubled commas) are dropped.
+
+    Used both by :func:`_canonicalize_task_id_string` (dedup-signature
+    normalization, task-2432 bullet 4) and by the entity-scoped cite_task
+    fold's subset-membership eligibility gate (task-2432 bullets 1b/2/3).
+    """
+    return {p.strip() for p in value.split(',') if p.strip()}
+
+
+def _task_id_part_sort_key(part: str) -> tuple[int, Any]:
+    """Sort key for a single task-id part: numeric parts by int value (and
+    ordered before non-numeric parts), non-numeric parts lexically.
+
+    A stable, deterministic ordering is all that's required for dedup
+    purposes — the exact numeric-before-lexical grouping is not itself load
+    -bearing, only that two calls describing the same set of parts always
+    sort to the same joined string.
+    """
+    try:
+        return (0, int(part))
+    except ValueError:
+        return (1, part)
+
+
+def _canonicalize_task_id_string(value: str) -> str:
+    """Canonicalize a top-level ``task_id`` string for dedup-signature purposes.
+
+    Splits *value* on ``','``, strips whitespace from each part, drops empty
+    parts, sorts (numeric parts by int value, non-numeric parts lexically —
+    see :func:`_task_id_part_sort_key`), dedupes, and rejoins with ``','``.
+    A single-value input canonicalizes to itself (e.g. ``'5040'`` ->
+    ``'5040'``); an input with no non-empty parts (e.g. ``''``) is returned
+    unchanged.
+
+    This ensures a comma-joined task_id whose components are reordered (or
+    duplicated) between two ``add_finding`` calls collapses onto the same
+    dedup signature (task-2432 bullet 4).
+
+    Both this helper and ``reconciliation.flag_dedup.compute_flag_signature``'s
+    ``cited_tasks`` union produce a sorted, comma-joined string, but the two
+    sort orders are independent, not mirrored: this one is numeric-aware (see
+    :func:`_task_id_part_sort_key`), while ``flag_dedup``'s is plain
+    lexicographic. Each subsystem is internally consistent among its own
+    callers and neither ever compares its signature against the other's — the
+    in-run (server) and cross-cycle (reconciliation) dedup layers run at
+    different boundaries and each recomputes its own signature fresh — so the
+    differing order is intentional, not a bug. Do not assume the two strings
+    are interchangeable if a future caller ever bridges server/ and
+    reconciliation/.
+    """
+    parts = _split_task_id_parts(value)
+    if not parts:
+        return value
+    return ','.join(sorted(parts, key=_task_id_part_sort_key))
+
+
 # ---------------------------------------------------------------------------
 # Fix 1 helpers — citation identity + same-run echo suppression (task-1654)
 # ---------------------------------------------------------------------------
@@ -460,7 +522,7 @@ class ReconReportState:
         category: str,
         description: str,
         suggested_action: str,
-        actionable: bool = True,
+        actionable: bool | None = None,
         task_id: str | None = None,
         flag_type: str | None = None,
     ) -> dict[str, Any]:
@@ -473,11 +535,34 @@ class ReconReportState:
         rather than creating a redundant row.  Cross-run isolation is preserved:
         findings from a different run_id are never considered.
 
+        ``actionable`` (task-2432 bullet 1a) is a COMPUTED default: when the
+        caller omits it (leaves it ``None``), it resolves to
+        ``not (task_id is None or category.startswith('cross_project'))`` —
+        i.e. False for a null-task_id finding or a ``cross_project*``
+        category (both are informational/routing findings, not directly
+        actionable), True otherwise. An explicit ``True``/``False`` from the
+        caller is always honored regardless of task_id/category. The None
+        check uses the raw ``task_id`` parameter (equivalent to the
+        canonicalized form, since only ``None`` coerces to ``None``); the
+        prefix check uses the POST-truncation ``category``.
+
         A null/missing ``flag_type`` on a re-raise of an already-flagged
         ``task_id`` inherits that task's single established flag_type before
         the signature lookup runs (task-2318), so an under-specified re-raise
         collapses onto the canonical finding instead of allocating a distinct
         ``(task_id, None)`` row.
+
+        A comma-joined ``task_id`` (e.g. ``'5040,5149'``) is canonicalized
+        via :func:`_canonicalize_task_id_string` (task-2432 bullet 4) BEFORE
+        the dedup signature is computed and BEFORE it is stored on the
+        resulting ``_Finding`` — split/stripped/deduped/sorted and rejoined,
+        so two calls describing the same set of task ids in a different
+        order (or with duplicated parts) collapse onto the same signature.
+        A single-value ``task_id`` canonicalizes to itself, so this is a
+        strict generalization of the pre-existing single-value dedup.
+        Because the stored ``finding.task_id`` is already canonical,
+        :meth:`_purge_finding` recomputes an identical signature from it —
+        delete/refile stays consistent with no separate change there.
 
         ``description``/``suggested_action``/``category`` are truncated to
         ``_MAX_FINDING_TEXT_CHARS`` BEFORE dedup hashing (task-2410;
@@ -540,6 +625,8 @@ class ReconReportState:
         # The two namespaces are kept separate so a null-null finding with description
         # 'd' never collides with a real-signature finding that shares description 'd'.
         c_task_id = _canonical_sig_field(task_id)
+        if c_task_id is not None:
+            c_task_id = _canonicalize_task_id_string(c_task_id)
         c_flag_type = _canonical_sig_field(flag_type)
 
         # Flag-type inheritance (task-2318): a re-raise that omits flag_type
@@ -588,6 +675,8 @@ class ReconReportState:
                     return _duplicate_finding_error(existing_id, warnings)
 
         finding_id = str(uuid.uuid4())
+        if actionable is None:
+            actionable = not (task_id is None or category.startswith('cross_project'))
         finding = _Finding(
             finding_id=finding_id,
             severity=severity,
@@ -951,11 +1040,15 @@ class ReconReportState:
     ) -> None:
         """Remove *finding* from *owning_entry* and every dedup index it may
         be registered under: ``_run_finding_index``, whichever of
-        ``_run_sig_index`` / ``_run_desc_index`` it was filed under, and
-        ``_run_cited_task_index`` if it is a primary-cited-task fold anchor.
+        ``_run_sig_index`` / ``_run_desc_index`` it was filed under,
+        ``_run_cited_task_index`` if it is a primary-cited-task fold anchor
+        (task-2425), and the derived projectless ``(cited_task_id,
+        flag_type)`` key in ``_run_sig_index`` if it is an entity-scoped
+        fold anchor (task-2432) — see :meth:`cite_task`'s docstring for both
+        folds.
 
         Single-sourced (task-2425) by :meth:`delete_finding` and the in-run
-        cited-task fold's retract path in :meth:`cite_task`, so the four
+        cited-task fold's retract path in :meth:`cite_task`, so the
         run-level dedup indices can never drift out of sync between the two
         removal paths, and neither path can leave a stale pointer to a
         finding that no longer exists.
@@ -995,6 +1088,22 @@ class ReconReportState:
             run_cited_tasks = self._run_cited_task_index.get(run_id, {})
             if run_cited_tasks.get(primary_key) == finding.finding_id:
                 run_cited_tasks.pop(primary_key, None)
+
+        # task-2432: clear the entity-scoped fold's derived (cited_task_id,
+        # flag_type) anchor. Unlike the project-scoped anchor above, this
+        # is NOT gated on finding.task_id is None — a finding whose top-level
+        # task_id matched its primary citation (single or comma-joined) can
+        # also be a derived-sig anchor (see cite_task's docstring). A finding
+        # purged MID-FOLD in cite_task (the losing side of a collision) has
+        # empty cited_tasks at purge time — its citation is only appended
+        # after the fold-check succeeds — so this guard correctly skips it;
+        # only an established anchor (whose citation is already recorded)
+        # clears its derived sig here.
+        if finding.flag_type is not None and finding.cited_tasks:
+            derived_sig = (_canonical_sig_field(finding.cited_tasks[0]['task_id']), finding.flag_type)
+            run_sig_index = self._run_sig_index.get(run_id, {})
+            if run_sig_index.get(derived_sig) == finding.finding_id:
+                run_sig_index.pop(derived_sig, None)
 
     # ------------------------------------------------------------------
     # cite_* tools (task β)
@@ -1094,22 +1203,50 @@ class ReconReportState:
         it. Titles are cosmetic display text, not part of the citation's
         identity, so this staleness is accepted rather than reconciled.
 
-        In-run cited-task fold (task-2425): when *finding* has a null
-        top-level task_id and this is its PRIMARY (first-ever) citation, the
-        (project_id, task_id) pair doubles as an in-run dedup anchor. If an
-        earlier finding in this run already registered the same primary
-        cited task, the just-looked-up finding is purged and
-        ``duplicate_finding`` is returned instead — two findings citing the
-        same external blocker are semantically duplicate regardless of how
-        differently they are worded. Findings with a real top-level task_id,
-        and secondary (non-first) citations, are never fold anchors.
+        Two in-run folds anchor on this call — BOTH are CHECKED before
+        EITHER registers, so a call that folds under either one always
+        purges/returns rather than leaving a half-registered anchor from the
+        other:
 
-        The fold EXEMPTS ``memory_consolidator`` (Stage-1) findings, mirroring
-        Fix-1's read-time ``stage != 'memory_consolidator'`` carve-out in
-        :meth:`get_assembled_report`: two sibling Stage-1 findings that cite the
-        same target stay distinct, and a Stage-2 echo of a Stage-1 citation is
-        already suppressed at read time — so the write-time fold only collapses
-        same-run duplicates in a non-Stage-1 stage that Fix-1 cannot reach.
+        1. Project-scoped null+null fold (task-2425): when *finding* has a
+           null top-level task_id and this is its PRIMARY (first-ever)
+           citation, the (project_id, task_id) pair doubles as an in-run
+           dedup anchor keyed in ``_run_cited_task_index``. Findings with a
+           real top-level task_id, and secondary (non-first) citations, are
+           never anchors here. EXEMPTS ``memory_consolidator`` (Stage-1)
+           findings, mirroring Fix-1's read-time ``stage !=
+           'memory_consolidator'`` carve-out in :meth:`get_assembled_report`:
+           two sibling Stage-1 findings that cite the same target stay
+           distinct, and a Stage-2 echo of a Stage-1 citation is already
+           suppressed at read time — so this fold only collapses same-run
+           duplicates in a non-Stage-1 stage that Fix-1 cannot reach.
+
+        2. Entity-scoped derived-signature fold (task-2432 bullets 1b/2/3):
+           reuses ``_run_sig_index`` — the SAME index add_finding's ordinary
+           (task_id, flag_type) signature lookup consults — with a
+           PROJECTLESS derived key ``(canonical(task_id), finding.flag_type)``
+           built from *this citation's* task_id. Registering it there means a
+           LATER add_finding whose top-level task_id equals this cited tid
+           collapses via add_finding's own ordinary signature lookup, with no
+           add_finding change needed. Eligible only for a finding's PRIMARY
+           citation (``cited_tasks`` still empty) with a non-null
+           ``flag_type`` (a null flag_type can't form a meaningful derived
+           signature — every null-flag_type citation of the same task would
+           collide), and only when ``finding.task_id is None`` or this
+           citation's task_id (canonicalized) is a MEMBER of
+           ``finding.task_id``'s comma-split parts (:func:`_split_task_id_parts`)
+           — a single-value top-level task_id is a singleton part set, so
+           this subsumes the equality case. A None, a foreign-single, a
+           local-single, and a comma-joined top-level task_id therefore all
+           fold through this ONE path when they share a cited task; a
+           finding citing a task outside its own top-level part set is never
+           folded (see test_non_null_task_id_finding_is_never_a_fold_anchor
+           and test_local_task_id_citing_different_task_is_not_folded).
+           Unlike fold 1, this fold has NO memory_consolidator carve-out:
+           the derived signature lives in the same run-wide, cross-stage
+           index add_finding already consults from every stage, so
+           exempting one stage from registering it would just let that
+           stage's findings silently evade the whole-run fold.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -1137,32 +1274,60 @@ class ReconReportState:
         title = result.get('title') or data.get('title', '')
         citation = {'project_id': project_id, 'task_id': task_id, 'title': title}
 
-        # In-run cited-task fold (task-2425) — see docstring above. Only the
-        # PRIMARY citation (finding.cited_tasks still empty) of a null-
-        # top-level-task_id finding is a fold anchor.
-        #
-        # memory_consolidator (Stage 1) findings are EXEMPT from the fold —
-        # mirroring Fix-1's own read-time carve-out in get_assembled_report
-        # (`stage != 'memory_consolidator'`). Two sibling Stage-1 findings that
-        # cite the same target are deliberately kept distinct (see
-        # test_sibling_stage1_findings_not_mutually_suppressed); a Stage-2 echo
-        # of a Stage-1 citation is already handled at read time by
-        # _traces_exclusively_to_stage1. The write-time fold therefore only
-        # targets the gap Fix-1 cannot reach: two same-run findings in a
-        # non-Stage-1 stage (e.g. task_knowledge_sync) that cite the same
-        # external blocker Stage 1 never cited — the autopilot_video repro.
-        if (
+        # In-run cited-task folds (task-2425 project-scoped; task-2432
+        # entity-scoped) — see docstring above. Both folds' EXISTENCE CHECKS
+        # run before EITHER registers.
+        project_fold_eligible = (
             finding.task_id is None
             and not finding.cited_tasks
             and finding_entry.stage != 'memory_consolidator'
-        ):
-            cited_task_key = _cited_task_key(project_id, task_id)
-            run_cited_tasks = self._run_cited_task_index.setdefault(run_id, {})
-            existing_id = run_cited_tasks.get(cited_task_key)
-            if existing_id is not None and existing_id != finding.finding_id:
-                self._purge_finding(run_id, finding_entry, finding)
-                return _duplicate_finding_error(existing_id)
-            run_cited_tasks[cited_task_key] = finding.finding_id
+        )
+        # Always compute the concrete key (pure, side-effect-free) so its
+        # static type stays non-Optional for the dict lookup/assignment below
+        # — mirrors _purge_finding's primary_key/derived_sig convention.
+        # Its *use* is still gated on project_fold_eligible.
+        cited_task_key = _cited_task_key(project_id, task_id)
+        project_existing_id = (
+            self._run_cited_task_index.get(run_id, {}).get(cited_task_key)
+            if project_fold_eligible
+            else None
+        )
+
+        c_cited_task_id = _canonical_sig_field(task_id)
+        entity_fold_eligible = (
+            not finding.cited_tasks
+            and finding.flag_type is not None
+            and (
+                finding.task_id is None
+                or c_cited_task_id in _split_task_id_parts(finding.task_id)
+            )
+        )
+        # Same rationale as cited_task_key above: compute unconditionally,
+        # gate the use on entity_fold_eligible.
+        derived_sig = (c_cited_task_id, finding.flag_type)
+        entity_existing_id = (
+            self._run_sig_index.get(run_id, {}).get(derived_sig)
+            if entity_fold_eligible
+            else None
+        )
+
+        # Sequential (not project_hit/entity_hit booleans + a re-derived
+        # existing_id) so pyright narrows each *_existing_id to `str` from
+        # its own `is not None` check at the call site — see cited_task_key
+        # comment above for why the naive boolean-flag version doesn't
+        # narrow. Semantics are unchanged: project fold takes priority when
+        # both would hit, purge runs exactly once, either way.
+        if project_existing_id is not None and project_existing_id != finding.finding_id:
+            self._purge_finding(run_id, finding_entry, finding)
+            return _duplicate_finding_error(project_existing_id)
+        if entity_existing_id is not None and entity_existing_id != finding.finding_id:
+            self._purge_finding(run_id, finding_entry, finding)
+            return _duplicate_finding_error(entity_existing_id)
+
+        if project_fold_eligible:
+            self._run_cited_task_index.setdefault(run_id, {})[cited_task_key] = finding.finding_id
+        if entity_fold_eligible:
+            self._run_sig_index.setdefault(run_id, {})[derived_sig] = finding.finding_id
 
         # task-2425 amend: skip the append when an identical {project_id,
         # task_id} citation is already present. Without this, re-citing a
@@ -1359,6 +1524,9 @@ Usage pattern (per PRD §9.2):
                   across ALL stages of the same run_id).  Overlength
                   description/suggested_action are truncated with a
                   'warnings' entry on the response, never rejected.
+                  actionable defaults to False when task_id is None or
+                  category starts with 'cross_project'; True otherwise. An
+                  explicit actionable=True/False is always honored.
 3. set_stat / inc_stat — track numeric metrics during the run.
 4. complete — stamp the summary and close the report; idempotent.
 5. delete_finding(run_id, finding_id) — IRREVERSIBLE retraction of a
@@ -1399,7 +1567,7 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         category: str,
         description: str,
         suggested_action: str,
-        actionable: bool = True,
+        actionable: bool | None = None,
         task_id: str | None = None,
         flag_type: str | None = None,
     ) -> dict:
@@ -1412,6 +1580,12 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         of this run_id (and neither is None), returns
         {error: duplicate_finding, existing_finding_id}.  Attach citations to
         existing_finding_id instead of creating a redundant row.
+
+        actionable (task-2432 bullet 1a): when omitted, defaults to False for
+        a null task_id or a cross_project* category, True otherwise — see
+        ReconReportState.add_finding's docstring. The `None` sentinel is
+        passed through unchanged so the state method's computed default
+        applies; an explicit True/False is always honored.
         """
         return state.add_finding(
             run_id=run_id,
