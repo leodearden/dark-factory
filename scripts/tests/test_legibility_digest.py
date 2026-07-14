@@ -779,3 +779,121 @@ class TestRenderFrontmatter:
 
         assert loaded['date'] == '2026-07-14'
         assert isinstance(loaded['date'], str)
+
+
+# ---------------------------------------------------------------------------
+# render_digest — full markdown assembly: frontmatter + one section per
+# NON-EMPTY signal class, and a byte-exact self-consistent size_bytes.
+# session/cwd/date are derived straight from the records: real transcripts
+# carry top-level cwd/sessionId/timestamp on every non-queue-operation
+# record (grounded via ~/.claude/projects/-home-leo-src-dark-factory
+# inspection); encoded_dir prefers the transcript file's parent dir name
+# (ground truth) and falls back to the cwd-derived mirror encoding when no
+# path is given.
+# ---------------------------------------------------------------------------
+
+_DIGEST_SESSION_ID = '000a8a42-3ca1-44f2-aa82-7f7ed46231fd'
+_DIGEST_CWD = '/home/leo/src/dark-factory'
+_DIGEST_TIMESTAMP = '2026-07-11T06:02:29.796Z'
+
+
+def _with_session_meta(
+    rec, *, cwd=_DIGEST_CWD, session_id=_DIGEST_SESSION_ID, timestamp=_DIGEST_TIMESTAMP,
+):
+    """Return a copy of *rec* with real-transcript-shaped top-level cwd/
+    sessionId/timestamp fields merged in (observed on every non-
+    queue-operation record in a real Claude Code transcript)."""
+    out = dict(rec)
+    out['cwd'] = cwd
+    out['sessionId'] = session_id
+    out['timestamp'] = timestamp
+    return out
+
+
+def _all_signals_records():
+    """A fixture touching every one of the seven digest sections at least
+    once: user correction, error neighborhood, self-correction, a 3x retry
+    loop, not-found, a df-guard trip, and an interrupt marker."""
+    return [
+        _with_session_meta(_user_text('Please redo this, it is wrong.')),
+        _with_session_meta(_assistant(_tool_use('Bash', {'command': 'false'}, id='tu-err'))),
+        _with_session_meta(_tool_result('tu-err', 'Exit code 1', is_error=True)),
+        _with_session_meta(_assistant(_text('My mistake, let me redo this.'))),
+        _with_session_meta(_assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-loop-1'))),
+        _with_session_meta(_assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-loop-2'))),
+        _with_session_meta(_assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-loop-3'))),
+        _with_session_meta(_tool_result('tu-nf', 'bash: foo: command not found', is_error=False)),
+        _with_session_meta(_tool_result(
+            'tu-guard', 'error: done_gate_missing_files -- cannot mark done', is_error=False,
+        )),
+        _with_session_meta(_user_text('[Request interrupted by user for tool use]')),
+    ]
+
+
+def _split_frontmatter(digest):
+    """Split a rendered digest into (frontmatter_inner_yaml, body) — the
+    inverse of render_frontmatter's '---'-delimiting, used to independently
+    verify the frontmatter contents of a full digest via yaml.safe_load."""
+    lines = digest.splitlines()
+    assert lines[0] == '---'
+    end = lines.index('---', 1)
+    return '\n'.join(lines[1:end]), '\n'.join(lines[end + 1:])
+
+
+class TestRenderDigest:
+    def test_includes_heading_for_each_present_signal_class(self):
+        digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
+
+        for heading in (
+            'User Corrections', 'Error Neighborhoods', 'Self-Corrections',
+            'Retry Loops', 'Not Found', 'Guard Trips', 'Interrupts',
+        ):
+            assert f'## {heading}' in digest, f'missing heading: {heading}'
+
+    def test_omits_heading_for_absent_signal_class(self):
+        records = [_with_session_meta(_user_text('just a normal turn, no confusion'))]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        assert '## User Corrections' in digest
+        for heading in (
+            'Error Neighborhoods', 'Self-Corrections', 'Retry Loops',
+            'Not Found', 'Guard Trips', 'Interrupts',
+        ):
+            assert f'## {heading}' not in digest
+
+    def test_frontmatter_fields_derived_from_records(self):
+        digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['session'] == _DIGEST_SESSION_ID
+        assert meta['cwd'] == _DIGEST_CWD
+        assert meta['date'] == '2026-07-11'
+        assert meta['agent_class'] == 'interactive'
+        # No transcript path given -> encoded_dir falls back to the
+        # cwd.replace('/','-').replace('.','-') mirror encoding.
+        assert meta['encoded_dir'] == '-home-leo-src-dark-factory'
+
+    def test_encoded_dir_prefers_transcript_path_parent_dir_name(self, tmp_path):
+        # An arbitrary dir name unrelated to cwd's mirror encoding, so a
+        # match proves the value came from the path, not a recomputation.
+        transcript_path = tmp_path / 'custom-encoded-dir-name' / f'{_DIGEST_SESSION_ID}.jsonl'
+
+        digest = mod.render_digest(
+            _all_signals_records(), agent_class='interactive', path=transcript_path,
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['encoded_dir'] == 'custom-encoded-dir-name'
+
+    def test_size_bytes_equals_actual_rendered_byte_length(self):
+        digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['size_bytes'] == len(digest.encode('utf-8'))
