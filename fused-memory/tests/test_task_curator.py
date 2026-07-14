@@ -5315,3 +5315,47 @@ class TestEvictTask:
 
         mock_client_missing.delete.assert_not_called()
 
+
+# ----------------------------------------------------------------------
+# TaskCurator.prune_orphans() — health-gated reconciliation sweep
+# (curator corpus RC1 — task 2520, Layer C)
+# ----------------------------------------------------------------------
+
+
+class TestPruneOrphans:
+    @pytest.mark.asyncio
+    async def test_prune_deletes_orphans(self):
+        """prune_orphans() deletes corpus points whose task id is absent from
+        the live snapshot, computing orphans via the deterministic point-id
+        scheme rather than payload task_id."""
+        from types import SimpleNamespace
+
+        from qdrant_client.models import PointIdsList
+
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        corpus_task_ids = {'1', '2', '2506', '2519'}
+        records = [
+            SimpleNamespace(id=_expected_point_id('proj', tid))
+            for tid in corpus_task_ids
+        ]
+
+        mock_client = AsyncMock()
+        mock_client.collection_exists = AsyncMock(return_value=True)
+        mock_client.scroll = AsyncMock(return_value=(records, None))
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client):
+            result = await curator.prune_orphans('proj', {'1', '2'})
+
+        mock_client.delete.assert_awaited_once()
+        call_kwargs = mock_client.delete.call_args.kwargs
+        assert call_kwargs.get('collection_name') == 'task_curator_proj'
+        points_selector = call_kwargs.get('points_selector')
+        assert isinstance(points_selector, PointIdsList)
+        assert set(points_selector.points) == {
+            _expected_point_id('proj', '2506'),
+            _expected_point_id('proj', '2519'),
+        }
+        assert result.pruned == 2
+
