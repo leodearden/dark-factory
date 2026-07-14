@@ -499,3 +499,57 @@ class TestCrossModulePreexistingSingleSourced:
             workflow.PREEXISTING_BREAK_SKIP_CATEGORIES
             is verify_categories.PREEXISTING_BREAK_SKIP_CATEGORIES
         )
+
+
+# ---------------------------------------------------------------------------
+# PART 2 (task 2549): two new host-infrastructure FailureCategory members —
+# DISK_FULL (ENOSPC / linker SIGBUS-on-full-disk) and SEMAPHORE_TIMEOUT
+# (flock/semaphore slot-acquisition timeout) — that previously had no
+# category at all and fell through to whichever code-fault category the
+# classifier matched first. Both are env_transient-family policy rows
+# (is_infra_transient=True, archive=False, preexisting_probe=False,
+# retry_kind=NONE — a serial re-run cannot fix a host condition) ranked
+# just below INFRA_TIMEOUT and above every code-fault category.
+#
+# RED today: neither member/row exists yet, so every test below fails on
+# the local ``from orchestrator.verify_categories import FailureCategory``
+# attribute access (``FailureCategory.DISK_FULL`` / ``.SEMAPHORE_TIMEOUT``
+# don't exist) or on the corresponding _worst_category priority check.
+# ---------------------------------------------------------------------------
+
+
+class TestEnvironmentalCategoriesExistWithInfraTransientPolicy:
+    """DISK_FULL / SEMAPHORE_TIMEOUT are new FailureCategory members with an
+    env_transient-family CATEGORY_POLICY row."""
+
+    def test_disk_full_value_and_policy(self):
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, RetryKind
+        assert FailureCategory.DISK_FULL.value == 'disk_full'
+        row = CATEGORY_POLICY[FailureCategory.DISK_FULL]
+        assert row.is_infra_transient is True
+        assert row.archive is False
+        assert row.preexisting_probe is False
+        assert row.retry_kind == RetryKind.NONE
+
+    def test_semaphore_timeout_value_and_policy(self):
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, RetryKind
+        assert FailureCategory.SEMAPHORE_TIMEOUT.value == 'semaphore_timeout'
+        row = CATEGORY_POLICY[FailureCategory.SEMAPHORE_TIMEOUT]
+        assert row.is_infra_transient is True
+        assert row.archive is False
+        assert row.preexisting_probe is False
+        assert row.retry_kind == RetryKind.NONE
+
+
+class TestEnvironmentalCategoriesOutrankCodeFaults:
+    """_worst_category must pick the infra root cause over a co-occurring
+    downstream code-fault category — DISK_FULL/SEMAPHORE_TIMEOUT are ranked
+    just below INFRA_TIMEOUT and above every code-fault category."""
+
+    def test_disk_full_outranks_compile_error(self):
+        from orchestrator.verify import _worst_category
+        assert _worst_category(['disk_full', 'compile_error']) == 'disk_full'
+
+    def test_semaphore_timeout_outranks_test_failure(self):
+        from orchestrator.verify import _worst_category
+        assert _worst_category(['semaphore_timeout', 'test_failure']) == 'semaphore_timeout'
