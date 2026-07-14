@@ -265,3 +265,13 @@ invariants pass" and `skills/review/references/phase2-architecture.md`
 **Result: 10/10 match.** Every seeded violation flags with the correct
 slug under the as-landed G7 and Step 5.5 text — acceptance met, no
 rehearsal miss.
+
+## Reconciliation
+
+Not required. The step-7 rehearsal above found no miss on its first
+walk — all 10 fixtures already flagged with the correct slug against the
+as-landed `skills/prd/references/gates.md` §G7 text and
+`skills/review/references/phase2-architecture.md` Step 5.5 text. No
+wording changes were made to `docs/legibility/design-invariants.md`,
+`skills/prd/references/gates.md`, or
+`skills/review/references/phase2-architecture.md`.
