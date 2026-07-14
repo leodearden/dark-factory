@@ -4,7 +4,7 @@ const { ProjectGroup: PG_T, Segmented: SEG_T } = window.DF_SHELL;
 const { PALETTE: CP_T } = window.DF_CHARTS;
 const DF_T = window.DF_DATA;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
-const { computeTiers, partitionComponents, orderRows } = window.DF_GRAPH_LAYOUT;
+const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusSubset } = window.DF_GRAPH_LAYOUT;
 
 // Persisted-state hook (same shape as elsewhere)
 function tasksPersistedState(key, def) {
@@ -103,7 +103,7 @@ function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhoo
   );
 }
 
-function TaskGraph({ tasks, selectedId, onSelect }) {
+function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus }) {
   const containerRef = uR_T(null);
   const nodeRefs = uR_T({});
 
@@ -119,28 +119,7 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
   }, [tasks]);
 
   // Highlight neighborhood when something is selected
-  const neighborhood = uM_T(() => {
-    if (!selectedId) return null;
-    const set = new Set([selectedId]);
-    const byId = new Map(tasks.map(t => [t.id, t]));
-    // ancestors
-    const stackUp = [selectedId];
-    while (stackUp.length) {
-      const cur = stackUp.pop();
-      const t = byId.get(cur);
-      if (!t) continue;
-      for (const d of (t.deps || [])) if (byId.has(d.id) && !set.has(d.id)) { set.add(d.id); stackUp.push(d.id); }
-    }
-    // descendants
-    const stackDown = [selectedId];
-    while (stackDown.length) {
-      const cur = stackDown.pop();
-      for (const t of tasks) {
-        if ((t.deps || []).some(d => d.id === cur) && !set.has(t.id)) { set.add(t.id); stackDown.push(t.id); }
-      }
-    }
-    return set;
-  }, [selectedId, tasks]);
+  const neighborhood = uM_T(() => computeNeighborhood(tasks, selectedId), [selectedId, tasks]);
 
   // Node card JSX, shared verbatim between component-block tier rows and the
   // singleton strip so TaskGraphEdges (which resolves positions via
@@ -153,7 +132,8 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
       <div key={t.id}
            ref={el => { if (el) nodeRefs.current[t.id] = el; else delete nodeRefs.current[t.id]; }}
            className={`node s-${t.status} ${isSel ? 'selected' : ''} ${inTree ? 'in-tree' : ''} ${dim ? 'dim' : ''}`}
-           onClick={() => onSelect(isSel ? null : t.id)}>
+           onClick={() => onSelect(isSel ? null : t.id)}
+           onDoubleClick={() => onEnterFocus && onEnterFocus(t.id)}>
         <div className="meta">
           <span className="status-pip"></span>
           <span className="id">{window.DF_SHELL.taskId(t.id)}</span>
@@ -361,6 +341,23 @@ function TasksTab({ projectFilter, search }) {
   // Selected task (single, across all projects)
   const [selectedId, setSelectedId] = uS_T(null);
 
+  // Focus mode: ephemeral (NOT persisted) — filters the graph down to the
+  // selected task's ancestors+descendants. Never survives a reload.
+  const [focusMode, setFocusMode] = uS_T(false);
+  function enterFocus(id) { setSelectedId(id); setFocusMode(true); }
+  function exitFocus() { setFocusMode(false); }
+
+  // Deselecting (via the graph, "clear", or otherwise) always drops focus —
+  // there's no such thing as a focused-but-unselected state.
+  uE_T(() => { if (selectedId == null) setFocusMode(false); }, [selectedId]);
+
+  // Esc exits focus mode from anywhere on the page.
+  uE_T(() => {
+    function onKeyDown(e) { if (e.key === 'Escape') exitFocus(); }
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, []);
+
   // Filter, default {active, pending} on
   const [filters, setFilters] = tasksPersistedState('df.tasksFilters',
     { active: true, pending: true, complete: false, deferred: false, cancelled: false });
@@ -422,8 +419,11 @@ function TasksTab({ projectFilter, search }) {
           <button className={filters.deferred  ? 'on' : ''} onClick={() => flipFilter('deferred')}>deferred</button>
           <button className={filters.cancelled ? 'on' : ''} onClick={() => flipFilter('cancelled')}>cancelled</button>
         </div>
-        <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
-          click a task to inspect →
+        <span className={focusMode && selectedId ? 'focus-chip' : ''}
+              style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
+          {focusMode && selectedId
+            ? `focused on ${window.DF_SHELL.taskId(selectedId)} — Esc to exit`
+            : 'click a task to inspect →'}
         </span>
       </div>
 
@@ -455,9 +455,10 @@ function TasksTab({ projectFilter, search }) {
               </>
             );
 
+            const graphTasks = focusMode ? focusSubset(filtered, selectedId) : filtered;
             return (
               <PG_T key={p.id} id={p.id} label={p.id} open={isOpen} onToggle={() => toggle(p.id)} summary={summary}>
-                <TaskGraph tasks={filtered} selectedId={selectedId} onSelect={setSelectedId} />
+                <TaskGraph tasks={graphTasks} selectedId={selectedId} onSelect={setSelectedId} onEnterFocus={enterFocus} />
               </PG_T>
             );
           })}
@@ -467,10 +468,17 @@ function TasksTab({ projectFilter, search }) {
           <div className="panel-head">
             <span className="title">Task detail</span>
             {selectedTask && (
-              <button onClick={() => setSelectedId(null)}
-                      style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--fg-3)', fontFamily: 'var(--mono)', padding: '2px 6px', borderRadius: 3, border: '1px solid var(--line)', background: 'transparent', cursor: 'pointer' }}>
-                clear
-              </button>
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+                {!focusMode && (
+                  <button className="focus-btn" onClick={() => enterFocus(selectedId)}>
+                    focus
+                  </button>
+                )}
+                <button onClick={() => { setSelectedId(null); setFocusMode(false); }}
+                        style={{ fontSize: 10, color: 'var(--fg-3)', fontFamily: 'var(--mono)', padding: '2px 6px', borderRadius: 3, border: '1px solid var(--line)', background: 'transparent', cursor: 'pointer' }}>
+                  clear
+                </button>
+              </div>
             )}
           </div>
           <TaskDetail task={selectedTask} allTasks={allTasks} />
