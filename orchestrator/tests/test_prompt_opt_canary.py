@@ -24,10 +24,12 @@ from orchestrator.evals.prompt_opt.canary import (
     WindowMetrics,
     compare_windows,
     compute_window_metrics,
+    deploy_at_from_provenance,
     load_window_rows,
     run_canary,
 )
 from orchestrator.run_store import _SCHEMA
+from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore
 
 
 def _explicit_thresholds(**overrides: object) -> CanaryThresholds:
@@ -523,3 +525,36 @@ class TestRunCanary:
         assert verdict.post_n == 5
         assert verdict.verdict == 'pass'
         assert verdict.regressed_metrics == []
+
+
+class TestDeployAtFromProvenance:
+    """The optional T8->T1 seam: deploy_at_from_provenance reads the T1
+    provenance sidecar's `date` read-only (shared.prompt_artifact.
+    PromptArtifactStore.read_provenance), so an operator can run the
+    canary right after pinning without hand-copying the deploy timestamp.
+    """
+
+    def test_returns_provenance_date_for_pinned_key(self, tmp_path: Path) -> None:
+        store = PromptArtifactStore(tmp_path)
+        provenance = ArtifactProvenance(
+            optimizer_model='claude-opus-4', corpus_hash='sha256:deadbeef', split_seed=42,
+            held_out_TEST_score=0.87, accept_delta=0.05, git_sha='abc1234',
+            date='2026-06-15', harness_version='harness-v3',
+        )
+        store.pin(
+            'reviewer', 'claude-opus-4', 'harness-v3',
+            heuristics='fixture heuristics block', provenance=provenance,
+        )
+
+        result = deploy_at_from_provenance(
+            'reviewer', 'claude-opus-4', 'harness-v3', root=tmp_path,
+        )
+
+        assert result == '2026-06-15'
+
+    def test_returns_none_for_unpinned_key(self, tmp_path: Path) -> None:
+        result = deploy_at_from_provenance(
+            'reviewer', 'claude-opus-4', 'harness-v3', root=tmp_path,
+        )
+
+        assert result is None
