@@ -3776,12 +3776,17 @@ class TaskInterceptor:
             # evict each removed task's vector from the curator corpus so it
             # never lingers as a stale duplicate-detection neighbour.
             # Best-effort, and still inside the curator lock so the next
-            # curator waiter sees row-gone AND vector-gone together.
-            removed = result.get('removed_ids') or ids
-            curator = await self._get_curator()
-            if curator is not None:
-                for tid in removed:
-                    await curator.evict_task(project_id, str(tid))
+            # curator waiter sees row-gone AND vector-gone together. Wrapped
+            # defense-in-depth beyond evict_task's own swallow — an eviction
+            # error must never fail the removal itself.
+            try:
+                removed = result.get('removed_ids') or ids
+                curator = await self._get_curator()
+                if curator is not None:
+                    for tid in removed:
+                        await curator.evict_task(project_id, str(tid))
+            except Exception:
+                logger.warning('remove_tasks: curator eviction failed', exc_info=True)
         # One task_deleted event per requested id — clearer reconciliation
         # signal than a single batched event, and matches the existing
         # per-id semantics elsewhere in the journal.
