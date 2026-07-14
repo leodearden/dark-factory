@@ -375,16 +375,26 @@ async def _recon_inspect_unit(unit: str) -> dict:
     return await inspect_systemd_unit(unit, timeout_secs=_INSPECT_TIMEOUT_SECS)
 
 
-def _is_stranded_deterministic_shape(metadata: dict | None) -> bool:
-    """Return True iff *metadata* matches the task-2059 stranded-deterministic shape.
+def _deterministic_deploy_stranded(metadata: dict | None) -> bool:
+    """Return True iff *metadata* represents a stranded deterministic deploy.
+
+    ζ/task 2240 (DS-4): replaces the deleted 4-stamp combinatorial
+    ``_is_stranded_deterministic_shape`` predicate — because ζ writes
+    ``deploy_state.phase`` atomically with every stamp, the old
+    stamp-combination archaeology collapses to a single enum compare.
 
     Metadata-only predicate (the empty-pending-escalation-queue check is I/O
     and is performed by the caller).  True iff ALL of:
       - ``task_kind == 'deterministic'``
       - ``before_done`` is a dict with a truthy ``target_unit``
-      - ``before_done_ran_at`` is truthy (the deploy action ran)
-      - ``before_done_verified_at``, ``gate_escalated_at``, and
-        ``done_provenance`` are ALL falsy (no terminal outcome was ever recorded)
+      - AND either:
+          - ``deploy_state`` is present and its ``phase`` is
+            ``DeployPhase.RAN`` (the deploy ran but reached no terminal
+            phase), or
+          - ``deploy_state`` is ABSENT and ``before_done_ran_at`` is truthy
+            — a bounded, documented migration shim for a deploy that began
+            before ζ activated (no deploy_state was ever written), so it
+            isn't silently un-stranded the moment ζ ships.
 
     None/non-dict *metadata* and a non-dict ``before_done`` are treated as
     non-matching rather than raising.
@@ -396,13 +406,10 @@ def _is_stranded_deterministic_shape(metadata: dict | None) -> bool:
     before_done = metadata.get('before_done')
     if not isinstance(before_done, dict) or not before_done.get('target_unit'):
         return False
-    if not metadata.get('before_done_ran_at'):
-        return False
-    return not (
-        metadata.get('before_done_verified_at')
-        or metadata.get('gate_escalated_at')
-        or metadata.get('done_provenance')
-    )
+    if 'deploy_state' in metadata:
+        state = DeployState.from_metadata(metadata)
+        return state is not None and state.phase == DeployPhase.RAN
+    return bool(metadata.get('before_done_ran_at'))
 
 
 def _acquire_project_lock(project_root: Path) -> IO:
@@ -8626,7 +8633,7 @@ Output JSON matching the schema. Every task must appear in the output.
             or esc.agent_role not in _DETERMINISTIC_ESCALATION_SENTINEL_ROLES
         ):
             return
-        if not _is_stranded_deterministic_shape(metadata):
+        if not _deterministic_deploy_stranded(metadata):
             return
 
         verdict = await self._revalidate_deterministic_deploy_health(metadata)
@@ -8784,7 +8791,7 @@ Output JSON matching the schema. Every task must appear in the output.
             if task.get('status') != 'blocked':
                 continue
             metadata = task.get('metadata') or {}
-            if not _is_stranded_deterministic_shape(metadata):
+            if not _deterministic_deploy_stranded(metadata):
                 continue
             try:
                 if self._escalation_queue.get_by_task(tid, status='pending'):
