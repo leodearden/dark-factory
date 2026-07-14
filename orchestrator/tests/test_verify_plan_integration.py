@@ -1007,6 +1007,16 @@ class TestEphemeralWorktreeNoPrune:
     def test_verify_failure_is_preexisting_on_main_routes_through_cm_no_prune(
         self, tmp_path, config, git_ops,
     ):
+        # Clear the process-wide TTL probe cache first. verify_failure_is_
+        # preexisting_on_main short-circuits ephemeral_worktree entirely on a
+        # cache hit keyed by (main_sha, category, normalised cause_hint); the
+        # category/cause_hint below are unique to THIS test to dodge
+        # collisions with other tests, but a same-process rerun of this exact
+        # test (pytest-repeat, a rerun-on-failure plugin, etc.) would replay
+        # the identical key within the 300s TTL and fail
+        # `spied_cm.call_count >= 1` spuriously without this reset.
+        verify._PROBE_CACHE.clear()
+
         git_ops.get_main_sha = AsyncMock(return_value=_MAIN_TIP_SHA)
         git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
         worktree = tmp_path / 'task-wt'
