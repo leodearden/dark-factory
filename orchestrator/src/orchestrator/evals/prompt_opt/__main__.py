@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -175,6 +176,16 @@ def canary(
         deploy_at = resolved
         click.echo(f'Resolved --deploy-at={deploy_at} from T1 provenance.')
 
+    try:
+        datetime.fromisoformat(deploy_at)
+    except ValueError:
+        click.echo(
+            f'Invalid --deploy-at value: {deploy_at!r} -- must be an ISO-8601 datetime '
+            '(e.g. 2026-07-01T00:00:00+00:00) parseable by datetime.fromisoformat.',
+            err=True,
+        )
+        sys.exit(_USAGE_ERROR_EXIT_CODE)
+
     if not runs_db.is_file():
         click.echo(
             f'runs.db not found at {runs_db}\n'
@@ -209,6 +220,20 @@ def canary(
 
     click.echo()
     click.echo(f'Baseline window: {verdict.baseline_n} rows   Post window: {verdict.post_n} rows')
+    zero_done_windows = [
+        label for label, n_done in (
+            ('baseline', verdict.baseline_n_done), ('post', verdict.post_n_done),
+        )
+        if n_done == 0
+    ]
+    if zero_done_windows:
+        click.echo(click.style(
+            f'  NOTE: {" and ".join(zero_done_windows)} window has ZERO done rows -- '
+            'cost_per_done_task/mean_review_cycles/mean_verify_attempts carry no signal '
+            'there (incomparable / 0.0 fallback); only requeue_rate reflects real deploy '
+            'behavior for that window. A verdict computed this way understates risk.',
+            fg='yellow',
+        ))
     click.echo()
     for comparison in verdict.comparisons:
         _print_metric(comparison)
