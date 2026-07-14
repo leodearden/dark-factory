@@ -15,7 +15,7 @@ from typing import cast
 
 from orchestrator import session_registry as sr
 
-from cockpit.panes.decision_queue import _QueueRowLike
+from cockpit.panes.decision_queue import QueueItem, _QueueRowLike
 
 _NOW = datetime(2026, 7, 11, tzinfo=UTC)
 
@@ -39,6 +39,28 @@ def _make_row_item(**overrides) -> _QueueRowLike:
     }
     fields.update(overrides)
     return cast(_QueueRowLike, SimpleNamespace(**fields))
+
+
+def _make_queue_item(**overrides) -> QueueItem:
+    """A real QueueItem, built for format_copy_payload's tests (task 2517) --
+    unlike _make_row_item's duck-typed stand-in, format_copy_payload reads
+    QueueItem-only fields (key/kind/decision_id/escalation_id), so a real
+    instance is required."""
+    fields: dict = {
+        'key': 'decision:dec-1',
+        'kind': 'decision',
+        'decision_id': 'dec-1',
+        'project': 'df',
+        'task_id': '2085',
+        'question': 'Which port?',
+        'filed_at': datetime(2026, 7, 1, tzinfo=UTC),
+        'score': 1.0,
+        'target': None,
+        'handling': False,
+        'escalation_id': 'esc-1',
+    }
+    fields.update(overrides)
+    return QueueItem(**fields)
 
 
 def _make_decision(**overrides):
@@ -257,6 +279,60 @@ class TestFormatQueueRow:
         _, _, _, question_col = format_queue_row(item, now)
 
         assert question_col != ''
+
+
+class TestFormatCopyPayload:
+    """format_copy_payload(item) -- the copy affordance's clipboard text
+    (task 2517). A pure QueueItem -> str transform, mirroring
+    format_queue_row's own pure-formatter contract."""
+
+    def test_decision_item_payload_contains_core_fields(self):
+        from cockpit.panes.decision_queue import format_copy_payload
+
+        item = _make_queue_item(
+            key='decision:dec-1',
+            kind='decision',
+            decision_id='dec-1',
+            project='df',
+            task_id='2085',
+            question='Which port?',
+            escalation_id='esc-9',
+        )
+
+        payload = format_copy_payload(item)
+
+        assert 'Which port?' in payload
+        assert '2085' in payload
+        assert 'esc-9' in payload
+        assert 'df' in payload
+        assert 'dec-1' in payload
+
+    def test_session_item_payload_contains_question_and_slug(self):
+        from cockpit.panes.decision_queue import format_copy_payload
+
+        item = _make_queue_item(
+            key='session:my-slug',
+            kind='session',
+            decision_id=None,
+            question='Which host?',
+        )
+
+        payload = format_copy_payload(item)
+
+        assert 'Which host?' in payload
+        assert 'my-slug' in payload
+
+    def test_none_ids_render_placeholder_not_literal_none(self):
+        """Fail-soft (PRD §2): task_id=None/escalation_id=None must degrade
+        to a placeholder, never the literal string 'None'."""
+        from cockpit.panes.decision_queue import format_copy_payload
+
+        item = _make_queue_item(task_id=None, escalation_id=None)
+
+        payload = format_copy_payload(item)
+
+        assert 'None' not in payload
+        assert '(none)' in payload
 
 
 class TestOrderQueue:
