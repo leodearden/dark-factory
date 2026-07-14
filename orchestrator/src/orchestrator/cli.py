@@ -372,7 +372,11 @@ def probe_models(config_path: Path | None, models_csv: str | None, output_path: 
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
 
-    models = [m.strip() for m in models_csv.split(',')] if models_csv else None
+    models = (
+        [m.strip() for m in models_csv.split(',') if m.strip()] or None
+        if models_csv
+        else None
+    )
 
     report = asyncio.run(routing.probe_models(
         config.usage_cap.accounts, config.routing.allowed_models, models=models,

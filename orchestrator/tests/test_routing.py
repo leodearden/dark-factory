@@ -228,16 +228,31 @@ class _ScriptedProbeCli:
     result when no override is scripted for that pair -- so a test only
     needs to script the (model, token) combinations it actually cares
     about. Records every call's kwargs, in order, for the call-count /
-    argument assertions below."""
+    argument assertions below.
 
-    def __init__(self, overrides: dict[tuple[str, str], AgentResult] | None = None) -> None:
+    An override may also be an exception (instance or class): the call
+    raises it instead of returning, standing in for a real invoke_fn crash
+    (network error, subprocess crash, etc.) -- see
+    TestProbeModelsInvokeErrorIsolation.
+    """
+
+    def __init__(
+        self,
+        overrides: dict[tuple[str, str], AgentResult | BaseException | type[BaseException]]
+        | None = None,
+    ) -> None:
         self._overrides = overrides or {}
         self.calls: list[dict] = []
 
     async def __call__(self, **kwargs: object) -> AgentResult:
         self.calls.append(kwargs)
         key = cast('tuple[str, str]', (kwargs.get('model'), kwargs.get('oauth_token')))
-        return self._overrides.get(key, AgentResult(success=True, output='ok'))
+        outcome = self._overrides.get(key, AgentResult(success=True, output='ok'))
+        if isinstance(outcome, BaseException) or (
+            isinstance(outcome, type) and issubclass(outcome, BaseException)
+        ):
+            raise outcome
+        return outcome
 
 
 class TestProbeModelsTargetSet:

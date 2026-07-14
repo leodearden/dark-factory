@@ -20,6 +20,7 @@ deferred to inside the functions that need them.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -30,6 +31,8 @@ if TYPE_CHECKING:
 
     from shared.cli_invoke import AgentResult
     from shared.config_models import AccountConfig
+
+logger = logging.getLogger(__name__)
 
 # Claude-backend model aliases admitted by default (task beta). claude-fable-5
 # is deliberately NOT included here — task xi admits it to the runtime
@@ -78,7 +81,10 @@ def classify_probe_outcome(outcome: object) -> str:
     status string: OK->available, ModelNotFound->unavailable,
     AuthFailed->auth_error, CapHit/NearCap->capped, else->error.
 
-    Pure -- reads only *outcome*, performs no I/O.
+    Pure -- reads only *outcome*, performs no I/O. Note this 'error'
+    catch-all is only reachable via a classified Failure *outcome*; a raised
+    exception from *invoke_fn* itself is handled separately by
+    ``probe_models`` as the distinct ``'invoke_error'`` status.
     """
     from shared.invocation_outcome import OK, AuthFailed, CapHit, ModelNotFound, NearCap
 
@@ -120,11 +126,22 @@ async def probe_models(
     ``invoke_claude_agent``) is called once per target model with a cheap
     1-turn invocation, and the result is classified via
     ``classify_invocation`` / ``classify_probe_outcome`` into a status
-    string.
+    string. If *invoke_fn* raises (network error, subprocess crash, or any
+    other exception not surfaced as an ``AgentResult``), that single
+    (account, model) pair is recorded as ``'invoke_error'`` and the probe
+    continues -- a single transient failure must not abort the whole run
+    and discard every status already collected.
 
     *invoke_fn* and *token_resolver* are dependency-injected (mirrors
     ``invoke_with_cap_retry``'s ``invoke_fn=`` seam) so callers can drive
     this network-free in tests.
+
+    Dispatch is intentionally sequential (both across accounts and across
+    models within an account), not concurrent: this is a manually-run
+    diagnostic CLI, not a latency-sensitive path, and sequential dispatch
+    keeps each account's probe traffic from hammering that account's own
+    rate limit. Revisit with a bounded ``asyncio.gather`` if probe latency
+    becomes a real concern.
     """
     from pathlib import Path as _Path
 
@@ -148,15 +165,27 @@ async def probe_models(
 
         statuses: dict[str, str] = {}
         for model in target_models:
-            result = await invoke(
-                prompt=prompt,
-                system_prompt='',
-                cwd=resolved_cwd,
-                model=model,
-                max_turns=max_turns,
-                max_budget_usd=budget_usd,
-                oauth_token=token,
-            )
+            try:
+                result = await invoke(
+                    prompt=prompt,
+                    system_prompt='',
+                    cwd=resolved_cwd,
+                    model=model,
+                    max_turns=max_turns,
+                    max_budget_usd=budget_usd,
+                    oauth_token=token,
+                )
+            except Exception as exc:
+                # A single (account, model) pair crashing (network error,
+                # subprocess crash, etc.) must not abort the whole probe and
+                # discard every status already collected for prior
+                # accounts/models -- record it and keep going.
+                logger.warning(
+                    'probe_models: invoke_fn raised for account=%s model=%s: %s',
+                    account.name, model, exc,
+                )
+                statuses[model] = 'invoke_error'
+                continue
             outcome = classify_invocation(result, strict_confirm=False, backend='claude')
             statuses[model] = classify_probe_outcome(outcome)
         report_accounts[account.name] = statuses
