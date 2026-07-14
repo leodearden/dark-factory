@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 
 import yaml
 
@@ -46,6 +47,31 @@ class CoderParseError(Exception):
     LLM's raw output into a usable structure. Never silently defaulted —
     callers must treat this as a hard per-digest failure (never-fabricate
     contract)."""
+
+
+class CoderInvocationError(Exception):
+    """Raised when the ``claude -p --model`` subprocess invocation fails —
+    non-zero exit or a timeout. Carries a stderr tail for diagnosis. Never
+    silently swallowed: code_digest turns this into a per-digest failure,
+    never a fabricated record."""
+
+
+@dataclass
+class CodingResult:
+    """Outcome of coding one digest.
+
+    ``ok=True`` means ``record`` is a schema-valid §7.3 coding record —
+    including a legitimately empty one (``matches=[]``, ``candidates=[]``
+    is a genuine finding, not a failure). ``ok=False`` means ``record`` is
+    None and ``reason`` explains why: a CLI invocation error, unparseable
+    LLM output, or a schema-invalid assembled record are never partially
+    applied and never fabricated into a record.
+    """
+
+    ok: bool
+    record: dict | None
+    reason: str | None = None
+    session: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -216,3 +242,69 @@ def parse_coder_output(raw: str) -> dict:
     raise CoderParseError(
         f"could not parse a JSON object from coder output: {raw[:200]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# code_digest — one digest -> one CodingResult
+# ---------------------------------------------------------------------------
+
+def code_digest(
+    digest_text: str,
+    codebook: dict,
+    *,
+    project: str,
+    model: str = "haiku",
+    invoke=None,
+) -> CodingResult:
+    """Code one digest against one codebook.
+
+    Flow: parse the digest's frontmatter -> build the compact codebook
+    index -> build the prompt -> invoke the LLM (*invoke* override, or the
+    real ``_invoke_cli`` by default) -> parse its strict-JSON judgment ->
+    assemble a §7.3 coding record with a DETERMINISTIC header
+    (session/date/agent_class from the digest's own frontmatter; project
+    from *project* — the LLM never supplies the header) -> schema-gate it
+    via codebook.validate_coding_record.
+
+    Never-fabricate contract: an invocation error, unparseable LLM output,
+    or a schema-invalid assembled record comes back as ``ok=False`` with
+    ``record=None`` and ``reason`` set — never partially applied, never
+    fabricated. A legitimately empty judgment
+    (``{"matches": [], "candidates": []}``) that passes schema validation
+    is a genuine ``ok=True`` success: "coded fine, found nothing" is never
+    conflated with "coding failed" (codebook lesson
+    one-shot-subagent-contract).
+    """
+    meta = parse_frontmatter(digest_text)
+    session = meta.get("session")
+
+    index = build_codebook_index(codebook)
+    prompt = build_prompt(digest_text, index)
+    invoke_fn = invoke or _invoke_cli
+
+    try:
+        raw = invoke_fn(prompt, model)
+    except CoderInvocationError as exc:
+        return CodingResult(ok=False, record=None, reason=str(exc), session=session)
+
+    try:
+        judgment = parse_coder_output(raw)
+    except CoderParseError as exc:
+        return CodingResult(ok=False, record=None, reason=str(exc), session=session)
+
+    record = {
+        "session": session,
+        "date": meta.get("date"),
+        "project": project,
+        "agent_class": meta.get("agent_class"),
+        "matches": judgment.get("matches") or [],
+        "candidates": judgment.get("candidates") or [],
+    }
+
+    errors = codebook_mod.validate_coding_record(record)
+    if errors:
+        return CodingResult(
+            ok=False, record=None, reason="; ".join(errors), session=session,
+        )
+
+    return CodingResult(ok=True, record=record, session=session)
