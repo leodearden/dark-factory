@@ -500,3 +500,73 @@ def test_code_digests_exactly_half_failure_is_not_a_storm():
     assert len(result.failures) == 2
     failure_sessions = {session for session, _reason in result.failures}
     assert failure_sessions == fail_sessions
+
+
+# ---------------------------------------------------------------------------
+# step-15: RED — _invoke_cli() via the fake-`claude`-binary-on-PATH idiom
+# (per tests/scripts/test_spawn_claude.py's _write_fake_claude* idiom)
+# ---------------------------------------------------------------------------
+
+def _write_fake_claude_capturing(bin_dir, *, argv_file, stdin_file, stdout_path):
+    """Fake `claude` binary: records its own argv (one per line, via "$@",
+    which excludes $0/the binary path itself) and its stdin to files, then
+    echoes the contents of *stdout_path* to stdout and exits 0."""
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$@" > "{argv_file}"\n'
+        f'cat > "{stdin_file}"\n'
+        f'cat "{stdout_path}"\n'
+    )
+    p.chmod(0o755)
+
+
+def _write_fake_claude_failing(bin_dir, *, exit_code=1, stderr_text="simulated failure"):
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "{stderr_text}" >&2\n'
+        f"exit {exit_code}\n"
+    )
+    p.chmod(0o755)
+
+
+def test_invoke_cli_argv_and_prompt_delivery(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_file = tmp_path / "argv.txt"
+    stdin_file = tmp_path / "stdin.txt"
+    stdout_path = tmp_path / "stdout.txt"
+    stdout_path.write_text('{"matches": [], "candidates": []}')
+
+    _write_fake_claude_capturing(
+        bin_dir, argv_file=argv_file, stdin_file=stdin_file, stdout_path=stdout_path,
+    )
+
+    raw = mod._invoke_cli(
+        "the prompt text UNIQUE_MARKER_UC999", "haiku",
+        claude_bin=str(bin_dir / "claude"), timeout=10,
+    )
+
+    argv = argv_file.read_text().splitlines()
+    assert "-p" in argv, argv
+    assert "--model" in argv, argv
+    assert "haiku" in argv, argv
+
+    # Prompt delivery: stdin, per code_digest's `input=prompt` contract --
+    # not necessarily present in argv.
+    assert "the prompt text UNIQUE_MARKER_UC999" in stdin_file.read_text()
+
+    assert raw == '{"matches": [], "candidates": []}'
+
+
+def test_invoke_cli_nonzero_exit_raises_invocation_error(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing(bin_dir, exit_code=1, stderr_text="boom, the model backend is down")
+
+    with pytest.raises(mod.CoderInvocationError):
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10,
+        )
