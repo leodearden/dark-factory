@@ -198,4 +198,45 @@ def maybe_suppress_escalation(esc):
 
 ## INV-5 `no-lockstep-duplication`
 
+### PRD-leaf-shaped (`INV-5-PRD`)
+
+> Add a retry-backoff schedule to the new webhook-delivery task:
+> hand-copy the existing `BACKOFF_SECONDS = [1, 2, 5, 10, 30]` list from
+> `orchestrator/src/orchestrator/retry.py` into a new
+> `webhooks/src/webhooks/retry.py` instead of importing the shared
+> constant — justified in the row as "a different subsystem, easier to
+> keep separate."
+
+**Expected disposition**: `flag: no-lockstep-duplication`
+
+**Redesign that clears it**: Extract `BACKOFF_SECONDS` into a shared
+module (e.g. `shared/src/shared/retry.py`) and import it from both call
+sites, per the extract-helper house pattern; add a drift/pinning test if
+the two ever need to diverge intentionally.
+
+### Code-snippet-shaped (`INV-5-CODE`)
+
+This fixture is deliberately distinct from the classifier.py/router.py
+category-table example in phase2-architecture.md's own Step 8 sample, so
+it is a genuine calibration rather than an echo of the doc's sample.
+
+File `orchestrator/src/orchestrator/retry.py` (existing, upstream):
+
+```python
+BACKOFF_SECONDS = [1, 2, 5, 10, 30]
+```
+
+File `webhooks/src/webhooks/retry.py` (new, the violation):
+
+```python
+# hand-copied from orchestrator/src/orchestrator/retry.py, kept "in sync" manually
+BACKOFF_SECONDS = [1, 2, 5, 10, 30]
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "no-lockstep-duplication", "file": "webhooks/src/webhooks/retry.py", "line": 2, "issue": "BACKOFF_SECONDS hand-copied from orchestrator/src/orchestrator/retry.py (line 1) — no shared helper or import ties the two lists together, so they must be kept byte-for-byte identical by hand", "severity": "warning"}
+```
+
 ## Rehearsal verdict table
