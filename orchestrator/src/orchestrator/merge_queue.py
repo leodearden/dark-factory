@@ -10678,6 +10678,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 dry_run_handles=self._dry_run_handles,
                 main_health_probe_handles=_MainHealthProbeHandles(
                     background_tasks=self._background_tasks,
+                    auto_heal=self._auto_heal_main_health_deferred,
                 ),
                 depth=depth,
                 speculative=item.speculative,
