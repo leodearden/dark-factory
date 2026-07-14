@@ -27,15 +27,22 @@ from orchestrator.workflow_types import CancellationScope, WorkflowCancelled
 def _make_recording_on_terminal(
     log: list[tuple[str, str | None]],
     names: tuple[str, ...] = ('a', 'b', 'c'),
+    delay: float = 0.0,
 ) -> list[tuple[str, Callable[[str | None], Awaitable[None]]]]:
     """Build an ordered on_terminal list that appends ``(name, kind)`` to
     *log* for each entry it runs, in the order the scope invokes them —
     the "recording on_terminal list" the plan's soft/hard-cancel tests use
     to pin ordering + kind propagation without a real ``TaskWorkflow``.
+
+    *delay*, when non-zero, makes each entry ``await asyncio.sleep(delay)``
+    before recording — giving a robustness test a real window in which to
+    fire a second cancel() while cleanup is genuinely in flight.
     """
     entries: list[tuple[str, Callable[[str | None], Awaitable[None]]]] = []
     for name in names:
         async def _fn(kind: str | None, _name: str = name) -> None:
+            if delay:
+                await asyncio.sleep(delay)
             log.append((_name, kind))
         entries.append((name, _fn))
     return entries
@@ -157,3 +164,100 @@ class TestCancellationScopeSoftCancel:
         assert result is sentinel
         assert [name for name, _kind in log] == ['a', 'b', 'c']
         assert all(kind is None for _name, kind in log)
+
+
+# ---------------------------------------------------------------------------
+# step-05: CancellationScope.supervise — hard-cancel + robustness
+# ---------------------------------------------------------------------------
+
+
+class TestCancellationScopeHardCancel:
+    """No real ``TaskWorkflow`` involved — pure asyncio.Task cancellation +
+    recording on_terminal list, per the plan's step-05 spec.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hard_cancel_of_outer_task_raises_workflow_cancelled_hard(self):
+        log: list[tuple[str, str | None]] = []
+        on_terminal = _make_recording_on_terminal(log)
+        event = asyncio.Event()  # never set — only the outer task is cancelled
+        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+
+        async def _body() -> None:
+            await asyncio.sleep(3600)
+
+        async def _runner() -> None:
+            await scope.supervise(_body())
+
+        outer = asyncio.create_task(_runner())
+        await asyncio.sleep(0)  # let supervise() reach its first real await
+        outer.cancel()
+        # asyncio.wait (unlike a bare `await outer`) never itself raises,
+        # even if outer ends up CANCELLED — lets us inspect the outcome.
+        await asyncio.wait({outer}, timeout=5.0)
+
+        assert outer.done()
+        assert not outer.cancelled(), (
+            'CancelledError escaped supervise() instead of being translated '
+            "to WorkflowCancelled(kind='hard')"
+        )
+        exc = outer.exception()
+        assert isinstance(exc, WorkflowCancelled), f'expected WorkflowCancelled, got {exc!r}'
+        assert exc.kind == 'hard'
+        assert [name for name, _kind in log] == ['a', 'b', 'c']
+        assert all(kind == 'hard' for _name, kind in log)
+
+    @pytest.mark.asyncio
+    async def test_body_raising_cancellederror_itself_is_treated_as_hard(self):
+        # A spontaneous CancelledError raised BY the body (a shutdown-race
+        # teardown) — not the outer task being cancelled — must also be
+        # typed 'hard', matching the old exc_info sniff's behaviour of
+        # catching ANY CancelledError propagating through the finally.
+        log: list[tuple[str, str | None]] = []
+        on_terminal = _make_recording_on_terminal(log)
+        event = asyncio.Event()
+        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+
+        async def _body() -> None:
+            await asyncio.sleep(0)
+            raise asyncio.CancelledError()
+
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await scope.supervise(_body())
+
+        assert excinfo.value.kind == 'hard'
+        assert [name for name, _kind in log] == ['a', 'b', 'c']
+        assert all(kind == 'hard' for _name, kind in log)
+
+    @pytest.mark.asyncio
+    async def test_repeated_cancel_during_on_terminal_does_not_truncate_cleanup(self):
+        # Mimics harness.hard_cancel_workflow's poll loop, which can call
+        # task.cancel() more than once on the same slot task.
+        log: list[tuple[str, str | None]] = []
+        on_terminal = _make_recording_on_terminal(log, delay=0.05)
+        event = asyncio.Event()
+        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+
+        async def _body() -> None:
+            await asyncio.sleep(3600)
+
+        async def _runner() -> None:
+            await scope.supervise(_body())
+
+        outer = asyncio.create_task(_runner())
+        await asyncio.sleep(0)
+        outer.cancel()  # 1st cancel: enters hard-cancel, starts on_terminal cleanup
+        await asyncio.sleep(0.02)  # land mid-sleep inside the first on_terminal entry
+        outer.cancel()  # 2nd cancel: must not truncate the still-running cleanup
+
+        await asyncio.wait({outer}, timeout=5.0)
+
+        assert outer.done()
+        assert not outer.cancelled(), (
+            'CancelledError escaped despite repeated cancel() during on_terminal cleanup'
+        )
+        exc = outer.exception()
+        assert isinstance(exc, WorkflowCancelled), f'expected WorkflowCancelled, got {exc!r}'
+        assert exc.kind == 'hard'
+        assert [name for name, _kind in log] == ['a', 'b', 'c'], f'cleanup truncated: {log!r}'
+        assert all(kind == 'hard' for _name, kind in log)
