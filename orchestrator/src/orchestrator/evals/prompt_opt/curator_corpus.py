@@ -155,22 +155,45 @@ def recover_recorded_action(
     return (action, target_fingerprint, target_id)
 
 
-def read_curator_decisions(db_path: Path) -> list[RecordedDecision]:
+def read_curator_decisions(
+    db_path: Path,
+    *,
+    project_id: str | None = None,
+) -> list[RecordedDecision]:
     """Read every recoverable curator decision from *db_path* (read-only).
 
-    Opens the tickets.db directly via stdlib ``sqlite3`` (no writes, no
-    ``fused_memory`` import) and skips rows :func:`recover_recorded_action`
-    deems un-actionable. A row whose ``candidate_json`` fails to parse as a
-    dict degrades to an empty candidate ``{}`` rather than dropping the
-    row entirely -- the recovered action is still a meaningful signal even
-    when the candidate payload itself is malformed.
+    Opens the tickets.db in true read-only mode (SQLite URI ``mode=ro``) via
+    stdlib ``sqlite3`` (no writes, no ``fused_memory`` import) and skips rows
+    :func:`recover_recorded_action` deems un-actionable. A row whose
+    ``candidate_json`` fails to parse as a dict degrades to an empty
+    candidate ``{}`` rather than dropping the row entirely -- the recovered
+    action is still a meaningful signal even when the candidate payload
+    itself is malformed.
+
+    ``mode=ro`` enforces read-only-ness at the driver level (rather than
+    merely by convention of issuing no writes), which matters because
+    *db_path* may be the live, gitignored ``data/reconciliation/tickets.db``
+    that the running curator middleware has open in WAL mode: a plain
+    read-write connection could still touch ``-wal``/``-shm`` sidecar files
+    and take a lock. ``mode=ro`` also fails fast with a clear
+    ``sqlite3.OperationalError`` if *db_path* doesn't exist, instead of
+    silently creating an empty database.
+
+    *project_id*, when given, scopes the read to a single project's tickets
+    (``WHERE project_id = ?``). tickets.db is single-project (``dark_factory``)
+    in practice today -- the table nonetheless carries a ``project_id``
+    column, so this keeps the corpus from silently mixing rows across
+    projects should the store ever become multi-project.
     """
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute(
-            'SELECT ticket_id, candidate_json, status, task_id, result_json FROM tickets'
-        ).fetchall()
+        query = 'SELECT ticket_id, candidate_json, status, task_id, result_json FROM tickets'
+        params: tuple[str, ...] = ()
+        if project_id is not None:
+            query += ' WHERE project_id = ?'
+            params = (project_id,)
+        rows = conn.execute(query, params).fetchall()
     finally:
         conn.close()
 
