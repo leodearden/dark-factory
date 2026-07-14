@@ -58,14 +58,21 @@ indexed ``(project_id, record_kind, state)`` ledger query, no Mem0 search
 — and drops flags matched by an active ``stage1_flag_suppression`` row. A
 row with ``flag_type == ''`` is a WILDCARD (blanket-suppresses every
 flag_type for its task_id); a row with a non-empty ``flag_type`` is
-SCOPED to just that pair.  When both a wildcard and a scoped row exist for
-the same task_id, the wildcard wins (union semantics — a blanket
+SCOPED to that pair AND any flag_type FAMILY VARIANT of it (task 2503) —
+see ``canonical_flag_type_family``.  When both a wildcard and a scoped row
+exist for the same task_id, the wildcard wins (union semantics — a blanket
 suppression cannot be narrowed by a more specific record).
 ``write_suppression_record`` upserts these rows: ``flag_types=None``
 writes a single blanket row; a non-empty list writes one scoped row per
 flag_type.  Suppression rows never expire (``expires_at=None``) — they are
-operator-managed and persist until explicitly cleared.  See
-``filter_suppressed`` and ``write_suppression_record`` for full semantics.
+operator-managed and persist until explicitly cleared.  Before upserting,
+``write_suppression_record`` also runs a PRE-WRITE COVERAGE CHECK
+(task 2503): it skips both the ledger upsert(s) and the Mem0 mirror for any
+requested flag_type already covered by an existing wildcard row, or by an
+existing scoped row whose flag_type family matches — the fix for the
+Mem0-mirror-never-upserts companion-record sprawl (mem0 c3a1bdfd on task
+544).  See ``filter_suppressed`` and ``write_suppression_record`` for full
+semantics.
 
 Completion-marker same-cycle self-delete (task-2312)
 -----------------------------------------------------
@@ -124,9 +131,13 @@ Public API
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
 - ``compute_content_fingerprint_signature(flag)`` — cheap, sync, no I/O;
   fallback signature for null-task_id flags lacking ``cited_tasks``.
+- ``canonical_flag_type_family(flag_type)`` — cheap, sync, no I/O;
+  canonicalizes a flag_type into a case/separator/whitespace/word-order
+  -insensitive family key (task 2503), used by ``filter_suppressed`` and
+  ``write_suppression_record``'s pre-write coverage check.
 - ``filter_suppressed(memory_service, project_id, flags)`` — async, one
-  indexed ``recon_ledger`` query; drops suppressed flags before signature
-  dedup.
+  indexed ``recon_ledger`` query; drops suppressed flags (by exact match or
+  flag_type family match, task 2503) before signature dedup.
 - ``dedup_flags(memory_service, project_id, run_id, flags)`` — async, calls
   ``filter_suppressed`` first, then UPSERTs a ``stage1_flag_marker`` ledger
   row per (task_id, flag_type) signature; best-effort (exceptions are
@@ -307,19 +318,27 @@ async def filter_suppressed(
       (below) is never split.
     - A row with ``flag_type == ''`` is a WILDCARD -- it blanket-suppresses
       every flag_type for each of its component task_id(s).
-    - A row with a non-empty ``flag_type`` is SCOPED -- it suppresses only
-      that (component task_id, flag_type) pair.
+    - A row with a non-empty ``flag_type`` is SCOPED -- it suppresses that
+      (component task_id, flag_type) pair AND any FAMILY VARIANT of
+      ``flag_type`` (task 2503): the scoped allowlist stores
+      :func:`canonical_flag_type_family` of each row's ``flag_type`` rather
+      than the raw string, so a case/separator/whitespace/word-order
+      variant (e.g. ``'deliverable_missing'`` for a seeded
+      ``'missing_deliverable'`` row) is also recognized as suppressed.
+      Family matching is a strict superset of exact-string matching -- an
+      exact match still matches, since :func:`canonical_flag_type_family`
+      is a pure function of its input.
     - When both a scoped and a wildcard row (or component) exist for the
       same task_id (in either row order), the wildcard wins -- union
       semantics, since a blanket suppression cannot be narrowed by a more
       specific record.
 
     A flag is dropped iff its ``task_id`` has a wildcard entry, or has a
-    scoped entry whose set contains the flag's (str-coerced) ``flag_type``.
-    A flag with no ``flag_type`` (``None``/absent) can never match a scoped
-    entry -- it is kept unless the task_id entry is a wildcard. The
-    remaining flags are returned unchanged so they can proceed through the
-    signature-dedup loop.
+    scoped entry whose family set contains the flag's (str-coerced,
+    family-canonicalized) ``flag_type``. A flag with no ``flag_type``
+    (``None``/absent) can never match a scoped entry -- it is kept unless
+    the task_id entry is a wildcard. The remaining flags are returned
+    unchanged so they can proceed through the signature-dedup loop.
 
     Rows with ``task_id == ''`` (or which decompose to no components) are
     skipped when building the map (a degenerate/malformed suppression with
@@ -384,7 +403,9 @@ async def filter_suppressed(
             if not isinstance(scoped, set):
                 scoped = set()
                 suppressed[tid_str] = scoped
-            scoped.add(row.flag_type)
+            # Store the flag_type FAMILY key (task 2503), not the raw string, so a
+            # case/separator/word-order variant is recognized as the same finding.
+            scoped.add(canonical_flag_type_family(row.flag_type))
 
     def _keep(f: dict[str, Any]) -> bool:
         flag_tid = f.get('task_id')
@@ -399,7 +420,7 @@ async def filter_suppressed(
         flag_type = f.get('flag_type')
         if flag_type is None:
             return True  # cannot match a scoped allowlist without a flag_type
-        return str(flag_type) not in allowlist
+        return canonical_flag_type_family(str(flag_type)) not in allowlist
 
     return [f for f in flags if _keep(f)]
 
