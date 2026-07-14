@@ -145,6 +145,28 @@ def evaluate(
     else:
         reasons.append("max-interval: no last-census anchor available -> N/A")
 
-    fire = cond_a
+    cond_b = (
+        days_since is not None
+        and days_since >= config.tasks_landed_min_days
+        and tasks_landed is not None
+        and tasks_landed >= config.tasks_landed_threshold
+    )
+    if tasks_landed is None:
+        reasons.append("tasks-landed: delta unavailable (no baseline/fetcher) -> N/A")
+    elif days_since is None or days_since < config.tasks_landed_min_days:
+        reasons.append(
+            "tasks-landed: {} landed but only {:.1f}d elapsed (min {}d) -> N/A".format(
+                tasks_landed, days_since if days_since is not None else 0.0,
+                config.tasks_landed_min_days,
+            )
+        )
+    else:
+        reasons.append(
+            "tasks-landed: {} landed since last census (threshold {}){}".format(
+                tasks_landed, config.tasks_landed_threshold, " -> FIRE" if cond_b else ""
+            )
+        )
+
+    fire = cond_a or cond_b
 
     return Decision(fire=fire, reasons=reasons)
