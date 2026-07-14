@@ -15,7 +15,7 @@ from typing import cast
 
 from orchestrator import session_registry as sr
 
-from cockpit.panes.decision_queue import _QueueRowLike
+from cockpit.panes.decision_queue import QueueItem, _QueueRowLike
 
 _NOW = datetime(2026, 7, 11, tzinfo=UTC)
 
@@ -39,6 +39,28 @@ def _make_row_item(**overrides) -> _QueueRowLike:
     }
     fields.update(overrides)
     return cast(_QueueRowLike, SimpleNamespace(**fields))
+
+
+def _make_queue_item(**overrides) -> QueueItem:
+    """A real QueueItem, built for format_copy_payload's tests (task 2517) --
+    unlike _make_row_item's duck-typed stand-in, format_copy_payload reads
+    QueueItem-only fields (key/kind/decision_id/escalation_id), so a real
+    instance is required."""
+    fields: dict = {
+        'key': 'decision:dec-1',
+        'kind': 'decision',
+        'decision_id': 'dec-1',
+        'project': 'df',
+        'task_id': '2085',
+        'question': 'Which port?',
+        'filed_at': datetime(2026, 7, 1, tzinfo=UTC),
+        'score': 1.0,
+        'target': None,
+        'handling': False,
+        'escalation_id': 'esc-1',
+    }
+    fields.update(overrides)
+    return QueueItem(**fields)
 
 
 def _make_decision(**overrides):
@@ -259,6 +281,90 @@ class TestFormatQueueRow:
         assert question_col != ''
 
 
+class TestFormatCopyPayload:
+    """format_copy_payload(item) -- the copy affordance's clipboard text
+    (task 2517). A pure QueueItem -> str transform, mirroring
+    format_queue_row's own pure-formatter contract."""
+
+    def test_decision_item_payload_contains_core_fields(self):
+        from cockpit.panes.decision_queue import format_copy_payload
+
+        item = _make_queue_item(
+            key='decision:dec-1',
+            kind='decision',
+            decision_id='dec-1',
+            project='df',
+            task_id='2085',
+            question='Which port?',
+            escalation_id='esc-9',
+        )
+
+        payload = format_copy_payload(item)
+
+        assert 'Which port?' in payload
+        assert '2085' in payload
+        assert 'esc-9' in payload
+        assert 'df' in payload
+        assert 'dec-1' in payload
+
+    def test_session_item_payload_contains_question_and_slug(self):
+        from cockpit.panes.decision_queue import format_copy_payload
+
+        item = _make_queue_item(
+            key='session:my-slug',
+            kind='session',
+            decision_id=None,
+            question='Which host?',
+        )
+
+        payload = format_copy_payload(item)
+
+        assert 'Which host?' in payload
+        assert 'my-slug' in payload
+
+    def test_none_ids_render_placeholder_not_literal_none(self):
+        """Fail-soft (PRD §2): task_id=None/escalation_id=None must degrade
+        to a placeholder, never the literal string 'None'."""
+        from cockpit.panes.decision_queue import format_copy_payload
+
+        item = _make_queue_item(task_id=None, escalation_id=None)
+
+        payload = format_copy_payload(item)
+
+        assert 'None' not in payload
+        assert '(none)' in payload
+
+    def test_long_question_is_capped_for_clipboard_safety(self):
+        """Some terminals silently DROP (rather than truncate) an
+        over-long OSC 52 clipboard write, so an unbounded question could
+        otherwise land on the clipboard as nothing at all with no
+        operator-visible feedback (task 2517 amendment: reviewer_comprehensive
+        robustness suggestion)."""
+        from cockpit.panes.decision_queue import _COPY_QUESTION_MAX_CHARS, format_copy_payload
+
+        long_question = 'x' * (_COPY_QUESTION_MAX_CHARS + 500)
+        item = _make_queue_item(question=long_question)
+
+        payload = format_copy_payload(item)
+
+        assert long_question not in payload
+        assert payload.count('x') <= _COPY_QUESTION_MAX_CHARS
+        assert '…' in payload
+
+    def test_short_question_is_unaffected_by_the_clipboard_cap(self):
+        """A realistic short question passes through untouched -- the cap
+        is purely defensive against pathological input, not a general
+        truncation of every question."""
+        from cockpit.panes.decision_queue import format_copy_payload
+
+        item = _make_queue_item(question='Which port do we bind?')
+
+        payload = format_copy_payload(item)
+
+        assert 'question: Which port do we bind?' in payload
+        assert '…' not in payload
+
+
 class TestOrderQueue:
     def test_includes_only_open_decisions_and_awaiting_sessions(self):
         from cockpit.panes.decision_queue import order_queue
@@ -417,6 +523,31 @@ class TestOrderQueue:
         items = order_queue([decision], [], Priorities.default(), _NOW, handling={'decision:dec-1'})
 
         assert items[0].handling is True
+
+    def test_escalation_id_populated_from_backing_record_for_both_kinds(self):
+        """USER-OBSERVABLE SIGNAL (task 2517): the copy affordance needs the
+        escalation id on QueueItem for both a decision row and an
+        awaiting-input session row -- and a record with no escalation_id
+        must degrade to None rather than a missing attribute."""
+        from cockpit.panes.decision_queue import order_queue
+        from cockpit.priority import Priorities
+
+        decision = _make_decision(id='dec-1', state=sr.DecisionState.OPEN, escalation_id='esc-9')
+        no_escalation = _make_decision(
+            id='dec-2', state=sr.DecisionState.OPEN, escalation_id=None
+        )
+        session = _make_session(
+            session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT, escalation_id='esc-7'
+        )
+
+        items = order_queue(
+            [decision, no_escalation], [session], Priorities.default(), _NOW
+        )
+
+        by_key = {item.key: item for item in items}
+        assert by_key['decision:dec-1'].escalation_id == 'esc-9'
+        assert by_key['session:awaiting-1'].escalation_id == 'esc-7'
+        assert by_key['decision:dec-2'].escalation_id is None
 
     def test_fresh_critical_decision_outranks_week_old_content_less_session(self):
         """USER-OBSERVABLE SIGNAL (F7): a freshly-filed critical ask ranks at

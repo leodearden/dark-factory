@@ -176,6 +176,9 @@ class QueueItem:
         (a gone/unlinked session) -- see resolve_target.
     handling: whether this item's key is in the app's in-memory "already
         acted on" set (stamped by order_queue's *handling* param).
+    escalation_id: the backing record's escalation_id, or None -- not
+        rendered by format_queue_row, but consumed by format_copy_payload
+        (the copy affordance, task 2517).
     """
 
     key: str
@@ -188,6 +191,63 @@ class QueueItem:
     score: float
     target: DisplayTarget | None
     handling: bool
+    escalation_id: str | None
+
+
+_ID_PLACEHOLDER = '(none)'
+
+# Some terminals silently DROP an over-long OSC 52 clipboard write rather
+# than truncating it (App.copy_to_clipboard's caller in app.py), so an
+# unbounded question could otherwise land on the clipboard as nothing at
+# all with no operator-visible feedback (task 2517 amendment). Sized
+# generously above any realistic question length and comfortably under the
+# payload limits reported by common terminals.
+_COPY_QUESTION_MAX_CHARS = 4000
+
+
+def _cap_for_clipboard(text: str, limit: int = _COPY_QUESTION_MAX_CHARS) -> str:
+    """Truncate *text* to at most *limit* characters, marking the cut with an ellipsis.
+
+    A no-op for text already at or under *limit* -- the overwhelmingly
+    common case for a real question. Purely defensive: this bounds the
+    clipboard payload size, it does not detect or target any particular
+    terminal's actual OSC 52 limit.
+    """
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + '…'
+
+
+def format_copy_payload(item: QueueItem) -> str:
+    """Render *item* as a labeled multi-line clipboard payload (the copy
+    affordance, task 2517).
+
+    Mirrors detail_pane.render_detail's 'label: value' line style, so the
+    clipboard block matches what the detail pane already shows the
+    operator. Pure, no clock/IO. Fail-soft (PRD §2): a None task_id/
+    escalation_id degrades to a placeholder, never the literal string
+    'None'. The trailing id line is derived from item.kind/item.key --
+    'decision_id: <id>' for a decision, or 'session: <slug>' for a
+    session (slug = item.key after its 'session:' prefix). The question
+    line is defensively capped (_cap_for_clipboard) so a pathologically
+    long question can't silently vanish from the clipboard on a terminal
+    that drops rather than truncates an over-long OSC 52 payload.
+    """
+    if item.kind == 'session':
+        slug = item.key.split(':', 1)[1] if ':' in item.key else item.key
+        id_line = f'session: {slug}'
+    else:
+        id_line = f'decision_id: {item.decision_id}'
+    question = _cap_for_clipboard(item.question or _QUESTION_PLACEHOLDER)
+    return '\n'.join(
+        [
+            f'question: {question}',
+            f'project: {item.project}',
+            f'task_id: {item.task_id or _ID_PLACEHOLDER}',
+            f'escalation_id: {item.escalation_id or _ID_PLACEHOLDER}',
+            id_line,
+        ]
+    )
 
 
 def _to_display_target(display: Display | None) -> DisplayTarget | None:
@@ -305,6 +365,7 @@ def order_queue(
                 score=score(scoring_item, priorities, now),
                 target=resolve_target(decision, sessions_by_slug),
                 handling=key in handling_set,
+                escalation_id=decision.escalation_id,
             )
         )
 
@@ -330,6 +391,7 @@ def order_queue(
                 score=score(scoring_item, priorities, now),
                 target=resolve_target(session, sessions_by_slug),
                 handling=key in handling_set,
+                escalation_id=session.escalation_id,
             )
         )
 

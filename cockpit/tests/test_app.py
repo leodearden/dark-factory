@@ -228,6 +228,17 @@ class TestPollRefresh:
         (set_interval actually calling refresh_registry) is covered
         separately by TestTimerIntegration below -- the one test in this
         module allowed to depend on real timing.
+
+        A large poll_interval keeps on_mount's own set_interval timer from
+        firing an uncontrolled background poll during this test (mirrors the
+        idiom in TestNonBlockingPoll/TestThreadedScanReachesUI/
+        TestScanBackpressure below) -- _apply_scan has no protection against
+        a stale threaded scan (one that read the registry before the
+        blocked-1 write below) landing via call_from_thread AFTER this
+        test's own direct refresh_registry() call and clobbering its
+        fresher result back down to 1 row. Confirmed by direct repro: with a
+        short real interval, an in-flight poll tick can race this exact
+        write+refresh_registry() sequence under a loaded runner.
         """
         from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
@@ -235,7 +246,7 @@ class TestPollRefresh:
         running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
         sr.write_record(running, root=tmp_path)
 
-        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
         async with app.run_test() as pilot:
             await pilot.pause()
             table = app.query_one(SessionTable)
@@ -256,7 +267,11 @@ class TestPollRefresh:
         """An existing record's status change on disk is picked up by refresh_registry.
 
         Same rationale as above: calls refresh_registry() directly instead of
-        racing the real poll_interval timer via pilot.pause(<duration>).
+        racing the real poll_interval timer via pilot.pause(<duration>). Same
+        large poll_interval as the test above too, for the same reason: it
+        keeps a real background poll tick from ever landing (via
+        call_from_thread) in between this test's own write and its direct
+        refresh_registry() call.
         """
         from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable, state_glyph
@@ -264,7 +279,7 @@ class TestPollRefresh:
         running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
         sr.write_record(running, root=tmp_path)
 
-        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
         async with app.run_test() as pilot:
             await pilot.pause()
             table = app.query_one(SessionTable)
@@ -904,6 +919,131 @@ class TestDropRemovesAndPersists:
             # proving no registry write was attempted for a session row.
             reread = sr.read_record('awaiting-1', root=tmp_path)
             assert reread.status == sr.Status.AWAITING_INPUT
+
+
+class TestCopyAction:
+    @pytest.mark.timeout(10)
+    async def test_copy_highlighted_decision_puts_question_and_ids_on_clipboard(self, tmp_path):
+        """'y' (the copy affordance, task 2517 / esc-2303-1 F4) copies the
+        highlighted DecisionQueue row's question text + ids onto the system
+        clipboard via Textual's in-app OSC 52 App.copy_to_clipboard --
+        terminal-native, no xclip/wl-copy subprocess -- and is strictly
+        READ-ONLY, never touching sessions/ or decisions/ (mirrors
+        TestWriteDiscipline's before/after _snapshot_tree diff).
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        decision = sr.DecisionRecord(
+            id='dec-1',
+            project='df',
+            text='Which port do we bind?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            task_id='2517',
+            escalation_id='esc-42',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        awaiting = _make_record(
+            session_slug='awaiting-1',
+            status=sr.Status.AWAITING_INPUT,
+            question=sr.Question(text='Which host?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 2
+
+            queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
+            await pilot.pause()
+
+            before = _snapshot_tree(tmp_path)
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            # (a) the row's question + ids landed on the clipboard.
+            assert app._clipboard
+            assert 'Which port do we bind?' in app._clipboard
+            assert 'esc-42' in app._clipboard
+            assert '2517' in app._clipboard
+
+            # (b) strictly read-only -- no sessions/ or decisions/ write.
+            after = _snapshot_tree(tmp_path)
+            assert after == before
+
+    @pytest.mark.timeout(10)
+    async def test_copy_highlighted_session_puts_slug_and_question_on_clipboard(self, tmp_path):
+        """'y' on a SESSION-backed row (no decision behind it) copies the
+        session slug + question text onto the clipboard. Covers the
+        app-level action_copy -> highlighted SESSION row -> clipboard path
+        end-to-end -- the decision-row case above and format_copy_payload's
+        own pure-formatter unit tests don't exercise this branch through
+        action_copy itself (reviewer_comprehensive test_coverage
+        suggestion, test_app.py:911).
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        awaiting = _make_record(
+            session_slug='awaiting-99',
+            status=sr.Status.AWAITING_INPUT,
+            question=sr.Question(text='Which region?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            queue.move_cursor(row=queue.get_row_index('session:awaiting-99'))
+            await pilot.pause()
+
+            before = _snapshot_tree(tmp_path)
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            # (a) the session row's question + slug landed on the clipboard.
+            assert app._clipboard
+            assert 'Which region?' in app._clipboard
+            assert 'awaiting-99' in app._clipboard
+
+            # (b) strictly read-only -- a session is never cockpit-written.
+            after = _snapshot_tree(tmp_path)
+            assert after == before
+
+    @pytest.mark.timeout(10)
+    async def test_copy_with_empty_queue_is_a_fail_soft_no_op(self, tmp_path):
+        """'y' against an EMPTY queue -- highlighted_key() returns None,
+        mirroring action_drop/action_defer's own fail-soft guard -- must
+        not crash and must leave the clipboard untouched (reviewer_comprehensive
+        test_coverage suggestion's optional no-highlight/no-op case).
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 0
+
+            await pilot.press('y')
+            await pilot.pause()
+
+            assert app._clipboard == ''
 
 
 class TestDeferResetsAge:

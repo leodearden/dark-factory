@@ -49,6 +49,7 @@ from cockpit.backends import DisplayTarget, FocusArrangeBackend, TmuxBackend, Wm
 from cockpit.panes.decision_queue import (
     DecisionQueue,
     QueueItem,
+    format_copy_payload,
     known_project_roots,
     order_queue,
     resolve_target,
@@ -156,6 +157,7 @@ class CockpitApp(App):
         Binding('B', 'big_boost', 'Big boost', show=False),
         Binding('x', 'drop', 'Drop', show=False),
         Binding('d', 'defer', 'Defer', show=False),
+        Binding('y', 'copy', 'Copy', show=False),
         Binding('n', 'new_session', 'New session', show=False),
         Binding('t', 'toggle_tree', 'Spawn tree', show=False),
         Binding('h', 'toggle_history', 'Toggle history', show=False),
@@ -673,6 +675,30 @@ class CockpitApp(App):
             return
         self._deferred[key] = self._now_fn()
         self._rebuild_queue()
+
+    def action_copy(self) -> None:
+        """'y' -- copy the highlighted row's question text + ids to the system clipboard.
+
+        The copy affordance (task 2517 / esc-2303-1 F4): Textual captures
+        the mouse, so native click-drag select/middle-click paste don't
+        work in the running cockpit -- this is the in-app replacement.
+        Mirrors action_drop/action_defer's highlighted-row lookup exactly
+        (fail-soft: no highlighted row, or a key not present in the
+        last-built queue, no-ops). Delegates to Textual's own
+        App.copy_to_clipboard, which writes an OSC 52 escape sequence --
+        terminal-native, works over SSH, no xclip/wl-copy subprocess.
+        Strictly READ-ONLY: never calls set_manual_boost/
+        update_decision_state, preserving the pure-consumer write-
+        discipline invariant (see TestCopyAction).
+        """
+        queue = self.query_one('#decision-queue', DecisionQueue)
+        key = queue.highlighted_key()
+        if key is None:
+            return
+        item = self._queue_items_by_key.get(key)
+        if item is None:
+            return
+        self.copy_to_clipboard(format_copy_payload(item))
 
     def action_new_session(self) -> None:
         """'n' -- push the spawn bar's project/role/prompt picker (PRD §9 C5b).
