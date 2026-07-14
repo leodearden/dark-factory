@@ -8289,21 +8289,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 note='landed-outbox journal hit (pre-MERGE recovery)',
             )
 
-        if not await self.git_ops.is_ancestor(branch_head, main_sha):
-            return None
+        # wt_head=None: the merge phase runs after a rebase, where a
+        # post-rebase HEAD may coincide with base_commit even on a
+        # genuinely-implemented branch, so this caller must keep the
+        # iteration-log fallback rather than the SHA-primary signal (see
+        # _has_prior_implementation's docstring and task 2504).
+        if await self._branch_work_landed_on_main(branch_head, main_sha, wt_head=None):
+            return await self._finalise_recovery_done(
+                basis='fallback', sha=main_sha, kind='found_on_main',
+                note='branch already on main at merge phase (pre-MERGE recovery)',
+            )
 
-        if not self._has_prior_implementation().has_work:
+        # Not landed. Re-check is_ancestor (cheap, redundant on this path
+        # only) purely to scope the breadcrumb to the spurious-merge-signal
+        # sub-case (ancestor but no work) — a normal divergent (non-ancestor)
+        # merge must stay silent.
+        if await self.git_ops.is_ancestor(branch_head, main_sha):
             logger.warning(
                 f'Task {self.task_id}: branch appears merged at '
                 f'merge phase but has no implementation entries '
                 f'— proceeding with merge'
             )
-            return None
-
-        return await self._finalise_recovery_done(
-            basis='fallback', sha=main_sha, kind='found_on_main',
-            note='branch already on main at merge phase (pre-MERGE recovery)',
-        )
+        return None
 
     def _escalate_plan_overwrite(self) -> None:
         """Submit a blocking escalation when plan.json ownership doesn't match.
