@@ -2428,14 +2428,16 @@ class TaskWorkflow:
             if isinstance(e, BranchResetError):
                 # task 2403: GitOps.rebase_preserving_task_commits detected
                 # that a requeue/inter-iteration rebase collapsed this
-                # branch to zero commits ahead of main — the pre-rebase
-                # HEAD has already been restored by the guard, so the
-                # task's work is safe, but the wipe condition itself needs
-                # a human to look at the merge-train state that produced
-                # it. Route to a targeted per-task BLOCKED + human L1,
-                # bypassing the steward corrective loop (mirrors the
-                # WorktreeConflictError branch above) rather than falling
-                # through to the generic 'Workflow error:' handler.
+                # branch to zero commits ahead of its rebase baseline — the
+                # guard already attempted to restore the pre-rebase HEAD
+                # (best-effort; see BranchResetError.restore_ok — a failed
+                # restore is called out explicitly in str(e) below rather
+                # than silently assumed safe), but the wipe condition
+                # itself needs a human to look at the merge-train state
+                # that produced it. Route to a targeted per-task BLOCKED +
+                # human L1, bypassing the steward corrective loop (mirrors
+                # the WorktreeConflictError branch above) rather than
+                # falling through to the generic 'Workflow error:' handler.
                 # escalate_to_human is passed explicitly (True) rather
                 # than via disp.escalate_to_human — BranchResetError has no
                 # _DISPOSITION_TABLE row, so disp is _DEFAULT_BLOCK here.
