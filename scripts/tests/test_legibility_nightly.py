@@ -647,3 +647,79 @@ def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
     assert after_log == before_log
+
+
+# ---------------------------------------------------------------------------
+# step-17/18: run_nightly -- fail-loud on extractor crash (decision 8)
+# ---------------------------------------------------------------------------
+
+def _crashing_build_digests(selected, **kwargs):
+    """A fake build_digests: one digest builds fine, one session crashes --
+    extractor_failures is non-empty even though a usable digest also
+    exists, so the RED test can prove the coder is never reached."""
+    ok_digest = (
+        '---\n'
+        'session: "ok-session"\n'
+        'date: "2026-07-13"\n'
+        'agent_class: "interactive"\n'
+        '---\n'
+        'body text\n'
+    )
+    return [ok_digest], [('session-1.jsonl', 'boom: corrupt transcript')]
+
+
+def test_run_nightly_fail_loud_on_extractor_crash(tmp_path, monkeypatch):
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    before_bytes = codebook_path.read_bytes()
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
+
+    coder_calls = []
+
+    def _unexpected_invoke(prompt, model):
+        coder_calls.append(prompt)
+        return 'not valid json'
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    escalation_calls = []
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_unexpected_invoke,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result.exit_code != 0
+    assert result.escalated is True
+    assert coder_calls == []  # the coder must never be reached after a crash
+
+    assert len(escalation_calls) == 1
+    url, envelope = escalation_calls[0]
+    arguments = envelope['params']['arguments']
+    assert arguments['category'] == 'infra_issue'
+    assert 'extractor' in arguments['summary'].lower()
+    assert '1' in arguments['summary']
+
+    # Merge/dump/commit skipped entirely: codebook untouched, no new commit.
+    assert codebook_path.read_bytes() == before_bytes
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log == before_log
