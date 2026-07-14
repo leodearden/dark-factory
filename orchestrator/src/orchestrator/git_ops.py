@@ -2263,13 +2263,21 @@ class GitOps:
         The script lives in the LANE's own scripts dir (the lane's checked-out
         tree provides it, consistent with the debug-port script pattern).
 
-        **Does NOT take ``<lane_dir>.lock``**: the only flock this method (or
-        the ``seed-warm-lane.sh`` it invokes) acquires is the *shared*
-        per-gen-dir lock above, scoped to protecting the shared CoW base
-        during copy — never the lane's own lock file. See
-        :meth:`_run_thin_warm_lane`'s "Lane-lock coupling gap" docstring
-        note for why that matters (a concurrent release-thin does not
-        actually contend with a re-acquire on ``<lane_dir>.lock``).
+        **Takes ``<lane_dir>.lock`` exclusively (task 2599)**: the seed
+        subprocess is wrapped in an OUTER blocking exclusive
+        ``flock -x <lane_dir>.lock`` spanning its full duration — nesting
+        outside the INNER *shared* per-gen-dir lock above in the symlink
+        branch (outer exclusive lane lock, inner shared gen lock; both held
+        for the script's whole lifetime and auto-released on exit, including
+        on holder crash). ``flock`` consumes its own leading args, so the
+        script itself still only ever sees ``base_target lane_dir mode`` as
+        its argv, and its exit code passes through unchanged — this method's
+        existing rc contract below is unaffected. This gives
+        :meth:`_run_thin_warm_lane`'s non-blocking T3 ``flock -n`` a real
+        counterparty: a concurrent release-thin and a re-acquire's seed can
+        no longer both proceed against the same ``target/`` at once — see
+        that method's "Lane-lock coupling gap" docstring note for the full
+        race analysis (now closed).
 
         Returns:
             0   — script ran and exited 0 (seed succeeded, lane is warm).
@@ -2286,6 +2294,11 @@ class GitOps:
             if not script.exists():
                 logger.debug('_seed_warm_lane: seed script absent at %s', script)
                 return 127  # command-not-found sentinel
+            # task 2599: outer exclusive lane lock spans the ENTIRE seed
+            # subprocess below (both branches), giving _run_thin_warm_lane's
+            # T3 flock -n a real counterparty — see the "Takes <lane_dir>.lock
+            # exclusively" docstring note above.
+            lane_lock = lane_dir.with_name(lane_dir.name + '.lock')
             base_path = self.warm_lane_base_target_path
             if base_path.is_symlink():
                 # D8: resolve relative-sibling symlink (target -> .gen.N) to the
@@ -2309,10 +2322,14 @@ class GitOps:
                         'this indicates a reify/DF gen-dir protocol mismatch',
                         lock_path,
                     )
-                cmd = ['flock', '-s', str(lock_path), str(script), base_target, str(lane_dir), mode]
+                cmd = [
+                    'flock', '-x', str(lane_lock),
+                    'flock', '-s', str(lock_path),
+                    str(script), base_target, str(lane_dir), mode,
+                ]
             else:
                 base_target = str(base_path)
-                cmd = [str(script), base_target, str(lane_dir), mode]
+                cmd = ['flock', '-x', str(lane_lock), str(script), base_target, str(lane_dir), mode]
             rc, _, err = await _run(cmd, cwd=lane_dir)
             if rc != 0:
                 logger.warning(
