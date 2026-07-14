@@ -112,25 +112,18 @@ from orchestrator.workflow_types import (  # noqa: F401  re-export shim
 # the plan-tools stdio MCP server.
 _ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
 
-# Role gates for per-invocation MCP wiring in _invoke().  A role listed in an
-# AgentRole.allowed_tools / briefing MUST also appear here for the matching
-# server family, or the session is told to call tools that do not exist.
-#
-# _MCP_CONFIG_ROLES: sessions that receive the orchestrator-assembled MCP
-# config (fused-memory + escalation).  simple_task is included (reify
-# esc-4943-54): its prompt embeds the escalation/memory instructions, and
-# without this entry the session only sees whatever static .mcp.json the
-# watched project happens to commit — nothing at all in projects without one.
-_MCP_CONFIG_ROLES = (
-    'architect', 'implementer', 'debugger', 'merger', 'judge', 'simple_task',
-)
-
-# _PLAN_TOOLS_ROLES: sessions that get the per-worktree plan-tools stdio
-# server injected.  simple_task is included (reify esc-4943-54): its success
-# contract (_run_simple_task requires a plan-tools-registered plan with >=1
-# step done) was unsatisfiable without the server, so the Lever-C fast-path
-# always fell through to the architect and its cost saving never materialized.
-_PLAN_TOOLS_ROLES = ('architect', 'implementer', 'debugger', 'simple_task')
+# Role gates for per-invocation MCP/sandbox wiring in _invoke() are read
+# directly off the AgentRole object (role.mcp_families / role.sandboxed) —
+# see orchestrator/agents/roles.py's AgentRole.__post_init__ and per-role
+# mcp_families/sandboxed declarations (W9-η, reify esc-4943-54: simple_task's
+# allowed_tools referenced fused-memory/escalation/plan-tools tools, but the
+# name-string gate tuples formerly here forgot to list it, so its sessions
+# were told to call tools that did not exist and the Lever-C fast-path
+# silently always fell through to the architect). The former
+# _MCP_CONFIG_ROLES / _PLAN_TOOLS_ROLES name-string tuples are retired in
+# favor of this role-object read — a role whose allowed_tools reference a
+# tool family now MUST declare the matching mcp_families entry or
+# AgentRole's import-time assertion raises, so the two can no longer drift.
 
 
 def _meta_root_for_worktree(worktree: Path) -> Path:
@@ -7394,9 +7387,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             timeout_val = timeouts_cfg.reviewer
             backend_val = backends_cfg.reviewer
 
-        # Determine sandbox modules based on role
+        # Determine sandbox modules based on role (role.sandboxed is a
+        # property of the role object — see roles.py's AgentRole/W9-η).
         sandbox_modules = None
-        if self.config.sandbox.enabled and role.name in ('implementer', 'debugger'):
+        if self.config.sandbox.enabled and role.sandboxed:
             sandbox_modules = self.modules
 
         # Warn once per workflow instance when an escalation-capable role is
@@ -7406,9 +7400,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # Build MCP config — fused-memory always, escalation when available.
         # Judge gets MCP so its jcodemunch tools (in allowed_tools) actually
         # work; it does not use escalation tools but mcp_config_json handles
-        # escalation_url=None fine.
+        # escalation_url=None fine. Gated on role.mcp_families (W9-η) rather
+        # than a role.name membership tuple.
         mcp_config = None
-        if role.name in _MCP_CONFIG_ROLES:
+        if 'orchestrator' in role.mcp_families:
             escalation_url = None
             if self.escalation_queue:
                 esc = self.config.escalation
@@ -7421,7 +7416,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # agent gets its own server bound to the worktree path.  Fast-start flags
         # (--no-sync, --frozen) reuse the already-synced orchestrator venv to
         # avoid cold-resolve stalls under load (reify esc-4415-240/esc-4437-123).
-        if role.name in _PLAN_TOOLS_ROLES and cwd:
+        if 'plan_tools' in role.mcp_families and cwd:
             mcp_config = _inject_plan_tools_mcp(mcp_config, cwd)
 
         # Session-resume lifecycle: if the harness recovered a sidecar that
