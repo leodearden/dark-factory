@@ -2071,6 +2071,94 @@ class TestWriteSuppressionRecord:
         assert result.memory_ids == ['supp-1']
 
 
+# ---------------------------------------------------------------------------
+# write_suppression_record pre-write coverage check (task 2503 step-5/step-6)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteSuppressionRecordPreWriteCheck:
+    """write_suppression_record performs a pre-write coverage check against
+    existing stage1_flag_suppression ledger rows before upserting/mirroring
+    (task 2503) — the writer-side fix for the task-544 companion-record
+    sprawl: the ledger UPSERT already self-collapses EXACT (task_id,
+    flag_type) identity, but the Mem0 mirror's add_memory NEVER upserts, so
+    a flag_type wording variant (or a request already covered by a
+    wildcard row) previously minted a fresh Mem0 companion on every write."""
+
+    @pytest.mark.asyncio
+    async def test_family_variant_write_fully_skipped(self, ledger_memory_service, caplog):
+        """(a) A second write whose flag_type is a FAMILY variant of an
+        already-written scoped row is fully skipped: no new ledger row, no
+        mirror call, empty AddMemoryResponse, INFO skip-log."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id=544, flag_types=['missing_deliverable']
+        )
+        ledger_memory_service.add_memory.reset_mock()
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await write_suppression_record(
+                ledger_memory_service,
+                project_id='p',
+                task_id=544,
+                flag_types=['deliverable_missing'],
+            )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1
+        assert rows[0].flag_type == 'missing_deliverable'
+
+        ledger_memory_service.add_memory.assert_not_called()
+        assert result == AddMemoryResponse(memory_ids=[])
+        assert any(
+            'suppression_companion_skip' in record.message and record.levelno == logging.INFO
+            for record in caplog.records
+        ), f'Expected an INFO skip-log, got: {[r.message for r in caplog.records]}'
+
+    @pytest.mark.asyncio
+    async def test_wildcard_covers_subsequent_scoped_write(self, ledger_memory_service):
+        """(b) An existing WILDCARD row for a task_id covers any subsequent
+        scoped write for that task_id — skipped entirely."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '42', '')
+
+        result = await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id=42, flag_types=['anything']
+        )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1
+        assert rows[0].flag_type == ''
+
+        ledger_memory_service.add_memory.assert_not_called()
+        assert result == AddMemoryResponse(memory_ids=[])
+
+    @pytest.mark.asyncio
+    async def test_partial_subset_writes_only_uncovered_flag_types(self, ledger_memory_service):
+        """(c) A write with a mix of already-covered and new flag_types
+        writes/mirrors ONLY the not-yet-covered subset."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '7', 'a')
+
+        result = await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id=7, flag_types=['a', 'b']
+        )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert {row.flag_type for row in rows} == {'a', 'b'}
+        assert len(rows) == 2
+
+        ledger_memory_service.add_memory.assert_called_once()
+        kwargs = ledger_memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['flag_types'] == ['b']
+        assert result.memory_ids == ['mirror-id']
+
+
 def test_write_suppression_record_importable_from_canonical_path():
     """Smoke test: write_suppression_record is importable from the path stage1.py advertises.
 
