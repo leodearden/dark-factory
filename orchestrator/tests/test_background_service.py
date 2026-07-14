@@ -539,3 +539,89 @@ class TestLifecycleRegistryStopAll:
         assert len(warnings) == 1
         assert 'raiser' in warnings[0].message
         assert 'stop() failed' in warnings[0].message
+
+
+class TestManagedService:
+    """step-13: ManagedService adapter (+ LifecycleService Protocol) — a
+    thin wrapper so the four bespoke lifecycle services (merge-worker,
+    offline-lane, escalation-server, watcher-supervisor) register in the
+    same LifecycleRegistry as BackgroundService, keeping their existing
+    ``_start_*``/``_stop_*`` methods verbatim."""
+
+    @pytest.mark.asyncio
+    async def test_start_and_stop_delegate_to_wrapped_fns(self) -> None:
+        from orchestrator.background_service import ManagedService
+
+        calls: list[str] = []
+
+        async def start_fn() -> None:
+            calls.append('started')
+
+        async def stop_fn() -> None:
+            calls.append('stopped')
+
+        svc = ManagedService(
+            name='bespoke', start_fn=start_fn, stop_fn=stop_fn, stop_timeout_secs=1.0
+        )
+
+        await svc.start()
+        await svc.stop()
+
+        assert calls == ['started', 'stopped']
+
+    def test_exposes_name_and_stop_timeout_secs(self) -> None:
+        from orchestrator.background_service import ManagedService
+
+        svc = ManagedService(
+            name='bespoke', start_fn=AsyncMock(), stop_fn=AsyncMock(), stop_timeout_secs=2.5
+        )
+
+        assert svc.name == 'bespoke'
+        assert svc.stop_timeout_secs == 2.5
+
+    @pytest.mark.asyncio
+    async def test_composes_with_background_service_and_honors_bounded_stop(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A ManagedService registers alongside a BackgroundService in the
+        same LifecycleRegistry; a wedging ManagedService.stop() is
+        abandoned by stop_all() exactly like a wedging BackgroundService
+        would be (S1), and the other (BackgroundService) member still
+        stops — proving the adapter honors the uniform bounded-stop
+        contract rather than needing special-casing."""
+        from orchestrator.background_service import LifecycleRegistry, ManagedService
+
+        async def wedging_stop() -> None:
+            await asyncio.Event().wait()
+
+        wedge = ManagedService(
+            name='wedge-managed',
+            start_fn=AsyncMock(),
+            stop_fn=wedging_stop,
+            stop_timeout_secs=0.05,
+        )
+
+        blocker = asyncio.Event()
+
+        async def bg_pass() -> None:
+            await blocker.wait()
+
+        background = _make_service(bg_pass, name='background', interval_secs=0)
+
+        registry = LifecycleRegistry()
+        registry.register(wedge)
+        registry.register(background)
+
+        await registry.start_all()
+        assert background._task is not None
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.background_service'):
+            await asyncio.wait_for(registry.stop_all(), timeout=5)
+
+        # background (registered second) stops first under reverse order;
+        # the wedging ManagedService is abandoned, not hung on forever.
+        assert background._task is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'wedge-managed' in warnings[0].message
+        assert 'did not stop' in warnings[0].message
