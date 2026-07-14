@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
+import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -180,6 +183,105 @@ def build_digests(
         digests.append(rendered)
 
     return digests, extractor_failures
+
+
+# ---------------------------------------------------------------------------
+# git helpers — docs-only commit of the codebook, ref-lock retry, never stash
+# ---------------------------------------------------------------------------
+
+_LOCK_ERROR_PATTERNS: tuple[str, ...] = (
+    'cannot lock ref',
+    'index.lock',
+    'another git process',
+    'unable to create',
+)
+"""Case-insensitive stderr substrings identifying a transient git ref/index
+lock contention (the merge worker/hooks racing for the lock in the shared
+main checkout) -- worth retrying. Any other failure (e.g. "nothing to
+commit") is NOT retried."""
+
+_DEFAULT_COMMIT_RETRIES = 5
+_DEFAULT_COMMIT_BACKOFF_SECS = 0.2
+
+
+def _git_status_changed(repo: Path | str, relpath: Path | str, *, runner=None) -> bool:
+    """True iff ``git status --porcelain -- relpath`` reports a change.
+
+    *runner* defaults to ``subprocess.run`` looked up at CALL time (not
+    bound as a function-default), so a test can monkeypatch
+    ``nightly.subprocess.run`` and have it take effect.
+    """
+    run = runner if runner is not None else subprocess.run
+    result = run(
+        ['git', '-C', str(repo), 'status', '--porcelain', '--', str(relpath)],
+        capture_output=True, text=True,
+    )
+    return bool((result.stdout or '').strip())
+
+
+@dataclass
+class GitCommitResult:
+    """Outcome of :func:`_git_commit_docs_only`.
+
+    ``ok=False`` (never a raised exception) on any failure -- including
+    exhausted ref-lock retries or a genuine no-op (nothing to commit) --
+    so the caller (:func:`run_nightly`) can escalate rather than crash.
+    """
+
+    ok: bool
+    sha: str | None = None
+    stderr: str = ''
+    attempts: int = 0
+
+
+def _git_commit_docs_only(
+    repo: Path | str,
+    paths: Sequence[Path | str],
+    message: str,
+    *,
+    runner=None,
+    retries: int = _DEFAULT_COMMIT_RETRIES,
+    backoff: float = _DEFAULT_COMMIT_BACKOFF_SECS,
+) -> GitCommitResult:
+    """Commit ONLY *paths* (``git commit --only <paths> -m message``) in
+    *repo* -- never any other dirty/staged path, and NEVER ``git stash``
+    (CLAUDE.md's machine-operated-main-checkout rules).
+
+    Retries up to *retries* attempts when the commit's stderr matches a
+    known transient ref/index-lock pattern (:data:`_LOCK_ERROR_PATTERNS`);
+    any other failure (e.g. a genuine no-op, "nothing to commit") fails
+    immediately without retrying. On success, resolves the new commit sha
+    via a follow-up ``git rev-parse HEAD`` (through the same *runner*).
+    Returns ``ok=False`` (never raises) after the final failed attempt.
+    """
+    run = runner if runner is not None else subprocess.run
+    str_paths = [str(p) for p in paths]
+
+    stderr = ''
+    for attempt in range(1, retries + 1):
+        result = run(
+            ['git', '-C', str(repo), 'commit', '--only', *str_paths, '-m', message],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            sha_result = run(
+                ['git', '-C', str(repo), 'rev-parse', 'HEAD'],
+                capture_output=True, text=True,
+            )
+            sha = (sha_result.stdout or '').strip() or None
+            return GitCommitResult(ok=True, sha=sha, stderr='', attempts=attempt)
+
+        stderr = result.stderr or ''
+        is_lock_error = any(
+            pattern in stderr.lower() for pattern in _LOCK_ERROR_PATTERNS
+        )
+        if is_lock_error and attempt < retries:
+            if backoff:
+                time.sleep(backoff)
+            continue
+        return GitCommitResult(ok=False, sha=None, stderr=stderr, attempts=attempt)
+
+    return GitCommitResult(ok=False, sha=None, stderr=stderr, attempts=retries)
 
 
 if __name__ == '__main__':
