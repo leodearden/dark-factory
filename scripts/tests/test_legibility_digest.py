@@ -957,5 +957,10 @@ class TestRenderDigestTruncation:
 
         assert len(digest.encode('utf-8')) <= 2048
         assert '## User Corrections' in digest
-        assert '## Not Found' in digest
-        assert '## Retry Loops' not in digest
+        # Higher-priority not_found (only 3 hits, ~120 bytes) survives
+        # completely untouched -- the trimmer never reaches it as long as
+        # the lower-priority retry_loops section still has items to give.
+        assert digest.count('command not found') == 3
+        # Lowest-priority retry_loops (60 groups) is what absorbed the
+        # truncation: fewer than all 60 groups survive.
+        assert digest.count('Bash x3:') < 60

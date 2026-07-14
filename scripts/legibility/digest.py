@@ -768,6 +768,37 @@ def _resolve_size_bytes(meta: dict[str, Any], body: str) -> str:
     return digest
 
 
+def _truncate_sections(
+    meta: dict[str, Any], sections: dict[str, list[str]], max_bytes: int,
+) -> str:
+    """Trim *sections* in ASCENDING SECTION_PRIORITY order (lowest-signal
+    first) until the fully-rendered digest fits within *max_bytes*, or
+    there is nothing left to trim -- PRD Sec 7.2 "truncate lowest-signal
+    sections last" (equivalently: trim lowest-signal sections FIRST).
+
+    Each iteration drops exactly one TRAILING item from the current
+    lowest-priority non-empty section (an emptied section stops being
+    rendered at all -- its heading disappears along with it -- and the
+    next-lowest-priority non-empty section becomes the new trim target),
+    then re-measures via the :func:`_resolve_size_bytes` fixed point.
+    Trimming only ever shrinks the digest, so this always terminates: in
+    the worst case every item in every section is removed, at which point
+    the loop stops even if the (now section-free) digest is still over
+    the cap -- a soft cap can't shrink the frontmatter itself.
+    """
+    sections = {key: list(lines) for key, lines in sections.items()}
+    digest = _resolve_size_bytes(meta, _render_body(sections))
+
+    while len(digest.encode('utf-8')) > max_bytes:
+        target_key = next((key for key in SECTION_PRIORITY if sections.get(key)), None)
+        if target_key is None:
+            break
+        sections[target_key].pop()
+        digest = _resolve_size_bytes(meta, _render_body(sections))
+
+    return digest
+
+
 def render_digest(
     records: list[dict[str, Any]],
     *,
@@ -776,16 +807,17 @@ def render_digest(
     max_bytes: int = 15360,
 ) -> str:
     """Render the full markdown digest: frontmatter + one section per
-    non-empty signal class (PRD Sec 7.2).
+    non-empty signal class (PRD Sec 7.2), soft-capped at *max_bytes*.
 
     *agent_class* is the caller's already-resolved class (typically
     :func:`classify_agent_class`'s result) -- render_digest never
     classifies on its own. *path*, when given, sources ``encoded_dir``
     from the transcript file's real parent dir name; otherwise it falls
     back to mirror-encoding the derived ``cwd`` (see
-    :func:`_derive_encoded_dir`). *max_bytes* is accepted here for the
-    soft-cap priority truncation (applied on top of the fixed-point
-    render below).
+    :func:`_derive_encoded_dir`). When the unrestricted render exceeds
+    *max_bytes*, :func:`_truncate_sections` trims lowest-signal sections
+    first (gold user-corrections last); a digest already under the cap is
+    returned unmodified (zero trim iterations).
     """
     cwd = _derive_cwd(records)
     meta = {
@@ -799,5 +831,4 @@ def render_digest(
     }
 
     sections = _build_sections(records)
-    body = _render_body(sections)
-    return _resolve_size_bytes(meta, body)
+    return _truncate_sections(meta, sections, max_bytes)
