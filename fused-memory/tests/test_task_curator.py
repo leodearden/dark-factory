@@ -5386,3 +5386,27 @@ class TestPruneOrphans:
         assert result.skipped is True
         assert result.pruned == 0
 
+    @pytest.mark.asyncio
+    async def test_prune_best_effort_on_qdrant_error(self, caplog):
+        """A Qdrant error mid-sweep (e.g. scroll failing) must degrade to a
+        safe skipped no-op, not raise — never fail the reconciliation sweep."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        mock_client = AsyncMock()
+        mock_client.collection_exists = AsyncMock(return_value=True)
+        mock_client.scroll = AsyncMock(side_effect=RuntimeError('qdrant down'))
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client):
+            with caplog.at_level(
+                logging.WARNING, logger='fused_memory.middleware.task_curator',
+            ):
+                result = await curator.prune_orphans('proj', {'1', '2'})
+
+        mock_client.delete.assert_not_called()
+        assert result.skipped is True
+        assert result.pruned == 0
+        assert any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        ), f'expected a WARNING log, got: {[(r.levelno, r.message) for r in caplog.records]}'
+
