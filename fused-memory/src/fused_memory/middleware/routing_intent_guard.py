@@ -35,6 +35,21 @@ targets (task 2332-style routing-intent churn) and the dominant filing path
   (``do_not_implement``, ``escalate_instead_of_implementing``) contain the
   substring "implement" in their canonical phrasing, so including it would
   make those markers permanently self-suppressing.
+
+  **Recall cost (deliberate, precision-over-recall):** unlike
+  ``operational_ask_registry``, which scopes ``_CODE_CHANGE_TITLE_SIGNALS``
+  to the title only, this guard scans the combined title + description +
+  details text. "bug" and "fix" in particular are common enough in ordinary
+  task prose that a genuine routing-intent mismatch (e.g. "DO NOT IMPLEMENT;
+  escalate to a human") is fully suppressed whenever either word appears
+  ANYWHERE in the submission — including in enforce mode, where such a
+  mis-routed task is then silently accepted rather than rejected. This is an
+  accepted tradeoff, not an oversight, but the recall cost is real: use the
+  ``routing_intent_lint.flagged`` census (see ``routing_intent_warning``) to
+  observe how often it actually fires before flipping
+  ``FUSED_ROUTING_INTENT_ENFORCE``, and reconsider narrowing the signal
+  words or scoping the suppression to the title field if false negatives
+  prove too costly.
 - None of the declarative markers match any field.
 
 This module is declaration-only: it never coerces ``task_kind`` or
@@ -84,6 +99,16 @@ _EXEMPT_EXECUTION_CLASSES: frozenset[str] = frozenset(
 # canonical phrasing, so including it would make those markers permanently
 # dead code (a real task declaring "DO NOT IMPLEMENT" would always be
 # suppressed by its own marker text).
+#
+# Recall cost (see module docstring for the full tradeoff writeup): "bug"
+# and "fix" are common enough in ordinary task prose that this suppression
+# is meaningfully lossy, not just a narrow escape hatch — unlike
+# operational_ask_registry, which checks title only, this regex is applied
+# to the COMBINED title+description+details text, so a genuine
+# routing-intent mismatch that merely also contains "bug" or "fix" anywhere
+# is silently suppressed (accepted even in enforce mode). Deliberate
+# precision-over-recall; watch the `routing_intent_lint.flagged` census
+# rate before flipping FUSED_ROUTING_INTENT_ENFORCE.
 _CODE_CHANGE_SIGNALS_RE = re.compile(r'\b(?:fix|bug|crash|refactor)\w*\b', re.IGNORECASE)
 
 # (compiled regex, marker label, detail text) — each anchored to a
