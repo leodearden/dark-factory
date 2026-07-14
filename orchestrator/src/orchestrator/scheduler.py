@@ -572,6 +572,7 @@ class TickContext:
     max_id: int = 0
     external_cache: dict[str, str] = field(default_factory=dict)
     external_resolver_failed: bool = False
+    delivered_check_cache: dict[str, bool] = field(default_factory=dict)
     overrides: dict[str, OverrideRow] = field(default_factory=dict)
     overrides_for_diff: dict[str, OverrideRow] = field(default_factory=dict)
     effective_priorities: dict[str, str] = field(default_factory=dict)
@@ -3427,6 +3428,7 @@ class Scheduler:
         *,
         external_status_cache: dict[str, str] | None = None,
         external_resolver_failed: bool = False,
+        delivered_check_cache: dict[str, bool] | None = None,
     ) -> tuple[bool, str | None]:
         """Check whether *task* passes all eligibility gates for dispatch.
 
@@ -3453,6 +3455,13 @@ class Scheduler:
         The ``_park_gc`` call site does NOT pass these params (preserving
         park-GC semantics, scope containment per design decision 4).
 
+        *delivered_check_cache* is forwarded to :meth:`_deps_satisfied` for
+        the delivered-check dep-gate (capability-delivered-checks PRD, task
+        delta).  When ``None`` (the default), the gate is skipped —
+        byte-identical to the pre-delivered-check implementation.  The
+        ``_park_gc`` call site does NOT pass this param either (same scope
+        containment as the external cache).
+
         Returns ``(True, signal_label)`` when all gates pass.
         Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
         the dispatch-cooldown signal for the task (or None), forwarded so the
@@ -3474,6 +3483,7 @@ class Scheduler:
             task, status_map, tasks_by_id,
             external_status_cache=external_status_cache,
             external_resolver_failed=external_resolver_failed,
+            delivered_check_cache=delivered_check_cache,
         ):
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
@@ -4510,7 +4520,8 @@ class Scheduler:
         """Filter tasks to dispatch-eligible candidates.
 
         Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``,
-        ``ctx.external_cache``, ``ctx.external_resolver_failed``. Writes:
+        ``ctx.external_cache``, ``ctx.external_resolver_failed``,
+        ``ctx.delivered_check_cache``. Writes:
         ``ctx.candidates``, ``ctx.candidate_signals``. Filters to pending
         tasks whose deps are all done and that aren't dispatched or in
         their post-requeue cooldown window. ``_eligible_for_dispatch``
@@ -4527,6 +4538,7 @@ class Scheduler:
                 t, tid_str, ctx.status_map, ctx.tasks_by_id,
                 external_status_cache=ctx.external_cache,
                 external_resolver_failed=ctx.external_resolver_failed,
+                delivered_check_cache=ctx.delivered_check_cache,
             )
             if not eligible:
                 continue
@@ -4700,7 +4712,8 @@ class Scheduler:
 
         Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``,
         ``ctx.external_cache``, ``ctx.external_resolver_failed``,
-        ``ctx.gated_ids``, ``ctx.psi_hold``, ``ctx.effective_priorities``.
+        ``ctx.delivered_check_cache``, ``ctx.gated_ids``, ``ctx.psi_hold``,
+        ``ctx.effective_priorities``.
         Writes: none on ctx (dispatch bookkeeping lives on ``self``).
         Pinned candidates bypass scoring entirely but still respect lock
         availability and eligibility checks (status, deps, cooldown). On
@@ -4725,6 +4738,7 @@ class Scheduler:
                     pin_task, pin_tid, ctx.status_map, ctx.tasks_by_id,
                     external_status_cache=ctx.external_cache,
                     external_resolver_failed=ctx.external_resolver_failed,
+                    delivered_check_cache=ctx.delivered_check_cache,
                 )
                 if not eligible:
                     continue
