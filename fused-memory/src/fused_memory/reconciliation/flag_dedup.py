@@ -164,7 +164,13 @@ logger = logging.getLogger(__name__)
 
 
 class _SuppressionMetadata(TypedDict):
-    """Producer-side contract: ``task_id`` is pinned to ``int``.
+    """Producer-side contract: ``task_id`` is pinned to ``str`` (task 2454).
+
+    A str-typed ``task_id`` makes the Mem0 mirror queryable via
+    ``count_memories_by_metadata(filters={'task_id': '<str>'})`` — an
+    int-typed value would false-negative against a string filter. String
+    also matches the ``recon_ledger`` table (``task_id`` column is TEXT)
+    and the established 2405-thread precedent.
 
     Reader (``filter_suppressed``) tolerates and str-coerces both ``int``
     and ``str`` task_ids for backward compat with legacy hand-authored
@@ -179,7 +185,7 @@ class _SuppressionMetadata(TypedDict):
     """
 
     kind: Literal['stage1_flag_suppression']
-    task_id: int
+    task_id: str
     flag_types: NotRequired[list[str]]
 
 
@@ -679,8 +685,11 @@ def build_suppression_payload(
     Returns a :class:`SuppressionPayload` with ``content``, ``category``, and
     ``metadata`` fields matching the canonical schema documented in the
     ``## Flag Suppression Check`` section of ``STAGE1_SYSTEM_PROMPT``.
-    ``task_id`` is coerced to ``int`` so the producer always pins the integer
-    type regardless of how the caller obtained the id.
+    ``task_id`` is validated as numeric (via an ``int()`` fast-path) then
+    canonicalized to ``str`` (task 2454) so the producer always pins a
+    string type regardless of how the caller obtained the id — this keeps
+    the Mem0 mirror queryable via ``count_memories_by_metadata`` with a
+    string filter.
 
     ``project_id`` is intentionally absent — it is a write-time concern that
     must be passed separately to ``memory_service.add_memory``, keeping this
@@ -697,12 +706,12 @@ def build_suppression_payload(
 
     Canonical schema (Mem0, observations_and_summaries category):
       - ``metadata.kind = "stage1_flag_suppression"``
-      - ``metadata.task_id = <N>`` (int — coerced by this function)
+      - ``metadata.task_id = "<N>"`` (str — canonicalized by this function)
       - ``metadata.flag_types = [<str>, ...]`` (optional; sorted-unique)
       - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
     """
     try:
-        tid = int(task_id)
+        tid = str(int(task_id))
     except (TypeError, ValueError) as e:
         raise ValueError(
             f'build_suppression_payload: task_id must be an int or numeric '
@@ -732,8 +741,8 @@ async def write_suppression_record(
     """Upsert a ``stage1_flag_suppression`` record to the ledger for *task_id*.
 
     Builds the canonical payload via :func:`build_suppression_payload` (which
-    coerces *task_id* to ``int``, validates it, and pins ``metadata.kind``/
-    ``content``) then upserts one ``recon_ledger`` row per entry in
+    validates *task_id* is numeric and canonicalizes it to ``str``, and pins
+    ``metadata.kind``/``content``) then upserts one ``recon_ledger`` row per entry in
     ``(flag_types or [''])`` to ``memory_service.recon_ledger`` — ``''`` is
     the blanket/wildcard ``flag_type`` (suppresses every flag_type for
     *task_id*); a non-empty ``flag_types`` list upserts one SCOPED row per
@@ -769,7 +778,7 @@ async def write_suppression_record(
 
     Canonical schema (Mem0 mirror, observations_and_summaries category):
       - ``metadata.kind = "stage1_flag_suppression"``
-      - ``metadata.task_id = <N>`` (int — coerced by build_suppression_payload)
+      - ``metadata.task_id = "<N>"`` (str — canonicalized by build_suppression_payload)
       - ``metadata.flag_types = [<str>, ...]`` (optional; sorted-unique)
       - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
 

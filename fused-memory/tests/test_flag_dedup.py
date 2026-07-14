@@ -1106,19 +1106,19 @@ class TestBuildSuppressionPayload:
     _CANONICAL = {
         'content': 'STAGE 1 FLAG SUPPRESSION task_id=42',
         'category': 'observations_and_summaries',
-        'metadata': {'kind': 'stage1_flag_suppression', 'task_id': 42},
+        'metadata': {'kind': 'stage1_flag_suppression', 'task_id': '42'},
     }
 
     def test_full_payload_for_int_task_id(self):
         """Full payload dict equals the canonical schema literal for int input.
 
         Implicitly asserts: content, category, metadata.kind, metadata.task_id
-        (int), and absence of project_id (not in canonical schema).
+        (str — task 2454), and absence of project_id (not in canonical schema).
         """
         assert build_suppression_payload(42) == self._CANONICAL
 
     def test_coerces_str_task_id_to_int(self):
-        """str task_id is coerced to int; resulting payload equals canonical schema."""
+        """str task_id is validated numeric then canonicalized to str; resulting payload equals canonical schema."""
         assert build_suppression_payload('42') == self._CANONICAL
 
     def test_invalid_task_id_raises_descriptive_value_error(self):
@@ -1166,17 +1166,17 @@ class TestBuildSuppressionPayloadFlagTypes:
         assert result == {
             'content': 'STAGE 1 FLAG SUPPRESSION task_id=42',
             'category': 'observations_and_summaries',
-            'metadata': {'kind': 'stage1_flag_suppression', 'task_id': 42},
+            'metadata': {'kind': 'stage1_flag_suppression', 'task_id': '42'},
         }
         assert 'flag_types' not in result['metadata']
 
     def test_scoped_call_includes_flag_types_in_metadata(self):
-        """(b) Non-empty flag_types produces metadata.task_id (int-coerced) AND
+        """(b) Non-empty flag_types produces metadata.task_id (str-canonicalized) AND
         metadata.flag_types (list[str]); content is still the canonical
         non-empty 'STAGE 1 FLAG SUPPRESSION task_id=452...' string."""
         result = build_suppression_payload(452, flag_types=['human_review_required_deferred'])
-        assert result['metadata']['task_id'] == 452
-        assert isinstance(result['metadata']['task_id'], int)
+        assert result['metadata']['task_id'] == '452'
+        assert isinstance(result['metadata']['task_id'], str)
         # .get() (not ['flag_types']) — the key is NotRequired in _SuppressionMetadata,
         # so a direct subscript trips pyright's reportTypedDictNotRequiredAccess.
         assert result['metadata'].get('flag_types') == ['human_review_required_deferred']
@@ -1388,7 +1388,7 @@ async def test_suppression_record_round_trips_via_producer():
 
     Canonical schema (four-line contract):
       1. metadata.kind == 'stage1_flag_suppression'
-      2. metadata.task_id == 42 (int)
+      2. metadata.task_id == '42' (str)
       3. content == 'STAGE 1 FLAG SUPPRESSION task_id=42'
       4. category == 'observations_and_summaries'
 
@@ -1422,8 +1422,8 @@ async def test_suppression_record_round_trips_via_producer():
         f'metadata.kind mismatch: {results[0].metadata}'
     )
 
-    # (6) task_id is stored as int by the producer
-    assert results[0].metadata['task_id'] == raw_task_id, (
+    # (6) task_id is stored as str by the producer (task 2454)
+    assert results[0].metadata['task_id'] == str(raw_task_id), (
         f'metadata.task_id mismatch: {results[0].metadata["task_id"]!r}'
     )
 
@@ -1538,7 +1538,7 @@ class TestWriteSuppressionRecord:
         ledger_memory_service.add_memory.assert_called_once_with(
             content='STAGE 1 FLAG SUPPRESSION task_id=42',
             category='observations_and_summaries',
-            metadata={'kind': 'stage1_flag_suppression', 'task_id': 42},
+            metadata={'kind': 'stage1_flag_suppression', 'task_id': '42'},
             project_id='autopilot_video',
             causation_id=None,
             _source='stage1_flag_suppression',
@@ -1559,15 +1559,15 @@ class TestWriteSuppressionRecord:
 
     @pytest.mark.asyncio
     async def test_coerces_str_task_id(self, ledger_memory_service):
-        """passing task_id='42' produces mirror metadata.task_id == 42 (int)
-        and a ledger row keyed by the same coerced task_id."""
+        """passing task_id='42' produces mirror metadata.task_id == '42' (str)
+        and a ledger row keyed by the same canonicalized task_id."""
         from fused_memory.reconciliation.flag_dedup import write_suppression_record
 
         await write_suppression_record(ledger_memory_service, project_id='p', task_id='42')
 
         kwargs = ledger_memory_service.add_memory.call_args.kwargs
-        assert kwargs['metadata']['task_id'] == 42
-        assert isinstance(kwargs['metadata']['task_id'], int)
+        assert kwargs['metadata']['task_id'] == '42'
+        assert isinstance(kwargs['metadata']['task_id'], str)
 
         rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
         assert rows[0].task_id == '42'
@@ -1587,7 +1587,7 @@ class TestWriteSuppressionRecord:
         kwargs = ledger_memory_service.add_memory.call_args.kwargs
         assert kwargs['metadata']['flag_types'] == ['human_review_required_deferred']
         assert kwargs['metadata']['kind'] == 'stage1_flag_suppression'
-        assert kwargs['metadata']['task_id'] == 452
+        assert kwargs['metadata']['task_id'] == '452'
 
     @pytest.mark.asyncio
     async def test_omitting_flag_types_produces_legacy_mirror_metadata(
