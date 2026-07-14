@@ -4,6 +4,7 @@ const { ProjectGroup: PG_T, Segmented: SEG_T } = window.DF_SHELL;
 const { PALETTE: CP_T } = window.DF_CHARTS;
 const DF_T = window.DF_DATA;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
+const { computeTiers, partitionComponents, orderRows } = window.DF_GRAPH_LAYOUT;
 
 // Persisted-state hook (same shape as elsewhere)
 function tasksPersistedState(key, def) {
@@ -13,28 +14,6 @@ function tasksPersistedState(key, def) {
   });
   uE_T(() => { try { localStorage.setItem(key, JSON.stringify(v)); } catch {} }, [key, v]);
   return [v, setV];
-}
-
-// ── Compute dep tiers for a task list (Kahn's algorithm style; tier = max(deps' tier)+1) ──
-function computeTiers(tasks) {
-  const byId = new Map(tasks.map(t => [t.id, t]));
-  const tiers = new Map(); // id -> tier
-  const visiting = new Set();
-
-  function tierOf(id) {
-    if (tiers.has(id)) return tiers.get(id);
-    const t = byId.get(id);
-    if (!t) return 0;             // dep references a task outside the project list — ignore
-    if (visiting.has(id)) return 0; // cycle guard
-    visiting.add(id);
-    const inProject = (t.deps || []).filter(d => byId.has(d.id));
-    const tier = inProject.length === 0 ? 0 : 1 + Math.max(...inProject.map(d => tierOf(d.id)));
-    tiers.set(id, tier);
-    visiting.delete(id);
-    return tier;
-  }
-  for (const t of tasks) tierOf(t.id);
-  return tiers;
 }
 
 // ── Edge router: draw curves from each parent (dep) to each child node ──
@@ -128,16 +107,16 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
   const containerRef = uR_T(null);
   const nodeRefs = uR_T({});
 
-  const tiers = uM_T(() => computeTiers(tasks), [tasks]);
-  const rows = uM_T(() => {
-    const max = Math.max(0, ...Array.from(tiers.values()));
-    const arr = Array.from({ length: max + 1 }, () => []);
-    for (const t of tasks) arr[tiers.get(t.id) || 0].push(t);
-    // Within a tier, sort by status priority: blocked → in-progress → merge-deferred → pending → done
-    const order = { blocked: 0, 'in-progress': 1, 'merge-deferred': 1.5, pending: 2, deferred: 3, done: 4, cancelled: 5 };
-    arr.forEach(row => row.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9)));
-    return arr;
-  }, [tasks, tiers]);
+  // Partition into weakly-connected components + singletons, then order each
+  // component's tiers via barycenter/transpose (STATUS_ORDER baked in as the
+  // initial permutation/tiebreak — see graph_layout.js). Tiers are computed
+  // once over the full filtered set: a weakly-connected component has no
+  // edges to other components, so per-component tiers equal global tiers.
+  const { blocks, singletons } = uM_T(() => {
+    const tiers = computeTiers(tasks);
+    const { components, singletons: singles } = partitionComponents(tasks);
+    return { blocks: components.map(c => orderRows(c, tiers)), singletons: singles };
+  }, [tasks]);
 
   // Highlight neighborhood when something is selected
   const neighborhood = uM_T(() => {
@@ -163,6 +142,31 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
     return set;
   }, [selectedId, tasks]);
 
+  // Node card JSX, shared verbatim between component-block tier rows and the
+  // singleton strip so TaskGraphEdges (which resolves positions via
+  // nodeRefs) keeps working identically in both.
+  function renderNode(t) {
+    const isSel = selectedId === t.id;
+    const inTree = neighborhood && neighborhood.has(t.id) && !isSel;
+    const dim = neighborhood && !neighborhood.has(t.id);
+    return (
+      <div key={t.id}
+           ref={el => { if (el) nodeRefs.current[t.id] = el; else delete nodeRefs.current[t.id]; }}
+           className={`node s-${t.status} ${isSel ? 'selected' : ''} ${inTree ? 'in-tree' : ''} ${dim ? 'dim' : ''}`}
+           onClick={() => onSelect(isSel ? null : t.id)}>
+        <div className="meta">
+          <span className="status-pip"></span>
+          <span className="id">{window.DF_SHELL.taskId(t.id)}</span>
+          {t.train && <span className="train-badge" title={`train ${t.train.id} · order ${t.train.order}`}>🚂 {t.train.id}</span>}
+          <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
+            {t.status === 'in-progress' ? `${t.started}m` : t.status === 'done' ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : t.status}
+          </span>
+        </div>
+        <div className="ttl">{t.title}</div>
+      </div>
+    );
+  }
+
   if (tasks.length === 0) {
     return <div className="empty">no tasks match the current filter</div>;
   }
@@ -171,31 +175,23 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
     <div className="taskgraph" ref={containerRef}>
       <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={tasks}
                       selectedId={selectedId} neighborhood={neighborhood} />
-      {rows.map((row, ri) => (
-        <div key={ri} className="row">
-          {row.length === 0 ? <div className="empty-tier">—</div> : row.map(t => {
-            const isSel = selectedId === t.id;
-            const inTree = neighborhood && neighborhood.has(t.id) && !isSel;
-            const dim = neighborhood && !neighborhood.has(t.id);
-            return (
-              <div key={t.id}
-                   ref={el => { if (el) nodeRefs.current[t.id] = el; else delete nodeRefs.current[t.id]; }}
-                   className={`node s-${t.status} ${isSel ? 'selected' : ''} ${inTree ? 'in-tree' : ''} ${dim ? 'dim' : ''}`}
-                   onClick={() => onSelect(isSel ? null : t.id)}>
-                <div className="meta">
-                  <span className="status-pip"></span>
-                  <span className="id">{window.DF_SHELL.taskId(t.id)}</span>
-                  {t.train && <span className="train-badge" title={`train ${t.train.id} · order ${t.train.order}`}>🚂 {t.train.id}</span>}
-                  <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
-                    {t.status === 'in-progress' ? `${t.started}m` : t.status === 'done' ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : t.status}
-                  </span>
-                </div>
-                <div className="ttl">{t.title}</div>
-              </div>
-            );
-          })}
+      {blocks.map((block, bi) => (
+        <div key={bi} className="component-block">
+          {block.map((row, ri) => (
+            <div key={ri} className="row">
+              {row.length === 0 ? <div className="empty-tier">—</div> : row.map(renderNode)}
+            </div>
+          ))}
         </div>
       ))}
+      {singletons.length > 0 && (
+        <div className="singleton-strip">
+          <div className="strip-label">unconnected</div>
+          <div className="row">
+            {singletons.map(renderNode)}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
