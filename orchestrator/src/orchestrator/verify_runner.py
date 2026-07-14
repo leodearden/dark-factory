@@ -2182,6 +2182,9 @@ _SLOT_PARKED = 'PARKED'   # cancel-fail path: held + non-acquirable, pending pgr
 class HostLease:
     """A held slot for a verify-host.  Returned by HostAllocator.acquire().
 
+    Never held by the main-health probe (task 2565) — that classifier is
+    leaseless by design; see :class:`HostAllocator`'s cross-ref note.
+
     Fields
     ------
     name      : host name (matches RemoteRunner.name, or 'local' for the local slot)
@@ -2196,6 +2199,13 @@ class HostLease:
 
 class HostAllocator:
     """Worker-lifetime host allocator: one slot per host, prefer-local-when-free.
+
+    Cross-ref (task 2565): the main-health probe
+    (:func:`~orchestrator.verify.verify_failure_is_preexisting_on_main`) is
+    intentionally leaseless and is NEVER routed through this allocator — it
+    never calls ``acquire_local``/``acquire_remote``, so its classification
+    work never occupies a slot here and a host's occupancy in this allocator
+    never reflects a main-health probe running.
 
     Selection policy (β decision 1): prefer local as the trust anchor; remotes
     take overflow only when local is busy.  This inverts VerifyRunnerPool's

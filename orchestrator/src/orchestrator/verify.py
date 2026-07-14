@@ -4079,6 +4079,36 @@ async def verify_failure_is_preexisting_on_main(
 ) -> tuple[bool, str]:
     """Detect whether *failing_result* is inherited from the current main HEAD.
 
+    LEASE-SAFETY & HOST-AFFINITY (task 2565): this is a leaseless,
+    local-only detective classifier.  It NEVER acquires or holds a merge
+    :class:`~orchestrator.verify_runner.HostLease` or host slot — it
+    verifies via a local ``_mainprobe-`` ephemeral worktree (see below)
+    and ``run_scoped_verification`` directly, never routing through
+    :class:`~orchestrator.verify_runner.HostAllocator` or
+    :class:`~orchestrator.verify_runner.RemoteRunner`.  It also NEVER runs
+    remote-affine (probing on the failing verify's origin host, e.g. a
+    laptop lease) even when the triggering post-merge verify ran remote —
+    it always runs on the dispatching/trust-anchor host.  This is
+    deliberate, not incidental: the verdict drives a queue-halting
+    born-at-L2 escalation and a "fix main" auto-heal, a
+    correctness-critical GLOBAL decision that must answer "is main
+    actually broken on the trust anchor?" — reproducing a HOST-SPECIFIC
+    toolchain/env/flock/disk quirk from a remote host onto that same
+    host's main would falsely conclude main is red (a false queue halt
+    plus a false fix-main task), and a remote-affine probe would
+    re-introduce the remote-lease / orphaned-remote-build hazards task
+    1757's ``_abort_remote_verify`` teardown exists to avoid.  The
+    (category, normalised cause_hint) signature comparison below is
+    environment-robust for genuine main breaks; a host-specific failure
+    that doesn't reproduce locally correctly falls through to
+    ``(False, '')`` (task-fault, fail-safe).  Callers thread an
+    ``origin_is_local`` signal (derived from the triggering verify's
+    ``runner``) through ``_run_deferred_main_health_probe`` down to the
+    ``origin_host``/``probe_host`` pair recorded on the
+    ``main_health_red`` merge-attempt telemetry purely for OBSERVABILITY
+    of the placement decision — it never changes where or how this
+    function itself probes.
+
     Returns:
         ``(True, main_sha)`` iff the same (category, normalised cause_hint) signature
         reproduces on main — the break is preexisting.  The caller can reuse
