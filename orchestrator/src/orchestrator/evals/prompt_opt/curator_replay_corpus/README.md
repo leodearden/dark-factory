@@ -168,9 +168,16 @@ sizing decision this task owns: within each recorded-action stratum, sample
 `~20%` (floor 5, so a stratum smaller than the floor is taken in full), then
 trim the combined subset to `spot_check_size` (default 200) if it would
 otherwise exceed it -- bounding total human review effort regardless of
-corpus size while still guaranteeing every present action (drop/combine/
-create) gets spot-check representation. Same items + seed always yields the
-same subset.
+corpus size. The trim itself is representation-preserving: it reserves up to
+`minimum` (default 5) ids from every stratum before spending any remaining
+cap budget on the leftover pool, so every present action (drop/combine/
+create) keeps spot-check representation whenever `spot_check_size` is at
+least the number of present actions. A pathologically small
+`spot_check_size` (below the number of present-action strata, e.g. `< 3`
+when all of drop/combine/create appear) cannot preserve all of them -- the
+cap bound still wins, and which stratum(a) survive is decided by the same
+deterministic seeded shuffle. Same items + seed always yields the same
+subset.
 
 **Protocol for an operator confirming the subset:** for each entry with
 `in_spot_check_subset: true` and `spot_check_status: "pending"`, read the

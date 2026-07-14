@@ -219,7 +219,14 @@ def select_spot_check_subset(
     represented in the human-reviewed subset rather than the sample being
     dominated by whichever action is most common. The combined subset is
     then trimmed to *cap* if it would otherwise exceed it, bounding total
-    human effort regardless of corpus size.
+    human effort regardless of corpus size -- the trim RESERVES up to
+    ``min(minimum, <stratum's selected count>)`` ids from every stratum
+    first and fills any remaining cap budget from the leftover pool, so
+    every present action keeps at least some representation whenever
+    ``cap >= len(<present actions>)``. A pathologically small *cap* (below
+    the number of present-action strata) cannot preserve all of them --
+    the *cap* bound still wins in that degenerate case, and which
+    stratum(a) survive is decided by the same deterministic seeded shuffle.
 
     Same *decisions* + *seed* always yields the same subset (``random.Random``
     seeded per stratum, no wall-clock/real randomness) -- required for a
@@ -241,22 +248,42 @@ def select_spot_check_subset(
     else:
         groups = {'_all': [d.ticket_id for d in decisions]}
 
-    selected: list[str] = []
+    per_stratum_selected: dict[str, list[str]] = {}
     for key in sorted(groups):
         ids = sorted(groups[key])
         rng = random.Random(f'{seed}:{key}')
         shuffled = ids[:]
         rng.shuffle(shuffled)
         k = min(len(shuffled), max(minimum, round(len(shuffled) * fraction)))
-        selected.extend(shuffled[:k])
+        per_stratum_selected[key] = shuffled[:k]
+
+    selected = [tid for key in sorted(per_stratum_selected) for tid in per_stratum_selected[key]]
 
     if len(selected) > cap:
-        # Reshuffle the combined selection (still seed-reproducible) rather
-        # than truncating in per-stratum append order, which would silently
-        # starve later-sorted strata whenever the combined set exceeds cap.
-        rng = random.Random(f'{seed}:trim')
-        rng.shuffle(selected)
-        selected = selected[:cap]
+        # Representation-preserving trim: a flat reshuffle-then-slice over
+        # the combined selection can zero out an entire (small) stratum,
+        # which would silently break the "every present action gets
+        # spot-check representation" guarantee documented above. Instead,
+        # reserve up to `minimum` ids per stratum first (deterministically
+        # shuffled within the reserved pool if IT still exceeds cap -- only
+        # possible when cap < number of strata), then spend whatever cap
+        # budget remains on a deterministic shuffle of the leftover pool.
+        reserved: list[str] = []
+        leftover: list[str] = []
+        for key in sorted(per_stratum_selected):
+            stratum_ids = per_stratum_selected[key]
+            reserve_n = min(minimum, len(stratum_ids))
+            reserved.extend(stratum_ids[:reserve_n])
+            leftover.extend(stratum_ids[reserve_n:])
+
+        rng = random.Random(f'{seed}:trim-reserved')
+        rng.shuffle(reserved)
+        reserved = reserved[:cap]
+
+        remaining_budget = cap - len(reserved)
+        rng = random.Random(f'{seed}:trim-leftover')
+        rng.shuffle(leftover)
+        selected = reserved + leftover[:remaining_budget]
 
     return sorted(set(selected))
 
