@@ -17,13 +17,14 @@ import { createRequire } from 'node:module';
 
 import grouping from '../../src/dashboard/static/redux/prd_grouping.js';
 
-const { prdTitle, aggregatePrdStatus, summarizePrdMembers } = grouping;
+const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd } = grouping;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/prd_grouping.js';
 const EXPECTED_FUNCTION_NAMES = [
   'prdTitle',
   'aggregatePrdStatus',
   'summarizePrdMembers',
+  'groupTasksByPrd',
 ];
 
 // Builds a minimal task fixture — only the fields prd_grouping.js's
@@ -176,4 +177,59 @@ test('summarizePrdMembers: total always equals tasks.length, including cancelled
 
 test('summarizePrdMembers: empty input yields all-zero counts', () => {
   assert.deepEqual(summarizePrdMembers([]), { done: 0, inProgress: 0, blocked: 0, pending: 0, total: 0 });
+});
+
+// ---------------------------------------------------------------------------
+// groupTasksByPrd — buckets by `prd` preserving first-seen-prd input order;
+// each group's tasks preserve input order; prd===null tasks collapse into a
+// single trailing "no PRD" group (flagged via `noPrd: true`), placed LAST
+// regardless of where in the input the null-prd tasks appeared.
+// ---------------------------------------------------------------------------
+
+test('groupTasksByPrd: empty input yields an empty array', () => {
+  assert.deepEqual(groupTasksByPrd([]), []);
+});
+
+test('groupTasksByPrd: two tasks sharing a non-null prd land in one group, preserving input order', () => {
+  const tasks = [mkTask('A', { prd: 'p1' }), mkTask('B', { prd: 'p1' })];
+  const groups = groupTasksByPrd(tasks);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].prd, 'p1');
+  assert.deepEqual(groups[0].tasks.map(t => t.id), ['A', 'B']);
+});
+
+test('groupTasksByPrd: groups appear in first-seen-prd input order; each group preserves input order', () => {
+  const tasks = [
+    mkTask('A', { prd: 'p2' }),
+    mkTask('B', { prd: 'p1' }),
+    mkTask('C', { prd: 'p2' }),
+    mkTask('D', { prd: 'p1' }),
+  ];
+  const groups = groupTasksByPrd(tasks);
+  assert.deepEqual(groups.map(g => g.prd), ['p2', 'p1']);
+  assert.deepEqual(groups[0].tasks.map(t => t.id), ['A', 'C']);
+  assert.deepEqual(groups[1].tasks.map(t => t.id), ['B', 'D']);
+});
+
+test('groupTasksByPrd: null-prd tasks collapse into one trailing "no PRD" group, even when first in input', () => {
+  const tasks = [
+    mkTask('N1', { prd: null }),
+    mkTask('A', { prd: 'p1' }),
+    mkTask('N2', { prd: null }),
+  ];
+  const groups = groupTasksByPrd(tasks);
+  assert.equal(groups.length, 2);
+  assert.equal(groups[0].prd, 'p1');
+  assert.ok(!groups[0].noPrd);
+  assert.equal(groups[1].prd, null);
+  assert.equal(groups[1].noPrd, true);
+  assert.deepEqual(groups[1].tasks.map(t => t.id), ['N1', 'N2']);
+});
+
+test('groupTasksByPrd: all-null input yields a single flagged no-PRD group', () => {
+  const tasks = [mkTask('A', { prd: null }), mkTask('B', { prd: null })];
+  const groups = groupTasksByPrd(tasks);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].noPrd, true);
+  assert.deepEqual(groups[0].tasks.map(t => t.id), ['A', 'B']);
 });
