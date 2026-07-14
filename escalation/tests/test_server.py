@@ -2311,6 +2311,239 @@ class TestMergeRequestWorkflowVerifyEmission:
             )
             await _call_merge_cancel(server, request_id=result['request_id'])
 
+    async def test_default_verified_green_emits_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Calling merge_request WITHOUT verified_green (implicit default
+        False) emits zero workflow_verify rows — the honest
+        INDETERMINATE-preserving gate for pathways that cannot vouch a
+        verify actually ran.
+        """
+        from unittest.mock import AsyncMock
+
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+
+        tip = 't' * 40
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            '_resolve_dispatch_time_merge_base',
+            AsyncMock(return_value='s' * 40),
+        )
+
+        stub_git = types.SimpleNamespace(
+            resolve_branch_sha=AsyncMock(
+                side_effect=lambda b: tip if b == 'task/778' else None
+            ),
+            is_ancestor=AsyncMock(return_value=False),
+            find_inflight_merge_worktree=AsyncMock(return_value=None),
+        )
+        stub_harness = types.SimpleNamespace(
+            git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
+        )
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-default')
+
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            harness=stub_harness,
+            orch_config=orch_config,
+            event_store=event_store,
+            merge_queue=asyncio.Queue(),
+        )
+
+        result = await _call_merge_request(
+            server,
+            task_id='778',
+            branch='778',
+            worktree=str(tmp_path / 'wt'),
+            description='',
+            wait_secs=0,
+        )
+
+        try:
+            rows = event_store.fetch_events_by_type(EventType.workflow_verify)
+            assert rows == [], f'Expected zero workflow_verify rows, got: {rows}'
+        finally:
+            assert result.get('status') == 'queued', (
+                f'Expected status queued, got: {result}'
+            )
+            await _call_merge_cancel(server, request_id=result['request_id'])
+
+    async def test_verified_green_false_explicit_emits_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """verified_green=False (explicit) emits zero workflow_verify rows —
+        pinned separately from the implicit-default case above since the
+        gate is ``if verified_green:``, not an ``is None`` check.
+        """
+        from unittest.mock import AsyncMock
+
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+
+        tip = 't' * 40
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            '_resolve_dispatch_time_merge_base',
+            AsyncMock(return_value='s' * 40),
+        )
+
+        stub_git = types.SimpleNamespace(
+            resolve_branch_sha=AsyncMock(
+                side_effect=lambda b: tip if b == 'task/779' else None
+            ),
+            is_ancestor=AsyncMock(return_value=False),
+            find_inflight_merge_worktree=AsyncMock(return_value=None),
+        )
+        stub_harness = types.SimpleNamespace(
+            git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
+        )
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-explicit-false')
+
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            harness=stub_harness,
+            orch_config=orch_config,
+            event_store=event_store,
+            merge_queue=asyncio.Queue(),
+        )
+
+        result = await _call_merge_request(
+            server,
+            task_id='779',
+            branch='779',
+            worktree=str(tmp_path / 'wt'),
+            description='',
+            verified_green=False,
+            wait_secs=0,
+        )
+
+        try:
+            rows = event_store.fetch_events_by_type(EventType.workflow_verify)
+            assert rows == [], f'Expected zero workflow_verify rows, got: {rows}'
+        finally:
+            assert result.get('status') == 'queued', (
+                f'Expected status queued, got: {result}'
+            )
+            await _call_merge_cancel(server, request_id=result['request_id'])
+
+    async def test_verified_green_true_but_already_merged_emits_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        """verified_green=True on a branch whose tip is already an ancestor
+        of main hits the already_merged fast-path and returns BEFORE the
+        emission block is reached — a branch already on main has no pending
+        merge to attribute, so this correctly emits nothing.
+        """
+        from unittest.mock import AsyncMock
+
+        tip = 't' * 40
+        stub_git = types.SimpleNamespace(
+            resolve_branch_sha=AsyncMock(
+                side_effect=lambda b: tip if b == 'task/780' else None
+            ),
+            is_ancestor=AsyncMock(return_value=True),
+            find_inflight_merge_worktree=AsyncMock(return_value=None),
+        )
+        stub_harness = types.SimpleNamespace(
+            git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
+        )
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-already-merged')
+
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            harness=stub_harness,
+            orch_config=orch_config,
+            event_store=event_store,
+            merge_queue=asyncio.Queue(),
+        )
+
+        result = await _call_merge_request(
+            server,
+            task_id='780',
+            branch='780',
+            worktree=str(tmp_path / 'wt'),
+            description='',
+            verified_green=True,
+            wait_secs=0,
+        )
+
+        # Fast-path short-circuits before any MergeRequest/future is created —
+        # no queue entry, no waiter, so no merge_cancel cleanup is needed
+        # (mirrors test_already_merged_fast_path_dedups_prefixed_branch).
+        assert result.get('status') == 'already_merged', (
+            f'Expected status already_merged, got: {result}'
+        )
+        rows = event_store.fetch_events_by_type(EventType.workflow_verify)
+        assert rows == [], f'Expected zero workflow_verify rows, got: {rows}'
+
+    async def test_verified_green_true_with_no_event_store_does_not_raise(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """verified_green=True on a server with no event_store wired (e.g.
+        standalone escalation without an orchestrator) must NOT raise — it
+        degrades to no attribution, the same fail-open guarantee as a git
+        error inside the base_sha helper, and still returns a normal
+        queued/attached response.
+
+        RED (pre step-4): the emission block unconditionally calls
+        event_store.emit(...) whenever verified_green is True, so a None
+        event_store raises AttributeError here instead of degrading
+        gracefully.
+        """
+        from unittest.mock import AsyncMock
+
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+
+        tip = 't' * 40
+        # Monkeypatched for determinism even though the post-step-4 gate
+        # short-circuits before this would ever be called when event_store
+        # is None — avoids relying on a real git subprocess pre-step-4.
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            '_resolve_dispatch_time_merge_base',
+            AsyncMock(return_value='s' * 40),
+        )
+
+        stub_git = types.SimpleNamespace(
+            resolve_branch_sha=AsyncMock(
+                side_effect=lambda b: tip if b == 'task/781' else None
+            ),
+            is_ancestor=AsyncMock(return_value=False),
+            find_inflight_merge_worktree=AsyncMock(return_value=None),
+        )
+        stub_harness = types.SimpleNamespace(
+            git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
+        )
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            harness=stub_harness,
+            orch_config=orch_config,
+            event_store=None,
+            merge_queue=asyncio.Queue(),
+        )
+
+        result = await _call_merge_request(
+            server,
+            task_id='781',
+            branch='781',
+            worktree=str(tmp_path / 'wt'),
+            description='',
+            verified_green=True,
+            wait_secs=0,
+        )
+
+        try:
+            assert result.get('status') in ('queued', 'attached'), (
+                f'Expected a normal queued/attached response, got: {result}'
+            )
+        finally:
+            if result.get('status') == 'queued':
+                await _call_merge_cancel(server, request_id=result['request_id'])
+
 
 # ---------------------------------------------------------------------------
 # TestGetMergeQueue — live merge-queue snapshot via get_merge_queue MCP tool
