@@ -128,14 +128,38 @@ Never process L0 or L1 from this skill, even if explicitly asked — doing so wo
 ### Starting the watcher
 
 ```bash
-cd $DARK_FACTORY_ROOT && uv run --project escalation python -m escalation.watcher \
-  --queue-dir <project_root>/data/escalations --level 2 \
-  [--exclude-id <esc-id>] [...] 2>&1
+cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
+  --queue-dir <project_root>/data/escalations --level 2 --timeout 540 [--baseline] 2>&1
 ```
 
-Run as a **background task** (Bash with `run_in_background`). The `--level 2` flag restricts the inotify watcher to L2 escalation files only. The watcher uses inotify and exits after the first matching L2 escalation, printing its JSON to stdout. If a matching L2 escalation is already pending when the watcher starts, it may fire immediately at launch — this is expected, not an error, and is consistent with drain-after-up ordering (the subsequent drain re-finds it).
+Run as a **background task** (Bash with `run_in_background`). `scripts/watcher-rearm.sh` is the
+canonical bounded-wait + re-arm wrapper around `escalation.watcher` shared by this skill and
+escalation-watcher-auto. `--level 2` restricts the inotify watcher to L2 escalation files only; the
+watcher exits after the first matching L2 escalation, printing its JSON to stdout. If a matching L2
+escalation is already pending when the watcher starts, it may fire immediately at launch — this is
+expected, not an error, and is consistent with drain-after-up ordering (the subsequent drain
+re-finds it). The wrapper preserves the underlying watcher's exit code (`0`=fired, `124`=timeout)
+and emits a `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` line to **stderr** on
+every run — do NOT pipe `2>&1` when you parse stdout as the escalation JSON, or you'll corrupt the
+parse.
 
-**Re-arming over deliberately-pending items:** any L2 item you deliberately left pending (Priority 3b, `design_concern`, `risk_identified`, `infra_issue`, AFK leave-pending paths) sits in the queue and causes every subsequent watcher start to instantly re-fire on it — degenerating into a busy-loop. Pass `--exclude-id <esc-id>` (repeatable) for each such item so the initial scan and event loop skip it. `--exclude-id` also suppresses event-loop wakes from dedupe rewrites of those files (MOVED_TO events on the excluded file are silently ignored). Both the bare id form (`esc-42-1`) and the `.json`-suffixed form are accepted.
+**Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds (540 here) before
+returning. If you ever invoke `watcher-rearm.sh --timeout 540` as a **foreground** call (e.g. while
+debugging outside the background task), the calling Bash tool's own timeout must be set to
+**≥ 600000ms** (10 min) — the harness's 2-minute default will otherwise kill the wait before it can
+return (the 07-09 exit-143 failure mode this wrapper exists to prevent).
+
+**Re-arming over deliberately-pending items:** any L2 item you deliberately left pending (Priority
+3b, `design_concern`, `risk_identified`, `infra_issue`, AFK leave-pending paths) sits in the queue
+and would cause every subsequent watcher start to instantly re-fire on it — degenerating into a
+busy-loop. Append `<esc-id>` (one per line; both the bare `esc-42-1` and `.json`-suffixed forms are
+accepted) to the wrapper-owned exclude-file instead of hand-maintaining a growing `--exclude-id`
+list — the wrapper always wires `--exclude-file` into the watcher invocation and re-reads it every
+poll, so an append takes effect without restarting the watcher, and it also suppresses event-loop
+wakes from dedupe rewrites of that file. The resolved path (default
+`<queue-dir>/.watcher-rearm-exclude-l2`, or your `--exclude-file` override) is printed to stderr on
+every wrapper run; pass `--check` for a dry-run print of the resolved path without starting the
+watcher.
 
 **Process safety**: only stop watcher processes you started via background task controls. Never `pkill` by pattern — other orchestrators, the user, or other sessions may have their own watchers.
 
@@ -196,7 +220,7 @@ Quality is king. In the long term, high quality is fast and cheap, but bugs and 
 - Create a local task/todo to track the need for resolution
 - Continue handling other escalations while you wait
 - Periodically remind (every ~3-5 escalation cycles, not more)
-- **Pass `--exclude-id <esc-id>` on every subsequent watcher (re)start** while the item is deliberately pending, so the initial scan does not instantly re-fire on it and busy-loop. The flag also suppresses event-loop wakes from dedupe rewrites of that file.
+- **Append `<esc-id>` to the wrapper-owned exclude-file** (see "Starting the watcher" above; path printed to stderr by `scripts/watcher-rearm.sh`) while the item is deliberately pending, so the initial scan does not instantly re-fire on it and busy-loop. Because the wrapper re-reads the exclude-file every poll, this also suppresses event-loop wakes from dedupe rewrites of that file without needing a watcher restart.
 - **File a DecisionRecord via `write-decision`** (see "Filing Parked Decisions to the Cockpit Registry" below) — IN ADDITION to the reminder above, so this item surfaces in the cockpit decision queue.
 
 It is better to stall development than to bake in a significant bad decision.
@@ -316,8 +340,9 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
      it to the digest — do NOT spawn an interactive `/unblock`.
    - **`wip_conflict` / `unmerged_state` / `dependency_discovered`-with-no-task / `design_concern` /
      `risk_identified` / `infra_issue` / `recon_*`:** leave pending + digest. These need a human;
-     a terminal nobody attends just clutters. Pass `--exclude-id <esc-id>` on the next watcher
-     (re)start for each item left pending so the initial scan does not busy-loop on it.
+     a terminal nobody attends just clutters. Append `<esc-id>` to the wrapper-owned exclude-file
+     (see "Starting the watcher" above) for each item left pending so the initial scan does not
+     busy-loop on it.
    - Either way, also **file a DecisionRecord via `write-decision`** (see "Filing Parked Decisions
      to the Cockpit Registry" below) for each item left pending — IN ADDITION to the digest entry.
 
@@ -603,14 +628,14 @@ Architectural or design questions. These already failed steward auto-resolution 
 2. Leave the escalation pending
 3. Create a local task/todo to track it
 4. Continue handling other escalations while waiting
-5. Pass `--exclude-id <esc-id>` on every subsequent watcher (re)start while this item is pending
+5. Append `<esc-id>` to the wrapper-owned exclude-file (see "Starting the watcher" above) while this item is pending
 
 ### `risk_identified` (info)
 
 An agent flagged a risk during development. Risk assessment requires human judgment.
 
-**Escalate to the human.** Tell them, track as todo, continue with other work. Pass
-`--exclude-id <esc-id>` on every subsequent watcher (re)start while this item is pending.
+**Escalate to the human.** Tell them, track as todo, continue with other work. Append `<esc-id>` to
+the wrapper-owned exclude-file (see "Starting the watcher" above) while this item is pending.
 
 ### `cleanup_needed` (info, rarely blocking)
 
@@ -667,7 +692,7 @@ Infrastructure problems — database connectivity, MCP failures, service outages
 4. File a DecisionRecord via `write-decision` (see "Filing Parked Decisions to the Cockpit
    Registry" above) — IN ADDITION to telling the human directly
 5. Wait for human instructions
-6. Pass `--exclude-id <esc-id>` on every subsequent watcher (re)start while this item is pending
+6. Append `<esc-id>` to the wrapper-owned exclude-file (see "Starting the watcher" above) while this item is pending
 
 ### `recon_*` categories
 
