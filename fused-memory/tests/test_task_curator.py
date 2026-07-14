@@ -6,6 +6,7 @@ import asyncio
 import logging
 import uuid
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -5646,8 +5647,11 @@ additional rules for duplicates that exist WITHIN the batch:
 """
 
 
-def _prompt_artifact_provenance_kwargs(**overrides):
-    kwargs = dict(
+def _prompt_artifact_provenance_kwargs(**overrides: Any) -> dict[str, Any]:
+    # dict[str, Any] is intentional: ArtifactProvenance's fields have
+    # heterogeneous types and spreading a concrete dict[str, <union>] defeats
+    # pyright's per-parameter type checking at the ** call site.
+    kwargs: dict[str, Any] = dict(
         optimizer_model='claude-opus-4',
         corpus_hash='sha256:deadbeef',
         split_seed=42,
@@ -5827,6 +5831,7 @@ class TestCuratorPromptLoaderWiringSingle:
                 CandidateTask(title='T'), pool=[], pool_sizes=pool_sizes,
                 start=0.0, project_id='p', project_root='/x',
             )
+        assert mock.await_args is not None
         assert mock.await_args.kwargs['system_prompt'] == CURATOR_SINGLE_SPEC.in_code_constant
 
         # Pin a heuristics override for this exact (prompt_id, model, harness) key.
@@ -5844,6 +5849,7 @@ class TestCuratorPromptLoaderWiringSingle:
                 CandidateTask(title='T'), pool=[], pool_sizes=pool_sizes,
                 start=0.0, project_id='p', project_root='/x',
             )
+        assert mock.await_args is not None
         assert mock.await_args.kwargs['system_prompt'] == compose_prompt(
             CURATOR_SINGLE_SPEC.contract, heuristics,
         )
@@ -5885,6 +5891,7 @@ class TestCuratorPromptLoaderWiringBatch:
                 candidates, pools=[[], []], pool_sizes_list=[pool_sizes, pool_sizes],
                 start=0.0, project_id='p', project_root='/x',
             )
+        assert mock.await_args is not None
         assert mock.await_args.kwargs['system_prompt'] == CURATOR_BATCH_SPEC.in_code_constant
 
         # Pin a heuristics override for this exact (prompt_id, model, harness) key.
@@ -5902,6 +5909,7 @@ class TestCuratorPromptLoaderWiringBatch:
                 candidates, pools=[[], []], pool_sizes_list=[pool_sizes, pool_sizes],
                 start=0.0, project_id='p', project_root='/x',
             )
+        assert mock.await_args is not None
         assert mock.await_args.kwargs['system_prompt'] == compose_prompt(
             CURATOR_BATCH_SPEC.contract, heuristics,
         )
