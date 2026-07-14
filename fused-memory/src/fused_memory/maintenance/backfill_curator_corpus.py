@@ -149,6 +149,13 @@ class BackfillManager:
 
         logger.info('backfill_curator_corpus: fetching task tree for prune sweep %s', project_root)
         try:
+            # Residual race (accepted, not fixed here): a tag created after
+            # list_tags() returns but before the per-tag get_tasks() loop
+            # below finishes won't appear in `tags`, so a task filed under
+            # it this cycle could be false-pruned if its corpus vector was
+            # already written. Self-heals on the next sweep once the tag is
+            # enumerated — the same class of enumerate-then-read snapshot
+            # race the prior single-tag read already carried for DEFAULT_TAG.
             tags = await self.taskmaster.list_tags(project_root)
             live_ids: set[str] = set()
             for tag in tags:
