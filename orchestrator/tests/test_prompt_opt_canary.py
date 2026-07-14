@@ -558,3 +558,121 @@ class TestDeployAtFromProvenance:
         )
 
         assert result is None
+
+
+_CLI_METRICS = ('cost_per_done_task', 'requeue_rate', 'mean_review_cycles', 'mean_verify_attempts')
+
+
+def _make_cli_regressed_db(tmp_path: Path) -> Path:
+    """Same shape as TestRunCanary's regress scenario: 5 clean baseline
+    rows vs 4 identical post rows + 1 sharply pricier requeued row."""
+    db_path = tmp_path / 'runs.db'
+    rows = [
+        {
+            'task_id': f'b-{i}', 'project_id': 'dark_factory', 'outcome': 'done',
+            'cost_usd': 1.0, 'steward_cost_usd': 0.0, 'review_cycles': 1, 'verify_attempts': 1,
+            'completed_at': date,
+        }
+        for i, date in enumerate([
+            '2026-06-09T00:00:00+00:00', '2026-06-10T00:00:00+00:00',
+            '2026-06-11T00:00:00+00:00', '2026-06-12T00:00:00+00:00',
+            '2026-06-13T00:00:00+00:00',
+        ])
+    ] + [
+        {
+            'task_id': f'p-{i}', 'project_id': 'dark_factory', 'outcome': 'done',
+            'cost_usd': 1.0, 'steward_cost_usd': 0.0, 'review_cycles': 1, 'verify_attempts': 1,
+            'completed_at': date,
+        }
+        for i, date in enumerate([
+            '2026-06-15T00:00:00+00:00', '2026-06-16T00:00:00+00:00',
+            '2026-06-17T00:00:00+00:00', '2026-06-18T00:00:00+00:00',
+        ])
+    ] + [
+        {
+            'task_id': 'p-requeued', 'project_id': 'dark_factory', 'outcome': 'requeued',
+            'cost_usd': 21.0, 'steward_cost_usd': 0.0, 'review_cycles': 0, 'verify_attempts': 0,
+            'completed_at': '2026-06-19T00:00:00+00:00',
+        },
+    ]
+    _make_runs_db(db_path, rows)
+    return db_path
+
+
+def _make_cli_steady_db(tmp_path: Path) -> Path:
+    """Same shape as TestRunCanary's steady scenario: post cost_usd nudged
+    +5%, within the 20% default relative tolerance -> nothing regresses."""
+    db_path = tmp_path / 'runs.db'
+    rows = [
+        {
+            'task_id': f'b-{i}', 'project_id': 'dark_factory', 'outcome': 'done',
+            'cost_usd': 1.0, 'steward_cost_usd': 0.0, 'review_cycles': 1, 'verify_attempts': 1,
+            'completed_at': date,
+        }
+        for i, date in enumerate([
+            '2026-06-09T00:00:00+00:00', '2026-06-10T00:00:00+00:00',
+            '2026-06-11T00:00:00+00:00', '2026-06-12T00:00:00+00:00',
+            '2026-06-13T00:00:00+00:00',
+        ])
+    ] + [
+        {
+            'task_id': f'p-{i}', 'project_id': 'dark_factory', 'outcome': 'done',
+            'cost_usd': 1.05, 'steward_cost_usd': 0.0, 'review_cycles': 1, 'verify_attempts': 1,
+            'completed_at': date,
+        }
+        for i, date in enumerate([
+            '2026-06-15T00:00:00+00:00', '2026-06-16T00:00:00+00:00',
+            '2026-06-17T00:00:00+00:00', '2026-06-18T00:00:00+00:00',
+            '2026-06-19T00:00:00+00:00',
+        ])
+    ]
+    _make_runs_db(db_path, rows)
+    return db_path
+
+
+class TestCanaryCLI:
+    """CLI smoke test (click.testing.CliRunner, mirroring
+    test_reviewer_trial_main.py): the `canary` command prints a per-metric
+    PASS/REGRESS line for each of the four metrics, and exits 0 on pass /
+    nonzero on regress -- using the CLI's DEFAULT thresholds (no override
+    flags), which match _explicit_thresholds()'s values exactly."""
+
+    def test_regress_fixture_prints_per_metric_lines_and_exits_nonzero(self, tmp_path: Path) -> None:
+        db_path = _make_cli_regressed_db(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            'canary',
+            '--runs-db', str(db_path),
+            '--deploy-at', '2026-06-15T00:00:00+00:00',
+            '--project-id', 'dark_factory',
+            '--baseline-days', '7',
+            '--post-days', '7',
+        ])
+
+        assert result.exit_code != 0, (
+            f'Expected nonzero exit for a regressed fixture.\nOutput:\n{result.output}'
+            + (f'\nException: {result.exception}' if result.exception else '')
+        )
+        for metric in _CLI_METRICS:
+            assert metric in result.output, f'Missing {metric!r} line.\nOutput:\n{result.output}'
+        assert 'REGRESS' in result.output
+        assert 'PASS' in result.output
+
+    def test_pass_fixture_exits_zero(self, tmp_path: Path) -> None:
+        db_path = _make_cli_steady_db(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            'canary',
+            '--runs-db', str(db_path),
+            '--deploy-at', '2026-06-15T00:00:00+00:00',
+            '--project-id', 'dark_factory',
+            '--baseline-days', '7',
+            '--post-days', '7',
+        ])
+
+        assert result.exit_code == 0, (
+            f'Expected exit 0 for a steady/pass fixture.\nOutput:\n{result.output}'
+            + (f'\nException: {result.exception}' if result.exception else '')
+        )
+        for metric in _CLI_METRICS:
+            assert metric in result.output, f'Missing {metric!r} line.\nOutput:\n{result.output}'
