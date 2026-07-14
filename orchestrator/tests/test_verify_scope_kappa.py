@@ -393,3 +393,82 @@ class TestModuleConfigScopeGoldens:
             f'expected the _scope_to_keyword-scoped string {expected!r}, got '
             f'{executed[0].test_command!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-5: delete-the-twin invariant
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteTheTwinInvariant:
+    """task κ deletes ``scope_module_config`` — the hand-mirrored twin the two
+    drift notes (verify.py / verify_plan.py) document — once the plan is the
+    SOLE decision tree for module scope.
+
+    RED today: ``scope_module_config`` still exists (removed in step-6, along
+    with both drift-note passages).
+    """
+
+    def test_scope_module_config_no_longer_exists(self):
+        assert not hasattr(verify, 'scope_module_config'), (
+            'scope_module_config is the hand-mirrored twin the drift notes '
+            'document — task κ deletes it once derive_verify_plan is the sole '
+            'decision tree for module scope (step-6)'
+        )
+
+    def test_verify_py_drift_note_is_gone(self):
+        source = Path(verify.__file__).read_text()
+        assert 'has_structural/has_conftest/has_test_data scan is a SEPARATE decision' not in source, (
+            "verify.py's scope_module_config drift note must be removed once "
+            'the twin it documents is deleted (step-6)'
+        )
+
+    def test_verify_plan_drift_note_is_gone(self):
+        source = Path(verify_plan.__file__).read_text()
+        assert 'mirrored BY HAND in verify.scope_module_config' not in source, (
+            "verify_plan._derive_module_runs' drift note must be removed once "
+            'scope_module_config (the hand-mirrored twin) is deleted (step-6)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_classify_file_runs_exactly_once_per_touched_file(self, tmp_path: Path):
+        """The module-config execution path does not independently re-classify:
+        classify_file runs exactly once per distinct touched .py file — proof
+        there is no second (hand-mirrored) decision tree consuming it.
+        """
+        (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
+        (tmp_path / 'mymod' / 'tests' / 'test_thing.py').write_text('def test_thing(): pass\n')
+        (tmp_path / 'mymod' / 'helpers.py').write_text('def helper():\n    return 1\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(
+                prefix='mymod',
+                test_command='uv run --directory mymod pytest tests/',
+                lint_command='uv run --directory mymod ruff check .',
+                type_check_command='uv run --directory mymod pyright',
+            ),
+        ]
+        task_files = ['mymod/tests/test_thing.py', 'mymod/helpers.py']
+
+        calls: list[str] = []
+        real_classify_file = verify_plan.classify_file
+
+        def counting_classify_file(path, content):
+            calls.append(path)
+            return real_classify_file(path, content)
+
+        mock_run_verification = _run_verification_spy()
+        with (
+            patch.object(verify, 'run_verification', new=mock_run_verification),
+            patch.object(verify_plan, 'classify_file', side_effect=counting_classify_file),
+        ):
+            await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=task_files,
+            )
+
+        assert len(calls) == len(set(calls)) == len(task_files), (
+            f'classify_file must run exactly once per distinct touched .py file '
+            f'on the module-config path — no independent re-classification by a '
+            f'second (hand-mirrored) decision tree: calls={calls!r}'
+        )
