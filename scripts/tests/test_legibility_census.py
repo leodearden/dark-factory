@@ -1180,7 +1180,13 @@ def test_run_census_submit_fn_raising_is_best_effort_not_fatal(tmp_path, caplog)
     assert len(fake_commit.calls) == 1
 
 
-def test_run_census_submit_fn_non_dict_result_records_none_id(tmp_path):
+# ---------------------------------------------------------------------------
+# amend round 2: an id-less submit_fn result must not be counted as a
+# genuinely-filed task, nor leak a "- None" bullet into the human-facing
+# report or inflate the filed-task count (reviewer_comprehensive finding #1).
+# ---------------------------------------------------------------------------
+
+def test_run_census_submit_fn_non_dict_result_is_not_counted_as_filed(tmp_path, caplog):
     batch = [
         _hand_digest("dup-1", "nothing new here"),
         _hand_digest("novel-verified", "a genuinely new confusion shape"),
@@ -1203,10 +1209,64 @@ def test_run_census_submit_fn_non_dict_result_records_none_id(tmp_path):
         commit=_make_fake_commit(),
     )
 
-    outcome = mod.run_census(**kwargs)
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    assert outcome.filed_task_ids == [None], "a non-dict submit_fn result must not crash .get('id')"
+    assert outcome.filed_task_ids == [], (
+        "a non-dict submit_fn result must not crash .get('id'), and must not "
+        "be counted as a genuinely-filed task"
+    )
+    assert any("no usable id" in r.message for r in caplog.records), "must log loudly, not swallow silently"
+
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    filed_section = report_text.split("## Filed Tasks")[1].split("## Cost")[0]
+    assert "None" not in filed_section, "an id-less result must never render as a '- None' bullet"
+    assert "_none filed._" in filed_section
+
+
+def test_run_census_promote_clamps_out_of_enum_severity_to_medium(tmp_path):
+    """A custom verify_fn may enrich a cluster with a severity outside
+    codebook.py's {high, medium, low} entry enum (e.g. an escalation-style
+    'critical', valid elsewhere in this codebase but not in the codebook's
+    own schema). That must be clamped, not persisted verbatim into a
+    codebook.dump() that would otherwise raise deep into the pipeline
+    (reviewer_comprehensive finding #3)."""
+    batch = [
+        _hand_digest("dup-1", "nothing new here"),
+        _hand_digest("novel-verified", "a genuinely new confusion shape"),
+    ]
+    fake_invoke = _make_fake_invoke(_happy_invoke_response)
+
+    def bad_severity_verify_fn(clusters, *, model):
+        verified = [
+            {**c, "severity": "critical"}
+            for c in clusters
+            if c.get("title") == "Silent no-op subagent contract"
+        ]
+        return {"verified": verified, "rejected": [], "fixed": []}
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        batch_source=[batch],
+        verify_fn=bad_severity_verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done", "an out-of-enum severity from verify_fn must not crash the census"
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    promoted_entry = next(
+        e for e in persisted["entries"] if e["title"] == "Silent no-op subagent contract"
+    )
+    assert promoted_entry["severity"] == "medium", "an out-of-enum severity is clamped, never persisted verbatim"
 
 
 def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):

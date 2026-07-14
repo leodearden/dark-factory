@@ -696,6 +696,18 @@ def _find_pending_candidate_id(cb: dict, title: str | None) -> str | None:
     return None
 
 
+_VALID_ENTRY_SEVERITIES = ("high", "medium", "low")
+"""codebook.py's own ``_ENTRY_SCHEMA["severity"]`` enum, duplicated here
+since codebook.py is NOT modified by this module (see the module
+docstring's "Codebook handling" section). ``run_census`` clamps an
+untrusted verify_fn-returned cluster's severity to this closed set before
+it ever reaches ``codebook.validate()`` -- an out-of-enum value (e.g. an
+escalation-style ``"critical"``/``"urgent"``, valid elsewhere in this
+codebase but NOT in the codebook's own severity enum) would otherwise fail
+validation deep into the pipeline, after mining/verify/synthesis work is
+already spent (reviewer_comprehensive finding #3)."""
+
+
 @dataclass
 class CensusOutcome:
     """Outcome of ``run_census``. ``status`` is ``"deferred"`` (headroom
@@ -751,18 +763,34 @@ def run_census(
     here) -> ``compute_matrix``/``render_matrix`` over verified sightings ->
     merge every mining record via ``codebook.apply_coding_record`` -> apply
     ``promote_candidate``/``reject_candidate`` for verified/rejected
-    clusters (resolved to the merge's real candidate ids by title) and
-    ``retire_entry`` for any entry ids *verify_fn* reports fixed ->
-    ``codebook.validate`` + ``codebook.dump`` -> ``build_task_payloads`` +
-    *submit_fn* per payload (best-effort -- a raised exception or a
-    non-dict/id-less result is logged and skipped rather than aborting the
-    run, since this happens AFTER the codebook is already persisted) ->
+    clusters (resolved to the merge's real candidate ids by title, severity
+    clamped to the codebook's own enum -- an untrusted out-of-enum severity
+    from *verify_fn* would otherwise fail ``codebook.validate`` deep into
+    the pipeline) and ``retire_entry`` for any entry ids *verify_fn*
+    reports fixed -> ``codebook.validate`` (raises and aborts BEFORE
+    anything is written, on an invalid merge) -> ``build_task_payloads`` +
+    *submit_fn* per payload, best-effort (a raised exception, or a result
+    with no usable id, is logged and excluded from ``filed_task_ids``
+    rather than aborting the run or inflating the filed-task count) ->
     ``render_report`` -> write the report to *report_path* ->
-    ``advance_census_state`` (done-count from *status_fetcher*) ->
-    best-effort *commit* of report + codebook + state. A storm batch
-    encountered during mining (see ``mine_to_saturation``) is logged loudly
-    and called out in the report's cost note rather than silently folded
-    into a clean-looking result.
+    ``codebook.dump`` -> ``advance_census_state`` (done-count from
+    *status_fetcher*) -> best-effort *commit* of report + codebook + state.
+
+    The report write, ``codebook.dump``, and ``advance_census_state`` run
+    in that fixed order, with nothing else in between the latter two, to
+    keep as small as possible the window in which a mid-pipeline failure
+    could leave on-disk state inconsistent: a failure before
+    ``codebook.dump`` leaves at most the report written (harmless -- a
+    plain re-run regenerates it); a failure inside ``advance_census_state``
+    itself (the one residual risk -- e.g. a disk-full atomic-write failure)
+    leaves the codebook advanced ahead of census-state.json on disk.
+    Recovery for that residual case is a plain re-run:
+    ``codebook.apply_coding_record`` dedups merged sightings/candidates by
+    session, and a promoted/rejected candidate is no longer ``"pending"``,
+    so re-mining the same window is idempotent rather than double-counted.
+    A storm batch encountered during mining (see ``mine_to_saturation``) is
+    logged loudly and called out in the report's cost note rather than
+    silently folded into a clean-looking result.
     """
     headroom = preflight_headroom(invoke, model=config.models.trickle)
     if not headroom.ok:
@@ -804,10 +832,18 @@ def run_census(
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
         if cand_id is None:
             continue
+        severity = cluster.get("severity")
+        if severity not in _VALID_ENTRY_SEVERITIES:
+            if severity is not None:
+                logger.warning(
+                    "census: cluster %r carries out-of-enum severity %r; "
+                    "clamping to 'medium'", cluster.get("title"), severity,
+                )
+            severity = "medium"
         entry_fields = {
             "id": f"entry-{cand_id}",
             "title": cluster.get("title"),
-            "severity": cluster.get("severity") or "medium",
+            "severity": severity,
             "status": "open",
             "origin_phase": cluster.get("origin_phase") or "unknown",
             "manifested_phase": cluster.get("manifested_phase") or "unknown",
@@ -827,14 +863,17 @@ def run_census(
         raise RuntimeError(
             f"census: codebook merge produced an invalid codebook: {validation_errors}"
         )
-    codebook.dump(updated_codebook, codebook_path)
 
-    # Best-effort per payload -- this runs AFTER codebook.dump() has already
-    # persisted, so one payload's submit_fn failure must never abort the
-    # rest of the run (which would strand the report/state unwritten).
-    # Mirrors the best-effort handling used for commit() below. A result
-    # that isn't a dict (or lacks "id") never crashes .get("id") -- it just
-    # contributes None rather than a real task id.
+    # Best-effort per payload -- a raised exception, or a result with no
+    # usable id, is logged and EXCLUDED from filed_task_ids rather than
+    # aborting the run or silently inflating the filed-task count
+    # (reviewer_comprehensive finding #1: an id-less result must never
+    # render as a "- None" report bullet, nor count as a genuinely-filed
+    # task). Mirrors the best-effort handling used for commit() below.
+    # Positioned BEFORE codebook.dump()/advance_census_state() below
+    # (reviewer_comprehensive finding #4): a bug in payload construction can
+    # then only abort the run before anything is persisted, never strand an
+    # already-advanced codebook.
     task_payloads = build_task_payloads(verified, project_root=project_root, project_id=project_id)
     filed_task_ids = []
     for payload in task_payloads:
@@ -845,9 +884,14 @@ def run_census(
                 "census: submit_fn failed for payload %r: %s", payload.get("title"), exc,
             )
             continue
-        filed_task_ids.append(
-            submit_result.get("id") if isinstance(submit_result, dict) else None
-        )
+        task_id = submit_result.get("id") if isinstance(submit_result, dict) else None
+        if task_id is None:
+            logger.warning(
+                "census: submit_fn returned no usable id for payload %r (result=%r) "
+                "-- not counted as filed", payload.get("title"), submit_result,
+            )
+            continue
+        filed_task_ids.append(task_id)
 
     storm_batch_indices = [s.index for s in mining_result.batch_stats if s.status == "failure"]
     if storm_batch_indices:
@@ -881,10 +925,23 @@ def run_census(
         filed_task_ids=filed_task_ids,
         cost_note=cost_note,
     )
+    # Written BEFORE codebook.dump()/advance_census_state() below -- a
+    # failure here (e.g. a disk-full write_text) leaves nothing but this one
+    # file touched (no codebook write, no state advance), so a re-run starts
+    # clean rather than resuming from a partially-persisted pipeline
+    # (reviewer_comprehensive finding #4).
     Path(report_path).write_text(report_md, encoding="utf-8")
 
     status = status_fetcher()
     done_count = sum(1 for v in (status.get("statuses") or {}).values() if v == "done")
+
+    # codebook.dump() and advance_census_state() are adjacent on purpose
+    # (reviewer_comprehensive finding #4): nothing else here can raise
+    # between them, so the ONLY way census-state.json can end up lagging
+    # behind an already-persisted codebook is a failure inside
+    # advance_census_state itself. Should that happen, recovery is a plain
+    # re-run -- see this function's docstring for why that is safe.
+    codebook.dump(updated_codebook, codebook_path)
     advance_census_state(
         census_state_path, now_iso=date, report_path=str(report_path), done_count=done_count,
     )
