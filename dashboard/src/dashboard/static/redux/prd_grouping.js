@@ -44,7 +44,25 @@ function aggregatePrdStatus(tasks) {
   return 'cancelled';
 }
 
-const API = { prdTitle, aggregatePrdStatus };
+// ── Per-bucket member counts for a PRD box ──
+// Single pass over `tasks` bucketing by status: done, inProgress
+// ('in-progress' or 'merge-deferred'), blocked, pending ('pending' or
+// 'deferred'), total (every member, including cancelled/anything-else,
+// which are counted in total but no other bucket). Source of both the
+// "n/m done" count (done/total) and the stacked-bar segment sizes.
+function summarizePrdMembers(tasks) {
+  const counts = { done: 0, inProgress: 0, blocked: 0, pending: 0, total: tasks.length };
+  for (const t of tasks) {
+    if (t.status === 'done') counts.done++;
+    else if (t.status === 'in-progress' || t.status === 'merge-deferred') counts.inProgress++;
+    else if (t.status === 'blocked') counts.blocked++;
+    else if (t.status === 'pending' || t.status === 'deferred') counts.pending++;
+    // cancelled (or any other/unrecognized status) is counted in total only.
+  }
+  return counts;
+}
+
+const API = { prdTitle, aggregatePrdStatus, summarizePrdMembers };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = API;
