@@ -172,6 +172,15 @@ class _SuppressionMetadata(TypedDict):
     also matches the ``recon_ledger`` table (``task_id`` column is TEXT)
     and the established 2405-thread precedent.
 
+    This per-id queryability claim holds for SINGLE-id records only. For a
+    composite comma-joined ``task_id`` (e.g. ``'2405,540,544'``), the mirror
+    stores the full joined string as ``metadata.task_id``, so a
+    per-component query (``filters={'task_id': '544'}``) does NOT match it —
+    only an exact-composite-string query does. Per-component matching for a
+    composite record is provided solely by the ``recon_ledger`` read path
+    (``filter_suppressed``, via :func:`_decompose_suppression_task_id`), not
+    by the Mem0 mirror.
+
     Reader (``filter_suppressed``) tolerates and str-coerces both ``int``
     and ``str`` task_ids for backward compat with legacy hand-authored
     records — do NOT tighten the reader to int-only without a migration
@@ -726,7 +735,14 @@ def build_suppression_payload(
     regardless of how the caller obtained the id.  A composite's components
     are stripped of surrounding whitespace (``'2405, 540'`` canonicalizes to
     ``'2405,540'``). String canonicalization keeps the Mem0 mirror queryable
-    via ``count_memories_by_metadata`` with a string filter.
+    via ``count_memories_by_metadata`` with an exact string filter — for a
+    SINGLE-id ``task_id`` this means per-id queryability
+    (``filters={'task_id': '544'}``). For a composite ``task_id`` the mirror
+    stores the full joined string, so only an exact-composite-string query
+    matches it; a per-component query does not. Per-component matching for a
+    composite record is provided solely by the ``recon_ledger`` read path
+    (:func:`filter_suppressed`, via :func:`_decompose_suppression_task_id`),
+    not by the Mem0 mirror.
 
     ``project_id`` is intentionally absent — it is a write-time concern that
     must be passed separately to ``memory_service.add_memory``, keeping this
