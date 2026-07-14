@@ -47,16 +47,28 @@ flags (see ``routing_intent_warning``) or, when
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
 
 from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     'RoutingIntentFinding',
     'routing_intent_finding',
+    'routing_intent_reject',
+    'routing_intent_warning',
+    'routing_intent_enforced',
 ]
+
+# Truthy string values for FUSED_ROUTING_INTENT_ENFORCE (case-insensitive,
+# whitespace-stripped). Unset, empty, or any other value -> warn-only
+# (the default) — see routing_intent_enforced().
+_TRUTHY_ENV_VALUES: frozenset[str] = frozenset({'1', 'true', 'yes', 'on'})
 
 _EXEMPT_EXECUTION_CLASSES: frozenset[str] = frozenset(EXECUTION_CLASSES) - {'code_tdd'}
 
@@ -222,3 +234,77 @@ def routing_intent_finding(
         details=tuple(matched_details),
         fields=tuple(matched_fields),
     )
+
+
+def routing_intent_reject(finding: RoutingIntentFinding) -> dict[str, Any]:
+    """Return a structured ValidationError dict naming *finding*'s markers.
+
+    Hard-reject payload used when :func:`routing_intent_enforced` is
+    ``True`` — mirrors the sibling guards' ``{'error', 'error_type':
+    'ValidationError', 'hint'}`` shape (see
+    ``execution_class_guard._validation_error``).
+    """
+    markers = ', '.join(finding.markers)
+    detail_text = ' '.join(finding.details)
+    return {
+        'error': (
+            f"task_kind='normal' submission declares a different execution "
+            f'path than it is filed under (matched marker(s): {markers}). '
+            f'{detail_text}'
+        ),
+        'error_type': 'ValidationError',
+        'hint': (
+            "If this is genuinely operational/decision work, set "
+            "metadata.execution_class to 'operational' or 'decision', or "
+            "resubmit with the matching task_kind (e.g. 'deterministic'). "
+            'If it is a genuine code task, remove the conflicting '
+            'declaration from the title/description/details.'
+        ),
+    }
+
+
+def routing_intent_warning(finding: RoutingIntentFinding) -> dict[str, Any]:
+    """Return a non-blocking ``{'routing_intent_warning': {...}}`` payload.
+
+    Mirrors task 2206's ``_attach_possible_scope_mismatch`` advisory-marker
+    precedent: a structured, non-blocking signal meant to be merged into the
+    submit result rather than a rejection — the returned dict carries no
+    top-level ``'error'``/``'error_type'`` key.
+
+    Also emits a greppable ``routing_intent_lint.flagged`` WARNING (the
+    census line the enforce-flip decision is meant to be based on — observe
+    the flagged rate from logs before flipping
+    ``FUSED_ROUTING_INTENT_ENFORCE``).
+    """
+    logger.warning(
+        'routing_intent_lint.flagged task_kind=normal markers=%s fields=%s',
+        ','.join(finding.markers),
+        ','.join(finding.fields),
+    )
+    return {
+        'routing_intent_warning': {
+            'markers': list(finding.markers),
+            'fields': list(finding.fields),
+            'detail': ' '.join(finding.details),
+            'hint': (
+                "This task_kind='normal' submission's text declares a "
+                "different execution path (see 'markers'). If genuinely "
+                'operational/decision work, set metadata.execution_class or '
+                'resubmit with the matching task_kind; otherwise remove the '
+                'conflicting declaration. Set FUSED_ROUTING_INTENT_ENFORCE=1 '
+                'to hard-reject such submissions instead of warning.'
+            ),
+        },
+    }
+
+
+def routing_intent_enforced() -> bool:
+    """Read ``FUSED_ROUTING_INTENT_ENFORCE`` from the environment.
+
+    Returns ``True`` (hard-reject) only when the env var is set to a
+    recognized truthy string (case-insensitive, whitespace-stripped: '1',
+    'true', 'yes', 'on'). Unset, empty, or any other value -> ``False``
+    (warn-only, the default).
+    """
+    raw = os.environ.get('FUSED_ROUTING_INTENT_ENFORCE', '')
+    return raw.strip().lower() in _TRUTHY_ENV_VALUES
