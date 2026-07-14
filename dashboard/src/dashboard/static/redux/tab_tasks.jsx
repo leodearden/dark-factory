@@ -232,28 +232,97 @@ function ProjectTaskGraph({ filtered, selectedId, focusMode, focusAnchorId, onSe
 // Each per-box TaskGraph is told renderEdges={false} (skip its own overlay)
 // and handed the SAME shared nodeRefs map (via the nodeRefs prop) so its
 // nodes register into the map the hoisted overlay reads from.
-function ProjectPrdGroups({ filtered, selectedId, onSelect, onEnterFocus }) {
+function ProjectPrdGroups({ filtered, allProjectTasks, selectedId, onSelect, onEnterFocus }) {
   const containerRef = uR_T(null);
   const nodeRefs = uR_T({});
   const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(filtered), computeTiers), [filtered]);
   const neighborhood = uM_T(() => computeNeighborhood(filtered, selectedId), [filtered, selectedId]);
+
+  // "n/m done", the outline/pip aggregate status, and the stacked status bar
+  // all read from each PRD's FULL member set (every task with that prd,
+  // regardless of the active status display filter) — per the plan's
+  // truthful-burndown requirement. Keyed by prd (null for the "no PRD"
+  // bucket) for O(1) lookup per rendered box below. Rendered node layout
+  // (g.tasks, from `groups` above) stays on the filtered subset.
+  const fullMembersByPrd = uM_T(() => {
+    const m = new Map();
+    for (const g of groupTasksByPrd(allProjectTasks)) m.set(g.noPrd ? null : g.prd, g.tasks);
+    return m;
+  }, [allProjectTasks]);
+
   return (
     <div className="prd-groups" ref={containerRef}>
       <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={filtered}
                       selectedId={selectedId} neighborhood={neighborhood} />
-      {groups.map(g => (
-        <div key={g.noPrd ? '__no_prd__' : g.prd} className="prd-box">
-          <div className="prd-box-head">
-            <span className="prd-box-title" title={g.noPrd ? undefined : g.prd}>
-              {g.noPrd ? 'No PRD' : prdTitle(g.prd)}
-            </span>
-          </div>
-          <div className="prd-box-body">
-            <TaskGraph tasks={g.tasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus}
-                       nodeRefs={nodeRefs} renderEdges={false} />
-          </div>
+      {groups.map(g => {
+        const key = g.noPrd ? null : g.prd;
+        const fullMembers = fullMembersByPrd.get(key) || g.tasks;
+        return (
+          <PrdBox key={g.noPrd ? '__no_prd__' : g.prd} group={g} fullMembers={fullMembers}
+                  selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus} nodeRefs={nodeRefs} />
+        );
+      })}
+    </div>
+  );
+}
+
+// One PRD box's chrome: title (basename via prdTitle, full path as a
+// tooltip), a status-colored outline + title pip (aggregatePrdStatus over
+// the FULL member set, driving an `s-<status>` class exactly like the
+// `.taskgraph .node.s-*` idiom — see graph_layout-era node rendering above),
+// "n/m done" + a thin stacked status bar (summarizePrdMembers over the same
+// full member set), and a collapse control that hides the box body while
+// leaving the title bar + bar visible. All-done PRDs default to collapsed.
+//
+// Kept as its own component (not inlined in ProjectPrdGroups' .map() above)
+// so each box's `collapsed` state is an independent useState — Rules of
+// Hooks requires one consistent hook set per mounted component instance,
+// not a variable-count hook call inside a loop over `groups`.
+function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nodeRefs }) {
+  const agg = aggregatePrdStatus(fullMembers);
+  const stats = summarizePrdMembers(fullMembers);
+  // Lazy-init only: this is a *default*, not an enforced state — later
+  // renders (e.g. a member finishing while the box is open) must not yank a
+  // manually-reopened box shut again, so the argument is only consulted by
+  // React on the box's first mount.
+  const [collapsed, setCollapsed] = uS_T(agg === 'done');
+  const title = g.noPrd ? 'No PRD' : prdTitle(g.prd);
+
+  // Stacked bar segments: only the four buckets the plan calls out
+  // (done/in-progress/blocked/pending). Cancelled (and any other status)
+  // still counts toward stats.total — and therefore toward "n/m done" — but
+  // is not drawn as its own segment, leaving the bar's track color to show
+  // through for that share, same as the plan's explicit segment list.
+  const segs = [
+    { cls: 's-done', n: stats.done },
+    { cls: 's-in-progress', n: stats.inProgress },
+    { cls: 's-blocked', n: stats.blocked },
+    { cls: 's-pending', n: stats.pending },
+  ].filter(s => s.n > 0);
+
+  return (
+    <div className={`prd-box s-${agg}`}>
+      <div className="prd-box-head" data-open={collapsed ? 'false' : 'true'} onClick={() => setCollapsed(c => !c)}>
+        <span className="twirl">
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+            <path d="M3.5 2L6.5 5L3.5 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+        </span>
+        <span className="status-pip"></span>
+        <span className="prd-box-title" title={g.noPrd ? undefined : g.prd}>{title}</span>
+        <span className="prd-box-count">{stats.done}/{stats.total} done</span>
+      </div>
+      <div className="prd-bar">
+        {segs.map(s => (
+          <span key={s.cls} className={`prd-bar-seg ${s.cls}`} style={{ width: `${(s.n / stats.total) * 100}%` }} />
+        ))}
+      </div>
+      {!collapsed && (
+        <div className="prd-box-body">
+          <TaskGraph tasks={g.tasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus}
+                     nodeRefs={nodeRefs} renderEdges={false} />
         </div>
-      ))}
+      )}
     </div>
   );
 }
@@ -558,7 +627,7 @@ function TasksTab({ projectFilter, search }) {
               <PG_T key={p.id} id={p.id} label={p.id} open={isOpen} onToggle={() => toggle(p.id)}
                     summary={summary} summaryRight={summaryRight}>
                 {groupByPrd
-                  ? <ProjectPrdGroups filtered={filtered} selectedId={selectedId}
+                  ? <ProjectPrdGroups filtered={filtered} allProjectTasks={projTasks} selectedId={selectedId}
                                       onSelect={setSelectedId} onEnterFocus={enterFocus} />
                   : <ProjectTaskGraph filtered={filtered} selectedId={selectedId} focusMode={focusMode}
                                       focusAnchorId={focusAnchorId} onSelect={setSelectedId} onEnterFocus={enterFocus} />}
