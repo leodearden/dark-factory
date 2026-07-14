@@ -499,14 +499,6 @@ CURATOR_BATCH_SPEC = PromptSpec(
     prompt_id='curator_batch', contract=_BATCH_CONTRACT, baseline_heuristics=_CURATOR_HEURISTICS,
 )
 
-# TODO(task 2494 step-4/step-6): these two module constants are a temporary
-# bridge so the existing _call_llm/_call_llm_batch call sites keep compiling
-# unchanged until the loader is wired in. They will be replaced by
-# self._resolve_curator_prompt(CURATOR_SINGLE_SPEC/CURATOR_BATCH_SPEC) and
-# then removed entirely.
-_SYSTEM_PROMPT = CURATOR_SINGLE_SPEC.in_code_constant
-_BATCH_SYSTEM_PROMPT = CURATOR_BATCH_SPEC.in_code_constant
-
 
 def normalize_title(title: str | None) -> str:
     """Lowercase + collapse whitespace for forgiving title comparison.
@@ -2286,13 +2278,14 @@ class TaskCurator:
             n - 1,
             self._config.curator.batch_budget_cap_usd,
         )
+        system_prompt = self._resolve_curator_prompt(CURATOR_BATCH_SPEC)
 
         agent_result: AgentResult = await invoke_with_cap_retry(
             usage_gate=self._usage_gate,
             label=f'task-curator-batch[{project_id}]',
             project_id=project_id,
             prompt=user_prompt,
-            system_prompt=_BATCH_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             cwd=cwd,
             model=self._config.curator.model,
             max_turns=max_turns,
