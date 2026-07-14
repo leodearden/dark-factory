@@ -207,6 +207,25 @@ class TestClassifyFailureKnownRows:
         assert disp.counts_against_requeue_cap is False
         assert disp.category is FailureCategory.NONE
 
+    def test_bare_warm_lane_requeue_base_matches_old_else_branch_fallback(self):
+        """Amendment (reviewer_comprehensive behavior-parity): a bare
+        WarmLaneRequeue (none of the 3 named subclasses) is never raised
+        anywhere in the tree today, but its table row must still mirror the
+        pre-W9-ε inline triage's `else:  # WarmLaneDiskPressure` fallback —
+        which mechanically classified ANY WarmLaneRequeue that wasn't
+        WarmLanePoolHardDown/WarmLanePoolExhausted as disk-pressure-shaped —
+        rather than a distinct 'warm_lane_requeue' literal no old code path
+        ever produced. This keeps the workflow.py WarmLaneRequeue
+        except-clause comment's "reproduces the old per-subclass strings
+        exactly" claim true for the base class too, not just the 3 concrete
+        subclasses.
+        """
+        from orchestrator.git_ops import WarmLaneDiskPressure, WarmLaneRequeue
+        from orchestrator.workflow_types import classify_failure
+        base_disp = classify_failure(WarmLaneRequeue('bare base instance'))
+        disk_pressure_disp = classify_failure(WarmLaneDiskPressure('seed exited 75'))
+        assert base_disp == disk_pressure_disp
+
     def test_verify_infra_error_blocks_and_escalates(self):
         from orchestrator.verify import VerifyInfraError
         from orchestrator.verify_categories import FailureCategory
@@ -326,6 +345,34 @@ class TestBD2Completeness:
         # classify_failure is still TOTAL — it falls back to the default.
         disp = classify_failure(_BrandNewFailure('surprise'))
         assert disp is not None
+
+    def test_worktree_missing_row_is_shadowed_by_the_oserror_branch(self):
+        """Amendment (reviewer_comprehensive correctness): passing the
+        completeness check above (``_lookup_disposition(WorktreeMissing) is
+        not None``) does NOT mean ``classify_failure()`` ever returns that
+        row. WorktreeMissing IS-A FileNotFoundError IS-A OSError, and
+        classify_failure's ``isinstance(exc, OSError)`` branch runs BEFORE
+        ``_lookup_disposition`` — see its docstring. A real WorktreeMissing
+        always carries ``errno=None`` (constructed from a single message
+        string, not the ``(errno, strerror)`` OSError form), which is never
+        in ``verify._INFRA_ERRNOS``, so ``classify_failure(instance)`` falls
+        all the way through to ``_DEFAULT_BLOCK`` — NOT the row's own
+        ``escalate_to_human=True``. This test pins that gap explicitly so a
+        future reader can't mistake the completeness check's success for
+        "classify_failure honors this row."
+        """
+        from orchestrator.git_ops import WorktreeMissing
+        from orchestrator.workflow_types import _disposition_table, classify_failure
+
+        exc = WorktreeMissing('/some/worktree/path')
+        assert exc.errno is None  # sanity: confirms the OSError branch decides, not the row
+
+        row = _disposition_table()[WorktreeMissing]
+        resolved = classify_failure(exc)
+
+        assert row.escalate_to_human is True  # the (unreachable) row's own declared value
+        assert resolved.escalate_to_human is False  # what classify_failure ACTUALLY returns
+        assert resolved != row
 
 
 # ---------------------------------------------------------------------------

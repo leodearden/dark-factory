@@ -265,13 +265,27 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         # counts; DISK_PRESSURE/HARD_DOWN are transient infra and do not).
         # The WarmLaneRequeue base row exists for BD-2 completeness (it is
         # itself one of git_ops.py's exported types) — MRO resolution means
-        # a real subclass instance always matches its OWN row first.
+        # a real subclass instance always matches its OWN row first, so this
+        # row is only ever reached by a bare WarmLaneRequeue instance (none
+        # raised anywhere in the tree today). Its disposition deliberately
+        # MIRRORS WarmLaneDiskPressure's rather than using a distinct
+        # 'warm_lane_requeue' literal (amendment, reviewer_comprehensive
+        # behavior-parity): the pre-W9-ε inline triage's `else:  #
+        # WarmLaneDiskPressure` fallback (removed by step-10; see that
+        # commit) mechanically classified ANY WarmLaneRequeue that wasn't
+        # WarmLanePoolHardDown/WarmLanePoolExhausted — including a
+        # hypothetical bare-base instance — as disk-pressure-shaped. Aliasing
+        # this row to that same disposition keeps workflow.py's
+        # WarmLaneRequeue except-clause comment ("reproduces the old
+        # per-subclass strings exactly") true for the base class too, not
+        # just the 3 named subclasses. Pinned by
+        # test_bare_warm_lane_requeue_base_matches_old_else_branch_fallback.
         WarmLaneRequeue: BlockDisposition(
             category=FailureCategory.NONE,
             escalate_to_human=False,
             requeue_kind=RequeueKind.REQUEUE,
-            counts_against_requeue_cap=True,
-            reason_prefix='warm_lane_requeue',
+            counts_against_requeue_cap=False,
+            reason_prefix='warm_lane_disk_pressure (transient infra)',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         WarmLanePoolExhausted: BlockDisposition(
@@ -317,6 +331,22 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         ),
         # ── BD-2 completeness rows: exported by the 4 covered modules, but
         # not (today) caught by name anywhere in _drive()'s ladder ─────────
+        # NOTE (amendment, reviewer_comprehensive correctness): this row is
+        # UNREACHABLE via classify_failure() — WorktreeMissing IS-A
+        # FileNotFoundError IS-A OSError, and classify_failure's
+        # isinstance(exc, OSError) branch runs BEFORE _lookup_disposition
+        # (see its docstring). A real WorktreeMissing always carries
+        # errno=None (constructed from a single message string, not the
+        # (errno, strerror) OSError form), which is never in
+        # verify._INFRA_ERRNOS, so classify_failure(instance) falls all the
+        # way through to _DEFAULT_BLOCK (escalate_to_human=False) — NOT this
+        # row's escalate_to_human=True below. This row exists ONLY so
+        # _lookup_disposition(WorktreeMissing) is non-None for BD-2's
+        # completeness test; its own field values are never observed by
+        # classify_failure(). Pinned by
+        # TestBD2Completeness.test_worktree_missing_row_is_shadowed_by_the_oserror_branch
+        # in test_block_disposition.py — do not treat that test's passing as
+        # license to "clean up" this row without re-reading this note.
         WorktreeMissing: BlockDisposition(
             category=FailureCategory.NONE,
             escalate_to_human=True,
