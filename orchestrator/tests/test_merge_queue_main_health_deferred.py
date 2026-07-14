@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from escalation.queue import EscalationQueue
+from shared.task_metadata import RetryLedger
 from test_merge_queue_main_health import (
     COMPILE_ERROR_RESULT,
     MAIN_SHA,
@@ -46,7 +47,6 @@ from orchestrator.merge_queue import (
 )
 from orchestrator.verify import _PROBE_CACHE, VerifyResult
 from orchestrator.verify_runner import HostLease
-from shared.task_metadata import RetryLedger
 
 
 @pytest.fixture(autouse=True)

@@ -1128,11 +1128,28 @@ def _file_main_health_escalation(
     escalation_queue: Any,
     req: MergeRequest,
     outcome: MergeOutcome,
-) -> None:
+    *,
+    suggested_action: str = 'await_preexisting_main_hotfix',
+) -> str | None:
     """File (or fold) a dedup'd ``preexisting_main_break`` escalation for a
     confirmed pre-existing main-red *outcome* (task 2564).
 
-    None-safe: returns immediately when *escalation_queue* is None.
+    Returns the id of the SURVIVING (parent) escalation, or ``None`` when
+    *escalation_queue* is None.  A folded submission returns the PARENT's id
+    (the child is absorbed via ``attach_dedupe_child`` and never becomes
+    independently addressable) — callers that need to register lane-halt
+    ownership (:func:`SpeculativeMergeWorker._auto_heal_main_health_deferred`)
+    must reference the parent, not the folded child.  Existing callers that
+    ignore the return value are unaffected (backward-compatible addition).
+
+    *suggested_action* defaults to ``'await_preexisting_main_hotfix'`` —
+    byte-identical to every call site predating this parameter — so an
+    escalation-only caller (the bare/test fallback in
+    :func:`_run_deferred_main_health_probe`) files the same operator
+    instruction as before.  A caller performing the full auto-heal
+    (:func:`SpeculativeMergeWorker._auto_heal_main_health_deferred`) passes
+    ``'main_health_auto_heal_in_flight'`` instead, mirroring
+    ``TaskWorkflow._auto_heal_main_health``'s halt-owner escalation.
 
     Folds via ``submit_or_dedupe`` using the SAME inf-window
     content-fingerprint :class:`~escalation.dedupe.DedupeConfig`
@@ -1145,7 +1162,7 @@ def _file_main_health_escalation(
     ``''`` path of :func:`_main_health_fingerprint`).
     """
     if escalation_queue is None:
-        return
+        return None
 
     from escalation.dedupe import DedupeConfig, content_fingerprint_key, submit_or_dedupe
     from escalation.models import Escalation  # local import — escalation optional dep
@@ -1159,11 +1176,11 @@ def _file_main_health_escalation(
         category='preexisting_main_break',
         summary=outcome.reason[:200],
         detail=outcome.reason,
-        suggested_action='await_preexisting_main_hotfix',
+        suggested_action=suggested_action,
         dedupe_fingerprint=fp,
     )
     if fp:
-        submit_or_dedupe(
+        submit_result = submit_or_dedupe(
             escalation_queue,
             esc,
             DedupeConfig(
@@ -1173,8 +1190,9 @@ def _file_main_health_escalation(
                 key_fn=content_fingerprint_key,
             ),
         )
-    else:
-        escalation_queue.submit(esc)
+        return submit_result.get('parent_id') or submit_result.get('id') or esc.id
+    escalation_queue.submit(esc)
+    return esc.id
 
 
 def _spawn_main_health_probe(
@@ -10347,6 +10365,158 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     'process may be orphaned): %s',
                     task_id, exc,
                 )
+
+    async def _post_submit_tasks(self, arguments_list: list[dict]) -> None:
+        """Fire-and-forget: POST all submit_task calls to the fused-memory MCP.
+
+        Worker-side mirror of ``TaskWorkflow._post_submit_tasks``
+        (workflow.py:9092, task 2564) — a single shared ``httpx.AsyncClient``
+        for the whole batch so only one TCP connection pool is opened
+        regardless of how many tasks are being submitted.  Per-POST
+        exceptions are caught and logged as warnings so a failure on one
+        submission does not abort the rest.
+
+        None-safe: no-ops when ``self._mcp`` is ``None`` (every bare-worker
+        test constructor and any harness that hasn't wired an MCP client).
+        """
+        if self._mcp is None:
+            return
+        try:
+            import httpx as httpx_mod
+            async with httpx_mod.AsyncClient() as client:
+                for arguments in arguments_list:
+                    try:
+                        await client.post(
+                            f'{self._mcp.url}/mcp/',
+                            json={
+                                'jsonrpc': '2.0',
+                                'id': 1,
+                                'method': 'tools/call',
+                                'params': {
+                                    'name': 'submit_task',
+                                    'arguments': arguments,
+                                },
+                            },
+                            timeout=10,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            'Failed to submit main-health fix task '
+                            '(fire-and-forget): %s',
+                            exc,
+                        )
+        except Exception as exc:
+            logger.warning(
+                'Failed to open HTTP client for main-health fix task '
+                'submits: %s',
+                exc,
+            )
+
+    async def _spawn_main_health_fix_task(
+        self,
+        req: MergeRequest,
+        sig: str,
+        esc_id: str,
+        category: str,
+        cause_hint: str,
+        detail: str,
+    ) -> None:
+        """Schedule a HIGH-lane fix task for a confirmed main-health break.
+
+        Worker-side mirror of ``TaskWorkflow._spawn_main_health_fix_task``
+        (workflow.py:6106, task 2564).  Builds a submit_task argument block
+        with:
+
+        - title/description from :func:`compose_fix_main_brief`
+        - ``priority='high'`` and ``metadata.merge_lane='high'`` so the fix
+          merges via the HIGH lane
+        - Correlation keys so the auto-watcher / ``unhalt_lanes_owned_by``
+          can link the fix task back to this escalation: ``spawn_context``,
+          ``main_health_signature``, ``main_health_escalation_id``
+
+        Delegates the actual POST to :meth:`_post_submit_tasks` via
+        ``asyncio.create_task`` (registered in ``self._background_tasks``,
+        drained on shutdown — mirrors :func:`_spawn_merge_verify_dry_run`)
+        so the caller is not blocked.
+        """
+        title, description = compose_fix_main_brief(category, cause_hint, detail)
+        arguments = {
+            'title': title,
+            'description': description,
+            'priority': 'high',
+            'project_root': str(req.config.project_root),
+            'metadata': {
+                'merge_lane': 'high',
+                'spawn_context': 'main_health_auto_heal',
+                'main_health_signature': sig,
+                'main_health_escalation_id': esc_id,
+            },
+        }
+        try:
+            task = asyncio.create_task(
+                self._post_submit_tasks([arguments]),
+                name=f'spawn_fix_main_{req.task_id}',
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except Exception as exc:
+            logger.warning(
+                'Task %s: failed to spawn main-health fix task: %s',
+                req.task_id, exc,
+            )
+
+    async def _auto_heal_main_health_deferred(
+        self, outcome: MergeOutcome, req: MergeRequest,
+    ) -> None:
+        """Worker-side auto-heal for a confirmed deferred main-health break (task 2564).
+
+        Mirrors ``TaskWorkflow._auto_heal_main_health``'s happy path (signal
+        a): record the attempt, halt the 'normal' lane, submit/fold the
+        dedup'd halt-owner escalation, register lane-halt ownership, and
+        spawn a HIGH-lane fix task.  Called from the deferred main-health
+        probe (:func:`_run_deferred_main_health_probe`, via the
+        ``auto_heal`` callback on :class:`_MainHealthProbeHandles`) once it
+        confirms a still-fresh pre-existing break — this is the ONLY
+        production path that can reach a main-health-red outcome, since the
+        provisional outcome returned to the caller is always task-fault (see
+        :func:`_run_post_merge_verify`'s DEFERRED-mode docstring), so
+        ``TaskWorkflow._auto_heal_main_health`` (which keys off
+        ``MAIN_HEALTH_RED_REASON_PREFIX``) never fires for it.
+
+        task 2564 step-18: happy path ONLY.  The guard branches mirroring
+        ``TaskWorkflow._auto_heal_main_health``'s (d) non-mechanical, (e)
+        attempt-cap, and (idempotency) already-halted branches are added in
+        step-20 — until then this unconditionally records an attempt, halts,
+        and spawns.
+        """
+        # Local import — the SAME signature-keying authority
+        # workflow._compute_merge_outcome_signature delegates to.  merge_queue
+        # must NOT import from orchestrator.workflow (that would be a cycle);
+        # shared.task_metadata has no orchestrator dependency, so this is safe.
+        from shared.task_metadata import RetryLedger
+
+        category = outcome.failure_category or ''
+        cause_hint = outcome.failure_cause_hint or ''
+        sig = RetryLedger.compute_merge_outcome_signature(
+            category, cause_hint, outcome.reason,
+        )
+
+        esc_id = _file_main_health_escalation(
+            self._escalation_queue, req, outcome,
+            suggested_action='main_health_auto_heal_in_flight',
+        )
+
+        self.auto_heal_registry.record_attempt(sig)
+        self.halt_lane(
+            'normal',
+            f'main-health auto-heal in flight (task {req.task_id})',
+        )
+        if esc_id:
+            self.set_lane_halt_owner('normal', esc_id)
+
+        await self._spawn_main_health_fix_task(
+            req, sig, esc_id or '', category, cause_hint, outcome.reason,
+        )
 
     async def _run_inflight_verify(
         self,
