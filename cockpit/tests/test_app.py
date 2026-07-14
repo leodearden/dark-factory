@@ -228,6 +228,17 @@ class TestPollRefresh:
         (set_interval actually calling refresh_registry) is covered
         separately by TestTimerIntegration below -- the one test in this
         module allowed to depend on real timing.
+
+        A large poll_interval keeps on_mount's own set_interval timer from
+        firing an uncontrolled background poll during this test (mirrors the
+        idiom in TestNonBlockingPoll/TestThreadedScanReachesUI/
+        TestScanBackpressure below) -- _apply_scan has no protection against
+        a stale threaded scan (one that read the registry before the
+        blocked-1 write below) landing via call_from_thread AFTER this
+        test's own direct refresh_registry() call and clobbering its
+        fresher result back down to 1 row. Confirmed by direct repro: with a
+        short real interval, an in-flight poll tick can race this exact
+        write+refresh_registry() sequence under a loaded runner.
         """
         from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
@@ -235,7 +246,7 @@ class TestPollRefresh:
         running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
         sr.write_record(running, root=tmp_path)
 
-        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
         async with app.run_test() as pilot:
             await pilot.pause()
             table = app.query_one(SessionTable)
@@ -256,7 +267,11 @@ class TestPollRefresh:
         """An existing record's status change on disk is picked up by refresh_registry.
 
         Same rationale as above: calls refresh_registry() directly instead of
-        racing the real poll_interval timer via pilot.pause(<duration>).
+        racing the real poll_interval timer via pilot.pause(<duration>). Same
+        large poll_interval as the test above too, for the same reason: it
+        keeps a real background poll tick from ever landing (via
+        call_from_thread) in between this test's own write and its direct
+        refresh_registry() call.
         """
         from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable, state_glyph
@@ -264,7 +279,7 @@ class TestPollRefresh:
         running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
         sr.write_record(running, root=tmp_path)
 
-        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
         async with app.run_test() as pilot:
             await pilot.pause()
             table = app.query_one(SessionTable)
