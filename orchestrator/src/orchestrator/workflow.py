@@ -58,6 +58,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
+    BranchResetError,
     GitOps,
     TrainMembership,
     WarmLaneRequeue,
@@ -2421,6 +2422,31 @@ class TaskWorkflow:
                     f'{disp.reason_prefix} ({e})',
                     category='wip_conflict',
                     escalate_to_human=disp.escalate_to_human,
+                    disposition=disp,
+                )
+
+            if isinstance(e, BranchResetError):
+                # task 2403: GitOps.rebase_preserving_task_commits detected
+                # that a requeue/inter-iteration rebase collapsed this
+                # branch to zero commits ahead of main — the pre-rebase
+                # HEAD has already been restored by the guard, so the
+                # task's work is safe, but the wipe condition itself needs
+                # a human to look at the merge-train state that produced
+                # it. Route to a targeted per-task BLOCKED + human L1,
+                # bypassing the steward corrective loop (mirrors the
+                # WorktreeConflictError branch above) rather than falling
+                # through to the generic 'Workflow error:' handler.
+                # escalate_to_human is passed explicitly (True) rather
+                # than via disp.escalate_to_human — BranchResetError has no
+                # _DISPOSITION_TABLE row, so disp is _DEFAULT_BLOCK here.
+                logger.warning(
+                    'Task %s: BranchResetError escaped run() — %s',
+                    self.task_id, e,
+                )
+                return await self._mark_blocked(
+                    f'{disp.reason_prefix} ({e})',
+                    category='branch_reset',
+                    escalate_to_human=True,
                     disposition=disp,
                 )
 
@@ -5181,7 +5207,12 @@ class TaskWorkflow:
             self.worktree, 'chore: save WIP before inter-iteration rebase',
         )
 
-        if not await self.git_ops.rebase_onto_main(self.worktree):
+        # rebase_preserving_task_commits wraps rebase_onto_main with a
+        # post-condition guard (task 2403): a BranchResetError propagates
+        # out of this method (and out of the execute/verify loops that
+        # call it) rather than being swallowed here — a silent wipe of
+        # committed work is not an ordinary, recoverable rebase conflict.
+        if not await self.git_ops.rebase_preserving_task_commits(self.worktree):
             logger.warning(
                 f'Task {self.task_id}: inter-iteration rebase failed, '
                 f'continuing on old base'
