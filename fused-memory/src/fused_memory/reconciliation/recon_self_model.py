@@ -216,11 +216,25 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     ),
     'add_finding': (
         'add_finding(severity, category, flag_type, actionable, description, '
-        "suggested_action, task_id) -> {'finding_id': ...}"
+        "suggested_action, task_id) -> {'finding_id': ...}  "
+        '# actionable is a COMPUTED default (task-2432): when omitted, it '
+        "resolves to False if task_id is None or category starts with "
+        "'cross_project', else True; an explicit True/False from the caller "
+        'is always honored. '
+        '# dedup key: cited_tasks is the authoritative dedup key, not this '
+        'task_id param — a None / single / comma-joined / foreign top-level '
+        'task_id is normalized to the cited-task set (see cite_task below '
+        'and compute_flag_signature\'s cited_tasks union, flag_dedup.py:889)'
     ),
     'cite_task': (
         "cite_task(finding_id, project_id, task_id) -> {'ok': True}  "
-        '# dedup anchor: _derive_affected_ids reads cited_tasks, not add_finding.task_id'
+        '# dedup anchor: _derive_affected_ids reads cited_tasks, not '
+        'add_finding.task_id. cite_task also performs an in-run fold '
+        '(task-2432): a finding whose top-level task_id is None, equals this '
+        'cited task_id, or (if comma-joined) contains it among its parts, '
+        'collapses onto whichever finding first cited this task — so None, '
+        'single, comma-joined, and foreign top-level task_id shapes all '
+        'dedup through this one path once they share a cited task.'
     ),
     'cite_entity': (
         "cite_entity(finding_id, name) -> {'ok': True}  "

@@ -124,7 +124,13 @@ FINDING_ITEM_SCHEMA: dict[str, Any] = {
                 'Task ID associated with this finding. '
                 'Dedup contract: either set task_id + flag_type here, OR include '
                 'at least one cited_tasks entry — otherwise compute_flag_signature '
-                'returns None and this finding will not deduplicate across runs.'
+                'returns None and this finding will not deduplicate across runs. '
+                'cited_tasks is the AUTHORITATIVE dedup key: this field\'s shape '
+                '(None, a single id, a comma-joined multi-id string, or a '
+                'foreign-project id) is normalized to the cited-task set for '
+                'both in-run (cite_task) and cross-cycle (compute_flag_signature) '
+                'dedup, so it need not exactly match a prior call\'s task_id as '
+                'long as the cited tasks agree.'
             ),
         },
         'flag_type': {
@@ -184,7 +190,13 @@ FINDING_ITEM_SCHEMA: dict[str, Any] = {
         },
         'cited_tasks': {
             'type': 'array',
-            'description': 'Tasks cited as evidence for this finding',
+            'description': (
+                'Tasks cited as evidence for this finding. AUTHORITATIVE dedup '
+                'key (task-2432): in-run (cite_task) and cross-cycle '
+                '(compute_flag_signature) dedup normalize the top-level task_id '
+                'shape (None / single / comma-joined / foreign) against this '
+                'cited-task set, rather than fingerprinting the raw task_id.'
+            ),
             'items': {
                 'type': 'object',
                 'properties': {
