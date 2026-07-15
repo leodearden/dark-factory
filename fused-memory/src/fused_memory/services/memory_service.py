@@ -313,6 +313,53 @@ def _cycle_summary_run_id_backfill(meta: dict, causation_id: str | None) -> str 
     return None
 
 
+def _normalize_task_id_metadata(meta: dict) -> None:
+    """Coerce ``meta['task_id']`` to ``str`` in place, when present and non-None.
+
+    Shared by add_memory, add_system_record, count_memories_by_metadata, and
+    get_memories_by_metadata (task 2620 and its amendment rounds, closing
+    gaps flagged in the task-2620 review — add_system_record is a parallel
+    Mem0-only write path sharing add_memory's exact-match read filters, and
+    count_memories_by_metadata/get_memories_by_metadata are the read side of
+    those same filters) so every path that can produce or consume a
+    task_id-keyed marker gets the same handling: those read filters are
+    exact-match, and the project-wide convention is a string task_id
+    (recon_ledger's task_id column is TEXT; every reader queries with
+    str(task_id)) — an int-typed value written without this coercion
+    silently false-negatives against a str-typed query filter, making a
+    write invisible to its own gate (e.g. the stage2_suppress
+    completion-guard). Coercing at the write boundary closes that gap for
+    every future write instead of relying on each LLM-prompt-driven writer
+    to remember the convention (task 2620, sibling of task 2454's
+    flag_dedup-specific fix).
+
+    On the read side (count_memories_by_metadata/get_memories_by_metadata),
+    callers pass their own ``filters`` dict; those two methods copy it
+    before calling this helper so the caller's original dict is never
+    mutated in place. This direction only protects a caller who queries
+    with an int-typed task_id filter (forgetting the str convention)
+    against the now-str-normalized data the write side produces — it does
+    NOT retroactively make historical int-typed task_id values, or
+    anything written by a path that bypasses add_memory/add_system_record,
+    matchable. Qdrant's payload filter is type-sensitive, so a str-coerced
+    query can only ever match str-typed stored data; reaching legacy
+    int-typed rows needs a separate backfill/migration, not read-side
+    coercion.
+
+    Assumes a scalar (int/str) task_id, matching today's single-task-id
+    write convention on this path. A list/tuple value would str()-coerce to
+    a Python repr (e.g. ``'[5040, 5149]'``), not a filter-compatible
+    canonical form — unlike ``server/recon_report._canonicalize_task_id_string``'s
+    comma-joined-string canonicalization used elsewhere for multi-task dedup
+    signatures. No current caller passes a non-scalar task_id on this path;
+    if one ever does, canonicalize consistently with that helper instead of
+    relying on this bare ``str()`` (task-2620 review, noted as a latent edge
+    case rather than a live defect).
+    """
+    if 'task_id' in meta and meta['task_id'] is not None:
+        meta['task_id'] = str(meta['task_id'])
+
+
 def _apply_cycle_summary_metadata_tagging(
     meta: dict,
     causation_id: str | None,
@@ -1951,6 +1998,13 @@ class MemoryService:
         meta = dict(metadata or {})
         meta['category'] = resolved_category.value
 
+        # Normalize metadata.task_id to str at this shared write boundary
+        # (task 2620, sibling of task 2454's flag_dedup-specific fix; shared
+        # with add_system_record below per the task-2620 amendment review —
+        # see _normalize_task_id_metadata's docstring for the full
+        # rationale).
+        _normalize_task_id_metadata(meta)
+
         # Server-side cycle_summary metadata tagging (recon_pool auto-tag
         # task 2077, run_id auto-backfill task 2109, missing-key warning
         # task 2094/2109) — factored into a shared helper (task 2222
@@ -2109,6 +2163,13 @@ class MemoryService:
 
         meta = dict(metadata or {})
         meta['category'] = resolved_category.value
+
+        # Same task_id normalization add_memory applies (task 2620 amendment
+        # review): this Mem0-only path shares add_memory's exact-match read
+        # filters (count_memories_by_metadata/get_memories_by_metadata), so
+        # a task_id-keyed marker written here needs the same str convention.
+        # See _normalize_task_id_metadata's docstring for the full rationale.
+        _normalize_task_id_metadata(meta)
 
         # Same authoritative cycle_summary tagging add_memory applies (task
         # 2222 amendment): the tool docstring names the cycle-summary Mem0
@@ -2826,8 +2887,23 @@ class MemoryService:
         markers keyed by ``flag_id``.  Goes through ``Mem0Backend.count_by_metadata``
         which talks to Qdrant's count API directly with a payload filter, so
         the result is exact rather than top-N-bounded.
+
+        A ``task_id`` filter is normalized to str here too (task 2620
+        amendment), symmetric with the add_memory/add_system_record
+        write-side coercion — see ``_normalize_task_id_metadata``'s
+        docstring. This protects a caller that queries with an int-typed
+        task_id filter (forgetting the str convention) against the
+        now-str-normalized data those write paths produce — it does NOT
+        retroactively make historical int-typed task_id values, or
+        anything written by a path that bypasses add_memory/
+        add_system_record, matchable. Qdrant's payload filter is
+        type-sensitive, so a str-coerced query can only ever match
+        str-typed stored data; reaching legacy int-typed rows needs a
+        separate backfill/migration, not this read-side coercion.
         """
         scope = Scope(project_id=project_id)
+        filters = dict(filters)
+        _normalize_task_id_metadata(filters)
         return await self.mem0.count_by_metadata(scope, filters)
 
     async def get_memories_by_metadata(
@@ -2849,8 +2925,14 @@ class MemoryService:
         db2ea69e).
 
         Returns a list of ``{'id', 'created_at', 'metadata'}`` dicts.
+
+        A ``task_id`` filter is normalized to str here too — see
+        ``count_memories_by_metadata`` above and ``_normalize_task_id_metadata``'s
+        docstring (task 2620 amendment).
         """
         scope = Scope(project_id=project_id)
+        filters = dict(filters)
+        _normalize_task_id_metadata(filters)
         return await self.mem0.scroll_by_metadata(scope, filters, limit)
 
     # ------------------------------------------------------------------

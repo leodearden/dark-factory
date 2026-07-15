@@ -178,6 +178,55 @@ class TestAddMemory:
         assert scope.project_id == 'test'
         assert scope.agent_id == 'a1'
         assert scope.session_id == 's1'
+
+    @pytest.mark.asyncio
+    async def test_int_task_id_normalized_to_str(self, service):
+        """metadata.task_id must persist as str even when passed as int (task 2620).
+
+        count_memories_by_metadata/get_memories_by_metadata filters are
+        exact-match on the string form — an int-typed task_id silently
+        false-negatives against that convention (e.g. the stage2_suppress
+        completion-guard gate), so add_memory must normalize at the write
+        boundary regardless of what type a caller passes.
+        """
+        await service.add_memory(
+            content='STAGE 2 SUPPRESS task_id=2614',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={'task_id': 2614, 'stage2_suppress': True},
+        )
+
+        service.mem0.add.assert_called_once()
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['task_id'] == '2614'
+        assert isinstance(call_kwargs['metadata']['task_id'], str)
+
+    @pytest.mark.asyncio
+    async def test_str_task_id_unaffected(self, service):
+        """An already-string task_id passes through unchanged (task 2620)."""
+        await service.add_memory(
+            content='STAGE 2 SUPPRESS task_id=2614',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={'task_id': '2614', 'stage2_suppress': True},
+        )
+
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['task_id'] == '2614'
+        assert isinstance(call_kwargs['metadata']['task_id'], str)
+
+    @pytest.mark.asyncio
+    async def test_missing_task_id_unaffected(self, service):
+        """metadata with no task_id key is unaffected (task 2620)."""
+        await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+            metadata={'other_key': 'value'},
+        )
+
+        call_kwargs = service.mem0.add.call_args[1]
+        assert 'task_id' not in call_kwargs['metadata']
         metadata = call_kwargs['metadata']
         assert metadata.get('category') == 'preferences_and_norms'
 
@@ -585,6 +634,50 @@ class TestAddSystemRecord:
         call_kwargs = mock_journal.log_write_op.call_args[1]
         assert call_kwargs['success'] is True
         assert call_kwargs['error'] is None
+
+    # -- Amendment (task 2620 review): same task_id normalization as add_memory --
+
+    @pytest.mark.asyncio
+    async def test_int_task_id_normalized_to_str(self, service):
+        """metadata.task_id must persist as str even when passed as int (task 2620
+        amendment). add_system_record shares add_memory's exact-match read filters
+        (count_memories_by_metadata/get_memories_by_metadata), so a task_id-keyed
+        system record must not silently miss its own gate just because it bypassed
+        add_memory."""
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+
+        await service.add_system_record(
+            content='cycle summary',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            category='observations_and_summaries',
+            metadata={'kind': 'cycle_summary', 'run_id': 'r1', 'task_id': 2614},
+            causation_id='c1',
+        )
+
+        assert service.mem0.add_system_record.await_args is not None
+        call_kwargs = service.mem0.add_system_record.await_args.kwargs
+        assert call_kwargs['metadata']['task_id'] == '2614'
+        assert isinstance(call_kwargs['metadata']['task_id'], str)
+
+    @pytest.mark.asyncio
+    async def test_str_task_id_unaffected_add_system_record(self, service):
+        """An already-string task_id passes through unchanged (task 2620 amendment)."""
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+
+        await service.add_system_record(
+            content='cycle summary',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            category='observations_and_summaries',
+            metadata={'kind': 'cycle_summary', 'run_id': 'r1', 'task_id': '2614'},
+            causation_id='c1',
+        )
+
+        assert service.mem0.add_system_record.await_args is not None
+        call_kwargs = service.mem0.add_system_record.await_args.kwargs
+        assert call_kwargs['metadata']['task_id'] == '2614'
+        assert isinstance(call_kwargs['metadata']['task_id'], str)
 
 
 class TestAddEpisode:
@@ -6781,6 +6874,47 @@ class TestCycleSummaryRunIdBackfillHelper:
         assert _cycle_summary_run_id_backfill(meta, 'run-b') is None
 
 
+# ---------------------------------------------------------------------------
+# Task 2620 amendment: _normalize_task_id_metadata helper tests (extracted
+# shared helper, sibling of _apply_cycle_summary_metadata_tagging above)
+# ---------------------------------------------------------------------------
+
+class TestNormalizeTaskIdMetadata:
+    """Module-level _normalize_task_id_metadata helper (task 2620 amendment).
+
+    Extracted from add_memory's inline task_id coercion so add_system_record
+    (a parallel Mem0-only write path sharing the same exact-match read
+    filters) gets identical treatment — see _normalize_task_id_metadata's
+    docstring for the full false-negative rationale.
+    """
+
+    def test_int_task_id_normalized_to_str(self):
+        from fused_memory.services.memory_service import _normalize_task_id_metadata
+        meta = {'task_id': 2614}
+        _normalize_task_id_metadata(meta)
+        assert meta['task_id'] == '2614'
+
+    def test_str_task_id_unaffected(self):
+        from fused_memory.services.memory_service import _normalize_task_id_metadata
+        meta = {'task_id': '2614'}
+        _normalize_task_id_metadata(meta)
+        assert meta['task_id'] == '2614'
+
+    def test_missing_task_id_key_unaffected(self):
+        from fused_memory.services.memory_service import _normalize_task_id_metadata
+        meta = {'other_key': 'value'}
+        _normalize_task_id_metadata(meta)
+        assert 'task_id' not in meta
+
+    def test_none_task_id_value_unaffected(self):
+        """A present-but-None task_id (distinct from a missing key) must not
+        be coerced to the string 'None'."""
+        from fused_memory.services.memory_service import _normalize_task_id_metadata
+        meta = {'task_id': None}
+        _normalize_task_id_metadata(meta)
+        assert meta['task_id'] is None
+
+
 class TestReconPoolAutoTagInjection:
     """Integration: add_memory must inject recon_pool into the metadata dict
     handed to mem0.add for cycle_summary writes, server-side, independent of
@@ -7742,6 +7876,169 @@ class TestGetMemoriesByMetadata:
         )
 
         svc.mem0.search.assert_not_awaited()
+
+    # -- Amendment (task 2620 review): symmetric read-side task_id coercion --
+    # count_memories_by_metadata/get_memories_by_metadata are exact-match
+    # filters against Qdrant; the write-side normalization added in
+    # add_memory/add_system_record only helps writes made AFTER this fix.
+    # Coercing task_id here too closes the gap for historical int-typed
+    # values and any writer that bypasses add_memory/add_system_record.
+
+    @pytest.mark.asyncio
+    async def test_int_task_id_in_filters_normalized_to_str(self, mock_config):
+        """An int-typed task_id filter is coerced to str before being sent to
+        mem0.scroll_by_metadata, symmetric with the add_memory/add_system_record
+        write-side normalization (task 2620 amendment)."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        await svc.get_memories_by_metadata(
+            project_id='dark_factory',
+            filters={'task_id': 2614, 'stage2_suppress': True},
+        )
+
+        call_args = svc.mem0.scroll_by_metadata.call_args
+        passed_filters = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get('filters')
+        assert passed_filters['task_id'] == '2614'
+        assert isinstance(passed_filters['task_id'], str)
+
+    @pytest.mark.asyncio
+    async def test_str_task_id_in_filters_unaffected(self, mock_config):
+        """An already-string task_id filter passes through unchanged."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        await svc.get_memories_by_metadata(
+            project_id='dark_factory',
+            filters={'task_id': '2614'},
+        )
+
+        call_args = svc.mem0.scroll_by_metadata.call_args
+        passed_filters = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get('filters')
+        assert passed_filters['task_id'] == '2614'
+
+    @pytest.mark.asyncio
+    async def test_original_filters_dict_not_mutated(self, mock_config):
+        """get_memories_by_metadata must not mutate the caller's filters dict
+        in place — the task_id normalization operates on a copy."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        filters = {'task_id': 2614}
+        await svc.get_memories_by_metadata(project_id='dark_factory', filters=filters)
+
+        assert filters['task_id'] == 2614
+        assert isinstance(filters['task_id'], int)
+
+
+class TestCountMemoriesByMetadata:
+    """MemoryService.count_memories_by_metadata delegates to mem0.count_by_metadata.
+
+    Amendment (task 2620 review): count_memories_by_metadata shares
+    get_memories_by_metadata's exact-match Qdrant filter semantics, so it
+    gets the same symmetric task_id str-coercion and the same pinning tests.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_count_result_unchanged(self, mock_config):
+        """count_memories_by_metadata returns the int from mem0.count_by_metadata verbatim."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.count_by_metadata = AsyncMock(return_value=3)
+
+        result = await svc.count_memories_by_metadata(
+            project_id='dark_factory',
+            filters={'recon_pool': 'stage2_cycle_summary'},
+        )
+
+        assert result == 3
+
+    @pytest.mark.asyncio
+    async def test_calls_count_with_correct_scope_and_filters(self, mock_config):
+        """count_memories_by_metadata builds Scope(project_id=...) and passes filters."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.count_by_metadata = AsyncMock(return_value=0)
+
+        filters = {'recon_pool': 'stage2_cycle_summary'}
+        await svc.count_memories_by_metadata(project_id='dark_factory', filters=filters)
+
+        svc.mem0.count_by_metadata.assert_awaited_once()
+        call_args = svc.mem0.count_by_metadata.call_args
+
+        scope = call_args.args[0] if call_args.args else call_args.kwargs.get('scope')
+        assert scope.project_id == 'dark_factory'
+
+        passed_filters = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get('filters')
+        assert passed_filters == filters
+
+    @pytest.mark.asyncio
+    async def test_int_task_id_in_filters_normalized_to_str(self, mock_config):
+        """An int-typed task_id filter is coerced to str before being sent to
+        mem0.count_by_metadata, symmetric with the add_memory/add_system_record
+        write-side normalization (task 2620 amendment)."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.count_by_metadata = AsyncMock(return_value=0)
+
+        await svc.count_memories_by_metadata(
+            project_id='dark_factory',
+            filters={'task_id': 2614, 'stage2_suppress': True},
+        )
+
+        call_args = svc.mem0.count_by_metadata.call_args
+        passed_filters = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get('filters')
+        assert passed_filters['task_id'] == '2614'
+        assert isinstance(passed_filters['task_id'], str)
+
+    @pytest.mark.asyncio
+    async def test_str_task_id_in_filters_unaffected(self, mock_config):
+        """An already-string task_id filter passes through unchanged."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.count_by_metadata = AsyncMock(return_value=0)
+
+        await svc.count_memories_by_metadata(
+            project_id='dark_factory',
+            filters={'task_id': '2614'},
+        )
+
+        call_args = svc.mem0.count_by_metadata.call_args
+        passed_filters = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get('filters')
+        assert passed_filters['task_id'] == '2614'
+
+    @pytest.mark.asyncio
+    async def test_original_filters_dict_not_mutated(self, mock_config):
+        """count_memories_by_metadata must not mutate the caller's filters dict
+        in place — the task_id normalization operates on a copy."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.count_by_metadata = AsyncMock(return_value=0)
+
+        filters = {'task_id': 2614}
+        await svc.count_memories_by_metadata(project_id='dark_factory', filters=filters)
+
+        assert filters['task_id'] == 2614
+        assert isinstance(filters['task_id'], int)
 
 
 # ---------------------------------------------------------------------------
