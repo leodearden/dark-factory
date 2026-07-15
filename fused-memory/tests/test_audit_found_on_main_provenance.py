@@ -228,3 +228,75 @@ class TestSelectFoundOnMainTasksOrdering:
         ]
         result = select_found_on_main_tasks(tasks)
         assert [a.task_id for a in result] == ['100', '200', '300']
+
+
+# ===========================================================================
+# Step-3: extract_cited_task_ids / commit_cites_task
+# ===========================================================================
+
+class TestExtractCitedTaskIdsConventions:
+    """The three citation conventions mirrored from DEFAULT_COMMIT_CITATION_PATTERN."""
+
+    def test_merge_subject_convention(self):
+        """The canonical no-ff merge subject cites the task id."""
+        assert extract_cited_task_ids('Merge task/50 into main') == {'50'}
+
+    def test_conventional_commit_convention(self):
+        """Conventional-commit `type(id):` subjects cite the task id."""
+        assert extract_cited_task_ids('impl(50): add X') == {'50'}
+
+    def test_task_branch_mention_convention(self):
+        """A bare `task/{id}` mention anywhere in the message cites the id."""
+        assert extract_cited_task_ids('fix: touch task/50 handler') == {'50'}
+
+    def test_no_citation_returns_empty_set(self):
+        """A message with no citation of any kind yields an empty set."""
+        assert extract_cited_task_ids('chore: general cleanup, no ticket') == set()
+
+    def test_empty_message_returns_empty_set(self):
+        """An empty message string does not raise and yields an empty set."""
+        assert extract_cited_task_ids('') == set()
+
+
+class TestExtractCitedTaskIdsWordBoundary:
+    r"""`\b` word-boundary guard: no substring overlap between numeric ids."""
+
+    def test_task_339_does_not_match_as_3399(self):
+        """Citing task/339 must not also register as a citation of '3399'."""
+        ids = extract_cited_task_ids('Merge task/339 into main')
+        assert '3399' not in ids
+        assert ids == {'339'}
+
+    def test_task_3399_does_not_match_as_339(self):
+        """Citing task/3399 must not also register as a citation of '339' (reverse case)."""
+        ids = extract_cited_task_ids('Merge task/3399 into main')
+        assert '339' not in ids
+        assert ids == {'3399'}
+
+
+class TestExtractCitedTaskIdsMultipleCitations:
+    """A message can cite more than one task id — all are captured."""
+
+    def test_multiple_ids_all_captured(self):
+        """Both a merge-subject id and a body-mention id are captured together."""
+        message = 'Merge task/50 into main\n\nAlso relates to task/77.'
+        assert extract_cited_task_ids(message) == {'50', '77'}
+
+
+class TestCommitCitesTask:
+    """commit_cites_task(message, task_id) == task_id in extract_cited_task_ids(message)."""
+
+    def test_true_when_cited(self):
+        assert commit_cites_task('impl(50): add X', '50') is True
+
+    def test_false_when_not_cited(self):
+        assert commit_cites_task('chore: general cleanup', '50') is False
+
+    def test_false_for_different_task_in_merge_commit(self):
+        """A merge commit citing task/77 does not cite task 50."""
+        message = 'Merge task/77 into main'
+        assert commit_cites_task(message, '50') is False
+
+    def test_false_when_word_boundary_would_be_violated(self):
+        """task/3399 must not satisfy a commit_cites_task('...', '339') check."""
+        assert commit_cites_task('Merge task/3399 into main', '339') is False
