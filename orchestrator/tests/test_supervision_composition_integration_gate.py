@@ -52,6 +52,7 @@ of these helpers to import.
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -540,3 +541,28 @@ class TestR2WorkingDirectory:
         assert wrapped.split()[0] == '/proj/scripts/restart-orchestrator.sh', (
             'the bare relative path must never appear as the payload script token'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-9/10 — S1: LifecycleRegistry x BackgroundService. A wedging service is
+# abandoned bounded, mid-ladder, with the reverse-order shutdown ladder still
+# completing — the structural elimination of the shutdown-hang class.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestS1RegistryShutdownBounded:
+    """S1 composition cell (the shutdown-hang class)."""
+
+    async def test_stop_all_abandons_wedging_service_and_completes_ladder(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        calls = await _stop_all_with_wedging_middle(caplog)
+
+        # Reverse order c, wedge, a — wedge is abandoned but a is still reached.
+        assert calls == ['c:stop', 'a:stop']
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'wedge' in warnings[0].message
+        assert 'did not stop' in warnings[0].message
