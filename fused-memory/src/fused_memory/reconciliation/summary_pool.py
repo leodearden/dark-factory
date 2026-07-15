@@ -60,12 +60,10 @@ CYCLE_SUMMARY_TTL_DAYS: int = 30
 # this module; until such a consumer exists, keeping the prompt-side literal
 # in sync with this value is a manual, reviewed invariant rather than an
 # enforced one. Both literal values are frozen by convention — plain string
-# discriminators with no anticipated reason to ever change — and are pinned
-# by ``TestCycleSummaryRecordTypeVocabulary`` in ``test_summary_pool.py``, so
-# an accidental future edit to either constant fails loudly there as a
-# reminder to also check the prompt text, even though that test deliberately
-# cannot (and must not) inspect the prompt text itself (task 2468 amendment
-# pass).
+# discriminators with no anticipated reason to ever change. There is no
+# automated pin test guarding them; if either constant is ever edited, also
+# check that the prompt-side literal (prompts/stage2.py, recon_self_model.py)
+# stays in sync, since that invariant is reviewed rather than enforced.
 #
 # record_type is write-only as of task 2468: no reader (dedup/near-duplicate
 # tooling, Path-2 verification, pool-cap trim) filters on it yet — the fix
