@@ -194,3 +194,96 @@ class TestAddMemoryLiveStatusGate:
             f'Gate must not fire for the durable point-in-time-check form; got: {result!r}'
         )
         mock_service.add_memory.assert_called_once()
+
+
+class TestAddEpisodeLiveStatusGate:
+    """Write-gate: recon-stage- agents must not write content via add_episode that
+    frames a LIVE task-table field/value as a standing/current fact rather than a
+    timestamped point-in-time check. Episodes carry no `category`, so the gate
+    fires on recon-stage + content alone (mirroring the conflicting-status /
+    mixed-framing add_episode guards).
+    """
+
+    @pytest.mark.asyncio
+    async def test_rejects_live_status_from_recon_stage_agent(self):
+        """Live-status content + recon-stage agent → rejected.
+
+        The gate must return the standard error dict and must NOT call
+        memory_service.add_episode.
+        """
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _LIVE_STATUS_CONTENT,
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}: {result!r}'
+        assert result.get('error') == 'live_task_status_current_fact_write_blocked', (
+            f"Expected error='live_task_status_current_fact_write_blocked', got: {result!r}"
+        )
+        assert result.get('error_type') == 'ReconLiveTaskStatusWriteRejected', (
+            f"Expected error_type='ReconLiveTaskStatusWriteRejected', got: {result!r}"
+        )
+        assert result.get('content_excerpt') == _LIVE_STATUS_CONTENT[:200], (
+            f'Expected content_excerpt=content[:200], got: {result!r}'
+        )
+        assert result.get('hint'), f'Expected a non-empty hint, got: {result!r}'
+        mock_service.add_episode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allows_live_status_from_non_recon_agent(self):
+        """Same content but non-recon agent_id → allowed through.
+
+        The gate must NOT fire for agent_ids that don't start with 'recon-stage-'.
+        """
+        mock_service = AsyncMock()
+        _episode_result = MagicMock()
+        _episode_result.model_dump.return_value = {'id': 'x'}
+        mock_service.add_episode.return_value = _episode_result
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _LIVE_STATUS_CONTENT,
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'live_task_status_current_fact_write_blocked', (
+            f'Gate must not fire for non-recon agent; got: {result!r}'
+        )
+        mock_service.add_episode.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_allows_durable_point_in_time_form_from_recon_stage_agent(self):
+        """The durable timestamped point-in-time-check form + recon-stage agent
+        → NOT blocked. Proves the guard rewards the correct form instead of
+        blocking it.
+        """
+        mock_service = AsyncMock()
+        _episode_result = MagicMock()
+        _episode_result.model_dump.return_value = {'id': 'y'}
+        mock_service.add_episode.return_value = _episode_result
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _DURABLE_POINT_IN_TIME_CONTENT,
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'live_task_status_current_fact_write_blocked', (
+            f'Gate must not fire for the durable point-in-time-check form; got: {result!r}'
+        )
+        mock_service.add_episode.assert_called_once()
