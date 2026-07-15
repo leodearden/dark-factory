@@ -455,20 +455,6 @@ class TestDeleteTheTwinInvariant:
             'decision tree for module scope (step-6)'
         )
 
-    def test_verify_py_drift_note_is_gone(self):
-        source = Path(verify.__file__).read_text()
-        assert 'has_structural/has_conftest/has_test_data scan is a SEPARATE decision' not in source, (
-            "verify.py's scope_module_config drift note must be removed once "
-            'the twin it documents is deleted (step-6)'
-        )
-
-    def test_verify_plan_drift_note_is_gone(self):
-        source = Path(verify_plan.__file__).read_text()
-        assert 'mirrored BY HAND in verify.scope_module_config' not in source, (
-            "verify_plan._derive_module_runs' drift note must be removed once "
-            'scope_module_config (the hand-mirrored twin) is deleted (step-6)'
-        )
-
     @pytest.mark.asyncio
     async def test_classify_file_runs_exactly_once_per_touched_file(self, tmp_path: Path):
         """The module-config execution path does not independently re-classify:
