@@ -10,6 +10,14 @@
 # Usage:
 #   spawn-claude.sh <cwd> <skip_permissions:true|false> <title|""> <prompt>
 #
+# Model selection:
+#   $CLAUDE_SPAWN_MODEL — pin the spawned session's model. Forwarded verbatim
+#     to `claude --model <value>`, so it takes any alias (opus/sonnet/haiku/
+#     fable) or full id (e.g. claude-fable-5). It's an env var, not a
+#     positional, so the four-arg calling contract above is unchanged; unset =
+#     inherit the spawner's default model. For other/extra claude flags use
+#     $CLAUDE_SPAWN_CLAUDE_ARGS (a raw passthrough, applied after --model).
+#
 # Backend selection:
 #   $CLAUDE_SPAWN_BACKEND=tmux — bypass terminal-emulator discovery entirely
 #     and launch in a crash-survivable, reattachable tmux window instead
@@ -272,11 +280,26 @@ fi
 
 flags=""
 [ "$skip_perms" = "true" ] && flags="--dangerously-skip-permissions"
+# Model selection (CLAUDE_SPAWN_MODEL, e.g. 'opus' / 'sonnet' / 'haiku' /
+# 'fable', or a full id like 'claude-fable-5'): the first-class, trivial way
+# to pin the spawned session's model. Forwarded verbatim to
+# `claude --model <value>`, so it accepts exactly what that flag does — a
+# latest-model alias OR a full model id. Baked into the payload string at
+# construction time (like $flags itself) so it reaches claude even under
+# daemon-owned emulators (gnome-terminal server) that don't inherit this
+# caller's environment. Default-empty: no behavior change for existing
+# callers. A model alias/id is a single whitespace-free token, so the
+# unquoted splice into $inner below is safe. Placed BEFORE
+# CLAUDE_SPAWN_CLAUDE_ARGS so a raw `--model` passed through that escape
+# hatch (the last --model on the argv) still wins if a caller sets both.
+[ -n "${CLAUDE_SPAWN_MODEL:-}" ] && flags="$flags --model $CLAUDE_SPAWN_MODEL"
 # Optional extra claude CLI args (e.g. CLAUDE_SPAWN_CLAUDE_ARGS='--model
 # claude-fable-5'). Baked into the payload string at construction time —
 # like $flags itself — so they reach claude even under daemon-owned
 # emulators (gnome-terminal server) that do not inherit this caller's
-# environment. Default-empty: no behavior change for existing callers.
+# environment. Default-empty: no behavior change for existing callers. For
+# the common case of just picking a model, prefer the dedicated
+# CLAUDE_SPAWN_MODEL above; reserve this for other/extra claude flags.
 [ -n "${CLAUDE_SPAWN_CLAUDE_ARGS:-}" ] && flags="$flags $CLAUDE_SPAWN_CLAUDE_ARGS"
 
 sentinel="$(mktemp -u -t spawn-claude-XXXXXX.done)"
