@@ -316,20 +316,27 @@ def _cycle_summary_run_id_backfill(meta: dict, causation_id: str | None) -> str 
 def _normalize_task_id_metadata(meta: dict) -> None:
     """Coerce ``meta['task_id']`` to ``str`` in place, when present and non-None.
 
-    Shared by add_memory and add_system_record (task 2620 amendment, closing
-    a gap flagged in the task-2620 review — add_system_record is a parallel
-    Mem0-only write path sharing add_memory's exact-match read filters, so a
-    task_id-keyed marker written through it needs the same treatment) so
-    every write path that can carry a task_id-keyed marker gets the same
-    handling: count_memories_by_metadata/get_memories_by_metadata filters are
+    Shared by add_memory, add_system_record, count_memories_by_metadata, and
+    get_memories_by_metadata (task 2620 and its amendment rounds, closing
+    gaps flagged in the task-2620 review — add_system_record is a parallel
+    Mem0-only write path sharing add_memory's exact-match read filters, and
+    count_memories_by_metadata/get_memories_by_metadata are the read side of
+    those same filters) so every path that can produce or consume a
+    task_id-keyed marker gets the same handling: those read filters are
     exact-match, and the project-wide convention is a string task_id
     (recon_ledger's task_id column is TEXT; every reader queries with
     str(task_id)) — an int-typed value silently false-negatives against that
-    filter, making the write invisible to its own gate (e.g. the
-    stage2_suppress completion-guard). Coercing here, once, for every caller
-    closes the bug class instead of relying on each LLM-prompt-driven writer
-    to remember the convention (task 2620, sibling of task 2454's
+    filter, making a write invisible to its own gate (e.g. the
+    stage2_suppress completion-guard) or a query blind to historical
+    int-typed rows. Coercing here, once, for every caller closes the bug
+    class instead of relying on each LLM-prompt-driven writer or reader to
+    remember the convention (task 2620, sibling of task 2454's
     flag_dedup-specific fix).
+
+    On the read side (count_memories_by_metadata/get_memories_by_metadata),
+    callers pass their own ``filters`` dict; those two methods copy it
+    before calling this helper so the caller's original dict is never
+    mutated in place.
 
     Assumes a scalar (int/str) task_id, matching today's single-task-id
     write convention on this path. A list/tuple value would str()-coerce to
@@ -2872,8 +2879,18 @@ class MemoryService:
         markers keyed by ``flag_id``.  Goes through ``Mem0Backend.count_by_metadata``
         which talks to Qdrant's count API directly with a payload filter, so
         the result is exact rather than top-N-bounded.
+
+        A ``task_id`` filter is normalized to str here too (task 2620
+        amendment), symmetric with the add_memory/add_system_record
+        write-side coercion — see ``_normalize_task_id_metadata``'s
+        docstring. This keeps the exact-match gate correct against
+        historical int-typed task_id values and any writer that bypasses
+        those two methods, rather than depending on every caller
+        remembering to query with ``str(task_id)``.
         """
         scope = Scope(project_id=project_id)
+        filters = dict(filters)
+        _normalize_task_id_metadata(filters)
         return await self.mem0.count_by_metadata(scope, filters)
 
     async def get_memories_by_metadata(
@@ -2895,8 +2912,14 @@ class MemoryService:
         db2ea69e).
 
         Returns a list of ``{'id', 'created_at', 'metadata'}`` dicts.
+
+        A ``task_id`` filter is normalized to str here too — see
+        ``count_memories_by_metadata`` above and ``_normalize_task_id_metadata``'s
+        docstring (task 2620 amendment).
         """
         scope = Scope(project_id=project_id)
+        filters = dict(filters)
+        _normalize_task_id_metadata(filters)
         return await self.mem0.scroll_by_metadata(scope, filters, limit)
 
     # ------------------------------------------------------------------
