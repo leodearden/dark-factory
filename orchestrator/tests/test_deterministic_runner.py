@@ -122,6 +122,45 @@ def _deploy_task(
     }
 
 
+def _deploy_task_omitted_target_unit(
+    task_id: str = '2632',
+    script: str = '/tmp/test-deploy.sh',
+    args: list | None = None,
+    env: dict | None = None,
+    cwd: str = '/tmp',
+    timeout_secs: int | float = 30,
+    description: str = 'Install trickle timer (no target_unit key)',
+) -> dict:
+    """Build a deterministic deploy task whose ``before_done`` OMITS the
+    ``target_unit`` key entirely (task 2632 / esc-2585-1).
+
+    Mirrors ``_deploy_task`` minus ``target_unit`` — this is the REAL shape
+    of the install-trickle-timer deploy config that produced esc-2585-1:
+    ``run()`` computes ``before_done.get('target_unit', '') == ''`` rather
+    than an explicit ``None``.  Kept as a distinct small helper (rather than
+    a ``target_unit=None`` sentinel on ``_deploy_task``) so the omitted-key
+    shape is faithfully reproduced instead of merely approximated.
+    """
+    before_done: dict = {
+        'script': script,
+        'args': args if args is not None else [],
+        'env': env if env is not None else {},
+        'cwd': cwd,
+        'timeout_secs': timeout_secs,
+    }
+    metadata: dict = {
+        'task_kind': 'deterministic',
+        'always_escalates': False,
+        'before_done': before_done,
+    }
+    return {
+        'id': task_id,
+        'title': 'Install trickle timer',
+        'description': description,
+        'metadata': metadata,
+    }
+
+
 def _predicate_task(
     task_id: str = '700',
     title: str = 'Milestone predicate check',
@@ -925,6 +964,84 @@ class TestBeforeDoneCrossUnitDeploy:
         assert (
             deploy_state_calls[-1].args[1]['deploy_state']['escalated_at']
             == deploy_state_calls[-1].args[1]['gate_escalated_at']
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 2632 / esc-2585-1 residual fix: a cross-unit before_done deploy whose
+# target_unit is falsy (None, or the key omitted entirely — before_done.get(
+# 'target_unit', '') == '') has no specific systemd unit to baseline-inspect
+# or fresh-PID-verify. Skip that machinery entirely and drive the outcome on
+# the deploy script's exit code alone.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestBeforeDoneTargetUnitlessDeploy:
+    """DeterministicRunner — before_done cross-unit deploy with a falsy
+    target_unit (None, or the key omitted entirely) skips the baseline/
+    fresh-PID-verify machinery and drives the outcome on the script's exit
+    code alone (task 2632 / esc-2585-1 residual fix)."""
+
+    @pytest.mark.parametrize(
+        'build_task',
+        [
+            pytest.param(
+                lambda: _deploy_task(task_id='2632', target_unit=None),
+                id='target_unit=None',
+            ),
+            pytest.param(
+                lambda: _deploy_task_omitted_target_unit(task_id='2632'),
+                id='target_unit-key-omitted',
+            ),
+        ],
+    )
+    async def test_targetless_deploy_rc0_drives_done_without_baseline_inspect(
+        self, tmp_path: Path, build_task,
+    ):
+        """rc==0 with a falsy target_unit drives straight to done WITHOUT
+        ever inspecting the unit (baseline or verify) — the runner must not
+        inspect the empty unit name '' the way esc-2585-1's config did.
+
+        RED today: run() unconditionally inspects target_unit (''), which
+        returns a degenerate ActiveState-less dict, tripping the baseline
+        gate and filing a false-block infra_issue escalation instead of
+        driving to done.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = build_task()
+        tid = str(task['id'])
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock()
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        unit_inspector.assert_not_awaited()
+        assert queue.get_by_task(tid, status='pending') == []
+
+        scheduler.set_task_status.assert_awaited_once()
+        call = scheduler.set_task_status.call_args
+        assert call.args[1] == 'done'
+        assert call.kwargs['done_provenance']['kind'] == 'deterministic-deploy'
+
+        verified_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_verified_at')
+        ]
+        assert verified_calls, (
+            'update_task must stamp before_done_verified_at (crash-safe verified stamp)'
         )
 
 
