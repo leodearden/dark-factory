@@ -630,6 +630,13 @@ _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE = 'stage2_cycle_summary_trim'
 # write_cycle_summary's internal-service idiom (task 2229).
 _TASK_COUNT_SNAPSHOT_WRITE_SOURCE = 'stage2_task_count_snapshot_write'
 
+# Audit tag for _prune_task_count_snapshots's prune-before-write delete pass
+# (task 2429) — makes the recurring task_count_snapshot near-duplicate
+# accumulation self-correcting: every kind='task_count_snapshot' Mem0 record
+# is deleted immediately before _write_task_count_snapshot's add_memory call,
+# so at most one canonical snapshot survives per project per cycle.
+_TASK_COUNT_SNAPSHOT_PRUNE_SOURCE = 'stage2_task_count_snapshot_prune'
+
 # Age-based GC for the stage2_persistence_marker Channel-3 persistence-counter
 # family (task 2095), mirroring the stage1_flag_marker age-GC above (task 1944).
 # _track_flag_persistence writes one stage2_persistence_marker per surviving
@@ -1021,6 +1028,45 @@ async def _verify_task_count_snapshot_written(
         )
         return None
     return False
+
+
+async def _prune_task_count_snapshots(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    scroll_limit: int = 1000,
+) -> int:
+    """Delete every existing ``kind='task_count_snapshot'`` Mem0 record (task 2429).
+
+    Called by :func:`_write_task_count_snapshot` immediately before its
+    ``add_memory`` call, so the net effect of one cycle is exactly one
+    canonical snapshot surviving per project — self-correcting the
+    near-duplicate accumulation that manual/LLM-driven cleanups failed to
+    keep pruned.
+    """
+    members = await memory_service.get_memories_by_metadata(
+        project_id=project_id,
+        filters={'kind': TASK_COUNT_SNAPSHOT_KIND},
+        limit=scroll_limit,
+    )
+
+    ids = [member['id'] for member in members if member.get('id')]
+    if not ids:
+        return 0
+
+    results = await gather_collect(
+        memory_service.delete_memory(
+            memory_id=mid,
+            store='mem0',
+            project_id=project_id,
+            causation_id=run_id,
+            _source=_TASK_COUNT_SNAPSHOT_PRUNE_SOURCE,
+        )
+        for mid in ids
+    )
+
+    return sum(1 for result in results if not isinstance(result, Exception))
 
 
 async def _write_task_count_snapshot(
