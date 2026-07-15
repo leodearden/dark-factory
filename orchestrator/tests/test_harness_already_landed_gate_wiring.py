@@ -152,6 +152,35 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
+    async def test_foreign_citation_not_on_branch_vetoes_flip(
+        self, mock_orch_config,
+    ) -> None:
+        """FIX 2 (task 2500) citation-lineage guard: the grep-found citation
+        must be reachable from THIS task's own branch tip. Here is_ancestor
+        returns True for (branch, main) — the ancestry evidence is real —
+        but False for (citation, branch): the citation commit is NOT an
+        ancestor of this task's branch, i.e. it is an unrelated task's
+        commit that merely matched the citation grep pattern (the task
+        2624 incident shape — a foreign merge commit fabricated as this
+        task's completion evidence). The gate must reject it, not flip.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        branch = 'task/42'
+        citation_sha = 'a' * 40  # matches _wired_ancestry_harness's citation default
+
+        async def _is_ancestor(a, b):
+            if (a, b) == (branch, 'main'):
+                return True
+            if (a, b) == (citation_sha, branch):
+                return False  # citation NOT reachable from this branch's tip
+            raise AssertionError(f'unexpected is_ancestor call: {a!r}, {b!r}')
+        h.git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
 
 def _wired_marker_harness(
     mock_orch_config, *, marker_sha, branch_base_sha, marker_is_ancestor_of_base,
