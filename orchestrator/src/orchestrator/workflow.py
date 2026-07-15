@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 
 # Runtime import of the BORN_AT_L2_SEVERITIES constant from escalation.models.
 # escalation.models is listed under TYPE_CHECKING above (:77-78) for the Escalation
@@ -93,7 +93,9 @@ from orchestrator.verify import (
 from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES, FailureCategory
 from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     BlockDisposition,
+    CancellationScope,
     IllegalTransition,
+    OnTerminalEntry,
     RequeueKind,
     StewardBudgetExhausted,
     StewardInterrupted,
@@ -102,6 +104,7 @@ from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     StewardResolved,
     StewardTerminalDecision,
     TerminalReport,
+    WorkflowCancelled,
     WorkflowOutcome,
     WorkflowState,
     WorkflowStateMachine,
@@ -2569,6 +2572,34 @@ class TaskWorkflow:
             # breaker tripped so the dir is available for forensic analysis).
             self._cleanup_config_dir()
 
+    def _on_terminal_cleanups(self) -> list[OnTerminalEntry]:
+        """Ordered, kind-aware terminal-cleanup list for ``CancellationScope``.
+
+        Placeholder for now (task 2252 step-8) — returns an empty list, so
+        ``_drive()``'s own finally block (above) remains the sole owner of
+        terminal cleanup until step-10 relocates its five cleanups here and
+        deletes that finally block.
+        """
+        return []
+
+    async def _finalise_cancellation(self, kind: Literal['hard', 'soft']) -> WorkflowOutcome:
+        """Resolve a caught :class:`WorkflowCancelled` into a ``WorkflowOutcome``.
+
+        Drives the machine to ``CANCELLED`` (guarded by ``is_terminal()`` —
+        a no-op if some other path already left it terminal; mirrors the
+        existing ``_handle_cancelled_terminal_exit`` CANCELLED transition).
+        ``kind == 'hard'`` maps straight to ``WorkflowOutcome.CANCELLED``.
+        ``kind == 'soft'`` delegates to the existing ``_handle_soft_cancel``
+        status-derived decision (DONE for a terminal-done scheduler row,
+        else SOFT_CANCELLED) — folded in here rather than duplicated.
+        """
+        working_phase = self.machine.state.value
+        if not self.machine.is_terminal():
+            self._enter_phase(WorkflowState.CANCELLED)
+        if kind == 'hard':
+            return WorkflowOutcome.CANCELLED
+        return await self._handle_soft_cancel(working_phase)
+
     async def run(self) -> TerminalReport:
         """Execute the full state machine and return the terminal contract.
 
@@ -2605,8 +2636,25 @@ class TaskWorkflow:
         ``not self._worktree_external`` guard for the identical reason —
         eval mode's task row is not the authoritative record real dispatch
         relies on.
+
+        CancellationScope (CX-1, W9-θ): ``_drive()`` runs under a
+        :class:`CancellationScope` supervising both the harness's hard
+        ``task.cancel()`` and the soft ``_cancel_event`` as ONE typed
+        :class:`WorkflowCancelled`, caught at this EXACTLY ONE site.  The
+        outcome<->status half of SM-2 is additionally skipped on a
+        hard-cancel exit (``cancel_kind == 'hard'``): ``_enter_phase``
+        never persists status, so a forcibly-torn-down workflow leaves the
+        live row at whatever it was (typically 'in-progress') — it does not
+        own its terminal row; the harness R3 grace window + reconcile sweep
+        do. The phase-consistency half always still holds.
         """
-        outcome = await self._drive()
+        cancel_kind: Literal['hard', 'soft'] | None = None
+        scope = CancellationScope(self._cancel_event, self._on_terminal_cleanups())
+        try:
+            outcome = await scope.supervise(self._drive())
+        except WorkflowCancelled as wc:
+            cancel_kind = wc.kind
+            outcome = await self._finalise_cancellation(wc.kind)
         report = (
             self._terminal_report
             if (
@@ -2622,7 +2670,7 @@ class TaskWorkflow:
             f'run()-exit SM-2: report.phase {report.phase!r} != '
             f'machine.state {self.machine.state!r} (task {self.task_id})'
         )
-        if not self._worktree_external:
+        if not self._worktree_external and cancel_kind != 'hard':
             try:
                 last_status_row = await self.scheduler.get_status(self.task_id)
             except Exception:
