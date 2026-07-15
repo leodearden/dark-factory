@@ -66,7 +66,7 @@ def _mock_scheduler(task: dict):
 
 def _deploy_task(
     task_id: str = '200',
-    target_unit: str = 'orchestrator-reify.service',
+    target_unit: str | None = 'orchestrator-reify.service',
     script: str = '/tmp/test-deploy.sh',
     args: list | None = None,
     env: dict | None = None,
