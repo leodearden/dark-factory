@@ -546,11 +546,78 @@ async def apply_audit_annotations(
 # ---------------------------------------------------------------------------
 
 async def _run(args: argparse.Namespace) -> int:
-    raise NotImplementedError
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+
+    import os  # noqa: PLC0415
+
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    config = FusedMemoryConfig()
+    if config.taskmaster is None:
+        logger.error('Task backend not configured in fused-memory config')
+        return 1
+
+    backend = SqliteTaskBackend(config.taskmaster)
+    await backend.start()
+    try:
+        raw = await backend.get_tasks(args.project_root)
+        tasks = raw.get('tasks') or []
+        logger.info('Fetched %d task(s) from task backend', len(tasks))
+
+        git = GitFacts(args.project_root)
+        report = await build_audit_report(tasks, git, ref=args.ref)
+        output = {'project': args.project, 'project_root': args.project_root, **report}
+        print(json.dumps(output, indent=2, default=str))
+
+        if not args.apply:
+            logger.info(
+                'Dry run — nothing was modified. Use --apply to annotate flagged tasks.',
+            )
+            return 0
+
+        result = await apply_audit_annotations(backend, args.project_root, report)
+        logger.info(
+            'Applied: annotated %d flagged task(s); %d error(s); needs_human_review=%s',
+            result['annotated'], result['errors'], result['needs_human_review'],
+        )
+        return 1 if result['errors'] > 0 else 0
+    finally:
+        await backend.close()
 
 
 def main() -> int:
-    raise NotImplementedError
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        '--project', default='dark_factory',
+        help='project_id label for the printed report (default: dark_factory)',
+    )
+    parser.add_argument(
+        '--project-root', required=True,
+        help='Absolute filesystem path to the project (required by Taskmaster + git)',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to fused-memory config file (sets CONFIG_PATH env var)',
+    )
+    parser.add_argument(
+        '--ref', default='main',
+        help='Git ref to audit commit lineage against (default: main)',
+    )
+    parser.add_argument(
+        '--apply', action='store_true',
+        help=(
+            "Annotate flagged tasks' metadata.x_provenance_audit "
+            '(default: dry-run, report only). Never reopens a done task.'
+        ),
+    )
+    args = parser.parse_args()
+    return asyncio.run(_run(args))
 
 
 if __name__ == '__main__':
