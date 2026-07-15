@@ -212,36 +212,40 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     The ``VerifyCmd``-layer counterpart of ``verify._scope_to_keyword`` (which
     operates on — and returns — a shell string): this returns a ``VerifyCmd``
     instead, since ``PlannedRun.cmd`` stores structured commands, not strings.
-    The two scopers are deliberately kept in algorithmic lockstep — a future
-    change to one's scoping rule should update the other.
+    The two scopers run the IDENTICAL algorithm (true algorithmic lockstep —
+    a future change to one's scoping rule must update the other): *raw* is
+    ALWAYS truncated to everything up to and including the first occurrence
+    of *keyword* before being (re-)parsed, regardless of whether the
+    untruncated *raw* would itself have parsed as one structured command or a
+    raw-retained chain. This means content positioned after the matched
+    *keyword* occurrence — including any flags trailing the target on an
+    otherwise single-clause command, or any further ``&&``-chained clause —
+    is intentionally dropped, exactly as ``_scope_to_keyword`` drops it: a
+    value-taking flag after the target (e.g. ``'ruff check src/ --select
+    E'``) would otherwise have its value misread as an extra target by
+    ``scope_to``, so truncating first — not scoping the whole parsed command
+    — is what keeps this safe as well as byte-identical.
 
-    A structured single-tool command (``parse_config_command(raw).raw is
-    None`` — no ``&&``-chain, not OPAQUE) is scoped directly: byte-identical
-    to this function's pre-remediation derivation, so every existing golden
-    and every real single-command config is unaffected.
-
-    A raw-retained command (OPAQUE, or a recognised-but-unstructurable chain
-    — e.g. dark_factory's real per-subproject ``lint_command``/
-    ``type_check_command`` ``&&``-chains) is handled exactly as
-    ``verify._scope_to_keyword`` handles it: everything up to and including
-    the first occurrence of *keyword* is re-parsed as a single tool
-    invocation and, if THAT prefix parses into a structured, non-OPAQUE
-    command, it is scoped to *files* — first-clause scoped, every trailing
-    ``&&``-chained clause dropped. *keyword* absent from *raw*, or the
-    prefix itself not parsing into one recognised structured invocation
-    (P1), leaves *raw* verbatim — rendering the returned ``VerifyCmd``
-    reproduces *raw* unchanged.
+    If the *keyword*-prefix parses into a structured, non-OPAQUE command, it
+    is scoped to *files* (first-clause scoped, every trailing ``&&``-chained
+    clause dropped). *keyword* absent from *raw*, or the prefix not parsing
+    into one recognised structured invocation (P1), leaves *raw* untouched:
+    the returned ``VerifyCmd`` is forced raw-retained (``raw=raw``) so
+    rendering it reproduces *raw* byte-for-byte even when *raw* itself would
+    otherwise have parsed into a structured command — a from-scratch render
+    of which is only argv-equivalent, not guaranteed byte-identical, to the
+    original string (e.g. a ``--directory`` flag renders back as a leading
+    ``cd``).
     """
     parsed = parse_config_command(raw)
-    if parsed.raw is None:
-        return strip_cwd(scope_to(parsed, files))
+    unscoped = parsed if parsed.raw is not None else VerifyCmd(tool=parsed.tool, raw=raw)
 
     idx = raw.find(keyword)
     if idx == -1:
-        return parsed
+        return unscoped
     prefix_parsed = parse_config_command(raw[: idx + len(keyword)])
     if prefix_parsed.tool is ToolKind.OPAQUE or prefix_parsed.raw is not None:
-        return parsed
+        return unscoped
     return strip_cwd(scope_to(prefix_parsed, files))
 
 

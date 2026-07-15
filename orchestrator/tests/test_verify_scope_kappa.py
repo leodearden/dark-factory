@@ -433,6 +433,100 @@ class TestModuleConfigScopeGoldens:
             f'{executed[0].test_command!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_file_scoped_command_with_trailing_flags_matches_scope_to_keyword(
+        self, tmp_path: Path,
+    ):
+        """(f) FILE_SCOPED command with flags trailing the target (dark_factory's
+        real ``... pytest tests/ --tb=short -q`` shape) -> test_command ==
+        _scope_to_keyword's own output: first-clause scoped, with the
+        trailing flags DROPPED (reviewer_comprehensive correctness finding,
+        verify_plan.py:207) — not preserved by scoping the whole parsed
+        command, which would both change the command actually run in the
+        merge gate for every real flag-bearing config AND (for a
+        value-taking flag, see the next golden) misread the flag's value as
+        an extra scope target.
+        """
+        (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
+        test_path = 'mymod/tests/test_thing.py'
+        (tmp_path / test_path).write_text('def test_thing(): pass\n')
+
+        test_command = 'uv run --directory mymod pytest tests/ --tb=short -q'
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [ModuleConfig(prefix='mymod', test_command=test_command)]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=[test_path],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        expected = verify._scope_to_keyword(test_command, 'pytest', [test_path])
+        assert executed[0].test_command == expected, (
+            f'expected the _scope_to_keyword-scoped string {expected!r}, got '
+            f'{executed[0].test_command!r}'
+        )
+        # The original command's trailing ` tests/ --tb=short -q` (target plus
+        # flags positioned after the matched 'pytest' keyword) must be dropped
+        # entirely — not merely have its `tests/` target replaced while
+        # `--tb=short -q` survives.
+        assert executed[0].test_command == 'uv run pytest mymod/tests/test_thing.py', (
+            f'trailing flags/targets after the matched keyword must be dropped, '
+            f'matching _scope_to_keyword, not preserved: {executed[0].test_command!r}'
+        )
+
+        assert result.plan is not None
+        _assert_plan_run_matches_executed(
+            result.plan, 'pytest:', executed[0].test_command, executed[0].prefix,
+        )
+
+    @pytest.mark.asyncio
+    async def test_file_scoped_command_with_value_taking_flag_after_target_is_dropped(
+        self, tmp_path: Path,
+    ):
+        """(g) FILE_SCOPED lint command with a value-taking flag AFTER the
+        target (``'ruff check src/ --select E'``) -> the whole
+        ``'--select E'`` tail is dropped, matching _scope_to_keyword — not
+        scoped as though ``'E'`` were an extra target (the latent hazard the
+        reviewer flagged: scoping the whole parsed command would replace
+        BOTH ``src/`` and ``E`` with the touched file, leaving a dangling
+        valueless ``--select``).
+        """
+        (tmp_path / 'mymod').mkdir(parents=True)
+        touched = 'mymod/thing.py'
+        (tmp_path / touched).write_text('def helper():\n    return 1\n')
+
+        lint_command = 'ruff check src/ --select E'
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [ModuleConfig(prefix='mymod', lint_command=lint_command)]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=[touched],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        expected = verify._scope_to_keyword(lint_command, 'ruff check', [touched])
+        assert executed[0].lint_command == expected, (
+            f'expected the _scope_to_keyword-scoped string {expected!r}, got '
+            f'{executed[0].lint_command!r}'
+        )
+        assert '--select' not in (executed[0].lint_command or ''), (
+            f'a dangling valueless --select must never survive scoping: '
+            f'{executed[0].lint_command!r}'
+        )
+
+        assert result.plan is not None
+        _assert_plan_run_matches_executed(
+            result.plan, 'lint:', executed[0].lint_command, executed[0].prefix,
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-5: delete-the-twin invariant
