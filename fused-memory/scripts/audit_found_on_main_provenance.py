@@ -164,11 +164,25 @@ def select_found_on_main_tasks(tasks: list[dict]) -> list[TaskProvenanceAudit]:
 # ---------------------------------------------------------------------------
 
 def extract_cited_task_ids(message: str) -> set[str]:
-    raise NotImplementedError
+    """Return every task id cited in *message* (commit subject + body).
+
+    Mirrors the citation conventions in ``CITATION_PATTERN`` above
+    (conventional-commit ``type(id):`` subjects and ``task/{id}`` mentions,
+    which subsumes the ``Merge task/{id} into <main>`` merge-commit
+    subject). Returns an empty set for a message with no citations —
+    never raises.
+    """
+    ids: set[str] = set()
+    for m in CITATION_PATTERN.finditer(message or ''):
+        tid = m.group('conv_tid') or m.group('branch_tid')
+        if tid:
+            ids.add(tid)
+    return ids
 
 
 def commit_cites_task(message: str, task_id: str) -> bool:
-    raise NotImplementedError
+    """Return True iff *task_id* is among the ids cited in *message*."""
+    return task_id in extract_cited_task_ids(message)
 
 
 # ---------------------------------------------------------------------------
