@@ -1951,6 +1951,19 @@ class MemoryService:
         meta = dict(metadata or {})
         meta['category'] = resolved_category.value
 
+        # Normalize metadata.task_id to str at this shared write boundary
+        # (task 2620, sibling of task 2454's flag_dedup-specific fix).
+        # count_memories_by_metadata/get_memories_by_metadata filters are
+        # exact-match, and the project-wide convention is a string task_id
+        # (recon_ledger's task_id column is TEXT; every reader queries with
+        # str(task_id)) — an int-typed value silently false-negatives against
+        # that filter, making the write invisible to its own gate (e.g. the
+        # stage2_suppress completion-guard). Coercing here, once, for every
+        # add_memory caller/category closes the bug class instead of relying
+        # on each LLM-prompt-driven writer to remember the convention.
+        if 'task_id' in meta and meta['task_id'] is not None:
+            meta['task_id'] = str(meta['task_id'])
+
         # Server-side cycle_summary metadata tagging (recon_pool auto-tag
         # task 2077, run_id auto-backfill task 2109, missing-key warning
         # task 2094/2109) — factored into a shared helper (task 2222

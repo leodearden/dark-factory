@@ -178,6 +178,55 @@ class TestAddMemory:
         assert scope.project_id == 'test'
         assert scope.agent_id == 'a1'
         assert scope.session_id == 's1'
+
+    @pytest.mark.asyncio
+    async def test_int_task_id_normalized_to_str(self, service):
+        """metadata.task_id must persist as str even when passed as int (task 2620).
+
+        count_memories_by_metadata/get_memories_by_metadata filters are
+        exact-match on the string form — an int-typed task_id silently
+        false-negatives against that convention (e.g. the stage2_suppress
+        completion-guard gate), so add_memory must normalize at the write
+        boundary regardless of what type a caller passes.
+        """
+        await service.add_memory(
+            content='STAGE 2 SUPPRESS task_id=2614',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={'task_id': 2614, 'stage2_suppress': True},
+        )
+
+        service.mem0.add.assert_called_once()
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['task_id'] == '2614'
+        assert isinstance(call_kwargs['metadata']['task_id'], str)
+
+    @pytest.mark.asyncio
+    async def test_str_task_id_unaffected(self, service):
+        """An already-string task_id passes through unchanged (task 2620)."""
+        await service.add_memory(
+            content='STAGE 2 SUPPRESS task_id=2614',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={'task_id': '2614', 'stage2_suppress': True},
+        )
+
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['task_id'] == '2614'
+        assert isinstance(call_kwargs['metadata']['task_id'], str)
+
+    @pytest.mark.asyncio
+    async def test_missing_task_id_unaffected(self, service):
+        """metadata with no task_id key is unaffected (task 2620)."""
+        await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+            metadata={'other_key': 'value'},
+        )
+
+        call_kwargs = service.mem0.add.call_args[1]
+        assert 'task_id' not in call_kwargs['metadata']
         metadata = call_kwargs['metadata']
         assert metadata.get('category') == 'preferences_and_norms'
 
