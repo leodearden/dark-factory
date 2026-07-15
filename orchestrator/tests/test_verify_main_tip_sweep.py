@@ -27,6 +27,10 @@ Test coverage:
            covered independently at BOTH the first-pass and the retry call
            site; a CONTROL test pins narrowness — an ENOENT naming a
            DIFFERENT path is still real drift and passes through unchanged.
+  task-2370 step-1 (confirm-before-alarm gate — node-id extraction):
+           TestExtractFailingTestIds
+  task-2370 step-3/step-5 (confirm-before-alarm gate — confirm fn):
+           TestConfirmMainTipFailureIsReal
 """
 
 from __future__ import annotations
@@ -822,3 +826,582 @@ class TestRunMainTipSweepEnoentOwnWorktree:
 
         remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
         assert remove_calls, 'git worktree remove should run even on drift passthrough'
+
+
+# ---------------------------------------------------------------------------
+# task-2370 step-1: _extract_failing_test_ids — pure node-id extraction
+# ---------------------------------------------------------------------------
+
+
+class TestExtractFailingTestIds:
+    """task-2370 step-1: verify._extract_failing_test_ids(test_output) -> list[str].
+
+    Pure helper (no I/O) that recovers pytest node-ids from raw test output
+    for the confirm-before-alarm isolated re-run gate. RED today: the
+    function does not exist yet.
+    """
+
+    def test_extracts_node_ids_from_failed_lines(self) -> None:
+        """FAILED lines yield node-ids, including a parametrized case and a
+        line with a trailing ' - AssertionError: ...' reason."""
+        from orchestrator import verify as verify_module
+
+        output = (
+            'FAILED orchestrator/tests/test_x.py::test_y\n'
+            "FAILED orchestrator/tests/test_x.py::test_z[case-1] - AssertionError: boom\n"
+        )
+        assert verify_module._extract_failing_test_ids(output) == [
+            'orchestrator/tests/test_x.py::test_y',
+            'orchestrator/tests/test_x.py::test_z[case-1]',
+        ]
+
+    def test_extracts_node_id_from_error_line(self) -> None:
+        """A fixture/teardown ``ERROR <nodeid>`` short-summary line yields the
+        node-id, same as a FAILED line (robustness-masking fix, task 2370
+        amendment)."""
+        from orchestrator import verify as verify_module
+
+        output = 'ERROR orchestrator/tests/test_x.py::test_y - Exception: setup boom\n'
+        assert verify_module._extract_failing_test_ids(output) == [
+            'orchestrator/tests/test_x.py::test_y',
+        ]
+
+    def test_extracts_file_from_bare_error_collection_line(self) -> None:
+        """A collection-level ``ERROR <file.py>`` line (whole module fails to
+        collect, no ``::``) yields the bare file path as the isolation
+        target."""
+        from orchestrator import verify as verify_module
+
+        output = 'ERROR orchestrator/tests/test_x.py - ImportError: boom\n'
+        assert verify_module._extract_failing_test_ids(output) == [
+            'orchestrator/tests/test_x.py',
+        ]
+
+    def test_extracts_both_failed_and_error_node_ids_in_first_seen_order(self) -> None:
+        """A mixed short-test-summary block — a genuine ERROR alongside a
+        load-induced FAILED flake — surfaces BOTH node-ids. This is the
+        scenario behind the robustness-masking finding: extracting only the
+        FAILED id would let the confirm gate re-run and pass on just that
+        test, suppressing the alarm while never re-running (and thus
+        masking) the real ERROR."""
+        from orchestrator import verify as verify_module
+
+        output = (
+            'FAILED orchestrator/tests/test_x.py::test_flaky - AssertionError: boom\n'
+            'ERROR orchestrator/tests/test_y.py::test_setup_broken - Exception: boom\n'
+        )
+        assert verify_module._extract_failing_test_ids(output) == [
+            'orchestrator/tests/test_x.py::test_flaky',
+            'orchestrator/tests/test_y.py::test_setup_broken',
+        ]
+
+    def test_extracts_node_id_from_xdist_worker_crash_notice(self) -> None:
+        """An explicit "crashed while running '<nodeid>'" notice yields the
+        quoted node-id."""
+        from orchestrator import verify as verify_module
+
+        output = "worker 'gw3' crashed while running 'tests/test_a.py::test_b'\n"
+        assert verify_module._extract_failing_test_ids(output) == [
+            'tests/test_a.py::test_b',
+        ]
+
+    def test_extracts_node_id_preceding_node_down_marker(self) -> None:
+        """When no explicit "crashed while running" phrasing is present, the
+        in-progress node-id line immediately preceding a
+        "[gwN] node down: Not properly terminated" marker is recovered."""
+        from orchestrator import verify as verify_module
+
+        output = (
+            'tests/test_a.py::test_b\n'
+            '[gw3] node down: Not properly terminated\n'
+        )
+        assert verify_module._extract_failing_test_ids(output) == [
+            'tests/test_a.py::test_b',
+        ]
+
+    def test_deduplicates_preserving_first_seen_order(self) -> None:
+        """Repeated node-ids (e.g. FAILED line + a later re-mention) collapse
+        to one entry, in first-seen order."""
+        from orchestrator import verify as verify_module
+
+        output = (
+            'FAILED orchestrator/tests/test_x.py::test_y\n'
+            'FAILED orchestrator/tests/test_a.py::test_b\n'
+            'FAILED orchestrator/tests/test_x.py::test_y\n'
+        )
+        assert verify_module._extract_failing_test_ids(output) == [
+            'orchestrator/tests/test_x.py::test_y',
+            'orchestrator/tests/test_a.py::test_b',
+        ]
+
+    def test_returns_empty_list_for_non_test_failure(self) -> None:
+        """A pure lint (ruff) error block has no pytest node-ids."""
+        from orchestrator import verify as verify_module
+
+        ruff_output = (
+            'orchestrator/src/orchestrator/foo.py:12:5: F401 unused import\n'
+            'Found 1 error.\n'
+        )
+        assert verify_module._extract_failing_test_ids(ruff_output) == []
+
+    def test_returns_empty_list_for_unparseable_worker_crash(self) -> None:
+        """A node-down marker with no adjacent node-id-shaped line yields []
+        rather than a guessed/garbage id."""
+        from orchestrator import verify as verify_module
+
+        opaque_crash_output = (
+            'Something bad happened.\n'
+            '[gw3] node down: Not properly terminated\n'
+        )
+        assert verify_module._extract_failing_test_ids(opaque_crash_output) == []
+
+    def test_returns_empty_list_for_falsy_output(self) -> None:
+        from orchestrator import verify as verify_module
+
+        assert verify_module._extract_failing_test_ids('') == []
+
+
+# ---------------------------------------------------------------------------
+# task-2370 step-3/step-5: confirm_main_tip_failure_is_real
+#
+# verify.confirm_main_tip_failure_is_real(config, git_ops, failing_result, *,
+# main_sha) -> bool
+#
+# Confirm-before-alarm gate: re-runs the named failing test(s) in isolation
+# (fresh probe worktree, serial + cleared addopts) before the harness files a
+# red-main L1 escalation. True = confirmed real (file the alarm); False =
+# demonstrated flake (suppress). Fail-safe = True for every path except a
+# clean isolated pass.
+# ---------------------------------------------------------------------------
+
+CONFIRM_NODE_ID = (
+    'orchestrator/tests/test_concurrent_verify_boundary.py::test_concurrent_verify_boundary'
+)
+
+CONFIRM_FAILING_RESULT = VerifyResult(
+    passed=False,
+    test_output=f'FAILED {CONFIRM_NODE_ID}',
+    lint_output='',
+    type_output='',
+    summary='test_failure',
+    cause_hint=f'FAILED {CONFIRM_NODE_ID}',
+    category='test_failure',
+)
+
+# A failing_result with no parseable node-ids: a pure lint/compile category
+# whose test_output carries no FAILED/worker-crash markers.
+CONFIRM_NO_NODEID_RESULT = VerifyResult(
+    passed=False,
+    test_output='',
+    lint_output='orchestrator/src/orchestrator/foo.py:12:5: F401 unused import',
+    type_output='',
+    summary='lint_failure',
+    cause_hint='F401 unused import',
+    category='lint_failure',
+)
+
+_CONFIRM_PROJECT_LAYOUT = {
+    'orchestrator/orchestrator.yaml': (
+        'test_command: "uv run --project orchestrator --directory orchestrator '
+        'pytest tests/ --tb=short -q"\n'
+    ),
+    'orchestrator/tests/test_concurrent_verify_boundary.py': (
+        'def test_concurrent_verify_boundary():\n    pass\n'
+    ),
+}
+
+# A discovered-subprojects layout that deliberately OMITS CONFIRM_NODE_ID's
+# file — the "no owning subproject" fail-safe path (task 2370 amendment,
+# suggestion #3).
+_CONFIRM_PROJECT_LAYOUT_MISSING_FILE = {
+    'orchestrator/orchestrator.yaml': (
+        'test_command: "uv run --project orchestrator --directory orchestrator '
+        'pytest tests/ --tb=short -q"\n'
+    ),
+}
+
+# A bare, subproject-*relative* node-id (no baked-in prefix) that exists
+# under TWO discovered subprojects — the ambiguous-mapping edge case (task
+# 2370 amendment, suggestion #5).
+CONFIRM_AMBIGUOUS_NODE_ID = 'tests/test_dup.py::test_dup'
+
+CONFIRM_AMBIGUOUS_FAILING_RESULT = VerifyResult(
+    passed=False,
+    test_output=f'FAILED {CONFIRM_AMBIGUOUS_NODE_ID}',
+    lint_output='',
+    type_output='',
+    summary='test_failure',
+    cause_hint=f'FAILED {CONFIRM_AMBIGUOUS_NODE_ID}',
+    category='test_failure',
+)
+
+_CONFIRM_PROJECT_LAYOUT_AMBIGUOUS = {
+    'alpha/orchestrator.yaml': (
+        'test_command: "uv run --project alpha --directory alpha pytest tests/ --tb=short -q"\n'
+    ),
+    'alpha/tests/test_dup.py': 'def test_dup():\n    pass\n',
+    'beta/orchestrator.yaml': (
+        'test_command: "uv run --project beta --directory beta pytest tests/ --tb=short -q"\n'
+    ),
+    'beta/tests/test_dup.py': 'def test_dup():\n    pass\n',
+}
+
+
+def _make_confirm_fake_run(run_calls: list, project_layout: dict[str, str]):
+    """Fake orchestrator.git_ops._run: on a worktree add, materializes
+    *project_layout* under the target path so module discovery and the
+    node-id -> subproject existence mapping run against real files without a
+    real git checkout (the real ``git worktree add`` subprocess is never
+    invoked in these unit tests)."""
+
+    async def _fake_run(cmd, **kwargs):
+        run_calls.append(cmd)
+        if 'worktree' in cmd and 'add' in cmd:
+            target = Path(cmd[4])
+            target.mkdir(parents=True, exist_ok=True)
+            for relpath, content in project_layout.items():
+                p = target / relpath
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(content)
+        return (0, '', '')
+
+    return _fake_run
+
+
+class TestConfirmMainTipFailureIsReal:
+    """task-2370 step-3/step-5: verify.confirm_main_tip_failure_is_real."""
+
+    # -- step-3: SUPPRESS path -------------------------------------------
+
+    def test_confirm_suppresses_when_isolated_rerun_passes(self, tmp_path: Path) -> None:
+        """All named failing tests pass on isolated re-run -> False (suppress),
+        with the probe-worktree lifecycle, the isolated+scoped ModuleConfig,
+        the suppressed-flake audit record, and the INFO log all verified.
+
+        RED today: confirm_main_tip_failure_is_real does not exist.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT)
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+            patch.object(verify_module, 'logger') as mock_logger,
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        # (a) flake -> suppress
+        assert result is False, f'Expected False (suppress), got {result!r}'
+
+        # (b) probe worktree lifecycle: add --detach ... <MAIN_SHA> AND remove --force
+        add_calls = [c for c in run_calls if 'worktree' in c and 'add' in c]
+        assert add_calls, 'Expected a git worktree add call'
+        assert '--detach' in add_calls[0], f'Expected --detach in add cmd: {add_calls[0]}'
+        assert MAIN_SHA in add_calls[0], f'Expected main_sha in add cmd: {add_calls[0]}'
+        remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
+        assert remove_calls, 'Expected a git worktree remove --force call'
+        assert '--force' in remove_calls[0], f'Expected --force in remove cmd: {remove_calls[0]}'
+
+        # (c) isolated + scoped ModuleConfig passed to run_verification
+        rv.assert_awaited()
+        called_mc = rv.call_args.args[2]
+        assert '-p no:xdist' in called_mc.test_command, called_mc.test_command
+        assert '-o addopts=' in called_mc.test_command, called_mc.test_command
+        assert CONFIRM_NODE_ID in called_mc.test_command, called_mc.test_command
+
+        # (d) exactly one new suppressed-flake record, tagged isolated_rerun
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert len(new_records) == 1, f'Expected 1 new record, got {new_records!r}'
+        rec = new_records[0]
+        assert rec['sha'] == MAIN_SHA, rec
+        assert rec['node_ids'] == [CONFIRM_NODE_ID], rec
+        assert rec['suppressed_via'] == 'isolated_rerun', rec
+
+        # (e) INFO log containing the sha prefix and "suppress"
+        sha_prefix = MAIN_SHA[:12]
+        found = False
+        for call in mock_logger.info.call_args_list:
+            args = call.args
+            msg = (args[0] % args[1:]) if len(args) > 1 else args[0]
+            if sha_prefix in msg and 'suppress' in msg.lower():
+                found = True
+                break
+        assert found, (
+            f'Expected an INFO log containing sha prefix {sha_prefix!r} and '
+            f'"suppress"; got calls={mock_logger.info.call_args_list!r}'
+        )
+
+    # -- step-5: ALARM / fail-safe paths ----------------------------------
+
+    def test_confirm_alarms_when_isolated_rerun_still_fails(self, tmp_path: Path) -> None:
+        """The isolated re-run fails on every attempt -> True (real drift,
+        file the alarm), and NO suppressed-flake record is appended."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT)
+
+        rv = AsyncMock(return_value=FAILING_RESULT)
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is True, f'Expected True (still failing -> alarm), got {result!r}'
+        assert rv.call_count == 2, (
+            f'Expected exactly 2 isolated-rerun attempts (_SWEEP_CONFIRM_MAX_ATTEMPTS), '
+            f'got {rv.call_count}'
+        )
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert new_records == [], f'Expected no new suppressed-flake record, got {new_records!r}'
+
+    def test_confirm_alarms_without_worktree_add_when_no_node_ids(self, tmp_path: Path) -> None:
+        """A failing_result with no parseable node-ids (lint/compile category)
+        -> True, WITHOUT issuing any git worktree add (cheap early-out)."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            return (0, '', '')
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_NO_NODEID_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is True, f'Expected True (unconfirmable -> alarm), got {result!r}'
+        assert not run_calls, (
+            f'Expected NO git worktree add (or any _run call) when there are no '
+            f'parseable node-ids, got {run_calls!r}'
+        )
+        rv.assert_not_called()
+
+    def test_confirm_alarms_when_worktree_add_fails(self, tmp_path: Path) -> None:
+        """git worktree add fails every retry -> True (fail-safe), and
+        run_verification is never called."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            if 'worktree' in cmd and 'add' in cmd:
+                return (1, '', 'lock contention')
+            return (0, '', '')
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is True, f'Expected True when worktree add fails, got {result!r}'
+        rv.assert_not_called()
+
+    def test_confirm_alarms_when_isolated_rerun_raises(self, tmp_path: Path) -> None:
+        """run_verification raising on every attempt -> True (never suppress
+        on an unconfirmable result), and no suppression record is appended."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT)
+
+        rv = AsyncMock(side_effect=RuntimeError('boom'))
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is True, f'Expected True when isolated re-run raises, got {result!r}'
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert new_records == [], f'Expected no new suppressed-flake record, got {new_records!r}'
+
+    def test_confirm_alarms_when_isolated_rerun_is_internalerror(self, tmp_path: Path) -> None:
+        """run_verification returning category='pytest_internalerror' on every
+        attempt -> True (infra-sentinel is never trusted as confirmation),
+        and no suppression record is appended."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT)
+
+        rv = AsyncMock(return_value=INTERNALERROR_RESULT)
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is True, (
+            f'Expected True on pytest_internalerror (unconfirmable), got {result!r}'
+        )
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert new_records == [], f'Expected no new suppressed-flake record, got {new_records!r}'
+
+    # -- amendment pass (task 2370): additional coverage -------------------
+
+    def test_confirm_suppresses_when_isolated_rerun_fails_then_passes(
+        self, tmp_path: Path
+    ) -> None:
+        """Isolated re-run FAILS on attempt 1 but PASSES on attempt 2 -> the
+        group is a confirmed flake -> False (suppress), with exactly 2
+        attempts made. Locks in the 'pass on ANY attempt within
+        _SWEEP_CONFIRM_MAX_ATTEMPTS' retry-loop contract: a regression that
+        returned after the first non-passing attempt would leave this red."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT)
+
+        rv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is False, (
+            f'Expected False (flake confirmed on 2nd attempt), got {result!r}'
+        )
+        assert rv.call_count == 2, (
+            f'Expected exactly 2 isolated-rerun attempts (fail then pass), '
+            f'got {rv.call_count}'
+        )
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert len(new_records) == 1, (
+            f'Expected 1 new suppressed-flake record, got {new_records!r}'
+        )
+
+    def test_confirm_alarms_when_node_id_matches_no_subproject(self, tmp_path: Path) -> None:
+        """The failing node-id's file does not exist under any discovered
+        subproject in the probe worktree -> True (fail-safe alarm), and
+        run_verification is never awaited — there is no group to run."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT_MISSING_FILE)
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is True, f'Expected True (unmapped node-id -> alarm), got {result!r}'
+        rv.assert_not_called()
+
+    def test_confirm_logs_warning_on_ambiguous_subproject_match(self, tmp_path: Path) -> None:
+        """A bare subproject-relative node-id that exists under TWO
+        discovered subprojects logs a WARNING (rather than silently
+        mis-attributing) and still resolves deterministically to one of them
+        for the re-run."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT_AMBIGUOUS)
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+            patch.object(verify_module, 'logger') as mock_logger,
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_AMBIGUOUS_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is False, f'Expected False (isolated re-run passed), got {result!r}'
+        warned = False
+        for call in mock_logger.warning.call_args_list:
+            args = call.args
+            msg = (args[0] % args[1:]) if len(args) > 1 else args[0]
+            if CONFIRM_AMBIGUOUS_NODE_ID in msg:
+                warned = True
+                break
+        assert warned, (
+            f'Expected a WARNING log about the ambiguous node-id match; got '
+            f'calls={mock_logger.warning.call_args_list!r}'
+        )

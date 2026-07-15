@@ -94,17 +94,26 @@ class TestRunMainTipSweepHarness:
 
     @pytest.mark.asyncio
     async def test_run_main_tip_sweep_escalates_on_drift(self) -> None:
-        """When run_main_tip_sweep returns a failing VerifyResult, the harness
-        calls _escalation_queue.submit with a blocking L1 infra_issue escalation
-        whose summary contains the SHA prefix and failure category."""
+        """When run_main_tip_sweep returns a failing VerifyResult AND the
+        confirm-before-alarm gate confirms the failure is real (task 2370),
+        the harness calls _escalation_queue.submit with a blocking L1
+        infra_issue escalation whose summary contains the SHA prefix and
+        failure category."""
         from orchestrator import verify as verify_module
 
         h = _make_sweep_harness()
 
-        with patch.object(
-            verify_module,
-            'run_main_tip_sweep',
-            new=AsyncMock(return_value=(MAIN_SHA, FAILING_RESULT)),
+        with (
+            patch.object(
+                verify_module,
+                'run_main_tip_sweep',
+                new=AsyncMock(return_value=(MAIN_SHA, FAILING_RESULT)),
+            ),
+            patch.object(
+                verify_module,
+                'confirm_main_tip_failure_is_real',
+                new=AsyncMock(return_value=True),
+            ),
         ):
             await h._run_main_tip_sweep()
 
@@ -120,6 +129,74 @@ class TestRunMainTipSweepHarness:
         assert 'test_failure' in submitted_esc.summary, (
             f'Expected failure category in summary: {submitted_esc.summary!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_run_main_tip_sweep_confirm_suppresses_no_escalation(self) -> None:
+        """task 2370: when confirm_main_tip_failure_is_real returns False (the
+        named failing tests passed on isolated re-run at current tip -> a
+        load-induced flake, not real drift), the harness must NOT submit an
+        escalation.  The SHA is still marked swept (no re-sweep next tick),
+        and — deliberately — self-heal is NOT invoked: a suppressed-flake
+        verdict from a scoped isolated re-run is weaker evidence than the
+        genuine full-verify PASS that self-heal requires."""
+        from orchestrator import verify as verify_module
+
+        h = _make_sweep_harness()
+        h._close_superseded_main_sweep_escalations = AsyncMock()  # type: ignore[method-assign]
+
+        with (
+            patch.object(
+                verify_module,
+                'run_main_tip_sweep',
+                new=AsyncMock(return_value=(MAIN_SHA, FAILING_RESULT)),
+            ),
+            patch.object(
+                verify_module,
+                'confirm_main_tip_failure_is_real',
+                new=AsyncMock(return_value=False),
+            ) as mock_confirm,
+        ):
+            await h._run_main_tip_sweep()
+
+        mock_confirm.assert_called_once()
+        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
+        assert h._last_swept_main_sha == MAIN_SHA, (
+            f'Expected _last_swept_main_sha={MAIN_SHA!r} even when suppressed '
+            f'(no re-sweep of the same SHA), got {h._last_swept_main_sha!r}'
+        )
+        h._close_superseded_main_sweep_escalations.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_run_main_tip_sweep_confirm_true_still_escalates(self) -> None:
+        """task 2370: when confirm_main_tip_failure_is_real returns True (the
+        failure is confirmed real, e.g. still failing on isolated re-run), the
+        harness files the level-1 infra_issue escalation exactly as before —
+        the confirm gate must never mask a genuine red main (regression
+        guard)."""
+        from orchestrator import verify as verify_module
+
+        h = _make_sweep_harness()
+
+        with (
+            patch.object(
+                verify_module,
+                'run_main_tip_sweep',
+                new=AsyncMock(return_value=(MAIN_SHA, FAILING_RESULT)),
+            ),
+            patch.object(
+                verify_module,
+                'confirm_main_tip_failure_is_real',
+                new=AsyncMock(return_value=True),
+            ) as mock_confirm,
+        ):
+            await h._run_main_tip_sweep()
+
+        mock_confirm.assert_called_once()
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        submitted_esc = h._escalation_queue.submit.call_args[0][0]  # type: ignore[union-attr, attr-defined]
+        assert submitted_esc.level == 1
+        assert submitted_esc.category == 'infra_issue'
+        assert submitted_esc.severity == 'blocking'
 
     @pytest.mark.asyncio
     async def test_run_main_tip_sweep_pass_no_escalation(self) -> None:
