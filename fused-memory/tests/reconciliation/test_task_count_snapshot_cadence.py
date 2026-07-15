@@ -515,6 +515,49 @@ class TestPruneTaskCountSnapshots:
         assert result == 0
         memory_service.delete_memory.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_enumeration_failure_returns_zero_not_raise(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.side_effect = RuntimeError('mem0 down')
+
+        result = await _prune_task_count_snapshots(memory_service, 'reify', 'run-1')
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_partial_delete_failure_excluded_from_count(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'm1', 'created_at': '2026-07-01T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm2', 'created_at': '2026-07-02T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm3', 'created_at': '2026-07-03T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+        ]
+        memory_service.delete_memory.side_effect = [
+            {'status': 'deleted'}, RuntimeError('boom'), {'status': 'deleted'},
+        ]
+
+        result = await _prune_task_count_snapshots(memory_service, 'reify', 'run-1')
+
+        assert result == 2
+        assert memory_service.delete_memory.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_records_missing_id_are_skipped(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'created_at': '2026-07-01T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm2', 'created_at': '2026-07-02T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+        ]
+        memory_service.delete_memory.return_value = None
+
+        result = await _prune_task_count_snapshots(memory_service, 'reify', 'run-1')
+
+        assert result == 1
+        memory_service.delete_memory.assert_awaited_once()
+        _, kwargs = memory_service.delete_memory.await_args
+        assert kwargs['memory_id'] == 'm2'
+
 
 # ---------------------------------------------------------------------------
 # _write_task_count_snapshot (stages/task_knowledge_sync.py) -- task 2325 step-5/6
