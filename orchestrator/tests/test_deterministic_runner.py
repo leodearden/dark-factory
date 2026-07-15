@@ -1133,6 +1133,114 @@ class TestBeforeDoneTargetUnitlessDeploy:
         assert esc.agent_role == 'orchestrator-deterministic'
         unit_inspector.assert_not_awaited()
 
+    async def test_targetless_always_escalates_true_runs_then_gates(self, tmp_path: Path):
+        """always_escalates=True (act-then-ask) with a falsy target_unit:
+        the script still runs, but rc==0 must fall through to the milestone
+        gate instead of unconditionally writing done (task 2632).
+
+        RED today: impl-targetless-failure's rc==0 branch always calls
+        _writeback_deploy_success, ignoring always_escalates entirely.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2632', target_unit=None)
+        task['metadata']['always_escalates'] = True
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock()
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        script_runner.assert_awaited_once()
+        unit_inspector.assert_not_awaited()
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('2632', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'milestone_gate'
+
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert done_calls == [], 'set_task_status must NOT be called with done — must gate instead'
+
+    async def test_named_target_wedged_baseline_still_blocks(self, tmp_path: Path):
+        """Regression guard for acceptance #3: a NAMED target_unit whose
+        baseline inspect is wedged (ActiveState=='') must still be caught
+        by the baseline gate and block — the new falsy-target_unit branch
+        must not have weakened genuine-wedge detection for a truthy unit."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2633', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock(return_value={
+            'MainPID': 0, 'ActiveState': '', 'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        })
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2633', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue'
+        assert 'Baseline inspect failed' in pending[0].summary
+        script_runner.assert_not_called()
+
+    async def test_named_target_happy_path_still_double_inspects_and_drives_done(
+        self, tmp_path: Path,
+    ):
+        """Regression guard for acceptance #3: a NAMED target_unit happy
+        path must still await the inspector TWICE (baseline + verify) and
+        drive to done — proving the falsy-target_unit branch condition did
+        not divert a truthy/named unit off the baseline/verify path."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2634', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        assert unit_inspector.await_count == 2, (
+            'a named target_unit must still be baseline- AND verify-inspected'
+        )
+        scheduler.set_task_status.assert_awaited_once()
+        assert scheduler.set_task_status.call_args.args[1] == 'done'
+        assert queue.get_by_task('2634', status='pending') == []
+
 
 # ---------------------------------------------------------------------------
 # ζ D2 boundary: an illegal deploy-phase transition files a REAL born-at-L2
