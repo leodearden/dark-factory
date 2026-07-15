@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, TypeVar
@@ -59,6 +60,8 @@ __all__ = [
 ]
 
 _T = TypeVar('_T')
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowState(enum.Enum):
@@ -791,6 +794,24 @@ class CancellationScope:
             for t in (waiter, body):
                 if not t.done():
                     t.cancel()
+                    # Deliberately NOT the shield()+uncancel() discipline
+                    # used by _run_on_terminal below: that pattern relies on
+                    # its background task NEVER being cancelled itself, so
+                    # every CancelledError it catches is unambiguously
+                    # outer-directed. Here `t` is a task WE just cancelled
+                    # on the line above, so a CancelledError surfacing at
+                    # this await is its ordinary, expected completion, not
+                    # an outer re-cancel — shielding and unconditionally
+                    # uncancel()-ing on every catch would misattribute that
+                    # expected completion as a handled outer cancel far more
+                    # often than the imbalance it would fix. A genuine
+                    # repeated outer cancel (the harness's hard_cancel_workflow
+                    # poll loop) CAN still land in this unshielded await and
+                    # leave current_task().cancelling() one higher than
+                    # "balanced" when merely suppressed here — but nothing
+                    # in this codebase reads Task.cancelling(), and this
+                    # method still runs to completion and returns/raises
+                    # correctly either way, so the imbalance is inert.
                     with contextlib.suppress(asyncio.CancelledError):
                         await t
             await self._run_on_terminal(kind)
@@ -805,10 +826,29 @@ class CancellationScope:
         detaches OUR await from the background task, never cancels the
         background task itself, so a second (or third) cancel here can
         never truncate an in-flight cleanup entry.
+
+        Each entry is also individually try/except-``Exception``-and-logged,
+        so a failure in one cleanup step can never skip the REMAINING
+        steps — notably ``release_lane``/``cleanup_config_dir`` — or escape
+        this method and mask the in-flight ``WorkflowCancelled`` that
+        ``supervise``'s ``finally`` is already unwinding (which would
+        otherwise surface to ``run()`` as an arbitrary exception and have
+        the harness report BLOCKED instead of CANCELLED). This generalizes
+        ``_stop_claimant_heartbeat``'s own bespoke catch-and-log into one
+        uniform per-entry policy, keyed on the entry name — a genuine
+        ``CancelledError`` is deliberately NOT caught here so the
+        done/cancelled bookkeeping below still sees it.
         """
         async def _run_all() -> None:
-            for _name, fn in self._on_terminal:
-                await fn(kind)
+            for name, fn in self._on_terminal:
+                try:
+                    await fn(kind)
+                except Exception:
+                    logger.exception(
+                        f'CancellationScope on_terminal entry {name!r} '
+                        f'failed (non-fatal — continuing remaining '
+                        f'terminal cleanup)'
+                    )
 
         task = asyncio.ensure_future(_run_all())
         while not task.done():
