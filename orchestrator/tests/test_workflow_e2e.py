@@ -8068,7 +8068,7 @@ class TestBuildSpawnEnv:
             'architect',
             workflow.config.fused_memory.project_id,
             str(workflow.task_id),
-            'arch-uuid-xyz',
+            'arch-uuid-xyz',  # type: ignore[arg-type]  # deliberate str in launcher_pid slot; see session_hooks.hook_session_slug
         )
 
     async def test_architect_still_receives_workflow_root_when_stashed(
@@ -8104,7 +8104,7 @@ class TestBuildSpawnEnv:
             capturing_invoke_with_cap_retry,
         )
 
-        await workflow._invoke(ARCHITECT, prompt='x', cwd=workflow.worktree)
+        await workflow._invoke(ARCHITECT, prompt='x', cwd=config.project_root)
 
         assert len(captured_calls) == 1
         architect_kwargs = captured_calls[0]
@@ -8113,7 +8113,7 @@ class TestBuildSpawnEnv:
         assert architect_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == workflow.session_id
         assert workflow._architect_spawn_session_id == architect_kwargs['session_id']
 
-        await workflow._invoke(IMPLEMENTER, prompt='y', cwd=workflow.worktree)
+        await workflow._invoke(IMPLEMENTER, prompt='y', cwd=config.project_root)
 
         assert len(captured_calls) == 2
         implementer_kwargs = captured_calls[1]
@@ -8123,7 +8123,7 @@ class TestBuildSpawnEnv:
             'architect',
             workflow.config.fused_memory.project_id,
             str(workflow.task_id),
-            workflow._architect_spawn_session_id,
+            workflow._architect_spawn_session_id,  # type: ignore[arg-type]  # deliberate str in launcher_pid slot; see session_hooks.hook_session_slug
         )
 
 
