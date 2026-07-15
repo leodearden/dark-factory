@@ -19,6 +19,10 @@ Test coverage:
   step-11: boundary row 15 — soft-cancel covers a new (unwrapped) await via
     the scope's own body-task race, and ``_await_cancellable`` raises
     ``WorkflowCancelled('soft')`` (orphan-avoidance detach preserved)
+  step-13: harness B2 + ``synthetic_cancel`` retirement — ``TaskReport``
+    sheds the field, harness.py sheds every reference to it, and the
+    ``except asyncio.CancelledError`` safety net (for cancels landing
+    OUTSIDE run()'s CancellationScope) keeps working without it
 """
 
 from __future__ import annotations
@@ -27,12 +31,14 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 # Cross-module reuse (task 2610 precedent — see test_workflow_terminal_report.py
 # for the same import shape): these factories live in _workflow_helpers.py, not
 # in any single test module's private namespace.
+from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
 from _workflow_helpers import (
     AgentStub,
     _build_workflow,
@@ -42,6 +48,7 @@ from _workflow_helpers import (
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.harness import Harness, TaskReport
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow_types import (
     CancellationScope,
@@ -730,3 +737,146 @@ class TestAwaitCancellableRaisesWorkflowCancelled:
 
         assert result == 'the_result'
         assert hook_calls == [], 'hook must NOT be called when future resolves first'
+
+
+# ---------------------------------------------------------------------------
+# step-13: harness B2 + synthetic_cancel retirement (RED)
+# ---------------------------------------------------------------------------
+#
+# With the workflow's kind-aware on_terminal now solely owning terminal lane
+# release for every run() exit (steps 8/10/12), the harness's B2 belt-and-
+# suspenders release block — and its synthetic_cancel skip-signal — is fully
+# redundant. But task.cancel() can still land OUTSIDE run()'s
+# CancellationScope (slot setup, post-run() report building, or a unit test
+# that mocks workflow.run() as a bare coroutine), so the harness's `except
+# asyncio.CancelledError` safety net must survive the retirement — it still
+# has to return a TaskReport(outcome=CANCELLED) so the wrapper task
+# completes normally.
+#
+# RED until step-14 deletes TaskReport.synthetic_cancel and the B2 block
+# from harness.py: today the field still exists (TaskReport(...
+# synthetic_cancel=True) does NOT raise) and harness.py still references it.
+
+
+def _make_harness_for_run_slot() -> Harness:
+    """Harness with all attributes needed to drive ``_run_slot`` directly.
+
+    Mirrors test_harness_cancel_workflow.py's ``harness_for_run_slot``
+    fixture (that file mocks run() as a bare sleep and asserts on
+    outcome/cleanup/sem only — none of which depend on synthetic_cancel, so
+    it is untouched by θ). This local helper reuses the same construction
+    shape for θ's own retirement test below.
+    """
+    h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)
+    h.scheduler = MagicMock()
+    wire_scheduler_liveness_mock(h.scheduler)
+    h._workflow_cancel_events = {}
+    h._workflow_cancel_at = {}
+    h._workflow_slot_tasks = {}
+    h._terminal_cancel_counts = {}
+    h._escalation_events = {}
+    h._escalation_queue = None
+    h._recovered_plans = {}
+    h._recovered_sessions = {}
+    h._preserved_worktrees = set()
+    h.event_store = None
+    h.config = None  # type: ignore[assignment]
+    h.git_ops = None  # type: ignore[assignment]
+    h.briefing = None  # type: ignore[assignment]
+    h.mcp = None  # type: ignore[assignment]
+    h.usage_gate = None
+    h._merge_queue = None  # type: ignore[assignment]
+    h._merge_worker = None
+    h._merge_inflight_registry = None  # type: ignore[assignment]
+    h.cost_store = None
+    h._run_store = None
+    h._run_id = None
+    h.review_checkpoint = None
+    h.scheduler.release = MagicMock()
+    h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
+    h.scheduler.is_deterministic = MagicMock(return_value=False)
+    return h
+
+
+class TestHarnessSyntheticCancelRetirement:
+    """RED (step-13): ``TaskReport`` sheds ``synthetic_cancel``; harness.py
+    sheds every reference to it (field + B2 release block); the ``except
+    asyncio.CancelledError`` safety net keeps returning a CANCELLED report
+    with cleanup/sem intact."""
+
+    def test_task_report_construction_rejects_synthetic_cancel_kwarg(self):
+        with pytest.raises(TypeError):
+            TaskReport(
+                task_id='42', title='t', outcome=WorkflowOutcome.CANCELLED,
+                synthetic_cancel=True,  # type: ignore[call-arg]
+            )
+
+    def test_harness_source_has_no_synthetic_cancel_reference(self):
+        import orchestrator.harness as harness_module
+
+        source = Path(harness_module.__file__).read_text()
+        assert 'synthetic_cancel' not in source, (
+            'harness.py must contain no synthetic_cancel reference — the '
+            'field + B2 dual-guard are retired; on_terminal now solely '
+            'owns terminal lane release'
+        )
+
+    @pytest.mark.asyncio
+    async def test_hard_cancel_safety_net_returns_cancelled_report_without_synthetic_cancel(
+        self,
+    ):
+        """Mirrors test_harness_cancel_workflow.py's hard-cancel integration
+        test — drive ``_run_slot`` with ``workflow.run`` patched to a bare
+        ``asyncio.sleep(3600)``, hard-cancel it — but additionally pins that
+        the returned report carries no ``synthetic_cancel`` attribute at
+        all, proving the except-CancelledError net still works (outcome,
+        finally cleanup, sem release) without the retired flag."""
+        h = _make_harness_for_run_slot()
+        tid = '42'
+        assignment = TaskAssignment(
+            task_id=tid, task={'title': 'wedged task'}, modules=[],
+        )
+        sem = asyncio.Semaphore(0)
+
+        with patch('orchestrator.harness.TaskWorkflow') as mock_wf_cls:
+            async def _wedge() -> None:
+                await asyncio.sleep(3600)
+
+            mock_wf = MagicMock()
+            mock_wf.run = _wedge
+            mock_wf_cls.return_value = mock_wf
+
+            wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+
+            # Poll until _run_slot registers itself in _workflow_slot_tasks.
+            for _ in range(50):
+                if tid in h._workflow_slot_tasks:
+                    break
+                await asyncio.sleep(0.01)
+            assert tid in h._workflow_slot_tasks, (
+                '_run_slot did not register itself in _workflow_slot_tasks'
+            )
+
+            h.hard_cancel_workflow(tid)
+
+            done, _pending = await asyncio.wait({wrapper_task}, timeout=5.0)
+            assert wrapper_task in done, 'wrapper_task did not finish within 5s'
+
+        assert not wrapper_task.cancelled(), (
+            'Expected _run_slot to return a synthetic CANCELLED TaskReport, '
+            'but the Task ended up in CANCELLED state — CancelledError escaped.'
+        )
+        report = wrapper_task.result()
+        assert report is not None, 'Expected _run_slot to return a TaskReport, got None'
+        assert report.outcome == WorkflowOutcome.CANCELLED, (
+            f'Expected outcome=CANCELLED, got {report.outcome!r}'
+        )
+        assert not hasattr(report, 'synthetic_cancel'), (
+            'TaskReport must no longer carry a synthetic_cancel attribute'
+        )
+
+        # Finally cleanup ran: registries cleared, semaphore released.
+        assert tid not in h._workflow_slot_tasks, 'slot task not cleaned up in finally'
+        assert tid not in h._workflow_cancel_events, 'cancel event not cleaned up in finally'
+        assert sem._value == 1, f'semaphore not released by finally (value={sem._value})'
