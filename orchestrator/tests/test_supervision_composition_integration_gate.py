@@ -500,6 +500,29 @@ class TestR3SelfKillRefusal:
 # ---------------------------------------------------------------------------
 
 
+async def _execute_relative_script_self_restart():
+    """R2 driver: a RELATIVE script + absolute cwd -> RestartPlan.__post_init__
+    absolutizes it against cwd, and the detached systemd-run path adds
+    --working-directory=<cwd> unconditionally to the argv (RP-3). Returns
+    the captured systemd-run argv."""
+    from orchestrator.proc_supervision import RestartPlan
+
+    runner = FakeRunner(returncode=0)
+    plan = RestartPlan(
+        script=Path('scripts/restart-orchestrator.sh'),  # RELATIVE
+        args=[],
+        cwd=Path('/proj'),
+        target_unit='orch.service',
+        own_unit='orch.service',
+        on_failure_escalation=None,
+        verify=None,
+        transient_unit='orch-redeploy-restart-1.service',
+        on_active_secs=10,
+    )
+    await plan.execute(runner=runner)
+    return runner.calls[0][0]
+
+
 @pytest.mark.asyncio
 class TestR2WorkingDirectory:
     """R2 composition cell (the 2105 bug)."""
