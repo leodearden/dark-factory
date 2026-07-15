@@ -1600,6 +1600,46 @@ def _select_subproject_pytest_targets(files: list[str], prefix: str) -> list[str
     ]
 
 
+def _config_test_extras(cmd: str | None) -> list[str]:
+    """Extract every ``--extra <name>`` / ``--extra=<name>`` flag from *cmd*, in order.
+
+    Carries a project's canonical ``config.test_command`` extras into the
+    fallback-synthesized ``uv run pytest`` command (task 2641; the TEST-path
+    twin of the task-2355 TYPE/LINT cold-verify dev-dep fix) so a cold merge
+    worktree syncs the project's dev-group deps before pytest is spawned.
+
+    Scope (review follow-up, task 2641): only ``--extra``/``--extra=`` is
+    recognized. Other uv dependency-selection flags — ``--group``/
+    ``--group=``, ``--all-extras``, ``--all-groups``, ``--dev``/``--no-dev``
+    — are intentionally NOT extracted; a project that selects its test deps
+    via one of those instead of ``--extra`` will still hit the cold-verify
+    "Failed to spawn" race this helper fixes for ``--extra``-based projects.
+    Broadening coverage to those flags is a follow-up, not handled here.
+
+    Returns ``[]`` when *cmd* is ``None``, carries no ``--extra`` flags, or
+    fails to tokenize (unbalanced quotes — mirrors :func:`parse_config_command`'s
+    ``shlex.split`` + ``except ValueError`` guard).
+    """
+    if cmd is None:
+        return []
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return []
+    extras: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == '--extra' and i + 1 < len(tokens):
+            extras.extend(['--extra', tokens[i + 1]])
+            i += 2
+            continue
+        if token.startswith('--extra='):
+            extras.extend(['--extra', token.split('=', 1)[1]])
+        i += 1
+    return extras
+
+
 def _build_fallback_config(
     task_files: list[str],
     config: OrchestratorConfig | None = None,
@@ -1730,8 +1770,29 @@ def _build_fallback_config(
         # left untouched since it also covers the worktree=None case that
         # has no `prefix` to make relative).
         rel_targets = _select_subproject_pytest_targets(py_files, sub)
+        # Cold-verify dev-dep sync (task 2641): carry any --extra flags from
+        # the project's canonical test_command into the synthesized command
+        # so a cold merge worktree's `uv run` syncs the project's dev-group
+        # extra before spawning pytest (TEST-path twin of the task-2355
+        # TYPE/LINT fix below). extras is [] for a no-extra config, so the
+        # output is byte-identical to before this change.
+        #
+        # Assumption (review follow-up, task 2641): extras are spliced into
+        # *sub*'s own uv context without checking that *sub*'s own
+        # pyproject.toml actually declares them. If config.test_command's
+        # extra is declared elsewhere (e.g. the repo root or another
+        # subproject) but not in *sub*, `uv run --extra <name>` hard-fails
+        # with "Extra `<name>` is not defined" — turning a passing change
+        # RED instead of silently dropping the flag. This mirrors the
+        # identical, pre-existing assumption in the task-2355 LINT/TYPE fix
+        # just below (`_scope_fallback_tool_to_subproject` leaves a verbatim
+        # `--extra` clause untouched with no subproject-declaration check
+        # either), so it is not a new gap introduced here — see
+        # TestBuildFallbackConfigSubprojectScoped
+        # .test_extras_carried_verbatim_even_when_undefined_in_touched_subproject.
+        extras = _config_test_extras(config.test_command if config is not None else None)
         test_cmd = (
-            'cd ' + sub + ' && uv run pytest ' + ' '.join(rel_targets)
+            'cd ' + sub + ' && uv run ' + ' '.join([*extras, 'pytest', *rel_targets])
             if rel_targets else None
         )
         # Cold-verify dev-dep race (task 2355): rescope TYPE/LINT into *sub*'s
@@ -1786,8 +1847,16 @@ def _build_fallback_config(
         # broader gating for the same reason the pure-sub branch made this
         # trade-off; revisit if source-only subproject regressions start
         # slipping through to merge.
+        # Cold-verify dev-dep sync (task 2641): same twin-bug fix as the
+        # pure-subproject branch above — carry test_command's --extra flags
+        # into the touched subproject's own pytest segment only.
+        # _ROOT_OWNING_TEST_COMMAND is a separate, dark_factory-specific
+        # command and is left untouched. Same undeclared-extra assumption as
+        # the pure-subproject branch above applies here too (see the
+        # "Assumption (review follow-up, task 2641)" comment there).
+        mixed_extras = _config_test_extras(config.test_command if config is not None else None)
         test_cmd = (
-            'cd ' + mixed_sub + ' && uv run pytest ' + ' '.join(mixed_rel_targets)
+            'cd ' + mixed_sub + ' && uv run ' + ' '.join([*mixed_extras, 'pytest', *mixed_rel_targets])
             + ' && cd .. && ' + _ROOT_OWNING_TEST_COMMAND
             if mixed_rel_targets else _ROOT_OWNING_TEST_COMMAND
         )

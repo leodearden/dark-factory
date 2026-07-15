@@ -4387,6 +4387,59 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         )
 
 
+class TestConfigTestExtras:
+    """`_config_test_extras` pulls `--extra <name>` flags out of a config test_command (task 2641).
+
+    TEST-path twin of the task-2355 cold-verify dev-dep fix: LINT/TYPE
+    fallback commands already preserve a configured ``--extra dev`` verbatim
+    (they parse OPAQUE and pass through untouched), but the synthesized
+    fallback TEST command (``_build_fallback_config``) drops any extras from
+    ``config.test_command`` entirely. This helper extracts them so the
+    synthesized command can carry them forward instead.
+    """
+
+    def test_extracts_multiple_extra_flags_in_order(self):
+        from orchestrator.verify import _config_test_extras
+
+        result = _config_test_extras("uv run --extra dev --extra web pytest -m 'not slow'")
+        assert result == ['--extra', 'dev', '--extra', 'web']
+
+    def test_extracts_equals_form_extra_flag(self):
+        from orchestrator.verify import _config_test_extras
+
+        assert _config_test_extras('uv run --extra=dev pytest') == ['--extra', 'dev']
+
+    def test_extracts_mixed_space_and_equals_form_flags(self):
+        """A command mixing `--extra dev` (space form) and `--extra=web` (equals form) carries both."""
+        from orchestrator.verify import _config_test_extras
+
+        result = _config_test_extras('uv run --extra dev --extra=web pytest')
+        assert result == ['--extra', 'dev', '--extra', 'web']
+
+    def test_no_extras_returns_empty_list(self):
+        from orchestrator.verify import _config_test_extras
+
+        assert _config_test_extras('uv run pytest tests/') == []
+        assert _config_test_extras('pytest') == []
+
+    def test_none_command_returns_empty_list(self):
+        from orchestrator.verify import _config_test_extras
+
+        assert _config_test_extras(None) == []
+
+    def test_unparseable_command_returns_empty_list(self):
+        """Unbalanced quotes degrade to no-extras rather than raising (shlex.split ValueError)."""
+        from orchestrator.verify import _config_test_extras
+
+        assert _config_test_extras('uv run --extra "dev pytest') == []
+
+    def test_dangling_extra_flag_with_no_value_is_dropped(self):
+        """A trailing `--extra` with no following token is silently dropped, not an IndexError."""
+        from orchestrator.verify import _config_test_extras
+
+        assert _config_test_extras('uv run pytest --extra') == []
+
+
 class TestBuildFallbackConfigSubprojectScoped:
     """`_build_fallback_config` scopes TEST to the task's own subproject (task 2344).
 
@@ -4792,6 +4845,112 @@ class TestBuildFallbackConfigSubprojectScoped:
         ), (
             'Did not expect an uncovered-root-test WARNING for a non-test root file; '
             f'got: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_test_command_extras_carried_into_pure_subproject_scoping(
+        self, tmp_path: Path,
+    ) -> None:
+        """A configured `--extra` on test_command is carried into the scoped pytest command.
+
+        Cold-verify dev-dep race, TEST-path twin of task 2355 (task 2641): a
+        project like pump_web_ui declares pytest in a `dev` optional-dependency
+        (extra) rather than a PEP-735 default group, so its canonical
+        test_command is `uv run --extra dev --extra web pytest ...`. The
+        pure-subproject scoped fallback must preserve those `--extra` flags —
+        dropping them means a cold merge worktree's `uv run` never syncs the
+        dev extra and pytest fails to spawn.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(
+            tmp_path, test_command="uv run --extra dev --extra web pytest -m 'not slow'",
+        )
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == (
+            'cd cockpit && uv run --extra dev --extra web pytest tests/test_c3.py'
+        )
+
+    def test_no_extras_in_config_yields_unchanged_pure_subproject_test_command(
+        self, tmp_path: Path,
+    ) -> None:
+        """A no-extra config's scoped test_command is byte-identical (no extras injected)."""
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == 'cd cockpit && uv run pytest tests/test_c3.py'
+
+    def test_test_command_extras_carried_into_mixed_subproject_scoping(
+        self, tmp_path: Path,
+    ) -> None:
+        """A configured `--extra` on test_command is carried into the mixed-branch pytest segment.
+
+        Twin-bug guard (task 2641): the mixed root+single-subproject branch
+        synthesizes the identical bare `uv run pytest` shape as the pure-sub
+        branch and shares the same dropped-extras defect. The trailing
+        `_ROOT_OWNING_TEST_COMMAND` segment is a distinct, dark_factory-specific
+        command and must stay unchanged — extras are injected only into the
+        touched-subproject's own pytest segment.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(
+            tmp_path, test_command="uv run --extra dev --extra web pytest -m 'not slow'",
+        )
+
+        result = _build_fallback_config(
+            ['cockpit/tests/test_c3.py', 'conftest.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == (
+            'cd cockpit && uv run --extra dev --extra web pytest tests/test_c3.py '
+            '&& cd .. && uv run --project shared pytest tests/scripts/'
+        )
+
+    def test_extras_carried_verbatim_even_when_undefined_in_touched_subproject(
+        self, tmp_path: Path,
+    ) -> None:
+        """Carried extras are NOT validated against the touched subproject's own pyproject.toml.
+
+        Known limitation (review follow-up, task 2641): `_make_cockpit_worktree`'s
+        `cockpit/pyproject.toml` declares no `[project.optional-dependencies]`
+        at all, yet `dev`/`web` extras configured on the fleet-level
+        `test_command` are still spliced into cockpit's own
+        `uv run --extra ...` context verbatim. If a real subproject's own
+        pyproject.toml doesn't declare an extra carried from the fleet
+        config, `uv run --extra <name>` hard-fails at runtime with "Extra
+        `<name>` is not defined" (turning a passing change RED) rather than
+        being silently dropped or caught here — `_build_fallback_config` does
+        no pyproject-declaration validation. This mirrors the identical,
+        pre-existing assumption in the task-2355 LINT/TYPE fix
+        (`_scope_fallback_tool_to_subproject` leaves a verbatim `--extra`
+        clause untouched with no subproject-declaration check either), so
+        it's not a new gap introduced by this task — pinned here so a future
+        maintainer isn't surprised.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        assert '[project.optional-dependencies]' not in (
+            (worktree / 'cockpit' / 'pyproject.toml').read_text()
+        )
+        cfg = self._make_config(
+            tmp_path, test_command='uv run --extra dev --extra web pytest',
+        )
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == (
+            'cd cockpit && uv run --extra dev --extra web pytest tests/test_c3.py'
         )
 
 
