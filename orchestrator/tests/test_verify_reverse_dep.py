@@ -29,6 +29,7 @@ catch-all — a dedicated file avoids that hazard.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -85,6 +86,28 @@ def _build_worktree_with_orchestrator_test(tmp_path: Path) -> Path:
         'def test_something():\n    assert True\n',
     )
     return worktree
+
+
+def _build_worktree_with_deleted_source(tmp_path: Path) -> Path:
+    """Escalation's tests plus an orchestrator TEST file — but no orchestrator
+    SOURCE file on disk, simulating a diff that deletes it.
+
+    ``orchestrator/tests/test_something.py`` surviving keeps 'orchestrator'
+    non-empty in ``run_scoped_verification``'s ``scoped`` list (its lint
+    command is always FILE_SCOPED to whatever ``.py`` files exist under the
+    prefix — see ``_derive_module_runs`` — so the widening call site is
+    still reached even though no orchestrator SOURCE file exists).
+    """
+    (tmp_path / 'escalation' / 'tests').mkdir(parents=True)
+    (tmp_path / 'escalation' / 'tests' / 'test_server.py').write_text(_TEST_SERVER_CONTENT)
+    (tmp_path / 'escalation' / 'tests' / 'test_unrelated.py').write_text(_TEST_UNRELATED_CONTENT)
+    (tmp_path / 'orchestrator' / 'tests').mkdir(parents=True)
+    (tmp_path / 'orchestrator' / 'tests' / 'test_something.py').write_text(
+        'def test_something():\n    assert True\n',
+    )
+    # Deliberately no orchestrator/src/orchestrator/merge_queue.py on disk —
+    # the diff's task_files will still name it (as a deletion).
+    return tmp_path
 
 
 _DASHBOARD_TEST_COMMAND = (
@@ -174,6 +197,54 @@ class TestReverseDependencyModuleConfigs:
 
         assert result == []
 
+    def test_unscopable_test_command_is_skipped_with_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """A dependent's test_command with no literal 'pytest' keyword can't be
+        narrowed by _scope_to_keyword (its own documented no-op contract:
+        returns *cmd* unchanged when the keyword isn't present or the prefix
+        doesn't parse). Widening it anyway would silently run the dependent's
+        FULL suite instead of just the coupled file(s) -- contradicting the
+        import-scoped cost/flake-bounding design. It must be skipped, with a
+        warning logged rather than silently dropped.
+        """
+        worktree = _build_worktree(tmp_path)
+        config = _build_config(tmp_path)
+        # Full-dict reassignment (not a subscript mutation) -- matches
+        # _build_config's own idiom and keeps `_module_configs` a plain
+        # dict[...] for pyright (the PrivateAttr's declared type is
+        # dict[...] | None, so a bare subscript assignment on it triggers
+        # reportOptionalSubscript outside the scope that narrowed it).
+        config._module_configs = {
+            **config.module_configs_or_empty,
+            'escalation': ModuleConfig(
+                prefix='escalation',
+                test_command='./run-tests.sh',  # no literal 'pytest' -- unscopable
+                lint_command=None,
+                type_check_command=None,
+            ),
+        }
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = verify._reverse_dependency_module_configs(
+                ['orchestrator/src/orchestrator/merge_queue.py'],
+                config,
+                worktree,
+                already_scoped={'orchestrator'},
+            )
+
+        assert result == [], (
+            'an unscopable test_command must be skipped, not widened unscoped '
+            f'(which would silently run the dependent\'s full suite); got: {result}'
+        )
+        assert any(
+            'escalation' in r.getMessage() and 'could not be scoped' in r.getMessage()
+            for r in caplog.records
+        ), (
+            f'expected a warning naming the skipped dependent; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
+
 
 @pytest.mark.asyncio
 class TestRunScopedVerificationReverseDependencyWidening:
@@ -217,6 +288,88 @@ class TestRunScopedVerificationReverseDependencyWidening:
         assert not any('test_unrelated.py' in c for c in escalation_pytest_cmds), (
             f'widened escalation command must not target the unrelated test file; '
             f'recorded commands: {recorded}'
+        )
+
+    async def test_widened_escalation_failure_fails_the_aggregated_result(self, tmp_path: Path):
+        """A failing widened escalation pytest run must FAIL the aggregated VerifyResult.
+
+        The point of widening is to gate the merge on the coupled test — a
+        regression that appends the widened ModuleConfig to `scoped` (so it
+        executes) but drops its VerifyResult from `_aggregate_results` would
+        still pass every other test in this file, since they all stub
+        `_run_cmd` to return rc=0 unconditionally. This pins that a real
+        failure in the widened run actually surfaces and fails the gate.
+        """
+        worktree = _build_worktree(tmp_path)
+        config = _build_config(tmp_path)
+        orchestrator_mc = config.module_configs_or_empty['orchestrator']
+
+        recorded: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            recorded.append(cmd)
+            if 'escalation' in cmd and 'pytest' in cmd:
+                return 1, 'FAILED escalation/tests/test_server.py::test_x', False
+            return 0, 'ok', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await verify.run_scoped_verification(
+                worktree, config, [orchestrator_mc],
+                task_files=['orchestrator/src/orchestrator/merge_queue.py'],
+                role='merge',
+            )
+
+        escalation_pytest_cmds = [
+            c for c in recorded if 'escalation' in c and 'pytest' in c
+        ]
+        assert any('test_server.py' in c for c in escalation_pytest_cmds), (
+            f'expected the widened escalation pytest command to have run; recorded: {recorded}'
+        )
+        assert result.passed is False, (
+            'a failing widened escalation test must fail the aggregated VerifyResult '
+            '-- otherwise the widening runs cosmetically without gating the merge'
+        )
+        assert 'FAILED escalation/tests/test_server.py' in result.test_output
+
+    async def test_deleted_orchestrator_source_named_in_task_files_still_widens(
+        self, tmp_path: Path,
+    ):
+        """A deleted orchestrator SOURCE file still triggers widening when another
+        orchestrator file (e.g. a test edited in the same diff) keeps
+        'orchestrator' in `scoped` (amendment, review suggestion 2).
+
+        `existing_files` (the `(worktree / f).exists()`-filtered list) drops
+        the deleted source path entirely, hiding exactly the class of change
+        most likely to break escalation's `from orchestrator.merge_queue
+        import ...` contract. The trigger gate must key off the RAW
+        `task_files` list instead, so a deletion/rename still counts.
+        """
+        worktree = _build_worktree_with_deleted_source(tmp_path)
+        config = _build_config(tmp_path)
+        orchestrator_mc = config.module_configs_or_empty['orchestrator']
+
+        recorded: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            recorded.append(cmd)
+            return 0, 'ok', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await verify.run_scoped_verification(
+                worktree, config, [orchestrator_mc],
+                task_files=[
+                    'orchestrator/src/orchestrator/merge_queue.py',  # deleted -- absent on disk
+                    'orchestrator/tests/test_something.py',  # survives -- keeps 'orchestrator' scoped
+                ],
+                role='merge',
+            )
+
+        escalation_pytest_cmds = [
+            c for c in recorded if 'escalation' in c and 'pytest' in c
+        ]
+        assert any('test_server.py' in c for c in escalation_pytest_cmds), (
+            f'a deleted orchestrator source file (named in task_files but absent '
+            f'on disk) must still widen to escalation; recorded: {recorded}'
         )
 
 
@@ -323,4 +476,35 @@ class TestRunScopedVerificationReverseDependencyGuards:
 
         assert not any('escalation' in c for c in recorded), (
             f'unmapped package source change must not widen; recorded: {recorded}'
+        )
+
+    async def test_task_role_diff_does_not_widen(self, tmp_path: Path):
+        """Widening is merge-path only (amendment, review suggestion 4).
+
+        Every design decision motivating this task frames it as a
+        merge-verify concern (the 3x RED-main recurrence this closes was
+        always a merge-time escape) — an otherwise-identical orchestrator-
+        source-only diff verified at role='task' must NOT widen to
+        escalation, so per-task dev-loop verify latency for orchestrator
+        tasks is unchanged from before this task.
+        """
+        worktree = _build_worktree(tmp_path)
+        config = _build_config(tmp_path)
+        orchestrator_mc = config.module_configs_or_empty['orchestrator']
+
+        recorded: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            recorded.append(cmd)
+            return 0, 'ok', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await verify.run_scoped_verification(
+                worktree, config, [orchestrator_mc],
+                task_files=['orchestrator/src/orchestrator/merge_queue.py'],
+                role='task',
+            )
+
+        assert not any('escalation' in c for c in recorded), (
+            f"role='task' diffs must not trigger reverse-dep widening; recorded: {recorded}"
         )
