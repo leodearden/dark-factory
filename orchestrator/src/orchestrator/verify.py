@@ -4248,6 +4248,34 @@ async def run_scoped_verification(
                 # for VerifyResult.plan rather than deriving a second time.
                 plan_dict = plan.to_dict()
                 logger.info('Verify plan: %s', plan_dict)
+                # Reverse-dependency test widening (task 2607): the plan
+                # above is authoritative for file-classification scope (task
+                # κ, verify-scope-inversion-prd.md) over the task's OWN
+                # module_configs — but a diff scoped to orchestrator/ SOURCE
+                # alone never puts escalation's ModuleConfig in
+                # module_configs, so escalation's coupled cross-package
+                # merge_queue tests never ran. That blind spot caused
+                # RED-main fix-forward 3x (1761/2038/2604), each patched
+                # reactively. Append any reverse-dependent test targets to
+                # the EXECUTED `scoped` list rather than folding them into
+                # `plan`/`plan_dict` — derive_verify_plan would SKIP
+                # escalation (no escalation files changed; the widening
+                # keys off the orchestrator SOURCE change, orthogonal to
+                # file-classification scope) — see design decision 6.
+                # Mirrors the pyright-only reverse-dep precedent in
+                # hooks/project-checks (task 2551), scoped to pytest/import
+                # coupling instead of whole-package lint fan-out.
+                already_scoped = {mc.prefix for mc in scoped} | set(skipped)
+                widened = _reverse_dependency_module_configs(
+                    existing_files, config, worktree, already_scoped,
+                    content_cache=_content_cache,
+                )
+                if widened:
+                    logger.info(
+                        'Verification scope: widening to %d reverse-dependent subproject(s): %s',
+                        len(widened), ', '.join(mc.prefix for mc in widened),
+                    )
+                    scoped = scoped + widened
             else:
                 scoped = module_configs
                 plan_dict = None
