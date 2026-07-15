@@ -30,6 +30,9 @@ catch-all — a dedicated file avoids that hazard.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -148,3 +151,48 @@ class TestReverseDependencyModuleConfigs:
         )
 
         assert result == []
+
+
+@pytest.mark.asyncio
+class TestRunScopedVerificationReverseDependencyWidening:
+    """Integration: run_scoped_verification's module_configs branch widens to escalation.
+
+    RED until step-8 wires _reverse_dependency_module_configs into
+    run_scoped_verification's module_configs branch.
+    """
+
+    async def test_orchestrator_only_diff_runs_escalations_coupled_test(self, tmp_path: Path):
+        """An orchestrator-source-only task diff still executes escalation's coupled test.
+
+        Uses the plan-authoritative flow (task_files given, module_configs=
+        [orchestrator_mc] only — escalation is NOT among the task's own
+        module_configs, mirroring a real orchestrator-only task).
+        """
+        worktree = _build_worktree(tmp_path)
+        config = _build_config(tmp_path)
+        orchestrator_mc = config._module_configs['orchestrator']
+
+        recorded: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            recorded.append(cmd)
+            return 0, 'ok', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await verify.run_scoped_verification(
+                worktree, config, [orchestrator_mc],
+                task_files=['orchestrator/src/orchestrator/merge_queue.py'],
+                role='merge',
+            )
+
+        escalation_pytest_cmds = [
+            c for c in recorded if 'escalation' in c and 'pytest' in c
+        ]
+        assert any('test_server.py' in c for c in escalation_pytest_cmds), (
+            f'expected a widened escalation pytest command targeting test_server.py; '
+            f'recorded commands: {recorded}'
+        )
+        assert not any('test_unrelated.py' in c for c in escalation_pytest_cmds), (
+            f'widened escalation command must not target the unrelated test file; '
+            f'recorded commands: {recorded}'
+        )
