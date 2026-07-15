@@ -1031,6 +1031,189 @@ class TestStage1CycleSummaryHarnessBackstop:
         harness.journal.update_run_stage_reports.assert_awaited_once()
 
 
+class TestStage1CycleSummaryRemediationBackstop:
+    """_run_remediation_pass's finally block guarantees a Stage 1 cycle_summary
+    ledger row on every exit path, even when the Stage 1 turn raises during a
+    remediation-mode pass (task 2626 — the run_full_cycle-only gap task 2440
+    left uncovered on this second, independent S1→S2→S3 driver)."""
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'harness_backstop_ledger.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @staticmethod
+    def _build_harness(journal, event_buffer, mock_memory_service, ledger_store):
+        """Wire the ledger + a no-op metadata lookup and construct the harness —
+        the setup every test in this class shares; only the stage mocks differ
+        per test."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        return _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    @staticmethod
+    async def _invoke_remediation(harness):
+        """Call _run_remediation_pass with the standard args shared by every
+        test in this class, so the five-argument invocation can't drift out of
+        sync across cases."""
+        from fused_memory.reconciliation.harness import TierConfig
+
+        await harness._run_remediation_pass(
+            'test-project',
+            'parent-run-id',
+            [_make_s3_findings()[0]],
+            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+            scope=_scope('test-project', '/tmp/test-project'),
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_stage1_raise_triggers_degraded_backstop_ledger_write(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Stage 1's run() raising during a remediation pass must still leave a
+        degraded cycle_summary ledger row, anchored at the remediation run's own
+        started_at (task 2626)."""
+        import json
+
+        harness = self._build_harness(journal, event_buffer, mock_memory_service, ledger_store)
+        harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage1 exploded'))
+
+        # Remediation swallows the Stage-1 exception (parent run already
+        # completed) — this must complete without raising.
+        await self._invoke_remediation(harness)
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent and recent[0].run_type == 'remediation', (
+            'expected the remediation run to be persisted by the journal'
+        )
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary', flag_type='memory_consolidator', run_id=recent[0].id,
+        )
+        assert record is not None, (
+            'the remediation-pass finally block must write a cycle_summary ledger row '
+            'when Stage 1 raises before completing its own in-stage write'
+        )
+
+        payload = json.loads(record.payload_json)
+        assert payload['stats'].get('stage1_cycle_summary_degraded_backstop') is True
+        assert payload['llm_calls'] == 0, (
+            'degraded synthesis cannot know the real llm_calls count once Stage 1 raised'
+        )
+        assert datetime.fromisoformat(payload['started_at']) == recent[0].started_at, (
+            "the anchor must be the remediation run's own started_at, not a "
+            'synthesized datetime.now()'
+        )
+
+        assert recent[0].stage_reports['_error']['stage1_cycle_summary_backstop_written'] is True, (
+            'the harness must stamp the operator-facing breadcrumb onto the persisted '
+            "run's _error record once the backstop ledger write succeeds"
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_happy_path_does_not_invoke_backstop_write(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """All three stages succeeding during a remediation pass must NOT
+        trigger a second, redundant write_stage1_cycle_summary call — the
+        in-stage fast path already wrote it, and current_stage_name has
+        moved past Stage 1 by the time the finally block runs."""
+        harness = self._build_harness(journal, event_buffer, mock_memory_service, ledger_store)
+
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            await self._invoke_remediation(harness)
+
+        mock_write.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_remediation_stage2_failure_preserves_stage1_report_and_skips_backstop(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Stage 1 succeeding then Stage 2 raising during a remediation pass
+        must leave Stage 1's real report in place and must NOT fire the
+        backstop — current_stage_name is 'task_knowledge_sync' by the time
+        the exception reaches finally, not 'memory_consolidator'."""
+        harness = self._build_harness(journal, event_buffer, mock_memory_service, ledger_store)
+
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(side_effect=RuntimeError('stage2 exploded'))
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            await self._invoke_remediation(harness)
+
+        mock_write.assert_not_called()
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent, 'expected the failed run to be persisted by the journal'
+        assert 'memory_consolidator' in recent[0].stage_reports, (
+            "Stage 1's report must remain present when Stage 2 fails"
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_all_accounts_capped_triggers_degraded_backstop_without_raising(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """AllAccountsCappedException takes the deferral branch (`except
+        AllAccountsCappedException`), which does not re-raise — the same
+        untested-until-now control-flow shape as
+        TestStage1CycleSummaryHarnessBackstop's sibling test, but on the
+        remediation driver. The finally-block backstop must still fire and
+        stamp the breadcrumb even though _run_remediation_pass completes
+        normally instead of raising, and even though this except branch
+        builds a differently-shaped `_error` record (`'deferred': True`, no
+        `error_type` of a raising exception)."""
+        import json
+
+        from shared.cli_invoke import AllAccountsCappedException
+
+        harness = self._build_harness(journal, event_buffer, mock_memory_service, ledger_store)
+        harness.stages[0].run = AsyncMock(
+            side_effect=AllAccountsCappedException(
+                retries=3, elapsed_secs=200.0, label='Reconciliation stage (sonnet)'
+            )
+        )
+
+        await self._invoke_remediation(harness)
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent and recent[0].run_type == 'remediation', (
+            'expected the deferred remediation run to be persisted by the journal'
+        )
+        assert recent[0].status in (RunStatus.failed, 'failed')
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary', flag_type='memory_consolidator', run_id=recent[0].id,
+        )
+        assert record is not None, (
+            'the remediation-pass finally block must write a cycle_summary ledger row '
+            'when Stage 1 defers via AllAccountsCappedException, even though '
+            '_run_remediation_pass returns normally instead of raising'
+        )
+        payload = json.loads(record.payload_json)
+        assert payload['stats'].get('stage1_cycle_summary_degraded_backstop') is True
+
+        err = recent[0].stage_reports.get('_error')
+        assert isinstance(err, dict)
+        assert err['stage1_cycle_summary_backstop_written'] is True, (
+            'the breadcrumb must be stamped on the deferral (return, not raise) '
+            'exit path too'
+        )
+
+
 @pytest.mark.asyncio
 async def test_finding_partition_actionable_vs_non_actionable():
     """Partition logic: actionable findings trigger remediation, non-actionable get escalated."""
