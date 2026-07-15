@@ -1100,6 +1100,75 @@ class TestStage1CycleSummaryRemediationBackstop:
             "run's _error record once the backstop ledger write succeeds"
         )
 
+    @pytest.mark.asyncio
+    async def test_remediation_happy_path_does_not_invoke_backstop_write(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """All three stages succeeding during a remediation pass must NOT
+        trigger a second, redundant write_stage1_cycle_summary call — the
+        in-stage fast path already wrote it, and current_stage_name has
+        moved past Stage 1 by the time the finally block runs."""
+        from fused_memory.reconciliation.harness import TierConfig
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            await harness._run_remediation_pass(
+                'test-project',
+                'parent-run-id',
+                [_make_s3_findings()[0]],
+                TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+                scope=_scope('test-project', '/tmp/test-project'),
+            )
+
+        mock_write.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_remediation_stage2_failure_preserves_stage1_report_and_skips_backstop(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Stage 1 succeeding then Stage 2 raising during a remediation pass
+        must leave Stage 1's real report in place and must NOT fire the
+        backstop — current_stage_name is 'task_knowledge_sync' by the time
+        the exception reaches finally, not 'memory_consolidator'."""
+        from fused_memory.reconciliation.harness import TierConfig
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(side_effect=RuntimeError('stage2 exploded'))
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            await harness._run_remediation_pass(
+                'test-project',
+                'parent-run-id',
+                [_make_s3_findings()[0]],
+                TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+                scope=_scope('test-project', '/tmp/test-project'),
+            )
+
+        mock_write.assert_not_called()
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent, 'expected the failed run to be persisted by the journal'
+        assert 'memory_consolidator' in recent[0].stage_reports, (
+            "Stage 1's report must remain present when Stage 2 fails"
+        )
+
 
 @pytest.mark.asyncio
 async def test_finding_partition_actionable_vs_non_actionable():
