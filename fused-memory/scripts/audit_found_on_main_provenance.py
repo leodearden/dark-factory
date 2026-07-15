@@ -202,7 +202,17 @@ def classify(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
             f'ref (git merge-base --is-ancestor reported unreachable)',
         ]
 
-    raise NotImplementedError
+    cited = extract_cited_task_ids(audit.commit_message)
+    if cited and audit.task_id not in cited:
+        others = ', '.join(sorted(cited))
+        return 'misattributed', [
+            f'commit message cites task(s) {others}, not task {audit.task_id} — '
+            f'likely proof of a different task, not this one',
+        ]
+
+    # TODO(step-10/step-12): reverted / deliverable_absent / unverifiable are
+    # not yet distinguished from this interim fallback.
+    return 'ok', []
 
 
 # ---------------------------------------------------------------------------
