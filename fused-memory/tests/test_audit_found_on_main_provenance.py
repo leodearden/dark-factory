@@ -739,6 +739,10 @@ def _build_test_repo(root: Path) -> dict[str, str]:
       4. ``c_revert_target`` — adds src/revert_target.py.
       5. ``c_revert``      — ``git revert`` of c_revert_target; its message
          carries the canonical "This reverts commit <full-sha>" trailer.
+      6. ``c_merge``       — a no-ff merge of a ``feature`` branch (holding
+         one commit, ``c_feature``, adding src/feature.py) into main. The
+         "commit under test" for _git_show_files' merge-commit regression:
+         plain ``git show --name-only`` reports NOTHING for a merge commit.
 
     Plus a sibling branch (``sidebranch``, off ``c_init``) holding one commit
     (``c_side``) that is never merged into ``main`` — not an ancestor of it.
@@ -783,6 +787,16 @@ def _build_test_repo(root: Path) -> dict[str, str]:
     c_side = _git(root, 'rev-parse', 'HEAD')
     _git(root, 'checkout', '-q', 'main')
 
+    # Feature branch merged into main via a real no-ff merge commit.
+    _git(root, 'checkout', '-q', '-b', 'feature', c_init)
+    _write(root, 'src/feature.py', 'feature = 1\n')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '--no-verify', '-m', 'feat: add feature')
+    c_feature = _git(root, 'rev-parse', 'HEAD')
+    _git(root, 'checkout', '-q', 'main')
+    _git(root, 'merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge feature into main', 'feature')
+    c_merge = _git(root, 'rev-parse', 'HEAD')
+
     return {
         'c_init': c_init,
         'c_keep_drop': c_keep_drop,
@@ -790,6 +804,8 @@ def _build_test_repo(root: Path) -> dict[str, str]:
         'c_revert_target': c_revert_target,
         'c_revert': c_revert,
         'c_side': c_side,
+        'c_feature': c_feature,
+        'c_merge': c_merge,
     }
 
 
@@ -813,6 +829,17 @@ class TestGitShowFiles:
         root, shas = repo_facts
         files = await _git_show_files(str(root), shas['c_keep_drop'])
         assert sorted(files) == ['src/drop.py', 'src/keep.py']
+
+    async def test_merge_commit_reports_first_parent_diff(self, repo_facts):
+        """A no-ff merge commit's brought-in files must be visible. Plain
+        `git show --name-only` on a merge commit reports NOTHING (verified
+        empirically) — the wrapper must pass --first-parent -m to see what
+        the merge actually brought in, since found_on_main provenance is
+        expected to cite exactly this kind of merge/landing commit.
+        """
+        root, shas = repo_facts
+        files = await _git_show_files(str(root), shas['c_merge'])
+        assert files == ['src/feature.py']
 
 
 @pytest.mark.asyncio
@@ -871,6 +898,15 @@ class TestGitFactsGather:
         assert facts['declared_files_missing_on_main'] == ['src/drop.py']
         assert facts['commit_subject']  # non-empty: first line of the commit message
         assert facts['commit_message']
+
+    async def test_merge_commit_aggregates_first_parent_diff(self, repo_facts):
+        """GitFacts.gather() surfaces the merge-commit fix end-to-end: the
+        merged-in file is visible in commit_files, not silently empty."""
+        root, shas = repo_facts
+        git = GitFacts(str(root))
+        facts = await git.gather(shas['c_merge'], 'main', [])
+        assert facts['is_ancestor'] is True
+        assert facts['commit_files'] == ['src/feature.py']
 
     async def test_non_ancestor_short_circuits_remaining_git_calls(self, repo_facts, monkeypatch):
         """When is_ancestor is False, none of the other four subprocesses run

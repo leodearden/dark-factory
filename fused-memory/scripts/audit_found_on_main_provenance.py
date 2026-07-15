@@ -249,12 +249,20 @@ def classify(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
 async def _git_show_files(project_root: str, commit: str) -> list[str]:
     """Return the list of files in a commit diff, or [] on failure.
 
-    Reuses the exact shape of invalidate_fabricated_shipping_edges.py's
-    helper of the same name.
+    Passes ``--first-parent -m`` so a no-ff merge commit reports the files
+    it actually brought in. Plain ``git show --name-only`` reports an EMPTY
+    list for a merge commit (verified empirically) — merge commits are
+    exactly what found_on_main provenance is expected to cite (the
+    orchestrator briefs agents to cite the merge/landing SHA on main), so
+    without this flag ``deliverable_absent`` would false-positive on most
+    legitimate found_on_main tasks. ``--first-parent -m`` is a no-op for an
+    ordinary single-parent commit (verified empirically), so this is a
+    strict improvement over the prior invocation.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
-            'git', '-C', project_root, 'show', '--name-only', '--format=', commit,
+            'git', '-C', project_root, 'show', '--name-only', '--format=',
+            '--first-parent', '-m', commit,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
