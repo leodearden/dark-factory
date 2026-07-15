@@ -969,6 +969,49 @@ class TestL2AutoCloseCarveout:
         )
 
     @pytest.mark.asyncio
+    async def test_stale_task_scoped_non_infra_category_closes_over_http(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """(1b) Class (c) stale_task_scoped is the broadest, category-agnostic
+        class — unlike (a)/(b) it can auto-close non-infra categories too
+        (e.g. task_failure). Verify the full end-to-end mutation (dismissed,
+        resolution_action stamped, resolved_by from the identity header,
+        archived out of the queue root) over HTTP, not just the pure
+        ``l2_auto_close_class`` unit return value."""
+        from orchestrator.harness import _WATCHER_ESCALATION_HEADERS
+
+        base_url, queue = http_server
+        levels = _WATCHER_ESCALATION_HEADERS['X-Escalation-Levels']
+        identity = _WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']
+
+        esc = _seed(
+            queue, level=2, task_id='task-stale-task-scoped',
+            agent_role='implementer', category='task_failure',
+        )
+        result = await _resolve_over_http(
+            base_url, levels=levels, identity=identity,
+            escalation_id=esc.id, action='close_only',
+            resolution='Subject task status=done per get_task; escalation moot.',
+            resolved_by='spoofed-by-agent',
+        )
+        assert 'code' not in result and 'error' not in result, (
+            f'Expected a clean success (stale_task_scoped class + evidence), got: {result}'
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'dismissed', f'Expected dismissed, got: {reread.status}'
+        assert reread.resolution_action == 'close_only', (
+            f"Expected resolution_action='close_only', got: {reread.resolution_action!r}"
+        )
+        assert reread.resolved_by == 'orchestrator-escalation-watcher-auto', (
+            f'Expected the identity header to stamp resolved_by (not the spoofed '
+            f'tool arg), got: {reread.resolved_by!r}'
+        )
+        assert not (queue.queue_dir / f'{esc.id}.json').exists(), (
+            'Expected the auto-closed record archived out of the queue root'
+        )
+
+    @pytest.mark.asyncio
     async def test_non_allowlisted_category_still_forbidden(
         self, http_server: tuple[str, EscalationQueue],
     ) -> None:
