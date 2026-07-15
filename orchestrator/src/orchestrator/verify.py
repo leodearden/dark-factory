@@ -1600,6 +1600,38 @@ def _select_subproject_pytest_targets(files: list[str], prefix: str) -> list[str
     ]
 
 
+def _config_test_extras(cmd: str | None) -> list[str]:
+    """Extract every ``--extra <name>`` / ``--extra=<name>`` flag from *cmd*, in order.
+
+    Carries a project's canonical ``config.test_command`` extras into the
+    fallback-synthesized ``uv run pytest`` command (task 2641; the TEST-path
+    twin of the task-2355 TYPE/LINT cold-verify dev-dep fix) so a cold merge
+    worktree syncs the project's dev-group deps before pytest is spawned.
+
+    Returns ``[]`` when *cmd* is ``None``, carries no ``--extra`` flags, or
+    fails to tokenize (unbalanced quotes — mirrors :func:`parse_config_command`'s
+    ``shlex.split`` + ``except ValueError`` guard).
+    """
+    if cmd is None:
+        return []
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return []
+    extras: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == '--extra' and i + 1 < len(tokens):
+            extras.extend(['--extra', tokens[i + 1]])
+            i += 2
+            continue
+        if token.startswith('--extra='):
+            extras.extend(['--extra', token.split('=', 1)[1]])
+        i += 1
+    return extras
+
+
 def _build_fallback_config(
     task_files: list[str],
     config: OrchestratorConfig | None = None,
