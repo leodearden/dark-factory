@@ -3981,7 +3981,7 @@ def _safe_derive_verify_plan_dict(
 
 
 def _reverse_dependency_module_configs(
-    existing_files: list[str],
+    changed_files: list[str],
     config: OrchestratorConfig,
     worktree: Path,
     already_scoped: set[str],
@@ -3995,6 +3995,23 @@ def _reverse_dependency_module_configs(
     ModuleConfig is never a candidate for an orchestrator-only diff. This
     recurred 3x as a RED-main fix-forward (1736->1761, 2173->2038,
     2435->2604) before being structurally closed here.
+
+    *changed_files* should be the RAW (pre-existence-filter) task file list
+    — NOT one narrowed to files that still exist on disk (amendment, review
+    suggestion 2). :func:`verify_plan.reverse_dependent_test_targets`'s
+    trigger gate matches purely on path shape (``<pkg>/src/**.py``), so a
+    deleted or renamed-away source path still correctly counts as a
+    trigger — precisely the kind of change most likely to break a
+    dependent's ``from <pkg> import ...`` contract. An existence-filtered
+    list would silently under-trigger whenever the only surviving
+    (still-existing) file under the depended-upon package's own prefix is a
+    non-source file, e.g. a test edit made alongside the source deletion.
+    Note this only helps when the caller reaches this function at all:
+    :func:`run_scoped_verification`'s ``if not scoped:`` early-exit means a
+    diff with NO surviving file under the task's own module_configs never
+    calls this helper in the first place, regardless of *changed_files* —
+    that residual gap is architectural (a property of the surrounding
+    scoping branch), not something this helper can close on its own.
 
     Thin impure wrapper around the pure
     :func:`verify_plan.reverse_dependent_test_targets`: builds a
@@ -4011,10 +4028,19 @@ def _reverse_dependency_module_configs(
     the task's own module_configs, or a prior widening — no double-add);
     looks up its BASE ``ModuleConfig`` via ``config.module_configs_or_empty``
     and skips it when absent or when it has no ``test_command`` configured
-    (nothing to scope); else appends a ``dataclasses.replace`` of the base
-    config with ``test_command`` narrowed to *coupled_files* via
+    (nothing to scope); else narrows ``test_command`` to *coupled_files* via
     :func:`_scope_to_keyword` (the same scoping :func:`_derive_module_runs`
-    uses for an in-diff FILE_SCOPED pytest run) and
+    uses for an in-diff FILE_SCOPED pytest run). When that scoping is a
+    no-op — :func:`_scope_to_keyword` returns *cmd* UNCHANGED when its
+    ``'pytest'`` keyword isn't literally present or the prefix doesn't parse
+    into a structured command, per its own documented contract — widening
+    with the untouched command would silently run the dependent's FULL
+    suite instead of just the coupled files, contradicting the
+    cost/flake-bounding goal (design decision: import-scoped, not
+    whole-suite). So that dependent is skipped (with a warning logged
+    rather than silently dropped — amendment, review suggestion 3) instead
+    of being widened unscoped. Otherwise appends a ``dataclasses.replace``
+    of the base config with the scoped ``test_command`` and
     ``lint_command``/``type_check_command`` forced to ``None`` — the
     widening is pytest-only (design decision: the failure class that
     recurred is a runtime import/attribute break, and reverse-dependency
@@ -4033,7 +4059,7 @@ def _reverse_dependency_module_configs(
     read_content = _worktree_reader(worktree, cache=content_cache)
 
     triggered = verify_plan.reverse_dependent_test_targets(
-        existing_files, verify_plan._REVERSE_TEST_DEPENDENTS, _list_pkg_tests, read_content,
+        changed_files, verify_plan._REVERSE_TEST_DEPENDENTS, _list_pkg_tests, read_content,
     )
 
     widened: list[ModuleConfig] = []
@@ -4043,9 +4069,26 @@ def _reverse_dependency_module_configs(
         base = config.module_configs_or_empty.get(dependent)
         if base is None or not base.test_command:
             continue
+        scoped_test_command = _scope_to_keyword(base.test_command, 'pytest', coupled)
+        if scoped_test_command == base.test_command:
+            # _scope_to_keyword no-op (no literal 'pytest' keyword match, or
+            # an unparseable command prefix) — widening this dependent
+            # would silently fan out to its FULL, un-narrowed suite.  Skip
+            # rather than run unscoped; log so a mis-shaped test_command on
+            # a mapped dependent is visible instead of silently missing
+            # from merge-verify coverage.
+            logger.warning(
+                "Reverse-dependency widening: %s's test_command could not be "
+                "scoped to %d coupled file(s) via 'pytest' keyword-matching "
+                '(no literal match, or an unparseable command prefix) — '
+                'skipping widening for this dependent rather than running '
+                'its full suite unscoped',
+                dependent, len(coupled),
+            )
+            continue
         widened.append(replace(
             base,
-            test_command=_scope_to_keyword(base.test_command, 'pytest', coupled),
+            test_command=scoped_test_command,
             lint_command=None,
             type_check_command=None,
         ))
@@ -4279,10 +4322,35 @@ async def run_scoped_verification(
                 # verify_plan `<pkg>/src/` gate), an escalation-in-diff task
                 # isn't double-widened (this union), and a no-map-entry
                 # package (e.g. dashboard) widens to nothing.
+                #
+                # Merge-only (amendment, review suggestion 4): every design
+                # decision above is framed as "merge-verify path" / "merge-
+                # path flake/cost surface" — the 3x recurrence this closes
+                # was always a merge-time escape, never a task-role dev-loop
+                # gap. Gating on role=='merge' leaves per-task verify
+                # latency for every orchestrator-source task unchanged; a
+                # task-role diff still gets its normal coverage plus the
+                # whole-tree main-tip sweep and hooks/project-checks'
+                # pyright reverse-dep backstops.
+                #
+                # `task_files` — the RAW, pre-existence-filter list, NOT
+                # `existing_files` — drives the trigger gate (amendment,
+                # review suggestion 2): a deleted/renamed orchestrator
+                # SOURCE path still counts as a trigger, since
+                # reverse_dependent_test_targets matches on path shape
+                # alone, never on-disk existence. See
+                # _reverse_dependency_module_configs' docstring for the
+                # residual gap this narrows but does not fully close (a
+                # diff with no surviving file under the task's own
+                # module_configs never reaches this call at all).
                 already_scoped = {mc.prefix for mc in scoped} | set(skipped)
-                widened = _reverse_dependency_module_configs(
-                    existing_files, config, worktree, already_scoped,
-                    content_cache=_content_cache,
+                widened = (
+                    _reverse_dependency_module_configs(
+                        task_files, config, worktree, already_scoped,
+                        content_cache=_content_cache,
+                    )
+                    if role == 'merge'
+                    else []
                 )
                 if widened:
                     logger.info(
