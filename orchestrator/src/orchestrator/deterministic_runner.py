@@ -2416,26 +2416,7 @@ class DeterministicRunner:
                 # grandchildren) and the (before_done)->(rc, tail) seam
                 # contract are both preserved.
                 run_fn = self._script_runner or self._default_run_script
-                outer_timeout = before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
-
-                async def _invoke_run_fn():
-                    # A custom/injected seam could itself raise a TimeoutError
-                    # internally (e.g. its own inner asyncio.wait_for) BEFORE
-                    # outer_timeout elapses.  asyncio.wait_for cannot tell that
-                    # apart from its OWN outer-guard timeout — both surface as
-                    # the same `TimeoutError` type at the call site below.
-                    # Translate a seam-internal TimeoutError into a distinct
-                    # exception type HERE, before it can reach wait_for's
-                    # propagation path, so `except TimeoutError` below can only
-                    # ever mean "the outer wall-clock guard itself fired" —
-                    # never a misattributed application error.
-                    try:
-                        return await run_fn(before_done)
-                    except TimeoutError as exc:
-                        raise RuntimeError(
-                            f'run_fn raised TimeoutError internally (not the '
-                            f'outer guard): {exc!r}'
-                        ) from exc
+                outer_timeout = self._deploy_outer_timeout(before_done)
 
                 class _RunFnProcShim:
                     """Adapts a (rc, tail) pair from run_fn into a
@@ -2451,7 +2432,13 @@ class DeterministicRunner:
                         return self._tail.encode(errors='replace'), None
 
                 async def _shim_runner(*_args, **_kwargs):
-                    rc, tail = await _invoke_run_fn()
+                    # Route through the shared translating-timeout wrapper
+                    # (see _invoke_run_fn_translating_timeout's docstring for
+                    # why the seam-internal TimeoutError must be translated
+                    # here) instead of a local copy, so this branch and the
+                    # target_unit-less branch's _run_deploy_script_guarded
+                    # cannot drift apart (task 2632 review amendment).
+                    rc, tail = await self._invoke_run_fn_translating_timeout(run_fn, before_done)
                     return _RunFnProcShim(rc, tail)
 
                 # RestartOutcome carries only disposition/escalated/detail —
