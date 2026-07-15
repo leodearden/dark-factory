@@ -261,6 +261,62 @@ class _RecordingService:
 # ---------------------------------------------------------------------------
 
 
+async def _scheduled_self_restart_then_crash_at_ran(tmp_queue_dir: Path):
+    """D1a driver: a real own-unit self-restart schedules deferred
+    (SCHEDULED — never blocks/self-kills), then a real None->RAN DeployState
+    write lands via enforce_transition + DeployState.to_metadata(). The
+    fault: no further VERIFIED write ever happens — the deploy 'crashed'
+    with metadata frozen at phase=ran. A real TaskGroundTruth then reads
+    that frozen metadata back through recovery_for(). Returns
+    (restart_outcome, truth_report, recovery_action)."""
+    from orchestrator.deploy_state import DeployPhase, DeployState, enforce_transition
+    from orchestrator.proc_supervision import EscalationSpec, RestartPlan
+
+    tid = 'task-2244-d1a'
+    plan = RestartPlan(
+        script=Path('/proj/scripts/restart-orchestrator.sh'),
+        args=[],
+        cwd=Path('/proj'),
+        target_unit='orch.service',
+        own_unit='orch.service',
+        on_failure_escalation=EscalationSpec(
+            queue_dir=str(tmp_queue_dir),
+            task_id=tid,
+            summary='Self-restart fire-time failure',
+        ),
+        verify=None,
+        transient_unit=f'orch-redeploy-restart-{tid}.service',
+        on_active_secs=10,
+    )
+    restart_outcome = await plan.execute(runner=FakeRunner(returncode=0))
+
+    metadata: dict = {}
+    sink_calls: list[tuple[str, DeployPhase | None, DeployPhase]] = []
+
+    def recording_sink(task_id: str, old: DeployPhase | None, new: DeployPhase) -> None:
+        sink_calls.append((task_id, old, new))
+
+    # old is None -> always legal (an initial write, not a transition).
+    enforce_transition(None, DeployPhase.RAN, task_id=tid, escalation_sink=recording_sink)
+    metadata.update(
+        DeployState(phase=DeployPhase.RAN, ran_at='2026-07-15T00:00:00+00:00').to_metadata()
+    )
+    # Fault point: the deploy 'crashes' here — no VERIFIED write ever happens.
+
+    resolver = _make_ground_truth(
+        git_ops=_fake_git_ops(is_ancestor=False, branch_sha=None, marker_sha=None),
+        scheduler=_fake_scheduler(is_actively_held=False, task={
+            'status': 'in-progress',
+            'claimant_run_id': None,
+            'heartbeat_at': None,
+            'metadata': metadata,
+        }),
+        escalation_queue=None,
+    )
+    truth_report, action = await resolver.recovery_for(tid)
+    return restart_outcome, truth_report, action
+
+
 @pytest.mark.asyncio
 class TestD1SelfRestartDeployCrash:
     """D1a composition cell (the 2059/2066 crashed-mid-deploy case)."""
