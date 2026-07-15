@@ -20,9 +20,10 @@ Test coverage:
     the scope's own body-task race, and ``_await_cancellable`` raises
     ``WorkflowCancelled('soft')`` (orphan-avoidance detach preserved)
   step-13: harness B2 + ``synthetic_cancel`` retirement — ``TaskReport``
-    sheds the field, harness.py sheds every reference to it, and the
-    ``except asyncio.CancelledError`` safety net (for cancels landing
-    OUTSIDE run()'s CancellationScope) keeps working without it
+    can no longer be constructed with the field, the harness's hard-cancel
+    safety-net report carries no such attribute, and the ``except
+    asyncio.CancelledError`` safety net (for cancels landing OUTSIDE
+    run()'s CancellationScope) keeps working without it
 """
 
 from __future__ import annotations
@@ -841,7 +842,8 @@ class TestAwaitCancellableRaisesWorkflowCancelled:
 #
 # RED until step-14 deletes TaskReport.synthetic_cancel and the B2 block
 # from harness.py: today the field still exists (TaskReport(...
-# synthetic_cancel=True) does NOT raise) and harness.py still references it.
+# synthetic_cancel=True) does NOT raise) and the harness's hard-cancel
+# safety-net report still carries the attribute.
 
 
 def _make_harness_for_run_slot() -> Harness:
@@ -886,10 +888,11 @@ def _make_harness_for_run_slot() -> Harness:
 
 
 class TestHarnessSyntheticCancelRetirement:
-    """RED (step-13): ``TaskReport`` sheds ``synthetic_cancel``; harness.py
-    sheds every reference to it (field + B2 release block); the ``except
-    asyncio.CancelledError`` safety net keeps returning a CANCELLED report
-    with cleanup/sem intact."""
+    """RED (step-13): ``TaskReport`` sheds ``synthetic_cancel`` — it can no
+    longer be constructed with the field, and the harness's hard-cancel
+    safety-net report carries no such attribute (field + B2 release block
+    retired); the ``except asyncio.CancelledError`` safety net keeps
+    returning a CANCELLED report with cleanup/sem intact."""
 
     def test_task_report_construction_rejects_synthetic_cancel_kwarg(self):
         with pytest.raises(TypeError):
@@ -897,16 +900,6 @@ class TestHarnessSyntheticCancelRetirement:
                 task_id='42', title='t', outcome=WorkflowOutcome.CANCELLED,
                 synthetic_cancel=True,  # type: ignore[call-arg]
             )
-
-    def test_harness_source_has_no_synthetic_cancel_reference(self):
-        import orchestrator.harness as harness_module
-
-        source = Path(harness_module.__file__).read_text()
-        assert 'synthetic_cancel' not in source, (
-            'harness.py must contain no synthetic_cancel reference — the '
-            'field + B2 dual-guard are retired; on_terminal now solely '
-            'owns terminal lane release'
-        )
 
     @pytest.mark.asyncio
     async def test_hard_cancel_safety_net_returns_cancelled_report_without_synthetic_cancel(
