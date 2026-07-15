@@ -245,6 +245,54 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        with sub-steps a–d above.
      - Not found → `mcp__escalation__merge_cancel(request_id)` then **ABORT**.
 
+## Merge-stage completion mode (block_class == 'merge_verify_red')
+
+Some proposals originate from a **post-merge-verify block**, not an ordinary
+agent-block: the task's solution already passed its own verify **and**
+review, but landing on `main` jammed (e.g. a rebase conflict, or an
+import/type/lint break introduced by whatever landed on `main` after this
+branch was verified). Recognize this mode from
+`latest['block_class'] == 'merge_verify_red'` (present on the same
+`dry_run_proposals[-1]` entry precondition 1 already reads).
+
+This mode does **not** add a new precondition or gate step. The (a)+(b)+(c)
+eligibility gate — block_class is MERGE_VERIFY_RED, VERIFY passed, REVIEW
+passed, all run-scoped — is enforced by the orchestrator **at
+proposal-generation time**: `run_dry_run_unblock` clamps `risk_label` down
+to `human-review-required` whenever that evidence is incomplete, so by the
+time you ever see `latest['risk_label'] == 'low'` on a `merge_verify_red`
+entry, the gate has already passed. Preconditions 1-6 above (freshness,
+category, risk_label, the post-merge-red-main hard-abort) apply completely
+unchanged — there is nothing extra for you to check.
+
+Two refinements to the Procedure for this mode specifically:
+
+- **Step 3 (apply the fix — scoped)** is, in practice, either a **rebase/
+  conflict resolution** confined to files already in the task's own diff,
+  or an **import/type/lint repair** against the new `main` tip. If the fix
+  demands anything beyond that (a logic change, a genuinely new and
+  unrelated test failure, a cross-module edit), the investigator's
+  labelling guidance (`skills/unblock-auto/SKILL.md`) says that should
+  never have been labelled `low` in the first place — treat it as a
+  labelling error, not license to proceed: **ABORT**.
+- **Step 5 (verify)** — instead of assuming a single repo-wide verify
+  command, run the scoped suite **per package touched by
+  `files_referenced`** (this repo's `<pkg>/src/<pkg>/` layout means each
+  touched top-level package — `orchestrator/`, `shared/`, `fused-memory/`,
+  etc. — has its own `pytest` + `pyright` + `ruff check`): e.g. for a fix
+  confined to `orchestrator/`, run `pytest`, `pyright`, and `ruff check`
+  from within `orchestrator/`. Any non-zero exit anywhere → **ABORT**,
+  exactly as step 5's existing rule.
+
+Everything else — rebase (step 4), commit (step 6), charge (step 7), and
+submitting via `merge_request` (step 8) — is **unchanged**: this mode
+merges through the same queue as every other low-risk fix. The merge
+queue's own **full-suite post-merge verify remains the final gate** — your
+per-package scoped verify here is a fast local check, not a substitute for
+it, and a failure there still routes the entry to `conflict` / `blocked`
+per step 9, exactly like any other post-charge merge failure. Abort-to-human
+on any doubt applies identically to this mode — nothing here loosens that.
+
 ## Aborting
 
 On any ABORT:
