@@ -1762,8 +1762,15 @@ def _build_fallback_config(
         # left untouched since it also covers the worktree=None case that
         # has no `prefix` to make relative).
         rel_targets = _select_subproject_pytest_targets(py_files, sub)
+        # Cold-verify dev-dep sync (task 2641): carry any --extra flags from
+        # the project's canonical test_command into the synthesized command
+        # so a cold merge worktree's `uv run` syncs the project's dev-group
+        # extra before spawning pytest (TEST-path twin of the task-2355
+        # TYPE/LINT fix below). extras is [] for a no-extra config, so the
+        # output is byte-identical to before this change.
+        extras = _config_test_extras(config.test_command if config is not None else None)
         test_cmd = (
-            'cd ' + sub + ' && uv run pytest ' + ' '.join(rel_targets)
+            'cd ' + sub + ' && uv run ' + ' '.join([*extras, 'pytest', *rel_targets])
             if rel_targets else None
         )
         # Cold-verify dev-dep race (task 2355): rescope TYPE/LINT into *sub*'s
