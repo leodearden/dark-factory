@@ -881,6 +881,18 @@ def create_mcp_server(
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
+        if (
+            isinstance(agent_id, str)
+            and agent_id.startswith('recon-stage-')
+            and frames_live_task_status_as_current_fact(content)
+        ):
+            return {
+                'error': 'live_task_status_current_fact_write_blocked',
+                'error_type': 'ReconLiveTaskStatusWriteRejected',
+                'agent_id': agent_id,
+                'content_excerpt': content[:200],
+                'hint': _LIVE_TASK_STATUS_HINT,
+            }
         causation_id, op_source, _ = _extract_causation(metadata, agent_id)
         result = await memory_service.add_episode(
             content=content,
