@@ -3980,6 +3980,121 @@ def _safe_derive_verify_plan_dict(
         return None
 
 
+def _reverse_dependency_module_configs(
+    changed_files: list[str],
+    config: OrchestratorConfig,
+    worktree: Path,
+    already_scoped: set[str],
+    content_cache: dict[str, str | None] | None = None,
+) -> list[ModuleConfig]:
+    """Widen scoped merge-verify to a depended-upon package's reverse-dependents (task 2607).
+
+    Closes the blind spot where a task's diff scoped to orchestrator/ SOURCE
+    never runs escalation/'s coupled cross-package tests — module_configs is
+    resolved from the TASK's own touched modules only, so escalation's
+    ModuleConfig is never a candidate for an orchestrator-only diff. This
+    recurred 3x as a RED-main fix-forward (1736->1761, 2173->2038,
+    2435->2604) before being structurally closed here.
+
+    *changed_files* should be the RAW (pre-existence-filter) task file list
+    — NOT one narrowed to files that still exist on disk (amendment, review
+    suggestion 2). :func:`verify_plan.reverse_dependent_test_targets`'s
+    trigger gate matches purely on path shape (``<pkg>/src/**.py``), so a
+    deleted or renamed-away source path still correctly counts as a
+    trigger — precisely the kind of change most likely to break a
+    dependent's ``from <pkg> import ...`` contract. An existence-filtered
+    list would silently under-trigger whenever the only surviving
+    (still-existing) file under the depended-upon package's own prefix is a
+    non-source file, e.g. a test edit made alongside the source deletion.
+    Note this only helps when the caller reaches this function at all:
+    :func:`run_scoped_verification`'s ``if not scoped:`` early-exit means a
+    diff with NO surviving file under the task's own module_configs never
+    calls this helper in the first place, regardless of *changed_files* —
+    that residual gap is architectural (a property of the surrounding
+    scoping branch), not something this helper can close on its own.
+
+    Thin impure wrapper around the pure
+    :func:`verify_plan.reverse_dependent_test_targets`: builds a
+    ``list_pkg_tests`` closure (rglobs ``worktree/<pkg>/tests`` for ``.py``
+    files, mapped to worktree-relative POSIX paths, filtered to genuinely
+    pytest-collectable files via ``verify_plan._is_collectable_test_file`` —
+    mirrors how ``derive_verify_plan`` selects collectable tests) and a
+    ``read_content`` reader via :func:`_worktree_reader` (threaded with the
+    caller's *content_cache*, so a file already read elsewhere this attempt
+    is not read from disk twice).
+
+    For each ``(dependent, coupled_files)`` the pure function returns: skips
+    it when *dependent* is already in *already_scoped* (already covered by
+    the task's own module_configs, or a prior widening — no double-add);
+    looks up its BASE ``ModuleConfig`` via ``config.module_configs_or_empty``
+    and skips it when absent or when it has no ``test_command`` configured
+    (nothing to scope); else narrows ``test_command`` to *coupled_files* via
+    :func:`_scope_to_keyword` (the same scoping :func:`_derive_module_runs`
+    uses for an in-diff FILE_SCOPED pytest run). When that scoping is a
+    no-op — :func:`_scope_to_keyword` returns *cmd* UNCHANGED when its
+    ``'pytest'`` keyword isn't literally present or the prefix doesn't parse
+    into a structured command, per its own documented contract — widening
+    with the untouched command would silently run the dependent's FULL
+    suite instead of just the coupled files, contradicting the
+    cost/flake-bounding goal (design decision: import-scoped, not
+    whole-suite). So that dependent is skipped (with a warning logged
+    rather than silently dropped — amendment, review suggestion 3) instead
+    of being widened unscoped. Otherwise appends a ``dataclasses.replace``
+    of the base config with the scoped ``test_command`` and
+    ``lint_command``/``type_check_command`` forced to ``None`` — the
+    widening is pytest-only (design decision: the failure class that
+    recurred is a runtime import/attribute break, and reverse-dependency
+    pyright is already covered by hooks/project-checks, task 2551). Every
+    other ``ModuleConfig`` field (lock_depth, verify_env, timeouts, ...)
+    survives via ``replace`` so the widened run uses the dependent's normal
+    per-module overrides.
+    """
+    def _list_pkg_tests(pkg: str) -> list[str]:
+        tests_dir = worktree / pkg / 'tests'
+        if not tests_dir.is_dir():
+            return []
+        rel_paths = (p.relative_to(worktree).as_posix() for p in tests_dir.rglob('*.py'))
+        return [p for p in rel_paths if verify_plan._is_collectable_test_file(p)]
+
+    read_content = _worktree_reader(worktree, cache=content_cache)
+
+    triggered = verify_plan.reverse_dependent_test_targets(
+        changed_files, verify_plan._REVERSE_TEST_DEPENDENTS, _list_pkg_tests, read_content,
+    )
+
+    widened: list[ModuleConfig] = []
+    for dependent, coupled in triggered:
+        if dependent in already_scoped:
+            continue
+        base = config.module_configs_or_empty.get(dependent)
+        if base is None or not base.test_command:
+            continue
+        scoped_test_command = _scope_to_keyword(base.test_command, 'pytest', coupled)
+        if scoped_test_command == base.test_command:
+            # _scope_to_keyword no-op (no literal 'pytest' keyword match, or
+            # an unparseable command prefix) — widening this dependent
+            # would silently fan out to its FULL, un-narrowed suite.  Skip
+            # rather than run unscoped; log so a mis-shaped test_command on
+            # a mapped dependent is visible instead of silently missing
+            # from merge-verify coverage.
+            logger.warning(
+                "Reverse-dependency widening: %s's test_command could not be "
+                "scoped to %d coupled file(s) via 'pytest' keyword-matching "
+                '(no literal match, or an unparseable command prefix) — '
+                'skipping widening for this dependent rather than running '
+                'its full suite unscoped',
+                dependent, len(coupled),
+            )
+            continue
+        widened.append(replace(
+            base,
+            test_command=scoped_test_command,
+            lint_command=None,
+            type_check_command=None,
+        ))
+    return widened
+
+
 async def run_scoped_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -4176,6 +4291,73 @@ async def run_scoped_verification(
                 # for VerifyResult.plan rather than deriving a second time.
                 plan_dict = plan.to_dict()
                 logger.info('Verify plan: %s', plan_dict)
+                # Reverse-dependency test widening (task 2607): the plan
+                # above is authoritative for file-classification scope (task
+                # κ, verify-scope-inversion-prd.md) over the task's OWN
+                # module_configs — but a diff scoped to orchestrator/ SOURCE
+                # alone never puts escalation's ModuleConfig in
+                # module_configs, so escalation's coupled cross-package
+                # merge_queue tests never ran. That blind spot caused
+                # RED-main fix-forward 3x (1761/2038/2604), each patched
+                # reactively. Append any reverse-dependent test targets to
+                # the EXECUTED `scoped` list rather than folding them into
+                # `plan`/`plan_dict` — derive_verify_plan would SKIP
+                # escalation (no escalation files changed; the widening
+                # keys off the orchestrator SOURCE change, orthogonal to
+                # file-classification scope) — see design decision 6.
+                # Mirrors the pyright-only reverse-dep precedent in
+                # hooks/project-checks (task 2551), scoped to pytest/import
+                # coupling instead of whole-package lint fan-out.
+                #
+                # `scoped` (surviving) union `skipped` (no matching files) is
+                # every mc.prefix in `module_configs` — the task's OWN
+                # modules — by construction (skipped is defined as
+                # module_configs minus scoped_prefixes above). So when the
+                # task's own diff already touches escalation, 'escalation' is
+                # already in already_scoped and the helper's own dedup
+                # (`if dependent in already_scoped: continue`) skips it — no
+                # double-add. Pinned by TestRunScopedVerificationReverse-
+                # DependencyGuards (test_verify_reverse_dep.py, task 2607
+                # step-9): orchestrator-test-only diffs don't trigger (the
+                # verify_plan `<pkg>/src/` gate), an escalation-in-diff task
+                # isn't double-widened (this union), and a no-map-entry
+                # package (e.g. dashboard) widens to nothing.
+                #
+                # Merge-only (amendment, review suggestion 4): every design
+                # decision above is framed as "merge-verify path" / "merge-
+                # path flake/cost surface" — the 3x recurrence this closes
+                # was always a merge-time escape, never a task-role dev-loop
+                # gap. Gating on role=='merge' leaves per-task verify
+                # latency for every orchestrator-source task unchanged; a
+                # task-role diff still gets its normal coverage plus the
+                # whole-tree main-tip sweep and hooks/project-checks'
+                # pyright reverse-dep backstops.
+                #
+                # `task_files` — the RAW, pre-existence-filter list, NOT
+                # `existing_files` — drives the trigger gate (amendment,
+                # review suggestion 2): a deleted/renamed orchestrator
+                # SOURCE path still counts as a trigger, since
+                # reverse_dependent_test_targets matches on path shape
+                # alone, never on-disk existence. See
+                # _reverse_dependency_module_configs' docstring for the
+                # residual gap this narrows but does not fully close (a
+                # diff with no surviving file under the task's own
+                # module_configs never reaches this call at all).
+                already_scoped = {mc.prefix for mc in scoped} | set(skipped)
+                widened = (
+                    _reverse_dependency_module_configs(
+                        task_files, config, worktree, already_scoped,
+                        content_cache=_content_cache,
+                    )
+                    if role == 'merge'
+                    else []
+                )
+                if widened:
+                    logger.info(
+                        'Verification scope: widening to %d reverse-dependent subproject(s): %s',
+                        len(widened), ', '.join(mc.prefix for mc in widened),
+                    )
+                    scoped = scoped + widened
             else:
                 scoped = module_configs
                 plan_dict = None

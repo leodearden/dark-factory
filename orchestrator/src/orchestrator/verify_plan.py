@@ -650,3 +650,111 @@ def derive_verify_plan(
             runs.extend(_derive_module_runs(mc, existing_files, worktree_reader))
         return VerifyPlan(runs=tuple(runs))
     return VerifyPlan(runs=tuple(_derive_fallback_runs(existing_files, config, worktree_reader)))
+
+
+# ---------------------------------------------------------------------------
+# Reverse-dependency test widening (task 2607)
+# ---------------------------------------------------------------------------
+#
+# Closes a merge-verify blind spot distinct from D1/D2 above: scoped verify
+# resolves module_configs from the TASK's own touched modules only, so an
+# orchestrator-only diff never considers escalation's ModuleConfig at all —
+# even though escalation/tests/test_server.py white-box-imports
+# orchestrator.merge_queue and can be broken by an orchestrator-source
+# change. This recurred 3x as a RED-main fix-forward (1736->1761,
+# 2173->2038, 2435->2604) before being structurally closed here. Mirrors the
+# hooks/project-checks reverse-dependency precedent (task 2551,
+# DEP_PACKAGES=(shared escalation) -> pyright in consumers), adapted to
+# pytest and import-scoped to the specific coupled test files rather than a
+# consumer's whole suite (bounding merge-path flake/cost surface).
+
+#: Minimal, hardcoded map of depended-upon package -> dependent packages whose
+#: tests are known to import it. A module constant (not operator-configurable)
+#: because the coupling is a structural fact of the codebase, mirroring
+#: hooks/project-checks' hardcoded DEP_PACKAGES. Extensible by one entry if
+#: another cross-package break class recurs.
+_REVERSE_TEST_DEPENDENTS: dict[str, frozenset[str]] = {
+    'orchestrator': frozenset({'escalation'}),
+}
+
+
+def _package_import_name(prefix: str) -> str:
+    """Map a package directory prefix to its Python import name (``'-' -> '_'``)."""
+    return prefix.replace('-', '_')
+
+
+def _imports_any(content: str | None, import_names: list[str]) -> bool:
+    """Return True when *content* has a top-level ``from``/``import`` of any of *import_names*.
+
+    The regex is anchored per-line (``re.MULTILINE``) but tolerates leading
+    whitespace, so a guarded/indented import — e.g. escalation/tests/
+    test_server.py's ``    try:\\n        from orchestrator.merge_queue
+    import ...`` — still matches. *content* of ``None`` (unreadable/missing
+    file) never matches, same as ``classify_file``'s STRUCTURAL detection
+    treats missing content as "simply not detected" rather than an error.
+    """
+    if content is None:
+        return False
+    return any(
+        re.search(rf'(?m)^\s*(from|import)\s+{re.escape(name)}\b', content)
+        for name in import_names
+    )
+
+
+def reverse_dependent_test_targets(
+    existing_files: list[str],
+    reverse_dep_map: dict[str, frozenset[str]],
+    list_pkg_tests: Callable[[str], list[str]],
+    read_content: Callable[[str], str | None],
+) -> list[tuple[str, list[str]]]:
+    """Which dependent packages' test files are coupled to *existing_files*' SOURCE changes.
+
+    Pure decision layer (task 2607): detects which depended-upon packages in
+    *reverse_dep_map* had a SOURCE file touched — a strict gate, a path
+    starting with ``'<pkg>/src/'`` AND ending in ``.py``, so a non-.py file
+    under ``<pkg>/src/`` (e.g. a stray data file) never triggers, and a path
+    under ``<pkg>/tests/`` or a bare ``<pkg>/orchestrator.yaml`` never does
+    either (only ``<pkg>/src/`` can defeat the ``/src/`` prefix check at
+    all). Only a real SOURCE change can break a dependent's import/attribute
+    contract; changes to the depended-upon package's own tests/config cannot.
+
+    For each triggered package, collects its dependents into a per-dependent
+    SET of triggering import names (``dependent_triggers``) — so a dependent
+    triggered by more than one changed depended-upon package (not reachable
+    with today's single-entry map, but preserved for extensibility) is
+    checked against the union of all their import names and contributes
+    exactly ONE ``(dependent, files)`` entry, never a duplicate — regardless
+    of how many of ITS depended-upon packages fired or how many of THEIR
+    files changed.
+
+    Via the injected *list_pkg_tests* (a dependent's collectable test files)
+    and *read_content* (that file's text) callables, keeps only the test
+    files that actually import one of the triggering packages. A dependent
+    with no importing test files is omitted entirely — never an empty-list
+    entry. Both the outer list (by dependent name) and each inner file list
+    are sorted for deterministic output.
+
+    *list_pkg_tests*/*read_content* are injected so this stays pure and
+    unit-testable — no filesystem, no subprocess — mirroring the
+    ``worktree_reader`` injection pattern ``derive_verify_plan`` already uses.
+    """
+    triggered_pkgs = [
+        pkg for pkg in reverse_dep_map
+        if any(f.startswith(f'{pkg}/src/') and f.endswith('.py') for f in existing_files)
+    ]
+
+    dependent_triggers: dict[str, set[str]] = {}
+    for pkg in triggered_pkgs:
+        for dependent in reverse_dep_map[pkg]:
+            dependent_triggers.setdefault(dependent, set()).add(pkg)
+
+    result: list[tuple[str, list[str]]] = []
+    for dependent in sorted(dependent_triggers):
+        import_names = [_package_import_name(pkg) for pkg in dependent_triggers[dependent]]
+        coupled = sorted(
+            f for f in list_pkg_tests(dependent)
+            if _imports_any(read_content(f), import_names)
+        )
+        if coupled:
+            result.append((dependent, coupled))
+    return result
