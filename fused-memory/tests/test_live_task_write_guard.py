@@ -492,6 +492,31 @@ class TestInterceptorUpdateTaskLifecycleGuard:
         assert finding.task_id == '1'
 
     @pytest.mark.asyncio
+    async def test_unrequested_status_change_invokes_filer(self, interceptor, taskmaster):
+        """update_task always calls the guard with requested_status=None — it
+        cannot legitimately change status itself (the SqliteTaskBackend
+        write-authority floor rejects non-None status writes via
+        update_task). So ANY observed status divergence during an
+        update_task write is unexpected and must fire, even with
+        claimant_run_id unchanged. Previously this was covered only at the
+        pure-detector level (TestDetectLifecycleReset); this exercises it at
+        the interceptor boundary."""
+        before = _live_claimant_before()
+        after = _flat(status='blocked', claimant_run_id=LIVE_CLAIMANT)
+        taskmaster.get_task = AsyncMock(side_effect=[before, after])
+        filer = AsyncMock()
+        interceptor.set_lifecycle_reset_filer(filer)
+
+        await interceptor.update_task('1', '/project', title='x', agent_id=RECON_AGENT_ID)
+
+        filer.assert_awaited_once()
+        assert filer.await_args is not None
+        finding = filer.await_args.args[0]
+        assert finding.flag_type == 'task_lifecycle_reset_detected'
+        assert 'status' in finding.diverged_fields
+        assert 'claimant_run_id' not in finding.diverged_fields
+
+    @pytest.mark.asyncio
     async def test_benign_after_state_does_not_invoke_filer(self, interceptor, taskmaster):
         """(c) a benign after-state (claimant unchanged) does NOT invoke the filer."""
         before = _live_claimant_before()
