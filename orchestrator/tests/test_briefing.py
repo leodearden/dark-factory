@@ -338,3 +338,32 @@ class TestPriorProposalAntiAnchor:
         )
         assert 'Root cause is a stale cache entry' in prompt
         assert 'prior block-time investigation' in prompt
+
+
+@pytest.mark.asyncio
+class TestRevalidationPriorProposal:
+    """Retry golden test.
+
+    ``build_revalidation_prompt`` is itself a retry path (blast-radius
+    requeue), so it always surfaces the prior proposal — no
+    ``include_prior_proposals`` gate needed, unlike ``build_architect_prompt``.
+    """
+
+    async def test_includes_proposal_with_provenance(
+        self, briefing: BriefingAssembler, task_with_proposal: dict,
+    ):
+        prompt = await briefing.build_revalidation_prompt(
+            task_with_proposal,
+            existing_plan={'files': ['orchestrator'], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        assert 'prior block-time investigation' in prompt
+        assert (
+            'Root cause is a stale cache entry; fix by invalidating on write.'
+            in prompt
+        )
+        assert 'medium' in prompt
+        assert 'orchestrator/x.py' in prompt
+        assert '2026-07-13T10:00:00+00:00' in prompt
