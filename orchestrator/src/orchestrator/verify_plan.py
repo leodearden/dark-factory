@@ -710,17 +710,29 @@ def reverse_dependent_test_targets(
     """Which dependent packages' test files are coupled to *existing_files*' SOURCE changes.
 
     Pure decision layer (task 2607): detects which depended-upon packages in
-    *reverse_dep_map* had a source file touched (a path starting with
-    ``'<pkg>/src/'``), collects their dependents, and — via the injected
-    *list_pkg_tests* (a dependent's collectable test files) and *read_content*
-    (that file's text) callables — keeps only the test files that actually
-    import the changed package. A dependent triggered by more than one
-    changed depended-upon package is checked against the union of all their
-    import names, and contributes exactly one ``(dependent, files)`` entry
-    regardless of how many of ITS depended-upon packages fired or how many of
-    THEIR files changed. A dependent with no importing test files is omitted
-    entirely (never an empty-list entry). Both the outer list (by dependent
-    name) and each inner file list are sorted for deterministic output.
+    *reverse_dep_map* had a SOURCE file touched — a strict gate, a path
+    starting with ``'<pkg>/src/'`` AND ending in ``.py``, so a non-.py file
+    under ``<pkg>/src/`` (e.g. a stray data file) never triggers, and a path
+    under ``<pkg>/tests/`` or a bare ``<pkg>/orchestrator.yaml`` never does
+    either (only ``<pkg>/src/`` can defeat the ``/src/`` prefix check at
+    all). Only a real SOURCE change can break a dependent's import/attribute
+    contract; changes to the depended-upon package's own tests/config cannot.
+
+    For each triggered package, collects its dependents into a per-dependent
+    SET of triggering import names (``dependent_triggers``) — so a dependent
+    triggered by more than one changed depended-upon package (not reachable
+    with today's single-entry map, but preserved for extensibility) is
+    checked against the union of all their import names and contributes
+    exactly ONE ``(dependent, files)`` entry, never a duplicate — regardless
+    of how many of ITS depended-upon packages fired or how many of THEIR
+    files changed.
+
+    Via the injected *list_pkg_tests* (a dependent's collectable test files)
+    and *read_content* (that file's text) callables, keeps only the test
+    files that actually import one of the triggering packages. A dependent
+    with no importing test files is omitted entirely — never an empty-list
+    entry. Both the outer list (by dependent name) and each inner file list
+    are sorted for deterministic output.
 
     *list_pkg_tests*/*read_content* are injected so this stays pure and
     unit-testable — no filesystem, no subprocess — mirroring the
@@ -728,7 +740,7 @@ def reverse_dependent_test_targets(
     """
     triggered_pkgs = [
         pkg for pkg in reverse_dep_map
-        if any(f.startswith(f'{pkg}/src/') for f in existing_files)
+        if any(f.startswith(f'{pkg}/src/') and f.endswith('.py') for f in existing_files)
     ]
 
     dependent_triggers: dict[str, set[str]] = {}
