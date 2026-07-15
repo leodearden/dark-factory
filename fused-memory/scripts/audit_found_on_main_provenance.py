@@ -222,8 +222,18 @@ def classify(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
             reasons.append(f'declared file(s) missing from the ref HEAD: {missing}')
         return 'reverted', reasons
 
-    # TODO(step-12): deliverable_absent / unverifiable are not yet
-    # distinguished from this interim fallback.
+    if audit.declared_files and not any(f in audit.commit_files for f in audit.declared_files):
+        return 'deliverable_absent', [
+            f'none of the declared file(s) {sorted(audit.declared_files)} appear in the '
+            f'cited commit\'s diff',
+        ]
+
+    if not audit.declared_files and audit.task_id not in cited:
+        return 'unverifiable', [
+            'no declared files and the commit message does not cite this task — '
+            'nothing to verify the found_on_main claim against',
+        ]
+
     return 'ok', []
 
 
