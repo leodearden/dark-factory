@@ -591,6 +591,7 @@ class TestWriteTaskCountSnapshot:
     @pytest.mark.asyncio
     async def test_success_writes_once_and_returns_true(self):
         memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
         memory_service.add_memory.return_value = {'memory_ids': ['m1']}
         taskmaster = self._taskmaster()
 
@@ -624,6 +625,7 @@ class TestWriteTaskCountSnapshot:
     @pytest.mark.asyncio
     async def test_add_memory_failure_returns_none_not_raise(self):
         memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
         memory_service.add_memory.side_effect = RuntimeError('mem0 down')
         taskmaster = self._taskmaster()
 
@@ -642,7 +644,76 @@ class TestWriteTaskCountSnapshot:
         )
 
         assert result is None
+        # Guard: never delete existing snapshots without a replacement in
+        # hand -- the taskmaster=None early-return must precede the prune.
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+        memory_service.delete_memory.assert_not_awaited()
         memory_service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prunes_existing_snapshots_before_writing(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {
+                'id': 'stale-1',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'kind': 'task_count_snapshot'},
+            },
+            {
+                'id': 'stale-2',
+                'created_at': '2026-07-02T00:00:00+00:00',
+                'metadata': {'kind': 'task_count_snapshot'},
+            },
+        ]
+        memory_service.delete_memory.return_value = None
+        memory_service.add_memory.return_value = {'memory_ids': ['fresh-1']}
+        taskmaster = self._taskmaster()
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+        )
+
+        assert result is True
+        # Both stale ids pruned...
+        assert memory_service.delete_memory.await_count == 2
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'stale-1', 'stale-2'}
+        # ...and exactly one canonical snapshot written -- net one survivor.
+        memory_service.add_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_prune_runs_before_write_not_after(self):
+        """A regression that writes-then-prunes must fail this ordering check."""
+        call_order = []
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {
+                'id': 'stale-1',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'kind': 'task_count_snapshot'},
+            },
+        ]
+
+        async def _delete(*args, **kwargs):
+            call_order.append('delete_memory')
+            return None
+
+        async def _add(*args, **kwargs):
+            call_order.append('add_memory')
+            return {'memory_ids': ['fresh-1']}
+
+        memory_service.delete_memory.side_effect = _delete
+        memory_service.add_memory.side_effect = _add
+        taskmaster = self._taskmaster()
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+        )
+
+        assert result is True
+        assert call_order == ['delete_memory', 'add_memory']
 
 
 # ---------------------------------------------------------------------------
