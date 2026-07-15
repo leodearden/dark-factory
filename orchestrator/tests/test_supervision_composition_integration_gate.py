@@ -337,3 +337,27 @@ class TestD1SelfRestartDeployCrash:
         assert truth_report.deploy_phase == DeployPhase.RAN
         assert action == RecoveryAction.RE_FILE_ESCALATION
         assert action != RecoveryAction.MARK_DONE_WITH_PROVENANCE
+
+
+# ---------------------------------------------------------------------------
+# step-3/4 — D1b/R4: RestartPlan x DeployState. A real cross-unit blocking
+# verify passes (DEPLOYED_AND_VERIFIED — RP-2/RP-5), and the real DeployState
+# chain advances RAN->VERIFIED->DONE, every edge _LEGAL (the escalation_sink
+# is never invoked).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestD1CrossUnitVerifyToDone:
+    """D1b/R4 composition cell."""
+
+    async def test_cross_unit_verify_then_verified_to_done(self) -> None:
+        from orchestrator.proc_supervision import RestartDisposition
+        from shared.deploy_state import DeployPhase
+
+        restart_outcome, final_phase, sink_calls = await _cross_unit_verify_then_advance_to_done()
+
+        assert restart_outcome.disposition == RestartDisposition.DEPLOYED_AND_VERIFIED
+        assert restart_outcome.escalated is False
+        assert final_phase == DeployPhase.DONE
+        assert sink_calls == []
