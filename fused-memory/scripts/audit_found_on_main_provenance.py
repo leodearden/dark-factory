@@ -252,25 +252,142 @@ def classify(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
 # ---------------------------------------------------------------------------
 
 async def _git_show_files(project_root: str, commit: str) -> list[str]:
-    raise NotImplementedError
+    """Return the list of files in a commit diff, or [] on failure.
+
+    Reuses the exact shape of invalidate_fabricated_shipping_edges.py's
+    helper of the same name.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'git', '-C', project_root, 'show', '--name-only', '--format=', commit,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except TimeoutError:
+            proc.kill()
+            return []
+    except FileNotFoundError:
+        return []
+    if proc.returncode != 0:
+        return []
+    return [
+        ln.strip() for ln in stdout.decode('utf-8', errors='replace').splitlines()
+        if ln.strip()
+    ]
 
 
 async def _git_is_ancestor(project_root: str, commit: str, ref: str) -> bool:
-    raise NotImplementedError
+    """Return True iff *commit* is reachable from *ref*.
+
+    Mirrors ``orchestrator.git_ops.GitOps.is_ancestor``'s rc==0 check over
+    ``git merge-base --is-ancestor``. Any failure to confirm ancestry —
+    unrelated commit, invalid object, missing git binary, or a timeout —
+    degrades to False rather than raising. False is the conservative
+    default here: it feeds classify()'s highest-precedence verdict
+    (``commit_not_on_main``), so "couldn't confirm" and "confirmed not an
+    ancestor" both surface as the loud outcome rather than silently passing.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'git', '-C', project_root, 'merge-base', '--is-ancestor', commit, ref,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except TimeoutError:
+            proc.kill()
+            return False
+    except FileNotFoundError:
+        return False
+    return proc.returncode == 0
 
 
 async def _git_find_revert(project_root: str, commit: str, ref: str) -> str | None:
-    raise NotImplementedError
+    """Return the sha of the commit on *ref* that reverted *commit*, or None.
+
+    Searches ``git log <commit>..<ref>`` (commits reachable from *ref* but
+    not from *commit* — i.e. everything that landed afterward) for the
+    canonical ``This reverts commit <full-sha>`` trailer ``git revert``
+    writes. Returns the newest match (git log's default order) when found;
+    None on no match or any git failure.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'git', '-C', project_root, 'log', f'{commit}..{ref}',
+            f'--grep=This reverts commit {commit}', '--format=%H',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except TimeoutError:
+            proc.kill()
+            return None
+    except FileNotFoundError:
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = [
+        ln.strip() for ln in stdout.decode('utf-8', errors='replace').splitlines()
+        if ln.strip()
+    ]
+    return lines[0] if lines else None
 
 
 async def _git_files_missing_on_ref(
     project_root: str, files: list[str], ref: str,
 ) -> list[str]:
-    raise NotImplementedError
+    """Return the subset of *files* that do NOT exist at *ref*'s HEAD.
+
+    Checks each path individually via ``git cat-file -e <ref>:<path>``
+    (rc==0 means it exists). A git-invocation failure (timeout / missing
+    binary) for a given path is treated as "missing" — the conservative
+    choice, since this signal feeds the ``reverted`` verdict and an infra
+    hiccup should not silently mask a real absence.
+    """
+    missing: list[str] = []
+    for path in files:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'git', '-C', project_root, 'cat-file', '-e', f'{ref}:{path}',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            except TimeoutError:
+                proc.kill()
+                missing.append(path)
+                continue
+        except FileNotFoundError:
+            missing.append(path)
+            continue
+        if proc.returncode != 0:
+            missing.append(path)
+    return missing
 
 
 async def _git_commit_message(project_root: str, commit: str) -> str:
-    raise NotImplementedError
+    """Return the full raw commit message (subject + body) for *commit*, or '' on failure."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'git', '-C', project_root, 'show', '-s', '--format=%B', commit,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except TimeoutError:
+            proc.kill()
+            return ''
+    except FileNotFoundError:
+        return ''
+    if proc.returncode != 0:
+        return ''
+    return stdout.decode('utf-8', errors='replace').strip()
 
 
 class GitFacts:
@@ -288,7 +405,18 @@ class GitFacts:
     async def gather(
         self, commit: str, ref: str, declared_files: list[str],
     ) -> dict[str, Any]:
-        raise NotImplementedError
+        """Gather every git fact :func:`classify` needs about *commit* vs *ref*."""
+        message = await _git_commit_message(self.project_root, commit)
+        return {
+            'is_ancestor': await _git_is_ancestor(self.project_root, commit, ref),
+            'commit_subject': message.splitlines()[0] if message else '',
+            'commit_message': message,
+            'commit_files': await _git_show_files(self.project_root, commit),
+            'revert_commit': await _git_find_revert(self.project_root, commit, ref),
+            'declared_files_missing_on_main': await _git_files_missing_on_ref(
+                self.project_root, declared_files, ref,
+            ),
+        }
 
 
 # ---------------------------------------------------------------------------
