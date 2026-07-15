@@ -431,6 +431,38 @@ class TestD1CrossUnitVerifyToDone:
 # ---------------------------------------------------------------------------
 
 
+async def _execute_unset_own_unit_blocking(tmp_queue_dir: Path, task_id: str):
+    """R3 driver: own_unit=None (ORCH_UNIT unset — cannot prove target_unit
+    != own_unit) + verify set -> RP-1 fail-closed REFUSE, escalated via the
+    real EscalationQueue, with zero runner/inspector calls (the 2064
+    self-kill guard). Returns (outcome, runner)."""
+    from orchestrator.proc_supervision import EscalationSpec, FreshPidVerify, RestartPlan
+
+    runner = FakeRunner(returncode=0)
+    inspector = make_fake_inspector({
+        'MainPID': 99, 'ActiveState': 'active', 'ActiveEnterTimestampMonotonic': 2000,
+    })
+    plan = RestartPlan(
+        script=Path('/proj/scripts/deploy.sh'),
+        args=[],
+        cwd=Path('/proj'),
+        target_unit='some-target.service',
+        own_unit=None,
+        on_failure_escalation=EscalationSpec(
+            queue_dir=str(tmp_queue_dir),
+            task_id=task_id,
+            summary='Cannot verify own unit before blocking restart',
+        ),
+        verify=FreshPidVerify(
+            baseline_active_enter_monotonic=1000,
+            baseline_main_pid=42,
+            inspect_timeout_secs=10.0,
+        ),
+    )
+    outcome = await plan.execute(runner=runner, inspector=inspector)
+    return outcome, runner
+
+
 @pytest.mark.asyncio
 class TestR3SelfKillRefusal:
     """R3 composition cell (the 2064 bug)."""
