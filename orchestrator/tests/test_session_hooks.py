@@ -31,35 +31,18 @@ _HOOKS_DIR = _REPO_ROOT / 'skills' / 'spawn' / 'hooks'
 
 @pytest.fixture(autouse=True)
 def _clear_claude_spawn_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Hermetic isolation from the REAL process environment (Task 2643).
+    """Isolate tests from the REAL process environment (Task 2643).
 
-    sh.main(...) reads env = os.environ directly (not an injectable
-    parameter), so when this suite runs inside a fleet-spawned Claude Code
-    session, a real CLAUDE_SPAWN_SESSION_ID leaks in and
-    hook_session_slug prefers it over the stdin session_id these tests
-    assert on -- the hook then writes its registry record at a different
-    slug than the test reads, raising FileNotFoundError. Clearing the
-    CLAUDE_SPAWN_* vars that spawn-claude.sh actually injects into a
-    spawned session's environment (see the amendment paragraph below for
-    the precise accounting) makes this file hermetic against that
-    launching context; tests that need a specific CLAUDE_SPAWN_* value
-    still set it explicitly via an env= mapping or monkeypatch.setenv,
-    which is unaffected by this fixture running first.
-
-    Reviewer follow-up (amendment pass): skills/spawn/spawn-claude.sh's
-    `inner` payload (the actual env of a spawned claude process) splices in
-    exactly four vars -- SESSION_ID, PARENT_ID, RESULT_FILE, WM_TITLE (see
-    spawn_id_export/parent_id_export/result_export/wm_title_export). The
-    first pass cleared three of the four; CLAUDE_SPAWN_PARENT_ID was
-    missing, which _resolve_parent_session_id (session_hooks.py) reads and
-    stamps onto record.parent_session_id via the main() path -- no current
-    main()-path test asserts on it, but a future one would flake under a
-    fleet-spawned launch exactly like the SESSION_ID gap this fixture
-    exists to close. Also clearing LAUNCHER_PID/TITLE for defense-in-depth:
-    session_hooks.py reads both, but spawn-claude.sh does not currently
-    splice either into `inner` (they only flow into the short-lived
-    `python3 ... launching` registry-write subprocess), so today these two
-    are inert no-ops -- kept as a hedge against that changing later.
+    sh.main(...) reads env=os.environ directly, so a real
+    CLAUDE_SPAWN_SESSION_ID leaking in from a fleet-spawned launching
+    context would make hook_session_slug prefer it over the stdin
+    session_id these tests assert on, writing the registry record at a
+    different slug than the test reads. Clears the CLAUDE_SPAWN_* vars
+    spawn-claude.sh sets (see that script for exactly which ones it
+    splices into a spawned session's real env) so this file is hermetic
+    regardless of launching context; tests needing a specific value still
+    set it explicitly via an env= mapping or monkeypatch.setenv, unaffected
+    by this fixture running first.
     """
     monkeypatch.delenv('CLAUDE_SPAWN_SESSION_ID', raising=False)
     monkeypatch.delenv('CLAUDE_SPAWN_WM_TITLE', raising=False)
@@ -67,6 +50,7 @@ def _clear_claude_spawn_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv('CLAUDE_SPAWN_PARENT_ID', raising=False)
     monkeypatch.delenv('CLAUDE_SPAWN_LAUNCHER_PID', raising=False)
     monkeypatch.delenv('CLAUDE_SPAWN_TITLE', raising=False)
+    monkeypatch.delenv('CLAUDE_SPAWN_PROMPT', raising=False)
 
 
 # ---------------------------------------------------------------------------
