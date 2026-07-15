@@ -4409,6 +4409,13 @@ class TestConfigTestExtras:
 
         assert _config_test_extras('uv run --extra=dev pytest') == ['--extra', 'dev']
 
+    def test_extracts_mixed_space_and_equals_form_flags(self):
+        """A command mixing `--extra dev` (space form) and `--extra=web` (equals form) carries both."""
+        from orchestrator.verify import _config_test_extras
+
+        result = _config_test_extras('uv run --extra dev --extra=web pytest')
+        assert result == ['--extra', 'dev', '--extra', 'web']
+
     def test_no_extras_returns_empty_list(self):
         from orchestrator.verify import _config_test_extras
 
@@ -4425,6 +4432,12 @@ class TestConfigTestExtras:
         from orchestrator.verify import _config_test_extras
 
         assert _config_test_extras('uv run --extra "dev pytest') == []
+
+    def test_dangling_extra_flag_with_no_value_is_dropped(self):
+        """A trailing `--extra` with no following token is silently dropped, not an IndexError."""
+        from orchestrator.verify import _config_test_extras
+
+        assert _config_test_extras('uv run pytest --extra') == []
 
 
 class TestBuildFallbackConfigSubprojectScoped:
