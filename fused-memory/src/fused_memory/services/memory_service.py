@@ -313,6 +313,38 @@ def _cycle_summary_run_id_backfill(meta: dict, causation_id: str | None) -> str 
     return None
 
 
+def _normalize_task_id_metadata(meta: dict) -> None:
+    """Coerce ``meta['task_id']`` to ``str`` in place, when present and non-None.
+
+    Shared by add_memory and add_system_record (task 2620 amendment, closing
+    a gap flagged in the task-2620 review — add_system_record is a parallel
+    Mem0-only write path sharing add_memory's exact-match read filters, so a
+    task_id-keyed marker written through it needs the same treatment) so
+    every write path that can carry a task_id-keyed marker gets the same
+    handling: count_memories_by_metadata/get_memories_by_metadata filters are
+    exact-match, and the project-wide convention is a string task_id
+    (recon_ledger's task_id column is TEXT; every reader queries with
+    str(task_id)) — an int-typed value silently false-negatives against that
+    filter, making the write invisible to its own gate (e.g. the
+    stage2_suppress completion-guard). Coercing here, once, for every caller
+    closes the bug class instead of relying on each LLM-prompt-driven writer
+    to remember the convention (task 2620, sibling of task 2454's
+    flag_dedup-specific fix).
+
+    Assumes a scalar (int/str) task_id, matching today's single-task-id
+    write convention on this path. A list/tuple value would str()-coerce to
+    a Python repr (e.g. ``'[5040, 5149]'``), not a filter-compatible
+    canonical form — unlike ``server/recon_report._canonicalize_task_id_string``'s
+    comma-joined-string canonicalization used elsewhere for multi-task dedup
+    signatures. No current caller passes a non-scalar task_id on this path;
+    if one ever does, canonicalize consistently with that helper instead of
+    relying on this bare ``str()`` (task-2620 review, noted as a latent edge
+    case rather than a live defect).
+    """
+    if 'task_id' in meta and meta['task_id'] is not None:
+        meta['task_id'] = str(meta['task_id'])
+
+
 def _apply_cycle_summary_metadata_tagging(
     meta: dict,
     causation_id: str | None,
@@ -1952,17 +1984,11 @@ class MemoryService:
         meta['category'] = resolved_category.value
 
         # Normalize metadata.task_id to str at this shared write boundary
-        # (task 2620, sibling of task 2454's flag_dedup-specific fix).
-        # count_memories_by_metadata/get_memories_by_metadata filters are
-        # exact-match, and the project-wide convention is a string task_id
-        # (recon_ledger's task_id column is TEXT; every reader queries with
-        # str(task_id)) — an int-typed value silently false-negatives against
-        # that filter, making the write invisible to its own gate (e.g. the
-        # stage2_suppress completion-guard). Coercing here, once, for every
-        # add_memory caller/category closes the bug class instead of relying
-        # on each LLM-prompt-driven writer to remember the convention.
-        if 'task_id' in meta and meta['task_id'] is not None:
-            meta['task_id'] = str(meta['task_id'])
+        # (task 2620, sibling of task 2454's flag_dedup-specific fix; shared
+        # with add_system_record below per the task-2620 amendment review —
+        # see _normalize_task_id_metadata's docstring for the full
+        # rationale).
+        _normalize_task_id_metadata(meta)
 
         # Server-side cycle_summary metadata tagging (recon_pool auto-tag
         # task 2077, run_id auto-backfill task 2109, missing-key warning
@@ -2122,6 +2148,13 @@ class MemoryService:
 
         meta = dict(metadata or {})
         meta['category'] = resolved_category.value
+
+        # Same task_id normalization add_memory applies (task 2620 amendment
+        # review): this Mem0-only path shares add_memory's exact-match read
+        # filters (count_memories_by_metadata/get_memories_by_metadata), so
+        # a task_id-keyed marker written here needs the same str convention.
+        # See _normalize_task_id_metadata's docstring for the full rationale.
+        _normalize_task_id_metadata(meta)
 
         # Same authoritative cycle_summary tagging add_memory applies (task
         # 2222 amendment): the tool docstring names the cycle-summary Mem0

@@ -635,6 +635,50 @@ class TestAddSystemRecord:
         assert call_kwargs['success'] is True
         assert call_kwargs['error'] is None
 
+    # -- Amendment (task 2620 review): same task_id normalization as add_memory --
+
+    @pytest.mark.asyncio
+    async def test_int_task_id_normalized_to_str(self, service):
+        """metadata.task_id must persist as str even when passed as int (task 2620
+        amendment). add_system_record shares add_memory's exact-match read filters
+        (count_memories_by_metadata/get_memories_by_metadata), so a task_id-keyed
+        system record must not silently miss its own gate just because it bypassed
+        add_memory."""
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+
+        await service.add_system_record(
+            content='cycle summary',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            category='observations_and_summaries',
+            metadata={'kind': 'cycle_summary', 'run_id': 'r1', 'task_id': 2614},
+            causation_id='c1',
+        )
+
+        assert service.mem0.add_system_record.await_args is not None
+        call_kwargs = service.mem0.add_system_record.await_args.kwargs
+        assert call_kwargs['metadata']['task_id'] == '2614'
+        assert isinstance(call_kwargs['metadata']['task_id'], str)
+
+    @pytest.mark.asyncio
+    async def test_str_task_id_unaffected_add_system_record(self, service):
+        """An already-string task_id passes through unchanged (task 2620 amendment)."""
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+
+        await service.add_system_record(
+            content='cycle summary',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            category='observations_and_summaries',
+            metadata={'kind': 'cycle_summary', 'run_id': 'r1', 'task_id': '2614'},
+            causation_id='c1',
+        )
+
+        assert service.mem0.add_system_record.await_args is not None
+        call_kwargs = service.mem0.add_system_record.await_args.kwargs
+        assert call_kwargs['metadata']['task_id'] == '2614'
+        assert isinstance(call_kwargs['metadata']['task_id'], str)
+
 
 class TestAddEpisode:
     @pytest.mark.asyncio
@@ -6828,6 +6872,47 @@ class TestCycleSummaryRunIdBackfillHelper:
         from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
         meta = {'kind': 'note'}
         assert _cycle_summary_run_id_backfill(meta, 'run-b') is None
+
+
+# ---------------------------------------------------------------------------
+# Task 2620 amendment: _normalize_task_id_metadata helper tests (extracted
+# shared helper, sibling of _apply_cycle_summary_metadata_tagging above)
+# ---------------------------------------------------------------------------
+
+class TestNormalizeTaskIdMetadata:
+    """Module-level _normalize_task_id_metadata helper (task 2620 amendment).
+
+    Extracted from add_memory's inline task_id coercion so add_system_record
+    (a parallel Mem0-only write path sharing the same exact-match read
+    filters) gets identical treatment — see _normalize_task_id_metadata's
+    docstring for the full false-negative rationale.
+    """
+
+    def test_int_task_id_normalized_to_str(self):
+        from fused_memory.services.memory_service import _normalize_task_id_metadata
+        meta = {'task_id': 2614}
+        _normalize_task_id_metadata(meta)
+        assert meta['task_id'] == '2614'
+
+    def test_str_task_id_unaffected(self):
+        from fused_memory.services.memory_service import _normalize_task_id_metadata
+        meta = {'task_id': '2614'}
+        _normalize_task_id_metadata(meta)
+        assert meta['task_id'] == '2614'
+
+    def test_missing_task_id_key_unaffected(self):
+        from fused_memory.services.memory_service import _normalize_task_id_metadata
+        meta = {'other_key': 'value'}
+        _normalize_task_id_metadata(meta)
+        assert 'task_id' not in meta
+
+    def test_none_task_id_value_unaffected(self):
+        """A present-but-None task_id (distinct from a missing key) must not
+        be coerced to the string 'None'."""
+        from fused_memory.services.memory_service import _normalize_task_id_metadata
+        meta = {'task_id': None}
+        _normalize_task_id_metadata(meta)
+        assert meta['task_id'] is None
 
 
 class TestReconPoolAutoTagInjection:
