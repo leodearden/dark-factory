@@ -92,8 +92,13 @@ max_turns:
 # multi-account failover landed — with Anthropic's per-account caps as the
 # real spend governor, the orch-level dollar guard just trips during normal
 # operation. Raised to effectively-disabled. The watcher ceiling
-# (watcher_daily_cost_ceiling_usd, default $50) is left at its default for now.
+# (watcher_daily_cost_ceiling_usd, default $50) was tripping on the L1
+# auto-watcher's normal ~$50/24h Opus burn (esc-__scheduler__-4, 2026-07-14 —
+# 28 opus invocations = $50.34), pausing dispatch. Raised to $150 to give
+# ~3 days of headroom while keeping an early-warning guard well below the
+# orch-wide net.
 orch_daily_cost_ceiling_usd: 10000.0
+watcher_daily_cost_ceiling_usd: 150.0
 
 # Usage cap / multi-account failover
 usage_cap:
