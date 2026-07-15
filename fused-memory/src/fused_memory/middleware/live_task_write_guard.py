@@ -31,6 +31,23 @@ Design notes
 - Filing is best-effort: a filer/after-read exception is logged and never
   breaks the underlying task write, which has already succeeded by the time
   the after-read/detect/file sequence runs.
+- Detection window: the before-read, ``do_write``, and after-read all run
+  while the caller holds ``TaskInterceptor._write_lock(project_id)`` (see
+  the ``update_task`` and ``_apply_status_transition`` call sites), so a
+  single guarded write is fully serialized against any *other* write that
+  also takes that same per-project lock — such a same-process,
+  lock-respecting writer cannot land between the before- and after-read.
+  This is not a gap for the incident this backstop targets: the
+  incident-2588 un-claim class is ``TaskInterceptor.set_task_claimant``
+  (used for stranded-task release and the periodic heartbeat refresh),
+  which by design takes NO write-lock at all (see its own docstring —
+  "mirrors get_statuses: no write-lock"). It, and any genuinely
+  out-of-process writer (a second server instance, a direct backend
+  write), therefore freely interleaves with a guarded write's window and
+  remains observable. A hypothetical same-process writer that *does* take
+  ``_write_lock`` for the same task during a guarded write's window would
+  queue behind it instead of interleaving — that narrower case is outside
+  what a single guarded write can observe.
 """
 
 from __future__ import annotations
@@ -191,12 +208,10 @@ def detect_lifecycle_reset(
     if heartbeat_changed and not requested_heartbeat_write:
         diverged.append('heartbeat_at')
 
-    description = (
-        f'Unexpected lifecycle divergence on task {task_id!r} during recon-stage '
-        f'{op!r} write: before={before_snapshot!r} after={after_snapshot!r} '
-        f'diverged_fields={tuple(diverged)!r}.'
-    )
-
+    # description is intentionally left at the dataclass default here: the
+    # only consumer (server/recon_lifecycle_filer.py's _describe) builds its
+    # own description from before/after/diverged_fields, so computing one
+    # here too would be a dead, drift-prone duplicate (task 2624 amendment).
     return LifecycleResetFinding(
         task_id=task_id,
         project_id=project_id,
@@ -204,7 +219,6 @@ def detect_lifecycle_reset(
         before=before_snapshot,
         after=after_snapshot,
         diverged_fields=tuple(diverged),
-        description=description,
     )
 
 
