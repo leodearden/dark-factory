@@ -715,6 +715,49 @@ class TestWriteTaskCountSnapshot:
         assert result is True
         assert call_order == ['delete_memory', 'add_memory']
 
+    @pytest.mark.asyncio
+    async def test_add_memory_failure_after_successful_prune_returns_none(self):
+        """Pins the accepted zero-snapshot window (task 2429 review).
+
+        If the prune deletes existing snapshots but the subsequent
+        ``add_memory`` then fails, this cycle leaves zero
+        ``task_count_snapshot`` records for the project until the next
+        cycle's write succeeds -- an accepted, self-correcting trade-off
+        (see the docstring note on ``_write_task_count_snapshot``), not an
+        oversight. This test pins that intended post-condition so it can't
+        silently regress into something else unnoticed.
+        """
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {
+                'id': 'stale-1',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'kind': 'task_count_snapshot'},
+            },
+            {
+                'id': 'stale-2',
+                'created_at': '2026-07-02T00:00:00+00:00',
+                'metadata': {'kind': 'task_count_snapshot'},
+            },
+        ]
+        memory_service.delete_memory.return_value = None
+        memory_service.add_memory.side_effect = RuntimeError('mem0 down')
+        taskmaster = self._taskmaster()
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+        )
+
+        assert result is None
+        # The prune still ran (and "succeeded") before the write failed --
+        # both stale ids were deleted, leaving zero snapshots this cycle.
+        assert memory_service.delete_memory.await_count == 2
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'stale-1', 'stale-2'}
+        memory_service.add_memory.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # TaskKnowledgeSync.run() wiring — report.stats['task_count_snapshot_written']

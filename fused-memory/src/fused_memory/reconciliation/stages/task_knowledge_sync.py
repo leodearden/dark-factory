@@ -1053,6 +1053,15 @@ async def _prune_task_count_snapshots(
     including LLM-authored duplicates — so the caller's subsequent
     ``add_memory`` leaves exactly one canonical snapshot.
 
+    Multi-cycle convergence on a large backlog (task 2429 review): when the
+    existing backlog exceeds *scroll_limit* records — precisely the
+    accumulation this change targets — only the first *scroll_limit*
+    matches are pruned in a given cycle (see the saturation WARNING
+    below); the remainder drains at up to *scroll_limit* per subsequent
+    cycle rather than being fully pruned in one run. This is an accepted
+    trade-off, not a bug: it is loudly logged (no silent truncation) and
+    strictly improves on the unbounded pre-2429 accumulation either way.
+
     Best-effort and never raises: an enumeration failure or a per-item
     delete failure degrades to a WARNING log and is excluded from the
     returned count, rather than aborting the caller's write.
@@ -1161,6 +1170,24 @@ async def _write_task_count_snapshot(
     a skipped/failed fetch never deletes existing snapshots without a
     replacement in hand; the prune helper is itself best-effort and never
     raises, so a prune failure cannot abort this write.
+
+    Accepted zero-snapshot window (task 2429 review): if the prune
+    succeeds but the subsequent ``add_memory`` call itself then fails
+    (e.g. a transient mem0 outage), this cycle deletes the prior
+    snapshot(s) without landing a replacement, leaving zero
+    ``task_count_snapshot`` records until the next cycle's write
+    succeeds. This is an accepted, self-correcting trade-off rather than
+    an oversight: the alternative (write-then-prune-all-but-the-just-
+    written-id) avoids the window but must exclude the just-written id
+    under Qdrant scroll eventual-consistency, which is more complex and
+    race-prone for no material safety gain (see the task 2429 plan's
+    design decisions). The window is also no worse than today's
+    escalation path — a failed write already makes
+    ``_verify_task_count_snapshot_written`` return ``None``
+    (inconclusive) rather than a confirmed miss, so it cannot spuriously
+    grow the consecutive-miss streak that drives the stale-snapshot
+    escalation. Pinned by
+    ``test_add_memory_failure_after_successful_prune_returns_none``.
 
     Counts are derived by self-fetching via ``taskmaster.get_tasks`` and
     filtering with :func:`filter_task_tree` — mirroring
