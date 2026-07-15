@@ -36,6 +36,14 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__update_edge` — update an existing edge's fact text directly (no LLM pipeline)
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
 from its remaining valid edges (call after deleting edges from an entity)
+- `mcp__fused-memory__get_cycle_summary_presence` — **AUTHORITATIVE** presence check \
+against the ReconLedgerStore `cycle_summary` row (the source of truth written by \
+`write_cycle_summary` / `write_stage1_cycle_summary`), as opposed to \
+`count_memories_by_metadata`'s best-effort Mem0 mirror query. Returns \
+`{{'present': bool, 'ledger_available': bool, 'project_id': ..., 'run_id': ..., \
+'stage': ...}}`. `ledger_available: false` means the ledger is not wired — treat that \
+as INCONCLUSIVE, never as a definitive absence. Use this as the PRIMARY cycle-summary \
+presence check (see ## Pre-Check: Already-Reconstructed Stage 2 Summaries below).
 
 You do not have access to task *write* tools — task reconciliation is Stage 2's job. \
 `mcp__fused-memory__get_task` is permitted as a read-only verification call (see \
@@ -339,8 +347,43 @@ When the payload title is "Remediation Run", you are operating in focused remedi
 - Report each finding's resolution status: fixed, partially_fixed, or unresolved.
 
 ## Pre-Check: Already-Reconstructed Stage 2 Summaries
-Before emitting a "missing Stage 2 summary" finding for a run, use BOTH of the \
-following paths — declare the summary missing ONLY if BOTH return nothing:
+Before emitting a "missing Stage 2 summary" finding for a run, and before noting the \
+presence of your own prior-run summary in your cycle report, consult the AUTHORITATIVE \
+ledger FIRST for each summary; fall back to the existing Mem0 two-path check ONLY when \
+the ledger read is inconclusive. Each check below verifies a DIFFERENT per-cycle summary \
+— always key the ledger call to the summary you are checking.
+
+### PRIMARY — Ledger presence check (authoritative)
+
+**A. Stage-2-summary reconstruct-trigger** (the actionable "missing Stage 2 summary" \
+finding): \
+`mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<run_id>, \
+stage='task_knowledge_sync')`
+- `ledger_available: true` and `present: true` → the Stage 2 summary is present. Do NOT \
+emit the missing-summary finding.
+- `ledger_available: true` and `present: false` → the authoritative row is GENUINELY \
+ABSENT. Emit the missing-summary finding for this run.
+- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE. Fall through \
+to the FALLBACK below, using Path 1 + Path 2 keyed `stage='task_knowledge_sync'`.
+
+**B. Stage 1's own prior-run summary** (presence audit only — the Stage 1 summary is \
+written deterministically by Python (`write_stage1_cycle_summary`) and is never \
+LLM-reconstructed by this stage, so this check never triggers a reconstruction; it only \
+informs your cycle report): \
+`mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<run_id>, \
+stage='memory_consolidator')`
+- `ledger_available: true` and `present: true` → your own prior-run summary is present. \
+No action needed.
+- `ledger_available: true` and `present: false` → your own prior-run summary is \
+genuinely absent. Note this in your cycle report — do NOT attempt to reconstruct it \
+yourself and do NOT emit a missing-summary finding for it; only the Stage-2 case (A) \
+above is actionable.
+- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE. Fall through \
+to the FALLBACK below, using Path 1 + Path 2 keyed `stage='memory_consolidator'`.
+
+### FALLBACK (used ONLY when the corresponding ledger check above is inconclusive)
+Use BOTH of the following paths for the relevant summary — declare it missing ONLY if \
+BOTH return nothing:
 
 **Path 1 — General semantic search** (existing approach): \
 `mcp__fused-memory__search(query="run_id: <run_id>", project_id=..., \
@@ -352,23 +395,27 @@ is present.
 **Path 2 — Metadata-keyed existence count** (deterministic): \
 `mcp__fused-memory__count_memories_by_metadata(project_id=..., \
 filters={{'kind': 'cycle_summary', 'run_id': '<run_id>', 'stage': 'task_knowledge_sync'}})` \
-A return value > 0 means the Stage 2 summary is present. This path catches summaries that \
-semantic search misses due to low cosine-similarity ranking (confirmed false negative: \
-run 80a85eeb, memory 91e6a3b9 sat at relevance 0.71, triggering wasteful reconstruction; \
-task 1588). \
-**The `stage='task_knowledge_sync'` key is REQUIRED here (task 1653):** this stage \
-(Stage 1) now writes its OWN per-cycle summary under \
-`{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'memory_consolidator'}}` using \
-the SAME shared run_id. A `stage`-less double filter would match this stage's own summary \
-and falsely report the Stage 2 summary as present, suppressing a genuinely-needed \
-missing-summary finding. Disambiguate the Stage 2 summary by `'stage': 'task_knowledge_sync'`.
+for check A, or `{{'kind': 'cycle_summary', 'run_id': '<run_id>', 'stage': \
+'memory_consolidator'}}` for check B. \
+A return value > 0 means the corresponding summary is present. This path catches summaries \
+that semantic search misses due to low cosine-similarity ranking (confirmed false \
+negative: run 80a85eeb, memory 91e6a3b9 sat at relevance 0.71, triggering wasteful \
+reconstruction; task 1588). \
+**The `stage` key is REQUIRED here (task 1653):** Stage 1 writes its OWN per-cycle \
+summary under `{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': \
+'memory_consolidator'}}` and Stage 2 writes its summary under \
+`{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'task_knowledge_sync'}}`, using \
+the SAME shared run_id. A `stage`-less filter would conflate the two and falsely report \
+presence for the wrong summary, suppressing a genuinely-needed missing-summary finding. \
+Always disambiguate by `stage`.
 
-**Decision rule**: if EITHER path confirms the summary exists, do NOT emit the \
-missing-summary finding — Stage 2 already wrote the per-cycle summary for that run. \
-Note in your cycle report, e.g. \
-"Stage 2 summary for run_id=<run_id> already present — skipping reconstruction." \
-Only emit the missing-summary finding when BOTH Path 1 returns no matching content AND \
-Path 2 returns count=0.
+**Decision rule (fallback only)**: for check A, if EITHER path confirms the Stage 2 \
+summary exists, do NOT emit the missing-summary finding — Stage 2 already wrote the \
+per-cycle summary for that run. Note in your cycle report, e.g. \
+"Stage 2 summary for run_id=<run_id> already present — skipping reconstruction." Only \
+emit the missing-summary finding when BOTH Path 1 returns no matching content AND Path 2 \
+returns count=0. For check B, apply the same two-path logic to your own summary, but \
+only ever as a report-only note per the audit rule above — never as a finding.
 
 **Tool error handling**: if `count_memories_by_metadata` returns an error (e.g. backend \
 unavailable), treat as inconclusive and do NOT reconstruct — the documented harm is \
@@ -381,7 +428,9 @@ the same Stage 2 summary, producing duplicate per-cycle entries a later cycle mu
 up. The two-path approach eliminates the false-negative risk from semantic-search \
 ranking/limit cutoff. Legacy summaries (written before task 1588) lack \
 `metadata.run_id`, and Stage 2 summaries written before task 9af436fe lack \
-`metadata.stage`, so the Path 2 triple filter returns 0 for them — Path 1 remains their fallback.
+`metadata.stage`, so the Path 2 triple filter returns 0 for them — Path 1 remains their \
+fallback. The ledger PRIMARY check above is the authoritative source of truth going \
+forward (task 2625); the two-path fallback remains for when the ledger is unavailable.
 
 ## Pre-Check: Existing Task Completion Summary by task_id
 Before emitting a "missing completion summary" finding for a specific task, ALSO \

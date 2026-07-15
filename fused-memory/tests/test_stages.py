@@ -182,6 +182,22 @@ class TestDisallowedToolLists:
         """
         assert 'mcp__fused-memory__count_memories_by_metadata' not in STAGE3_DISALLOWED
 
+    def test_get_cycle_summary_presence_not_in_stage1_or_stage2_disallowed(self):
+        """Pin get_cycle_summary_presence as auto-allowed (read-only) in Stage 1 and Stage 2.
+
+        get_cycle_summary_presence is the read-only ledger-presence tool Stage 1 and
+        Stage 2 now call as PRIMARY in their missing-cycle-summary decision logic
+        (task 2625), mirroring how Stage 3 already relies on it (task 2437). It must
+        NOT appear in STAGE1_DISALLOWED or STAGE2_DISALLOWED, or the prompt wiring
+        added for those stages would be silently uncallable. This guard passes
+        immediately — the tool was never in either list — and catches accidental
+        future addition to any of the DISALLOW_MEMORY_WRITES, DISALLOW_TASK_WRITES,
+        or DISALLOW_BUILTIN lists that compose them, mirroring
+        test_count_memories_by_metadata_not_in_stage3_disallowed above.
+        """
+        assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE1_DISALLOWED
+        assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE2_DISALLOWED
+
 
 class TestStageSubclasses:
     """Each stage subclass returns the correct disallowed list."""
@@ -428,6 +444,116 @@ class TestStage3PromptAlignment:
     def test_stage3_prompt_has_output_format_section(self):
         # Should have an Output Format section to guide the LLM
         assert 'Output Format' in STAGE3_SYSTEM_PROMPT
+
+
+class TestStage1LedgerPresenceWiring:
+    """Stage 1 consults the ReconLedgerStore ground truth
+    (``get_cycle_summary_presence``) as the PRIMARY cycle-summary presence
+    check, mirroring Stage 3's τ2 wiring (task 2437), instead of relying
+    solely on the Mem0 two-path check (task 2625).
+    """
+
+    def test_stage1_prompt_names_ledger_tool_in_available_tools(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'mcp__fused-memory__get_cycle_summary_presence' in STAGE1_SYSTEM_PROMPT, (
+            'STAGE1_SYSTEM_PROMPT must name get_cycle_summary_presence in its '
+            '## Available Tools section.'
+        )
+
+    def test_stage1_prompt_checks_ledger_for_stage2_summary(self):
+        """The actionable Stage-2-summary reconstruct-trigger decision must be keyed
+        to stage='task_knowledge_sync' (the summary Stage 2 writes).
+
+        Asserts the semantic stage-key token rather than the full multi-line call
+        signature, so harmless prompt rewording (whitespace, argument order,
+        ellipsis style) does not break the test while the stage-keying contract
+        that task 1653 protects is still verified. The ledger tool itself is
+        pinned separately by test_stage1_prompt_names_ledger_tool_in_available_tools.
+        """
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert "stage='task_knowledge_sync'" in STAGE1_SYSTEM_PROMPT, (
+            "Stage 1 must key a presence check on stage='task_knowledge_sync' "
+            'for the Stage-2-summary reconstruct-trigger decision.'
+        )
+
+    def test_stage1_prompt_checks_ledger_for_own_prior_run_summary(self):
+        """Stage 1 also audits its OWN prior-run summary (written deterministically
+        by write_stage1_cycle_summary, never LLM-reconstructed) via
+        stage='memory_consolidator' — a presence audit, not a reconstruction trigger.
+
+        Asserts the semantic stage-key token rather than the full call signature
+        (see test_stage1_prompt_checks_ledger_for_stage2_summary); the two distinct
+        stage keys must both be present so the dual-check keeps them un-conflated.
+        """
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert "stage='memory_consolidator'" in STAGE1_SYSTEM_PROMPT, (
+            "Stage 1 must key a presence check on stage='memory_consolidator' "
+            'to audit its own prior-run summary.'
+        )
+
+    def test_stage1_prompt_has_ledger_authoritative_anchors(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'ledger_available' in STAGE1_SYSTEM_PROMPT
+        assert 'AUTHORITATIVE' in STAGE1_SYSTEM_PROMPT
+
+    def test_stage1_prompt_retains_mem0_fallback(self):
+        """The existing Mem0 two-path check must be retained as the inconclusive-only
+        fallback, never deleted (fail-safe monotonicity)."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'count_memories_by_metadata' in STAGE1_SYSTEM_PROMPT
+
+
+class TestStage2LedgerPresenceWiring:
+    """Stage 2 consults the ReconLedgerStore ground truth
+    (``get_cycle_summary_presence``) as the PRIMARY presence authority when
+    re-verifying a carry-forward missing_stage2_summary finding, mirroring
+    Stage 3's τ2 wiring (task 2437) (task 2625).
+    """
+
+    def test_stage2_prompt_names_ledger_tool_in_available_tools(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'mcp__fused-memory__get_cycle_summary_presence' in STAGE2_SYSTEM_PROMPT, (
+            'STAGE2_SYSTEM_PROMPT must name get_cycle_summary_presence in its '
+            '## Available Tools section.'
+        )
+
+    def test_stage2_prompt_checks_ledger_before_reconstructing(self):
+        """Stage 2's carry-forward reconstruct re-verify must be keyed to
+        stage='task_knowledge_sync' (the summary Stage 2 owns).
+
+        Asserts the semantic stage-key token rather than the full multi-line call
+        signature, so harmless prompt rewording does not break the test while the
+        stage-keying contract is still verified. The ledger tool is pinned
+        separately by test_stage2_prompt_names_ledger_tool_in_available_tools.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert "stage='task_knowledge_sync'" in STAGE2_SYSTEM_PROMPT, (
+            "Stage 2 must key a presence check on stage='task_knowledge_sync' "
+            'before deciding whether to reconstruct a carry-forward '
+            'missing_stage2_summary finding.'
+        )
+
+    def test_stage2_prompt_has_ledger_authoritative_anchors(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'ledger_available' in STAGE2_SYSTEM_PROMPT
+        assert 'AUTHORITATIVE' in STAGE2_SYSTEM_PROMPT
+
+    def test_stage2_prompt_retains_post_write_recheck_and_retry_nonce(self):
+        """The existing post-write count_memories_by_metadata re-check + retry_nonce
+        retry loop must be retained as the inconclusive-only fallback verification,
+        never deleted (fail-safe monotonicity)."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'count_memories_by_metadata' in STAGE2_SYSTEM_PROMPT
+        assert 'retry_nonce' in STAGE2_SYSTEM_PROMPT
 
 
 class TestTaskKnowledgeSyncPayload:
