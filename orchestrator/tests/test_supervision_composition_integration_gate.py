@@ -250,3 +250,34 @@ class _RecordingService:
 
     async def stop(self) -> None:
         self._calls.append(f'{self.name}:stop')
+
+
+# ---------------------------------------------------------------------------
+# step-1/2 — D1a: RestartPlan x DeployState x TaskGroundTruth. A real
+# own-unit self-restart schedules deferred (SCHEDULED); a real None->RAN
+# DeployState write lands; the deploy then 'crashes' (no VERIFIED write ever
+# happens); TaskGroundTruth.recovery_for must see the NAMED deploy_phase=ran
+# and re-file an escalation — never phantom-done.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestD1SelfRestartDeployCrash:
+    """D1a composition cell (the 2059/2066 crashed-mid-deploy case)."""
+
+    async def test_ran_phase_crash_recovers_to_refile_not_phantom_done(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        from shared.deploy_state import DeployPhase
+
+        from orchestrator.proc_supervision import RestartDisposition
+        from orchestrator.task_ground_truth import RecoveryAction
+
+        restart_outcome, truth_report, action = await _scheduled_self_restart_then_crash_at_ran(
+            tmp_queue_dir,
+        )
+
+        assert restart_outcome.disposition == RestartDisposition.SCHEDULED
+        assert truth_report.deploy_phase == DeployPhase.RAN
+        assert action == RecoveryAction.RE_FILE_ESCALATION
+        assert action != RecoveryAction.MARK_DONE_WITH_PROVENANCE
