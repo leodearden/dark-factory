@@ -3601,12 +3601,28 @@ _MC_ATTR_BY_REASON_PREFIX: tuple[tuple[str, str], ...] = (
 )
 
 
-def _mc_attr_for_run(run: verify_plan.PlannedRun) -> str:
-    """Resolve which ModuleConfig attribute *run* renders into, from its reason prefix."""
+def _mc_attr_for_run_or_none(run: verify_plan.PlannedRun) -> str | None:
+    """Resolve which ModuleConfig attribute *run* renders into, from its reason prefix.
+
+    Returns ``None`` (rather than raising) when *run*.reason carries no
+    recognised tool prefix — the shape ``_derive_fallback_runs`` emits for its
+    single "no .py files touched" SKIPPED run (e.g. a fallback diff whose only
+    source files are ``.rs``), which is not keyed to any of the three
+    ``ModuleConfig`` tool slots. :func:`_mc_attr_for_run` is the raising
+    variant for callers that have already excluded that shape.
+    """
     for prefix, attr in _MC_ATTR_BY_REASON_PREFIX:
         if run.reason.startswith(prefix):
             return attr
-    raise ValueError(f'PlannedRun.reason has no recognised tool prefix: {run.reason!r}')
+    return None
+
+
+def _mc_attr_for_run(run: verify_plan.PlannedRun) -> str:
+    """Resolve which ModuleConfig attribute *run* renders into, from its reason prefix."""
+    attr = _mc_attr_for_run_or_none(run)
+    if attr is None:
+        raise ValueError(f'PlannedRun.reason has no recognised tool prefix: {run.reason!r}')
+    return attr
 
 
 def _executed_module_configs_from_plan(
@@ -3744,10 +3760,26 @@ def _executed_fallback_plan(
     diff with no derivable pytest target). ``scope_kind``/``reason`` carry
     over from the decision unchanged: they answer WHY a tool slot was scoped
     a given way, not WHERE/HOW it actually ran.
+
+    A run with no recognised tool prefix — ``_derive_fallback_runs``'s single
+    "no .py files touched" SKIPPED run, returned when *plan* was derived from
+    an ``existing_files`` list with zero ``.py`` files (e.g. a diff touching
+    only ``.rs`` sources) — is passed through unchanged rather than resolved
+    against :func:`_mc_attr_for_run`: it is not keyed to any of *fallback*'s
+    three tool slots, so there is nothing to reconcile it against. (In
+    practice ``run_scoped_verification`` only calls this when
+    ``_build_fallback_config`` returned non-``None``, which requires at least
+    one ``.py`` file — the same precondition under which
+    ``_derive_fallback_runs`` never emits this shape — so this guard is
+    defense-in-depth against that precondition drifting rather than a
+    presently-reachable path.)
     """
     executed_runs = []
     for run in plan.runs:
-        attr = _mc_attr_for_run(run)
+        attr = _mc_attr_for_run_or_none(run)
+        if attr is None:
+            executed_runs.append(run)
+            continue
         executed_cmd_str = getattr(fallback, attr)
         cmd = (
             VerifyCmd(tool=_FALLBACK_TOOLKIND_BY_ATTR[attr], raw=executed_cmd_str)
