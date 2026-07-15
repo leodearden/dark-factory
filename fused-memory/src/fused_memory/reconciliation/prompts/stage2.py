@@ -570,6 +570,17 @@ inconsistencies), report them through the recon_report channel \
 (`mcp__recon-report__add_finding`); the reconciliation harness owns their \
 persistence-gated escalation path.
 
+One of these is now handled for you: the before/after `get_task` self-check \
+around a write to a live in-progress task — reading status/`claimant_run_id`/ \
+`heartbeat_at` immediately before and after, and flagging unexpected \
+divergence — is a CODE-ENFORCED harness backstop, not just this prompt's \
+convention. `TaskInterceptor` routes your recon-stage `update_task`/ \
+`set_task_status` writes through `middleware/live_task_write_guard`, which \
+self-files a `task_lifecycle_reset_detected` finding via the recon_report \
+channel whenever `status` or `claimant_run_id` diverges unexpectedly. You do \
+not need to spend budget re-implementing this check by hand — rely on the \
+finding being filed automatically.
+
 ## Same-Run Stage 1 human_operator_required Suppression
 If Stage 1 already filed a `human_operator_required` flag for a given `(task_id, \
 flag_type)` pair in this same run, do not re-emit it — Stage 1 already filed it. \
