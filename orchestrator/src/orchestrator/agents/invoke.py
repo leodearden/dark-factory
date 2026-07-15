@@ -26,6 +26,7 @@ from shared.cli_invoke import (  # noqa: F401
     _parse_claude_output,
     _run_subprocess,
     _SubprocessResult,
+    apply_spawn_env,
     build_claude_argv,
     invoke_claude_agent,
     invoke_with_cap_retry,
@@ -261,18 +262,11 @@ async def _invoke_claude_with_sandbox(
                 env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
             if config_dir:
                 env['CLAUDE_CONFIG_DIR'] = str(config_dir)
-            if spawn_env:
-                env.update({k: v for k, v in spawn_env.items() if v})
-                # Amendment (task 2512 review): mirrors shared.cli_invoke.
-                # _invoke_claude's non-sandbox injection -- scrub any
-                # inherited CLAUDE_SPAWN_SESSION_ID/LAUNCHER_PID so
-                # session_hooks.hook_session_slug is guaranteed to take the
-                # build_session_slug(role, project, task_id, session_id)
-                # branch Workflow._build_spawn_env's parent-slug
-                # reconstruction assumes; see that site's comment for the
-                # full rationale.
-                env.pop('CLAUDE_SPAWN_SESSION_ID', None)
-                env.pop('CLAUDE_SPAWN_LAUNCHER_PID', None)
+            # Mirrors shared.cli_invoke._invoke_claude's non-sandbox
+            # injection (task 2512 dedup) -- see apply_spawn_env's docstring
+            # for the full rationale on the CLAUDE_SPAWN_SESSION_ID/
+            # LAUNCHER_PID scrub.
+            apply_spawn_env(env, spawn_env)
 
             try:
                 result = await _run_subprocess(

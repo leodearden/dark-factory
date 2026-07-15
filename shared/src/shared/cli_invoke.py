@@ -1367,6 +1367,37 @@ def build_claude_argv(
     return cmd, temp_files
 
 
+def apply_spawn_env(env: dict[str, str], spawn_env: dict[str, str] | None) -> None:
+    """Merge spawn-identity vars into a subprocess env dict, in place.
+
+    The single source of truth for the ``CLAUDE_SPAWN_*`` injection shared by
+    the non-sandbox (``_invoke_claude``) and sandbox
+    (``orchestrator.agents.invoke._invoke_claude_with_sandbox``) invocation
+    paths (task 2512 dedup — mirrors the ``build_claude_argv`` split above).
+
+    When *spawn_env* is set, its truthy-valued keys (``CLAUDE_SPAWN_ROLE`` /
+    ``PROJECT`` / ``TASK_ID`` / ``PARENT_ID``) are merged into *env*; empty
+    values are skipped so a blank never clobbers an inherited
+    ``CLAUDE_SPAWN_*`` value. Any ``CLAUDE_SPAWN_SESSION_ID`` /
+    ``CLAUDE_SPAWN_LAUNCHER_PID`` this process itself inherited (e.g. if the
+    orchestrator was itself fleet-spawned) is then scrubbed from *env* —
+    ``session_hooks.hook_session_slug`` prefers an inherited
+    ``CLAUDE_SPAWN_SESSION_ID`` outright over reconstructing a slug from
+    role/project/task_id, the exact branch ``Workflow._build_spawn_env``'s
+    ``CLAUDE_SPAWN_PARENT_ID`` reconstruction assumes; leaving an inherited
+    value in place would collapse every spawned agent onto ONE registry
+    record instead of each getting its own.
+
+    A no-op (including the scrub) when *spawn_env* is falsy, so callers can
+    invoke this unconditionally after building the base env.
+    """
+    if not spawn_env:
+        return
+    env.update({k: v for k, v in spawn_env.items() if v})
+    env.pop('CLAUDE_SPAWN_SESSION_ID', None)
+    env.pop('CLAUDE_SPAWN_LAUNCHER_PID', None)
+
+
 async def _invoke_claude(
     prompt: str,
     system_prompt: str,
@@ -1417,24 +1448,11 @@ async def _invoke_claude(
     if env_overrides:
         env.update(env_overrides)
     # Merge spawn-identity vars (CLAUDE_SPAWN_ROLE/PROJECT/TASK_ID/PARENT_ID) for
-    # the SessionStart hook. Applied after env_overrides so per-agent spawn
-    # identity always wins; empty values are skipped so a blank never clobbers
-    # an inherited CLAUDE_SPAWN_* value.
-    if spawn_env:
-        env.update({k: v for k, v in spawn_env.items() if v})
-        # Amendment (task 2512 review): CLAUDE_SPAWN_SESSION_ID/LAUNCHER_PID
-        # key a DIFFERENT registry record than ROLE/PROJECT/TASK_ID/PARENT_ID
-        # do -- session_hooks.hook_session_slug prefers an inherited
-        # CLAUDE_SPAWN_SESSION_ID outright, bypassing the
-        # build_session_slug(role, project, task_id, session_id)
-        # reconstruction Workflow._build_spawn_env's CLAUDE_SPAWN_PARENT_ID
-        # depends on. If this process's own os.environ carries either (e.g.
-        # the orchestrator itself was fleet-spawned), the plain os.environ
-        # copy above would otherwise carry the SAME value into every spawned
-        # agent, collapsing them all onto one registry record. Scrub both
-        # whenever we assert a fresh spawn identity.
-        env.pop('CLAUDE_SPAWN_SESSION_ID', None)
-        env.pop('CLAUDE_SPAWN_LAUNCHER_PID', None)
+    # the SessionStart hook, and scrub any inherited CLAUDE_SPAWN_SESSION_ID/
+    # LAUNCHER_PID. Applied after env_overrides so per-agent spawn identity
+    # always wins. See apply_spawn_env's docstring for the full rationale
+    # (shared with the sandbox path in orchestrator.agents.invoke).
+    apply_spawn_env(env, spawn_env)
     # Multi-account failover: inject per-invocation OAuth token
     if oauth_token:
         env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
