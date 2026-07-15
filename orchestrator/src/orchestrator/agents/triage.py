@@ -180,7 +180,17 @@ You may read files to verify suggestions before classifying.
 """
 
 # ---------------------------------------------------------------------------
-# Output schema — enforced via --json-schema
+# Output schema — documentation only; NOT enforced at runtime.
+#
+# This used to be passed as invoke_with_cap_retry's output_schema= kwarg and
+# consumed by parse_triage_result. Both are gone: the steward now grants the
+# submit_triage MCP tool and reads its verdict artifact via
+# extract_triage_verdict (see _pre_triage_suggestions in steward.py), and the
+# submit_triage tool itself takes untyped params — it does not consult this
+# schema. Retained only as a precise, human-readable reference for the
+# accepted/skipped/proposed_task_groups payload shape described in prose by
+# build_triage_prompt() below; nothing validates it, so update it by hand if
+# the submit_triage contract changes.
 # ---------------------------------------------------------------------------
 
 TRIAGE_OUTPUT_SCHEMA: dict[str, Any] = {
