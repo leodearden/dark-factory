@@ -50,6 +50,7 @@ from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_STATUSES,
     find_conflicting_task_status_ids,
+    frames_live_task_status_as_current_fact,
     is_batch_plan_framing,
     is_count_snapshot,
     is_mixed_temporal_framing,
@@ -761,6 +762,26 @@ def create_mcp_server(
         'stage1_flag_marker persistence is code-managed via the recon_ledger; '
         'add_memory is not a valid write path for it'
     )
+    # Remediation hint returned alongside live_task_status_current_fact_write_blocked
+    # (task 2628, Stage-1 reify finding 82c8a42a) so a blocked recon-stage agent can
+    # self-correct instead of guessing why a liveness/status snapshot was rejected.
+    _LIVE_TASK_STATUS_HINT = (
+        'rephrase into the durable point-in-time form instead of framing a live '
+        'task-table field as a standing fact: "a liveness/status check was performed '
+        'at <timestamp> and reported <value>", not the bare current-fact framing'
+    )
+    # Categories the live-task-status current-fact guard covers — exactly the four
+    # the task names. preferences_and_norms/procedural_knowledge are deliberately
+    # excluded: a norm ABOUT recording liveness as a point-in-time check legitimately
+    # lives there.
+    _LIVE_STATUS_GATED_CATEGORIES = frozenset(
+        {
+            'decisions_and_rationale',
+            'observations_and_summaries',
+            'entities_and_relations',
+            'temporal_facts',
+        }
+    )
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -991,6 +1012,19 @@ def create_mcp_server(
                 'agent_id': agent_id,
                 'content_excerpt': content[:200],
                 'hint': _FLAG_MARKER_WRITE_HINT,
+            }
+        if (
+            category in _LIVE_STATUS_GATED_CATEGORIES
+            and isinstance(agent_id, str)
+            and agent_id.startswith('recon-stage-')
+            and frames_live_task_status_as_current_fact(content)
+        ):
+            return {
+                'error': 'live_task_status_current_fact_write_blocked',
+                'error_type': 'ReconLiveTaskStatusWriteRejected',
+                'agent_id': agent_id,
+                'content_excerpt': content[:200],
+                'hint': _LIVE_TASK_STATUS_HINT,
             }
         allow_near_duplicate = (
             isinstance(metadata, dict) and metadata.get('allow_near_duplicate') is True
