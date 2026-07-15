@@ -1044,6 +1044,95 @@ class TestBeforeDoneTargetUnitlessDeploy:
             'update_task must stamp before_done_verified_at (crash-safe verified stamp)'
         )
 
+    async def test_targetless_deploy_rc_nonzero_escalates_and_blocks(self, tmp_path: Path):
+        """rc != 0 with a falsy target_unit must escalate + block — NOT
+        drive to done — and must never touch unit_inspector.
+
+        RED today: impl-targetless-happy's branch ignores rc entirely and
+        always writebacks done, regardless of the script's exit code.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2632', target_unit=None)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock()
+        script_runner = AsyncMock(return_value=(1, 'boom: install failed'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('2632', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'infra_issue'
+        assert esc.agent_role == 'orchestrator-deterministic'
+
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert done_calls == [], 'set_task_status must NOT be called with done on failure'
+        unit_inspector.assert_not_awaited()
+
+    async def test_targetless_deploy_outer_guard_timeout_escalates(self, tmp_path: Path):
+        """A hung run_fn under a falsy target_unit must still trip the outer
+        wall-clock guard and produce exactly one born-at-L2 infra_issue —
+        never hang run() forever.
+
+        RED today: the target_unit-less branch has no try/except around
+        asyncio.wait_for, so the TimeoutError propagates uncaught instead of
+        being translated into a BLOCKED outcome.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2632', target_unit=None, timeout_secs=0)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0,
+        )
+
+        # Hang tripwire: if the outer guard regresses, fail loudly instead of
+        # stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2632', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'infra_issue'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        unit_inspector.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # ζ D2 boundary: an illegal deploy-phase transition files a REAL born-at-L2
