@@ -300,3 +300,33 @@ class TestCommitCitesTask:
     def test_false_when_word_boundary_would_be_violated(self):
         """task/3399 must not satisfy a commit_cites_task('...', '339') check."""
         assert commit_cites_task('Merge task/3399 into main', '339') is False
+
+
+# ===========================================================================
+# Step-5/6: classify — commit_not_on_main (highest precedence)
+# ===========================================================================
+
+class TestClassifyCommitNotOnMain:
+    """commit_not_on_main wins whenever is_ancestor is False, regardless of other facts."""
+
+    def test_not_ancestor_yields_commit_not_on_main(self):
+        """A cited commit unreachable from the audited ref is the strongest bogus signal."""
+        audit = _audit(is_ancestor=False)
+        verdict, reasons = classify(audit)
+        assert verdict == 'commit_not_on_main'
+        assert reasons
+        assert any('ancestor' in r or 'not reachable' in r for r in reasons)
+
+    def test_wins_over_every_other_signal(self):
+        """Even with misattribution/revert/deliverable-absent facts also present,
+        commit_not_on_main takes precedence over all of them.
+        """
+        audit = _audit(
+            is_ancestor=False,
+            commit_message='Merge task/999 into main',  # would-be misattribution
+            revert_commit='f' * 40,  # would-be reverted
+            declared_files=['a.py'],
+            commit_files=[],  # would-be deliverable_absent
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'commit_not_on_main'
