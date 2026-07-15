@@ -148,6 +148,14 @@ class TestReconcileSweepDelegatesToGroundTruth:
         harness.git_ops.warm_lane_ref_is_degenerate = AsyncMock(  # type: ignore[attr-defined]
             return_value=False,
         )
+        # task 2500 FIX 1 — commit_effect_present_in_main is a legitimate
+        # applier-side sibling check to warm_lane_ref_is_degenerate above
+        # (same "sweep-side refinement" pattern), so it IS expected to be
+        # called on the ON_MAIN mark-done path; give it a real return value
+        # so the flip is reached, mirroring warm_lane_ref_is_degenerate.
+        harness.git_ops.commit_effect_present_in_main = AsyncMock(  # type: ignore[attr-defined]
+            return_value=True,
+        )
 
         report = TruthReport(
             db_status='in-progress',

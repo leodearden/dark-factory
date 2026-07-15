@@ -3588,6 +3588,34 @@ Output JSON matching the schema. Every task must appear in the output.
                 return None
 
             on_main = report.branch_state.kind == BranchStateKind.ON_MAIN
+
+            # FIX 1 effect-present refinement (task 2500): a cited ON_MAIN
+            # commit stays an ancestor of main forever — ancestry is
+            # immutable history — even after a LATER commit on main
+            # reverts exactly the paths it touched (the found_on_main
+            # post-hoc-revert blind spot; reify esc-5179-3/esc-5181-2).
+            # Sibling to the degenerate-branch refinement above: same
+            # downgrade shape, flip only on positive evidence. Journal
+            # (MergeProvenance advanced_sha) and merge-marker shas are
+            # always merge commits — commit_effect_present_in_main returns
+            # True unconditionally for those (empty diff-tree), so only
+            # the git-fallback branch-tip work-commit ON_MAIN case pays
+            # for a real check.
+            if on_main and report.branch_state.sha and not await (
+                self.git_ops.commit_effect_present_in_main(report.branch_state.sha)
+            ):
+                logger.warning(
+                    'Reconcile: task %s ON_MAIN evidence sha %s is an ancestor '
+                    'of main but its effect is not present at current HEAD '
+                    '(post-hoc revert) — not marking done',
+                    tid, report.branch_state.sha,
+                )
+                if status == 'in-progress':
+                    return await self._revert_in_progress_if_no_live_claimant(
+                        tid, mid_run=mid_run, metadata=metadata, status=status,
+                    )
+                return None
+
             if status == 'blocked':
                 note = (
                     'reconcile: branch on main while task was blocked (out-of-band merge)'

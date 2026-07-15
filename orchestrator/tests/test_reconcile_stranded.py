@@ -203,6 +203,12 @@ def harness(tmp_path: Path, mock_orch_config):
     # to exercise the primitive-degenerate fallback path.
     h.git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=False)
 
+    # Default: commit_effect_present_in_main returns True (task 2500 FIX 1)
+    # so existing found_on_main mark-done tests reach the flip unchanged.
+    # Individual tests may override with AsyncMock(return_value=False) to
+    # exercise the post-hoc-revert blind-spot guard.
+    h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)
+
     return h
 
 
