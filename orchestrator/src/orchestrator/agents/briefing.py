@@ -131,6 +131,7 @@ class BriefingAssembler:
 
         task_block = self._format_task(task)
         identity = self._agent_identity(task.get('id'), 'architect')
+        prior_proposal_section = self._format_prior_proposal(task)
 
         plan_files = set(existing_plan.get('files', []))
         overlapping = [f for f in changed_files if f in plan_files]
@@ -169,6 +170,7 @@ class BriefingAssembler:
 
 {task_block}
 
+{prior_proposal_section}
 # Plan Revalidation
 
 You created a plan for this task in a prior session, but the task was requeued
