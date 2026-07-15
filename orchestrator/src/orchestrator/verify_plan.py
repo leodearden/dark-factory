@@ -16,7 +16,7 @@ from enum import Enum, StrEnum
 from typing import Literal
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.verify_cmd import VerifyCmd, parse_config_command, scope_to, strip_cwd
+from orchestrator.verify_cmd import ToolKind, VerifyCmd, parse_config_command, scope_to, strip_cwd
 
 
 class FileKind(Enum):
@@ -206,6 +206,49 @@ class VerifyPlan:
         }
 
 
+def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> VerifyCmd:
+    """Scope *raw* to *files*, first-clause-scoping a raw-retained chain.
+
+    The ``VerifyCmd``-layer counterpart of ``verify._scope_to_keyword`` (which
+    operates on — and returns — a shell string): this returns a ``VerifyCmd``
+    instead, since ``PlannedRun.cmd`` stores structured commands, not strings.
+    The two scopers run the IDENTICAL algorithm (true algorithmic lockstep —
+    a future change to one's scoping rule must update the other): *raw* is
+    ALWAYS truncated to everything up to and including the first occurrence
+    of *keyword* before being (re-)parsed, regardless of whether the
+    untruncated *raw* would itself have parsed as one structured command or a
+    raw-retained chain. This means content positioned after the matched
+    *keyword* occurrence — including any flags trailing the target on an
+    otherwise single-clause command, or any further ``&&``-chained clause —
+    is intentionally dropped, exactly as ``_scope_to_keyword`` drops it: a
+    value-taking flag after the target (e.g. ``'ruff check src/ --select
+    E'``) would otherwise have its value misread as an extra target by
+    ``scope_to``, so truncating first — not scoping the whole parsed command
+    — is what keeps this safe as well as byte-identical.
+
+    If the *keyword*-prefix parses into a structured, non-OPAQUE command, it
+    is scoped to *files* (first-clause scoped, every trailing ``&&``-chained
+    clause dropped). *keyword* absent from *raw*, or the prefix not parsing
+    into one recognised structured invocation (P1), leaves *raw* untouched:
+    the returned ``VerifyCmd`` is forced raw-retained (``raw=raw``) so
+    rendering it reproduces *raw* byte-for-byte even when *raw* itself would
+    otherwise have parsed into a structured command — a from-scratch render
+    of which is only argv-equivalent, not guaranteed byte-identical, to the
+    original string (e.g. a ``--directory`` flag renders back as a leading
+    ``cd``).
+    """
+    parsed = parse_config_command(raw)
+    unscoped = parsed if parsed.raw is not None else VerifyCmd(tool=parsed.tool, raw=raw)
+
+    idx = raw.find(keyword)
+    if idx == -1:
+        return unscoped
+    prefix_parsed = parse_config_command(raw[: idx + len(keyword)])
+    if prefix_parsed.tool is ToolKind.OPAQUE or prefix_parsed.raw is not None:
+        return unscoped
+    return strip_cwd(scope_to(prefix_parsed, files))
+
+
 def _derive_module_runs(
     mc: ModuleConfig,
     existing_files: list[str],
@@ -240,15 +283,6 @@ def _derive_module_runs(
         for f in scoped
     }
 
-    # Drift note (task γ review, architecture finding): this trigger scan is
-    # mirrored BY HAND in verify.scope_module_config's
-    # has_structural/has_conftest/has_test_data loop, which consumes the same
-    # classify_file-derived predicates but does not read these triggers back
-    # — the two are independently maintained decision trees kept in sync only
-    # by convention. A new narrowing rule added to one must be mirrored in
-    # the other, or the VerifyResult.plan this function feeds can diverge
-    # from what scope_module_config actually scoped — see
-    # derive_verify_plan's "Fidelity" docstring paragraph.
     conftest_trigger = next((f for f, k in kinds.items() if k is FileKind.CONFTEST), None)
     test_data_trigger = next((f for f, k in kinds.items() if k is FileKind.TEST_DATA), None)
     structural_trigger = next((f for f, k in kinds.items() if k is FileKind.STRUCTURAL), None)
@@ -260,7 +294,7 @@ def _derive_module_runs(
     # cross-file invariant to protect, unlike pyright's Protocol/TypedDict
     # concern (D2), so there is no "widen to full suite" branch here. --
     if mc.lint_command:
-        lint_cmd = strip_cwd(scope_to(parse_config_command(mc.lint_command), scoped))
+        lint_cmd = _scope_prefix_to_keyword(mc.lint_command, 'ruff check', scoped)
         runs.append(PlannedRun(
             mc.prefix, lint_cmd, ScopeKind.FILE_SCOPED, 'lint: file-scoped to touched file(s)',
         ))
@@ -280,7 +314,7 @@ def _derive_module_runs(
                 f'pyright: structural file {structural_trigger} requires unscoped type check',
             ))
         else:
-            type_cmd = strip_cwd(scope_to(parse_config_command(mc.type_check_command), scoped))
+            type_cmd = _scope_prefix_to_keyword(mc.type_check_command, 'pyright', scoped)
             runs.append(PlannedRun(
                 mc.prefix, type_cmd, ScopeKind.FILE_SCOPED,
                 'pyright: file-scoped to touched file(s)',
@@ -310,7 +344,7 @@ def _derive_module_runs(
                 f'pytest: test-data module touched ({test_data_trigger}) — full suite required',
             ))
         elif collectable_tests:
-            test_cmd = strip_cwd(scope_to(parse_config_command(mc.test_command), collectable_tests))
+            test_cmd = _scope_prefix_to_keyword(mc.test_command, 'pytest', collectable_tests)
             runs.append(PlannedRun(
                 mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
                 'pytest: file-scoped to touched test file(s)',
@@ -398,6 +432,14 @@ def _derive_fallback_runs(
     does not depend on subproject rescoping, so ``plan`` remains a reliable
     record of *why* a decision was made, but not always of *where*/*how* it
     ran for a subproject-shaped fallback diff.
+
+    This caveat describes THIS function's raw return value only. Its caller
+    in :func:`run_scoped_verification` reconciles this gap before attaching
+    anything to ``VerifyResult.plan``: it folds ``_build_fallback_config``'s
+    already-executed ``ModuleConfig`` back onto this decision via
+    :func:`_executed_fallback_plan`, so the record a consumer of
+    ``VerifyResult.plan`` actually sees reflects *where*/*how* it ran too —
+    see :func:`derive_verify_plan`'s own "Fidelity" docstring paragraph.
     """
     py_files = [f for f in existing_files if f.endswith('.py')]
     if not py_files:
@@ -577,23 +619,25 @@ def derive_verify_plan(
     ``'__fallback__'`` module is derived from *config*'s global commands via
     :func:`_derive_fallback_runs`.
 
-    Fidelity: this is a decision record, not an execution trace — the two
-    branches above are independently derived from *existing_files* /
-    *module_configs* / *config*, not read back from whatever a caller
-    actually executed, so two known gaps can make the returned
-    :class:`VerifyPlan` diverge from what ran. (1) The fallback branch does
-    NOT model the subproject / mixed-root+subproject rescoping that
-    ``_build_fallback_config`` applies (see :func:`_derive_fallback_runs`'s
-    docstring) — a diff landing in a real subproject executes
-    ``cd <sub> && ...`` while the plan still records a flat
-    ``'__fallback__'`` run. (2) The module-config branch recomputes each
-    module's per-tool ``scope_kind`` from :func:`classify_file` independently
-    of ``scope_module_config`` rather than reading back its actual output —
-    the two are carefully kept in sync (both consume the same classify_file
-    predicates) but are not the same code path, so a future change to one
-    must be mirrored in the other to keep this record accurate. Callers that
-    need a faithful diagnostic record of what ran, not just why, should treat
-    the attached ``VerifyResult.plan`` accordingly.
+    Fidelity: this plan is no longer just a decision record on either branch
+    (task κ, verify-scope-inversion-prd.md) — by the time it reaches
+    ``VerifyResult.plan``, both faithfully record what ran. For the
+    module-config branch, the caller (:func:`run_scoped_verification`)
+    derives this plan once and EXECUTES it directly (see
+    :func:`_executed_module_configs_from_plan`). For the fallback branch
+    (*module_configs* empty), THIS function's raw return value is still just
+    an idealized D1/D2 decision record against the flat *existing_files*
+    list — it does NOT model the subproject / mixed-root+subproject
+    rescoping that ``_build_fallback_config`` applies (see
+    :func:`_derive_fallback_runs`'s "Fidelity caveat" docstring paragraph for
+    exactly what it omits) — but the caller folds
+    ``_build_fallback_config``'s already-executed ``ModuleConfig`` back onto
+    this plan via :func:`_executed_fallback_plan` before attaching it to
+    ``VerifyResult.plan``, so the ATTACHED record reflects the actual
+    subproject/rescoped command that ran, not the idealized flat
+    ``'__fallback__'`` decision alone. A caller consuming THIS function's
+    fallback-branch return value directly, bypassing that reconciliation,
+    still gets only the decision, not the execution trace.
     """
     if not _has_source_files(existing_files):
         return VerifyPlan(

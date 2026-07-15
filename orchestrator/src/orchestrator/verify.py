@@ -39,6 +39,7 @@ from orchestrator.verify_categories import (
 from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import (
     ToolKind,
+    VerifyCmd,
     cargo_scope,
     govern_cpu,
     parse_config_command,
@@ -1460,129 +1461,6 @@ async def _verify_pipeline_guard_requires_full_gate(
         return False
 
 
-def scope_module_config(
-    mc: ModuleConfig,
-    task_files: list[str],
-    worktree: Path | None = None,
-    content_cache: dict[str, str | None] | None = None,
-) -> ModuleConfig | None:
-    """Narrow *mc*'s commands to the specific *task_files* it covers.
-
-    Filters *task_files* to ``.py`` files matching ``mc.prefix + '/'`` and
-    keeps full worktree-relative paths.  The ``--directory`` flag is stripped
-    from scoped commands so that tools resolve paths from the worktree root,
-    where the full paths are valid.
-
-    When *worktree* is provided, any scoped ``.py`` file that defines a
-    ``Protocol`` or ``TypedDict`` subclass causes *mc.type_check_command* to
-    be used verbatim (unscoped).  File-scoped pyright cannot verify cross-file
-    invariants such as Protocol conformance; the package-wide form is the only
-    safe option.  The ``--directory`` flag is preserved (NOT stripped) in the
-    unscoped case — it is required for ``uv run`` to resolve ``src/``/``tests/``
-    correctly when running from the worktree root.  This mirrors the existing
-    ``has_conftest`` branch that sets ``test_cmd = mc.test_command`` verbatim.
-
-    *content_cache*, when given, is threaded into the structural-file content
-    read (see :func:`_worktree_reader`) so a file already read for this verify
-    attempt (e.g. by a sibling module's scope, or by ``derive_verify_plan``'s
-    observability pass) is not read from disk again (task γ amendment).
-
-    Returns ``None`` when no ``.py`` files from *task_files* fall under the
-    prefix — the caller should skip that subproject entirely rather than run
-    its full unscoped suite.  Running a subproject's complete test suite for
-    a task that touched zero of its files is both wasteful and a source of
-    unrelated-flake blockers on the merge-queue path.
-    """
-    prefix = mc.prefix + '/'
-    # Keep full worktree-relative paths, filter to .py files under this module
-    scoped: list[str] = []
-    for f in task_files:
-        if f.startswith(prefix) and f.endswith('.py'):
-            scoped.append(f)
-
-    if not scoped:
-        return None
-
-    # conftest.py defines fixtures/hooks that affect every test in the directory
-    # subtree — the only correct scope is the full unscoped suite expressed by
-    # mc.test_command.  Passing conftest.py directly to pytest finds 0 tests
-    # (pytest >= 9 exits 1 with "no tests ran").
-    has_conftest = any(_is_conftest(f) for f in scoped)
-    # Narrow: only test_*.py / *_test.py files pytest will actually collect.
-    # A data module under tests/ (e.g. silent_fallthrough_allowlist.py) is in
-    # the test tree (_is_test_file) but NOT collectable — passing it to pytest
-    # produces rc=5 ("no tests ran") → RED.  Task 1852 fixes this at the
-    # scoping layer; the classifier (verify_classify.classify_failure) is
-    # left untouched.
-    collectable_tests = [f for f in scoped if _is_collectable_test_file(f)]
-    # has_test_data: in-tree (test-tree member) but not collectable — mirrors
-    # has_conftest: fall back to the full owning-package suite (mc.test_command).
-    has_test_data = any(
-        _is_test_file(f) and not _is_collectable_test_file(f) for f in scoped
-    )
-
-    # Detect structural files (Protocol/TypedDict definitions) when we have a
-    # worktree to read from.  File-scoped pyright misses cross-file invariance
-    # breaks; the package-wide command is the only safe scope.
-    # Guard: skip the I/O loop entirely when there is no type-check command to
-    # widen — has_structural can only affect type_cmd, so reading files is
-    # wasted work when mc.type_check_command is None/empty.
-    # Drift note (task γ review, architecture finding): this
-    # has_structural/has_conftest/has_test_data scan is a SEPARATE decision
-    # tree from verify_plan._derive_module_runs's equivalent
-    # structural_trigger/conftest_trigger/test_data_trigger scan — both
-    # consume the same classify_file-derived predicates (so today's outcomes
-    # agree), but neither reads the other's result back. A new narrowing rule
-    # added HERE must be mirrored in _derive_module_runs (and vice versa), or
-    # the VerifyResult.plan attached by run_scoped_verification will silently
-    # misrepresent what this function actually scoped — see
-    # derive_verify_plan's "Fidelity" docstring paragraph for the accepted
-    # trade-off and the run_scoped_verification call site's matching comment.
-    has_structural = False
-    structural_trigger: str | None = None
-    if worktree is not None and mc.type_check_command:
-        _read = _worktree_reader(worktree, cache=content_cache)
-        for f in scoped:
-            content = _read(f)
-            if content is not None and _is_structural_python_file(f, content):
-                has_structural = True
-                structural_trigger = f
-                break
-
-    # Build scoped commands with worktree-relative paths, then strip any cwd
-    # shift (leading `cd` or `--directory`) so tools resolve paths from the
-    # worktree root.
-    lint_cmd = _scope_to_keyword(mc.lint_command, 'ruff check', scoped)
-    if has_structural:
-        # Verbatim unscoped type check — mirrors the has_conftest test_cmd branch.
-        # --directory is intentionally preserved so uv resolves src/ and tests/
-        # relative to the module subdirectory (NOT the worktree root).
-        type_cmd = mc.type_check_command
-        logger.info('pyright unscoped: structural file %s in diff', structural_trigger)
-    else:
-        type_cmd = _scope_to_keyword(mc.type_check_command, 'pyright', scoped)
-    if has_conftest or has_test_data:
-        # Full unscoped suite: conftest changes affect everything it shadows;
-        # data-module changes (e.g. a σ-allowlist re-baseline) are consumed by
-        # tests we cannot enumerate from the path alone, so the full suite is
-        # the only safe scope.  Both branches mirror each other (task 1852).
-        test_cmd = mc.test_command
-    elif collectable_tests:
-        test_cmd = _scope_to_keyword(mc.test_command, 'pytest', collectable_tests)
-    else:
-        test_cmd = None
-
-    return ModuleConfig(
-        prefix=mc.prefix,
-        lint_command=lint_cmd,
-        type_check_command=type_cmd,
-        test_command=test_cmd,
-        lock_depth=mc.lock_depth,
-        max_per_module=mc.max_per_module,
-        module_overrides=mc.module_overrides,
-    )
-
-
 def _single_subproject_prefix(files: list[str], worktree: Path | None) -> str | None:
     """Return the sole top-level subproject directory shared by *files*, else ``None``.
 
@@ -2180,13 +2058,19 @@ class VerifyResult:
     # without reconstructing it. None when no plan was derived (default /
     # back-compat / _trivial_pass and other non-planned results).
     #
-    # Fidelity caveat: `plan` is an independently-derived decision record
-    # (why a scope was chosen), not a trace of exactly what executed — see
-    # derive_verify_plan's docstring ("Fidelity" paragraph) and the
-    # "Fidelity note" comments at this field's call sites in
-    # run_scoped_verification for the specific known gaps (fallback
-    # subproject/mixed-subproject rescoping; module-path scope recomputed
-    # rather than read back from the executed ModuleConfigs).
+    # Fidelity: `plan` IS the plan that drove execution on BOTH branches
+    # (task κ, verify-scope-inversion-prd.md). On the module-config path,
+    # derive_verify_plan is derived once and executed directly (see
+    # _executed_module_configs_from_plan), so it faithfully records what
+    # ran. On the fallback (no-module_configs) path, the same decision is
+    # derived once and then reconciled against _build_fallback_config's
+    # already-executed ModuleConfig via _executed_fallback_plan (see
+    # _safe_derive_verify_plan_dict and its call site below), so the
+    # attached record reflects the actual subproject/mixed-subproject
+    # rescoping and OPAQUE-chain first-clause scoping that ran, not the
+    # idealized flat '__fallback__' decision alone — see
+    # derive_verify_plan's docstring ("Fidelity" paragraph) for what its raw,
+    # unreconciled return value alone still omits.
     plan: dict | None = None
     # Wall-clock verify cost.  For a single-module run: max(test, lint, type)
     # when the three commands ran concurrently (asyncio.gather), or their sum
@@ -3697,6 +3581,215 @@ def _worktree_reader(
     return _read
 
 
+# Maps a PlannedRun's reason-string tool prefix to the ModuleConfig attribute
+# it renders into. Used by _executed_module_configs_from_plan to recover
+# which of test_command/lint_command/type_check_command a PlannedRun belongs
+# to. Keyed off `reason` (verify_plan._derive_module_runs's docstring: "Each
+# per-tool run's reason is prefixed with the tool name ... so a caller can
+# recover tool identity even for a SKIPPED slot") rather than `run.cmd.tool`,
+# because an OPAQUE-parsed command — an unrecognised head, e.g. a synthetic
+# test-fixture command or dark_factory's real multi-clause fleet lint/type
+# `&&`-chains (config.yaml) — always resolves to the SAME `ToolKind.OPAQUE`
+# regardless of which slot produced it, so `cmd.tool` alone cannot tell an
+# OPAQUE lint command apart from an OPAQUE test command. A SKIPPED run's cmd
+# is None and needs no attribution, since the corresponding ModuleConfig
+# field is simply left unset (None) there.
+_MC_ATTR_BY_REASON_PREFIX: tuple[tuple[str, str], ...] = (
+    ('lint:', 'lint_command'),
+    ('pyright:', 'type_check_command'),
+    ('pytest:', 'test_command'),
+)
+
+
+def _mc_attr_for_run_or_none(run: verify_plan.PlannedRun) -> str | None:
+    """Resolve which ModuleConfig attribute *run* renders into, from its reason prefix.
+
+    Returns ``None`` (rather than raising) when *run*.reason carries no
+    recognised tool prefix — the shape ``_derive_fallback_runs`` emits for its
+    single "no .py files touched" SKIPPED run (e.g. a fallback diff whose only
+    source files are ``.rs``), which is not keyed to any of the three
+    ``ModuleConfig`` tool slots. :func:`_mc_attr_for_run` is the raising
+    variant for callers that have already excluded that shape.
+    """
+    for prefix, attr in _MC_ATTR_BY_REASON_PREFIX:
+        if run.reason.startswith(prefix):
+            return attr
+    return None
+
+
+def _mc_attr_for_run(run: verify_plan.PlannedRun) -> str:
+    """Resolve which ModuleConfig attribute *run* renders into, from its reason prefix."""
+    attr = _mc_attr_for_run_or_none(run)
+    if attr is None:
+        raise ValueError(f'PlannedRun.reason has no recognised tool prefix: {run.reason!r}')
+    return attr
+
+
+def _executed_module_configs_from_plan(
+    module_configs: list[ModuleConfig],
+    plan: verify_plan.VerifyPlan,
+) -> list[ModuleConfig]:
+    """Build the ModuleConfig(s) *plan* prescribes running, for the module-config branch.
+
+    The plan->execution bridge (task κ, verify-scope-inversion-prd.md):
+    groups *plan*.runs by module_prefix and, for each *mc* in
+    *module_configs*, rebuilds its three commands from the corresponding
+    PlannedRun's scope_kind:
+
+    - SKIPPED -> ``None`` (that check does not run).
+    - FULL_SUITE -> *mc*'s OWN verbatim command (preserves e.g.
+      ``--directory``, matching ``scope_module_config``'s has_conftest/
+      has_test_data/has_structural branches, which reuse
+      ``mc.test_command``/``mc.type_check_command`` unmodified).
+    - FILE_SCOPED -> ``render(run.cmd)`` (identical to ``_scope_to_keyword``'s
+      output, which itself renders a VerifyCmd — see ``verify_cmd.render``).
+
+    A module whose ONLY run is the "no files under prefix" SKIPPED emitted by
+    ``verify_plan._derive_module_runs`` (a single-element runs list — the
+    normal 3-run-per-module shape never collapses to one) is dropped from the
+    returned list entirely, mirroring ``scope_module_config`` returning
+    ``None`` for a subproject with zero matching files: the caller must skip
+    that subproject rather than run its full unscoped suite.
+
+    Uses ``dataclasses.replace`` (imported as ``replace``) rather than a
+    hand-listed ``ModuleConfig(...)`` reconstruction, so every other
+    ModuleConfig field — lock_depth, max_per_module, module_overrides,
+    verify_command_timeout_secs, verify_cold_command_timeout_secs,
+    concurrent_verify, verify_env, scope_cargo — survives onto the executed
+    config unchanged (the same pattern :func:`_apply_cargo_scope` already
+    uses), so ``run_verification``'s resolvers see identical per-module
+    overrides to what they'd have seen from *mc* directly.
+
+    Guard: a TRIVIAL *plan* (``derive_verify_plan``'s top-level "no
+    .py/.rs file at all" short-circuit — a single run with
+    ``module_prefix=''``, which matches no real ``mc.prefix``) means every
+    module has zero matching ``.py`` files by construction, so this returns
+    ``[]`` immediately rather than mis-reading the absent per-module lookup
+    as "no commands configured" and emitting a vacuous ModuleConfig per
+    module (``scope_module_config`` returns ``None`` — excluded — for every
+    *mc* in this case too).
+    """
+    if len(plan.runs) == 1 and plan.runs[0].scope_kind is verify_plan.ScopeKind.TRIVIAL:
+        return []
+
+    runs_by_prefix: dict[str, list[verify_plan.PlannedRun]] = {}
+    for run in plan.runs:
+        runs_by_prefix.setdefault(run.module_prefix, []).append(run)
+
+    executed: list[ModuleConfig] = []
+    for mc in module_configs:
+        runs = runs_by_prefix.get(mc.prefix, [])
+        only_run = runs[0] if len(runs) == 1 else None
+        if (
+            only_run is not None
+            and only_run.cmd is None
+            and only_run.scope_kind is verify_plan.ScopeKind.SKIPPED
+        ):
+            continue
+
+        commands: dict[str, str | None] = {}
+        for run in runs:
+            if run.cmd is None:
+                continue  # SKIPPED slot — the matching field stays unset (None) below
+            attr = _mc_attr_for_run(run)
+            commands[attr] = (
+                getattr(mc, attr)
+                if run.scope_kind is verify_plan.ScopeKind.FULL_SUITE
+                else render(run.cmd)
+            )
+
+        executed.append(replace(
+            mc,
+            test_command=commands.get('test_command'),
+            lint_command=commands.get('lint_command'),
+            type_check_command=commands.get('type_check_command'),
+        ))
+    return executed
+
+
+# Maps a fallback PlannedRun's ModuleConfig attribute (as resolved by
+# _mc_attr_for_run, reused here) to the ToolKind its raw-wrapped executed
+# VerifyCmd should carry in _executed_fallback_plan. Fixed rather than
+# derived from the DECISION run's own `cmd.tool` because a SKIPPED decision
+# run's `cmd` is None — there is no tool to read off it — yet the tool
+# identity is still needed to wrap an execution-time value that turned out
+# non-None (e.g. the decision skipped pytest for lack of a real suite, but a
+# subproject rescoping might yet resolve one).
+_FALLBACK_TOOLKIND_BY_ATTR: dict[str, ToolKind] = {
+    'test_command': ToolKind.PYTEST,
+    'lint_command': ToolKind.RUFF,
+    'type_check_command': ToolKind.PYRIGHT,
+}
+
+
+def _executed_fallback_plan(
+    plan: verify_plan.VerifyPlan,
+    fallback: ModuleConfig,
+) -> verify_plan.VerifyPlan:
+    """Rebuild *plan* (``derive_verify_plan``'s fallback-branch DECISION record)
+    into the EXECUTED plan, using *fallback* — the ``ModuleConfig``
+    :func:`_build_fallback_config` (plus :func:`_apply_cargo_scope`) actually
+    produced — as the ground truth for WHAT ran.
+
+    The plan->execution bridge for the fallback branch (task κ,
+    verify-scope-inversion-prd.md), mirroring
+    :func:`_executed_module_configs_from_plan`'s role for the module-config
+    branch but in the OPPOSITE direction: rather than building an executed
+    ``ModuleConfig`` FROM the plan, this rebuilds the EXECUTED PLAN from the
+    already-executed ``ModuleConfig``, since ``_build_fallback_config``'s
+    filesystem-dependent rendering (subproject cd-scoping, mixed
+    root+subproject scoping, TYPE/LINT uv-context rescoping, OPAQUE
+    fleet-chain first-clause scoping — see its own docstring) is retained
+    unchanged as the fallback's execution-layer renderer rather than being
+    reimplemented here (or threaded a `plan` parameter to consume directly:
+    :func:`_build_fallback_config`'s call site must keep its exact current
+    arguments — ``TestRunScopedVerificationForwardsWorktreeToFallback``
+    replaces it with a fixed ``(task_files, config=None, worktree=None)``
+    fake with no ``**kwargs`` catch-all, so any new call-site keyword breaks
+    it, the same constraint the "NOTE (task γ amendment)" comment at that
+    call site already documents for ``content_cache``).
+
+    Each of *plan*'s runs (keyed by the same tool-prefixed *reason*
+    convention :func:`_mc_attr_for_run` relies on) is replaced by a new
+    ``PlannedRun`` whose ``module_prefix`` is *fallback*.prefix (the ACTUAL
+    subproject/fallback identity that ran — e.g. ``'cockpit'``, not the
+    idealized flat ``'__fallback__'``) and whose ``cmd`` is a raw
+    pass-through ``VerifyCmd`` wrapping *fallback*'s corresponding field
+    verbatim (``None`` when that field is ``None`` — an execution-time skip,
+    which may not match the decision's own ``scope_kind``, e.g. a subproject
+    diff with no derivable pytest target). ``scope_kind``/``reason`` carry
+    over from the decision unchanged: they answer WHY a tool slot was scoped
+    a given way, not WHERE/HOW it actually ran.
+
+    A run with no recognised tool prefix — ``_derive_fallback_runs``'s single
+    "no .py files touched" SKIPPED run, returned when *plan* was derived from
+    an ``existing_files`` list with zero ``.py`` files (e.g. a diff touching
+    only ``.rs`` sources) — is passed through unchanged rather than resolved
+    against :func:`_mc_attr_for_run`: it is not keyed to any of *fallback*'s
+    three tool slots, so there is nothing to reconcile it against. (In
+    practice ``run_scoped_verification`` only calls this when
+    ``_build_fallback_config`` returned non-``None``, which requires at least
+    one ``.py`` file — the same precondition under which
+    ``_derive_fallback_runs`` never emits this shape — so this guard is
+    defense-in-depth against that precondition drifting rather than a
+    presently-reachable path.)
+    """
+    executed_runs = []
+    for run in plan.runs:
+        attr = _mc_attr_for_run_or_none(run)
+        if attr is None:
+            executed_runs.append(run)
+            continue
+        executed_cmd_str = getattr(fallback, attr)
+        cmd = (
+            VerifyCmd(tool=_FALLBACK_TOOLKIND_BY_ATTR[attr], raw=executed_cmd_str)
+            if executed_cmd_str is not None
+            else None
+        )
+        executed_runs.append(replace(run, module_prefix=fallback.prefix, cmd=cmd))
+    return replace(plan, runs=tuple(executed_runs))
+
+
 def _safe_derive_verify_plan_dict(
     existing_files: list[str],
     module_configs: list[ModuleConfig],
@@ -3704,25 +3797,36 @@ def _safe_derive_verify_plan_dict(
     worktree_reader: Callable[[str], str | None],
     *,
     role: Literal['merge', 'task'],
+    executed_fallback: ModuleConfig | None = None,
 ) -> dict | None:
-    """Best-effort ``derive_verify_plan(...).to_dict()`` for ``VerifyResult.plan``.
+    """Best-effort executed-plan dict for ``VerifyResult.plan``.
 
-    ``plan`` is diagnostic-only (task γ, verify_plan.py) — attached to the
-    aggregated ``VerifyResult`` for post-hoc triage but never consulted to
-    decide what actually runs (see the "Declarative decision record" comments
-    at this helper's call sites in :func:`run_scoped_verification`).  A bug in
-    the pure decision layer — an unforeseen ``VerifyCmd``/dataclass edge, or a
-    future change to ``_verify_cmd_to_dict``/``to_dict`` — must never fail an
-    otherwise-passing verify attempt just because its diagnostic record
-    couldn't be built.  Catches broadly and logs a warning, returning ``None``
-    (``VerifyResult.plan``'s own default) on any failure instead of
-    propagating and failing the gate.
+    Used by the fallback (no-``module_configs``) branch of
+    :func:`run_scoped_verification` — the module-config branch derives its
+    plan directly and executes it (see
+    :func:`_executed_module_configs_from_plan`), so this helper's job is
+    giving the fallback branch the same ``VerifyResult.plan`` treatment: it
+    best-effort-builds the EXECUTED plan record without re-deriving it
+    inline. When *executed_fallback* is given (the fallback branch's own
+    already-executed ``ModuleConfig``), the derived DECISION plan is folded
+    through :func:`_executed_fallback_plan` first, so the returned dict
+    records what actually ran (module_prefix + rendered command) rather than
+    the idealized flat ``'__fallback__'`` decision alone. A bug in the
+    decision layer or this reconciliation — an unforeseen ``VerifyCmd``/
+    dataclass edge, or a future change to ``_verify_cmd_to_dict``/``to_dict``
+    — must never fail an otherwise-passing verify attempt just because its
+    plan record couldn't be built. Catches broadly and logs a warning,
+    returning ``None`` (``VerifyResult.plan``'s own default) on any failure
+    instead of propagating and failing the gate.
     """
     try:
-        return verify_plan.derive_verify_plan(
+        plan = verify_plan.derive_verify_plan(
             existing_files, module_configs, config, worktree_reader, role=role,
-        ).to_dict()
-    except Exception as exc:  # noqa: BLE001 — diagnostic-only; must never fail the verify gate
+        )
+        if executed_fallback is not None:
+            plan = _executed_fallback_plan(plan, executed_fallback)
+        return plan.to_dict()
+    except Exception as exc:  # noqa: BLE001 — best-effort; must never fail the verify gate
         logger.warning(
             'derive_verify_plan failed — omitting VerifyResult.plan for this attempt: %s',
             exc, exc_info=True,
@@ -3844,24 +3948,27 @@ async def run_scoped_verification(
                 # Filter to files that still exist — tasks may delete files as part of their work
                 existing_files = [f for f in task_files if (worktree / f).exists()]
                 # Shared structural-content cache (task γ amendment): threaded
-                # through every scope_module_config call below AND into
-                # derive_verify_plan's worktree_reader further down, so a
+                # into derive_verify_plan's worktree_reader below, so a
                 # touched file is read from disk at most once per attempt
                 # instead of once per (module, observability) consumer.
                 _content_cache: dict[str, str | None] = {}
-                # scope_module_config returns None when no files touch the subproject;
-                # those subprojects are skipped rather than running their full suite.
-                per_module = [
-                    (
-                        mc.prefix,
-                        scope_module_config(
-                            mc, existing_files, worktree=worktree, content_cache=_content_cache,
-                        ),
-                    )
-                    for mc in module_configs
-                ]
-                skipped = [prefix for prefix, scoped_mc in per_module if scoped_mc is None]
-                scoped = [scoped_mc for _prefix, scoped_mc in per_module if scoped_mc is not None]
+                # Plan-authoritative execution (task κ,
+                # verify-scope-inversion-prd.md): derive_verify_plan is the
+                # SOLE decision tree for module scope now — classify_file
+                # runs exactly once per touched file here, not a second time
+                # in a hand-mirrored scope_module_config tree.
+                # _executed_module_configs_from_plan renders each module's
+                # PlannedRuns into the ModuleConfig run_verification actually
+                # executes; a module whose only run is "no files under
+                # prefix" is dropped entirely (mirrors scope_module_config's
+                # `return None` "caller must skip this subproject" contract).
+                plan = verify_plan.derive_verify_plan(
+                    existing_files, module_configs, config,
+                    _worktree_reader(worktree, cache=_content_cache), role=role,
+                )
+                scoped = _executed_module_configs_from_plan(module_configs, plan)
+                scoped_prefixes = {mc.prefix for mc in scoped}
+                skipped = [mc.prefix for mc in module_configs if mc.prefix not in scoped_prefixes]
                 if skipped:
                     logger.info(
                         'Verification scope: skipping %d subproject(s) with no matching files: %s',
@@ -3917,34 +4024,12 @@ async def run_scoped_verification(
                 n_files = len(existing_files)
                 n_mods = len(scoped)
                 logger.info('Verification mode: file-scoped (%d files across %d subprojects)', n_files, n_mods)
-                # Declarative decision record (task γ, verify_plan.py) — NOT
-                # the execution driver: scope_module_config (above) already
-                # built `scoped`, preserving its subproject-narrowing/cargo
-                # logic byte-for-byte. derive_verify_plan is attached to the
-                # aggregated result (VerifyResult.plan) and logged per
-                # attempt for observability/diagnosis.
-                #
-                # Fidelity note: this plan is derived from the pre-scope
-                # `module_configs` + `existing_files` via derive_verify_plan's
-                # OWN independent per-tool scope_kind decision (the same
-                # classify_file predicates as scope_module_config, but not
-                # literally read back from the `scoped` ModuleConfigs above)
-                # — it is not reconciled against `scoped`/`skipped` line for
-                # line. A module scope_module_config skips for lack of
-                # matching files is recorded the same way here (a single
-                # SKIPPED PlannedRun, from the identical prefix filter), but
-                # if scope_module_config's decision tree ever grows a new
-                # narrowing branch, _derive_module_runs must be updated in
-                # parallel to keep this record accurate (see
-                # derive_verify_plan's "Fidelity" docstring paragraph).
-                # Reuses `_content_cache` (built above for scope_module_config)
-                # so the structural-content probe reads each file once.
-                plan_dict = _safe_derive_verify_plan_dict(
-                    existing_files, module_configs, config,
-                    _worktree_reader(worktree, cache=_content_cache), role=role,
-                )
-                if plan_dict is not None:
-                    logger.info('Verify plan: %s', plan_dict)
+                # `plan` (derived once, above) IS the execution driver for
+                # this branch — `scoped` was built from it by
+                # _executed_module_configs_from_plan. Reuse the same object
+                # for VerifyResult.plan rather than deriving a second time.
+                plan_dict = plan.to_dict()
+                logger.info('Verify plan: %s', plan_dict)
             else:
                 scoped = module_configs
                 plan_dict = None
@@ -4002,26 +4087,28 @@ async def run_scoped_verification(
                     fallback, existing_files, worktree, scope_cargo_enabled,
                 )
                 logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
-                # Declarative decision record (task γ) — see the
-                # module_configs branch's identical comment above; not the
-                # execution driver. module_configs is [] here by construction
-                # (we're past the `if module_configs:` branch above), which
-                # selects derive_verify_plan's fallback branch.
-                #
-                # Fidelity note (see _derive_fallback_runs's docstring for
-                # detail): this fallback plan does NOT model the
-                # subproject/mixed-root+subproject rescoping (tasks 2344/
-                # 2368) that _build_fallback_config (above) actually applies
-                # to `fallback`. When the diff lands in a real subproject,
-                # execution runs `cd <sub> && uv run pytest ...` while this
-                # plan still records a flat `'__fallback__'` run against
-                # *existing_files* — the D1/D2 scope_kind decision itself is
-                # unaffected, but the recorded module_prefix/targets/cwd can
-                # diverge from what actually ran. Its structural-content read
-                # is NOT deduped against _build_fallback_config's own read
-                # above (see the NOTE at the _build_fallback_config call site).
+                # Plan-authoritative execution (task κ,
+                # verify-scope-inversion-prd.md): derive_verify_plan's
+                # fallback branch supplies the D1/D2 scope_kind DECISION (why
+                # a tool slot is FULL_SUITE/FILE_SCOPED/SKIPPED);
+                # _build_fallback_config (above) still owns the
+                # filesystem-dependent RENDERING (subproject cd-scoping,
+                # mixed root+subproject scoping, TYPE/LINT uv-context
+                # rescoping, OPAQUE fleet-chain first-clause scoping — see
+                # its own docstring) exactly as before this task. Passing
+                # `fallback` (the already-executed, already-cargo-scoped
+                # ModuleConfig) as `executed_fallback` below folds that
+                # rendering back onto the plan via _executed_fallback_plan,
+                # so VerifyResult.plan records the EXECUTED command
+                # (module_prefix + cmd) rather than an idealized flat
+                # '__fallback__' guess that ignores subproject rescoping. Its
+                # structural-content read is still NOT deduped against
+                # _build_fallback_config's own read above (see the NOTE at
+                # the _build_fallback_config call site) — unchanged from
+                # before this task.
                 plan_dict = _safe_derive_verify_plan_dict(
                     existing_files, module_configs, config, _worktree_reader(worktree), role=role,
+                    executed_fallback=fallback,
                 )
                 if plan_dict is not None:
                     logger.info('Verify plan: %s', plan_dict)
