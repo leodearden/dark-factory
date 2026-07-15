@@ -182,6 +182,22 @@ class TestDisallowedToolLists:
         """
         assert 'mcp__fused-memory__count_memories_by_metadata' not in STAGE3_DISALLOWED
 
+    def test_get_cycle_summary_presence_not_in_stage1_or_stage2_disallowed(self):
+        """Pin get_cycle_summary_presence as auto-allowed (read-only) in Stage 1 and Stage 2.
+
+        get_cycle_summary_presence is the read-only ledger-presence tool Stage 1 and
+        Stage 2 now call as PRIMARY in their missing-cycle-summary decision logic
+        (task 2625), mirroring how Stage 3 already relies on it (task 2437). It must
+        NOT appear in STAGE1_DISALLOWED or STAGE2_DISALLOWED, or the prompt wiring
+        added for those stages would be silently uncallable. This guard passes
+        immediately — the tool was never in either list — and catches accidental
+        future addition to any of the DISALLOW_MEMORY_WRITES, DISALLOW_TASK_WRITES,
+        or DISALLOW_BUILTIN lists that compose them, mirroring
+        test_count_memories_by_metadata_not_in_stage3_disallowed above.
+        """
+        assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE1_DISALLOWED
+        assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE2_DISALLOWED
+
 
 class TestStageSubclasses:
     """Each stage subclass returns the correct disallowed list."""
