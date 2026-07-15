@@ -6101,6 +6101,57 @@ class GitOps:
         )
         return rc == 0
 
+    async def commit_effect_present_in_main(self, commit_sha: str) -> bool:
+        """Return True iff *commit_sha*'s own effect is still present at main HEAD.
+
+        Companion check to :meth:`is_ancestor` for the found_on_main
+        post-hoc-revert blind spot (task 2500): a cited commit can remain
+        an ancestor of main forever — ancestry is immutable history — even
+        after a LATER commit on main reverts exactly the paths it
+        touched.  ``is_ancestor`` alone cannot see that the commit's own
+        effect is gone from current HEAD.
+
+        Computes ``touched = git diff-tree --no-commit-id --name-only -r
+        <commit_sha>`` (plain diff-tree, no ``-m``/``-c`` — this is the
+        commit's own diff against its sole parent for an ordinary commit,
+        and is empty by git's own default behavior for a merge commit)
+        and, when non-empty, returns whether ``git diff --quiet
+        <commit_sha> <main> -- <touched...>`` reports no difference — i.e.
+        main HEAD still carries byte-identical content for every path
+        *commit_sha* touched.
+
+        Returns True (path-based revert detection inapplicable) when:
+        - ``touched`` is empty — a merge commit (plain diff-tree shows no
+          per-file diff for a merge by default) or a genuinely empty
+          commit.  This deliberately preserves prior mark-done behavior
+          for journal-hit (:class:`MergeProvenance` ``advanced_sha``) and
+          merge-marker (:meth:`find_merge_marker`) shas, which are always
+          merge commits — only the git-fallback branch-tip work-commit
+          case gets a real check.
+
+        Returns False (fail-safe — never claim an effect is present on
+        doubt) when:
+        - the ``diff-tree`` call errors (rc != 0);
+        - the ``diff --quiet`` call errors for a reason other than "paths
+          differ" (rc not in {0, 1}); or
+        - any touched path differs between *commit_sha* and main HEAD
+          (rc == 1) — the shape a post-hoc revert produces.
+        """
+        rc, touched_out, _ = await _run(
+            ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', commit_sha],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return False
+        touched = [f for f in touched_out.strip().splitlines() if f.strip()]
+        if not touched:
+            return True
+        rc, _, _ = await _run(
+            ['git', 'diff', '--quiet', commit_sha, self.config.main_branch, '--', *touched],
+            cwd=self.project_root,
+        )
+        return rc == 0
+
     async def worktree_head_beyond_main(self, worktree: Path) -> str | None:
         """Return the HEAD SHA when *worktree* carries commits beyond main, else None.
 
