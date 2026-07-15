@@ -641,6 +641,7 @@ class AgentStub:
         timeout_seconds: float | None = None,
         config_dir: Path | None = None,
         env_overrides: dict[str, str] | None = None,
+        spawn_env: dict[str, str] | None = None,
         startup_grace_secs: float = 120.0,
         working_idle_secs: float | None = None,
         absolute_cap_secs: float | None = None,
