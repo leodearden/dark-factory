@@ -431,18 +431,34 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
 
 
 # Pytest node-id extraction for the main-tip-sweep isolated-rerun confirm gate
-# (task 2370). Two failure surfaces produce a recoverable node-id:
-#   1. A genuine assertion/collection failure: the ``FAILED <nodeid>`` summary
-#      line pytest prints per failing test (optionally followed by a trailing
-#      `` - <reason>``, e.g. `` - AssertionError: ...``).
-#   2. An xdist worker crash (task 1907's --max-worker-restart=0): either an
+# (task 2370). Three failure surfaces produce a recoverable node-id:
+#   1. A genuine assertion/collection-level test failure: the ``FAILED
+#      <nodeid>`` summary line pytest prints per failing test (optionally
+#      followed by a trailing `` - <reason>``, e.g. `` - AssertionError:
+#      ...``).
+#   2. A fixture/teardown/collection ERROR: the ``ERROR <nodeid>`` short
+#      summary line pytest prints for a test whose setup/teardown raised
+#      (test-level, ``::``-qualified), or the bare ``ERROR <file.py>`` form
+#      pytest prints when an entire module fails to collect (no single test
+#      to name, so the whole file becomes the isolation target). Without
+#      this surface, a failing_result mixing a genuine ERROR with one or
+#      more load-induced FAILED flakes would extract only the FAILED
+#      node-ids, re-run just those, see them pass, and suppress — masking
+#      the ERROR, which is never re-run.
+#   3. An xdist worker crash (task 1907's --max-worker-restart=0): either an
 #      explicit ``crashed while running '<nodeid>'`` notice, or — when that
 #      phrasing is absent — the in-progress ``<nodeid>`` line pytest-xdist
 #      prints immediately before reporting ``[gwN] node down: Not properly
 #      terminated`` for the worker that was running it.
-# All three patterns are anchored/multiline like the _PYTEST_* patterns above
-# so they don't false-match indented traceback prose.
+# The FAILED/ERROR summary-line patterns and the node-down-preceding pattern
+# are all line-anchored (``^``), like the _PYTEST_* patterns above, so they
+# don't false-match indented traceback prose. _XDIST_CRASH_NODEID_RE is the
+# one exception: the crash notice is not line-anchored (it can appear
+# mid-line), so it instead relies on its distinctive literal "crashed while
+# running" prefix to avoid false matches.
 _FAILED_LINE_NODEID_RE = re.compile(r'^FAILED\s+(\S+\.py::\S+)', re.MULTILINE)
+_ERROR_LINE_NODEID_RE = re.compile(r'^ERROR\s+(\S+\.py::\S+)', re.MULTILINE)
+_ERROR_LINE_FILE_RE = re.compile(r'^ERROR\s+(\S+\.py)(?:\s|$)', re.MULTILINE)
 _XDIST_CRASH_NODEID_RE = re.compile(
     r"crashed while running '?([^'\s]+\.py::[^'\s]+)'?", re.MULTILINE,
 )
@@ -453,13 +469,14 @@ _XDIST_NODE_DOWN_PRECEDING_NODEID_RE = re.compile(
 
 
 def _extract_failing_test_ids(test_output: str) -> list[str]:
-    """Extract pytest node-ids of failing/crashed tests from *test_output*.
+    """Extract pytest node-ids of failing/errored/crashed tests from *test_output*.
 
-    Scans for the two failure surfaces documented above the module-level
-    patterns: ``FAILED <nodeid>`` summary lines, and xdist worker-crash
-    notices (both the explicit ``crashed while running '<nodeid>'`` phrasing
-    and the in-progress ``<nodeid>`` line immediately preceding a ``node
-    down: Not properly terminated`` marker).
+    Scans for the three failure surfaces documented above the module-level
+    patterns: ``FAILED <nodeid>`` summary lines, ``ERROR <nodeid>`` /
+    ``ERROR <file.py>`` summary lines (fixture/teardown/collection errors),
+    and xdist worker-crash notices (both the explicit ``crashed while
+    running '<nodeid>'`` phrasing and the in-progress ``<nodeid>`` line
+    immediately preceding a ``node down: Not properly terminated`` marker).
 
     Returns node-ids in first-seen (leftmost-match) order, de-duplicated.
     Returns ``[]`` for falsy *test_output* or output with no recoverable
@@ -473,6 +490,8 @@ def _extract_failing_test_ids(test_output: str) -> list[str]:
     matches: list[tuple[int, str]] = []
     for pattern in (
         _FAILED_LINE_NODEID_RE,
+        _ERROR_LINE_NODEID_RE,
+        _ERROR_LINE_FILE_RE,
         _XDIST_CRASH_NODEID_RE,
         _XDIST_NODE_DOWN_PRECEDING_NODEID_RE,
     ):
@@ -4773,7 +4792,10 @@ async def confirm_main_tip_failure_is_real(
     node-id, the common case for the sweep's aggregated per-subproject
     output) or ``<worktree>/<relpath>`` (already worktree-root-relative /
     prefix-qualified). Node-ids owned by the same subproject are grouped into
-    one scoped+serial re-run.
+    one scoped+serial re-run. If a node-id's relative path happens to exist
+    under more than one discovered subproject, the first (by module-config
+    discovery order) is used and a WARNING is logged — this is a low-
+    likelihood, non-fatal ambiguity, not a fail-safe-to-alarm path.
     """
     import uuid  # noqa: PLC0415, I001 — lazy, mirrors run_main_tip_sweep/verify_failure_is_preexisting_on_main
     from orchestrator.config import _discover_module_configs  # noqa: PLC0415
@@ -4836,18 +4858,18 @@ async def confirm_main_tip_failure_is_real(
         groups: dict[str, list[str]] = {}
         for node_id in node_ids:
             file_part = node_id.split('::', 1)[0]
-            matched_prefix: str | None = None
-            matched_node_id: str = node_id
+            # Collect EVERY subproject the node-id could belong to (not just
+            # the first) so a bare relative path that happens to exist under
+            # more than one discovered subproject can be flagged rather than
+            # silently mis-attributed to whichever prefix iterates first —
+            # see the docstring's "Node-id -> subproject mapping" section.
+            candidates: list[tuple[str, str]] = []
             for prefix, _mc in module_configs.items():
                 if (tmp_path / prefix / file_part).exists():
-                    matched_prefix = prefix
-                    matched_node_id = f'{prefix}/{node_id}'
-                    break
-                if file_part.startswith(f'{prefix}/') and (tmp_path / file_part).exists():
-                    matched_prefix = prefix
-                    matched_node_id = node_id
-                    break
-            if matched_prefix is None:
+                    candidates.append((prefix, f'{prefix}/{node_id}'))
+                elif file_part.startswith(f'{prefix}/') and (tmp_path / file_part).exists():
+                    candidates.append((prefix, node_id))
+            if not candidates:
                 logger.info(
                     'confirm_main_tip_failure_is_real: node-id %r did not map '
                     'to any discovered subproject at %s — unconfirmable, '
@@ -4855,6 +4877,16 @@ async def confirm_main_tip_failure_is_real(
                     node_id, _sha_prefix,
                 )
                 return True
+            if len(candidates) > 1:
+                logger.warning(
+                    'confirm_main_tip_failure_is_real: node-id %r matched %d '
+                    'discovered subprojects (%s) at %s — using %r; a relative '
+                    'path shared across subprojects can mis-attribute the '
+                    'isolated re-run to the wrong ModuleConfig',
+                    node_id, len(candidates), [c[0] for c in candidates],
+                    _sha_prefix, candidates[0][0],
+                )
+            matched_prefix, matched_node_id = candidates[0]
             groups.setdefault(matched_prefix, []).append(matched_node_id)
 
         # Each subproject group gets its own scoped + forced-serial isolated
