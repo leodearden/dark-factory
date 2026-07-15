@@ -486,6 +486,49 @@ class TestStage1LedgerPresenceWiring:
         assert 'count_memories_by_metadata' in STAGE1_SYSTEM_PROMPT
 
 
+class TestStage2LedgerPresenceWiring:
+    """Stage 2 consults the ReconLedgerStore ground truth
+    (``get_cycle_summary_presence``) as the PRIMARY presence authority when
+    re-verifying a carry-forward missing_stage2_summary finding, mirroring
+    Stage 3's τ2 wiring (task 2437) (task 2625).
+    """
+
+    def test_stage2_prompt_names_ledger_tool_in_available_tools(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'mcp__fused-memory__get_cycle_summary_presence' in STAGE2_SYSTEM_PROMPT, (
+            'STAGE2_SYSTEM_PROMPT must name get_cycle_summary_presence in its '
+            '## Available Tools section.'
+        )
+
+    def test_stage2_prompt_checks_ledger_before_reconstructing(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert (
+            "mcp__fused-memory__get_cycle_summary_presence(project_id=..., "
+            "run_id=<reconstructed run's full UUID>, stage='task_knowledge_sync')"
+        ) in STAGE2_SYSTEM_PROMPT, (
+            'Stage 2 must consult get_cycle_summary_presence with '
+            "stage='task_knowledge_sync' before deciding whether to reconstruct a "
+            'carry-forward missing_stage2_summary finding.'
+        )
+
+    def test_stage2_prompt_has_ledger_authoritative_anchors(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'ledger_available' in STAGE2_SYSTEM_PROMPT
+        assert 'AUTHORITATIVE' in STAGE2_SYSTEM_PROMPT
+
+    def test_stage2_prompt_retains_post_write_recheck_and_retry_nonce(self):
+        """The existing post-write count_memories_by_metadata re-check + retry_nonce
+        retry loop must be retained as the inconclusive-only fallback verification,
+        never deleted (fail-safe monotonicity)."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'count_memories_by_metadata' in STAGE2_SYSTEM_PROMPT
+        assert 'retry_nonce' in STAGE2_SYSTEM_PROMPT
+
+
 class TestTaskKnowledgeSyncPayload:
     """TaskKnowledgeSync.assemble_payload() uses correct project attributes."""
 
