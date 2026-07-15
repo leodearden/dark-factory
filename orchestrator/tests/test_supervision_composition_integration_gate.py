@@ -52,6 +52,7 @@ of these helpers to import.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 from pathlib import Path
@@ -548,6 +549,38 @@ class TestR2WorkingDirectory:
 # abandoned bounded, mid-ladder, with the reverse-order shutdown ladder still
 # completing — the structural elimination of the shutdown-hang class.
 # ---------------------------------------------------------------------------
+
+
+async def _stop_all_with_wedging_middle(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """S1 driver: a real LifecycleRegistry registers a service, then a
+    wedging service (stop() never returns), then a third service.stop_all()
+    bounds the wedger's stop() by its own stop_timeout_secs (0.05s — far
+    below the 5s outer wait_for bound below), abandons it with a WARNING,
+    and still reaches the earlier-registered service in reverse order — no
+    hang. Returns the recorded stop-order list."""
+    from orchestrator.background_service import LifecycleRegistry
+
+    calls: list[str] = []
+    registry = LifecycleRegistry()
+
+    class _WedgingService:
+        name = 'wedge'
+        stop_timeout_secs = 0.05
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            await asyncio.Event().wait()  # never set: wedges forever
+
+    registry.register(_RecordingService('a', calls))
+    registry.register(_WedgingService())
+    registry.register(_RecordingService('c', calls))
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.background_service'):
+        await asyncio.wait_for(registry.stop_all(), timeout=5)
+
+    return calls
 
 
 @pytest.mark.asyncio
