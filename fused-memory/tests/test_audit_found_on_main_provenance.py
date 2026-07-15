@@ -418,3 +418,92 @@ class TestClassifyReverted:
         joined = ' '.join(reasons).lower()
         assert 'revert' in joined
         assert 'missing' in joined
+
+
+# ===========================================================================
+# Step-11/12: classify — deliverable_absent / unverifiable / ok + precedence
+# ===========================================================================
+
+class TestClassifyDeliverableAbsent:
+    """deliverable_absent: declared files exist but none appear in the commit diff."""
+
+    def test_no_declared_file_in_commit_diff_yields_deliverable_absent(self):
+        audit = _audit(
+            is_ancestor=True,
+            commit_message='Merge task/50 into main',
+            declared_files=['src/thing.py'],
+            commit_files=['README.md'],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'deliverable_absent'
+        assert reasons
+
+
+class TestClassifyUnverifiable:
+    """unverifiable: nothing to check against — no declared files and no self-citation."""
+
+    def test_no_declared_files_and_no_self_citation_yields_unverifiable(self):
+        audit = _audit(
+            is_ancestor=True,
+            commit_message='chore: general cleanup',
+            declared_files=[],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'unverifiable'
+        assert reasons
+
+
+class TestClassifyOk:
+    """ok: every check passes — self-cited (or declared files present), no revert/missing."""
+
+    def test_self_cited_with_no_declared_files_is_ok(self):
+        """Self-citation alone (no declared files to check) is sufficient for ok."""
+        audit = _audit(
+            task_id='50', is_ancestor=True,
+            commit_message='Merge task/50 into main',
+            declared_files=[],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'ok'
+        assert reasons == []
+
+    def test_declared_files_present_in_commit_is_ok(self):
+        """Declared files present in the commit diff are sufficient, even with no citation."""
+        audit = _audit(
+            is_ancestor=True,
+            commit_message='chore: unrelated subject',
+            declared_files=['src/thing.py'],
+            commit_files=['src/thing.py', 'README.md'],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'ok'
+        assert reasons == []
+
+
+class TestClassifyPrecedence:
+    """Earlier rungs of the ladder win over later ones when multiple facts apply."""
+
+    def test_not_on_main_wins_over_deliverable_absent(self):
+        """A not-on-main + deliverable-absent audit resolves to commit_not_on_main,
+        not deliverable_absent.
+        """
+        audit = _audit(
+            is_ancestor=False,
+            commit_message='Merge task/50 into main',
+            declared_files=['src/thing.py'],
+            commit_files=[],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'commit_not_on_main'
+
+    def test_reverted_wins_over_deliverable_absent(self):
+        """A revert + deliverable-absent audit resolves to reverted, not deliverable_absent."""
+        audit = _audit(
+            is_ancestor=True,
+            commit_message='Merge task/50 into main',
+            revert_commit='f' * 40,
+            declared_files=['src/thing.py'],
+            commit_files=[],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'reverted'
