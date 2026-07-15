@@ -370,3 +370,51 @@ class TestClassifyMisattributed:
         audit = _audit(task_id='50', is_ancestor=True, commit_message='chore: general cleanup')
         verdict, _reasons = classify(audit)
         assert verdict != 'misattributed'
+
+
+# ===========================================================================
+# Step-9/10: classify — reverted (post-hoc-revert blind spot)
+# ===========================================================================
+
+class TestClassifyReverted:
+    """reverted: a correctly-attributed, on-ref commit was later undone."""
+
+    def test_revert_commit_set_yields_reverted(self):
+        """A `This reverts commit <sha>` marker found on the ref flags reverted."""
+        audit = _audit(
+            is_ancestor=True,
+            commit_message='Merge task/50 into main',
+            revert_commit='f' * 40,
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'reverted'
+        assert reasons
+        assert any('revert' in r.lower() for r in reasons)
+
+    def test_declared_files_missing_on_main_yields_reverted(self):
+        """A declared deliverable file absent from the ref HEAD flags reverted."""
+        audit = _audit(
+            is_ancestor=True,
+            commit_message='Merge task/50 into main',
+            declared_files=['src/thing.py'],
+            declared_files_missing_on_main=['src/thing.py'],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'reverted'
+        assert reasons
+        assert any('missing' in r.lower() for r in reasons)
+
+    def test_reason_distinguishes_the_two_subsignals(self):
+        """When both signals are present, the reasons mention both distinctly."""
+        audit = _audit(
+            is_ancestor=True,
+            commit_message='Merge task/50 into main',
+            revert_commit='f' * 40,
+            declared_files=['src/thing.py'],
+            declared_files_missing_on_main=['src/thing.py'],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'reverted'
+        joined = ' '.join(reasons).lower()
+        assert 'revert' in joined
+        assert 'missing' in joined
