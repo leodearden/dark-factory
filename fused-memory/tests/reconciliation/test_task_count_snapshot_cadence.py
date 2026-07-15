@@ -38,6 +38,7 @@ from fused_memory.models.reconciliation import (
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     TaskKnowledgeSync,
+    _prune_task_count_snapshots,
     _verify_task_count_snapshot_written,
     _write_task_count_snapshot,
 )
@@ -458,6 +459,61 @@ class TestVerifyTaskCountSnapshotWritten:
         )
 
         assert result is True
+
+
+# ---------------------------------------------------------------------------
+# _prune_task_count_snapshots (stages/task_knowledge_sync.py) -- task 2429 step-1/2, step-3/4
+# ---------------------------------------------------------------------------
+
+
+class TestPruneTaskCountSnapshots:
+    """_prune_task_count_snapshots(memory_service, project_id, run_id) -> int.
+
+    Best-effort, never-raising deletion of ALL existing kind='task_count_snapshot'
+    Mem0 records, so that a subsequent add_memory leaves exactly one canonical
+    snapshot. Structurally mirrors _sweep_stale_persistence_markers's
+    enumerate-via-get_memories_by_metadata + parallel-delete-via-gather_collect
+    template, minus the age cutoff (this prune deletes ALL matches, not just
+    aged ones).
+    """
+
+    @pytest.mark.asyncio
+    async def test_deletes_all_enumerated_records_and_returns_count(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'm1', 'created_at': '2026-07-01T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm2', 'created_at': '2026-07-02T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm3', 'created_at': '2026-07-03T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+        ]
+        memory_service.delete_memory.return_value = None
+
+        result = await _prune_task_count_snapshots(memory_service, 'reify', 'run-1')
+
+        assert result == 3
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+        _, kwargs = memory_service.get_memories_by_metadata.await_args
+        assert kwargs['filters'] == {'kind': 'task_count_snapshot'}
+
+        assert memory_service.delete_memory.await_count == 3
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'m1', 'm2', 'm3'}
+        for call in memory_service.delete_memory.call_args_list:
+            call_kwargs = call.kwargs
+            assert call_kwargs.get('store') == 'mem0'
+            assert call_kwargs.get('project_id') == 'reify'
+            assert call_kwargs.get('causation_id') == 'run-1'
+
+    @pytest.mark.asyncio
+    async def test_empty_enumeration_returns_zero_and_no_deletes(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+
+        result = await _prune_task_count_snapshots(memory_service, 'reify', 'run-1')
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
