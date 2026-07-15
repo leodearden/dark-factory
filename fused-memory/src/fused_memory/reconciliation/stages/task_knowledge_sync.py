@@ -1044,17 +1044,65 @@ async def _prune_task_count_snapshots(
     canonical snapshot surviving per project — self-correcting the
     near-duplicate accumulation that manual/LLM-driven cleanups failed to
     keep pruned.
+
+    Enumerates deterministically via ``memory_service.get_memories_by_metadata``
+    (Qdrant payload-filter scroll) — NEVER semantic search, which silently
+    drops low-similarity rows and is unsuitable for exhaustive GC. Unlike
+    :func:`_sweep_stale_persistence_markers`, this applies NO age cutoff:
+    every enumerated ``kind='task_count_snapshot'`` match is deleted —
+    including LLM-authored duplicates — so the caller's subsequent
+    ``add_memory`` leaves exactly one canonical snapshot.
+
+    Best-effort and never raises: an enumeration failure or a per-item
+    delete failure degrades to a WARNING log and is excluded from the
+    returned count, rather than aborting the caller's write.
+
+    Args:
+        memory_service: Service with ``get_memories_by_metadata`` and
+            ``delete_memory``.
+        project_id: Project scope for enumeration and delete calls.
+        run_id: Current reconciliation run identifier used as ``causation_id``
+            in the audit journal.
+        scroll_limit: Max records to enumerate in one scroll (default 1000).
+
+    Returns:
+        Number of memories successfully deleted (0 if nothing matched, or
+        on enumeration failure).
     """
-    members = await memory_service.get_memories_by_metadata(
-        project_id=project_id,
-        filters={'kind': TASK_COUNT_SNAPSHOT_KIND},
-        limit=scroll_limit,
-    )
+    try:
+        members = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={'kind': TASK_COUNT_SNAPSHOT_KIND},
+            limit=scroll_limit,
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._prune_task_count_snapshots: '
+            'get_memories_by_metadata failed for project_id=%s; skipping prune',
+            project_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return 0
+
+    if len(members) >= scroll_limit:
+        logger.warning(
+            'reconciliation._prune_task_count_snapshots: enumerated %d of scroll_limit=%d '
+            'task_count_snapshot records — scroll cap reached; older stale snapshots may '
+            'remain unpruned this cycle; re-run with a higher scroll_limit.',
+            len(members), scroll_limit,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
 
     ids = [member['id'] for member in members if member.get('id')]
     if not ids:
         return 0
 
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents this delete pass from silently converting a shutdown
+    # signal into an under-counted deletion tally.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
     results = await gather_collect(
         memory_service.delete_memory(
             memory_id=mid,
@@ -1066,7 +1114,26 @@ async def _prune_task_count_snapshots(
         for mid in ids
     )
 
-    return sum(1 for result in results if not isinstance(result, Exception))
+    success_count = 0
+    for mid, result in zip(ids, results, strict=True):
+        if isinstance(result, Exception):
+            logger.warning(
+                'reconciliation._prune_task_count_snapshots: delete failed for memory_id=%s; not counted',
+                mid,
+                extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
+            )
+        else:
+            success_count += 1
+
+    if success_count:
+        logger.info(
+            'reconciliation._prune_task_count_snapshots: pruned %d stale task_count_snapshot '
+            'record(s) for project_id=%s prior to canonical write',
+            success_count, project_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+
+    return success_count
 
 
 async def _write_task_count_snapshot(
