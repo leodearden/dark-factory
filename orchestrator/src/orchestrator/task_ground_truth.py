@@ -390,7 +390,15 @@ class TaskGroundTruth:
             # narrower tuple let a byte-corrupt lock escape uncaught
             # (review finding #2).
             lock_data = None
-        if lock_data is not None:
+        # read_plan_lock's `-> dict | None` type hint is aspirational: its
+        # implementation is a bare `json.loads(...)`, so syntactically valid
+        # but non-dict JSON (e.g. a corrupt lock truncated to `[1, 2]`)
+        # passes through as a list/str/number rather than raising. Guard
+        # explicitly rather than crashing `.get()` below — same "degrade to
+        # no plan-lock claimant" intent as the except block above (task
+        # 2243, W10-θ2 wiring; caught by
+        # test_reconcile_lock_format_variants[non-dict-json]).
+        if isinstance(lock_data, dict):
             owner_pid = lock_data.get('owner_pid')
             try:
                 owner_alive = owner_pid is not None and _pid_alive(int(owner_pid))

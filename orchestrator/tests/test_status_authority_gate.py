@@ -352,10 +352,14 @@ class TestB2StrandedInProgressRevert:
         )
         harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]
 
-    async def test_live_claimant_not_reverted(self, harness: Harness) -> None:
-        """Contrast: a LIVE claimant (fresh plan.lock, live owner_pid) on a
-        startup sweep (mid_run=False) is left intact — the stranded-revert
-        sweep only reaps tasks with NO live claimant."""
+    async def test_live_looking_lock_no_longer_gates_applier(self, harness: Harness) -> None:
+        """Task 2243, W10-θ2 step-16: a plan.lock recording a live owner_pid
+        no longer short-circuits this applier — that determination now
+        belongs to TaskGroundTruth.recovery_for's live_claimant resolution,
+        which has already ruled out a live claimant before REVERT_TO_PENDING
+        is dispatched here. Calling the applier directly with a live-looking
+        lock now reverts (see test_harness_infra_hold_repend.py's
+        TestRevertInProgressLivenessGateRetired for the full parity suite)."""
         tid = 'zeta-b2-live'
         _make_worktree(harness, tid, with_lock=True)
         harness.scheduler.get_task = AsyncMock(return_value={
@@ -364,11 +368,11 @@ class TestB2StrandedInProgressRevert:
 
         result = await harness._revert_in_progress_if_no_live_claimant(tid, mid_run=False)
 
-        assert result != 'reverted', (
-            f'Task with a live claimant (fresh plan.lock) must not be '
-            f'reverted; got {result!r}'
+        assert result == 'reverted', (
+            f'The applier no longer re-derives plan.lock liveness; a '
+            f'live-looking lock must not block the revert. Got {result!r}'
         )
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]
 
     async def test_infra_held_stranded_row_exempt_from_revert(self, harness: Harness) -> None:
         """An infra-held row (status='infra-hold') on a non-degenerate branch

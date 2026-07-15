@@ -221,10 +221,22 @@ class TestMidRunSweepUsesIsActivelyHeld:
     """(d1) The mid-run stranded-in-progress sweep consults
     ``scheduler.is_actively_held()`` (folding dispatched / module-lock-held /
     recent-cancel into one Scheduler-owned check) rather than reaching into
-    the three liveness signals individually."""
+    the three liveness signals individually.
+
+    Updated for task 2243 (W10-θ2, step-12): the driver no longer
+    short-circuits ``_reconcile_one_stranded`` for an actively-held
+    candidate (that standalone ``continue`` guard is retired —
+    ``is_actively_held`` is folded into ``TaskGroundTruth.recovery_for``'s
+    ``live_claimant`` and drives every ``_RECOVERY``-table row to the
+    ``LEAVE`` default, so ``_reconcile_one_stranded`` itself now leaves an
+    actively-held task untouched). ``is_actively_held`` is still consulted
+    directly in the driver, but purely to gate the ``clear_workflow_cancel``
+    lazy-prune housekeeping — no longer to decide whether to process the
+    candidate at all.
+    """
 
     @pytest.mark.asyncio
-    async def test_actively_held_task_skipped_other_processed(
+    async def test_actively_held_task_still_processed_but_not_flipped(
         self, tmp_path: Path,
     ) -> None:
         config = OrchestratorConfig(project_root=tmp_path)
@@ -257,9 +269,11 @@ class TestMidRunSweepUsesIsActivelyHeld:
         assert set(held_queries) == {'held', 'free'}, (
             'is_actively_held must be consulted for every mid-run sweep candidate'
         )
-        assert processed == ['free'], (
-            'a task for which is_actively_held() is True must be skipped as '
-            f'actively held; the other must be processed. processed={processed}'
+        assert processed == ['held', 'free'], (
+            'task 2243 (W10-θ2, step-12): the driver no longer skips calling '
+            '_reconcile_one_stranded for an actively-held candidate — both '
+            'must be processed, relying on recovery_for\'s LEAVE '
+            f'classification (not a driver-level short-circuit). processed={processed}'
         )
         assert cleared == ['free'], (
             'clear_workflow_cancel (lazy prune) must run only for tasks that '

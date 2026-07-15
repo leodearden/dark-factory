@@ -71,6 +71,12 @@ from orchestrator.systemd_inspect import (
     _deterministic_deploy_health_verdict,
     inspect_systemd_unit,
 )
+from orchestrator.task_ground_truth import (
+    BranchStateKind,
+    ClaimantSource,
+    RecoveryAction,
+    TaskGroundTruth,
+)
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_STATUSES,
@@ -102,17 +108,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# After this many consecutive set_task_status rejections for the same task in
-# the stranded-in-progress / blocked sweep, escalate to L1 instead of looping.
-# A genuine persistent failure (server-side validation contradicts a
-# branch-on-main observation) is L1-worthy; transient PID-liveness or
-# branch-resolution races should clear well before this threshold fires.
-MAX_RECONCILE_FAILURES: int = 5
-
 # Maximum number of same-signature blocked→pending re-pends allowed before the
-# 4th flip is withheld and a born-at-L2 human escalation is filed.
-# Mirrors MAX_RECONCILE_FAILURES shape — a module constant so the value stays
-# inside the declared module scope without touching config.py / defaults.yaml.
+# 4th flip is withheld and a born-at-L2 human escalation is filed.  A module
+# constant so the value stays inside the declared module scope without
+# touching config.py / defaults.yaml.
 _REBLOCK_GUARD_THRESHOLD: int = 3
 
 # Fixed sentinel task_id for the dirty-project-root-at-startup born-at-L2
@@ -130,6 +129,16 @@ _DIRTY_TREE_ESCALATION_SENTINEL: str = 'dirty-project-root-startup'
 # The explicit merge-deferred early-return in _reconcile_one_stranded mirrors
 # the open-L1 /unblock veto guard (harness.py _reconcile_one_stranded:~1598).
 _RECONCILE_SWEEP_STATUSES: frozenset[str] = frozenset({'in-progress', 'blocked'})
+
+# heartbeat_ttl the harness configures TaskGroundTruth (task 2243, W10-θ2)
+# with — the staleness threshold TG-3's live_claimant folding applies to the
+# W2 db claimant signal (shared.task_claimant.is_stranded) and the plan.lock
+# freshness cross-check. No dedicated OrchestratorConfig field exists for
+# this yet, so it is bound explicitly here rather than left to silently ride
+# whatever default TaskGroundTruth ships with; the value mirrors
+# TaskGroundTruth's own _DEFAULT_HEARTBEAT_TTL (task_ground_truth.py) and
+# TaskArtifacts.clear_stale_plan_lock's hardcoded 600s default.
+_RECONCILE_HEARTBEAT_TTL: timedelta = timedelta(minutes=10)
 
 # Non-terminal parked statuses whose worktrees are inviolable — owned by a
 # non-scheduler party, not by the task's own progress — and so must NEVER be
@@ -948,6 +957,15 @@ class Harness:
         self._escalation_events: dict[str, asyncio.Event] = {}
         self._escalation_task: asyncio.Task | None = None
 
+        # Ground-truth resolver seam (task 2243, W10-θ2) — lazily built (and
+        # memoized) by _get_ground_truth() the first time a reconcile sweep
+        # needs it. MUST stay unbuilt here: TaskGroundTruth captures
+        # escalation_queue at construction, and self._escalation_queue above
+        # is still None at this point in __init__ (only populated later, in
+        # run()) — building eagerly would freeze that None forever. See
+        # _get_ground_truth's docstring.
+        self._ground_truth: TaskGroundTruth | None = None
+
         # Unified lifecycle seam (task 2241, W10-η — PRD §5.3 LR-1/2/3):
         # the eleven background-loop/service lifecycles below register into
         # ONE ordered LifecycleRegistry instead of eleven hand-rolled
@@ -1045,15 +1063,6 @@ class Harness:
         # volume's total capacity (making disk-recovery auto-resume unreachable).
         self._no_landings_floor_capacity_warned: bool = False
 
-        # Per-task consecutive-failure counter for the reconcile sweep —
-        # cleared on any successful mark_done, used to gate L1 escalation.
-        self._reconcile_failure_counts: dict[str, int] = {}
-        # Per-task consecutive-citation-miss counter for the reconcile sweep —
-        # incremented when the is_ancestor fast-path is short-circuited by a
-        # missing task-id citation on main; reset on any successful flip or
-        # genuine skip (e.g. open L1).  Used to escalate to L1 when the
-        # reconciler refuses to auto-flip a task indefinitely.
-        self._reconcile_skip_counts: dict[str, int] = {}
         # Wall-clock of the most recent _workflow_cancel_events.set() call,
         # keyed by task_id.  R3-race-guard window — the sweep skips a task
         # whose workflow was cancelled within the last grace period, since
@@ -3219,6 +3228,47 @@ Output JSON matching the schema. Every task must appear in the output.
                 'Terminal-lane reconciler: released %d lane(s)', released,
             )
 
+    def _get_ground_truth(self) -> TaskGroundTruth:
+        """Lazily build (and memoize) the ground-truth resolver (task 2243, W10-θ2).
+
+        ``TaskGroundTruth`` captures its ``escalation_queue`` collaborator at
+        construction time; ``self._escalation_queue`` is ``None`` at
+        ``Harness.__init__`` and is only populated later, during ``run()``
+        startup. Building the resolver once in ``__init__`` (or memoizing it
+        on first use with no refresh) would freeze that startup-time
+        ``None`` forever — every open-escalation-aware recovery row
+        (``_RECOVERY`` rows f/g/h in task_ground_truth.py) would then never
+        see a real queue for the rest of the process lifetime (the
+        "frozen-None trap").
+
+        So: build on first call, and REBUILD whenever ``self._escalation_queue``
+        has since changed identity (the one-time ``None`` -> live-queue
+        startup transition in production; a test re-pointing the queue).
+        Once ``self._escalation_queue`` is stable, repeated calls return the
+        SAME memoized instance rather than reconstructing on every reconcile
+        pass.
+        """
+        # getattr (not self._ground_truth directly): several narrow-scope
+        # test harnesses build a Harness via Harness.__new__(Harness),
+        # bypassing __init__ (and its _ground_truth = None seed) entirely —
+        # task 2243, W10-θ2 wiring made this the first call site to actually
+        # reach _get_ground_truth from such a harness (test_harness_
+        # deterministic_recon_sweep.py / test_deterministic_task.py).
+        existing = getattr(self, '_ground_truth', None)
+        if (
+            existing is None
+            or existing.escalation_queue is not self._escalation_queue
+        ):
+            existing = TaskGroundTruth(
+                self.git_ops,
+                self.scheduler,
+                self._escalation_queue,
+                self._resolve_task_worktree,
+                heartbeat_ttl=_RECONCILE_HEARTBEAT_TTL,
+            )
+            self._ground_truth = existing
+        return existing
+
     async def _reconcile_stranded_in_progress(self, *, mid_run: bool = False) -> int:
         """Sweep stranded in-progress tasks back to pending (or done).
 
@@ -3240,44 +3290,36 @@ Output JSON matching the schema. Every task must appear in the output.
         decide whether to keep the main loop running (Fix 4: stuck-blocked
         recovery).
 
-        **Already-on-main fast-path** (is_ancestor == True):
-        When the task branch is already an ancestor of main, the task is
-        terminal.  We resolve the branch to its 40-char commit SHA via
-        ``git rev-parse --verify`` *before* ``cleanup_worktree`` (which calls
-        ``git branch -D`` and would invalidate a post-cleanup rev-parse — see
-        git_ops.py lines around cleanup_worktree).
+        **Ground-truth delegation** (task 2243, W10-θ2): per-candidate
+        branch-state derivation and recovery classification are NOT performed
+        here or in ``_reconcile_one_stranded`` — this driver only filters
+        candidates (``_RECONCILE_SWEEP_STATUSES``) and dispatches each to
+        ``_reconcile_one_stranded``, which calls
+        ``TaskGroundTruth.recovery_for(tid)`` (``_get_ground_truth()``) to get
+        a ``(TruthReport, RecoveryAction)`` pair and then applies the
+        indicated action:
 
-        Success path: ``done_provenance={'commit': <sha>, 'note': '…'}`` —
-        matches the workflow.py:656 convention so downstream consumers
-        (fused-memory ``_validate_done_provenance``,
-        ``invalidate_fabricated_shipping_edges.py``, Stage 2 reconciliation)
-        can identify the SHA the task ended on.
+        - ``MARK_DONE_WITH_PROVENANCE`` → ``_mark_in_progress_done`` calls
+          ``scheduler.mark_done(kind='found_on_main', sha=report.branch_state.sha, ...)``.
+          ``report.branch_state.sha`` is populated whether the resolver found
+          the landing via a ``MergeProvenance`` journal row (journal-first) or
+          its git fallback (``is_ancestor`` / ``find_merge_marker``, resolved
+          internally by ``derive_truth`` — see task_ground_truth.py).
+        - ``REVERT_TO_PENDING`` → ``_revert_in_progress_if_no_live_claimant``
+          flips the task back to pending.
+        - ``RE_FILE_ESCALATION`` → a ``stranded_blocked`` L1 escalation is
+          filed (blocked-status only).
+        - ``LEAVE`` (default) → no change.
 
-        Failure path: if the branch ref vanishes between is_ancestor and the
-        subsequent rev-parse (rare TOCTOU race), ``resolve_branch_sha`` returns
-        None.  We fall back to note-only provenance and emit a WARNING log so
-        operators can spot the race.  Reconciliation is best-effort and must
-        not abort on this edge case; fused-memory accepts note-only provenance.
-
-        **Branch-deleted fast-path** (find_merge_marker):
-        ``is_ancestor`` returns False in two cases: (1) the branch ref still
-        exists but isn't on main — revert is correct; (2) the branch ref is
-        gone — ``git merge-base --is-ancestor`` exits non-zero because it
-        cannot resolve the ref.  Case (2) is the realistic post-merge-queue
-        crash scenario: ``advance_main`` succeeded and ``cleanup_worktree``
-        deleted the branch, but ``set_task_status('done')`` never ran.
-
-        To distinguish case (2) from case (1) we call
-        ``git_ops.find_merge_marker(branch)`` immediately after the
-        ``is_ancestor`` block.  ``find_merge_marker`` gates on
-        ``resolve_branch_sha`` (returns None when the branch is still present,
-        so it can only hit the git-log path when the ref is truly gone), then
-        searches recent main commits for a subject matching
-        ``Merge {branch} into {main_branch}`` — the format ``merge_to_main``
-        writes.  A hit is treated identically to the
-        is_ancestor path: pop ``_recovered_plans``, attempt
-        ``cleanup_worktree`` (swallow errors), call
-        ``set_task_status('done', done_provenance={'commit': marker_sha, ...})``.
+        ``done_provenance={'commit': <sha>, 'note': '…'}`` matches the
+        workflow.py:656 convention so downstream consumers (fused-memory
+        ``_validate_done_provenance``, ``invalidate_fabricated_shipping_edges.py``,
+        Stage 2 reconciliation) can identify the SHA the task ended on. If the
+        resolver's branch ref vanishes mid-derivation (rare TOCTOU race),
+        ``report.branch_state.sha`` is ``None`` and ``_mark_in_progress_done``
+        skips the flip with a WARNING log so operators can spot the race and
+        the next sweep retries; reconciliation is best-effort and must not
+        abort on this edge case.
         """
         statuses, err = await self.scheduler.get_statuses()
         reverted = 0
@@ -3305,19 +3347,25 @@ Output JSON matching the schema. Every task must appear in the output.
         for tid, status in statuses.items():
             if status not in _RECONCILE_SWEEP_STATUSES:
                 continue
-            # is_actively_held folds three liveness signals (dispatched,
-            # module-lock held, recent workflow-cancel stamp — task 2235's
-            # R3 race guard: a workflow soft-cancel set very recently may
-            # still have its finally: block writing state, so skip until the
-            # grace period elapses) into one Scheduler-owned check.
-            if mid_run and self.scheduler.is_actively_held(tid):
-                # Actively held by this run's scheduler — not stranded.
-                continue
-
-            if mid_run:
+            # task 2243, W10-θ2 step-12: the standalone `if mid_run and
+            # is_actively_held(tid): continue` race guard is retired —
+            # is_actively_held (dispatched / module-lock held / recent
+            # workflow-cancel stamp) is folded into recovery_for's
+            # report.live_claimant, and ANY live claimant collapses every
+            # _RECOVERY row to the LEAVE default (see
+            # _reconcile_one_stranded). is_actively_held is still consulted
+            # here (cheap, in-memory, no I/O) purely to decide whether the
+            # cancel-stamp prune below is safe right now — it no longer
+            # gates whether _reconcile_one_stranded runs at all.
+            if mid_run and not self.scheduler.is_actively_held(tid):
                 # Grace window elapsed (or never set) — lazily prune so the
                 # dict stays bounded for tasks that exit terminal and are never
                 # re-dispatched (re-dispatch otherwise clears the stamp).
+                # Gated on is_actively_held being FALSE right now (not merely
+                # "reached this line") so a task still inside its cancel-grace
+                # window isn't pruned out from under recovery_for's own
+                # is_actively_held check a few lines down (which would read
+                # the cleared stamp and wrongly conclude no live claimant).
                 self.scheduler.clear_workflow_cancel(tid)
 
             try:
@@ -3325,30 +3373,28 @@ Output JSON matching the schema. Every task must appear in the output.
                     tid, status, mid_run=mid_run,
                 )
             except SetTaskStatusRejected as exc:
-                # Persistence layer refused our write — count strikes; on
-                # threshold, escalate to L1.  Honest log so future operators
-                # can see *why* the task is still stranded instead of the
-                # old "marked done" misnomer.  Other (unexpected) exception
-                # types intentionally propagate so bugs in the sweep surface
-                # rather than being silently skipped.
-                count = self._reconcile_failure_counts.get(tid, 0) + 1
-                self._reconcile_failure_counts[tid] = count
+                # Persistence layer refused our write — escalate directly
+                # (task 2243, W10-θ2 step-14: the per-tid strike counter and
+                # its MAX_RECONCILE_FAILURES threshold gate are retired; a
+                # persistent rejection is now surfaced loudly on the sweep
+                # it occurs, not tallied toward a threshold first).  Honest
+                # log so future operators can see *why* the task is still
+                # stranded instead of the old "marked done" misnomer.
+                # Other (unexpected) exception types intentionally propagate
+                # so bugs in the sweep surface rather than being silently
+                # skipped.
                 logger.error(
-                    '%s: failed to mark task %s done — %s: %s '
-                    '(consecutive failures=%d/%d)',
+                    '%s: failed to mark task %s done — %s: %s',
                     log_prefix, tid, exc.error_code, exc.raw,
-                    count, MAX_RECONCILE_FAILURES,
                 )
-                if count >= MAX_RECONCILE_FAILURES and self._escalation_queue:
-                    self._escalate_reconcile_failure(tid, exc, count)
+                if self._escalation_queue:
+                    self._escalate_reconcile_failure(tid, exc)
                 continue
 
             if outcome == 'marked_done':
                 marked_done += 1
-                self._reconcile_failure_counts.pop(tid, None)
             elif outcome == 'reverted':
                 reverted += 1
-                self._reconcile_failure_counts.pop(tid, None)
 
         if reverted or marked_done:
             logger.info(
@@ -3382,9 +3428,12 @@ Output JSON matching the schema. Every task must appear in the output.
 
         A branch is degenerate when its live tip SHA equals the recorded
         branch_base_sha (#1226), meaning zero commits were ever pushed beyond
-        the creation point.  Called from the Guard-2 citation-miss path and the
-        Guard-3 citation-hit path in _reconcile_one_stranded to share the same
-        degeneracy signal without duplicating the three-step check.
+        the creation point.  Called from the MARK_DONE_WITH_PROVENANCE
+        degenerate-branch refinement in _reconcile_one_stranded (task 2243,
+        W10-θ2) — downgrading a would-be mark-done to a revert when
+        TaskGroundTruth's resolver classifies a zero-commit branch as
+        ON_MAIN — and from _revert_in_progress_if_no_live_claimant's
+        infra-held guard, which share this same degeneracy signal.
 
         Returns False when:
         - branch_base_sha is absent or not a valid 40-hex SHA (backward compat
@@ -3413,6 +3462,9 @@ Output JSON matching the schema. Every task must appear in the output.
             the worktree must survive intact for the train-merge worker.
             Mirrors the open-L1 veto pattern — explicit early-return as
             belt-and-suspenders on top of the _RECONCILE_SWEEP_STATUSES filter.
+          - mid-run actively-held short-circuit (below): cheap pre-check for
+            a task recovery_for would classify LEAVE anyway (review
+            amendment, task 2243 W10-θ2 reviewer_comprehensive #1).
         """
         # PRD § 9.8 — train-parked tasks must never be reverted or have their
         # worktree cleaned up; the train-merge worker owns their lifecycle.
@@ -3425,277 +3477,160 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             return None
 
+        # Cheap in-memory short-circuit (review amendment, task 2243 W10-θ2
+        # reviewer_comprehensive #1): mid-run, an actively-held task (the
+        # scheduler's own dispatched / module-lock-held / recent-cancel
+        # bookkeeping — the exact signal recovery_for folds into
+        # report.live_claimant) is GUARANTEED to classify LEAVE — no
+        # _RECOVERY row (task_ground_truth.py) has live_claimant=True, so any
+        # live claimant always falls through to the LEAVE default, and
+        # neither sweep-side upgrade above can apply once one is established
+        # (both require report.live_claimant is None). The deep
+        # `is_actively_held` re-check below (kept as defense-in-depth for
+        # mid_run=False and TOCTOU races) would reach the same conclusion —
+        # but only AFTER paying for get_task + recovery_for's derive_truth
+        # (a MergeProvenance lookup and, on a journal miss, up to two git
+        # subprocess calls). This sweep runs periodically over every
+        # in-progress/blocked task, so that cost would otherwise scale with
+        # the number of concurrently-running (i.e. normal, not stranded)
+        # tasks. Outcome-identical to letting recovery_for run — this only
+        # changes WHERE the check happens, not what it decides. The driver
+        # (_reconcile_stranded_in_progress) still calls this function
+        # unconditionally for every candidate (task 2243 step-12 parity — no
+        # driver-level continue reintroduced).
+        if mid_run and self.scheduler.is_actively_held(tid):
+            return None
+
         branch = f'{self.git_ops.config.branch_prefix}{tid}'
 
-        # Fetch task metadata once for both fast-paths (is_ancestor + find_merge_marker).
+        # Fetch task metadata once for the downstream blocked/revert paths
+        # below (unrelated to the mark-done decision, which now derives its
+        # own task row internally via TaskGroundTruth.derive_truth — a second,
+        # accepted fetch until a later step folds this one away too).
         # Scheduler.get_task normalises metadata at the boundary
         # (scheduler.py:_normalize_task_metadata), so task['metadata'] is always a
         # dict whenever task is not None.  `or {}` collapses any residual None value
         # (e.g. a manually-constructed task dict that bypasses normalisation); the
         # load-bearing guard against task itself being absent is `if task else {}`.
-        # The unconditional fetch is the deliberate trade-off: one MCP call per
-        # stranded task even when neither fast-path fires (e.g. lock-state revert),
-        # in exchange for a single source of truth for `metadata` shared by both
-        # fast-paths (eliminating the duplicated per-branch get_task pattern).
         task = await self.scheduler.get_task(tid)
         metadata = (task.get('metadata') or {}) if task else {}
 
-        # Already-on-main fast-path (is_ancestor == True).
-        # NB: is_ancestor is degenerate for zero-commit branches whose tip
-        # equals the main HEAD at branch-create time.  Two guards reject
-        # the false-positive shape before we flip the row to done.
-        if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
-            # Guard 1 — open L1 escalation for this task.  An L1 escalation
-            # is the deliberate human-handoff signal (e.g. workflow ran
-            # _mark_blocked(escalate_to_human=True) when the task was
-            # declared unactionable); the reconciler must not second-guess
-            # the disposition, even if the branch tip happens to sit on a
-            # main ancestor.  Skip counter is intentionally NOT incremented
-            # here — the L1 escalation that triggered the skip already
-            # exists, so double-escalating would spam.
-            if (
-                self._escalation_queue is not None
-                and self._escalation_queue.has_open_l1(tid)
-            ):
-                logger.info(
-                    'Reconcile: task %s on main but has open L1 escalation; '
-                    'leaving status=%s (open L1 vetoes auto-flip)',
-                    tid, status,
-                )
-                return None
+        # Ground-truth mark-done decision (task 2243, W10-θ2): recovery_for
+        # composes derive_truth (journal-first branch-state resolution, TG-1)
+        # with the _RECOVERY classification table (TG-2), retiring the inline
+        # is_ancestor/find_task_citation_commit/find_merge_marker archaeology
+        # (including the citation-guard and stale-marker/prior-incarnation
+        # checks) that used to live here.
+        report, action = await self._get_ground_truth().recovery_for(tid)
 
-            # Guard 2 — positive citation evidence on main.  We require a
-            # commit on main whose subject cites the task id; this rejects
-            # the zero-commit-branch shape where is_ancestor returns True
-            # trivially but no commit actually lands the task's work.
-            # Resolve BEFORE cleanup_worktree (which runs `git branch -D`
-            # and would invalidate a post-cleanup grep against the branch).
-            citation_sha = await self.git_ops.find_task_citation_commit(
-                tid,
-                pattern_template=self.git_ops.config.commit_citation_pattern,
+        # θ1's _RECOVERY table only maps ON_MAIN/GONE_WITH_MERGE_MARKER to
+        # MARK_DONE for TaskStatus.IN_PROGRESS — it carries no row for a
+        # stranded 'blocked' task on the same evidence.  The pre-migration
+        # sweep marks 'blocked' done here too (R4 — see the
+        # _RECONCILE_SWEEP_STATUSES comment above: "out-of-band-merged
+        # blocked tasks... get marked done"): a human `git merge`-ing a
+        # blocked task's branch out-of-band must still self-heal to done.
+        # This is a thin sweep-side upgrade — mirroring the
+        # already-established degenerate-branch refinement pattern
+        # (_branch_is_degenerate below) — rather than a change to θ1's
+        # reviewed table (design decision, task 2243; esc-2243-4).
+        if (
+            action == RecoveryAction.LEAVE
+            and status == 'blocked'
+            and report.live_claimant is None
+            and not report.open_escalations
+            and report.branch_state.kind in (
+                BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER,
             )
-            if citation_sha is None:
-                # -------------------------------------------------------
-                # #1823 degenerate-provisioning-branch guard.
-                #
-                # Guard 3 (below) recognises the degenerate shape on the
-                # citation-HIT path but is unreachable here — this Guard-2
-                # block bails before Guard 3 ever runs.  Each bail
-                # increments the skip counter, so after MAX_RECONCILE_FAILURES
-                # sweeps the reconciler incorrectly escalates
-                # reconcile_citation_missing for a branch that is simply
-                # provisioning-only (no work ever pushed).
-                # Repro: esc-4598-6 cluster (tasks in-progress, tip ==
-                # branch_base_sha, zero commits).
-                # _branch_is_degenerate implements the precise degeneracy
-                # test (tip == branch_base_sha, NOT rev-list==0 — see its
-                # docstring) and is shared with Guard 3 below.
-                if await self._branch_is_degenerate(branch, metadata):
-                    # A degenerate branch (tip == branch_base_sha) carries ZERO
-                    # task work, so is_ancestor==True is a false "already on
-                    # main" signal — nothing landed.  #1823 added this guard to
-                    # suppress a spurious reconcile_citation_missing escalation
-                    # for provisioning-only branches, but `return None` here
-                    # ALSO stranded any in-progress task whose agent died after
-                    # provisioning but before its first commit (the task-2992
-                    # incident: agent killed mid-execute by a restart, no
-                    # commit, branch base still on main → trapped here forever,
-                    # neither reverted nor escalated).  Recover it: an
-                    # in-progress incarnation with no live claimant is reverted
-                    # to pending so the scheduler re-dispatches it.  'blocked'
-                    # keeps the leave-alone behaviour (blocked discipline: never
-                    # blocked→pending; only →done on positive evidence, which a
-                    # degenerate branch is not).
-                    self._reconcile_skip_counts.pop(tid, None)
-                    if status == 'in-progress':
-                        logger.info(
-                            'Reconcile: task %s branch is degenerate (zero '
-                            'commits beyond main; tip == branch_base_sha %s); '
-                            'reverting stranded in-progress to pending '
-                            '(provisioning-only branch, no work landed)',
-                            tid, metadata.get('branch_base_sha'),
-                        )
-                        return await self._revert_in_progress_if_no_live_claimant(
-                            tid, mid_run=mid_run, metadata=metadata, status=status,
-                        )
-                    logger.info(
-                        'Reconcile: task %s branch is degenerate '
-                        '(zero commits beyond main; tip == branch_base_sha %s); '
-                        'skipping citation-missing escalation '
-                        '(provisioning-only branch, status=%s)',
-                        tid, metadata.get('branch_base_sha'), status,
-                    )
-                    return None
-                # -------------------------------------------------------
+        ):
+            action = RecoveryAction.MARK_DONE_WITH_PROVENANCE
 
-                # Task 2112 / angle B — metadata-independent degenerate-ref
-                # classifier fallback. _branch_is_degenerate (above) only
-                # fires when metadata['branch_base_sha'] is present and a
-                # valid 40-hex SHA; a task fault-killed before its metadata
-                # write leaves branch_base_sha absent/malformed, so the
-                # metadata check returns False even though the ref is
-                # actually degenerate (parked on a foreign merge commit,
-                # zero unique commits over main). Repro: esc-4388-46 /
-                # esc-4875-7. warm_lane_ref_is_degenerate wraps reify's
-                # metadata-independent classifier (count==0 over main AND
-                # tip does not cite this task) that catches that gap. It is
-                # fail-soft (False on any doubt — absent script, live/
-                # advanced/landed/absent classification, or exception), so
-                # this fallback can only ever suppress a spurious escalation
-                # when the primitive is CERTAIN the ref is degenerate; any
-                # uncertainty falls through to the existing skip-count path
-                # below, unchanged.
-                # Cost note: this spawns one subprocess per sweep for every
-                # task that reaches here. The metadata fast-path above
-                # (_branch_is_degenerate) already resolves the common case
-                # without a subprocess, so this branch is only exercised for
-                # the exceptional absent/malformed-branch_base_sha case and
-                # is expected to be low-volume; no within-sweep memoization
-                # is applied.
-                if await self.git_ops.warm_lane_ref_is_degenerate(tid):
-                    self._reconcile_skip_counts.pop(tid, None)
-                    if status == 'in-progress':
-                        logger.info(
-                            'Reconcile: task %s branch is degenerate per '
-                            'warm-lane-degenerate-ref-check.sh (metadata '
-                            'branch_base_sha absent/malformed); reverting '
-                            'stranded in-progress to pending (provisioning-only '
-                            'branch, no work landed)',
-                            tid,
-                        )
-                        return await self._revert_in_progress_if_no_live_claimant(
-                            tid, mid_run=mid_run, metadata=metadata, status=status,
-                        )
-                    logger.info(
-                        'Reconcile: task %s branch is degenerate per '
-                        'warm-lane-degenerate-ref-check.sh (metadata '
-                        'branch_base_sha absent/malformed); skipping '
-                        'citation-missing escalation (status=%s)',
-                        tid, status,
-                    )
-                    return None
+        # θ1's _RECOVERY table only maps GONE_NO_MARKER to RE_FILE_ESCALATION
+        # for a stranded 'blocked' task — it carries no row for
+        # EXISTS_OFF_MAIN (branch ref still present, just never merged).
+        # Pre-migration, the sweep's blocked-escalation backstop fired on ANY
+        # 'blocked' task reaching this point on NO on-main evidence,
+        # regardless of which of the two no-evidence branch shapes it was
+        # in. Second thin sweep-side upgrade — same pattern as the R4
+        # MARK_DONE upgrade above — rather than a change to θ1's reviewed
+        # table (design decision, task 2243; esc-2243-5).
+        if (
+            action == RecoveryAction.LEAVE
+            and status == 'blocked'
+            and report.live_claimant is None
+            and not report.open_escalations
+            and report.branch_state.kind == BranchStateKind.EXISTS_OFF_MAIN
+        ):
+            action = RecoveryAction.RE_FILE_ESCALATION
 
-                count = self._reconcile_skip_counts.get(tid, 0) + 1
-                self._reconcile_skip_counts[tid] = count
-                logger.info(
-                    'Reconcile: task %s branch on main but no commit '
-                    'cites task/%s; leaving status=%s '
-                    '(consecutive citation misses=%d/%d)',
-                    tid, tid, status, count, MAX_RECONCILE_FAILURES,
-                )
-                if (
-                    count >= MAX_RECONCILE_FAILURES
-                    and self._escalation_queue is not None
-                ):
-                    self._escalate_reconcile_skip(tid, status, count)
-                return None
-
-            # Guard 3 — branch-advanced structural check (#1226).
-            # Guards 1 (open L1) and 2 (citation grep) are content
-            # heuristics.  This guard is structural: it rejects the
-            # false-positive shape where a zero-commit branch sits on a
-            # main ancestor (is_ancestor returns True trivially) even
-            # though no real implementation work was pushed.
-            # _branch_is_degenerate encapsulates the tip==branch_base_sha
-            # check (missing / malformed base SHA → returns False →
-            # fall through to flip, preserving backward compat).
-            if await self._branch_is_degenerate(branch, metadata):
-                # Citation found but the branch is degenerate (tip ==
-                # branch_base_sha): the on-main citation belongs to a PRIOR
-                # incarnation under this task id — the current incarnation
-                # produced no commits.  Same recovery as the Guard-2 degenerate
-                # path: revert a live-claimant-less in-progress incarnation to
-                # pending; leave 'blocked' intact (blocked discipline).
+        if action == RecoveryAction.MARK_DONE_WITH_PROVENANCE:
+            # Degenerate-branch refinement (task 2243, W10-θ2; RESOLVER GAP
+            # design decision): θ1's _RECOVERY table has no degenerate-branch
+            # guard — a zero-commit branch (tip == branch_base_sha) that is
+            # an ancestor of main classifies ON_MAIN -> MARK_DONE the same as
+            # a genuinely merged branch. Extending θ1's resolver would mean
+            # threading task metadata into _resolve_branch_state, undoing its
+            # reviewed branch-state/task-row concurrency split — so this
+            # thin, sweep-side check downgrades the decision instead. Safe
+            # for journal hits: a genuinely merged branch is never
+            # degenerate, so this never fires for a real MergeProvenance
+            # journal row.
+            if (
+                await self._branch_is_degenerate(branch, metadata)
+                or await self.git_ops.warm_lane_ref_is_degenerate(tid)
+            ):
+                # A degenerate branch carries ZERO task work, so MARK_DONE
+                # would phantom-complete a task that never actually landed
+                # anything. An in-progress incarnation with no live claimant
+                # (already established by recovery_for reaching this action)
+                # is recovered by reverting to pending so the scheduler
+                # re-dispatches it. 'blocked' keeps the leave-alone
+                # discipline: only flip to done on positive evidence, which a
+                # degenerate branch is not — matching pre-migration behavior.
                 if status == 'in-progress':
-                    self._reconcile_skip_counts.pop(tid, None)
-                    logger.info(
-                        'Reconcile: task %s branch tip == branch_base_sha (%s); '
-                        'branch never advanced past creation — reverting '
-                        'stranded in-progress to pending (on-main citation '
-                        'belongs to a prior incarnation)',
-                        tid, metadata.get('branch_base_sha'),
-                    )
                     return await self._revert_in_progress_if_no_live_claimant(
                         tid, mid_run=mid_run, metadata=metadata, status=status,
                     )
-                logger.info(
-                    'Reconcile: task %s branch tip == branch_base_sha (%s); '
-                    'branch never advanced past creation — vetoing auto-flip '
-                    '(status=%s)',
-                    tid, metadata.get('branch_base_sha'), status,
-                )
                 return None
 
-            # All guards passed — clear the skip counter and flip.
-            self._reconcile_skip_counts.pop(tid, None)
-            note = (
-                f'reconcile: branch on main while task was {status} '
-                f'(out-of-band merge)'
-                if status == 'blocked'
-                else 'reconcile: branch already on main when stranded in-progress'
-            )
-            await self._mark_in_progress_done(
-                tid, citation_sha, note, 'branch-already-on-main',
-            )
-            return 'marked_done'
-
-        # Branch-deleted fast-path (find_merge_marker).
-        # is_ancestor returned False, but the branch may simply not exist
-        # any more (cleanup_worktree ran after advance_main but before
-        # set_task_status).
-        # Note: find_merge_marker already gates on branch-existence
-        # (git_ops.py:774) — it returns None when the branch ref is still
-        # live.  The stale-marker check below therefore only fires when the
-        # branch is gone and a commit on main mentions the task id in its
-        # merge message.
-        marker_sha = await self.git_ops.find_merge_marker(branch)
-        if marker_sha:
-            # Stale-marker check — re-opened-branch / prior-incarnation guard.
-            # A task can be re-queued (branch deleted + re-created) after a
-            # prior incarnation was merged.  In that case, the prior merge's
-            # commit lands on main with the same task id, and find_merge_marker
-            # would return its SHA — triggering a spurious done flip for the
-            # current incarnation.
-            #
-            # Reject the marker if it is an ancestor of branch_base_sha (i.e.
-            # it pre-dates the current incarnation's creation point).
-            # `find_merge_marker`'s branch-existence gate handles the orthogonal
-            # case where the branch ref still exists (returns None there);
-            # this check handles the case where the branch is gone but the
-            # stale marker from a *prior* incarnation under the same task id
-            # is already on main.
-            #
-            # Missing/malformed branch_base_sha → fall through (backward compat
-            # for tasks created before this guard was deployed).
-            branch_base_sha = metadata.get('branch_base_sha')
-            if _is_valid_sha_40(branch_base_sha) and await self.git_ops.is_ancestor(
-                marker_sha, branch_base_sha
-            ):
-                logger.info(
-                    'Reconcile: task %s stale marker %s is ancestor of '
-                    'branch_base_sha %s — belongs to a prior incarnation; '
-                    'vetoing auto-flip',
-                    tid, marker_sha, branch_base_sha,
+            on_main = report.branch_state.kind == BranchStateKind.ON_MAIN
+            if status == 'blocked':
+                note = (
+                    'reconcile: branch on main while task was blocked (out-of-band merge)'
+                    if on_main
+                    else 'reconcile: merge marker found on main while task was blocked'
                 )
-                return None
-
-            note = (
-                f'reconcile: merge marker found on main while task was {status}'
-                if status == 'blocked'
-                else 'reconcile: branch deleted but merge marker found on main'
-            )
-            await self._mark_in_progress_done(
-                tid, marker_sha, note, 'branch-deleted-marker-found',
-            )
+            else:
+                note = (
+                    'reconcile: branch already on main when stranded in-progress'
+                    if on_main
+                    else 'reconcile: branch deleted but merge marker found on main'
+                )
+            reason = 'branch-already-on-main' if on_main else 'branch-deleted-marker-found'
+            await self._mark_in_progress_done(tid, report.branch_state.sha, note, reason)
             return 'marked_done'
+
+        # Ground-truth revert decision (task 2243, W10-θ2): the _RECOVERY
+        # table maps a stranded in-progress task with no live claimant and no
+        # on-main landing evidence (branch EXISTS_OFF_MAIN or GONE_NO_MARKER)
+        # straight to REVERT_TO_PENDING — retiring the inline branch-state
+        # derivation this dispatch used to require. Step-16 also retired the
+        # applier's own plan.lock owner_pid liveness re-derivation — it now
+        # trusts recovery_for's live_claimant and owns only the worktree
+        # cleanup / lock unlink / retention bookkeeping side effects (see
+        # _revert_in_progress_if_no_live_claimant).
+        if action == RecoveryAction.REVERT_TO_PENDING:
+            return await self._revert_in_progress_if_no_live_claimant(
+                tid, mid_run=mid_run, metadata=metadata, status=status,
+            )
 
         # No on-main evidence.  For 'blocked' tasks, leave the row alone —
         # blocked is a deliberate state and we only flip it to done on
         # observed evidence.
         if status == 'blocked':
             # Fix #1b — defense-in-depth backstop for the stranded-blocked gap.
-            # A task left 'blocked' with NO open escalation AND no active
-            # workflow is an orphaned recovery: its blocking escalation was
+            # A task left 'blocked' with NO open escalation AND no live
+            # claimant is an orphaned recovery: its blocking escalation was
             # resolved directly with no live workflow to re-pend it (3576,
             # 2026-05-29).  blocked→pending recovery is owned exclusively by
             # the active-workflow resume path and the L2-cascade / direct-resolve
@@ -3704,63 +3639,37 @@ Output JSON matching the schema. Every task must appear in the output.
             #
             # We RE-FILE a single L1 — we NEVER change status.  Re-filing (not
             # re-pending) cannot yank a deliberate release_workflow blocked-park:
-            # a parked /unblock task either still has an open L1 (→ skipped by
-            # the pending-escalation check) or, if a human resolved its L1 and
+            # a parked /unblock task either still has an open L1 (→ recovery_for
+            # classifies LEAVE, no re-file) or, if a human resolved its L1 and
             # is mid-merge, the re-filed L1 is harmless noise they dismiss.
             # Fix #1a then performs the actual re-pend when this L1 is resolved.
-            #
-            # Self-dedupes: once filed, the pending-escalation check below
-            # suppresses re-filing on the next cycle until it is resolved.
             #
             # Category: 'stranded_blocked' (PRD-3 task ε, 2026-06-04).
             # The escalation-watcher (task θ) auto-resolves stranded_blocked
             # L1s with action='resume', triggering this exact Fix #1a path:
             # _on_escalation_resolved → _cascade_unblock_member →
-            # blocked→pending re-pend.  This replaces the prior 'task_failure'
-            # category, which routed to the human-triage watcher instead of the
-            # auto-resume watcher.
-            #
-            # RE-FILE-NEVER-FLIP discipline is PRESERVED: we still only file
-            # the L1 and let resolution drive the status change.  The /unblock
-            # blocked-park protection (pending-escalation check above) is also
-            # preserved — an open L1 of any category prevents re-filing.
+            # blocked→pending re-pend.
             #
             # task_kind == 'deterministic' tasks are excluded here (task 2074
             # amendment) and delegated exclusively to
             # _recover_stranded_deterministic_task via the deterministic-recon
-            # sweep.  Rationale: this generic backstop and that sweep write to
-            # the SAME queue and dedup on the SAME get_by_task(tid,
-            # status='pending') check, so whichever fires first wins — and the
-            # escalation-watcher-auto's `stranded_blocked` routing
-            # (skills/escalation-watcher-auto/SKILL.md) auto-resumes ANY
-            # category='stranded_blocked' L1 once its predicate holds,
-            # regardless of the filer's suggested_action or role.  If this
-            # generic reaper won the race for a deterministic-deploy task
-            # whose target unit is actually down, it would file
-            # stranded_blocked/manual_intervention — which still gets
-            # auto-resumed the same as a health-verified 'resume', silently
-            # bypassing the live-systemd-health check that is the entire
-            # point of the task-2074 sweep.  Excluding deterministic tasks
-            # here means only the health-aware sweep ever files their first
-            # escalation, so an unhealthy unit correctly gets
-            # infra_issue/manual_intervention instead.
+            # sweep — that sweep's live-systemd-health check is the reason
+            # deterministic-deploy recovery is routed through it instead of
+            # this generic reaper.
             #
-            # The active-workflow guards below (`tid not in
-            # self._escalation_events`, `not self._workflow_cancel_recent`)
-            # are intentionally NOT reimplemented in the deterministic sweep:
-            # task_kind='deterministic' tasks never enter the LLM/workflow
-            # pipeline (no worktree, no branch, no agent — see
-            # DeterministicRunner), so their tid can never appear in
-            # `_escalation_events` or `_workflow_cancel_at`.  Both guards
-            # would be vacuously true for every deterministic task, so
-            # omitting them from the sweep is a no-op simplification, not a
-            # missing safety check.
+            # Dispatch + dedup (task 2243, W10-θ2): action ==
+            # RE_FILE_ESCALATION (recovery_for's row g) already means no live
+            # claimant (is_actively_held / db claimant / plan.lock) and no
+            # escalation open at any level — both folded by the resolver in
+            # place of the old in-sweep _escalation_events /
+            # workflow_cancel_recent / get_by_task guards.  Once filed, the
+            # next sweep sees the new pending escalation in
+            # report.open_escalations and recovery_for classifies LEAVE —
+            # self-dedup without a separate check here.
             if (
-                self.config.stranded_blocked_escalate_enabled
+                action == RecoveryAction.RE_FILE_ESCALATION
+                and self.config.stranded_blocked_escalate_enabled
                 and self._escalation_queue is not None
-                and tid not in self._escalation_events       # no active workflow
-                and not self.scheduler.workflow_cancel_recent(tid)  # not a recent cancel/park
-                and not self._escalation_queue.get_by_task(tid, status='pending')
                 and metadata.get('task_kind') != 'deterministic'
             ):
                 from escalation.models import Escalation
@@ -3811,25 +3720,74 @@ Output JSON matching the schema. Every task must appear in the output.
                 )
             return None
 
-        # An open L1 escalation is the deliberate human-handoff signal (e.g. an
-        # active /unblock session owns this worktree). Don't reap it — leave the
-        # worktree, branch, and status intact. Mirrors the is_ancestor Guard 1,
-        # extended to the unmerged in-progress path. No revert: reverting to
-        # pending would let the scheduler dispatch a competing agent.
-        if (
-            self._escalation_queue is not None
-            and self._escalation_queue.has_open_l1(tid)
-        ):
-            logger.info(
-                'Reconcile: task %s in-progress with open L1 escalation; '
-                'leaving worktree intact (human-managed)', tid,
-            )
+        # Deploy-phase-tracked in-progress tasks are never auto-recovered by
+        # this generic reaper (review amendment, task 2243 W10-θ2
+        # reviewer_comprehensive #2). θ1's _RECOVERY table (task_ground_truth.py)
+        # requires deploy_phase is None for EVERY MARK_DONE_WITH_PROVENANCE /
+        # REVERT_TO_PENDING row (a/b/c/d) — so an in-progress task carrying a
+        # deploy_phase can only reach this point via the LEAVE default
+        # (VERIFIED / FAILED / SCHEDULED / ESCALATED / DONE, or RAN paired
+        # with a branch state other than GONE_NO_MARKER) or via
+        # RE_FILE_ESCALATION (row h — GONE_NO_MARKER + RAN, the D1
+        # crashed-mid-deploy shape). Both are deliberate: the table's
+        # "Deliberately-unmapped deploy phases" comment explains FAILED /
+        # ESCALATED already own a mandatory DS-2 recovery path, VERIFIED /
+        # DONE are terminal-success, and reverting (or phantom-completing) a
+        # stranded deploy could re-trigger one that already took effect. Row
+        # h's RE_FILE_ESCALATION is likewise handled elsewhere (the runner's
+        # own born-at-L2 escalation), not by this in-progress path. Without
+        # this guard, either action fell through to the generic revert
+        # below, silently overriding the table's LEAVE/defer-to-DS-2 intent
+        # — most notably for a deterministic deploy task, which carries no
+        # task_kind != 'deterministic' exclusion on this path (unlike the
+        # 'blocked' branch above).
+        if report.deploy_phase is not None:
             return None
 
-        # 'in-progress' and not on main, no live-claimant signal yet: classify
-        # by lock state and revert to pending if no live owner.  Shared with the
+        # task 2243, W10-θ2 step-12: is_actively_held is the scheduler's own
+        # in-memory dispatch bookkeeping (dispatched / module-lock held /
+        # recent workflow-cancel stamp) — unambiguous, and not something the
+        # applier below independently re-derives (that was the now-deleted
+        # driver-level guard's job). Trust it directly rather than falling
+        # through.
+        if self.scheduler.is_actively_held(tid):
+            return None
+
+        # An open escalation at ANY level (not just L1 — the resolver's row
+        # (f) folds every level) is the deliberate human/automation-handoff
+        # signal: don't reap it. Replaces the old has_open_l1(tid) veto
+        # (L1-only), which missed an L2-only open escalation and fell
+        # through to an incorrect revert.
+        if report.open_escalations:
+            return None
+
+        # A live claimant is a deliberate leave-alone (task 2243, W10-θ2
+        # step-16 — this blanket check replaces the applier's own owner_pid
+        # re-derivation, now retired), EXCEPT the R3 mid-run exception: a
+        # plan.lock's owner_pid is almost always the harness's OWN pid (it
+        # stamps the lock on behalf of whichever workflow it runs), so an
+        # alive owner_pid there proves nothing about whether that workflow
+        # is still running — is_actively_held (already checked above, and
+        # already False here) is the authoritative live signal mid-run, so a
+        # PLAN_LOCK-sourced claimant must still fall through to recovery
+        # mid-run (a workflow that exited without releasing the lock). A
+        # startup sweep (mid_run=False) has no such live-tracking fallback,
+        # so a fresh plan.lock is trusted at face value there. A DB- or
+        # in-memory-sourced claimant has no such false-positive mode and
+        # always leaves alone regardless of mid_run.
+        live_claimant = report.live_claimant
+        if live_claimant is not None:
+            plan_lock_mid_run_exception = (
+                mid_run and live_claimant.source == ClaimantSource.PLAN_LOCK
+            )
+            if not plan_lock_mid_run_exception:
+                return None
+
+        # 'in-progress', not on main, no live claimant (or the mid-run R3
+        # plan.lock exception above): revert to pending.  Shared with the
         # is_ancestor==True degenerate-provisioning-branch guards above so a
-        # never-advanced branch (the 2992 strand) is recovered, not left to sit.
+        # never-advanced branch (the 2992 strand) is recovered, not left to
+        # sit.
         return await self._revert_in_progress_if_no_live_claimant(
             tid, mid_run=mid_run, metadata=metadata, status=status,
         )
@@ -3838,19 +3796,20 @@ Output JSON matching the schema. Every task must appear in the output.
         self, tid: str, *, mid_run: bool, metadata: dict | None = None,
         status: str | None = None,
     ) -> str | None:
-        """Revert a stranded in-progress task to pending when no live claimant.
+        """Revert a stranded in-progress task to pending (REVERT_TO_PENDING applier).
 
         Returns ``'reverted'`` (status flipped to pending) or ``None`` (left
-        intact — a live ``owner_pid`` on a startup sweep, or an unreadable lock
-        failing closed).
+        intact — an infra-held non-degenerate branch, or an unreadable lock
+        failing closed on a startup sweep).
 
-        Extracted from ``_reconcile_one_stranded`` so the is_ancestor==True
-        degenerate-provisioning-branch guards (#1823 / the task-2992 strand)
-        can reuse the exact plan.lock liveness classification instead of
-        returning ``None`` and stranding the task in-progress forever.  Callers
-        guarantee ``status == 'in-progress'`` and that the open-L1 human-handoff
-        veto has already been checked (Guard 1 in the is_ancestor block; the
-        explicit in-progress L1 guard on the not-on-main path).
+        Callers only reach this on the REVERT_TO_PENDING action:
+        ``TaskGroundTruth.recovery_for``'s ``live_claimant`` resolution has
+        already established there is no live claimant (task 2243, W10-θ2
+        step-16 — the plan.lock owner_pid liveness re-derivation formerly
+        performed directly in this function is retired as redundant). This
+        function owns only the physical side effects: worktree cleanup,
+        plan.lock unlink, and the ``_recovered_plans``/``_preserved_worktrees``
+        retention bookkeeping.
 
         For warm tasks the real worktree is the assigned pool lane, not
         ``worktree_base/<tid>``.  ``_resolve_task_worktree`` handles both cases.
@@ -3993,32 +3952,21 @@ Output JSON matching the schema. Every task must appear in the output.
                     ' during mid-run sweep; treating as stale and reaping',
                     tid,
                 )
-                owner_alive = False  # fall through to stale-lock cleanup below
-        else:
-            # Valid dict — use the existing owner_pid liveness logic.
-            owner_alive = False
-            owner_pid = lock_data.get('owner_pid')  # type: ignore[union-attr]
-            if owner_pid is None:
-                logger.warning(
-                    'Reconcile: plan.lock for task %s has no owner_pid;'
-                    ' treating as stale',
-                    tid,
-                )
-            else:
-                try:
-                    owner_alive = _pid_alive(int(owner_pid))
-                except (TypeError, ValueError):
-                    owner_alive = False
+        elif lock_data.get('owner_pid') is None:  # type: ignore[union-attr]
+            # Missing owner_pid: still an observability breadcrumb for which
+            # stale-lock variant triggered the cleanup below, even though the
+            # applier no longer branches on it (see docstring: liveness is
+            # the resolver's call now).
+            logger.warning(
+                'Reconcile: plan.lock for task %s has no owner_pid;'
+                ' treating as stale',
+                tid,
+            )
 
-        # R3: during a mid_run sweep, owner_pid is almost always the harness
-        # PID (which IS alive by definition).  The dispatch-table filter at
-        # the top of the loop already excluded actively-held tasks; if we
-        # made it here, the workflow has exited without releasing the lock.
-        # Treat the lock as stale and fall through to recovery.
-        if owner_alive and not mid_run:
-            return None  # Live claimant outside our run — leave alone.
-
-        # Stale lock (or mid_run-and-not-active) — clear it and revert.
+        # Lock present — recovery_for's live_claimant has already ruled out
+        # a live claimant before dispatching REVERT_TO_PENDING here (task
+        # 2243, W10-θ2 step-16: the owner_pid liveness re-derivation formerly
+        # gating this point is retired as redundant). Clear the lock and revert.
         if (
             tid not in self._recovered_plans
             and tid not in self._preserved_worktrees
@@ -4112,14 +4060,15 @@ Output JSON matching the schema. Every task must appear in the output.
         self,
         tid: str,
         exc: SetTaskStatusRejected,
-        count: int,
     ) -> None:
-        """Submit an L1 escalation for persistent reconcile failure.
+        """Submit an L1 escalation for a persistent reconcile failure.
 
-        Fired when the same task has rejected ``mark_done`` MAX_RECONCILE_FAILURES
-        consecutive sweeps in a row — i.e. the persistence layer
-        contradicts a branch-on-main observation persistently enough that
-        steward-mediated retry can't unstick it.
+        Fired directly on every ``mark_done`` rejection the reconcile sweep
+        observes for *tid* (task 2243, W10-θ2 step-14 — the per-tid strike
+        counter and its ``MAX_RECONCILE_FAILURES`` threshold gate are
+        retired): the persistence layer contradicts a branch-on-main
+        observation, which is L1-worthy on its own without waiting for a
+        run of consecutive sweeps to confirm it.
         """
         if not self._escalation_queue:
             return
@@ -4131,13 +4080,10 @@ Output JSON matching the schema. Every task must appear in the output.
             agent_role='harness-reconcile',
             severity='blocking',
             category='reconcile_persistent_rejection',
-            summary=(
-                f'Reconcile sweep failed to mark task {tid} done '
-                f'{count}x consecutively'
-            )[:200],
+            summary=f'Reconcile sweep failed to mark task {tid} done'[:200],
             detail=(
-                f'set_task_status(done) rejected by fused-memory after '
-                f'{count} consecutive sweeps for task {tid}.\n\n'
+                f'set_task_status(done) rejected by fused-memory for task '
+                f'{tid}.\n\n'
                 f'error_code: {exc.error_code}\n'
                 f'raw: {exc.raw}\n\n'
                 f'The branch was observed on main (or a merge marker was '
@@ -4149,10 +4095,6 @@ Output JSON matching the schema. Every task must appear in the output.
             suggested_action='investigate_persistence_layer_rejection',
         )
         self._escalation_queue.submit(esc)
-        # Reset counter so we don't re-escalate every sweep — operator
-        # action will resolve and the next true rejection (if any) starts
-        # a fresh strike count.
-        self._reconcile_failure_counts.pop(tid, None)
 
     # Synthetic task_id for scheduler-pause escalations.  Filename-safe for
     # EscalationQueue.make_id (yields esc-__scheduler__-N); never a real task,
@@ -5424,58 +5366,6 @@ Output JSON matching the schema. Every task must appear in the output.
                 ),
             )
         self._escalation_queue.submit(esc)
-
-    def _escalate_reconcile_skip(
-        self,
-        tid: str,
-        status: str,
-        count: int,
-    ) -> None:
-        """Submit an L1 escalation for persistent citation-miss skips.
-
-        Mirror of ``_escalate_reconcile_failure`` for the case where
-        ``find_task_citation_commit`` keeps returning None despite a stable
-        ``is_ancestor==True`` observation — i.e. the branch sits on main
-        but nothing on main cites the task, so the reconciler refuses to
-        auto-flip the row.  After ``MAX_RECONCILE_FAILURES`` consecutive
-        skips, escalate so a human can resolve manually.
-        """
-        if not self._escalation_queue:
-            return
-        from escalation.models import Escalation
-
-        esc = Escalation(
-            id=self._escalation_queue.make_id(tid),
-            task_id=tid,
-            agent_role='harness-reconcile',
-            severity='blocking',
-            category='reconcile_citation_missing',
-            summary=(
-                f'Reconciler refuses to auto-flip task {tid}: branch on '
-                f'main but no commit cites the task ({count}x consecutive)'
-            )[:200],
-            detail=(
-                f'reconciler refuses to auto-flip task {tid}: branch on '
-                f'main but no commit cites the task. Status: {status}. '
-                f'Resolve manually.\n\n'
-                f'Consecutive citation misses: {count} / '
-                f'{MAX_RECONCILE_FAILURES}.\n\n'
-                f'The is_ancestor check returns True for task/{tid}, but '
-                f'no commit on main matches the configured citation '
-                f'pattern (GitConfig.commit_citation_pattern, or the '
-                f'built-in default if unset).  Either the merge happened '
-                f'with a non-conventional commit subject, or the branch '
-                f'tip is degenerate (zero-commit branch sitting on a main '
-                f'ancestor).  Inspect the branch and main history; mark '
-                f'the task done manually if the work landed under a '
-                f'non-matching subject, or leave it in its current status '
-                f'and resolve this escalation to silence the sweep.'
-            ),
-            suggested_action='investigate_citation_missing',
-            level=1,
-        )
-        self._escalation_queue.submit(esc)
-        self._reconcile_skip_counts.pop(tid, None)
 
     async def _run_slot(
         self, assignment, sem: asyncio.Semaphore

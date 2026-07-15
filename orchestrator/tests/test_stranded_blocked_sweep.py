@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,6 +21,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
+from orchestrator.task_ground_truth import RecoveryAction
 
 # ---------------------------------------------------------------------------
 # Fixture
@@ -39,7 +41,21 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     # Replace scheduler with async mocks
     h.scheduler = MagicMock()
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
-    h.scheduler.get_task = AsyncMock(return_value=None)
+
+    # Derive get_task's row from get_statuses() so TaskGroundTruth.derive_truth's
+    # db_status (task 2243, W10-θ2: recovery_for is now consulted for the
+    # blocked-escalation dispatch) reflects the same status the sweep loop
+    # reads from get_statuses() — mirrors test_reconcile_stranded.py's
+    # identically-purposed default. Individual tests only need to configure
+    # get_statuses(); get_task() follows automatically.
+    def _default_get_task(tid: str) -> dict | None:
+        try:
+            statuses, _err = cast(AsyncMock, h.scheduler.get_statuses).return_value
+        except (TypeError, ValueError):
+            return None
+        status = statuses.get(tid) if isinstance(statuses, dict) else None
+        return None if status is None else {'status': status, 'metadata': {}}
+    h.scheduler.get_task = AsyncMock(side_effect=_default_get_task)
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.update_task = AsyncMock(return_value=True)
@@ -418,6 +434,14 @@ class TestActiveWorkflowGateSuppressesReFile:
         assert task_id in harness._escalation_events, (
             'Pre-condition: event must be in _escalation_events before sweep'
         )
+        # Production dispatch ordering (task 2243, W10-θ2 design decision):
+        # scheduler.acquire_next() adds task_id to scheduler._dispatched
+        # BEFORE _register_escalation_event runs, so is_actively_held(tid) is
+        # already True whenever _escalation_events holds an entry. Mirror
+        # that ordering here — post-migration, recovery_for's live_claimant
+        # (via is_actively_held) is the operative suppression signal, not
+        # _escalation_events membership on its own.
+        harness.scheduler._dispatched.add(task_id)  # type: ignore[attr-defined]
 
         # Task appears as blocked in the status map (e.g. it was soft-cancelled
         # or flipped externally while the workflow slot is still starting up)
@@ -432,4 +456,105 @@ class TestActiveWorkflowGateSuppressesReFile:
             f'Expected no L1 filed for active-workflow task; got {len(filed)} — '
             'harness.py:1875 active-workflow gate must suppress re-filing when '
             'task_id is in _escalation_events'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2243 (W10-θ2) step-9 — RE_FILE_ESCALATION dispatch parity.
+#
+# Post-migration (step-10), _reconcile_one_stranded's blocked-escalation
+# block dispatches on action == RecoveryAction.RE_FILE_ESCALATION (from
+# TaskGroundTruth.recovery_for) instead of re-deriving the decision from ad
+# hoc guards (_escalation_events membership / workflow_cancel_recent /
+# get_by_task pending). These tests pin: (1) the resolver already classifies
+# this shape correctly, (2) dedup via the resolver's open-escalation shape
+# holds at a non-1 level too (not just level 1), and (3) is_actively_held
+# (folding scheduler._dispatched) now suppresses re-filing even when
+# _escalation_events was never populated for the task — a signal the
+# pre-migration ad hoc guard chain never checked at all.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestRecoveryForDrivesReFileEscalation:
+    async def test_recovery_for_classifies_blocked_no_evidence_as_re_file_escalation(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """The exact shape the blocked-escalation backstop fires on (no
+        landing evidence, no open escalation, no live claimant) classifies
+        RE_FILE_ESCALATION via the resolver directly."""
+        queue = EscalationQueue(tmp_path / 'esc_classify')
+        task_id = 'task-classify'
+        harness._escalation_queue = queue
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({task_id: 'blocked'}, None)
+        )
+
+        report, action = await harness._get_ground_truth().recovery_for(task_id)  # type: ignore[attr-defined]
+
+        assert action == RecoveryAction.RE_FILE_ESCALATION
+        assert report.live_claimant is None
+        assert report.open_escalations == []
+
+    async def test_open_escalation_at_non_l1_level_yields_leave_no_duplicate(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """An escalation open at level 2 (not just level 1) is still the
+        resolver's 'don't second-guess' signal: recovery_for classifies
+        LEAVE, and the sweep does not file a duplicate — dedup now flows
+        through the resolver's any-level open-escalation shape, not the
+        in-sweep get_by_task(status='pending') guard."""
+        queue = EscalationQueue(tmp_path / 'esc_l2')
+        task_id = 'task-open-l2'
+        harness._escalation_queue = queue
+        queue.submit(Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id, agent_role='steward', severity='critical',
+            category='infra_issue', summary='pre-existing L2', level=2,
+        ))
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({task_id: 'blocked'}, None)
+        )
+
+        report, action = await harness._get_ground_truth().recovery_for(task_id)  # type: ignore[attr-defined]
+        assert action == RecoveryAction.LEAVE
+        assert len(report.open_escalations) == 1
+
+        await harness._reconcile_stranded_in_progress()
+
+        pending = queue.get_by_task(task_id, status='pending')
+        assert len(pending) == 1, 'must not add a second escalation'
+        assert pending[0].category == 'infra_issue', 'pre-existing L2 untouched'
+
+    async def test_dispatched_task_not_in_escalation_events_is_not_refiled(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """A blocked task the scheduler has actively dispatched
+        (is_actively_held via scheduler._dispatched) must not be re-filed —
+        even when _escalation_events was never populated for it. Mirrors the
+        real acquire_next() -> _register_escalation_event ordering
+        (production sets both), but is_actively_held alone is now the
+        operative signal (task 2243, W10-θ2 design decision: is_actively_held
+        subsumes the old _escalation_events-only guard).
+
+        RED under current code: the pre-migration guard chain never consults
+        scheduler._dispatched for the blocked-escalation path, so it would
+        incorrectly file here.
+        """
+        queue = EscalationQueue(tmp_path / 'esc_dispatched')
+        task_id = 'task-dispatched-only'
+        harness._escalation_queue = queue
+        harness._escalation_events.clear()
+        harness.scheduler._dispatched.add(task_id)  # type: ignore[attr-defined]
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({task_id: 'blocked'}, None)
+        )
+
+        await harness._reconcile_stranded_in_progress()
+
+        filed = queue.get_by_task(task_id, status='pending')
+        assert len(filed) == 0, (
+            f'Expected no L1 for actively-dispatched task; got {len(filed)} — '
+            'is_actively_held (scheduler._dispatched) must suppress re-filing '
+            'even without an _escalation_events entry'
         )
