@@ -40,6 +40,17 @@ logger = logging.getLogger(__name__)
 # cleanup code.
 CYCLE_SUMMARY_TTL_DAYS: int = 30
 
+# record_type vocabulary for cycle_summary Mem0 writes (task 2468). There are
+# two distinct writers of kind='cycle_summary': this module's deterministic,
+# terse, auto-generated Mem0 mirror of the authoritative ledger row
+# (LEDGER_STAMP, written unconditionally below), and the LLM-authored
+# reconstruction/self-heal cycle_summary write in
+# ``reconciliation.prompts.stage2`` (NARRATIVE). Single-sourced here so future
+# Python near-duplicate/dedup consumers have one place to import the values
+# from rather than re-typing string literals.
+CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP: str = 'ledger_stamp'
+CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = 'narrative'
+
 
 def _assume_utc(dt: datetime) -> datetime:
     """Return *dt* with UTC timezone attached if it is naive; return *dt* unchanged otherwise.
@@ -300,7 +311,18 @@ async def write_cycle_summary(
                 project_id=project_id,
                 agent_id=f'recon-stage-{stage}',
                 category='observations_and_summaries',
-                metadata={'kind': 'cycle_summary', 'stage': stage, 'run_id': run_id},
+                # record_type discriminates this deterministic code mirror
+                # (LEDGER_STAMP) from the distinct LLM-authored reconstruction
+                # write in prompts/stage2.py (NARRATIVE) — task 2468.
+                # _apply_cycle_summary_metadata_tagging (memory_service.py)
+                # is additive-only and never strips unknown keys, so this
+                # survives through to storage unchanged.
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': stage,
+                    'run_id': run_id,
+                    'record_type': CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP,
+                },
                 causation_id=run_id,
                 _source='cycle_summary_mirror',
             )
