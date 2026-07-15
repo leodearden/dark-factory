@@ -503,6 +503,7 @@ class TestWriteCycleSummaryMirrorAndTrim:
         assert metadata.get('stage') == 'task_knowledge_sync'
         assert metadata.get('run_id') == 'run-mirror'
         assert 'recon_pool' not in metadata
+        assert metadata.get('record_type') == 'ledger_stamp'
         assert 'run-mirror' in kwargs.get('content', '')
 
     @pytest.mark.asyncio
