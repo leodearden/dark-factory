@@ -296,6 +296,12 @@ _WORKTREE_DIR_MARKERS: tuple[str, ...] = (
     # /home/leo/src/reify/.warm-lanes/worktrees/<id> and
     # .../reify/build-worktrees/<id> never produce the double-dash
     # '--worktrees-'/'--claude-worktrees-' form above.
+    # The two are deliberately asymmetric: 'build-worktrees' is a generic
+    # enough phrase that an unqualified '-build-worktrees-' marker could
+    # false-match an unrelated repo's own build/worktrees dir (e.g. a repo
+    # named '...-build'), so it's qualified with the repo name; whereas
+    # 'warm-lanes-worktrees' is distinctive enough on its own that no
+    # project qualifier is needed.
     '-warm-lanes-worktrees-', '-reify-build-worktrees-',
 )
 
