@@ -11,6 +11,8 @@ import json
 import types
 from pathlib import Path
 
+import pytest
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_found_on_main_provenance.py'
 
 
@@ -507,3 +509,181 @@ class TestClassifyPrecedence:
         )
         verdict, _reasons = classify(audit)
         assert verdict == 'reverted'
+
+
+# ===========================================================================
+# Step-13/14: build_audit_report (async orchestrator)
+# ===========================================================================
+
+class FakeGitFacts:
+    """Test double for GitFacts — returns canned facts per commit sha, and
+    records every ``gather`` call so tests can assert which commits were
+    actually inspected (i.e. that non-found_on_main tasks are never touched).
+    """
+
+    def __init__(self, facts_by_commit: dict[str, dict] | None = None):
+        self.facts_by_commit = facts_by_commit or {}
+        self.calls: list[tuple[str, str, list[str]]] = []
+
+    async def gather(self, commit, ref, declared_files):
+        self.calls.append((commit, ref, list(declared_files)))
+        return self.facts_by_commit.get(commit, {})
+
+
+def _facts(
+    *,
+    is_ancestor: bool = True,
+    commit_subject: str = '',
+    commit_message: str = '',
+    commit_files: list[str] | None = None,
+    revert_commit: str | None = None,
+    declared_files_missing_on_main: list[str] | None = None,
+) -> dict:
+    """Build a canned git-facts dict, shaped like GitFacts.gather()'s return value."""
+    return {
+        'is_ancestor': is_ancestor,
+        'commit_subject': commit_subject,
+        'commit_message': commit_message,
+        'commit_files': commit_files or [],
+        'revert_commit': revert_commit,
+        'declared_files_missing_on_main': declared_files_missing_on_main or [],
+    }
+
+
+def _fom_task(task_id: str, commit: str, files: list[str] | None = None) -> dict:
+    """A found_on_main task dict, terse for build_audit_report fixtures."""
+    return _task(
+        task_id, f'Task {task_id}',
+        done_provenance={'kind': 'found_on_main', 'commit': commit, 'note': 'n'},
+        files=files,
+    )
+
+
+@pytest.mark.asyncio
+class TestBuildAuditReportSelection:
+    """Only found_on_main tasks are audited; git facts are gathered per audited task."""
+
+    @staticmethod
+    def _mixed_tasks():
+        return [
+            _fom_task('10', 'a' * 40, files=['src/a.py']),
+            _fom_task('20', 'b' * 40, files=['src/b.py']),
+            _task('99', 'Merged, not found_on_main',
+                  done_provenance={'kind': 'merged', 'commit': 'z' * 40}),
+        ]
+
+    async def test_only_found_on_main_tasks_are_audited(self):
+        tasks = self._mixed_tasks()
+        git = FakeGitFacts({
+            'a' * 40: _facts(commit_message='Merge task/10 into main', commit_files=['src/a.py']),
+            'b' * 40: _facts(commit_message='Merge task/20 into main', commit_files=['src/b.py']),
+        })
+        report = await build_audit_report(tasks, git, ref='main')
+        assert report['total'] == 2
+        assert [t['task_id'] for t in report['tasks']] == ['10', '20']
+        # task 99 (kind='merged') was never gathered — only found_on_main commits are inspected.
+        gathered_commits = {c for c, _ref, _files in git.calls}
+        assert gathered_commits == {'a' * 40, 'b' * 40}
+        assert all(_ref == 'main' for _c, _ref, _files in git.calls)
+
+    async def test_declared_files_threaded_into_gather_call(self):
+        """Each task's declared_files are passed through to git.gather()."""
+        tasks = [_fom_task('10', 'a' * 40, files=['src/a.py', 'src/other.py'])]
+        git = FakeGitFacts({'a' * 40: _facts(commit_message='Merge task/10 into main')})
+        await build_audit_report(tasks, git, ref='main')
+        [(_commit, _ref, declared_files)] = git.calls
+        assert declared_files == ['src/a.py', 'src/other.py']
+
+    async def test_git_facts_gathered_and_classify_run_per_task(self):
+        """Each audited task's canned facts flow through classify() into its verdict."""
+        tasks = self._mixed_tasks()
+        git = FakeGitFacts({
+            'a' * 40: _facts(commit_message='Merge task/10 into main', commit_files=['src/a.py']),
+            'b' * 40: _facts(commit_message='Merge task/20 into main', commit_files=['src/b.py']),
+        })
+        report = await build_audit_report(tasks, git, ref='main')
+        by_id = {t['task_id']: t for t in report['tasks']}
+        assert by_id['10']['verdict'] == 'ok'
+        assert by_id['20']['verdict'] == 'ok'
+        assert by_id['10']['commit'] == 'a' * 40
+        assert by_id['10']['reasons'] == []
+
+
+@pytest.mark.asyncio
+class TestBuildAuditReportShape:
+    """The report dict's structural fields: verdict_counts, tasks, total, ref, dry_run."""
+
+    async def test_clean_set_yields_all_ok_and_zeroed_other_counts(self):
+        tasks = [
+            _fom_task('10', 'a' * 40, files=['src/a.py']),
+            _fom_task('20', 'b' * 40, files=['src/b.py']),
+        ]
+        git = FakeGitFacts({
+            'a' * 40: _facts(commit_message='Merge task/10 into main', commit_files=['src/a.py']),
+            'b' * 40: _facts(commit_message='Merge task/20 into main', commit_files=['src/b.py']),
+        })
+        report = await build_audit_report(tasks, git, ref='main')
+        assert report['verdict_counts'] == {
+            'commit_not_on_main': 0, 'misattributed': 0, 'reverted': 0,
+            'deliverable_absent': 0, 'unverifiable': 0, 'ok': 2,
+        }
+        assert report['total'] == 2
+        assert report['ref'] == 'main'
+        assert report['dry_run'] is True
+
+    async def test_per_task_detail_shape(self):
+        tasks = [_fom_task('10', 'a' * 40, files=['src/a.py'])]
+        git = FakeGitFacts({
+            'a' * 40: _facts(commit_message='Merge task/10 into main', commit_files=['src/a.py']),
+        })
+        report = await build_audit_report(tasks, git, ref='main')
+        assert report['tasks'] == [{
+            'task_id': '10', 'verdict': 'ok', 'commit': 'a' * 40, 'reasons': [],
+        }]
+
+    async def test_deterministic_ordering_by_int_task_id(self):
+        """Per-task detail is ordered by numeric task id regardless of input order."""
+        tasks = [
+            _fom_task('300', 'c' * 40),
+            _fom_task('100', 'a' * 40),
+            _fom_task('200', 'b' * 40),
+        ]
+        git = FakeGitFacts({
+            'a' * 40: _facts(commit_message='Merge task/100 into main'),
+            'b' * 40: _facts(commit_message='Merge task/200 into main'),
+            'c' * 40: _facts(commit_message='Merge task/300 into main'),
+        })
+        report = await build_audit_report(tasks, git, ref='main')
+        assert [t['task_id'] for t in report['tasks']] == ['100', '200', '300']
+
+    async def test_custom_ref_is_echoed_back(self):
+        tasks = [_fom_task('10', 'a' * 40)]
+        git = FakeGitFacts({'a' * 40: _facts(commit_message='Merge task/10 into main')})
+        report = await build_audit_report(tasks, git, ref='origin/main')
+        assert report['ref'] == 'origin/main'
+
+    async def test_planted_misattributed_and_reverted_tasks_get_right_verdicts(self):
+        """A clean task plus a planted misattributed task and a planted reverted task."""
+        tasks = [
+            _fom_task('10', 'a' * 40, files=['src/a.py']),
+            _fom_task('30', 'c' * 40),  # misattributed: cites a different task
+            _fom_task('40', 'd' * 40, files=['src/d.py']),  # reverted: revert marker present
+        ]
+        git = FakeGitFacts({
+            'a' * 40: _facts(commit_message='Merge task/10 into main', commit_files=['src/a.py']),
+            'c' * 40: _facts(commit_message='Merge task/999 into main'),
+            'd' * 40: _facts(
+                commit_message='Merge task/40 into main', commit_files=['src/d.py'],
+                revert_commit='e' * 40,
+            ),
+        })
+        report = await build_audit_report(tasks, git, ref='main')
+        by_id = {t['task_id']: t for t in report['tasks']}
+        assert by_id['10']['verdict'] == 'ok'
+        assert by_id['30']['verdict'] == 'misattributed'
+        assert by_id['40']['verdict'] == 'reverted'
+        assert report['verdict_counts'] == {
+            'commit_not_on_main': 0, 'misattributed': 1, 'reverted': 1,
+            'deliverable_absent': 0, 'unverifiable': 0, 'ok': 1,
+        }
+        assert report['total'] == 3
