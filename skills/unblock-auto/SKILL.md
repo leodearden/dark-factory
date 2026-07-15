@@ -79,6 +79,41 @@ Based on gathered context, determine:
      - Root cause is unclear or multiple conflicting hypotheses
      - A prior dry-run proposal for this task already exists and was not acted on
 
+### Merge-stage completion labelling (MERGE_VERIFY_RED only)
+
+If `reason` indicates a **post-merge verification or rebase failure** — the
+task's solution already passed its own verify+review and only failed
+landing on the current `main` tip (e.g. "post-merge verify failed", a
+rebase conflict, a pyright/lint break against the new main tip) — this
+investigation is running on the **merge-stage completion mode** path
+(orchestrator `block_class == MERGE_VERIFY_RED`; see
+`orchestrator/src/orchestrator/merge_completion.py`). This is narrower than
+the general risk assessment above: only label `risk_label: "low"` for
+**MECHANICAL** completion classes:
+
+- **Rebase/conflict resolution** confined strictly to files that are
+  already part of the task's own diff (no edits outside the task's
+  declared footprint).
+- **Import/type/lint repairs** against the new `main` tip (e.g. a renamed
+  symbol, a moved module, a newly-strict lint rule) — small, mechanical,
+  and clearly attributable to the main-tip move.
+- Under a **small line cap** — a handful of lines, not a substantive
+  rewrite.
+
+Anything **semantic** — logic edits, a genuinely new test failure unrelated
+to the main-tip move, cross-module changes, or any edit outside the task's
+own diff — is `medium` or `human-review-required`, never `low`. This
+labelling judgment is the mechanism that enforces "a semantic merge-verify
+failure yields no low-risk proposal": there is no separate code gate
+checking mechanical-vs-semantic — your call here is load-bearing.
+
+Note: labelling `low` here is necessary but not sufficient for autonomous
+completion. The orchestrator separately enforces a run-scoped
+pipeline-eligibility gate (VERIFY passed AND REVIEW passed for this task,
+in the current run) and clamps `low` back down to
+`human-review-required` when that evidence is missing — you do not need to
+verify that gate yourself; it is applied after your proposal is emitted.
+
 ---
 
 ## Step 3: Emit your proposal
