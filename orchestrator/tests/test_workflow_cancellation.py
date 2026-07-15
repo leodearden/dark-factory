@@ -16,6 +16,9 @@ Test coverage:
     real workflow, harness-style hard-cancelled mid-VERIFY
   step-09: ``_on_terminal_cleanups()`` ordering + kind-aware lane release
     (1:1 replacement of the deleted exc_info ``_hard_cancel`` skip)
+  step-11: boundary row 15 — soft-cancel covers a new (unwrapped) await via
+    the scope's own body-task race, and ``_await_cancellable`` raises
+    ``WorkflowCancelled('soft')`` (orphan-avoidance detach preserved)
 """
 
 from __future__ import annotations
@@ -561,3 +564,140 @@ class TestOnTerminalCleanups:
             self._wire_spies(workflow, calls)
             await self._run_cleanups(workflow, kind)
             assert 'release_lane' not in calls, f'release fired for kind={kind!r}'
+
+
+# ---------------------------------------------------------------------------
+# step-11: boundary row 15 — soft-cancel covers a new await + orphan-avoidance
+# ---------------------------------------------------------------------------
+#
+# (a) The CancellationScope races the WHOLE _drive() body-task against
+# _cancel_event (steps 03/06/08) — so ANY long await inside _drive() is
+# cancellable by construction, not just ones wrapped by _await_cancellable.
+# This pins that property end-to-end against a real TaskWorkflow, using a
+# patched steward-shaped wait _await_cancellable never sees.
+#
+# (b) _await_cancellable itself (the merge-submit orphan-avoidance helper)
+# currently returns None on cancel-win; callers do
+# `if result is None: return await self._handle_soft_cancel(...)` — a normal
+# _drive() return that never reaches run()'s single WorkflowCancelled catch
+# with kind='soft'.  RED until step-12 retypes it to RAISE
+# WorkflowCancelled('soft') (keeping the fut.cancel()/on_soft_cancel detach).
+
+
+@pytest.mark.asyncio
+class TestSoftCancelCoversNewAwait:
+    """Boundary row 15(a): a soft-cancel during a long await NOT wrapped by
+    ``_await_cancellable`` is still caught by the ``CancellationScope``'s own
+    body-task race — ``run()`` returns ``TerminalReport(SOFT_CANCELLED)``,
+    ``machine.state == CANCELLED``, and the lane is released (kind='soft')."""
+
+    async def test_soft_cancel_during_unwrapped_await_returns_soft_cancelled_report(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+
+        wedged = asyncio.Event()
+        release_calls: list[str] = []
+
+        async def _wedge_verify() -> WorkflowOutcome:
+            # A stand-in for a long, non-_await_cancellable-wrapped wait (e.g.
+            # a steward wait) — entered only after _enter_phase(VERIFY).
+            wedged.set()
+            await asyncio.sleep(3600)
+            raise AssertionError('unreachable — soft-cancelled before the sleep returns')
+
+        async def _spy_release_lane(task_id: str) -> bool:
+            release_calls.append(task_id)
+            return True
+
+        workflow._verify_debugfix_loop = _wedge_verify  # type: ignore[method-assign]
+        workflow.git_ops.release_lane_for_terminal_task = _spy_release_lane  # type: ignore[method-assign]
+
+        run_task = asyncio.create_task(workflow.run())
+        await asyncio.wait_for(wedged.wait(), timeout=5.0)
+        assert workflow.machine.state == WorkflowState.VERIFY
+
+        # Soft-cancel: set the event directly — no task.cancel() involved.
+        # Mirrors a human release_workflow / watcher-triggered soft-cancel
+        # arriving while wedged on a wait _await_cancellable never sees.
+        workflow._cancel_event.set()
+        done, _pending = await asyncio.wait({run_task}, timeout=5.0)
+        assert run_task in done, 'run() task did not finish within 5s'
+        assert not run_task.cancelled(), (
+            'CancelledError escaped run() on a soft-cancel'
+        )
+
+        report = run_task.result()
+        assert isinstance(report, TerminalReport)
+        assert report.outcome == WorkflowOutcome.SOFT_CANCELLED
+        assert workflow.machine.state == WorkflowState.CANCELLED
+        assert report.phase == WorkflowState.CANCELLED
+        assert release_calls == ['42'], (
+            'kind=soft must release the lane even from a still-working state'
+        )
+
+
+@pytest.mark.asyncio
+class TestAwaitCancellableRaisesWorkflowCancelled:
+    """Boundary row 15(b): ``_await_cancellable`` raises
+    ``WorkflowCancelled(kind='soft')`` on cancel-win instead of returning
+    ``None``, while still performing its orphan-avoidance detach
+    (``fut.cancel()`` / ``on_soft_cancel``) so an enqueued merge request is
+    never orphaned."""
+
+    async def test_hook_called_future_not_cancelled_and_raises(
+        self, config, git_ops, task_assignment,
+    ):
+        """cancel-win with an on_soft_cancel hook: hook fires exactly once,
+        the future is left untouched (registry.detach owns it instead), and
+        WorkflowCancelled('soft') is raised — not a None return."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow._cancel_event.set()  # cancel wins immediately
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        hook_calls: list[int] = []
+
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await workflow._await_cancellable(fut, on_soft_cancel=lambda: hook_calls.append(1))
+
+        assert excinfo.value.kind == 'soft'
+        assert hook_calls == [1], 'hook must be called exactly once'
+        assert not fut.cancelled(), 'future must NOT be cancelled when hook is provided'
+
+    async def test_no_hook_future_is_cancelled_and_raises(
+        self, config, git_ops, task_assignment,
+    ):
+        """cancel-win with no hook (default None): the blanket fut.cancel()
+        orphan-avoidance still fires, and WorkflowCancelled('soft') is raised."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow._cancel_event.set()
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await workflow._await_cancellable(fut)
+
+        assert excinfo.value.kind == 'soft'
+        assert fut.cancelled(), 'future must be cancelled when no hook is provided'
+
+    async def test_future_resolves_first_returns_normally_no_raise(
+        self, config, git_ops, task_assignment,
+    ):
+        """Same-window race: the awaitable's result wins over a set cancel
+        event — no WorkflowCancelled, no hook call (unaffected by step-12)."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        # cancel_event is NOT set.
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        fut.set_result('the_result')
+        hook_calls: list[int] = []
+
+        result = await workflow._await_cancellable(fut, on_soft_cancel=lambda: hook_calls.append(1))
+
+        assert result == 'the_result'
+        assert hook_calls == [], 'hook must NOT be called when future resolves first'
