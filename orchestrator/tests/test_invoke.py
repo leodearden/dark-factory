@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1064,6 +1065,165 @@ class TestStartupGraceSecsForwarding:
         assert captured_kwargs.get('startup_grace_secs') == 33.0, (
             f'startup_grace_secs not forwarded to _run_subprocess; captured={captured_kwargs!r}'
         )
+
+
+@pytest.mark.asyncio
+class TestSpawnEnvForwarding:
+    """invoke_agent and _invoke_claude_with_sandbox must thread spawn_env
+    (CLAUDE_SPAWN_* identity vars) through to the Claude subprocess env.
+
+    Step-3 RED (task 2512): fails until invoke.py is updated to accept and
+    forward spawn_env on both the non-sandbox (invoke_claude_agent) and
+    sandbox (_run_subprocess) paths.
+    """
+
+    async def test_non_sandbox_path_forwards_spawn_env(self, tmp_path):
+        """Non-sandbox claude path: spawn_env reaches invoke_claude_agent.
+
+        invoke_agent(backend='claude', sandbox_modules=None) falls through to
+        invoke_claude_agent().  We patch that and assert spawn_env is
+        forwarded unchanged.
+
+        Fails today: invoke_agent has no spawn_env param → TypeError.
+        """
+        captured_kwargs: dict = {}
+
+        async def capturing_invoke_claude_agent(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return AgentResult(success=True, output='')
+
+        spawn_env = {
+            'CLAUDE_SPAWN_ROLE': 'implementer',
+            'CLAUDE_SPAWN_PROJECT': 'dark_factory',
+            'CLAUDE_SPAWN_TASK_ID': '2512',
+            'CLAUDE_SPAWN_PARENT_ID': '2512-abcd1234',
+        }
+
+        with patch(
+            'orchestrator.agents.invoke.invoke_claude_agent',
+            side_effect=capturing_invoke_claude_agent,
+        ):
+            await invoke_agent(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                backend='claude', sandbox_modules=None,
+                spawn_env=spawn_env,
+            )
+
+        assert captured_kwargs.get('spawn_env') == spawn_env, (
+            f'spawn_env not forwarded to invoke_claude_agent; captured={captured_kwargs!r}'
+        )
+
+    async def test_sandbox_path_forwards_spawn_env(self, tmp_path):
+        """Sandbox-active branch: spawn_env's CLAUDE_SPAWN_* keys land in the
+        subprocess env passed to _run_subprocess.
+
+        Mirrors TestStartupGraceSecsForwarding.test_sandbox_path_forwards_startup_grace_secs:
+        patches resolve_active_backend → 'bwrap' and wrap_command → identity so
+        the sandbox branch is taken. Captures the *env* positional arg on the
+        _run_subprocess mock and asserts the CLAUDE_SPAWN_* keys appear in it.
+
+        Fails today: _invoke_claude_with_sandbox has no spawn_env param → TypeError.
+        """
+        captured_env: dict = {}
+
+        async def mock_run_subprocess(cmd, cwd, env, model, timeout_seconds, **kwargs):
+            captured_env.update(env)
+            return _SubprocessResult(
+                stdout='', stderr='', returncode=0, duration_ms=50, timed_out=False,
+            )
+
+        spawn_env = {
+            'CLAUDE_SPAWN_ROLE': 'implementer',
+            'CLAUDE_SPAWN_PROJECT': 'dark_factory',
+            'CLAUDE_SPAWN_TASK_ID': '2512',
+            'CLAUDE_SPAWN_PARENT_ID': '2512-abcd1234',
+        }
+
+        with (
+            patch(
+                'orchestrator.agents.sandbox_dispatch.resolve_active_backend',
+                return_value='bwrap',
+            ),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.wrap_command',
+                side_effect=lambda cmd, cwd, mods: cmd,
+            ),
+            patch(
+                'orchestrator.agents.invoke._run_subprocess',
+                side_effect=mock_run_subprocess,
+            ),
+        ):
+            await _invoke_claude_with_sandbox(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=['m'],
+                effort=None, timeout_seconds=30.0,
+                spawn_env=spawn_env,
+            )
+
+        for key, value in spawn_env.items():
+            assert captured_env.get(key) == value, (
+                f'{key} not forwarded to _run_subprocess env; captured={captured_env!r}'
+            )
+
+    async def test_sandbox_path_scrubs_inherited_session_id_and_launcher_pid(self, tmp_path):
+        """Sandbox-active branch: an inherited CLAUDE_SPAWN_SESSION_ID/
+        CLAUDE_SPAWN_LAUNCHER_PID (this process's own os.environ) must not
+        leak into the subprocess env once spawn_env is provided -- mirrors
+        the non-sandbox scrub in shared.cli_invoke._invoke_claude; see that
+        site's comment for the full rationale (session_hooks.hook_session_slug
+        prefers an inherited CLAUDE_SPAWN_SESSION_ID outright, which would
+        otherwise collapse every spawned agent onto one registry record).
+        """
+        captured_env: dict = {}
+
+        async def mock_run_subprocess(cmd, cwd, env, model, timeout_seconds, **kwargs):
+            captured_env.update(env)
+            return _SubprocessResult(
+                stdout='', stderr='', returncode=0, duration_ms=50, timed_out=False,
+            )
+
+        spawn_env = {
+            'CLAUDE_SPAWN_ROLE': 'implementer',
+            'CLAUDE_SPAWN_PARENT_ID': '2512-abcd1234',
+        }
+        inherited = {
+            'CLAUDE_SPAWN_SESSION_ID': 'inherited-launching-slug',
+            'CLAUDE_SPAWN_LAUNCHER_PID': '99999',
+        }
+
+        with (
+            patch.dict(os.environ, inherited),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.resolve_active_backend',
+                return_value='bwrap',
+            ),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.wrap_command',
+                side_effect=lambda cmd, cwd, mods: cmd,
+            ),
+            patch(
+                'orchestrator.agents.invoke._run_subprocess',
+                side_effect=mock_run_subprocess,
+            ),
+        ):
+            await _invoke_claude_with_sandbox(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=['m'],
+                effort=None, timeout_seconds=30.0,
+                spawn_env=spawn_env,
+            )
+
+        assert 'CLAUDE_SPAWN_SESSION_ID' not in captured_env
+        assert 'CLAUDE_SPAWN_LAUNCHER_PID' not in captured_env
+        assert captured_env.get('CLAUDE_SPAWN_ROLE') == 'implementer'
 
 
 @pytest.mark.asyncio

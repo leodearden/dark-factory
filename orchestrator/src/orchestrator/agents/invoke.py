@@ -26,6 +26,7 @@ from shared.cli_invoke import (  # noqa: F401
     _parse_claude_output,
     _run_subprocess,
     _SubprocessResult,
+    apply_spawn_env,
     build_claude_argv,
     invoke_claude_agent,
     invoke_with_cap_retry,
@@ -110,6 +111,7 @@ async def invoke_agent(
     timeout_seconds: float | None = None,
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
+    spawn_env: dict[str, str] | None = None,
     startup_grace_secs: float = 120.0,
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
@@ -124,6 +126,10 @@ async def invoke_agent(
     session UUID via ``--session-id``.
     *timeout_seconds*, when set, kills the subprocess after this many seconds.
     *env_overrides*, when set, are merged into the subprocess environment.
+    *spawn_env*, when set (claude backend only), carries ``CLAUDE_SPAWN_*``
+    spawn-identity vars (role/project/task/parent) for the SessionStart hook;
+    any inherited ``CLAUDE_SPAWN_SESSION_ID``/``CLAUDE_SPAWN_LAUNCHER_PID``
+    is scrubbed at the same time (see shared.cli_invoke._invoke_claude).
     *working_idle_secs* / *absolute_cap_secs*, when BOTH set (claude backend
     only), extend the working-regime watchdog past *timeout_seconds* while
     the transcript keeps advancing. Default ``None`` for both → no extension.
@@ -144,6 +150,7 @@ async def invoke_agent(
             timeout_seconds=timeout_seconds,
             config_dir=config_dir,
             env_overrides=env_overrides,
+            spawn_env=spawn_env,
             startup_grace_secs=startup_grace_secs,
             working_idle_secs=working_idle_secs,
             absolute_cap_secs=absolute_cap_secs,
@@ -200,6 +207,7 @@ async def _invoke_claude_with_sandbox(
     timeout_seconds: float | None = None,
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
+    spawn_env: dict[str, str] | None = None,
     startup_grace_secs: float = 120.0,
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
@@ -254,6 +262,11 @@ async def _invoke_claude_with_sandbox(
                 env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
             if config_dir:
                 env['CLAUDE_CONFIG_DIR'] = str(config_dir)
+            # Mirrors shared.cli_invoke._invoke_claude's non-sandbox
+            # injection (task 2512 dedup) -- see apply_spawn_env's docstring
+            # for the full rationale on the CLAUDE_SPAWN_SESSION_ID/
+            # LAUNCHER_PID scrub.
+            apply_spawn_env(env, spawn_env)
 
             try:
                 result = await _run_subprocess(
@@ -281,6 +294,7 @@ async def _invoke_claude_with_sandbox(
         session_id=session_id,
         timeout_seconds=timeout_seconds, config_dir=config_dir,
         env_overrides=env_overrides,
+        spawn_env=spawn_env,
         startup_grace_secs=startup_grace_secs,
         working_idle_secs=working_idle_secs,
         absolute_cap_secs=absolute_cap_secs,

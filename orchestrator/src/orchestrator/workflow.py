@@ -76,6 +76,7 @@ from orchestrator.scheduler import (
     files_to_modules,
     normalize_lock,
 )
+from orchestrator.session_registry import build_session_slug
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_STATUSES,
@@ -1045,6 +1046,28 @@ class TaskWorkflow:
         # right after session_id_val is determined; read by _capture_zero_output_evidence
         # so it can locate the transcript even when result.session_id is '' (hard SIGKILL).
         self._last_invoke_session_id: str | None = None
+
+        # Architect's Claude session_id (the --session-id UUID), stashed in
+        # _invoke when role.name == 'architect'.  Used by _build_spawn_env to
+        # reconstruct the architect's SessionStart-hook registry slug as the
+        # CLAUDE_SPAWN_PARENT_ID for post-architect roles (task 2512).  None
+        # until an architect has run in this workflow instance.
+        #
+        # Deliberately in-process-only, NOT persisted to the crash-recovery
+        # sidecar (self.artifacts.write_agent_session/clear_agent_session,
+        # consumed via the resume_session_id ctor dict above) or rehydrated
+        # on restart. If an orchestrator restart lands between the architect
+        # finishing and a later role starting, the fresh Workflow instance's
+        # copy is None again, so _build_spawn_env falls back to
+        # self.session_id (workflow-root) as parent for that resumed role and
+        # everything after it in this instance -- best-effort (parent is
+        # never null, just less specific than a same-instance run would
+        # produce), acknowledged by
+        # test_implementer_falls_back_to_workflow_root_when_no_architect_ran.
+        # A durable fix would need the architect's session id threaded
+        # through harness.py's crash-recovery reconstruction, out of this
+        # task's module scope.
+        self._architect_spawn_session_id: str | None = None
 
         # PRD plans/task-status-authority-prd.md contract C4/D4 (task 2188,
         # omega1).  Process-level run_id (harness.py self._run_id), threaded
@@ -7584,6 +7607,44 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         merged.update(self.config.cpu_governance.agent_env(self.worktree, os.environ.get('PATH', '')))
         return merged or None
 
+    def _build_spawn_env(self, role: AgentRole) -> dict[str, str]:
+        """Build the CLAUDE_SPAWN_* spawn-identity env for this agent invocation.
+
+        Consumed by the SessionStart hook (session_hooks.run_session_start ->
+        parse_spawn_identity) so every orchestrator-launched agent's registry
+        record carries an accurate role/project/task and a non-null parent
+        (task 2512). Built for EVERY role — unlike _build_agent_env, which
+        returns None for merger/judge/reviewer.
+
+        CLAUDE_SPAWN_PARENT_ID defaults to the workflow-root self.session_id
+        (used for the architect itself, and as the fallback for any role
+        dispatched before an architect ran in this instance). For a
+        non-architect role once an architect HAS run, the parent is instead
+        the architect's reconstructed registry slug — built via the exact
+        same session_registry.build_session_slug the architect's own
+        SessionStart hook uses, so it matches that real record precisely.
+        """
+        parent_id = self.session_id
+        if role.name != 'architect' and self._architect_spawn_session_id is not None:
+            # The architect's Claude session_id (str) deliberately fills the
+            # launcher_pid slot as the uniqueness token here -- mirrors
+            # session_hooks.hook_session_slug, which does the same for the
+            # identical reason: build_session_slug only ever str()s this
+            # argument, so the int annotation is not a real runtime
+            # constraint.
+            parent_id = build_session_slug(
+                'architect',
+                self.config.fused_memory.project_id,
+                str(self.task_id),
+                self._architect_spawn_session_id,  # type: ignore[arg-type]
+            )
+        return {
+            'CLAUDE_SPAWN_ROLE': role.name,
+            'CLAUDE_SPAWN_PROJECT': self.config.fused_memory.project_id,
+            'CLAUDE_SPAWN_TASK_ID': str(self.task_id),
+            'CLAUDE_SPAWN_PARENT_ID': parent_id,
+        }
+
     async def _invoke(
         self,
         role: AgentRole,
@@ -7692,6 +7753,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # hard SIGKILL, so we capture the effective id here before the invocation.
         self._last_invoke_session_id = session_id_val
 
+        # Stash the architect's own --session-id UUID so _build_spawn_env can
+        # reconstruct its SessionStart-hook registry slug as the
+        # CLAUDE_SPAWN_PARENT_ID for post-architect roles nesting under it
+        # (task 2512).  In-process only -- see the field's __init__ comment
+        # for why this deliberately does not survive an orchestrator restart.
+        if role.name == 'architect':
+            self._architect_spawn_session_id = session_id_val
+
         if self.artifacts is not None:
             self.artifacts.write_agent_session(
                 session_id_val, role.name, datetime.now(UTC).isoformat(),
@@ -7736,6 +7805,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # Cap hits on Claude API are handled by UsageGate account failover
                 # (wired in runner.py for eval mode).
                 env_overrides=self._build_agent_env(role),
+                # Spawn-identity env for the SessionStart hook (task 2512) —
+                # independent of env_overrides (which is None for
+                # merger/judge/reviewer); spawn_env is built for every role.
+                spawn_env=self._build_spawn_env(role),
             )
         finally:
             if self.artifacts is not None:

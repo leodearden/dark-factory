@@ -1213,6 +1213,232 @@ class TestEnvOverrides:
         assert len(captured_kwargs['env']) > 0
 
 
+# ── spawn_env plumbing ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestSpawnEnv:
+    """Verify spawn_env (CLAUDE_SPAWN_*) is merged into the subprocess env."""
+
+    async def test_spawn_env_merged_into_subprocess_env(self, tmp_path):
+        """spawn_env keys appear verbatim in the env dict passed to create_subprocess_exec."""
+        captured_kwargs = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        spawn_env = {
+            'CLAUDE_SPAWN_PARENT_ID': '2512-abcd1234',
+            'CLAUDE_SPAWN_ROLE': 'implementer',
+            'CLAUDE_SPAWN_PROJECT': 'dark_factory',
+            'CLAUDE_SPAWN_TASK_ID': '2512',
+        }
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                spawn_env=spawn_env,
+            )
+
+        env = captured_kwargs['env']
+        assert env['CLAUDE_SPAWN_PARENT_ID'] == '2512-abcd1234'
+        assert env['CLAUDE_SPAWN_ROLE'] == 'implementer'
+        assert env['CLAUDE_SPAWN_PROJECT'] == 'dark_factory'
+        assert env['CLAUDE_SPAWN_TASK_ID'] == '2512'
+
+    async def test_spawn_env_empty_value_not_written(self, tmp_path):
+        """A spawn_env key with an empty-string value is not injected into the subprocess env."""
+        captured_kwargs = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        spawn_env = {
+            'CLAUDE_SPAWN_PARENT_ID': '',
+            'CLAUDE_SPAWN_ROLE': 'implementer',
+        }
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                spawn_env=spawn_env,
+            )
+
+        env = captured_kwargs['env']
+        assert 'CLAUDE_SPAWN_PARENT_ID' not in env
+        assert env['CLAUDE_SPAWN_ROLE'] == 'implementer'
+
+    async def test_spawn_env_none_is_harmless(self, tmp_path):
+        """spawn_env=None (default) produces a valid subprocess env with no CLAUDE_SPAWN_* keys."""
+        captured_kwargs = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                spawn_env=None,
+            )
+
+        env = captured_kwargs['env']
+        assert isinstance(env, dict)
+        assert not any(k.startswith('CLAUDE_SPAWN_') for k in env)
+
+    async def test_spawn_env_does_not_mutate_os_environ(self, tmp_path):
+        """Passing spawn_env must not modify the calling process's os.environ."""
+        captured_kwargs = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        sentinel_key = 'CLAUDE_SPAWN_TASK_ID'
+        assert sentinel_key not in os.environ, 'Sentinel already in os.environ — test precondition violated'
+
+        spawn_env = {sentinel_key: '2512'}
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                spawn_env=spawn_env,
+            )
+
+        assert captured_kwargs['env'][sentinel_key] == '2512'
+        assert sentinel_key not in os.environ
+
+    async def test_spawn_env_scrubs_inherited_session_id_and_launcher_pid(self, tmp_path):
+        """An inherited CLAUDE_SPAWN_SESSION_ID/CLAUDE_SPAWN_LAUNCHER_PID (e.g.
+        this process itself was fleet-spawned) must not leak into a child's
+        subprocess env when spawn_env is provided.
+
+        session_hooks.hook_session_slug prefers CLAUDE_SPAWN_SESSION_ID
+        outright over reconstructing from ROLE/PROJECT/TASK_ID -- the branch
+        Workflow._build_spawn_env's CLAUDE_SPAWN_PARENT_ID reconstruction
+        depends on -- so an inherited value must be actively scrubbed, not
+        merely left to the truthy-value filter (which only guards *empty*
+        values, not populated ones inherited from os.environ).
+        """
+        captured_kwargs = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        spawn_env = {
+            'CLAUDE_SPAWN_ROLE': 'implementer',
+            'CLAUDE_SPAWN_PARENT_ID': '2512-abcd1234',
+        }
+        inherited = {
+            'CLAUDE_SPAWN_SESSION_ID': 'inherited-launching-slug',
+            'CLAUDE_SPAWN_LAUNCHER_PID': '99999',
+        }
+
+        with (
+            patch.dict(os.environ, inherited),
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+        ):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                spawn_env=spawn_env,
+            )
+
+        env = captured_kwargs['env']
+        assert 'CLAUDE_SPAWN_SESSION_ID' not in env
+        assert 'CLAUDE_SPAWN_LAUNCHER_PID' not in env
+        assert env['CLAUDE_SPAWN_ROLE'] == 'implementer'
+
+    async def test_spawn_env_overrides_env_overrides_for_same_key(self, tmp_path):
+        """spawn_env is merged AFTER env_overrides, so a spawn-identity value
+        wins over any same-named key an env_overrides caller supplied --
+        exercises the precedence the invoke_claude_agent/_invoke_claude
+        docstrings document but which no test previously covered."""
+        captured_kwargs = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                env_overrides={'CLAUDE_SPAWN_ROLE': 'x'},
+                spawn_env={'CLAUDE_SPAWN_ROLE': 'implementer'},
+            )
+
+        env = captured_kwargs['env']
+        assert env['CLAUDE_SPAWN_ROLE'] == 'implementer'
+
+
 # ── VllmBridge activation tests ──────────────────────────────────────────────
 
 
