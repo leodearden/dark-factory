@@ -10688,6 +10688,7 @@ async def test_remediation_pass_wires_scope_freshness_precheck(
         )
 
     mock_precheck.assert_awaited_once()
+    assert mock_precheck.await_args is not None
     call_kwargs = mock_precheck.await_args.kwargs
     assert call_kwargs.get('findings') == findings, (
         'precheck must be called with the ORIGINAL (unfiltered) findings list'
@@ -10807,6 +10808,7 @@ async def test_remediation_pass_short_circuits_when_all_fresh(
     for mock in stage_run_mocks:
         mock.assert_not_awaited()
 
+    assert mock_precheck.await_args is not None
     run_id_arg = mock_precheck.await_args.kwargs.get('run_id')
     assert complete_run_calls == [(run_id_arg, 'completed')], (
         f"Expected the run to be journal-completed exactly once with status "

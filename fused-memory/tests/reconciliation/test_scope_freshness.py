@@ -14,6 +14,7 @@ cross-project scope-correction threads.  Grown step-by-step per plan.json:
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -241,7 +242,7 @@ class TestBuildScopeSnapshotMetadata:
             build_scope_snapshot_metadata,
         )
 
-        kwargs = {
+        kwargs: dict[str, Any] = {
             'task_ref': 'dark_factory:2405',
             'flag_key': 'cross_project',
             'subject_project_id': 'dark_factory',
@@ -342,7 +343,7 @@ class TestSnapshotFreshness:
             build_scope_snapshot_metadata,
         )
 
-        kwargs = {
+        kwargs: dict[str, Any] = {
             'task_ref': 'dark_factory:2405',
             'flag_key': 'cross_project',
             'subject_project_id': 'dark_factory',

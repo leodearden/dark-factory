@@ -63,7 +63,7 @@ SCOPE_FRESHNESS_SOURCE: str = 'stage_scope_freshness'
 """``_source`` audit tag used for every scope_freshness memory write."""
 
 
-def is_cross_project_scope_correction(finding: dict[str, Any], project_id: str) -> bool:
+def is_cross_project_scope_correction(finding: dict[str, Any] | None, project_id: str) -> bool:
     """Return True iff *finding* is a cross-project scope-correction thread.
 
     True iff BOTH:
@@ -252,9 +252,7 @@ def snapshot_is_fresh(snapshot_metadata: dict[str, Any], live_task: Any) -> bool
         return False
     if updated_at != snapshot_metadata['subject_updated_at']:
         return False
-    if _content_fingerprint(description or '') != snapshot_metadata['subject_description_fingerprint']:
-        return False
-    return True
+    return _content_fingerprint(description or '') == snapshot_metadata['subject_description_fingerprint']
 
 
 async def _pool_cap_scope_snapshots(

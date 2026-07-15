@@ -2778,6 +2778,8 @@ class ReconciliationHarness:
         # guard just below to key off of.
         freshness: ScopeFreshnessResult | None = None
         try:
+            if self.taskmaster is None:
+                raise RuntimeError('taskmaster is not configured')
             freshness = await precheck_scope_correction_freshness(
                 memory_service=self.memory,
                 taskmaster=self.taskmaster,
