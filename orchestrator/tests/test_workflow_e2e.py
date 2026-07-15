@@ -32,6 +32,7 @@ from _workflow_helpers import (
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
 
+from orchestrator import session_registry
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, JUDGE, MERGER
 from orchestrator.artifacts import TaskArtifacts
@@ -8031,6 +8032,57 @@ class TestBuildSpawnEnv:
         assert env['CLAUDE_SPAWN_ROLE'] == 'architect'
         assert env['CLAUDE_SPAWN_PROJECT'] == workflow.config.fused_memory.project_id
         assert env['CLAUDE_SPAWN_TASK_ID'] == str(workflow.task_id)
+        assert env['CLAUDE_SPAWN_PARENT_ID'] == workflow.session_id
+
+    async def test_implementer_falls_back_to_workflow_root_when_no_architect_ran(
+        self, config, git_ops, task_assignment,
+    ):
+        """No architect has run yet in this workflow instance (e.g. a
+        simple_task, or mid-pipeline resume) -- _build_spawn_env(IMPLEMENTER)
+        falls back to the workflow-root session_id, same as the architect's
+        own parent."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        assert workflow._architect_spawn_session_id is None
+
+        env = workflow._build_spawn_env(IMPLEMENTER)
+
+        assert env['CLAUDE_SPAWN_ROLE'] == 'implementer'
+        assert env['CLAUDE_SPAWN_PARENT_ID'] == workflow.session_id
+
+    async def test_implementer_nests_under_architect_registry_slug(
+        self, config, git_ops, task_assignment,
+    ):
+        """Once an architect has run in this workflow instance
+        (_architect_spawn_session_id stashed), a post-architect role's
+        CLAUDE_SPAWN_PARENT_ID is the architect's reconstructed
+        SessionStart-hook registry slug -- built via the exact same
+        session_registry.build_session_slug the architect's own hook uses,
+        so it matches that real record precisely."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow._architect_spawn_session_id = 'arch-uuid-xyz'
+
+        env = workflow._build_spawn_env(IMPLEMENTER)
+
+        assert env['CLAUDE_SPAWN_ROLE'] == 'implementer'
+        assert env['CLAUDE_SPAWN_PARENT_ID'] == session_registry.build_session_slug(
+            'architect',
+            workflow.config.fused_memory.project_id,
+            str(workflow.task_id),
+            'arch-uuid-xyz',
+        )
+
+    async def test_architect_still_receives_workflow_root_when_stashed(
+        self, config, git_ops, task_assignment,
+    ):
+        """The architect itself always gets the workflow-root session_id as
+        parent -- never its own reconstructed slug -- even when
+        _architect_spawn_session_id happens to already be set (e.g. a
+        second architect invocation after a resume)."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow._architect_spawn_session_id = 'arch-uuid-xyz'
+
+        env = workflow._build_spawn_env(ARCHITECT)
+
         assert env['CLAUDE_SPAWN_PARENT_ID'] == workflow.session_id
 
 
