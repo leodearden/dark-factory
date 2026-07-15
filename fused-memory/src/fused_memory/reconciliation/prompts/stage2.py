@@ -274,12 +274,17 @@ summary is absent — you MUST re-run the Path-2 existence check AFTER your reco
 `add_memory` write, never before. \
 The reconstruction `add_memory` MUST carry \
 `metadata={{'kind': 'cycle_summary', 'stage': 'task_knowledge_sync', \
-'run_id': <reconstructed run's full UUID>, 'recon_pool': 'stage2_cycle_summary'}}` — \
+'run_id': <reconstructed run's full UUID>, 'recon_pool': 'stage2_cycle_summary', \
+'record_type': 'narrative'}}` — \
 where `run_id` is the TOP-LEVEL metadata key set to the reconstructed run's full UUID \
 (the prior run whose summary is being reconstructed, NOT the current run_id). \
 This matches the canonical cycle_summary metadata convention \
 so the retroactive write is deterministically findable by metadata-keyed lookup and \
 subject to the stage2_cycle_summary pool cap. \
+`record_type='narrative'` marks this write as your LLM-authored reconstruction \
+summary, distinct from the harness's own code-driven `record_type='ledger_stamp'` \
+mirror written deterministically every cycle by `summary_pool.write_cycle_summary` — \
+never use `'ledger_stamp'` here. \
 \
 Concretely: AFTER your reconstruction `add_memory` write returns, call \
 `mcp__fused-memory__count_memories_by_metadata(project_id, \
