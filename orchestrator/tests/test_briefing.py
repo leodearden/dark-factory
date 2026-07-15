@@ -14,6 +14,7 @@ introduced for the plan-files-not-touched architect-narrowing retry.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -367,3 +368,33 @@ class TestRevalidationPriorProposal:
         assert 'medium' in prompt
         assert 'orchestrator/x.py' in prompt
         assert '2026-07-13T10:00:00+00:00' in prompt
+
+
+@pytest.mark.asyncio
+class TestResumePriorProposal:
+    """Resume golden test.
+
+    ``build_resume_prompt`` runs after an escalation resolution — inherently
+    a retry/resume path — so it always surfaces the prior proposal. It has
+    no ``context`` override parameter, so ``_get_memory_context`` is patched
+    to avoid a real fused-memory HTTP call (mirrors test_briefing_judge.py).
+    """
+
+    async def test_includes_proposal_with_provenance(
+        self, briefing: BriefingAssembler, task_with_proposal: dict,
+    ):
+        with patch.object(
+            BriefingAssembler, '_get_memory_context', return_value='# Context\n\n_stub_',
+        ):
+            prompt = await briefing.build_resume_prompt(
+                task_with_proposal,
+                plan={},
+                escalation_summary='the issue',
+                resolution='the fix',
+                worktree=None,
+            )
+        assert 'prior block-time investigation' in prompt
+        assert (
+            'Root cause is a stale cache entry; fix by invalidating on write.'
+            in prompt
+        )
