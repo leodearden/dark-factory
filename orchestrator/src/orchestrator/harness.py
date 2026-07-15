@@ -7319,15 +7319,32 @@ Output JSON matching the schema. Every task must appear in the output.
             if citation is None:
                 return False
             # FIX 2 citation-lineage guard (task 2500): the grep-found
-            # citation must be reachable from THIS task's own branch tip.
-            # In this ancestor path (is_ancestor(branch, main) already
-            # True) a genuine citing commit is a WORK commit ON the
-            # branch — an ancestor of its tip — so an unrelated task's
-            # commit that merely matches the citation grep pattern (e.g.
+            # citation must be tied to THIS task's own branch, not merely
+            # match the citation grep pattern. Two shapes legitimately
+            # qualify:
+            #   (a) a WORK commit ON the branch — an ancestor of its tip:
+            #       is_ancestor(citation, branch) is True; or
+            #   (b) THIS branch's OWN no-ff merge commit — the
+            #       ``^Merge task/{tid} into`` subject that
+            #       git_ops.DEFAULT_COMMIT_CITATION_PATTERN deliberately
+            #       matches. find_task_citation_commit returns the MOST
+            #       RECENT match on main, which after a no-ff landing is
+            #       that merge commit; a merge commit is a DESCENDANT of
+            #       the branch tip (the tip is one of its parents), so
+            #       is_ancestor(citation, branch) is False for it while
+            #       is_ancestor(branch, citation) is True. This shape is
+            #       a genuine landing (esc-2500-2: prior orchestrator run
+            #       that merged but crashed before delete/mark-done, or a
+            #       manual `git merge --no-ff task/{tid}`) and must NOT be
+            #       rejected — doing so regressed the pre-diff behavior and
+            #       re-dispatched the task as duplicate work.
+            # An unrelated task's commit that merely matched the grep (e.g.
             # another task's merge commit — the task 2624 incident shape)
-            # is NOT an ancestor of this branch and is rejected here
-            # before any provenance is fabricated.
-            if not await self.git_ops.is_ancestor(citation, branch):
+            # is NEITHER: is_ancestor is False in BOTH directions, so it is
+            # rejected here before any provenance is fabricated.
+            if not await self.git_ops.is_ancestor(
+                citation, branch,
+            ) and not await self.git_ops.is_ancestor(branch, citation):
                 return False
             # FIX 1 effect-present guard (task 2500): the citation may be a
             # real, in-lineage work commit that a LATER commit on main

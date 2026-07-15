@@ -174,7 +174,9 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
             if (a, b) == (branch, 'main'):
                 return True
             if (a, b) == (citation_sha, branch):
-                return False  # citation NOT reachable from this branch's tip
+                return False  # citation NOT a work commit on this branch
+            if (a, b) == (branch, citation_sha):
+                return False  # citation NOT this branch's own merge commit
             raise AssertionError(f'unexpected is_ancestor call: {a!r}, {b!r}')
         h.git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
 
@@ -182,6 +184,49 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
 
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_no_ff_merge_commit_citation_flips_to_done(
+        self, mock_orch_config,
+    ) -> None:
+        """FIX 2 (task 2500) citation-lineage guard must ACCEPT this branch's
+        own no-ff merge commit, not just work commits on the branch.
+
+        Regression for esc-2500-2: git_ops.DEFAULT_COMMIT_CITATION_PATTERN
+        deliberately also matches the ``^Merge task/{tid} into`` no-ff merge
+        subject, and find_task_citation_commit returns the MOST RECENT match
+        on main — so for a legitimate no-ff landing whose branch ref still
+        exists (a prior orchestrator run that merged but crashed before
+        deleting the branch / marking done, or a manual
+        ``git merge --no-ff task/42``) the citation IS the merge commit. A
+        merge commit is a DESCENDANT of the branch tip, so
+        is_ancestor(citation, branch) is False; the guard must fall back to
+        is_ancestor(branch, citation) (True — the branch tip is a parent of
+        its own merge commit) and still flip the task to done rather than
+        re-dispatch it as duplicate work.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        branch = 'task/42'
+        merge_commit_sha = 'a' * 40  # citation default; here it's the merge commit
+
+        async def _is_ancestor(a, b):
+            if (a, b) == (branch, 'main'):
+                return True
+            if (a, b) == (merge_commit_sha, branch):
+                return False  # merge commit is a DESCENDANT of the branch tip
+            if (a, b) == (branch, merge_commit_sha):
+                return True  # branch tip is a parent of its own merge commit
+            raise AssertionError(f'unexpected is_ancestor call: {a!r}, {b!r}')
+        h.git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
+        assert call_args is not None
+        assert call_args.args[0] == '42'
+        assert call_args.args[1] == merge_commit_sha
+        assert call_args.args[3] == 'dispatch-gate-already-on-main'
 
     async def test_reverted_citation_effect_vetoes_flip(
         self, mock_orch_config,
