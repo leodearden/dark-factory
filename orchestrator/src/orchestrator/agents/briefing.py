@@ -61,14 +61,32 @@ class BriefingAssembler:
         )
 
     async def build_architect_prompt(
-        self, task: dict, worktree: Path | None = None, context: str | None = None
+        self,
+        task: dict,
+        worktree: Path | None = None,
+        context: str | None = None,
+        *,
+        include_prior_proposals: bool = False,
     ) -> str:
-        """Build prompt for the architect agent."""
+        """Build prompt for the architect agent.
+
+        Args:
+            include_prior_proposals: When True, surface the task's most
+                recent ``dry_run_proposals`` entry (if any) as a prior
+                block-time investigation. Defaults to False so a truly-fresh
+                first dispatch stays proposal-free (C-A1 anti-anchoring) —
+                only the re-plan path (an existing plan fell through to
+                architect) should pass True.
+        """
         if context is None:
             context = await self._get_memory_context(task.get('id'))
 
         task_block = self._format_task(task, include_files=False)
         identity = self._agent_identity(task.get('id'), 'architect')
+
+        prior_proposal_section = ''
+        if include_prior_proposals:
+            prior_proposal_section = self._format_prior_proposal(task)
 
         return f"""\
 {context}
@@ -79,6 +97,7 @@ class BriefingAssembler:
 
 {task_block}
 
+{prior_proposal_section}
 # Action
 
 1. Explore the codebase thoroughly — read relevant files, understand existing patterns and utilities.
@@ -965,6 +984,48 @@ Handle this escalation, then call `resolve_issue` with a summary.
         except Exception as e:
             logger.debug(f'MCP search failed for "{query}": {e}')
             return None
+
+    def _format_prior_proposal(self, task: dict) -> str:
+        """Format the most recent dry-run block-time proposal, if any.
+
+        Reads ``task.metadata.dry_run_proposals[-1]`` defensively (None-safe
+        at every level) and renders it as a markdown block carrying an
+        explicit provenance/verification line — the reader must not assume a
+        persisted proposal still holds against the current tree. Returns ''
+        when there is no proposal, the latest entry is not a dict, or (once
+        the staleness guard lands) the proposal predates the task's last
+        block transition.
+
+        Called only from retry/resume prompt builders
+        (``build_revalidation_prompt``, ``build_resume_prompt``) and, behind
+        ``include_prior_proposals=True``, from ``build_architect_prompt``'s
+        re-plan path — NEVER unconditionally from ``_format_task``, which
+        would leak proposals into the first-dispatch anti-anchoring path
+        (C-A1).
+        """
+        proposals = (task.get('metadata') or {}).get('dry_run_proposals') or []
+        if not proposals:
+            return ''
+        proposal = proposals[-1]
+        if not isinstance(proposal, dict):
+            return ''
+
+        proposal_text = proposal.get('proposal_text', '')
+        risk_label = proposal.get('risk_label', '')
+        files_referenced = proposal.get('files_referenced') or []
+        created_at = proposal.get('timestamp') or proposal.get('investigated_at') or ''
+        files_str = ', '.join(files_referenced)
+
+        return f"""\
+## Prior Block-Time Investigation
+
+A prior block-time investigation concluded the following; verify against the current tree before reusing — do NOT assume it still holds:
+
+**Proposal:** {proposal_text}
+**Risk:** {risk_label}
+**Files referenced:** {files_str}
+**Investigated at:** {created_at}
+"""
 
     def _format_task(self, task: dict, *, include_files: bool = True) -> str:
         """Format a task dict as readable text.
