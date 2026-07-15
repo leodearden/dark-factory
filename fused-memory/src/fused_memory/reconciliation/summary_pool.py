@@ -59,7 +59,13 @@ CYCLE_SUMMARY_TTL_DAYS: int = 30
 # (e.g. near-duplicate/dedup tooling) that sits on the same import side as
 # this module; until such a consumer exists, keeping the prompt-side literal
 # in sync with this value is a manual, reviewed invariant rather than an
-# enforced one.
+# enforced one. Both literal values are frozen by convention — plain string
+# discriminators with no anticipated reason to ever change — and are pinned
+# by ``TestCycleSummaryRecordTypeVocabulary`` in ``test_summary_pool.py``, so
+# an accidental future edit to either constant fails loudly there as a
+# reminder to also check the prompt text, even though that test deliberately
+# cannot (and must not) inspect the prompt text itself (task 2468 amendment
+# pass).
 CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP: str = 'ledger_stamp'
 CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = 'narrative'
 

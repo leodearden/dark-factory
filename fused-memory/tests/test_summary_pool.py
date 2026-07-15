@@ -26,6 +26,8 @@ import pytest_asyncio
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
 from fused_memory.reconciliation.summary_pool import (
+    CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP,
+    CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE,
     enforce_summary_pool_cap,
     write_cycle_summary,
 )
@@ -658,3 +660,25 @@ class TestWriteCycleSummaryMirrorAndTrim:
         assert 'run-no-ledger' in kwargs.get('content', '')
 
         mock_trim.assert_awaited_once()
+
+
+class TestCycleSummaryRecordTypeVocabulary:
+    """Pin the record_type vocabulary's literal values (task 2468 amendment
+    pass, reviewer_comprehensive/code_duplication_drift_risk).
+
+    ``CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE`` has no Python consumer today —
+    ``reconciliation.prompts.stage2`` and ``recon_self_model.py`` hardcode
+    the 'narrative' string directly instead of importing it, because those
+    prompt modules are deliberately import-light (see the module-level
+    comment above these constants in summary_pool.py). That leaves equality
+    between this constant and the prompt-side literal a manual, unenforced
+    invariant. This test does not — and must not — grep the prompt text
+    (that would be a prose/substring meta-test over prompt content); it only
+    pins each constant's own value, so an accidental future edit to either
+    constant fails loudly here as a reminder to check the prompt text too,
+    rather than silently desyncing the LLM-facing instruction.
+    """
+
+    def test_record_type_literal_values_are_pinned(self):
+        assert CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP == 'ledger_stamp'
+        assert CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE == 'narrative'
