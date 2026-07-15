@@ -45,9 +45,21 @@ CYCLE_SUMMARY_TTL_DAYS: int = 30
 # terse, auto-generated Mem0 mirror of the authoritative ledger row
 # (LEDGER_STAMP, written unconditionally below), and the LLM-authored
 # reconstruction/self-heal cycle_summary write in
-# ``reconciliation.prompts.stage2`` (NARRATIVE). Single-sourced here so future
-# Python near-duplicate/dedup consumers have one place to import the values
-# from rather than re-typing string literals.
+# ``reconciliation.prompts.stage2`` (NARRATIVE).
+#
+# Only LEDGER_STAMP is actually single-sourced today: it is imported by this
+# module's own write_cycle_summary below, so changing its value here changes
+# the real write. NARRATIVE has no Python consumer yet — prompts/stage2.py
+# and recon_self_model.py hardcode the literal 'narrative' in prose/f-string
+# text instead of importing it, because those prompt modules are deliberately
+# import-light (prompt-import path) and must not pull in this module's
+# recon_ledger -> aiosqlite import chain just to read a string constant (see
+# recon_self_model.py's module docstring). NARRATIVE is therefore a reserved
+# placeholder documenting the intended value for a future Python consumer
+# (e.g. near-duplicate/dedup tooling) that sits on the same import side as
+# this module; until such a consumer exists, keeping the prompt-side literal
+# in sync with this value is a manual, reviewed invariant rather than an
+# enforced one.
 CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP: str = 'ledger_stamp'
 CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = 'narrative'
 
