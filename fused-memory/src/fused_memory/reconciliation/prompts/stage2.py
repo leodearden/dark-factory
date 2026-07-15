@@ -31,6 +31,14 @@ You have full access to fused-memory MCP tools for both memory and task operatio
 `mcp__fused-memory__remove_task`, \
 `mcp__fused-memory__add_dependency`, `mcp__fused-memory__remove_dependency`, \
 `mcp__fused-memory__commit_planning`
+- `mcp__fused-memory__get_cycle_summary_presence` — **AUTHORITATIVE** presence check \
+against the ReconLedgerStore `cycle_summary` row (the source of truth written by \
+`write_cycle_summary`), as opposed to `count_memories_by_metadata`'s best-effort Mem0 \
+mirror query. Returns `{{'present': bool, 'ledger_available': bool, 'project_id': ..., \
+'run_id': ..., 'stage': ...}}`. `ledger_available: false` means the ledger is not wired \
+— treat that as INCONCLUSIVE, never as a definitive absence. Use this as the PRIMARY \
+cycle-summary presence authority before reconstructing a carry-forward finding (see \
+## Re-Verify Reconstruction Writes Before Carry-Forward below).
 
 ## Creating Tasks
 Task creation is a two-phase operation:
@@ -268,6 +276,27 @@ it was actually processed.
 {render_cycle_summary_section()}
 
 ## Re-Verify Reconstruction Writes Before Carry-Forward (report-before-write ordering)
+
+### PRIMARY — Ledger presence check (authoritative), before you reconstruct
+Before reconstructing ANY memory to resolve a carry-forward finding flagged by Stage 1 or \
+Stage 3 — most commonly a `missing_stage2_summary` finding where a prior run's per-cycle \
+summary is claimed absent — consult the AUTHORITATIVE ledger FIRST to confirm the finding \
+is still real: \
+`mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<reconstructed \
+run's full UUID>, stage='task_knowledge_sync')`
+
+- `ledger_available: true` and `present: true` → the authoritative summary ALREADY \
+EXISTS. The carry-forward finding is stale — do NOT reconstruct. Emit the finding as \
+RESOLVED (or omit it) and note in your cycle report, e.g. "Stage 2 summary for \
+run_id=<reconstructed run's full UUID> already present per ledger — skipping \
+reconstruction."
+- `ledger_available: true` and `present: false` → the authoritative row is GENUINELY \
+ABSENT. Proceed to reconstruct and re-verify exactly as described below.
+- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE. Proceed to \
+reconstruct as below (unchanged behavior) — the post-write re-check remains your \
+fallback verification.
+
+### Reconstruction and post-write re-check (fallback verification, kept verbatim)
 When you reconstruct a memory to resolve a carry-forward finding flagged by Stage 1 or \
 Stage 3 — most commonly a `missing_stage2_summary` finding where a prior run's per-cycle \
 summary is absent — you MUST re-run the Path-2 existence check AFTER your reconstruction \
