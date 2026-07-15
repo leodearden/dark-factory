@@ -855,6 +855,46 @@ class TestExtractFailingTestIds:
             'orchestrator/tests/test_x.py::test_z[case-1]',
         ]
 
+    def test_extracts_node_id_from_error_line(self) -> None:
+        """A fixture/teardown ``ERROR <nodeid>`` short-summary line yields the
+        node-id, same as a FAILED line (robustness-masking fix, task 2370
+        amendment)."""
+        from orchestrator import verify as verify_module
+
+        output = 'ERROR orchestrator/tests/test_x.py::test_y - Exception: setup boom\n'
+        assert verify_module._extract_failing_test_ids(output) == [
+            'orchestrator/tests/test_x.py::test_y',
+        ]
+
+    def test_extracts_file_from_bare_error_collection_line(self) -> None:
+        """A collection-level ``ERROR <file.py>`` line (whole module fails to
+        collect, no ``::``) yields the bare file path as the isolation
+        target."""
+        from orchestrator import verify as verify_module
+
+        output = 'ERROR orchestrator/tests/test_x.py - ImportError: boom\n'
+        assert verify_module._extract_failing_test_ids(output) == [
+            'orchestrator/tests/test_x.py',
+        ]
+
+    def test_extracts_both_failed_and_error_node_ids_in_first_seen_order(self) -> None:
+        """A mixed short-test-summary block — a genuine ERROR alongside a
+        load-induced FAILED flake — surfaces BOTH node-ids. This is the
+        scenario behind the robustness-masking finding: extracting only the
+        FAILED id would let the confirm gate re-run and pass on just that
+        test, suppressing the alarm while never re-running (and thus
+        masking) the real ERROR."""
+        from orchestrator import verify as verify_module
+
+        output = (
+            'FAILED orchestrator/tests/test_x.py::test_flaky - AssertionError: boom\n'
+            'ERROR orchestrator/tests/test_y.py::test_setup_broken - Exception: boom\n'
+        )
+        assert verify_module._extract_failing_test_ids(output) == [
+            'orchestrator/tests/test_x.py::test_flaky',
+            'orchestrator/tests/test_y.py::test_setup_broken',
+        ]
+
     def test_extracts_node_id_from_xdist_worker_crash_notice(self) -> None:
         """An explicit "crashed while running '<nodeid>'" notice yields the
         quoted node-id."""
@@ -968,6 +1008,42 @@ _CONFIRM_PROJECT_LAYOUT = {
     'orchestrator/tests/test_concurrent_verify_boundary.py': (
         'def test_concurrent_verify_boundary():\n    pass\n'
     ),
+}
+
+# A discovered-subprojects layout that deliberately OMITS CONFIRM_NODE_ID's
+# file — the "no owning subproject" fail-safe path (task 2370 amendment,
+# suggestion #3).
+_CONFIRM_PROJECT_LAYOUT_MISSING_FILE = {
+    'orchestrator/orchestrator.yaml': (
+        'test_command: "uv run --project orchestrator --directory orchestrator '
+        'pytest tests/ --tb=short -q"\n'
+    ),
+}
+
+# A bare, subproject-*relative* node-id (no baked-in prefix) that exists
+# under TWO discovered subprojects — the ambiguous-mapping edge case (task
+# 2370 amendment, suggestion #5).
+CONFIRM_AMBIGUOUS_NODE_ID = 'tests/test_dup.py::test_dup'
+
+CONFIRM_AMBIGUOUS_FAILING_RESULT = VerifyResult(
+    passed=False,
+    test_output=f'FAILED {CONFIRM_AMBIGUOUS_NODE_ID}',
+    lint_output='',
+    type_output='',
+    summary='test_failure',
+    cause_hint=f'FAILED {CONFIRM_AMBIGUOUS_NODE_ID}',
+    category='test_failure',
+)
+
+_CONFIRM_PROJECT_LAYOUT_AMBIGUOUS = {
+    'alpha/orchestrator.yaml': (
+        'test_command: "uv run --project alpha --directory alpha pytest tests/ --tb=short -q"\n'
+    ),
+    'alpha/tests/test_dup.py': 'def test_dup():\n    pass\n',
+    'beta/orchestrator.yaml': (
+        'test_command: "uv run --project beta --directory beta pytest tests/ --tb=short -q"\n'
+    ),
+    'beta/tests/test_dup.py': 'def test_dup():\n    pass\n',
 }
 
 
@@ -1220,3 +1296,112 @@ class TestConfirmMainTipFailureIsReal:
         )
         new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
         assert new_records == [], f'Expected no new suppressed-flake record, got {new_records!r}'
+
+    # -- amendment pass (task 2370): additional coverage -------------------
+
+    def test_confirm_suppresses_when_isolated_rerun_fails_then_passes(
+        self, tmp_path: Path
+    ) -> None:
+        """Isolated re-run FAILS on attempt 1 but PASSES on attempt 2 -> the
+        group is a confirmed flake -> False (suppress), with exactly 2
+        attempts made. Locks in the 'pass on ANY attempt within
+        _SWEEP_CONFIRM_MAX_ATTEMPTS' retry-loop contract: a regression that
+        returned after the first non-passing attempt would leave this red."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT)
+
+        rv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is False, (
+            f'Expected False (flake confirmed on 2nd attempt), got {result!r}'
+        )
+        assert rv.call_count == 2, (
+            f'Expected exactly 2 isolated-rerun attempts (fail then pass), '
+            f'got {rv.call_count}'
+        )
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert len(new_records) == 1, (
+            f'Expected 1 new suppressed-flake record, got {new_records!r}'
+        )
+
+    def test_confirm_alarms_when_node_id_matches_no_subproject(self, tmp_path: Path) -> None:
+        """The failing node-id's file does not exist under any discovered
+        subproject in the probe worktree -> True (fail-safe alarm), and
+        run_verification is never awaited — there is no group to run."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT_MISSING_FILE)
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is True, f'Expected True (unmapped node-id -> alarm), got {result!r}'
+        rv.assert_not_called()
+
+    def test_confirm_logs_warning_on_ambiguous_subproject_match(self, tmp_path: Path) -> None:
+        """A bare subproject-relative node-id that exists under TWO
+        discovered subprojects logs a WARNING (rather than silently
+        mis-attributing) and still resolves deterministically to one of them
+        for the re-run."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT_AMBIGUOUS)
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+            patch.object(verify_module, 'logger') as mock_logger,
+        ):
+            result = asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_AMBIGUOUS_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        assert result is False, f'Expected False (isolated re-run passed), got {result!r}'
+        warned = False
+        for call in mock_logger.warning.call_args_list:
+            args = call.args
+            msg = (args[0] % args[1:]) if len(args) > 1 else args[0]
+            if CONFIRM_AMBIGUOUS_NODE_ID in msg:
+                warned = True
+                break
+        assert warned, (
+            f'Expected a WARNING log about the ambiguous node-id match; got '
+            f'calls={mock_logger.warning.call_args_list!r}'
+        )
