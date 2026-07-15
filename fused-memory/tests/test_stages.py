@@ -430,6 +430,62 @@ class TestStage3PromptAlignment:
         assert 'Output Format' in STAGE3_SYSTEM_PROMPT
 
 
+class TestStage1LedgerPresenceWiring:
+    """Stage 1 consults the ReconLedgerStore ground truth
+    (``get_cycle_summary_presence``) as the PRIMARY cycle-summary presence
+    check, mirroring Stage 3's τ2 wiring (task 2437), instead of relying
+    solely on the Mem0 two-path check (task 2625).
+    """
+
+    def test_stage1_prompt_names_ledger_tool_in_available_tools(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'mcp__fused-memory__get_cycle_summary_presence' in STAGE1_SYSTEM_PROMPT, (
+            'STAGE1_SYSTEM_PROMPT must name get_cycle_summary_presence in its '
+            '## Available Tools section.'
+        )
+
+    def test_stage1_prompt_checks_ledger_for_stage2_summary(self):
+        """The actionable Stage-2-summary reconstruct-trigger decision must consult
+        the ledger keyed by stage='task_knowledge_sync' (the summary Stage 2 writes)."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert (
+            "mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<run_id>, "
+            "stage='task_knowledge_sync')"
+        ) in STAGE1_SYSTEM_PROMPT, (
+            "Stage 1 must call get_cycle_summary_presence with stage='task_knowledge_sync' "
+            'for the Stage-2-summary reconstruct-trigger decision.'
+        )
+
+    def test_stage1_prompt_checks_ledger_for_own_prior_run_summary(self):
+        """Stage 1 also audits its OWN prior-run summary (written deterministically
+        by write_stage1_cycle_summary, never LLM-reconstructed) via
+        stage='memory_consolidator' — a presence audit, not a reconstruction trigger."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert (
+            "mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<run_id>, "
+            "stage='memory_consolidator')"
+        ) in STAGE1_SYSTEM_PROMPT, (
+            "Stage 1 must also call get_cycle_summary_presence with stage='memory_consolidator' "
+            'to audit its own prior-run summary.'
+        )
+
+    def test_stage1_prompt_has_ledger_authoritative_anchors(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'ledger_available' in STAGE1_SYSTEM_PROMPT
+        assert 'AUTHORITATIVE' in STAGE1_SYSTEM_PROMPT
+
+    def test_stage1_prompt_retains_mem0_fallback(self):
+        """The existing Mem0 two-path check must be retained as the inconclusive-only
+        fallback, never deleted (fail-safe monotonicity)."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'count_memories_by_metadata' in STAGE1_SYSTEM_PROMPT
+
+
 class TestTaskKnowledgeSyncPayload:
     """TaskKnowledgeSync.assemble_payload() uses correct project attributes."""
 
