@@ -157,6 +157,30 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      BLOCKED instead of silently stranding the task with an empty queue.
    - If ``always_escalates=True``: fall through to gate (act-then-ask).
 
+   Phase γ **cross-unit, target_unit-less** sub-path (``target_unit`` is
+   falsy — an explicit ``None``, or the key omitted entirely so
+   ``before_done.get('target_unit', '')`` is ``''``; the documented
+   "``target_unit=None`` → cross-unit, no named unit" configuration): there
+   is no specific systemd unit to baseline-inspect or fresh-PID-verify
+   against — inspecting the empty unit name returns a degenerate
+   ``{'MainPID': 0, 'ActiveEnterTimestampMonotonic': 0}`` dict with no
+   ``ActiveState``, which the baseline gate above misreads as a wedge (task
+   2632 / esc-2585-1's exact escalation — the 2-key baseline repr
+   byte-matches an inspect of ``''``, not a real wedge). Both the baseline
+   gate and the FreshPidVerify/RestartPlan leg are skipped entirely; the
+   deploy is driven on the script's exit code alone:
+   - ``rc == 0``: hand off to ``_writeback_deploy_success`` (empty
+     ``new_state``, ``pid=0`` — the same helper the named-target path uses)
+     unless ``always_escalates=True``, in which case fall through to the
+     gate (act-then-ask) instead, since the script already ran.
+   - ``rc != 0``, an outer wall-clock guard timeout, or an unexpected
+     ``run_fn`` error: file born-at-L2 ``infra_issue``, return BLOCKED
+     (parallel to B7a); ``before_done_ran_at`` is already stamped (I1), so
+     the deploy is NOT re-run.
+   Named-target genuine-wedge detection (the baseline/verify logic above)
+   is entirely unchanged — this sub-path is reached only when
+   ``target_unit`` itself is falsy.
+
    Phase γ **predicate** sub-path (``before_done['kind'] == 'predicate'``):
    - A read-only exit-code VERDICT check — NOT a deploy.  Dispatched at the
      very top of section 2, above the deploy-only ``target_unit``/I1/baseline
@@ -1571,6 +1595,132 @@ class DeterministicRunner:
         return WorkflowOutcome.DONE
 
     # ------------------------------------------------------------------
+    # before_done deploy script execution — shared by run()'s named-target
+    # and target_unit-less branches (task 2632 review amendment: these two
+    # branches previously each carried their own copy of the run_fn
+    # TimeoutError-translation wrapper and outer_timeout computation, which
+    # could silently drift apart — e.g. one path's default timeout or
+    # exception classification changing without the other).
+    # ------------------------------------------------------------------
+
+    def _deploy_outer_timeout(self, before_done: dict) -> float:
+        """The Layer-B outer wall-clock guard budget for a ``before_done``
+        deploy run (or run+verify, for a named ``target_unit``):
+        ``before_done['timeout_secs']`` plus the runner's configured grace
+        period.  Shared by both of ``run()``'s ``before_done`` deploy
+        branches so a future default-timeout change can't apply to one
+        path and not the other."""
+        return before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
+
+    async def _invoke_run_fn_translating_timeout(self, run_fn, before_done: dict):
+        """Await ``run_fn(before_done)``, translating a seam-internal
+        ``TimeoutError`` into ``RuntimeError`` first.
+
+        A custom/injected ``run_fn`` seam could itself raise a
+        ``TimeoutError`` internally (e.g. its own inner
+        ``asyncio.wait_for``) BEFORE an outer
+        ``asyncio.wait_for(..., timeout=outer_timeout)`` elapses —
+        ``asyncio.wait_for`` cannot tell that apart from its OWN
+        outer-guard timeout; both surface as the same ``TimeoutError``
+        type at the call site.  Translating here means a caller's
+        ``except TimeoutError`` around the outer ``wait_for`` can only
+        ever mean "the outer wall-clock guard itself fired" — never a
+        misattributed application error.
+
+        Shared by both of ``run()``'s ``before_done`` deploy branches (the
+        named-target ``RestartPlan`` shim runner, and the target_unit-less
+        direct invocation below) so the translation logic cannot drift
+        between the two copies.
+        """
+        try:
+            return await run_fn(before_done)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f'run_fn raised TimeoutError internally (not the '
+                f'outer guard): {exc!r}'
+            ) from exc
+
+    async def _run_deploy_script_guarded(
+        self,
+        task_id: str,
+        before_done: dict,
+        description: str,
+        note: str,
+        *,
+        metadata: dict | None,
+    ) -> tuple[int, str] | WorkflowOutcome:
+        """Run a ``before_done`` deploy script under the Layer-B outer
+        wall-clock guard, mapping a timeout / unexpected error / non-zero
+        exit to an already-filed born-at-L2 ``infra_issue`` + ``BLOCKED``.
+
+        Returns ``(rc, tail)`` ONLY on a successful (``rc == 0``) run — a
+        caller never needs to re-check ``rc``.  Any other outcome returns
+        ``WorkflowOutcome.BLOCKED`` directly, having already filed the
+        escalation; callers distinguish the two with
+        ``isinstance(result, WorkflowOutcome)``.
+
+        Used by the target_unit-less branch below, which has no
+        baseline/verify machinery to run afterwards — unlike the
+        named-target branch, whose single outer guard must instead bound
+        ``RestartPlan.execute()``'s COMBINED run+verify (see the comment
+        there), so that branch cannot use this helper without splitting
+        the run and verify legs onto two separate timeout budgets, a
+        behaviour change out of scope for this amendment.
+        """
+        run_fn = self._script_runner or self._default_run_script
+        outer_timeout = self._deploy_outer_timeout(before_done)
+
+        try:
+            rc, tail = await asyncio.wait_for(
+                self._invoke_run_fn_translating_timeout(run_fn, before_done),
+                timeout=outer_timeout,
+            )
+        except TimeoutError:
+            timeout_detail = '\n'.join([
+                description,
+                note,
+                f'Deploy run exceeded the outer guard timeout ({outer_timeout}s = '
+                f"before_done['timeout_secs'] + run_timeout_grace_secs).",
+                'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+            ])
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Deploy run exceeded outer guard (no target_unit)',
+                detail=timeout_detail,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            error_detail = '\n'.join([
+                description,
+                note,
+                f'Deploy run_fn raised an unexpected error: {exc!r}',
+                'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+            ])
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Deploy run_fn failed (unexpected error, no target_unit)',
+                detail=error_detail,
+                metadata=metadata,
+            )
+
+        if rc != 0:
+            fail_detail = '\n'.join([
+                description,
+                note,
+                f'Deploy script exit code: rc={rc}',
+                f'Output:\n{tail}',
+                'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+            ])
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary=f'Deploy failed (no target_unit) (rc={rc})',
+                detail=fail_detail,
+                metadata=metadata,
+            )
+
+        return rc, tail
+
+    # ------------------------------------------------------------------
     # Main runner
     # ------------------------------------------------------------------
 
@@ -1691,6 +1841,10 @@ class DeterministicRunner:
         # ── 2. before_done execution (γ) ────────────────────────────────────
         # Cross-unit blocking deploy: stamp → baseline → run script → verify → done.
         # Self-target detection + detached systemd-run is deferred to ε.
+        # A falsy target_unit (cross-unit, no named unit) skips the
+        # baseline/verify legs entirely and drives on rc alone — see the
+        # module docstring's target_unit-less sub-path and the
+        # `if not target_unit:` branch below (task 2632 / esc-2585-1).
         if before_done is not None:
             # γ-predicate: a read-only exit-code verdict check — NOT a deploy.
             # Dispatched FIRST, above target_unit/I1/baseline, so a predicate
@@ -2152,6 +2306,54 @@ class DeterministicRunner:
             #   (a) self-kill: the blocking deploy would kill this runner mid-run;
             #   (b) double-deploy: the detached transient restart was already scheduled.
             if not self_target:
+                if not target_unit:
+                    # ── target_unit-less cross-unit deploy (task 2632 / esc-2585-1) ──
+                    # A falsy target_unit (an explicit None, or the key
+                    # omitted entirely -> before_done.get('target_unit', '')
+                    # == '') names no specific systemd unit, so there is
+                    # nothing to baseline-inspect or fresh-PID-verify against
+                    # — inspecting the empty unit name returns a degenerate
+                    # ActiveState-less dict that the baseline gate below
+                    # misreads as a wedge (esc-2585-1's exact escalation).
+                    # Skip the baseline gate AND the FreshPidVerify/
+                    # RestartPlan leg entirely (deliberately never reached)
+                    # and drive the outcome on the script's exit code alone,
+                    # via the shared _run_deploy_script_guarded helper (task
+                    # 2632 review amendment: this branch used to hand-inline
+                    # a byte-for-byte copy of that helper's run + timeout-
+                    # translate + escalate ladder, which could silently drift
+                    # from the helper over time — routing through the helper
+                    # makes that impossible).
+                    no_target_note = (
+                        'No target_unit is set — the deploy is driven on the '
+                        'script exit code alone (task 2632 / esc-2585-1).'
+                    )
+                    result = await self._run_deploy_script_guarded(
+                        task_id, before_done, description, no_target_note,
+                        metadata=metadata,
+                    )
+                    if isinstance(result, WorkflowOutcome):
+                        return result
+                    rc, tail = result
+
+                    if not always_escalates:
+                        return await self._writeback_deploy_success(
+                            task_id, metadata, {}, target_unit or '', description,
+                        )
+
+                    # always_escalates=True (act-then-ask, no target_unit):
+                    # the script already ran — fall through to the gate
+                    # rather than the named-target path's textual fallthrough
+                    # (this branch always RETURNs, so it calls the gate
+                    # helper directly instead of falling out of the `if not
+                    # target_unit:` block into the shared cross-unit code).
+                    logger.info(
+                        'DeterministicRunner: task %s target_unit-less deploy ran with '
+                        'always_escalates=True — falling through to gate',
+                        task_id,
+                    )
+                    return await self._file_milestone_gate_and_block(task_id, task, metadata)
+
                 # Capture baseline unit state before the deploy fires
                 inspect_fn = self._unit_inspector or self._default_inspect_unit
                 baseline = await inspect_fn(target_unit)
@@ -2214,26 +2416,7 @@ class DeterministicRunner:
                 # grandchildren) and the (before_done)->(rc, tail) seam
                 # contract are both preserved.
                 run_fn = self._script_runner or self._default_run_script
-                outer_timeout = before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
-
-                async def _invoke_run_fn():
-                    # A custom/injected seam could itself raise a TimeoutError
-                    # internally (e.g. its own inner asyncio.wait_for) BEFORE
-                    # outer_timeout elapses.  asyncio.wait_for cannot tell that
-                    # apart from its OWN outer-guard timeout — both surface as
-                    # the same `TimeoutError` type at the call site below.
-                    # Translate a seam-internal TimeoutError into a distinct
-                    # exception type HERE, before it can reach wait_for's
-                    # propagation path, so `except TimeoutError` below can only
-                    # ever mean "the outer wall-clock guard itself fired" —
-                    # never a misattributed application error.
-                    try:
-                        return await run_fn(before_done)
-                    except TimeoutError as exc:
-                        raise RuntimeError(
-                            f'run_fn raised TimeoutError internally (not the '
-                            f'outer guard): {exc!r}'
-                        ) from exc
+                outer_timeout = self._deploy_outer_timeout(before_done)
 
                 class _RunFnProcShim:
                     """Adapts a (rc, tail) pair from run_fn into a
@@ -2249,7 +2432,13 @@ class DeterministicRunner:
                         return self._tail.encode(errors='replace'), None
 
                 async def _shim_runner(*_args, **_kwargs):
-                    rc, tail = await _invoke_run_fn()
+                    # Route through the shared translating-timeout wrapper
+                    # (see _invoke_run_fn_translating_timeout's docstring for
+                    # why the seam-internal TimeoutError must be translated
+                    # here) instead of a local copy, so this branch and the
+                    # target_unit-less branch's _run_deploy_script_guarded
+                    # cannot drift apart (task 2632 review amendment).
+                    rc, tail = await self._invoke_run_fn_translating_timeout(run_fn, before_done)
                     return _RunFnProcShim(rc, tail)
 
                 # RestartOutcome carries only disposition/escalated/detail —

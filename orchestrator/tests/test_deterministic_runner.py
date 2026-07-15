@@ -66,7 +66,7 @@ def _mock_scheduler(task: dict):
 
 def _deploy_task(
     task_id: str = '200',
-    target_unit: str = 'orchestrator-reify.service',
+    target_unit: str | None = 'orchestrator-reify.service',
     script: str = '/tmp/test-deploy.sh',
     args: list | None = None,
     env: dict | None = None,
@@ -117,6 +117,45 @@ def _deploy_task(
     return {
         'id': task_id,
         'title': 'Deploy orchestrator-reify',
+        'description': description,
+        'metadata': metadata,
+    }
+
+
+def _deploy_task_omitted_target_unit(
+    task_id: str = '2632',
+    script: str = '/tmp/test-deploy.sh',
+    args: list | None = None,
+    env: dict | None = None,
+    cwd: str = '/tmp',
+    timeout_secs: int | float = 30,
+    description: str = 'Install trickle timer (no target_unit key)',
+) -> dict:
+    """Build a deterministic deploy task whose ``before_done`` OMITS the
+    ``target_unit`` key entirely (task 2632 / esc-2585-1).
+
+    Mirrors ``_deploy_task`` minus ``target_unit`` — this is the REAL shape
+    of the install-trickle-timer deploy config that produced esc-2585-1:
+    ``run()`` computes ``before_done.get('target_unit', '') == ''`` rather
+    than an explicit ``None``.  Kept as a distinct small helper (rather than
+    a ``target_unit=None`` sentinel on ``_deploy_task``) so the omitted-key
+    shape is faithfully reproduced instead of merely approximated.
+    """
+    before_done: dict = {
+        'script': script,
+        'args': args if args is not None else [],
+        'env': env if env is not None else {},
+        'cwd': cwd,
+        'timeout_secs': timeout_secs,
+    }
+    metadata: dict = {
+        'task_kind': 'deterministic',
+        'always_escalates': False,
+        'before_done': before_done,
+    }
+    return {
+        'id': task_id,
+        'title': 'Install trickle timer',
         'description': description,
         'metadata': metadata,
     }
@@ -926,6 +965,332 @@ class TestBeforeDoneCrossUnitDeploy:
             deploy_state_calls[-1].args[1]['deploy_state']['escalated_at']
             == deploy_state_calls[-1].args[1]['gate_escalated_at']
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2632 / esc-2585-1 residual fix: a cross-unit before_done deploy whose
+# target_unit is falsy (None, or the key omitted entirely — before_done.get(
+# 'target_unit', '') == '') has no specific systemd unit to baseline-inspect
+# or fresh-PID-verify. Skip that machinery entirely and drive the outcome on
+# the deploy script's exit code alone.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestBeforeDoneTargetUnitlessDeploy:
+    """DeterministicRunner — before_done cross-unit deploy with a falsy
+    target_unit (None, or the key omitted entirely) skips the baseline/
+    fresh-PID-verify machinery and drives the outcome on the script's exit
+    code alone (task 2632 / esc-2585-1 residual fix)."""
+
+    @pytest.mark.parametrize(
+        'build_task',
+        [
+            pytest.param(
+                lambda: _deploy_task(task_id='2632', target_unit=None),
+                id='target_unit=None',
+            ),
+            pytest.param(
+                lambda: _deploy_task_omitted_target_unit(task_id='2632'),
+                id='target_unit-key-omitted',
+            ),
+        ],
+    )
+    async def test_targetless_deploy_rc0_drives_done_without_baseline_inspect(
+        self, tmp_path: Path, build_task,
+    ):
+        """rc==0 with a falsy target_unit drives straight to done WITHOUT
+        ever inspecting the unit (baseline or verify) — the runner must not
+        inspect the empty unit name '' the way esc-2585-1's config did.
+
+        RED today: run() unconditionally inspects target_unit (''), which
+        returns a degenerate ActiveState-less dict, tripping the baseline
+        gate and filing a false-block infra_issue escalation instead of
+        driving to done.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = build_task()
+        tid = str(task['id'])
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock()
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        unit_inspector.assert_not_awaited()
+        assert queue.get_by_task(tid, status='pending') == []
+
+        scheduler.set_task_status.assert_awaited_once()
+        call = scheduler.set_task_status.call_args
+        assert call.args[1] == 'done'
+        assert call.kwargs['done_provenance']['kind'] == 'deterministic-deploy'
+
+        verified_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_verified_at')
+        ]
+        assert verified_calls, (
+            'update_task must stamp before_done_verified_at (crash-safe verified stamp)'
+        )
+
+    async def test_targetless_deploy_rc_nonzero_escalates_and_blocks(self, tmp_path: Path):
+        """rc != 0 with a falsy target_unit must escalate + block — NOT
+        drive to done — and must never touch unit_inspector.
+
+        RED today: impl-targetless-happy's branch ignores rc entirely and
+        always writebacks done, regardless of the script's exit code.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2632', target_unit=None)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock()
+        script_runner = AsyncMock(return_value=(1, 'boom: install failed'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('2632', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'infra_issue'
+        assert esc.agent_role == 'orchestrator-deterministic'
+
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert done_calls == [], 'set_task_status must NOT be called with done on failure'
+        unit_inspector.assert_not_awaited()
+
+    async def test_targetless_deploy_outer_guard_timeout_escalates(self, tmp_path: Path):
+        """A hung run_fn under a falsy target_unit must still trip the outer
+        wall-clock guard and produce exactly one born-at-L2 infra_issue —
+        never hang run() forever.
+
+        RED today: the target_unit-less branch has no try/except around
+        asyncio.wait_for, so the TimeoutError propagates uncaught instead of
+        being translated into a BLOCKED outcome.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2632', target_unit=None, timeout_secs=0)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0,
+        )
+
+        # Hang tripwire: if the outer guard regresses, fail loudly instead of
+        # stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2632', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'infra_issue'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        unit_inspector.assert_not_awaited()
+
+    async def test_targetless_deploy_run_fn_unexpected_error_escalates_and_blocks(
+        self, tmp_path: Path,
+    ):
+        """A non-timeout run_fn error (e.g. a bug in the script runner seam,
+        as opposed to a non-zero exit code or the outer guard firing) under a
+        falsy target_unit must still escalate + block via exactly one
+        born-at-L2 infra_issue, with a summary distinct from the rc!=0 and
+        outer-guard-timeout cases, and must never touch unit_inspector.
+
+        Covers the `except Exception as exc:` branch of
+        DeterministicRunner._run_deploy_script_guarded, reached from the
+        target_unit-less branch of run() (task 2632 review amendment)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2632', target_unit=None)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock()
+        script_runner = AsyncMock(side_effect=ValueError('boom'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('2632', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'infra_issue'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.summary == 'Deploy run_fn failed (unexpected error, no target_unit)'
+
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert done_calls == [], (
+            'set_task_status must NOT be called with done on an unexpected run_fn error'
+        )
+        unit_inspector.assert_not_awaited()
+
+    async def test_targetless_always_escalates_true_runs_then_gates(self, tmp_path: Path):
+        """always_escalates=True (act-then-ask) with a falsy target_unit:
+        the script still runs, but rc==0 must fall through to the milestone
+        gate instead of unconditionally writing done (task 2632).
+
+        RED today: impl-targetless-failure's rc==0 branch always calls
+        _writeback_deploy_success, ignoring always_escalates entirely.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2632', target_unit=None)
+        task['metadata']['always_escalates'] = True
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock()
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        script_runner.assert_awaited_once()
+        unit_inspector.assert_not_awaited()
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('2632', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'milestone_gate'
+
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert done_calls == [], 'set_task_status must NOT be called with done — must gate instead'
+
+    async def test_named_target_wedged_baseline_still_blocks(self, tmp_path: Path):
+        """Regression guard for acceptance #3: a NAMED target_unit whose
+        baseline inspect is wedged (ActiveState=='') must still be caught
+        by the baseline gate and block — the new falsy-target_unit branch
+        must not have weakened genuine-wedge detection for a truthy unit."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2633', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock(return_value={
+            'MainPID': 0, 'ActiveState': '', 'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        })
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2633', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue'
+        assert 'Baseline inspect failed' in pending[0].summary
+        script_runner.assert_not_called()
+
+    async def test_named_target_happy_path_still_double_inspects_and_drives_done(
+        self, tmp_path: Path,
+    ):
+        """Regression guard for acceptance #3: a NAMED target_unit happy
+        path must still await the inspector TWICE (baseline + verify) and
+        drive to done — proving the falsy-target_unit branch condition did
+        not divert a truthy/named unit off the baseline/verify path."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2634', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        assert unit_inspector.await_count == 2, (
+            'a named target_unit must still be baseline- AND verify-inspected'
+        )
+        scheduler.set_task_status.assert_awaited_once()
+        assert scheduler.set_task_status.call_args.args[1] == 'done'
+        assert queue.get_by_task('2634', status='pending') == []
 
 
 # ---------------------------------------------------------------------------
