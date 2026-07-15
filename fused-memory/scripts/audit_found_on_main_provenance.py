@@ -190,6 +190,18 @@ def commit_cites_task(message: str, task_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def classify(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
+    """Resolve *audit* to a single verdict via a fixed precedence ladder.
+
+    ``commit_not_on_main`` > ``misattributed`` > ``reverted`` >
+    ``deliverable_absent`` > ``unverifiable`` > ``ok`` — first matching rule
+    wins (see module docstring for the rationale behind this ordering).
+    """
+    if not audit.is_ancestor:
+        return 'commit_not_on_main', [
+            f'cited commit {audit.commit!r} is not an ancestor of the audited '
+            f'ref (git merge-base --is-ancestor reported unreachable)',
+        ]
+
     raise NotImplementedError
 
 
