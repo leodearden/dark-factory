@@ -462,29 +462,35 @@ class TestStage1LedgerPresenceWiring:
         )
 
     def test_stage1_prompt_checks_ledger_for_stage2_summary(self):
-        """The actionable Stage-2-summary reconstruct-trigger decision must consult
-        the ledger keyed by stage='task_knowledge_sync' (the summary Stage 2 writes)."""
+        """The actionable Stage-2-summary reconstruct-trigger decision must be keyed
+        to stage='task_knowledge_sync' (the summary Stage 2 writes).
+
+        Asserts the semantic stage-key token rather than the full multi-line call
+        signature, so harmless prompt rewording (whitespace, argument order,
+        ellipsis style) does not break the test while the stage-keying contract
+        that task 1653 protects is still verified. The ledger tool itself is
+        pinned separately by test_stage1_prompt_names_ledger_tool_in_available_tools.
+        """
         from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 
-        assert (
-            "mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<run_id>, "
-            "stage='task_knowledge_sync')"
-        ) in STAGE1_SYSTEM_PROMPT, (
-            "Stage 1 must call get_cycle_summary_presence with stage='task_knowledge_sync' "
+        assert "stage='task_knowledge_sync'" in STAGE1_SYSTEM_PROMPT, (
+            "Stage 1 must key a presence check on stage='task_knowledge_sync' "
             'for the Stage-2-summary reconstruct-trigger decision.'
         )
 
     def test_stage1_prompt_checks_ledger_for_own_prior_run_summary(self):
         """Stage 1 also audits its OWN prior-run summary (written deterministically
         by write_stage1_cycle_summary, never LLM-reconstructed) via
-        stage='memory_consolidator' — a presence audit, not a reconstruction trigger."""
+        stage='memory_consolidator' — a presence audit, not a reconstruction trigger.
+
+        Asserts the semantic stage-key token rather than the full call signature
+        (see test_stage1_prompt_checks_ledger_for_stage2_summary); the two distinct
+        stage keys must both be present so the dual-check keeps them un-conflated.
+        """
         from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 
-        assert (
-            "mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<run_id>, "
-            "stage='memory_consolidator')"
-        ) in STAGE1_SYSTEM_PROMPT, (
-            "Stage 1 must also call get_cycle_summary_presence with stage='memory_consolidator' "
+        assert "stage='memory_consolidator'" in STAGE1_SYSTEM_PROMPT, (
+            "Stage 1 must key a presence check on stage='memory_consolidator' "
             'to audit its own prior-run summary.'
         )
 
@@ -518,15 +524,20 @@ class TestStage2LedgerPresenceWiring:
         )
 
     def test_stage2_prompt_checks_ledger_before_reconstructing(self):
+        """Stage 2's carry-forward reconstruct re-verify must be keyed to
+        stage='task_knowledge_sync' (the summary Stage 2 owns).
+
+        Asserts the semantic stage-key token rather than the full multi-line call
+        signature, so harmless prompt rewording does not break the test while the
+        stage-keying contract is still verified. The ledger tool is pinned
+        separately by test_stage2_prompt_names_ledger_tool_in_available_tools.
+        """
         from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 
-        assert (
-            "mcp__fused-memory__get_cycle_summary_presence(project_id=..., "
-            "run_id=<reconstructed run's full UUID>, stage='task_knowledge_sync')"
-        ) in STAGE2_SYSTEM_PROMPT, (
-            'Stage 2 must consult get_cycle_summary_presence with '
-            "stage='task_knowledge_sync' before deciding whether to reconstruct a "
-            'carry-forward missing_stage2_summary finding.'
+        assert "stage='task_knowledge_sync'" in STAGE2_SYSTEM_PROMPT, (
+            "Stage 2 must key a presence check on stage='task_knowledge_sync' "
+            'before deciding whether to reconstruct a carry-forward '
+            'missing_stage2_summary finding.'
         )
 
     def test_stage2_prompt_has_ledger_authoritative_anchors(self):
