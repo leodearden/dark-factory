@@ -599,3 +599,32 @@ class TestS1RegistryShutdownBounded:
         assert len(warnings) == 1
         assert 'wedge' in warnings[0].message
         assert 'did not stop' in warnings[0].message
+
+
+# ---------------------------------------------------------------------------
+# step-11/12 — G1: TaskGroundTruth x MergeProvenance. A bound LandedOutbox
+# row recovers a stranded task to done{merged,sha} JOURNAL-FIRST, with git
+# archaeology never awaited (TG-1).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestG1JournalFirstRecovery:
+    """G1 composition cell (journal-first branch resolution, TG-1)."""
+
+    async def test_journal_row_recovers_on_main_without_git_archaeology(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.task_ground_truth import BranchState, BranchStateKind, RecoveryAction
+
+        task_id = 'task-2244-g1'
+        advanced_sha = 'a1' * 20  # sentinel: no git fake could ever produce this
+
+        report, action, git_ops = await _derive_after_binding_journal_row(
+            tmp_path, task_id, advanced_sha,
+        )
+
+        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, advanced_sha)
+        assert action == RecoveryAction.MARK_DONE_WITH_PROVENANCE
+        git_ops.find_merge_marker.assert_not_awaited()
+        git_ops.is_ancestor.assert_not_awaited()
