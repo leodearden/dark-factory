@@ -1605,8 +1605,8 @@ class TestStarvationWatchdogConfig:
         assert cfg.starvation_watchdog.skip_threshold == 50, (
             f'Expected skip_threshold=50; got {cfg.starvation_watchdog.skip_threshold!r}'
         )
-        assert cfg.starvation_watchdog.idle_secs == 1800.0, (
-            f'Expected idle_secs=1800.0; got {cfg.starvation_watchdog.idle_secs!r}'
+        assert cfg.starvation_watchdog.idle_secs == 259200.0, (
+            f'Expected idle_secs=259200.0; got {cfg.starvation_watchdog.idle_secs!r}'
         )
 
     def test_full_yaml_override(self, tmp_path: Path, monkeypatch):
@@ -1651,8 +1651,8 @@ class TestStarvationWatchdogConfig:
             f'Expected skip_threshold=50 (default preserved); '
             f'got {cfg.starvation_watchdog.skip_threshold!r}'
         )
-        assert cfg.starvation_watchdog.idle_secs == 1800.0, (
-            f'Expected idle_secs=1800.0 (default preserved); '
+        assert cfg.starvation_watchdog.idle_secs == 259200.0, (
+            f'Expected idle_secs=259200.0 (default preserved); '
             f'got {cfg.starvation_watchdog.idle_secs!r}'
         )
 

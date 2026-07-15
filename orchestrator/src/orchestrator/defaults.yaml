@@ -277,10 +277,15 @@ fairness:
 #   - skip_threshold: consecutive top-skips (reuses the fairness _skip_count)
 #   - idle_secs: continuous wall-clock eligibility in seconds
 # Auto-resolves when the task finally dispatches.  Set enabled: false to silence.
+#
+# idle_secs default raised to 259200 (72h) — task 2631, owner decision (Leo
+# 2026-07-15): archive analysis of 209 prior firings found max starving
+# duration 5.8h and legitimate sibling-project lock waits of ~48h, so 72h
+# isolates genuine multi-day wedges while silencing ordinary contention.
 starvation_watchdog:
   enabled: true
   skip_threshold: 50
-  idle_secs: 1800.0
+  idle_secs: 259200.0
 
 # Warm-lane base hard-down watchdog (task 2061).
 #

@@ -406,9 +406,17 @@ class StarvationWatchdogConfig(BaseModel):
       leaves the candidate pool for any tick).
 
     Default 50 skips is well above the fairness per-tier park thresholds (0–9,
-    polish 9999) so the watchdog only fires on genuine multi-hour starvation (e.g.
-    the live reify-3465 case: 475× skipped).  Default 1800 s (30 min) provides the
+    polish 9999) so the watchdog only fires on genuine multi-day starvation (e.g.
+    the live reify-3465 case: 475× skipped).  Default 259200 s (72h) provides the
     independent wall-clock backstop required by PROPERTY 3.
+
+    Owner decision (Leo 2026-07-15), backed by archive analysis of all 209
+    STARVATION_WATCHDOG escalations filed since 06-17: 94% closed benign/no-action,
+    zero produced a direct intervention, and starving duration at fire was median
+    0.5h / p90 0.8h / max 5.8h — every one of the 209 would have been silenced by a
+    72h threshold, while sibling-project reify tasks legitimately wait ~48h on
+    locks.  The watchdog remains the multi-day true-wedge tripwire; it is not being
+    removed, only re-tuned so it no longer fires on ordinary lock contention.
 
     Set ``enabled: false`` in orchestrator.yaml to silence the watchdog entirely.
     """
@@ -423,16 +431,22 @@ class StarvationWatchdogConfig(BaseModel):
         description=(
             'Minimum consecutive top-candidate skips before filing an INFO escalation. '
             'Must be >= 1.  Well above the fairness park thresholds (0–9 / polish 9999) '
-            'so it only fires on genuine multi-hour starvation.'
+            'so it only fires on genuine multi-day starvation.  Secondary signal only: '
+            'crossing this threshold alone never files an escalation — idle_secs must '
+            'also be crossed.'
         ),
     )
     idle_secs: float = Field(
-        default=1800.0,
+        default=259200.0,
         gt=0,
         description=(
             'Minimum wall-clock seconds of continuous dispatch-eligibility before '
             'filing.  Anchored on the first tick the task enters the candidate pool; '
-            'reset if the task leaves the pool for any tick.  Must be > 0.'
+            'reset if the task leaves the pool for any tick.  Must be > 0.  Default '
+            '259200s (72h): archive analysis of 209 prior firings showed max starving '
+            'duration was 5.8h and sibling-project reify tasks legitimately wait ~48h '
+            'on locks, so 72h isolates genuine multi-day wedges without false-positive '
+            'noise.'
         ),
     )
 
