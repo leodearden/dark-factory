@@ -1202,3 +1202,157 @@ class TestExecutedPlanRecordsModuleSkips:
             else:
                 assert run['scope_kind'] == 'file_scoped'
                 assert executed_mc.test_command == _render_plan_cmd(run['cmd'])
+
+
+# ---------------------------------------------------------------------------
+# step-14/step-15: module-config OPAQUE &&-chain scoping (reviewer_comprehensive
+# remediation, verify_plan.py:253)
+# ---------------------------------------------------------------------------
+
+
+class TestModuleConfigOpaqueChainScoping:
+    """Every ``TestModuleConfigScopeGoldens``/``TestModuleConfigPlanAuthority``
+    golden uses a single-clause command, but a REAL subproject
+    ``lint_command``/``type_check_command`` is an ``&&``-chain that parses
+    OPAQUE (or, for a chained ``pytest``, a recognised-but-unstructurable
+    chain) — a shape none of those goldens exercise. Before this class, that
+    left the module-config path's FILE_SCOPED derivation silently UNPINNED
+    for the one command shape that actually occurs in production, so a
+    regression (the whole unscoped chain, INCLUDING any trailing clause,
+    executing verbatim instead of being file-scoped to the touched file)
+    slipped through.
+
+    Each golden below asserts the executed command is FIRST-CLAUSE scoped
+    EXACTLY as the deleted ``scope_module_config`` twin produced it — derived
+    independently via ``verify._scope_to_keyword`` (the exact helper the old
+    twin used, and the fallback path still uses today — see golden (f) of
+    ``TestFallbackPlanAuthorityGoldens``) — not merely self-consistency with
+    the plan.
+
+    RED today: ``_derive_module_runs`` stores the raw-retained chain
+    unchanged (``strip_cwd(scope_to(parse_config_command(x), files))``
+    no-ops on an OPAQUE/raw-retained command — see ``verify_cmd.scope_to``'s
+    P1 guard) and ``_executed_module_configs_from_plan`` renders it verbatim
+    (``render()==raw``), so the whole unscoped chain — plus any trailing
+    ``&&``-chained clause — executes instead of a file-scoped first clause.
+    """
+
+    @pytest.mark.asyncio
+    async def test_lint_real_subproject_chain_scopes_to_first_clause(self, tmp_path: Path):
+        """(1) LINT — the real subproject shape (config.yaml-style): an
+        OPAQUE ``ruff check`` clause followed by an unrelated
+        ``check_bare_magicmock_config.py`` clause -> first-clause scoped,
+        the trailing clause and the unscoped ``src/ tests/`` targets both
+        dropped.
+        """
+        (tmp_path / 'escalation' / 'src').mkdir(parents=True)
+        touched = 'escalation/src/thing.py'
+        (tmp_path / touched).write_text('def helper():\n    return 1\n')
+
+        lint_command = (
+            'uv run --project escalation --directory escalation ruff check src/ tests/ '
+            '&& python3 fused-memory/scripts/check_bare_magicmock_config.py escalation/tests'
+        )
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [ModuleConfig(prefix='escalation', lint_command=lint_command)]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=[touched],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        expected = verify._scope_to_keyword(lint_command, 'ruff check', [touched])
+        assert executed[0].lint_command == expected, (
+            f'expected the first-clause-scoped string {expected!r}, got '
+            f'{executed[0].lint_command!r}'
+        )
+        assert 'check_bare_magicmock_config' not in (executed[0].lint_command or ''), (
+            f'the trailing (unrelated) clause must be dropped, not re-enabled: '
+            f'{executed[0].lint_command!r}'
+        )
+        assert 'src/ tests/' not in (executed[0].lint_command or ''), (
+            f'the unscoped src/ tests/ targets must not survive scoping: '
+            f'{executed[0].lint_command!r}'
+        )
+
+        assert result.plan is not None
+        _assert_plan_run_matches_executed(
+            result.plan, 'lint:', executed[0].lint_command, executed[0].prefix,
+        )
+
+    @pytest.mark.asyncio
+    async def test_type_non_structural_chain_scopes_to_first_clause(self, tmp_path: Path):
+        """(2) TYPE — a non-structural diff against a genuine multi-clause
+        ``npx pyright`` chain -> first-clause scoped. A plain
+        (non-Protocol/TypedDict) source file, so D2 does not widen this to
+        FULL_SUITE — this pins the FILE_SCOPED pyright branch specifically.
+        """
+        tmp_path.joinpath('mymod').mkdir(parents=True)
+        touched = 'mymod/helpers.py'
+        (tmp_path / touched).write_text('def helper():\n    return 1\n')
+
+        type_check_command = (
+            'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
+        )
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(prefix='mymod', type_check_command=type_check_command),
+        ]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=[touched],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        expected = verify._scope_to_keyword(type_check_command, 'pyright', [touched])
+        assert executed[0].type_check_command == expected, (
+            f'expected the first-clause-scoped string {expected!r}, got '
+            f'{executed[0].type_check_command!r}'
+        )
+
+        assert result.plan is not None
+        _assert_plan_run_matches_executed(
+            result.plan, 'pyright:', executed[0].type_check_command, executed[0].prefix,
+        )
+
+    @pytest.mark.asyncio
+    async def test_pytest_chained_command_scopes_to_first_clause(self, tmp_path: Path):
+        """(3) TEST — a touched collectable test file against a genuine
+        multi-clause pytest chain (recognised-but-unstructurable — see
+        ``verify_cmd._parse_chain``) -> first-clause scoped.
+        """
+        (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
+        touched = 'mymod/tests/test_thing.py'
+        (tmp_path / touched).write_text('def test_thing(): pass\n')
+
+        test_command = 'cd a && uv run pytest tests/ && cd b && uv run pytest tests/'
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [ModuleConfig(prefix='mymod', test_command=test_command)]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=[touched],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        expected = verify._scope_to_keyword(test_command, 'pytest', [touched])
+        assert executed[0].test_command == expected, (
+            f'expected the first-clause-scoped string {expected!r}, got '
+            f'{executed[0].test_command!r}'
+        )
+
+        assert result.plan is not None
+        _assert_plan_run_matches_executed(
+            result.plan, 'pytest:', executed[0].test_command, executed[0].prefix,
+        )
