@@ -4086,6 +4086,102 @@ class TestBranchContentInMain:
 
 
 @pytest.mark.asyncio
+class TestCommitEffectPresentInMain:
+    """Real-git tests for GitOps.commit_effect_present_in_main (task 2500).
+
+    FIX 1 primitive for the found_on_main post-hoc-revert blind spot: a
+    cited commit can remain an ancestor of main while a LATER commit on
+    main reverts the paths it touched — is_ancestor alone cannot see that
+    the commit's own effect is gone.  Cases:
+    (a) TRUE when the commit's own touched paths are still byte-identical
+        on main (effect present — here the trivial "commit == main HEAD"
+        shape).
+    (b) FALSE when a later commit on main reverts those same paths — the
+        commit is STILL an ancestor of main, but its effect is gone (the
+        blind spot this primitive exists to catch).
+    (c) TRUE for a no-ff merge commit whose plain (no -m/-c) diff-tree
+        touched-set is empty by git's own default behavior — path-based
+        revert detection is inapplicable, so this preserves prior
+        mark-done behavior for journal-hit and merge-marker shas (both of
+        which are merge commits).
+    """
+
+    async def test_true_when_touched_paths_still_match_main(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A fix commit lands directly on main and nothing later touches
+        its paths — the commit's own touched file is trivially
+        byte-identical at main HEAD (the commit IS main HEAD), so the
+        effect is present.
+        """
+        (git_repo / 'fileA.py').write_text('fixed\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'fix commit'], cwd=git_repo)
+        assert rc == 0, f'fix commit failed: {err}'
+        rc, fix_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        fix_sha = fix_sha.strip()
+
+        assert await git_ops.commit_effect_present_in_main(fix_sha) is True
+
+    async def test_false_when_later_commit_reverts_touched_paths(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The post-hoc-revert blind spot: the fix commit is STILL an
+        ancestor of main (it is never removed from history) but a later
+        commit on main reverts the exact paths it touched — the effect is
+        gone from HEAD even though ancestry alone says "landed".
+        """
+        (git_repo / 'fileA.py').write_text('fixed\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'fix commit'], cwd=git_repo)
+        assert rc == 0, f'fix commit failed: {err}'
+        rc, fix_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        fix_sha = fix_sha.strip()
+
+        (git_repo / 'fileA.py').write_text('reverted\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'revert commit'], cwd=git_repo)
+        assert rc == 0, f'revert commit failed: {err}'
+
+        assert await git_ops.is_ancestor(fix_sha, 'main') is True, (
+            'fix commit must still be an ancestor of main — this is the blind spot'
+        )
+        assert await git_ops.commit_effect_present_in_main(fix_sha) is False
+
+    async def test_true_for_merge_commit_with_empty_touched_set(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A no-ff merge commit's plain diff-tree (no -m/-c) reports an
+        empty touched-set by git's own default behavior for merge commits
+        — path-based revert detection is inapplicable, so this must
+        return True and preserve prior mark-done behavior for
+        journal-hit and merge-marker shas (both of which are merge
+        commits).
+        """
+        rc, _, err = await _run(['git', 'checkout', '-b', 'feature'], cwd=git_repo)
+        assert rc == 0, f'checkout feature failed: {err}'
+        (git_repo / 'fileB.py').write_text('feature\n')
+        await _run(['git', 'add', 'fileB.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'feature commit'], cwd=git_repo)
+        assert rc == 0, f'feature commit failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'feature', '-m', 'Merge feature into main'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'merge failed: {err}'
+        rc, merge_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        merge_sha = merge_sha.strip()
+
+        assert await git_ops.commit_effect_present_in_main(merge_sha) is True
+
+
+@pytest.mark.asyncio
 class TestMergeSubjectContract:
     """End-to-end contract: the merge subject written to main by merge_to_main
     equals _merge_subject output, and find_merge_marker locates that commit.
