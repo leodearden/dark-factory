@@ -1595,6 +1595,132 @@ class DeterministicRunner:
         return WorkflowOutcome.DONE
 
     # ------------------------------------------------------------------
+    # before_done deploy script execution — shared by run()'s named-target
+    # and target_unit-less branches (task 2632 review amendment: these two
+    # branches previously each carried their own copy of the run_fn
+    # TimeoutError-translation wrapper and outer_timeout computation, which
+    # could silently drift apart — e.g. one path's default timeout or
+    # exception classification changing without the other).
+    # ------------------------------------------------------------------
+
+    def _deploy_outer_timeout(self, before_done: dict) -> float:
+        """The Layer-B outer wall-clock guard budget for a ``before_done``
+        deploy run (or run+verify, for a named ``target_unit``):
+        ``before_done['timeout_secs']`` plus the runner's configured grace
+        period.  Shared by both of ``run()``'s ``before_done`` deploy
+        branches so a future default-timeout change can't apply to one
+        path and not the other."""
+        return before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
+
+    async def _invoke_run_fn_translating_timeout(self, run_fn, before_done: dict):
+        """Await ``run_fn(before_done)``, translating a seam-internal
+        ``TimeoutError`` into ``RuntimeError`` first.
+
+        A custom/injected ``run_fn`` seam could itself raise a
+        ``TimeoutError`` internally (e.g. its own inner
+        ``asyncio.wait_for``) BEFORE an outer
+        ``asyncio.wait_for(..., timeout=outer_timeout)`` elapses —
+        ``asyncio.wait_for`` cannot tell that apart from its OWN
+        outer-guard timeout; both surface as the same ``TimeoutError``
+        type at the call site.  Translating here means a caller's
+        ``except TimeoutError`` around the outer ``wait_for`` can only
+        ever mean "the outer wall-clock guard itself fired" — never a
+        misattributed application error.
+
+        Shared by both of ``run()``'s ``before_done`` deploy branches (the
+        named-target ``RestartPlan`` shim runner, and the target_unit-less
+        direct invocation below) so the translation logic cannot drift
+        between the two copies.
+        """
+        try:
+            return await run_fn(before_done)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f'run_fn raised TimeoutError internally (not the '
+                f'outer guard): {exc!r}'
+            ) from exc
+
+    async def _run_deploy_script_guarded(
+        self,
+        task_id: str,
+        before_done: dict,
+        description: str,
+        note: str,
+        *,
+        metadata: dict | None,
+    ) -> tuple[int, str] | WorkflowOutcome:
+        """Run a ``before_done`` deploy script under the Layer-B outer
+        wall-clock guard, mapping a timeout / unexpected error / non-zero
+        exit to an already-filed born-at-L2 ``infra_issue`` + ``BLOCKED``.
+
+        Returns ``(rc, tail)`` ONLY on a successful (``rc == 0``) run — a
+        caller never needs to re-check ``rc``.  Any other outcome returns
+        ``WorkflowOutcome.BLOCKED`` directly, having already filed the
+        escalation; callers distinguish the two with
+        ``isinstance(result, WorkflowOutcome)``.
+
+        Used by the target_unit-less branch below, which has no
+        baseline/verify machinery to run afterwards — unlike the
+        named-target branch, whose single outer guard must instead bound
+        ``RestartPlan.execute()``'s COMBINED run+verify (see the comment
+        there), so that branch cannot use this helper without splitting
+        the run and verify legs onto two separate timeout budgets, a
+        behaviour change out of scope for this amendment.
+        """
+        run_fn = self._script_runner or self._default_run_script
+        outer_timeout = self._deploy_outer_timeout(before_done)
+
+        try:
+            rc, tail = await asyncio.wait_for(
+                self._invoke_run_fn_translating_timeout(run_fn, before_done),
+                timeout=outer_timeout,
+            )
+        except TimeoutError:
+            timeout_detail = '\n'.join([
+                description,
+                note,
+                f'Deploy run exceeded the outer guard timeout ({outer_timeout}s = '
+                f"before_done['timeout_secs'] + run_timeout_grace_secs).",
+                'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+            ])
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Deploy run exceeded outer guard (no target_unit)',
+                detail=timeout_detail,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            error_detail = '\n'.join([
+                description,
+                note,
+                f'Deploy run_fn raised an unexpected error: {exc!r}',
+                'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+            ])
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Deploy run_fn failed (unexpected error, no target_unit)',
+                detail=error_detail,
+                metadata=metadata,
+            )
+
+        if rc != 0:
+            fail_detail = '\n'.join([
+                description,
+                note,
+                f'Deploy script exit code: rc={rc}',
+                f'Output:\n{tail}',
+                'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+            ])
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary=f'Deploy failed (no target_unit) (rc={rc})',
+                detail=fail_detail,
+                metadata=metadata,
+            )
+
+        return rc, tail
+
+    # ------------------------------------------------------------------
     # Main runner
     # ------------------------------------------------------------------
 
