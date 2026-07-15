@@ -188,20 +188,6 @@ def extract_cited_task_ids(message: str) -> set[str]:
     return ids
 
 
-def commit_cites_task(message: str, task_id: str) -> bool:
-    """Return True iff *task_id* is among the ids cited in *message*.
-
-    Small public convenience wrapper for a single-id citation check.
-    :func:`classify` itself calls :func:`extract_cited_task_ids` directly
-    (it needs the full cited-id set to name the *other* task(s) in a
-    misattributed verdict's reason) — this helper is kept as documented
-    citation-checking API in its own right, mirroring the module's
-    ``extract_cited_task_ids`` / ``commit_cites_task`` pair called out in
-    the design docs, not dead surface.
-    """
-    return task_id in extract_cited_task_ids(message)
-
-
 # ---------------------------------------------------------------------------
 # Classifier (pure)
 # ---------------------------------------------------------------------------

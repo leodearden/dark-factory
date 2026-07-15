@@ -45,7 +45,6 @@ TaskProvenanceAudit = _mod.TaskProvenanceAudit
 CITATION_PATTERN = _mod.CITATION_PATTERN
 select_found_on_main_tasks = _mod.select_found_on_main_tasks
 extract_cited_task_ids = _mod.extract_cited_task_ids
-commit_cites_task = _mod.commit_cites_task
 classify = _mod.classify
 GitFacts = _mod.GitFacts
 build_audit_report = _mod.build_audit_report
@@ -285,25 +284,6 @@ class TestExtractCitedTaskIdsMultipleCitations:
         """Both a merge-subject id and a body-mention id are captured together."""
         message = 'Merge task/50 into main\n\nAlso relates to task/77.'
         assert extract_cited_task_ids(message) == {'50', '77'}
-
-
-class TestCommitCitesTask:
-    """commit_cites_task(message, task_id) == task_id in extract_cited_task_ids(message)."""
-
-    def test_true_when_cited(self):
-        assert commit_cites_task('impl(50): add X', '50') is True
-
-    def test_false_when_not_cited(self):
-        assert commit_cites_task('chore: general cleanup', '50') is False
-
-    def test_false_for_different_task_in_merge_commit(self):
-        """A merge commit citing task/77 does not cite task 50."""
-        message = 'Merge task/77 into main'
-        assert commit_cites_task(message, '50') is False
-
-    def test_false_when_word_boundary_would_be_violated(self):
-        """task/3399 must not satisfy a commit_cites_task('...', '339') check."""
-        assert commit_cites_task('Merge task/3399 into main', '339') is False
 
 
 # ===========================================================================
