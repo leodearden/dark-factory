@@ -36,7 +36,7 @@ Design notes
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -206,3 +206,78 @@ def detect_lifecycle_reset(
         diverged_fields=tuple(diverged),
         description=description,
     )
+
+
+# ---------------------------------------------------------------------------
+# guarded_recon_task_write
+# ---------------------------------------------------------------------------
+
+GetTaskFn = Callable[..., Awaitable[Any]]
+DoWriteFn = Callable[[], Awaitable[Any]]
+FileFindingFn = Callable[[LifecycleResetFinding], Awaitable[Any]]
+
+
+async def guarded_recon_task_write(
+    *,
+    task_id: str,
+    project_id: str,
+    op: str,
+    get_task: GetTaskFn,
+    do_write: DoWriteFn,
+    file_finding: FileFindingFn,
+    project_root: str,
+    tag: str | None = None,
+    before_task: Any = None,
+    requested_status: str | None = None,
+    requested_claimant_write: bool = False,
+    requested_heartbeat_write: bool = False,
+) -> Any:
+    """Run *do_write*, guarded by a before/after live-task self-check.
+
+    Resolves the before-state from *before_task* when supplied (the caller
+    already read it, e.g. for ``recon_write_policy.check``), otherwise reads
+    it via ``get_task(task_id, project_root, tag)``. When the before-state is
+    not a live in-progress claimant, the guard is dormant: *do_write* runs
+    and its result is returned directly, with no after-read.
+
+    Otherwise: *do_write* is awaited (its exceptions propagate unchanged —
+    the guard never suppresses a real write failure); then, best-effort
+    (any exception here is logged and swallowed, never re-raised — filing a
+    diagnostic must never turn an already-succeeded write into a failure for
+    the caller), the after-state is read, :func:`detect_lifecycle_reset` is
+    run, and on a hit *file_finding* is awaited. The write's result is always
+    returned unchanged.
+    """
+    before = (
+        before_task if before_task is not None else await get_task(task_id, project_root, tag)
+    )
+
+    if not has_live_claimant(before):
+        return await do_write()
+
+    result = await do_write()
+
+    try:
+        after = await get_task(task_id, project_root, tag)
+        finding = detect_lifecycle_reset(
+            before,
+            after,
+            op=op,
+            task_id=task_id,
+            project_id=project_id,
+            requested_status=requested_status,
+            requested_claimant_write=requested_claimant_write,
+            requested_heartbeat_write=requested_heartbeat_write,
+        )
+        if finding is not None:
+            await file_finding(finding)
+    except Exception:
+        logger.exception(
+            'live_task_write_guard: best-effort after-read/detect/file failed for '
+            'task_id=%r project_id=%r op=%r; write already succeeded, not retrying',
+            task_id,
+            project_id,
+            op,
+        )
+
+    return result
