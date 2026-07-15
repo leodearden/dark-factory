@@ -703,7 +703,21 @@ class TaskSteward:
             meta_root.mkdir(parents=True, exist_ok=True)
         artifacts = TaskArtifacts(self.worktree, meta_root)
         artifacts.clear_verdict('triage')  # I-FRESH: never consume a stale verdict
-        mcp_config = _inject_verdict_tools_mcp(None, self.worktree, TRIAGE)
+
+        # Base the injected config on the steward's own fused-memory wiring
+        # (not a from-scratch skeleton) so the 'orchestrator' family TRIAGE
+        # declares — and the get_tasks/search dedup step its system prompt
+        # instructs the agent to run — is explicitly wired here, rather than
+        # relying on the ambient project_root/.mcp.json merge that cli_invoke
+        # performs (--mcp-config without --strict-mcp-config). That merge
+        # happens to supply fused-memory today, but it's an accident of cwd
+        # and merge behavior neither of which this method controls; building
+        # from self.mcp.mcp_config_json() makes the wiring match the role
+        # declaration directly. No escalation_url: TRIAGE grants no
+        # escalation tools.
+        mcp_config = _inject_verdict_tools_mcp(
+            self.mcp.mcp_config_json(), self.worktree, TRIAGE,
+        )
 
         try:
             result = await invoke_with_cap_retry(
