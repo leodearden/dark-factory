@@ -347,13 +347,73 @@ class TestD1SelfRestartDeployCrash:
 # ---------------------------------------------------------------------------
 
 
+async def _cross_unit_verify_then_advance_to_done():
+    """D1b/R4 driver: a real cross-unit blocking verify against a provably
+    different target unit passes (DEPLOYED_AND_VERIFIED — fresh, non-baseline
+    PID + strictly-later monotonic, RP-5), and the real DeployState chain
+    then advances RAN->VERIFIED->DONE, every edge legal per `_LEGAL` (the
+    recording escalation_sink is never invoked). Returns
+    (restart_outcome, final_phase, sink_calls)."""
+    from orchestrator.deploy_state import DeployPhase, DeployState, enforce_transition
+    from orchestrator.proc_supervision import EscalationSpec, FreshPidVerify, RestartPlan
+
+    tid = 'task-2244-d1b'
+    plan = RestartPlan(
+        script=Path('/proj/scripts/deploy.sh'),
+        args=['--flag'],
+        cwd=Path('/proj'),
+        target_unit='fused-memory.service',
+        own_unit='orch.service',
+        on_failure_escalation=EscalationSpec(
+            queue_dir='/nonexistent/escalations',  # unreached on this success path
+            task_id=tid,
+            summary='Cross-unit deploy verify failed',
+        ),
+        verify=FreshPidVerify(
+            baseline_active_enter_monotonic=1000,
+            baseline_main_pid=42,
+            inspect_timeout_secs=10.0,
+        ),
+    )
+    restart_outcome = await plan.execute(
+        runner=FakeRunner(returncode=0),
+        inspector=make_fake_inspector({
+            'MainPID': 99,
+            'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 2000,
+        }),
+    )
+
+    sink_calls: list[tuple[str, DeployPhase, DeployPhase]] = []
+
+    def recording_sink(task_id: str, old: DeployPhase, new: DeployPhase) -> None:
+        sink_calls.append((task_id, old, new))
+
+    metadata: dict = DeployState(
+        phase=DeployPhase.RAN, ran_at='2026-07-15T00:00:00+00:00',
+    ).to_metadata()
+
+    enforce_transition(DeployPhase.RAN, DeployPhase.VERIFIED, task_id=tid, escalation_sink=recording_sink)
+    metadata.update(
+        DeployState(phase=DeployPhase.VERIFIED, verified_at='2026-07-15T00:05:00+00:00').to_metadata()
+    )
+
+    enforce_transition(DeployPhase.VERIFIED, DeployPhase.DONE, task_id=tid, escalation_sink=recording_sink)
+    metadata.update(DeployState(phase=DeployPhase.DONE).to_metadata())
+
+    final_state = DeployState.from_metadata(metadata)
+    final_phase = final_state.phase if final_state is not None else None
+    return restart_outcome, final_phase, sink_calls
+
+
 @pytest.mark.asyncio
 class TestD1CrossUnitVerifyToDone:
     """D1b/R4 composition cell."""
 
     async def test_cross_unit_verify_then_verified_to_done(self) -> None:
-        from orchestrator.proc_supervision import RestartDisposition
         from shared.deploy_state import DeployPhase
+
+        from orchestrator.proc_supervision import RestartDisposition
 
         restart_outcome, final_phase, sink_calls = await _cross_unit_verify_then_advance_to_done()
 
