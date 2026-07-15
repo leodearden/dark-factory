@@ -181,6 +181,28 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
+    async def test_reverted_citation_effect_vetoes_flip(
+        self, mock_orch_config,
+    ) -> None:
+        """FIX 1 (task 2500) effect-present guard: the citation is present
+        AND in-lineage (is_ancestor(citation, branch) True, from
+        _wired_ancestry_harness's blanket is_ancestor=True default) but its
+        effect was reverted at current main HEAD
+        (commit_effect_present_in_main returns False) — a later commit on
+        main undid the citation's changes, so the citation's ancestry is
+        real but stale. The gate must reject it, not flip.
+
+        RED: the ancestor path has no effect-present check yet, so it
+        would flip regardless of commit_effect_present_in_main.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
 
 def _wired_marker_harness(
     mock_orch_config, *, marker_sha, branch_base_sha, marker_is_ancestor_of_base,
