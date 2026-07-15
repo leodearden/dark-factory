@@ -8865,6 +8865,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # Legitimate done — fall through; the existing post-steward
                 # flow below handles current==done by returning DONE.
             if _status_set_ok:
+                # Best-effort staleness-reference stamp (task 2557): records
+                # the confirmed block transition so BriefingAssembler can
+                # tell a stale persisted dry_run_proposals entry (from a
+                # PRIOR block cycle, re-blocked without a fresh investigation)
+                # apart from a fresh one. Awaited synchronously here, BEFORE
+                # the fire-and-forget _spawn_dry_run_unblock below appends its
+                # own later-timestamped proposal — so a fresh investigation's
+                # proposal.timestamp always lands after last_blocked_at.
+                # Default metadata_mode ('merge') preserves sibling keys
+                # (incl. dry_run_proposals). Never raises — mirrors the
+                # existing best-effort dry_run proposal-list trim in
+                # dry_run_unblock.py.
+                try:
+                    await self.scheduler.update_task(
+                        self.task_id, {'last_blocked_at': datetime.now(UTC).isoformat()},
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        '_mark_blocked: last_blocked_at stamp failed for task %s '
+                        '(best-effort, continuing): %s',
+                        self.task_id, exc,
+                    )
                 self._spawn_dry_run_unblock(
                     reason, detail or reason,
                     block_class=(disposition.block_class if disposition is not None else None),
