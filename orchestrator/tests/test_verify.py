@@ -4902,6 +4902,44 @@ class TestBuildFallbackConfigSubprojectScoped:
             '&& cd .. && uv run --project shared pytest tests/scripts/'
         )
 
+    def test_extras_carried_verbatim_even_when_undefined_in_touched_subproject(
+        self, tmp_path: Path,
+    ) -> None:
+        """Carried extras are NOT validated against the touched subproject's own pyproject.toml.
+
+        Known limitation (review follow-up, task 2641): `_make_cockpit_worktree`'s
+        `cockpit/pyproject.toml` declares no `[project.optional-dependencies]`
+        at all, yet `dev`/`web` extras configured on the fleet-level
+        `test_command` are still spliced into cockpit's own
+        `uv run --extra ...` context verbatim. If a real subproject's own
+        pyproject.toml doesn't declare an extra carried from the fleet
+        config, `uv run --extra <name>` hard-fails at runtime with "Extra
+        `<name>` is not defined" (turning a passing change RED) rather than
+        being silently dropped or caught here — `_build_fallback_config` does
+        no pyproject-declaration validation. This mirrors the identical,
+        pre-existing assumption in the task-2355 LINT/TYPE fix
+        (`_scope_fallback_tool_to_subproject` leaves a verbatim `--extra`
+        clause untouched with no subproject-declaration check either), so
+        it's not a new gap introduced by this task — pinned here so a future
+        maintainer isn't surprised.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        assert '[project.optional-dependencies]' not in (
+            (worktree / 'cockpit' / 'pyproject.toml').read_text()
+        )
+        cfg = self._make_config(
+            tmp_path, test_command='uv run --extra dev --extra web pytest',
+        )
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == (
+            'cd cockpit && uv run --extra dev --extra web pytest tests/test_c3.py'
+        )
+
 
 class TestRunScopedVerificationForwardsWorktreeToFallback:
     """`run_scoped_verification` forwards *worktree* into `_build_fallback_config` (task 2344).

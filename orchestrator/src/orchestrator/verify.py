@@ -1608,6 +1608,14 @@ def _config_test_extras(cmd: str | None) -> list[str]:
     twin of the task-2355 TYPE/LINT cold-verify dev-dep fix) so a cold merge
     worktree syncs the project's dev-group deps before pytest is spawned.
 
+    Scope (review follow-up, task 2641): only ``--extra``/``--extra=`` is
+    recognized. Other uv dependency-selection flags — ``--group``/
+    ``--group=``, ``--all-extras``, ``--all-groups``, ``--dev``/``--no-dev``
+    — are intentionally NOT extracted; a project that selects its test deps
+    via one of those instead of ``--extra`` will still hit the cold-verify
+    "Failed to spawn" race this helper fixes for ``--extra``-based projects.
+    Broadening coverage to those flags is a follow-up, not handled here.
+
     Returns ``[]`` when *cmd* is ``None``, carries no ``--extra`` flags, or
     fails to tokenize (unbalanced quotes — mirrors :func:`parse_config_command`'s
     ``shlex.split`` + ``except ValueError`` guard).
@@ -1768,6 +1776,20 @@ def _build_fallback_config(
         # extra before spawning pytest (TEST-path twin of the task-2355
         # TYPE/LINT fix below). extras is [] for a no-extra config, so the
         # output is byte-identical to before this change.
+        #
+        # Assumption (review follow-up, task 2641): extras are spliced into
+        # *sub*'s own uv context without checking that *sub*'s own
+        # pyproject.toml actually declares them. If config.test_command's
+        # extra is declared elsewhere (e.g. the repo root or another
+        # subproject) but not in *sub*, `uv run --extra <name>` hard-fails
+        # with "Extra `<name>` is not defined" — turning a passing change
+        # RED instead of silently dropping the flag. This mirrors the
+        # identical, pre-existing assumption in the task-2355 LINT/TYPE fix
+        # just below (`_scope_fallback_tool_to_subproject` leaves a verbatim
+        # `--extra` clause untouched with no subproject-declaration check
+        # either), so it is not a new gap introduced here — see
+        # TestBuildFallbackConfigSubprojectScoped
+        # .test_extras_carried_verbatim_even_when_undefined_in_touched_subproject.
         extras = _config_test_extras(config.test_command if config is not None else None)
         test_cmd = (
             'cd ' + sub + ' && uv run ' + ' '.join([*extras, 'pytest', *rel_targets])
@@ -1829,7 +1851,9 @@ def _build_fallback_config(
         # pure-subproject branch above — carry test_command's --extra flags
         # into the touched subproject's own pytest segment only.
         # _ROOT_OWNING_TEST_COMMAND is a separate, dark_factory-specific
-        # command and is left untouched.
+        # command and is left untouched. Same undeclared-extra assumption as
+        # the pure-subproject branch above applies here too (see the
+        # "Assumption (review follow-up, task 2641)" comment there).
         mixed_extras = _config_test_extras(config.test_command if config is not None else None)
         test_cmd = (
             'cd ' + mixed_sub + ' && uv run ' + ' '.join([*mixed_extras, 'pytest', *mixed_rel_targets])
