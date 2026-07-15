@@ -1,0 +1,110 @@
+prd: plans/dashboard-task-runtime-endpoint-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 2634
+  title: Harness.task_runtime_snapshot() accessor
+  capabilities:
+  - name: harness-task-runtime-snapshot-accessor
+    binding: capability→producer (wired) — reaches WarmLanePool (warm_lane_pool.py:238),
+      LaneLifecycle (lane_lifecycle.py:253,192), TaskArtifacts (artifacts.py:486,536,425,204)
+      via harness.git_ops
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def task_runtime_snapshot
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: loops-attempts-non-sentinel-honest-empty
+    binding: field-population — real TaskArtifacts line/verdict counts; a per-task
+      artifact read failure is NOT silently coerced to 0 (structured-facts-at-failure);
+      honest-empty→0 is B4
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: honest-empty vs read-error is a behavioural property verified by ε's
+        B4, not a grep
+- label: β
+  task_id: 2635
+  title: get_task_runtime_state MCP tool + declared return schema
+  capabilities:
+  - name: get-task-runtime-state-mcp-tool
+    binding: 'capability→producer (wired) — @mcp.tool closure over harness (merge_request/get_merge_halt_status
+      precedent, server.py); DAG-direction: α upstream'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def get_task_runtime_state
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: return-schema-single-shared-model
+    binding: capability→producer — ONE shared/ pydantic/TypedDict model imported by
+      both the tool and the dashboard join, no mirrored copy (INV-1 contracts-machine-checked,
+      INV-5 no-lockstep-duplication; resolves Open-Q2)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: single-source-of-truth (no structurally-mirrored second copy) is an
+        import-topology property judged by β's tests, not a stable grep
+- label: γ
+  task_id: 2636
+  title: Dashboard consumes MCP runtime; delete the hand reader
+  capabilities:
+  - name: fetch-task-runtime-fanout-helper
+    binding: 'capability→producer (wired) — clones data/merge_halt.py fan-out over
+      config.escalation_urls (mcp_tool_call memory.py:176); joined at active_tasks._shape_one_project
+      (:211); DAG-direction: β upstream'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def fetch_task_runtime
+      paths:
+      - dashboard/src/dashboard/data/
+      expect: present
+  - name: hand-reader-deleted-no-fallback
+    binding: rejection-mechanism (B7) — _scan_worktrees/_extract_task_id/read_task_artifacts
+      + discover_orchestrators worktrees dict removed; no disk-read fallback survives
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an expect:absent grep would false-positive on a docstring/comment naming
+        the retired symbol (e.g. ζ's retirement note); ε's B7 is the observing check
+- label: δ
+  task_id: 2637
+  title: OrchTab Lane / Phase / State columns + offline dash rendering
+  capabilities:
+  - name: orchtab-lane-phase-state-columns-offline-dash
+    binding: capability→producer — γ (upstream) populates the row + per-project offline
+      marker; δ renders the new columns and '—' for an offline project
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a JSX render assertion is not robustly greppable; exercised by ε's B6
+        (offline renders '—', not 0)
+- label: ε
+  task_id: 2638
+  title: 'B+H integration gate: two-way boundary suite B1-B7'
+  capabilities:
+  - name: boundary-suite-b1-b7-green
+    binding: DAG-direction — all legs (α accessor, β tool, γ join/delete, δ render)
+      produced upstream; ε is the two-way producer+consumer boundary suite
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the task IS the check suite; its signal is pytest B1-B7 green, and no
+        downstream task consumes it (nothing to gate)
+- label: ζ
+  task_id: 2639
+  title: Retire the FORMAT-COUPLING reader marker (companion correction)
+  capabilities:
+  - name: format-coupling-marker-retired
+    binding: 'capability→producer (wired) — orchestrator.py FORMAT-COUPLING / W11-grep
+      doc block retired + retirement notes added to worktree-lane-lifecycle-prd.md
+      and dashboard-alignment-prd.md; DAG-direction: γ deletion upstream'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: docs retirement/redirect is prose-judged; grep-observable in ζ's own
+        signal, and no downstream task consumes ζ (nothing to gate)
