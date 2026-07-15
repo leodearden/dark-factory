@@ -1262,6 +1262,23 @@ class TestBuildParser:
         assert args.check is True
         assert args.max_backlog == 5
 
+    def test_max_backlog_zero_is_accepted(self):
+        """0 is the documented default ceiling and must be accepted."""
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--max-backlog', '0'])
+        assert args.max_backlog == 0
+
+    def test_max_backlog_negative_is_rejected_at_parse_time(self):
+        """A negative --max-backlog makes backlog_verdict() report a
+        violation for ANY residual count (even 0), forever, with no
+        explanation — the same silent-misbehavior-on-typo class already
+        rejected for --max-age-days. This must be rejected at parse time,
+        not accepted and silently misbehave (task 2596 amendment,
+        reviewer_comprehensive #1)."""
+        parser = _mod._build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(['--max-backlog', '-1'])
+
     def test_terminal_drain_flag(self):
         """--terminal-drain is a boolean flag, defaulting to False."""
         parser = _mod._build_parser()

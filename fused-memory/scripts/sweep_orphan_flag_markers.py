@@ -79,6 +79,7 @@ import json
 import logging
 import sys
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Any
 
 from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
@@ -661,21 +662,31 @@ def _split_comma_ids(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(',') if part.strip()]
 
 
-def _non_negative_int(raw: str) -> int:
-    """argparse ``type=`` callback for ``--max-age-days``.
+def _non_negative_int(raw: str, *, flag_name: str) -> int:
+    """argparse ``type=`` callback rejecting negative ints, shared by
+    ``--max-age-days`` and ``--max-backlog`` (task 2596 amendment,
+    reviewer_comprehensive #1).
 
-    Rejects negative values at parse time. ``find_stale_markers`` computes
-    its cutoff as ``now - timedelta(days=max_age_days)``; a negative
-    ``max_age_days`` pushes that cutoff into the FUTURE, which would
-    silently drain every dated member (not just stale ones) — the same
-    effect as the documented ``--max-age-days 0`` ("drain everything")
-    lever, but reached by what reads as a typo rather than the deliberate,
-    explicit ``0`` (task 2596 amendment, reviewer_comprehensive #2). This
-    script's ``--apply`` path performs irreversible deletes, so a footgun
-    like this is rejected outright rather than silently honoured.
+    Both flags silently misbehave rather than erroring on a negative value:
+    ``find_stale_markers`` computes its cutoff as
+    ``now - timedelta(days=max_age_days)``, so a negative ``max_age_days``
+    pushes the cutoff into the FUTURE and drains every dated member (not
+    just stale ones); ``backlog_verdict`` compares ``after_total_source``
+    against ``max_backlog`` with ``<=``, so a negative ``max_backlog`` makes
+    ANY residual count a violation and a ``--check`` predicate wired with a
+    typo'd negative ceiling escalates forever with no explanation. Both are
+    the same footgun class, reached by what reads as a typo rather than a
+    deliberate value. This script's ``--apply`` path performs irreversible
+    deletes and ``--check`` gates deterministic-task completion, so the
+    footgun is rejected outright rather than silently honoured.
+
+    Bind ``flag_name`` per call site via :func:`functools.partial` so the
+    raised error names the actual flag that failed to parse.
 
     Args:
-        raw: Raw ``--max-age-days`` CLI value.
+        raw: Raw CLI value for the bound flag.
+        flag_name: The CLI flag name to cite in the error message, e.g.
+            ``'--max-age-days'`` or ``'--max-backlog'``.
 
     Returns:
         The parsed non-negative int.
@@ -691,10 +702,7 @@ def _non_negative_int(raw: str) -> int:
     except ValueError:
         raise argparse.ArgumentTypeError(f'invalid int value: {raw!r}') from None
     if value < 0:
-        raise argparse.ArgumentTypeError(
-            f'--max-age-days must be >= 0 (got {value}); use 0 to '
-            'explicitly drain every dated dead-weight record.'
-        )
+        raise argparse.ArgumentTypeError(f'{flag_name} must be >= 0 (got {value}).')
     return value
 
 
@@ -730,7 +738,8 @@ def _build_parser() -> argparse.ArgumentParser:
              'Increase if count_memories_by_metadata shows >1000 source markers.',
     )
     parser.add_argument(
-        '--max-age-days', dest='max_age_days', type=_non_negative_int, default=14,
+        '--max-age-days', dest='max_age_days',
+        type=partial(_non_negative_int, flag_name='--max-age-days'), default=14,
         help='Age cutoff in days for find_stale_markers (default: 14). '
              'Use 0 to drain every dated dead-weight record. Negative '
              'values are rejected (they would push the cutoff into the '
@@ -755,8 +764,19 @@ def _build_parser() -> argparse.ArgumentParser:
              'predicate (mirrors scripts/check_merge_flakiness.sh).',
     )
     parser.add_argument(
-        '--max-backlog', dest='max_backlog', type=int, default=0,
-        help='Residual stage1_flag_marker ceiling checked by --check (default: 0).',
+        '--max-backlog', dest='max_backlog',
+        type=partial(_non_negative_int, flag_name='--max-backlog'), default=0,
+        help=(
+            'Residual stage1_flag_marker ceiling checked by --check '
+            '(default: 0). Negative values are rejected (a negative '
+            'ceiling reached by typo would make backlog_verdict violate '
+            'on any residual, forever, with no explanation). A '
+            'before_done predicate wired with the default 0 may never be '
+            'satisfiable if the population has a nonzero '
+            "undated_kept_count (see run()'s report and WARNING log) — "
+            'set --max-backlog to at least that count, or run '
+            '--delete-ids/--terminal-drain first to clear it.'
+        ),
     )
     return parser
 
