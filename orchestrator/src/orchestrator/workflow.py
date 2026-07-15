@@ -7738,6 +7738,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # hard SIGKILL, so we capture the effective id here before the invocation.
         self._last_invoke_session_id = session_id_val
 
+        # Stash the architect's own --session-id UUID so _build_spawn_env can
+        # reconstruct its SessionStart-hook registry slug as the
+        # CLAUDE_SPAWN_PARENT_ID for post-architect roles nesting under it
+        # (task 2512).
+        if role.name == 'architect':
+            self._architect_spawn_session_id = session_id_val
+
         if self.artifacts is not None:
             self.artifacts.write_agent_session(
                 session_id_val, role.name, datetime.now(UTC).isoformat(),
@@ -7782,6 +7789,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # Cap hits on Claude API are handled by UsageGate account failover
                 # (wired in runner.py for eval mode).
                 env_overrides=self._build_agent_env(role),
+                # Spawn-identity env for the SessionStart hook (task 2512) —
+                # independent of env_overrides (which is None for
+                # merger/judge/reviewer); spawn_env is built for every role.
+                spawn_env=self._build_spawn_env(role),
             )
         finally:
             if self.artifacts is not None:
