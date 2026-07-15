@@ -1133,6 +1133,57 @@ class TestBeforeDoneTargetUnitlessDeploy:
         assert esc.agent_role == 'orchestrator-deterministic'
         unit_inspector.assert_not_awaited()
 
+    async def test_targetless_deploy_run_fn_unexpected_error_escalates_and_blocks(
+        self, tmp_path: Path,
+    ):
+        """A non-timeout run_fn error (e.g. a bug in the script runner seam,
+        as opposed to a non-zero exit code or the outer guard firing) under a
+        falsy target_unit must still escalate + block via exactly one
+        born-at-L2 infra_issue, with a summary distinct from the rc!=0 and
+        outer-guard-timeout cases, and must never touch unit_inspector.
+
+        Covers the `except Exception as exc:` branch of
+        DeterministicRunner._run_deploy_script_guarded, reached from the
+        target_unit-less branch of run() (task 2632 review amendment)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2632', target_unit=None)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock()
+        script_runner = AsyncMock(side_effect=ValueError('boom'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('2632', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'infra_issue'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.summary == 'Deploy run_fn failed (unexpected error, no target_unit)'
+
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert done_calls == [], (
+            'set_task_status must NOT be called with done on an unexpected run_fn error'
+        )
+        unit_inspector.assert_not_awaited()
+
     async def test_targetless_always_escalates_true_runs_then_gates(self, tmp_path: Path):
         """always_escalates=True (act-then-ask) with a falsy target_unit:
         the script still runs, but rc==0 must fall through to the milestone
