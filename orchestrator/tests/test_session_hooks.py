@@ -39,10 +39,12 @@ def _clear_claude_spawn_env(monkeypatch: pytest.MonkeyPatch) -> None:
     hook_session_slug prefers it over the stdin session_id these tests
     assert on -- the hook then writes its registry record at a different
     slug than the test reads, raising FileNotFoundError. Clearing the
-    CLAUDE_SPAWN_* env vars here makes every test in this file hermetic
-    regardless of the launching context; tests that need a specific
-    CLAUDE_SPAWN_* value still set it explicitly via an env= mapping or
-    monkeypatch.setenv, which is unaffected by this fixture running first.
+    CLAUDE_SPAWN_* vars that spawn-claude.sh actually injects into a
+    spawned session's environment (see the amendment paragraph below for
+    the precise accounting) makes this file hermetic against that
+    launching context; tests that need a specific CLAUDE_SPAWN_* value
+    still set it explicitly via an env= mapping or monkeypatch.setenv,
+    which is unaffected by this fixture running first.
 
     Reviewer follow-up (amendment pass): skills/spawn/spawn-claude.sh's
     `inner` payload (the actual env of a spawned claude process) splices in
