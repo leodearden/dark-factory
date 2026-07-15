@@ -75,9 +75,16 @@ PROMOTE_ALLOWED: frozenset[str] = frozenset({_WATCHER_AUTO_IDENTITY})
 L2_AUTO_CLOSE_ACTION: str = 'close_only'
 
 # Categories that are NEVER auto-closable regardless of class match — the
-# born-at-L2 human-judgment categories (design decisions, milestone
-# predicate gates). Checked BEFORE the allowlist (denylist-first).
-L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset({'design_concern', 'milestone_gate'})
+# born-at-L2 human-judgment categories (design decisions, and BOTH milestone
+# categories the deterministic runner files: 'milestone_gate' — the gate
+# itself — and 'milestone_check_failed' — a failed predicate check. The
+# latter is also covered by L2_AUTO_CLOSE_DENY_ROLES below (both file under
+# agent_role='orchestrator-deterministic'), but is listed here too for
+# defense-in-depth so a future filing under a different role stays blocked.
+# Checked BEFORE the allowlist (denylist-first).
+L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset(
+    {'design_concern', 'milestone_gate', 'milestone_check_failed'}
+)
 
 # Agent roles that are NEVER auto-closable regardless of category/evidence —
 # the born-at-L2 human-gate sentinel role (deterministic always_escalates /
@@ -131,10 +138,16 @@ class _L2CloseClass:
 #       requires BOTH a newer sweep-escalation id (``esc-...``) AND proof the
 #       failing tip is an ancestor of a now-green main.
 #   (b) self_cleared_infra — mirrors harness._revalidate_open_deterministic_escalation:
-#       requires a quoted live-probe key=value liveness token.
+#       requires a quoted liveness-probe token from a known key allowlist
+#       (paused / ActiveState / MainPID / ActiveEnterTimestamp) — NOT an
+#       arbitrary "word=word" token, so incidental '='s in prose (e.g.
+#       'note=ok') can't satisfy the evidence requirement.
 #   (c) stale_task_scoped — mirrors harness._revalidate_open_l2: category-agnostic,
 #       requires a live get_task status citation showing the subject task went
-#       terminal / re-scoped / re-dispatched.
+#       terminal / re-scoped / re-dispatched. The terminal-status alternative
+#       is anchored on a 'status=' / 'status:' citation shape, not a
+#       free-standing "is done" English phrase, so casual prose ("the work is
+#       done") can't satisfy it.
 L2_AUTO_CLOSE_ALLOWLIST: tuple[_L2CloseClass, ...] = (
     _L2CloseClass(
         name='superseded_main_sweep',
@@ -150,7 +163,7 @@ L2_AUTO_CLOSE_ALLOWLIST: tuple[_L2CloseClass, ...] = (
         categories=frozenset({'infra_issue'}),
         agent_roles=None,
         evidence=(
-            (r'[\w.]+\s*=\s*\S+',),
+            (r'\b(?:paused|ActiveState|MainPID|ActiveEnterTimestamp)\b\s*[=:>]\s*\S+',),
         ),
     ),
     _L2CloseClass(
@@ -160,7 +173,6 @@ L2_AUTO_CLOSE_ALLOWLIST: tuple[_L2CloseClass, ...] = (
         evidence=(
             (
                 r'status\s*[=:]\s*(done|cancelled)',
-                r'\bis\s+(done|cancelled)\b',
                 r're-?scoped',
                 r're-?dispatched',
             ),

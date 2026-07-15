@@ -156,6 +156,31 @@ class TestL2AutoCloseClass:
         )
         assert result is None, f'Expected no match (no probe token), got: {result!r}'
 
+    def test_self_cleared_infra_arbitrary_key_value_no_match(self) -> None:
+        """An arbitrary 'word=word' token (not a known liveness-probe key)
+        must NOT satisfy the evidence requirement — only a recognized probe
+        key (paused/ActiveState/MainPID/ActiveEnterTimestamp) counts."""
+        resolution = 'note=ok, config a=b was wrong but infra_issue closed anyway.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='infra_issue', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected no match (arbitrary key=value is not a probe token), got: {result!r}'
+        )
+
+    def test_self_cleared_infra_with_active_state_and_mainpid_tokens(self) -> None:
+        """Other allowlisted probe keys (ActiveState, MainPID) also count,
+        including the '>' comparison harness.py itself emits (MainPID>0)."""
+        resolution = 'Live unit healthy: MainPID>0, ActiveState=active.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='infra_issue', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result == 'self_cleared_infra', f'Expected match, got: {result!r}'
+
     # -- (3) class (c): stale_task_scoped — category-agnostic, status citation required --
 
     def test_stale_task_scoped_status_citation(self) -> None:
@@ -193,6 +218,21 @@ class TestL2AutoCloseClass:
             resolution=resolution,
         )
         assert result is None, f'Expected no match (no status citation), got: {result!r}'
+
+    def test_stale_task_scoped_casual_is_done_phrasing_no_match(self) -> None:
+        """A free-standing 'is done' English phrase is NOT a live get_task
+        citation — it must not satisfy the evidence requirement, even though
+        it reads as plausible closure prose."""
+        resolution = 'The work is done, closing this out.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected no match (casual "is done" phrasing is not a status citation), '
+            f'got: {result!r}'
+        )
 
     # -- (4) GATING: non-watcher identity / level != 2 / action != close_only --
 
@@ -245,6 +285,20 @@ class TestL2AutoCloseClass:
         )
         assert result is None, f'Expected denylist to block milestone_gate, got: {result!r}'
 
+    def test_milestone_check_failed_denied_even_for_non_deterministic_role(self) -> None:
+        """'milestone_check_failed' is blocked by CATEGORY (not just the
+        orchestrator-deterministic role denylist) — defense-in-depth so a
+        future filing under a different role stays blocked too."""
+        resolution = 'Subject task status=done per get_task; escalation moot.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='milestone_check_failed', agent_role='some-other-role',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected denylist to block milestone_check_failed, got: {result!r}'
+        )
+
     def test_orchestrator_deterministic_role_denied_even_for_infra_issue(self) -> None:
         resolution = 'live probe: curator paused=false — transient infra self-cleared.'
         result = l2_auto_close_class(
@@ -265,6 +319,7 @@ class TestL2AutoCloseClass:
         assert isinstance(L2_AUTO_CLOSE_DENY_CATEGORIES, frozenset)
         assert 'design_concern' in L2_AUTO_CLOSE_DENY_CATEGORIES
         assert 'milestone_gate' in L2_AUTO_CLOSE_DENY_CATEGORIES
+        assert 'milestone_check_failed' in L2_AUTO_CLOSE_DENY_CATEGORIES
 
     def test_deny_roles_are_frozenset_containing_expected_members(self) -> None:
         assert isinstance(L2_AUTO_CLOSE_DENY_ROLES, frozenset)
