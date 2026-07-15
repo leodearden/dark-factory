@@ -1052,6 +1052,21 @@ class TaskWorkflow:
         # reconstruct the architect's SessionStart-hook registry slug as the
         # CLAUDE_SPAWN_PARENT_ID for post-architect roles (task 2512).  None
         # until an architect has run in this workflow instance.
+        #
+        # Deliberately in-process-only, NOT persisted to the crash-recovery
+        # sidecar (self.artifacts.write_agent_session/clear_agent_session,
+        # consumed via the resume_session_id ctor dict above) or rehydrated
+        # on restart. If an orchestrator restart lands between the architect
+        # finishing and a later role starting, the fresh Workflow instance's
+        # copy is None again, so _build_spawn_env falls back to
+        # self.session_id (workflow-root) as parent for that resumed role and
+        # everything after it in this instance -- best-effort (parent is
+        # never null, just less specific than a same-instance run would
+        # produce), acknowledged by
+        # test_implementer_falls_back_to_workflow_root_when_no_architect_ran.
+        # A durable fix would need the architect's session id threaded
+        # through harness.py's crash-recovery reconstruction, out of this
+        # task's module scope.
         self._architect_spawn_session_id: str | None = None
 
         # PRD plans/task-status-authority-prd.md contract C4/D4 (task 2188,
@@ -7741,7 +7756,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # Stash the architect's own --session-id UUID so _build_spawn_env can
         # reconstruct its SessionStart-hook registry slug as the
         # CLAUDE_SPAWN_PARENT_ID for post-architect roles nesting under it
-        # (task 2512).
+        # (task 2512).  In-process only -- see the field's __init__ comment
+        # for why this deliberately does not survive an orchestrator restart.
         if role.name == 'architect':
             self._architect_spawn_session_id = session_id_val
 
