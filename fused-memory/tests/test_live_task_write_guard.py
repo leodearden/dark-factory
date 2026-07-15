@@ -254,3 +254,154 @@ class TestDetectLifecycleReset:
 
         assert finding is not None
         assert 'heartbeat_at' not in finding.diverged_fields
+
+
+# ---------------------------------------------------------------------------
+# guarded_recon_task_write — async wrapper (acceptance regression)
+# ---------------------------------------------------------------------------
+
+SENTINEL_RESULT = {'success': True, 'sentinel': 'do-write-result'}
+
+
+def _live_claimant_before(claimant_run_id=LIVE_CLAIMANT, status='in-progress'):
+    return _flat(status=status, claimant_run_id=claimant_run_id)
+
+
+class TestGuardedReconTaskWrite:
+    @pytest.mark.asyncio
+    async def test_claimant_reset_files_finding(self):
+        """(1) SIMULATED CLAIMANT RESET: get_task returns a live-claimant
+        before-state then an un-claimed after-state; do_write's result is
+        returned and file_finding is awaited once with the finding."""
+        before = _live_claimant_before()
+        after = _flat(status='in-progress', claimant_run_id=None)
+        get_task = AsyncMock(side_effect=[before, after])
+        do_write = AsyncMock(return_value=SENTINEL_RESULT)
+        file_finding = AsyncMock()
+
+        result = await guard_mod.guarded_recon_task_write(
+            task_id='42',
+            project_id='dark_factory',
+            op='update_task',
+            get_task=get_task,
+            do_write=do_write,
+            file_finding=file_finding,
+            project_root='/project',
+        )
+
+        assert result == SENTINEL_RESULT
+        do_write.assert_awaited_once()
+        file_finding.assert_awaited_once()
+        finding = file_finding.await_args.args[0]
+        assert isinstance(finding, LifecycleResetFinding)
+        assert finding.flag_type == 'task_lifecycle_reset_detected'
+        assert finding.task_id == '42'
+
+    @pytest.mark.asyncio
+    async def test_benign_write_does_not_file(self):
+        """(2) benign write (claimant identical before/after) -> not filed."""
+        before = _live_claimant_before()
+        after = _live_claimant_before()
+        get_task = AsyncMock(side_effect=[before, after])
+        do_write = AsyncMock(return_value=SENTINEL_RESULT)
+        file_finding = AsyncMock()
+
+        result = await guard_mod.guarded_recon_task_write(
+            task_id='42', project_id='dark_factory', op='update_task',
+            get_task=get_task, do_write=do_write, file_finding=file_finding,
+            project_root='/project',
+        )
+
+        assert result == SENTINEL_RESULT
+        do_write.assert_awaited_once()
+        file_finding.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dormant_when_before_not_live_claimant(self):
+        """(3) dormant: before has no live claimant -> do_write still runs,
+        no get_task-after (get_task called exactly once), not filed."""
+        before = _flat(status='pending', claimant_run_id=None)
+        get_task = AsyncMock(return_value=before)
+        do_write = AsyncMock(return_value=SENTINEL_RESULT)
+        file_finding = AsyncMock()
+
+        result = await guard_mod.guarded_recon_task_write(
+            task_id='42', project_id='dark_factory', op='update_task',
+            get_task=get_task, do_write=do_write, file_finding=file_finding,
+            project_root='/project',
+        )
+
+        assert result == SENTINEL_RESULT
+        do_write.assert_awaited_once()
+        get_task.assert_awaited_once()
+        file_finding.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_requested_claimant_write_clear_not_filed(self):
+        """(4) requested_claimant_write=True with claimant->None -> not filed."""
+        before = _live_claimant_before()
+        after = _flat(status='in-progress', claimant_run_id=None)
+        get_task = AsyncMock(side_effect=[before, after])
+        do_write = AsyncMock(return_value=SENTINEL_RESULT)
+        file_finding = AsyncMock()
+
+        result = await guard_mod.guarded_recon_task_write(
+            task_id='42', project_id='dark_factory', op='set_task_status',
+            get_task=get_task, do_write=do_write, file_finding=file_finding,
+            project_root='/project', requested_claimant_write=True,
+        )
+
+        assert result == SENTINEL_RESULT
+        file_finding.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_do_write_raising_propagates(self):
+        """(5) do_write raising propagates; file_finding is never invoked."""
+        before = _live_claimant_before()
+        get_task = AsyncMock(return_value=before)
+        do_write = AsyncMock(side_effect=RuntimeError('write blew up'))
+        file_finding = AsyncMock()
+
+        with pytest.raises(RuntimeError, match='write blew up'):
+            await guard_mod.guarded_recon_task_write(
+                task_id='42', project_id='dark_factory', op='update_task',
+                get_task=get_task, do_write=do_write, file_finding=file_finding,
+                project_root='/project',
+            )
+
+        file_finding.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_file_finding_raising_is_swallowed(self):
+        """(6) file_finding raising is swallowed; do_write's result still returns."""
+        before = _live_claimant_before()
+        after = _flat(status='in-progress', claimant_run_id=None)
+        get_task = AsyncMock(side_effect=[before, after])
+        do_write = AsyncMock(return_value=SENTINEL_RESULT)
+        file_finding = AsyncMock(side_effect=RuntimeError('filer blew up'))
+
+        result = await guard_mod.guarded_recon_task_write(
+            task_id='42', project_id='dark_factory', op='update_task',
+            get_task=get_task, do_write=do_write, file_finding=file_finding,
+            project_root='/project',
+        )
+
+        assert result == SENTINEL_RESULT
+        file_finding.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_after_read_raising_is_swallowed(self):
+        """(7) after-read get_task raising is swallowed; write result still returns."""
+        before = _live_claimant_before()
+        get_task = AsyncMock(side_effect=[before, RuntimeError('get_task blew up')])
+        do_write = AsyncMock(return_value=SENTINEL_RESULT)
+        file_finding = AsyncMock()
+
+        result = await guard_mod.guarded_recon_task_write(
+            task_id='42', project_id='dark_factory', op='update_task',
+            get_task=get_task, do_write=do_write, file_finding=file_finding,
+            project_root='/project',
+        )
+
+        assert result == SENTINEL_RESULT
+        file_finding.assert_not_awaited()
