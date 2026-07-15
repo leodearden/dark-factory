@@ -11,7 +11,6 @@ import hashlib
 import json
 import logging
 import re
-from typing import Any
 
 from orchestrator.agents.roles import AgentRole
 
@@ -180,69 +179,6 @@ You may read files to verify suggestions before classifying.
 """
 
 # ---------------------------------------------------------------------------
-# Output schema — documentation only; NOT enforced at runtime.
-#
-# This used to be passed as invoke_with_cap_retry's output_schema= kwarg and
-# consumed by parse_triage_result. Both are gone: the steward now grants the
-# submit_triage MCP tool and reads its verdict artifact via
-# extract_triage_verdict (see _pre_triage_suggestions in steward.py), and the
-# submit_triage tool itself takes untyped params — it does not consult this
-# schema. Retained only as a precise, human-readable reference for the
-# accepted/skipped/proposed_task_groups payload shape described in prose by
-# build_triage_prompt() below; nothing validates it, so update it by hand if
-# the submit_triage contract changes.
-# ---------------------------------------------------------------------------
-
-TRIAGE_OUTPUT_SCHEMA: dict[str, Any] = {
-    'type': 'object',
-    'properties': {
-        'accepted': {
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'properties': {
-                    'index': {'type': 'integer', 'description': 'Zero-based index in the original suggestion list'},
-                    'suggestion': {'type': 'string', 'description': 'Brief description of the suggestion'},
-                    'reason': {'type': 'string', 'description': 'Why this has merit'},
-                    'files': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Affected file paths'},
-                    'proposed_task_title': {'type': 'string', 'description': 'Concise follow-up task title'},
-                },
-                'required': ['index', 'suggestion', 'reason', 'files', 'proposed_task_title'],
-            },
-        },
-        'skipped': {
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'properties': {
-                    'index': {'type': 'integer', 'description': 'Zero-based index in the original suggestion list'},
-                    'suggestion': {'type': 'string', 'description': 'Brief description'},
-                    'reason': {'type': 'string', 'description': 'Why this is meritless'},
-                },
-                'required': ['index', 'suggestion', 'reason'],
-            },
-        },
-        'proposed_task_groups': {
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'properties': {
-                    'title': {'type': 'string', 'description': 'Task title grouping related accepted items'},
-                    'description': {'type': 'string', 'description': 'What needs to be done, with file paths and specifics'},
-                    'accepted_indices': {
-                        'type': 'array',
-                        'items': {'type': 'integer'},
-                        'description': 'Indices into the accepted array',
-                    },
-                },
-                'required': ['title', 'description', 'accepted_indices'],
-            },
-        },
-    },
-    'required': ['accepted', 'skipped', 'proposed_task_groups'],
-}
-
-# ---------------------------------------------------------------------------
 # TRIAGE AgentRole — verdict-tools submit_triage tool grant
 #
 # name='triage' is the authoritative --verdict-role passed to
@@ -268,7 +204,18 @@ TRIAGE = AgentRole(
 
 
 def build_triage_prompt(suggestions: list[dict], task: dict) -> str:
-    """Format suggestions + task context into a triage prompt."""
+    """Format suggestions + task context into a triage prompt.
+
+    The trailing ``submit_triage`` instructions below are the single source
+    of truth for the accepted/skipped/proposed_task_groups payload shape —
+    there is no separate schema constant. The tool's own signature
+    (``orchestrator.mcp.verdict_tools.create_server``'s ``submit_triage``,
+    selected by ``--verdict-role triage``) only fixes the three top-level
+    ``list[dict]`` params; the per-item field names (``index``,
+    ``proposed_task_title``, etc.) live here in prose, and are read back out
+    by :func:`format_pretriaged_detail`. Keep the two in sync by hand if the
+    payload shape changes.
+    """
     task_ctx = (
         f'Task {task.get("id", "?")}: {task.get("title", "Unknown")}\n'
         f'Description: {task.get("description", "N/A")}'
