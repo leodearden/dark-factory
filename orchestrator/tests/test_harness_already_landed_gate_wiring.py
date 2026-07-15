@@ -250,6 +250,46 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
+    async def test_intermediate_work_commit_citation_checks_branch_tip_effect(
+        self, mock_orch_config,
+    ) -> None:
+        """FIX 1 effect-present guard (task 2500 amendment, review finding):
+        when the citation is an in-branch WORK commit
+        (citation_on_branch True — shape (a)), it may be an INTERMEDIATE
+        commit rather than the branch's final state. A LATER commit on
+        this SAME branch can legitimately re-touch the citation's own
+        touched paths again on the way to the branch's final content, so
+        checking the citation's stale snapshot against main would
+        false-reject a genuine multi-commit landing. The guard must
+        anchor commit_effect_present_in_main on the branch TIP sha
+        (resolve_branch_sha's return value) instead of the possibly-stale
+        citation sha, and still flip to done — anchoring
+        _mark_in_progress_done's provenance on the citation, as before.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        branch_tip_sha = 'f' * 40  # matches _wired_ancestry_harness's resolve_branch_sha
+        citation_sha = 'a' * 40  # matches _wired_ancestry_harness's citation default
+
+        async def _effect_present(sha):
+            # Only the branch tip reflects the landing's actual final
+            # state at HEAD — the intermediate citation's own snapshot is
+            # stale (a later on-branch commit re-touched its paths).
+            return sha == branch_tip_sha
+        h.git_ops.commit_effect_present_in_main = AsyncMock(side_effect=_effect_present)
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        cast(
+            AsyncMock, h.git_ops.commit_effect_present_in_main,
+        ).assert_awaited_once_with(branch_tip_sha)
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
+        assert call_args is not None
+        assert call_args.args[0] == '42'
+        assert call_args.args[1] == citation_sha
+        assert call_args.args[3] == 'dispatch-gate-already-on-main'
+
 
 def _wired_marker_harness(
     mock_orch_config, *, marker_sha, branch_base_sha, marker_is_ancestor_of_base,
