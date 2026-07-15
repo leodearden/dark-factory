@@ -1046,6 +1046,13 @@ class TaskWorkflow:
         # so it can locate the transcript even when result.session_id is '' (hard SIGKILL).
         self._last_invoke_session_id: str | None = None
 
+        # Architect's Claude session_id (the --session-id UUID), stashed in
+        # _invoke when role.name == 'architect'.  Used by _build_spawn_env to
+        # reconstruct the architect's SessionStart-hook registry slug as the
+        # CLAUDE_SPAWN_PARENT_ID for post-architect roles (task 2512).  None
+        # until an architect has run in this workflow instance.
+        self._architect_spawn_session_id: str | None = None
+
         # PRD plans/task-status-authority-prd.md contract C4/D4 (task 2188,
         # omega1).  Process-level run_id (harness.py self._run_id), threaded
         # through so the dispatch-stamp claimant_run_id can embed it via
@@ -7583,6 +7590,38 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         merged.update(self.config.cpu_priority.agent_env())
         merged.update(self.config.cpu_governance.agent_env(self.worktree, os.environ.get('PATH', '')))
         return merged or None
+
+    def _build_spawn_env(self, role: AgentRole) -> dict[str, str]:
+        """Build the CLAUDE_SPAWN_* spawn-identity env for this agent invocation.
+
+        Consumed by the SessionStart hook (session_hooks.run_session_start ->
+        parse_spawn_identity) so every orchestrator-launched agent's registry
+        record carries an accurate role/project/task and a non-null parent
+        (task 2512). Built for EVERY role — unlike _build_agent_env, which
+        returns None for merger/judge/reviewer.
+
+        CLAUDE_SPAWN_PARENT_ID defaults to the workflow-root self.session_id
+        (used for the architect itself, and as the fallback for any role
+        dispatched before an architect ran in this instance). For a
+        non-architect role once an architect HAS run, the parent is instead
+        the architect's reconstructed registry slug — built via the exact
+        same session_registry.build_session_slug the architect's own
+        SessionStart hook uses, so it matches that real record precisely.
+        """
+        parent_id = self.session_id
+        if role.name != 'architect' and self._architect_spawn_session_id is not None:
+            parent_id = build_session_slug(
+                'architect',
+                self.config.fused_memory.project_id,
+                str(self.task_id),
+                self._architect_spawn_session_id,
+            )
+        return {
+            'CLAUDE_SPAWN_ROLE': role.name,
+            'CLAUDE_SPAWN_PROJECT': self.config.fused_memory.project_id,
+            'CLAUDE_SPAWN_TASK_ID': str(self.task_id),
+            'CLAUDE_SPAWN_PARENT_ID': parent_id,
+        }
 
     async def _invoke(
         self,
