@@ -8085,6 +8085,47 @@ class TestBuildSpawnEnv:
 
         assert env['CLAUDE_SPAWN_PARENT_ID'] == workflow.session_id
 
+    async def test_invoke_wires_spawn_env_and_stashes_architect_session_id(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """_invoke forwards spawn_env to invoke_with_cap_retry on every call,
+        and stashes the architect's own --session-id UUID so a later
+        non-architect role's spawn_env nests under the architect's
+        reconstructed registry slug."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        captured_calls: list[dict] = []
+
+        async def capturing_invoke_with_cap_retry(*args, **kwargs):
+            captured_calls.append(kwargs)
+            return AgentResult(success=True, output='OK')
+
+        monkeypatch.setattr(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            capturing_invoke_with_cap_retry,
+        )
+
+        await workflow._invoke(ARCHITECT, prompt='x', cwd=workflow.worktree)
+
+        assert len(captured_calls) == 1
+        architect_kwargs = captured_calls[0]
+        architect_spawn_env = architect_kwargs['spawn_env']
+        assert architect_spawn_env['CLAUDE_SPAWN_ROLE'] == 'architect'
+        assert architect_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == workflow.session_id
+        assert workflow._architect_spawn_session_id == architect_kwargs['session_id']
+
+        await workflow._invoke(IMPLEMENTER, prompt='y', cwd=workflow.worktree)
+
+        assert len(captured_calls) == 2
+        implementer_kwargs = captured_calls[1]
+        implementer_spawn_env = implementer_kwargs['spawn_env']
+        assert implementer_spawn_env['CLAUDE_SPAWN_ROLE'] == 'implementer'
+        assert implementer_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == session_registry.build_session_slug(
+            'architect',
+            workflow.config.fused_memory.project_id,
+            str(workflow.task_id),
+            workflow._architect_spawn_session_id,
+        )
+
 
 if TYPE_CHECKING:
     from orchestrator.scheduler import Scheduler, SchedulerFacade
