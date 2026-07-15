@@ -331,6 +331,77 @@ def is_conflicting_task_status_framing(text: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Live task-status current-fact framing detection (task 2628)
+# --------------------------------------------------------------------------- #
+#
+# Stage-1 reify finding 82c8a42a flagged a recurring anti-pattern: recon-stage
+# writes (decisions_and_rationale / observations_and_summaries, and their
+# entities_and_relations / temporal_facts siblings) frame a point-in-time
+# snapshot of LIVE task-table fields (status=, claimant_run_id=, heartbeat_at=,
+# pid=) — or a clear paraphrase ("is actively driven by", "confirmed
+# LIVE/in-progress") — as a STANDING/current fact rather than a timestamped
+# point-in-time check. These go stale within hours (2026-07-14 instances:
+# task 5207 / Graphiti episode 2df7dda7, edges 3b56747d + 124a6d36 since
+# invalidated; task 5208 / mem0 memory bc2126d4-bf07-47aa-9ea0-f8a3bf706222).
+# This repeats an already-established memory-only norm ("never record
+# task/PRD/deployment STATUS in memories") that a prompt-only reminder failed
+# to hold durably — this detector is the code-enforced backstop.
+#
+# Detection is deterministic lexical matching (word-boundary alternation over
+# fixed marker lists), mirroring is_count_snapshot, is_mixed_temporal_framing,
+# and find_conflicting_task_status_ids above rather than semantic/LLM
+# classification: no fragile thresholds, fully unit-testable. This may
+# occasionally false-positive on prose that coincidentally uses one of the
+# paraphrase markers without describing task liveness at all; the impact is
+# bounded — a rejected recon write is simply rephrased and retried, the same
+# tolerance documented for the sibling detectors in this module.
+#
+# The task's own prescribed durable form ("a liveness/status check was
+# performed at <timestamp> and reported <value>") necessarily still mentions
+# the live field/value, so a naive field-token match would wrongly block the
+# correct form. POINT_IN_TIME_CHECK_RE is the exemption: it recognizes the
+# timestamped point-in-time-check framing — a "liveness/status/live check"
+# noun phrase co-occurring anywhere in the text with a check
+# verb/"as of" (order-independent, via lookahead), or a check verb
+# immediately followed by "at", or a bare "as of". Requiring
+# LIVE_TASK_STATUS_RE to match AND POINT_IN_TIME_CHECK_RE to NOT match
+# mirrors is_mixed_temporal_framing's two-marker requirement and
+# find_conflicting_task_status_ids's NEGATED_TERMINAL_RE exemption — and the
+# exemption is intentionally generous (a broad exemption only widens
+# under-firing of the outer gate, the accepted failure mode documented above;
+# a narrow exemption would instead over-fire and block the very durable form
+# the task prescribes).
+LIVE_TASK_STATUS_RE: re.Pattern[str] = re.compile(
+    r'\b(?:status|claimant_run_id|heartbeat_at|pid)\s*=|'
+    r'\b(?:is|are|being)\s+actively\s+driven\s+by\b|'
+    r'\bactively\s+driven\s+by\b|'
+    r'\bconfirmed\s+(?:live|in[-\s]?progress)\b|'
+    r'\bcurrently\s+(?:live|in[-\s]?progress|claimed|running)\b',
+    re.IGNORECASE,
+)
+
+POINT_IN_TIME_CHECK_RE: re.Pattern[str] = re.compile(
+    r'(?=.*\b(?:liveness|status|live)\s+check\b)'
+    r'(?=.*\b(?:performed|ran|checked|verified|observed|reported|recorded|sampled|as\s+of)\b)|'
+    r'\b(?:performed|checked|verified|observed|reported|recorded|sampled)\s+at\b|'
+    r'\bas\s+of\b',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def frames_live_task_status_as_current_fact(text: str) -> bool:
+    """Return True when `text` frames a LIVE task-table field/value (status=,
+    claimant_run_id=, heartbeat_at=, pid=, or a paraphrase like "actively
+    driven by" / "confirmed LIVE") as a standing/current fact rather than a
+    timestamped point-in-time check.
+
+    Fails open on under-firing: only fires on a clear live-status marker with
+    no point-in-time-check exemption present — see module comment above.
+    """
+    return bool(LIVE_TASK_STATUS_RE.search(text)) and not POINT_IN_TIME_CHECK_RE.search(text)
+
+
+# --------------------------------------------------------------------------- #
 # Status constants
 # --------------------------------------------------------------------------- #
 
