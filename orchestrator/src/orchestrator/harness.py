@@ -7318,6 +7318,17 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             if citation is None:
                 return False
+            # FIX 2 citation-lineage guard (task 2500): the grep-found
+            # citation must be reachable from THIS task's own branch tip.
+            # In this ancestor path (is_ancestor(branch, main) already
+            # True) a genuine citing commit is a WORK commit ON the
+            # branch — an ancestor of its tip — so an unrelated task's
+            # commit that merely matches the citation grep pattern (e.g.
+            # another task's merge commit — the task 2624 incident shape)
+            # is NOT an ancestor of this branch and is rejected here
+            # before any provenance is fabricated.
+            if not await self.git_ops.is_ancestor(citation, branch):
+                return False
             await self._mark_in_progress_done(
                 task_id, citation,
                 'reconcile: pre-dispatch check found branch already on main',
