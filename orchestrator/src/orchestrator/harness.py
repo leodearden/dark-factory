@@ -3588,6 +3588,34 @@ Output JSON matching the schema. Every task must appear in the output.
                 return None
 
             on_main = report.branch_state.kind == BranchStateKind.ON_MAIN
+
+            # FIX 1 effect-present refinement (task 2500): a cited ON_MAIN
+            # commit stays an ancestor of main forever — ancestry is
+            # immutable history — even after a LATER commit on main
+            # reverts exactly the paths it touched (the found_on_main
+            # post-hoc-revert blind spot; reify esc-5179-3/esc-5181-2).
+            # Sibling to the degenerate-branch refinement above: same
+            # downgrade shape, flip only on positive evidence. Journal
+            # (MergeProvenance advanced_sha) and merge-marker shas are
+            # always merge commits — commit_effect_present_in_main returns
+            # True unconditionally for those (empty diff-tree), so only
+            # the git-fallback branch-tip work-commit ON_MAIN case pays
+            # for a real check.
+            if on_main and report.branch_state.sha and not await (
+                self.git_ops.commit_effect_present_in_main(report.branch_state.sha)
+            ):
+                logger.warning(
+                    'Reconcile: task %s ON_MAIN evidence sha %s is an ancestor '
+                    'of main but its effect is not present at current HEAD '
+                    '(post-hoc revert) — not marking done',
+                    tid, report.branch_state.sha,
+                )
+                if status == 'in-progress':
+                    return await self._revert_in_progress_if_no_live_claimant(
+                        tid, mid_run=mid_run, metadata=metadata, status=status,
+                    )
+                return None
+
             if status == 'blocked':
                 note = (
                     'reconcile: branch on main while task was blocked (out-of-band merge)'
@@ -7278,9 +7306,10 @@ Output JSON matching the schema. Every task must appear in the output.
         branch = f'{self.git_ops.config.branch_prefix}{task_id}'
         task = await self.scheduler.get_task(task_id)
         metadata = (task.get('metadata') or {}) if task else {}
-        branch_exists = await self.git_ops.resolve_branch_sha(branch) is not None
+        branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
+        branch_exists = branch_tip_sha is not None
 
-        if branch_exists and await self.git_ops.is_ancestor(
+        if branch_tip_sha is not None and await self.git_ops.is_ancestor(
             branch, self.git_ops.config.main_branch,
         ):
             if await self._branch_is_degenerate(branch, metadata):
@@ -7289,6 +7318,64 @@ Output JSON matching the schema. Every task must appear in the output.
                 task_id, pattern_template=self.git_ops.config.commit_citation_pattern,
             )
             if citation is None:
+                return False
+            # FIX 2 citation-lineage guard (task 2500): the grep-found
+            # citation must be tied to THIS task's own branch, not merely
+            # match the citation grep pattern. Two shapes legitimately
+            # qualify:
+            #   (a) a WORK commit ON the branch — an ancestor of its tip:
+            #       is_ancestor(citation, branch) is True; or
+            #   (b) THIS branch's OWN no-ff merge commit — the
+            #       ``^Merge task/{tid} into`` subject that
+            #       git_ops.DEFAULT_COMMIT_CITATION_PATTERN deliberately
+            #       matches. find_task_citation_commit returns the MOST
+            #       RECENT match on main, which after a no-ff landing is
+            #       that merge commit; a merge commit is a DESCENDANT of
+            #       the branch tip (the tip is one of its parents), so
+            #       is_ancestor(citation, branch) is False for it while
+            #       is_ancestor(branch, citation) is True. This shape is
+            #       a genuine landing (esc-2500-2: prior orchestrator run
+            #       that merged but crashed before delete/mark-done, or a
+            #       manual `git merge --no-ff task/{tid}`) and must NOT be
+            #       rejected — doing so regressed the pre-diff behavior and
+            #       re-dispatched the task as duplicate work.
+            # An unrelated task's commit that merely matched the grep (e.g.
+            # another task's merge commit — the task 2624 incident shape)
+            # is NEITHER: is_ancestor is False in BOTH directions, so it is
+            # rejected here before any provenance is fabricated.
+            citation_on_branch = await self.git_ops.is_ancestor(citation, branch)
+            if not citation_on_branch and not await self.git_ops.is_ancestor(
+                branch, citation,
+            ):
+                return False
+            # FIX 1 effect-present guard (task 2500): the citation may be a
+            # real, in-lineage work commit that a LATER commit on main
+            # changed — ancestry alone doesn't mean the effect survives at
+            # HEAD. Reject the flip unless the landing's effect still
+            # matches main (or the checked commit is a merge/empty commit,
+            # where path-based revert detection is inapplicable).
+            #
+            # Which sha to check depends on the citation shape established
+            # above (review finding, task 2500 amendment):
+            #   (a) citation_on_branch True — an in-branch WORK commit that
+            #       may be an INTERMEDIATE commit, not the branch's final
+            #       state. A later commit on this SAME branch (still part
+            #       of this landing, since the whole branch is an ancestor
+            #       of main) can legitimately re-touch the citation's paths
+            #       again on the way to the branch's final content —
+            #       checking the citation's own stale snapshot against main
+            #       would false-reject a genuine multi-commit landing.
+            #       Anchor on the branch TIP instead — the actual final
+            #       state this landing put on main.
+            #   (b) citation_on_branch False — shape (b) from above (this
+            #       branch's own no-ff merge commit): keep checking the
+            #       citation directly. Its diff-tree is empty, so the check
+            #       is an intentional no-op (see
+            #       commit_effect_present_in_main's empty-touched-set
+            #       contract) — using branch_tip_sha here would needlessly
+            #       turn a deliberate no-op into a real (redundant) check.
+            effect_check_sha = branch_tip_sha if citation_on_branch else citation
+            if not await self.git_ops.commit_effect_present_in_main(effect_check_sha):
                 return False
             await self._mark_in_progress_done(
                 task_id, citation,

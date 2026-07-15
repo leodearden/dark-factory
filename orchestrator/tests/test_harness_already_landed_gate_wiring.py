@@ -65,6 +65,7 @@ class TestAlreadyLandedDispatchGateAncestryHappyPath:
         h.git_ops.resolve_branch_sha = AsyncMock(return_value='f' * 40)
         h.git_ops.is_ancestor = AsyncMock(return_value=True)
         h.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
+        h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)
         h.git_ops.config.branch_prefix = 'task/'
         h.git_ops.config.main_branch = 'main'
 
@@ -95,6 +96,7 @@ def _wired_ancestry_harness(mock_orch_config) -> Harness:
     h.git_ops.resolve_branch_sha = AsyncMock(return_value='f' * 40)
     h.git_ops.is_ancestor = AsyncMock(return_value=True)
     h.git_ops.find_task_citation_commit = AsyncMock(return_value='a' * 40)
+    h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)
     h.git_ops.config.branch_prefix = 'task/'
     h.git_ops.config.main_branch = 'main'
 
@@ -151,6 +153,142 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
 
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_foreign_citation_not_on_branch_vetoes_flip(
+        self, mock_orch_config,
+    ) -> None:
+        """FIX 2 (task 2500) citation-lineage guard: the grep-found citation
+        must be reachable from THIS task's own branch tip. Here is_ancestor
+        returns True for (branch, main) — the ancestry evidence is real —
+        but False for (citation, branch): the citation commit is NOT an
+        ancestor of this task's branch, i.e. it is an unrelated task's
+        commit that merely matched the citation grep pattern (the task
+        2624 incident shape — a foreign merge commit fabricated as this
+        task's completion evidence). The gate must reject it, not flip.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        branch = 'task/42'
+        citation_sha = 'a' * 40  # matches _wired_ancestry_harness's citation default
+
+        async def _is_ancestor(a, b):
+            if (a, b) == (branch, 'main'):
+                return True
+            if (a, b) == (citation_sha, branch):
+                return False  # citation NOT a work commit on this branch
+            if (a, b) == (branch, citation_sha):
+                return False  # citation NOT this branch's own merge commit
+            raise AssertionError(f'unexpected is_ancestor call: {a!r}, {b!r}')
+        h.git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_no_ff_merge_commit_citation_flips_to_done(
+        self, mock_orch_config,
+    ) -> None:
+        """FIX 2 (task 2500) citation-lineage guard must ACCEPT this branch's
+        own no-ff merge commit, not just work commits on the branch.
+
+        Regression for esc-2500-2: git_ops.DEFAULT_COMMIT_CITATION_PATTERN
+        deliberately also matches the ``^Merge task/{tid} into`` no-ff merge
+        subject, and find_task_citation_commit returns the MOST RECENT match
+        on main — so for a legitimate no-ff landing whose branch ref still
+        exists (a prior orchestrator run that merged but crashed before
+        deleting the branch / marking done, or a manual
+        ``git merge --no-ff task/42``) the citation IS the merge commit. A
+        merge commit is a DESCENDANT of the branch tip, so
+        is_ancestor(citation, branch) is False; the guard must fall back to
+        is_ancestor(branch, citation) (True — the branch tip is a parent of
+        its own merge commit) and still flip the task to done rather than
+        re-dispatch it as duplicate work.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        branch = 'task/42'
+        merge_commit_sha = 'a' * 40  # citation default; here it's the merge commit
+
+        async def _is_ancestor(a, b):
+            if (a, b) == (branch, 'main'):
+                return True
+            if (a, b) == (merge_commit_sha, branch):
+                return False  # merge commit is a DESCENDANT of the branch tip
+            if (a, b) == (branch, merge_commit_sha):
+                return True  # branch tip is a parent of its own merge commit
+            raise AssertionError(f'unexpected is_ancestor call: {a!r}, {b!r}')
+        h.git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
+        assert call_args is not None
+        assert call_args.args[0] == '42'
+        assert call_args.args[1] == merge_commit_sha
+        assert call_args.args[3] == 'dispatch-gate-already-on-main'
+
+    async def test_reverted_citation_effect_vetoes_flip(
+        self, mock_orch_config,
+    ) -> None:
+        """FIX 1 (task 2500) effect-present guard: the citation is present
+        AND in-lineage (is_ancestor(citation, branch) True, from
+        _wired_ancestry_harness's blanket is_ancestor=True default) but its
+        effect was reverted at current main HEAD
+        (commit_effect_present_in_main returns False) — a later commit on
+        main undid the citation's changes, so the citation's ancestry is
+        real but stale. The gate must reject it, not flip.
+
+        RED: the ancestor path has no effect-present check yet, so it
+        would flip regardless of commit_effect_present_in_main.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_intermediate_work_commit_citation_checks_branch_tip_effect(
+        self, mock_orch_config,
+    ) -> None:
+        """FIX 1 effect-present guard (task 2500 amendment, review finding):
+        when the citation is an in-branch WORK commit
+        (citation_on_branch True — shape (a)), it may be an INTERMEDIATE
+        commit rather than the branch's final state. A LATER commit on
+        this SAME branch can legitimately re-touch the citation's own
+        touched paths again on the way to the branch's final content, so
+        checking the citation's stale snapshot against main would
+        false-reject a genuine multi-commit landing. The guard must
+        anchor commit_effect_present_in_main on the branch TIP sha
+        (resolve_branch_sha's return value) instead of the possibly-stale
+        citation sha, and still flip to done — anchoring
+        _mark_in_progress_done's provenance on the citation, as before.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        branch_tip_sha = 'f' * 40  # matches _wired_ancestry_harness's resolve_branch_sha
+        citation_sha = 'a' * 40  # matches _wired_ancestry_harness's citation default
+
+        async def _effect_present(sha):
+            # Only the branch tip reflects the landing's actual final
+            # state at HEAD — the intermediate citation's own snapshot is
+            # stale (a later on-branch commit re-touched its paths).
+            return sha == branch_tip_sha
+        h.git_ops.commit_effect_present_in_main = AsyncMock(side_effect=_effect_present)
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        cast(
+            AsyncMock, h.git_ops.commit_effect_present_in_main,
+        ).assert_awaited_once_with(branch_tip_sha)
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
+        assert call_args is not None
+        assert call_args.args[0] == '42'
+        assert call_args.args[1] == citation_sha
+        assert call_args.args[3] == 'dispatch-gate-already-on-main'
 
 
 def _wired_marker_harness(

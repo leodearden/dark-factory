@@ -203,6 +203,12 @@ def harness(tmp_path: Path, mock_orch_config):
     # to exercise the primitive-degenerate fallback path.
     h.git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=False)
 
+    # Default: commit_effect_present_in_main returns True (task 2500 FIX 1)
+    # so existing found_on_main mark-done tests reach the flip unchanged.
+    # Individual tests may override with AsyncMock(return_value=False) to
+    # exercise the post-hoc-revert blind-spot guard.
+    h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)
+
     return h
 
 
@@ -281,6 +287,51 @@ class TestReconcileOneStrandedGroundTruthMarkDone:
         harness.git_ops.is_ancestor.assert_awaited_once_with(  # type: ignore[attr-defined]
             f'task/{tid}', 'main',
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2500 FIX 1 — the found_on_main post-hoc-revert blind spot.
+#
+# A cited ON_MAIN commit remains an ancestor of main forever (ancestry is
+# immutable history) even after a LATER commit on main reverts exactly the
+# paths it touched. TaskGroundTruth's resolver only ever sees is_ancestor,
+# so it still classifies MARK_DONE_WITH_PROVENANCE; the sweep-side
+# effect-present refinement (mirroring the existing degenerate-branch
+# refinement) is the only place this blind spot gets caught.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestReconcileOneStrandedEffectPresentGuard:
+    async def test_on_main_effect_absent_reverts_instead_of_marking_done(
+        self, harness: Harness,
+    ):
+        """Git-fallback ON_MAIN evidence (is_ancestor True) whose effect was
+        reverted at current main HEAD must NOT be marked done — it reverts
+        to pending like the degenerate-branch case, so the scheduler
+        re-dispatches it."""
+        tid = '9010'
+        recovered_sha = 'deadbeef' + 'a' * 32
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'in-progress', 'metadata': {}},
+        )
+        # Git-fallback ON_MAIN: is_ancestor(branch, main) True, resolve_branch_sha
+        # returns the recovered sha (non-degenerate: no branch_base_sha in metadata).
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=recovered_sha)  # type: ignore[attr-defined]
+        # The cited commit's effect was reverted at current main HEAD.
+        harness.git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)  # type: ignore[attr-defined]
+
+        result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.git_ops.commit_effect_present_in_main.assert_awaited_once_with(  # type: ignore[attr-defined]
+            recovered_sha,
+        )
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'pending',
+        )
+        assert result == 1
 
 
 # ---------------------------------------------------------------------------
