@@ -2168,9 +2168,73 @@ class DeterministicRunner:
                     outer_timeout = (
                         before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
                     )
-                    rc, tail = await asyncio.wait_for(
-                        run_fn(before_done), timeout=outer_timeout,
+                    no_target_note = (
+                        'No target_unit is set — the deploy is driven on the '
+                        'script exit code alone (task 2632 / esc-2585-1).'
                     )
+
+                    async def _invoke_targetless_run_fn():
+                        # See the named-target branch's identical inner
+                        # wrapper below: translate a seam-internal
+                        # TimeoutError into a distinct exception type here so
+                        # `except TimeoutError` below can only ever mean "the
+                        # outer wall-clock guard itself fired" — never a
+                        # misattributed application error.
+                        try:
+                            return await run_fn(before_done)
+                        except TimeoutError as exc:
+                            raise RuntimeError(
+                                f'run_fn raised TimeoutError internally (not the '
+                                f'outer guard): {exc!r}'
+                            ) from exc
+
+                    try:
+                        rc, tail = await asyncio.wait_for(
+                            _invoke_targetless_run_fn(), timeout=outer_timeout,
+                        )
+                    except TimeoutError:
+                        timeout_detail = '\n'.join([
+                            description,
+                            no_target_note,
+                            f'Deploy run exceeded the outer guard timeout ({outer_timeout}s = '
+                            f"before_done['timeout_secs'] + run_timeout_grace_secs).",
+                            'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                        ])
+                        return await self._file_infra_issue_and_block(
+                            task_id,
+                            summary='Deploy run exceeded outer guard (no target_unit)',
+                            detail=timeout_detail,
+                            metadata=metadata,
+                        )
+                    except Exception as exc:
+                        error_detail = '\n'.join([
+                            description,
+                            no_target_note,
+                            f'Deploy run_fn raised an unexpected error: {exc!r}',
+                            'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                        ])
+                        return await self._file_infra_issue_and_block(
+                            task_id,
+                            summary='Deploy run_fn failed (unexpected error, no target_unit)',
+                            detail=error_detail,
+                            metadata=metadata,
+                        )
+
+                    if rc != 0:
+                        fail_detail = '\n'.join([
+                            description,
+                            no_target_note,
+                            f'Deploy script exit code: rc={rc}',
+                            f'Output:\n{tail}',
+                            'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                        ])
+                        return await self._file_infra_issue_and_block(
+                            task_id,
+                            summary=f'Deploy failed (no target_unit) (rc={rc})',
+                            detail=fail_detail,
+                            metadata=metadata,
+                        )
+
                     return await self._writeback_deploy_success(
                         task_id, metadata, {}, target_unit or '', description,
                     )
