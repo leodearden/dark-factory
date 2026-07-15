@@ -2235,9 +2235,23 @@ class DeterministicRunner:
                             metadata=metadata,
                         )
 
-                    return await self._writeback_deploy_success(
-                        task_id, metadata, {}, target_unit or '', description,
+                    if not always_escalates:
+                        return await self._writeback_deploy_success(
+                            task_id, metadata, {}, target_unit or '', description,
+                        )
+
+                    # always_escalates=True (act-then-ask, no target_unit):
+                    # the script already ran — fall through to the gate
+                    # rather than the named-target path's textual fallthrough
+                    # (this branch always RETURNs, so it calls the gate
+                    # helper directly instead of falling out of the `if not
+                    # target_unit:` block into the shared cross-unit code).
+                    logger.info(
+                        'DeterministicRunner: task %s target_unit-less deploy ran with '
+                        'always_escalates=True — falling through to gate',
+                        task_id,
                     )
+                    return await self._file_milestone_gate_and_block(task_id, task, metadata)
 
                 # Capture baseline unit state before the deploy fires
                 inspect_fn = self._unit_inspector or self._default_inspect_unit
