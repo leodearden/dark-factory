@@ -28,6 +28,27 @@ from orchestrator import session_registry as sr
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HOOKS_DIR = _REPO_ROOT / 'skills' / 'spawn' / 'hooks'
 
+
+@pytest.fixture(autouse=True)
+def _clear_claude_spawn_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hermetic isolation from the REAL process environment (Task 2643).
+
+    sh.main(...) reads env = os.environ directly (not an injectable
+    parameter), so when this suite runs inside a fleet-spawned Claude Code
+    session, a real CLAUDE_SPAWN_SESSION_ID leaks in and
+    hook_session_slug prefers it over the stdin session_id these tests
+    assert on -- the hook then writes its registry record at a different
+    slug than the test reads, raising FileNotFoundError. Clearing the
+    CLAUDE_SPAWN_* env vars here makes every test in this file hermetic
+    regardless of the launching context; tests that need a specific
+    CLAUDE_SPAWN_* value still set it explicitly via an env= mapping or
+    monkeypatch.setenv, which is unaffected by this fixture running first.
+    """
+    monkeypatch.delenv('CLAUDE_SPAWN_SESSION_ID', raising=False)
+    monkeypatch.delenv('CLAUDE_SPAWN_WM_TITLE', raising=False)
+    monkeypatch.delenv('CLAUDE_SPAWN_RESULT_FILE', raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Step-1: identity + slug resolution
 # ---------------------------------------------------------------------------
