@@ -1305,6 +1305,57 @@ class TestPreTriageSuggestions:
         assert result.detail == esc.detail
         assert result.summary == esc.summary
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'triage_output',
+        [
+            {
+                'accepted': [
+                    {'index': 0, 'suggestion': 'case 0', 'reason': 'merit',
+                     'files': 5, 'proposed_task_title': 'Fix 0'},
+                ],
+                'skipped': [],
+                'proposed_task_groups': [
+                    {'title': 'Fix 0', 'description': 'Fix it',
+                     'accepted_indices': [0]},
+                ],
+            },
+            {
+                'accepted': [
+                    {'index': 0, 'suggestion': 'case 0', 'reason': 'merit',
+                     'files': ['src/mod0.py'], 'proposed_task_title': 'Fix 0'},
+                ],
+                'skipped': [],
+                'proposed_task_groups': [
+                    {'title': 'Fix 0', 'description': 'Fix it',
+                     'accepted_indices': ['0']},
+                ],
+            },
+        ],
+        ids=['accepted-files-non-list', 'group-accepted-indices-non-int-element'],
+    )
+    async def test_pre_triage_wrong_value_type_falls_back(self, triage_output):
+        """A well-shaped-but-mistyped verdict (all required keys present, but
+        `files` or `accepted_indices` has the wrong value type) must degrade
+        to the original escalation unchanged, not raise TypeError out of
+        format_pretriaged_detail's extend(int) / `0 <= '0'` comparison
+        (steward.py:766, outside the try/except).
+        """
+        steward = _make_steward()
+        suggestions = _make_suggestions(15)
+        esc = _make_escalation(detail=json.dumps(suggestions))
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry',
+            side_effect=_invoke_writing_verdict(steward.worktree, triage_output),
+        ):
+            result = await steward._pre_triage_suggestions(esc)
+
+        # Must fall back to the ORIGINAL escalation, not raise or return a
+        # broken pre-triaged detail.
+        assert result.detail == esc.detail
+        assert result.summary == esc.summary
+
 
 # ---------------------------------------------------------------------------
 # Pre-triage cap handling

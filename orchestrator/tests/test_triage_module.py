@@ -241,6 +241,65 @@ class TestExtractTriageVerdict:
         result = extract_triage_verdict({'verdict': verdict})
         assert result == verdict
 
+    # ── Per-item VALUE-TYPE validation (step-14/15) ─────────────────────
+    #
+    # Step-12/13 validated per-item field PRESENCE but not value TYPES.
+    # format_pretriaged_detail crashes with TypeError (not KeyError) when
+    # `files` or `accepted_indices` is present but mistyped:
+    # `group_files.extend(accepted[idx].get('files', []))` (triage.py:410)
+    # raises TypeError on a non-iterable `files`, and
+    # `if 0 <= idx < len(accepted)` over `accepted_indices`
+    # (triage.py:409/419) raises TypeError on a non-int element. These
+    # recover the old TRIAGE_OUTPUT_SCHEMA's per-item `items` type
+    # constraints (git 4d4d32d9c3).
+
+    @pytest.mark.parametrize('bad_files', [5, 'a.py'])
+    def test_accepted_files_non_list_returns_none(self, bad_files):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        verdict['accepted'][0]['files'] = bad_files
+        assert extract_triage_verdict({'verdict': verdict}) is None
+
+    @pytest.mark.parametrize('bad_files', [[5], [None]])
+    def test_accepted_files_non_str_element_returns_none(self, bad_files):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        verdict['accepted'][0]['files'] = bad_files
+        assert extract_triage_verdict({'verdict': verdict}) is None
+
+    def test_group_accepted_indices_non_list_returns_none(self):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        verdict['proposed_task_groups'][0]['accepted_indices'] = 5
+        assert extract_triage_verdict({'verdict': verdict}) is None
+
+    @pytest.mark.parametrize('bad_indices', [['0'], [None]])
+    def test_group_accepted_indices_non_int_element_returns_none(self, bad_indices):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        verdict['proposed_task_groups'][0]['accepted_indices'] = bad_indices
+        assert extract_triage_verdict({'verdict': verdict}) is None
+
+    @pytest.mark.parametrize(
+        'files, accepted_indices',
+        [(['a.py'], [0]), ([], [])],
+        ids=['non-empty', 'empty'],
+    )
+    def test_valid_type_sensitive_fields_return_payload(self, files, accepted_indices):
+        """Regression guard: well-typed files/accepted_indices — both a
+        populated and a vacuously-empty variant — must not be over-rejected."""
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        verdict['accepted'][0]['files'] = files
+        verdict['proposed_task_groups'][0]['accepted_indices'] = accepted_indices
+        result = extract_triage_verdict({'verdict': verdict})
+        assert result == verdict
+
 
 # ---------------------------------------------------------------------------
 # TRIAGE AgentRole — verdict-tools submit_triage tool grant
