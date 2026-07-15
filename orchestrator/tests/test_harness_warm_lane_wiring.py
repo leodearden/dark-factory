@@ -339,56 +339,78 @@ class TestCancelledWorkflowLaneRelease:
 
 
 # ===========================================================================
-# Step-3 (1913): RED — B1: run() finally skips release on in-flight hard-cancel
+# Step-3 (1913): originally RED — B1: run() finally skips release on
+# in-flight hard-cancel. W9-θ (task 2252) retired the sys.exc_info() B1
+# sniff this class originally pinned; the guard it exercises now lives in
+# the kind-aware release_lane entry of TaskWorkflow._on_terminal_cleanups.
 # ===========================================================================
 
 
 @pytest.mark.asyncio
 class TestB1InFlightHardCancelSkipsRelease:
-    """β (task 1913): B1 (workflow.run() finally) must SKIP release when an
-    asyncio.CancelledError is propagating through the finally block.
+    """The kind-aware ``release_lane`` on_terminal entry (W9-θ, task 2252)
+    must SKIP the release when a ``CancellationScope``-supervised ``run()``
+    exits via a hard-cancel (``kind == 'hard'``).
 
-    B1 condition (workflow.py:2002):
+    Historical B1 condition (pre-θ, workflow.py):
         if self.state in (DONE, CANCELLED) and not self._worktree_external:
             await git_ops.release_lane_for_terminal_task(...)
+    with a third guard, ``and not _hard_cancel``, where ``_hard_cancel`` was
+    sniffed via ``sys.exc_info()[0] is asyncio.CancelledError`` inside
+    ``_drive()``'s ``finally``. θ deleted that sniff and the finally block
+    itself; the equivalent guard is now ``kind != 'hard'`` in the
+    ``_release_lane`` closure inside ``_on_terminal_cleanups``, fed by
+    ``CancellationScope`` typing a spontaneously-``CancelledError``-raising
+    body as ``kind='hard'``.
 
-    β adds a third guard:  and not _hard_cancel
-    where _hard_cancel = sys.exc_info()[0] is asyncio.CancelledError (in-flight).
-
-    A normal DONE/authoritative-CANCELLED run() return has exc_info==None →
-    release fires (unchanged, regression-guarded by test_cancelled_workflow_frees_lane).
-    An in-flight asyncio.CancelledError (process teardown) suppresses the release.
+    A normal DONE/authoritative-CANCELLED run() exit has ``kind is None`` →
+    release fires (unchanged, regression-guarded by
+    test_cancelled_workflow_frees_lane). A hard-cancel exit — whether from
+    the harness's outer ``task.cancel()`` or (as simulated here) the body
+    itself raising ``CancelledError`` — suppresses the release, and ``run()``
+    now RETURNS a ``TerminalReport(outcome=CANCELLED)`` instead of letting
+    ``CancelledError`` escape (CX-1: the ONE ``WorkflowCancelled`` catch site).
     """
 
     async def test_b1_run_finally_skips_release_on_inflight_hard_cancel(
         self, tmp_path: Path
     ):
-        """B1 guard: in-flight CancelledError prevents release_lane_for_terminal_task.
+        """Hard-cancel kind suppresses release_lane_for_terminal_task, and
+        run() RETURNS a TerminalReport instead of letting CancelledError escape.
 
-        Setup: force run() finally to execute with self.state==CANCELLED AND an
-        in-flight asyncio.CancelledError by monkeypatching _setup_worktree_and_artifacts
-        (the first await in run()'s try block) to set state then raise CancelledError.
+        Setup: force the CancellationScope body (``_drive()``) to execute with
+        self.state==CANCELLED AND then spontaneously raise CancelledError, by
+        monkeypatching _setup_worktree_and_artifacts (the first await in
+        _drive()'s try block) to set state then raise CancelledError. Per
+        ``CancellationScope.supervise``, a body that itself raises
+        CancelledError is typed ``kind='hard'`` (matching the old exc_info
+        sniff's "ANY CancelledError propagating through the finally"
+        behaviour) and surfaces as ``WorkflowCancelled('hard')``, caught at
+        run()'s single catch site.
 
-        RED: pre-guard B1 evaluates self.state in (DONE, CANCELLED) and not
-        _worktree_external → True → calls release_lane_for_terminal_task (spy fires).
-        GREEN: _hard_cancel=True (in-flight) → condition is False → spy not called.
+        Pre-θ: the B1 condition ``self.state in (DONE, CANCELLED) and not
+        self._worktree_external`` evaluated True for this state, and only the
+        (now-deleted) exc_info ``_hard_cancel`` sniff suppressed the release.
+        Post-θ: the kind-aware ``_release_lane`` on_terminal entry checks
+        ``kind != 'hard'`` — False here (kind=='hard') — so the release is
+        skipped regardless of ``self.state``.
 
-        Contrasting normal-return CANCELLED case (release DOES fire, exc_info==None)
-        is covered by TestCancelledWorkflowLaneRelease.test_cancelled_workflow_frees_lane,
-        guarding that β does not over-suppress the genuine authoritative-cancel path.
+        Contrasting normal-return CANCELLED case (release DOES fire, kind is
+        None) is covered by
+        TestCancelledWorkflowLaneRelease.test_cancelled_workflow_frees_lane,
+        guarding that the hard-cancel kind does not over-suppress the genuine
+        authoritative-cancel path.
 
         NOTE — intentionally-unreachable state combination:
         In production, state==CANCELLED can only be written by
-        _handle_cancelled_terminal_exit (workflow.py:7265), which is never reached
-        during a hard-cancel because the asyncio.CancelledError (a BaseException)
-        propagates directly through run()'s ``except Exception`` guard.  So the
-        combination ``state==CANCELLED AND exc_info()==CancelledError`` cannot
-        occur on a real code path — the ``self.state in (DONE, CANCELLED)`` branch
-        of the B1 condition is already False for hard-cancels in practice.
-        The test nonetheless exercises this combination to lock the defensive
-        ``_hard_cancel`` guard, ensuring it does not silently disappear under
-        refactoring.  A future reader should treat this as intentional belt-and-
-        suspenders for an unreachable production state, not a test of a live path.
+        _handle_cancelled_terminal_exit / _finalise_cancellation, neither of
+        which raises CancelledError afterward — so the combination
+        ``state==CANCELLED AND body raises CancelledError`` does not occur on
+        a live path; the test constructs it directly (via the monkeypatch) to
+        lock the defensive ``kind=='hard'`` guard, ensuring it does not
+        silently disappear under refactoring. A future reader should treat
+        this as intentional belt-and-suspenders for an unreachable production
+        state, not a test of a live path.
         """
         from unittest.mock import AsyncMock, MagicMock
 
@@ -397,7 +419,7 @@ class TestB1InFlightHardCancelSkipsRelease:
 
         from orchestrator.git_ops import GitOps
         from orchestrator.scheduler import TaskAssignment
-        from orchestrator.workflow import TaskWorkflow, WorkflowState
+        from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
         # ── Setup: minimal git repo ─────────────────────────────────────────
         repo = tmp_path / 'repo'
@@ -457,53 +479,62 @@ class TestB1InFlightHardCancelSkipsRelease:
 
         workflow._setup_worktree_and_artifacts = _fake_setup_raises_cancelled  # type: ignore[method-assign]
 
-        # ── Run — expect CancelledError to propagate ────────────────────────
-        with pytest.raises(asyncio.CancelledError):
-            await workflow.run()
+        # ── Run — run() must RETURN a TerminalReport, not raise ─────────────
+        report = await workflow.run()
 
-        # B1 β-guard: in-flight CancelledError must suppress the release.
-        # RED: pre-guard B1 condition is True (state==CANCELLED, not external) →
-        #      release_spy is called (fails assert_not_called).
-        # GREEN: _hard_cancel=True → condition is False → spy not called.
+        assert report.outcome == WorkflowOutcome.CANCELLED, (
+            f'Expected outcome=CANCELLED, got {report.outcome!r}'
+        )
+        assert workflow.state == WorkflowState.CANCELLED
+
+        # Kind-aware release_lane guard: hard-cancel kind must suppress release.
+        # Pre-θ: pre-guard B1 condition is True (state==CANCELLED, not external) →
+        #        release_spy is called (fails assert_not_called).
+        # Post-θ: kind=='hard' → _release_lane's `kind != 'hard'` guard is False →
+        #         spy not called.
         release_spy.assert_not_called()
 
 
 # ===========================================================================
-# Step-7 (1881) / Step-1 (1913): β — B2 synthetic-CANCELLED contract
+# Step-7 (1881) / Step-1 (1913): originally β — B2 synthetic-CANCELLED
+# contract. W9-θ (task 2252) retired TaskReport.synthetic_cancel and the
+# entire B2 belt-and-suspenders release block; this class now pins the
+# harness's thin `except asyncio.CancelledError` safety net (harness.py) —
+# the only place a hard-cancel landing OUTSIDE run()'s CancellationScope
+# (e.g. a fully-mocked workflow.run(), as simulated here) is still handled.
 # ===========================================================================
 
 
 @pytest.mark.asyncio
 class TestHardCancelLaneRelease:
-    """β (task 1913): hard-cancel → synthetic report must NOT trigger eager B2 release.
+    """A hard-cancel landing outside run()'s CancellationScope (workflow.run()
+    itself raising CancelledError, e.g. from a mock) must NOT release the
+    warm lane — the harness's ``except asyncio.CancelledError`` safety net
+    returns a bare ``TaskReport(outcome=CANCELLED)`` with no lane-release
+    call at all.
 
-    B2 (harness.py:3929 finally) gates the warm-lane release on
-    ``report.outcome in (DONE, CANCELLED)``.  β adds a second guard:
-    ``and not report.synthetic_cancel``.
+    Historically (pre-θ) this was a guarded B2 belt-and-suspenders release in
+    ``_run_slot``'s ``finally``, gated on ``report.outcome in (DONE,
+    CANCELLED) and not report.synthetic_cancel``. θ deleted both the
+    ``synthetic_cancel`` field and the whole B2 block: the workflow's own
+    kind-aware ``on_terminal`` cleanup (``_on_terminal_cleanups``) now SOLELY
+    owns terminal lane release for every run()-scope exit, so a second
+    release in the harness would be redundant. A cancel landing outside
+    run()'s scope never runs ``on_terminal`` either (the workflow was never
+    really driven), so there is correctly no release call anywhere on this
+    path — the lane stays ASSIGNED and is reclaimable by the periodic
+    terminal-lane reconciler / next acquire, the same externally-observable
+    contract as before.
 
-    A synthetic hard-cancel (asyncio.CancelledError → harness.py:3896) is process
-    teardown, NOT "work finished and discardable".  Pre-fix B2 fires
-    release_lane_for_terminal_task → git branch -D task/<id>, deleting a
-    still-unmerged branch.  Post-fix B2 is skipped for synthetic reports; the lane
-    stays ASSIGNED and is reclaimable by the periodic terminal-lane reconciler /
-    next acquire.  β alone only DELAYS deletion to the reconciler tick — durable
-    branch survival across that reclaim is α (task 1912)'s contract, not β's.
-
-    Contrasting case (non-synthetic CANCELLED still releases) is guarded by
-    test_nonsynthetic_terminal_report_still_releases_lane (regression against
-    over-suppression).
+    The contrasting normal-return CANCELLED case (release DOES fire, via the
+    workflow's own on_terminal) is covered by
+    TestCancelledWorkflowLaneRelease.test_cancelled_workflow_frees_lane.
     """
 
     async def test_synthetic_hard_cancel_retains_branch_and_lane(self, tmp_path: Path):
-        """Hard-cancel (asyncio.CancelledError): β contract — branch survives + lane reclaimable.
-
-        RED triggers:
-        1. ``report.synthetic_cancel`` AttributeError (field not yet on TaskReport).
-        2. Pre-fix B2 fires release_lane_for_terminal_task → git branch -D task/99
-           (the real branch is deleted, so git rev-parse --verify fails).
-
-        GREEN: field added + B2 gated by ``and not report.synthetic_cancel``
-        → branch retained, lane ASSIGNED (reclaimable, not permanently leaked).
+        """Hard-cancel (asyncio.CancelledError from a mocked run()): branch
+        survives and lane stays reclaimable, because the harness's safety
+        net (see class docstring) makes no release call at all.
         """
         from orchestrator.git_ops import _run as git_run
         from orchestrator.scheduler import TaskAssignment
@@ -516,8 +547,8 @@ class TestHardCancelLaneRelease:
         await _init_git_repo(repo)
 
         # Create task/99 branch with an unmerged commit so rev-list main..task/99 > 0.
-        # Pre-fix B2 fires git branch -D task/99 → ref deleted → RED.
-        # Post-fix B2 is skipped → ref survives → GREEN.
+        # The harness safety net makes no release call on this path, so the
+        # ref must survive untouched.
         await git_run(['git', 'checkout', '-b', 'task/99'], cwd=repo)
         (repo / 'task99.txt').write_text('work in progress\n')
         await git_run(['git', 'add', '-A'], cwd=repo)
@@ -573,21 +604,14 @@ class TestHardCancelLaneRelease:
         assert report is not None
         assert report.outcome == WorkflowOutcome.CANCELLED
 
-        # β: synthetic_cancel must be True on the hard-cancel report
-        # RED: AttributeError (field not yet on TaskReport)
-        assert report.synthetic_cancel is True, (
-            'hard-cancel must produce a synthetic report with synthetic_cancel=True'
-        )
-
-        # B2 β-fix: task/99 branch must SURVIVE.
-        # Pre-fix: B2 fires release_lane_for_terminal_task → git branch -D task/99 → RED.
-        # Post-fix: B2 gated by `and not report.synthetic_cancel` → skipped → GREEN.
+        # task/99 branch must SURVIVE: the harness safety net makes no
+        # release call for a cancel landing outside run()'s scope.
         rc, _, _ = await git_run(
             ['git', 'rev-parse', '--verify', 'refs/heads/task/99'], cwd=repo,
         )
         assert rc == 0, (
-            'task/99 branch must survive hard-cancel — '
-            'B2 must not delete it when synthetic_cancel=True'
+            'task/99 branch must survive hard-cancel — the harness safety '
+            'net must not release/delete the lane for an out-of-scope cancel'
         )
 
         # Lane is RECLAIMABLE, not permanently leaked:
@@ -598,79 +622,6 @@ class TestHardCancelLaneRelease:
         )
         assert pool.state(lane) == LaneState.ASSIGNED, (
             f'lane must stay ASSIGNED after synthetic hard-cancel, got {pool.state(lane)!r}'
-        )
-
-    async def test_nonsynthetic_terminal_report_still_releases_lane(self, tmp_path: Path):
-        """Non-synthetic CANCELLED (run() returns normally) still triggers B2 release.
-
-        Regression guard: β must not over-suppress.  The full TaskReport built at
-        harness.py:3842 when run() returns normally inherits synthetic_cancel=False
-        (the default), so B2's eager release still fires for genuine terminal exits.
-
-        The contrasting normal-return CANCELLED case where release DOES fire is also
-        covered by TestCancelledWorkflowLaneRelease.test_cancelled_workflow_frees_lane
-        (authoritative-cancel via B1 path).
-        """
-        from orchestrator.scheduler import TaskAssignment
-        from orchestrator.warm_lane_pool import LaneState
-        from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
-
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_git_repo(repo)
-
-        config = OrchestratorConfig(
-            project_root=repo,
-            max_concurrent_tasks=1,
-            git=GitConfig(warm_lane_pool=True),
-        )
-        harness = _build_harness(config)
-        pool = harness.git_ops.warm_lane_pool
-        assert pool is not None
-
-        tid = '88'
-        await pool.acquire_for(tid)
-        lane = pool.assignment_for(tid)
-        assert lane is not None, f'setup: lane must be ASSIGNED for task {tid}'
-        assert pool.state(lane) == LaneState.ASSIGNED
-
-        harness.scheduler.carries_substrate_probe.return_value = False  # type: ignore[attr-defined]
-        harness.scheduler.is_deterministic.return_value = False  # type: ignore[attr-defined]
-
-        # Patch TaskWorkflow to return CANCELLED normally (not raise).
-        # The harness builds the full report at harness.py:3842 with
-        # synthetic_cancel defaulting to False.
-        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
-            mock_wf = MagicMock()
-            mock_wf.run = AsyncMock(return_value=TerminalReport(
-                outcome=WorkflowOutcome.CANCELLED, reason='',
-                phase=WorkflowState.CANCELLED, detail='', category=None,
-            ))
-            MockWorkflow.return_value = mock_wf
-
-            assignment = TaskAssignment(
-                task_id=tid,
-                task={
-                    'id': tid, 'title': 'Non-synthetic cancel', 'status': 'pending',
-                    'metadata': {}, 'dependencies': [],
-                },
-                modules=[],
-            )
-            sem = asyncio.Semaphore(1)
-            report = await harness._run_slot(assignment, sem)
-
-        # Full report: synthetic_cancel defaults to False
-        # RED: AttributeError (field not yet on TaskReport)
-        assert report is not None
-        assert report.synthetic_cancel is False, (
-            'non-synthetic CANCELLED report must have synthetic_cancel=False'
-        )
-        # B2 must STILL fire for a non-synthetic terminal report (regression guard)
-        assert pool.assignment_for(tid) is None, (
-            'B2 must release the lane for a non-synthetic terminal CANCELLED report'
-        )
-        assert pool.state(lane) == LaneState.FREE, (
-            f'lane must be FREE after non-synthetic CANCELLED exit, got {pool.state(lane)!r}'
         )
 
     async def test_reconciler_reclaims_lane_after_synthetic_hard_cancel(self, tmp_path: Path):
