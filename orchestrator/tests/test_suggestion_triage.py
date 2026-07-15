@@ -1068,6 +1068,42 @@ def _fake_agent_result(*, cost=0.5, turns=3, structured_output=None):
     return result
 
 
+def _write_triage_verdict(worktree: Path, triage_output: dict) -> None:
+    """Simulate the verdict-tools server's submit_triage tool call.
+
+    Writes the verdict envelope to *worktree*'s `.task-meta` meta-root — the
+    identical root _pre_triage_suggestions' read-side TaskArtifacts derives
+    via meta_root_for. Creates the meta-root dir first since
+    TaskArtifacts.write_verdict guards on root.is_dir() (it does not mkdir
+    the root itself, only verdicts/ under an existing root).
+    """
+    meta_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+    meta_root.mkdir(parents=True, exist_ok=True)
+    envelope = {
+        'role': 'triage',
+        'schema_version': 1,
+        'session_id': 'sess-triage',
+        'emitted_at': '2026-07-14T00:00:00+00:00',
+        'verdict': triage_output,
+    }
+    TaskArtifacts(worktree, meta_root).write_verdict('triage', envelope)
+
+
+def _invoke_writing_verdict(worktree: Path, triage_output: dict, **result_kwargs):
+    """Build an invoke_with_cap_retry side_effect that writes the verdict
+    artifact (simulating submit_triage) before returning a fake AgentResult.
+
+    The write must happen DURING the (mocked) invocation, not before it:
+    ``_pre_triage_suggestions`` clears any pre-existing verdict (I-FRESH)
+    immediately before spawning, so a verdict written before entering the
+    method under test would be wiped before the read-back.
+    """
+    def _side_effect(*args, **kwargs):
+        _write_triage_verdict(worktree, triage_output)
+        return _fake_agent_result(**result_kwargs)
+    return _side_effect
+
+
 class TestPreTriageSuggestions:
     @pytest.mark.asyncio
     async def test_pre_triage_invoked_above_threshold(self):
@@ -1092,8 +1128,14 @@ class TestPreTriageSuggestions:
 
         esc = _make_escalation(detail=json.dumps(suggestions))
 
-        with patch('orchestrator.steward.invoke_with_cap_retry',
-                   return_value=_fake_agent_result(structured_output=triage_output)):
+        # Simulate the triage agent calling submit_triage during the
+        # (mocked) invocation: the verdict write happens as a side effect of
+        # invoke_with_cap_retry, not before it — replaces the old
+        # structured_output= kwarg.
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry',
+            side_effect=_invoke_writing_verdict(steward.worktree, triage_output),
+        ):
             result = await steward._pre_triage_suggestions(esc)
 
         assert '## Pre-Triaged Results' in result.detail
@@ -1125,14 +1167,54 @@ class TestPreTriageSuggestions:
         suggestions = _make_suggestions(15)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
-        # Triage returns no structured output
-        bad_result = _fake_agent_result(structured_output=None)
-        bad_result.success = False
-
-        with patch('orchestrator.steward.invoke_with_cap_retry', return_value=bad_result):
+        # No verdict written — simulates the agent never calling submit_triage
+        # (or the tool call failing), so read_verdict('triage') returns None.
+        with patch('orchestrator.steward.invoke_with_cap_retry',
+                   return_value=_fake_agent_result()):
             result = await steward._pre_triage_suggestions(esc)
 
         # Original escalation returned unchanged
+        assert result.detail == esc.detail
+        assert result.summary == esc.summary
+
+    @pytest.mark.asyncio
+    async def test_pre_triage_clears_stale_verdict_before_spawn(self):
+        """I-FRESH: a stale verdicts/triage.json from a prior run must not be
+        consumed by a run whose invocation never calls submit_triage.
+
+        Pre-seeds a stale (valid-shaped) verdict at the worktree meta-root
+        before invoking _pre_triage_suggestions; the mocked invocation writes
+        nothing (simulating a run where the agent never calls submit_triage).
+        Until _pre_triage_suggestions clears the verdict before the spawn,
+        this stale verdict would be read back and returned as a bogus
+        pre-triaged escalation instead of falling back to the original.
+        """
+        steward = _make_steward()
+        suggestions = _make_suggestions(15)
+        esc = _make_escalation(detail=json.dumps(suggestions))
+
+        stale_triage_output = {
+            'accepted': [
+                {'index': 0, 'suggestion': 'stale case', 'reason': 'stale',
+                 'files': ['src/stale.py'], 'proposed_task_title': 'Stale fix'},
+            ],
+            'skipped': [],
+            'proposed_task_groups': [
+                {'title': 'Stale group', 'description': 'stale',
+                 'accepted_indices': [0]},
+            ],
+        }
+        # Pre-seed a STALE verdict, simulating leftover artifact state from a
+        # prior triage run against the same worktree meta-root.
+        _write_triage_verdict(steward.worktree, stale_triage_output)
+
+        # This invocation's mocked agent writes NOTHING (never calls submit_triage).
+        with patch('orchestrator.steward.invoke_with_cap_retry',
+                   return_value=_fake_agent_result()):
+            result = await steward._pre_triage_suggestions(esc)
+
+        # Must fall back to the ORIGINAL escalation — the stale verdict must
+        # have been cleared before the spawn, not consumed.
         assert result.detail == esc.detail
         assert result.summary == esc.summary
 
@@ -1177,8 +1259,10 @@ class TestPreTriageSuggestions:
             ],
         }
 
-        with patch('orchestrator.steward.invoke_with_cap_retry',
-                   return_value=_fake_agent_result(structured_output=triage_output)):
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry',
+            side_effect=_invoke_writing_verdict(steward.worktree, triage_output),
+        ):
             result = await steward._pre_triage_suggestions(esc)
 
         # Detail is replaced with pre-triaged markdown
@@ -1186,6 +1270,91 @@ class TestPreTriageSuggestions:
         assert 'Fix case 0' in result.detail
         # Original suggestions are embedded as reference
         assert 'Original Suggestions' in result.detail
+
+    @pytest.mark.asyncio
+    async def test_pre_triage_malformed_item_falls_back(self):
+        """A malformed per-item shape (a proposed_task_groups entry missing
+        'title') must degrade to the original escalation unchanged, not
+        raise KeyError out of format_pretriaged_detail's unguarded
+        g["title"] indexing (steward.py:766, outside the try/except).
+        """
+        steward = _make_steward()
+        suggestions = _make_suggestions(15)
+        esc = _make_escalation(detail=json.dumps(suggestions))
+
+        malformed_triage_output = {
+            'accepted': [
+                {'index': 0, 'suggestion': 'case 0', 'reason': 'merit',
+                 'files': ['src/mod0.py'], 'proposed_task_title': 'Fix 0'},
+            ],
+            'skipped': [],
+            'proposed_task_groups': [
+                # Missing 'title' — malformed per-item shape.
+                {'description': 'Fix it', 'accepted_indices': [0]},
+            ],
+        }
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry',
+            side_effect=_invoke_writing_verdict(steward.worktree, malformed_triage_output),
+        ):
+            result = await steward._pre_triage_suggestions(esc)
+
+        # Must fall back to the ORIGINAL escalation, not raise or return a
+        # broken pre-triaged detail.
+        assert result.detail == esc.detail
+        assert result.summary == esc.summary
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'triage_output',
+        [
+            {
+                'accepted': [
+                    {'index': 0, 'suggestion': 'case 0', 'reason': 'merit',
+                     'files': 5, 'proposed_task_title': 'Fix 0'},
+                ],
+                'skipped': [],
+                'proposed_task_groups': [
+                    {'title': 'Fix 0', 'description': 'Fix it',
+                     'accepted_indices': [0]},
+                ],
+            },
+            {
+                'accepted': [
+                    {'index': 0, 'suggestion': 'case 0', 'reason': 'merit',
+                     'files': ['src/mod0.py'], 'proposed_task_title': 'Fix 0'},
+                ],
+                'skipped': [],
+                'proposed_task_groups': [
+                    {'title': 'Fix 0', 'description': 'Fix it',
+                     'accepted_indices': ['0']},
+                ],
+            },
+        ],
+        ids=['accepted-files-non-list', 'group-accepted-indices-non-int-element'],
+    )
+    async def test_pre_triage_wrong_value_type_falls_back(self, triage_output):
+        """A well-shaped-but-mistyped verdict (all required keys present, but
+        `files` or `accepted_indices` has the wrong value type) must degrade
+        to the original escalation unchanged, not raise TypeError out of
+        format_pretriaged_detail's extend(int) / `0 <= '0'` comparison
+        (steward.py:766, outside the try/except).
+        """
+        steward = _make_steward()
+        suggestions = _make_suggestions(15)
+        esc = _make_escalation(detail=json.dumps(suggestions))
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry',
+            side_effect=_invoke_writing_verdict(steward.worktree, triage_output),
+        ):
+            result = await steward._pre_triage_suggestions(esc)
+
+        # Must fall back to the ORIGINAL escalation, not raise or return a
+        # broken pre-triaged detail.
+        assert result.detail == esc.detail
+        assert result.summary == esc.summary
 
 
 # ---------------------------------------------------------------------------

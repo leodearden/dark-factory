@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import pytest
 
 from orchestrator.agents.triage import (
     _combine_suggestion_hashes,
     build_triage_prompt,
     format_pretriaged_detail,
-    parse_triage_result,
     sha256_16,
     suggestion_hash,
 )
@@ -56,44 +53,289 @@ class TestBuildTriagePrompt:
         assert '[0]' in prompt
         assert 'something' in prompt
 
+    def test_instructs_agent_to_call_submit_triage(self):
+        """The prompt must name the submit_triage tool and its three params
+        so the agent knows to emit its verdict via the verdict-tools MCP
+        server instead of (the now-removed) --json-schema structured output.
+        """
+        suggestions = [
+            {'reviewer': 'test_analyst', 'location': 'a.py:1',
+             'category': 'coverage', 'description': 'Missing test',
+             'suggested_fix': 'Add test'},
+        ]
+        task = {'id': '42', 'title': 'Test Task', 'description': 'A test'}
+        prompt = build_triage_prompt(suggestions, task)
+
+        assert 'submit_triage' in prompt
+        assert 'accepted' in prompt
+        assert 'skipped' in prompt
+        assert 'proposed_task_groups' in prompt
+
 
 # ---------------------------------------------------------------------------
-# parse_triage_result
+# extract_triage_verdict — verdict-tools artifact envelope unwrapping
+#
+# Local (function-scope) imports below, matching the codebase convention
+# (e.g. test_workflow_verdict_tools_injection.py) of importing not-yet-built
+# symbols inside the test body rather than at module level, so a RED failure
+# here does not cascade into an ImportError for every other test in this file.
 # ---------------------------------------------------------------------------
 
-class TestParseTriageResult:
-    def test_valid_structured_output(self):
-        result = MagicMock()
-        result.structured_output = {
-            'accepted': [{'index': 0, 'suggestion': 'x', 'reason': 'y',
-                          'files': ['a.py'], 'proposed_task_title': 'Fix x'}],
-            'skipped': [{'index': 1, 'suggestion': 'z', 'reason': 'n/a'}],
-            'proposed_task_groups': [{'title': 'Fix x', 'description': 'do it',
-                                      'accepted_indices': [0]}],
+def _valid_verdict_payload() -> dict:
+    """Minimal fully-populated, schema-valid triage verdict payload.
+
+    Shared by the per-item shape-validation tests below (step-12/13): each
+    test starts from this baseline and deletes/replaces exactly one field
+    or list, so a passing baseline plus one violation isolates what
+    extract_triage_verdict is actually checking.
+    """
+    return {
+        'accepted': [
+            {'index': 0, 'suggestion': 'x', 'reason': 'y',
+             'files': ['a.py'], 'proposed_task_title': 'Fix x'},
+        ],
+        'skipped': [
+            {'index': 1, 'suggestion': 'z', 'reason': 'n/a'},
+        ],
+        'proposed_task_groups': [
+            {'title': 'Fix x', 'description': 'do it', 'accepted_indices': [0]},
+        ],
+    }
+
+
+class TestExtractTriageVerdict:
+    def test_valid_envelope_returns_verdict_payload(self):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        envelope = {
+            'role': 'triage',
+            'schema_version': 1,
+            'session_id': 'sess-1',
+            'emitted_at': '2026-07-14T00:00:00+00:00',
+            'verdict': {
+                'accepted': [{'index': 0, 'suggestion': 'x', 'reason': 'y',
+                              'files': ['a.py'], 'proposed_task_title': 'Fix x'}],
+                'skipped': [{'index': 1, 'suggestion': 'z', 'reason': 'n/a'}],
+                'proposed_task_groups': [{'title': 'Fix x', 'description': 'do it',
+                                          'accepted_indices': [0]}],
+            },
         }
-        result.success = True
-        parsed = parse_triage_result(result)
-        assert parsed is not None
-        assert len(parsed['accepted']) == 1
-        assert len(parsed['skipped']) == 1
+        result = extract_triage_verdict(envelope)
+        assert result == envelope['verdict']
 
-    def test_returns_none_on_missing_keys(self):
-        result = MagicMock()
-        result.structured_output = {'accepted': []}
-        result.success = True
-        assert parse_triage_result(result) is None
+    def test_none_envelope_returns_none(self):
+        from orchestrator.agents.triage import extract_triage_verdict
 
-    def test_returns_none_on_no_structured_output(self):
-        result = MagicMock()
-        result.structured_output = None
-        result.success = False
-        assert parse_triage_result(result) is None
+        assert extract_triage_verdict(None) is None
 
-    def test_returns_none_on_non_dict(self):
-        result = MagicMock()
-        result.structured_output = 'not a dict'
-        result.success = True
-        assert parse_triage_result(result) is None
+    def test_missing_verdict_key_returns_none(self):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        envelope = {'role': 'triage', 'schema_version': 1, 'session_id': 's'}
+        assert extract_triage_verdict(envelope) is None
+
+    def test_verdict_missing_required_key_returns_none(self):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        # 'proposed_task_groups' is absent from the verdict payload.
+        envelope = {'verdict': {'accepted': [], 'skipped': []}}
+        assert extract_triage_verdict(envelope) is None
+
+    def test_non_dict_envelope_returns_none(self):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        assert extract_triage_verdict('not a dict') is None  # type: ignore[arg-type]
+
+    def test_non_dict_verdict_returns_none(self):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        envelope = {'verdict': 'not a dict'}
+        assert extract_triage_verdict(envelope) is None
+
+    # ── Per-item shape validation (step-12/13) ──────────────────────────
+    #
+    # extract_triage_verdict used to validate only the three top-level
+    # keys, so a per-item shape defect (e.g. a proposed_task_groups entry
+    # missing 'title') flowed through as a "valid" verdict and blew up
+    # later in format_pretriaged_detail's unguarded g["title"]/s["index"]
+    # indexing (steward.py:766, outside the try/except) instead of
+    # degrading to inline triage. These recover the old
+    # TRIAGE_OUTPUT_SCHEMA's per-item `required` sets (see git 4d4d32d9c3)
+    # as plain validation instead of a --json-schema contract.
+
+    @pytest.mark.parametrize(
+        'missing_key',
+        ['index', 'suggestion', 'reason', 'files', 'proposed_task_title'],
+    )
+    def test_accepted_item_missing_field_returns_none(self, missing_key):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        del verdict['accepted'][0][missing_key]
+        assert extract_triage_verdict({'verdict': verdict}) is None
+
+    @pytest.mark.parametrize('missing_key', ['index', 'suggestion', 'reason'])
+    def test_skipped_item_missing_field_returns_none(self, missing_key):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        del verdict['skipped'][0][missing_key]
+        assert extract_triage_verdict({'verdict': verdict}) is None
+
+    @pytest.mark.parametrize(
+        'missing_key', ['title', 'description', 'accepted_indices'],
+    )
+    def test_proposed_task_groups_item_missing_field_returns_none(self, missing_key):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        del verdict['proposed_task_groups'][0][missing_key]
+        assert extract_triage_verdict({'verdict': verdict}) is None
+
+    @pytest.mark.parametrize(
+        'list_key, bad_items',
+        [
+            ('accepted', ['x']),
+            ('skipped', ['x']),
+            ('proposed_task_groups', [42]),
+        ],
+    )
+    def test_non_dict_item_in_list_returns_none(self, list_key, bad_items):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        verdict[list_key] = bad_items
+        assert extract_triage_verdict({'verdict': verdict}) is None
+
+    @pytest.mark.parametrize(
+        'list_key', ['accepted', 'skipped', 'proposed_task_groups'],
+    )
+    def test_non_list_value_returns_none(self, list_key):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        verdict[list_key] = 'oops'
+        assert extract_triage_verdict({'verdict': verdict}) is None
+
+    def test_valid_envelope_with_multiple_items_per_list_returns_payload(self):
+        """Regression guard: per-item validation must not over-reject a
+        verdict whose lists each hold more than one well-formed item."""
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = {
+            'accepted': [
+                {'index': 0, 'suggestion': 'a', 'reason': 'r0',
+                 'files': ['a.py'], 'proposed_task_title': 'Fix a'},
+                {'index': 1, 'suggestion': 'b', 'reason': 'r1',
+                 'files': ['b.py'], 'proposed_task_title': 'Fix b'},
+            ],
+            'skipped': [
+                {'index': 2, 'suggestion': 'c', 'reason': 'noise'},
+                {'index': 3, 'suggestion': 'd', 'reason': 'dup'},
+            ],
+            'proposed_task_groups': [
+                {'title': 'Group A', 'description': 'da', 'accepted_indices': [0]},
+                {'title': 'Group B', 'description': 'db', 'accepted_indices': [1]},
+            ],
+        }
+        result = extract_triage_verdict({'verdict': verdict})
+        assert result == verdict
+
+    # ── Per-item VALUE-TYPE validation (step-14/15) ─────────────────────
+    #
+    # Step-12/13 validated per-item field PRESENCE but not value TYPES.
+    # format_pretriaged_detail crashes with TypeError (not KeyError) when
+    # `files` or `accepted_indices` is present but mistyped:
+    # `group_files.extend(accepted[idx].get('files', []))` (triage.py:410)
+    # raises TypeError on a non-iterable `files`, and
+    # `if 0 <= idx < len(accepted)` over `accepted_indices`
+    # (triage.py:409/419) raises TypeError on a non-int element. These
+    # recover the old TRIAGE_OUTPUT_SCHEMA's per-item `items` type
+    # constraints (git 4d4d32d9c3).
+
+    @pytest.mark.parametrize('bad_files', [5, 'a.py'])
+    def test_accepted_files_non_list_returns_none(self, bad_files):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        verdict['accepted'][0]['files'] = bad_files
+        assert extract_triage_verdict({'verdict': verdict}) is None
+
+    @pytest.mark.parametrize('bad_files', [[5], [None]])
+    def test_accepted_files_non_str_element_returns_none(self, bad_files):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        verdict['accepted'][0]['files'] = bad_files
+        assert extract_triage_verdict({'verdict': verdict}) is None
+
+    def test_group_accepted_indices_non_list_returns_none(self):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        verdict['proposed_task_groups'][0]['accepted_indices'] = 5
+        assert extract_triage_verdict({'verdict': verdict}) is None
+
+    @pytest.mark.parametrize('bad_indices', [['0'], [None]])
+    def test_group_accepted_indices_non_int_element_returns_none(self, bad_indices):
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        verdict['proposed_task_groups'][0]['accepted_indices'] = bad_indices
+        assert extract_triage_verdict({'verdict': verdict}) is None
+
+    @pytest.mark.parametrize(
+        'files, accepted_indices',
+        [(['a.py'], [0]), ([], [])],
+        ids=['non-empty', 'empty'],
+    )
+    def test_valid_type_sensitive_fields_return_payload(self, files, accepted_indices):
+        """Regression guard: well-typed files/accepted_indices — both a
+        populated and a vacuously-empty variant — must not be over-rejected."""
+        from orchestrator.agents.triage import extract_triage_verdict
+
+        verdict = _valid_verdict_payload()
+        verdict['accepted'][0]['files'] = files
+        verdict['proposed_task_groups'][0]['accepted_indices'] = accepted_indices
+        result = extract_triage_verdict({'verdict': verdict})
+        assert result == verdict
+
+
+# ---------------------------------------------------------------------------
+# TRIAGE AgentRole — verdict-tools submit_triage tool grant
+#
+# Local (function-scope) import, matching the TestExtractTriageVerdict
+# convention above: TRIAGE does not exist yet, so importing it at module
+# level would turn this RED test into a collection-time ImportError for
+# every other test in the file.
+# ---------------------------------------------------------------------------
+
+class TestTriageRole:
+    def test_name_is_triage(self):
+        from orchestrator.agents.triage import TRIAGE
+
+        assert TRIAGE.name == 'triage'
+
+    def test_allowed_tools_include_submit_triage_and_read_tools(self):
+        from orchestrator.agents.triage import TRIAGE
+
+        assert 'mcp__verdict-tools__submit_triage' in TRIAGE.allowed_tools
+        assert 'Read' in TRIAGE.allowed_tools
+        assert 'Glob' in TRIAGE.allowed_tools
+        assert 'Grep' in TRIAGE.allowed_tools
+        assert 'mcp__fused-memory__get_tasks' in TRIAGE.allowed_tools
+        assert 'mcp__fused-memory__search' in TRIAGE.allowed_tools
+
+    def test_mcp_families_satisfy_post_init_capability_assertion(self):
+        # Importing TRIAGE constructs the module-level AgentRole immediately,
+        # so AgentRole.__post_init__ already ran by the time this import
+        # returns. A wrong mcp_families declaration (missing 'orchestrator'
+        # for the fused-memory tools, or 'verdict_tools' for submit_triage)
+        # would have raised ValueError at import time, failing this test
+        # with an error rather than an assertion failure.
+        from orchestrator.agents.triage import TRIAGE
+
+        assert TRIAGE.mcp_families == frozenset({'orchestrator', 'verdict_tools'})
 
 
 # ---------------------------------------------------------------------------

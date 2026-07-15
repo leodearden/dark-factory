@@ -11,7 +11,8 @@ import hashlib
 import json
 import logging
 import re
-from typing import Any
+
+from orchestrator.agents.roles import AgentRole
 
 logger = logging.getLogger(__name__)
 
@@ -178,61 +179,43 @@ You may read files to verify suggestions before classifying.
 """
 
 # ---------------------------------------------------------------------------
-# Output schema — enforced via --json-schema
+# TRIAGE AgentRole — verdict-tools submit_triage tool grant
+#
+# name='triage' is the authoritative --verdict-role passed to
+# _inject_verdict_tools_mcp, which selects the submit_triage tool on the
+# verdict-tools server and the verdicts/triage.json artifact filename.
+# mcp_families declares both families referenced by allowed_tools below:
+# 'orchestrator' for the mcp__fused-memory__ tools, 'verdict_tools' for
+# mcp__verdict-tools__submit_triage — required by AgentRole.__post_init__'s
+# capability assertion (see roles.py _FAMILY_TOOL_PREFIXES). Defined here
+# (not roles.py) to keep triage concerns co-located; roles.py does not
+# import this module, so there is no import cycle.
 # ---------------------------------------------------------------------------
-
-TRIAGE_OUTPUT_SCHEMA: dict[str, Any] = {
-    'type': 'object',
-    'properties': {
-        'accepted': {
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'properties': {
-                    'index': {'type': 'integer', 'description': 'Zero-based index in the original suggestion list'},
-                    'suggestion': {'type': 'string', 'description': 'Brief description of the suggestion'},
-                    'reason': {'type': 'string', 'description': 'Why this has merit'},
-                    'files': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Affected file paths'},
-                    'proposed_task_title': {'type': 'string', 'description': 'Concise follow-up task title'},
-                },
-                'required': ['index', 'suggestion', 'reason', 'files', 'proposed_task_title'],
-            },
-        },
-        'skipped': {
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'properties': {
-                    'index': {'type': 'integer', 'description': 'Zero-based index in the original suggestion list'},
-                    'suggestion': {'type': 'string', 'description': 'Brief description'},
-                    'reason': {'type': 'string', 'description': 'Why this is meritless'},
-                },
-                'required': ['index', 'suggestion', 'reason'],
-            },
-        },
-        'proposed_task_groups': {
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'properties': {
-                    'title': {'type': 'string', 'description': 'Task title grouping related accepted items'},
-                    'description': {'type': 'string', 'description': 'What needs to be done, with file paths and specifics'},
-                    'accepted_indices': {
-                        'type': 'array',
-                        'items': {'type': 'integer'},
-                        'description': 'Indices into the accepted array',
-                    },
-                },
-                'required': ['title', 'description', 'accepted_indices'],
-            },
-        },
-    },
-    'required': ['accepted', 'skipped', 'proposed_task_groups'],
-}
+TRIAGE = AgentRole(
+    name='triage',
+    system_prompt=TRIAGE_SYSTEM_PROMPT,
+    allowed_tools=[
+        'Read', 'Glob', 'Grep',
+        'mcp__fused-memory__get_tasks', 'mcp__fused-memory__search',
+        'mcp__verdict-tools__submit_triage',
+    ],
+    mcp_families=frozenset({'orchestrator', 'verdict_tools'}),
+)
 
 
 def build_triage_prompt(suggestions: list[dict], task: dict) -> str:
-    """Format suggestions + task context into a triage prompt."""
+    """Format suggestions + task context into a triage prompt.
+
+    The trailing ``submit_triage`` instructions below are the single source
+    of truth for the accepted/skipped/proposed_task_groups payload shape —
+    there is no separate schema constant. The tool's own signature
+    (``orchestrator.mcp.verdict_tools.create_server``'s ``submit_triage``,
+    selected by ``--verdict-role triage``) only fixes the three top-level
+    ``list[dict]`` params; the per-item field names (``index``,
+    ``proposed_task_title``, etc.) live here in prose, and are read back out
+    by :func:`format_pretriaged_detail`. Keep the two in sync by hand if the
+    payload shape changes.
+    """
     task_ctx = (
         f'Task {task.get("id", "?")}: {task.get("title", "Unknown")}\n'
         f'Description: {task.get("description", "N/A")}'
@@ -264,22 +247,123 @@ def build_triage_prompt(suggestions: list[dict], task: dict) -> str:
 
 Classify each suggestion as ACCEPT or SKIP, then group accepted items into
 logical follow-up task groups. Read the code at referenced locations as needed.
+
+When you are finished, submit your verdict by calling the `submit_triage`
+tool with three parameters:
+- `accepted`: list of accepted suggestion objects, each with `index`
+  (zero-based index into the original suggestion list), `suggestion` (brief
+  description), `reason` (why it has merit), `files` (affected file paths),
+  and `proposed_task_title` (concise follow-up task title).
+- `skipped`: list of skipped suggestion objects, each with `index`,
+  `suggestion`, and `reason` (why it is meritless).
+- `proposed_task_groups`: list of task group objects, each with `title`,
+  `description` (what needs to be done, with file paths and specifics), and
+  `accepted_indices` (indices into the `accepted` array for the suggestions
+  belonging to this group).
+
+You MUST call `submit_triage` exactly once, as your final action.
 """
 
 
-def parse_triage_result(result) -> dict | None:
-    """Extract structured triage output from an AgentResult.
+# Per-item required field sets — recovered from the removed
+# TRIAGE_OUTPUT_SCHEMA's per-item `required` lists (git 4d4d32d9c3), which
+# used to be enforced via --json-schema. Now that the payload arrives
+# through the submit_triage verdict-tools artifact instead of structured
+# output, extract_triage_verdict enforces these directly so a malformed
+# item degrades to inline triage here rather than crashing later in
+# format_pretriaged_detail's unguarded per-item indexing.
+_ACCEPTED_ITEM_REQUIRED = {'index', 'suggestion', 'reason', 'files', 'proposed_task_title'}
+_SKIPPED_ITEM_REQUIRED = {'index', 'suggestion', 'reason'}
+_GROUP_ITEM_REQUIRED = {'title', 'description', 'accepted_indices'}
 
-    Returns the parsed dict on success, None on failure.
+# Per-item VALUE-TYPE specs (step-14/15) — recovered from the same removed
+# TRIAGE_OUTPUT_SCHEMA's per-item `items` type constraints, for exactly the
+# two fields format_pretriaged_detail consumes iteratively/arithmetically:
+# - accepted[].files must be list[str]: format_pretriaged_detail does
+#   `group_files.extend(accepted[idx].get('files', []))` (triage.py:410),
+#   which raises TypeError if `files` is present but non-iterable (e.g. an
+#   int).
+# - proposed_task_groups[].accepted_indices must be list[int]:
+#   format_pretriaged_detail does `if 0 <= idx < len(accepted)` over
+#   `g.get('accepted_indices', [])` (triage.py:409/419), which raises
+#   TypeError if an element is non-int (e.g. a str).
+# `index` is deliberately NOT type-checked here — it is only string-formatted
+# (skipped items, triage.py:436) or read behind an existing
+# `isinstance(orig_idx, int)` guard (triage.py:421), so it is not a crash
+# vector and type-checking it would add over-rejection surface for no
+# benefit.
+_ACCEPTED_ITEM_TYPES: dict[str, type] = {'files': str}
+_GROUP_ITEM_TYPES: dict[str, type] = {'accepted_indices': int}
+_ITEM_TYPE_SPECS: dict[str, dict[str, type]] = {
+    'accepted': _ACCEPTED_ITEM_TYPES,
+    'proposed_task_groups': _GROUP_ITEM_TYPES,
+}
+
+
+def extract_triage_verdict(envelope: dict | None) -> dict | None:
+    """Unwrap and validate a verdict-tools envelope's triage payload.
+
+    ``envelope`` is the schema-versioned artifact read via
+    ``TaskArtifacts.read_verdict('triage')``:
+    ``{role, schema_version, session_id, emitted_at, verdict: {...}}``.
+    Returns the inner ``verdict`` dict on success, or None on any failure —
+    no envelope, non-dict envelope, missing/non-dict ``verdict``, a verdict
+    dict missing one of the required top-level keys, a non-list value for
+    one of those keys, a non-dict item within one of the lists, an item
+    missing one of its own required fields (see ``_ACCEPTED_ITEM_REQUIRED``
+    / ``_SKIPPED_ITEM_REQUIRED`` / ``_GROUP_ITEM_REQUIRED``), or an item
+    whose ``files`` (accepted) / ``accepted_indices`` (proposed_task_groups)
+    value is present but not a list of the expected element type (see
+    ``_ACCEPTED_ITEM_TYPES`` / ``_GROUP_ITEM_TYPES``) — a fail-safe contract
+    so the caller can fall back to inline triage instead of crashing later
+    in ``format_pretriaged_detail``'s unguarded per-item indexing/iteration.
     """
-    if result.structured_output and isinstance(result.structured_output, dict):
-        required = {'accepted', 'skipped', 'proposed_task_groups'}
-        if required <= result.structured_output.keys():
-            return result.structured_output
-        logger.warning('Triage result missing required keys: %s', required - result.structured_output.keys())
-    else:
-        logger.warning('Triage agent returned no structured output (success=%s)', result.success)
-    return None
+    if not isinstance(envelope, dict):
+        logger.warning('Triage verdict envelope missing or not a dict (got %r)', type(envelope).__name__)
+        return None
+    verdict = envelope.get('verdict')
+    if not isinstance(verdict, dict):
+        logger.warning('Triage verdict envelope missing a dict "verdict" key')
+        return None
+    required = {'accepted', 'skipped', 'proposed_task_groups'}
+    if not required <= verdict.keys():
+        logger.warning('Triage verdict missing required keys: %s', required - verdict.keys())
+        return None
+
+    for key, item_required in (
+        ('accepted', _ACCEPTED_ITEM_REQUIRED),
+        ('skipped', _SKIPPED_ITEM_REQUIRED),
+        ('proposed_task_groups', _GROUP_ITEM_REQUIRED),
+    ):
+        items = verdict[key]
+        if not isinstance(items, list):
+            logger.warning(
+                'Triage verdict "%s" is not a list (got %r)',
+                key, type(items).__name__,
+            )
+            return None
+        item_types = _ITEM_TYPE_SPECS.get(key, {})
+        for item in items:
+            if not isinstance(item, dict) or not (item_required <= item.keys()):
+                logger.warning(
+                    'Triage verdict "%s" item has malformed shape '
+                    '(expected a dict with keys %s, got %r)',
+                    key, sorted(item_required), item,
+                )
+                return None
+            for field, elem_type in item_types.items():
+                value = item[field]
+                if not isinstance(value, list) or not all(
+                    isinstance(elem, elem_type) for elem in value
+                ):
+                    logger.warning(
+                        'Triage verdict "%s" item field %r must be a list '
+                        'of %s (got %r)',
+                        key, field, elem_type.__name__, value,
+                    )
+                    return None
+
+    return verdict
 
 
 def format_pretriaged_detail(

@@ -671,15 +671,53 @@ class TaskSteward:
         so the steward falls back to inline triage.
         """
         from orchestrator.agents.triage import (
-            TRIAGE_OUTPUT_SCHEMA,
-            TRIAGE_SYSTEM_PROMPT,
+            TRIAGE,
             build_triage_prompt,
+            extract_triage_verdict,
             format_pretriaged_detail,
-            parse_triage_result,
         )
+        from orchestrator.artifacts import TaskArtifacts
+        from orchestrator.workflow import _inject_verdict_tools_mcp
 
         suggestions = json.loads(_strip_hash_prefix(escalation.detail))
         prompt = build_triage_prompt(suggestions, self.task)
+
+        meta_root = TaskArtifacts.meta_root_for(self.worktree.parent, self.worktree.name)
+        if not meta_root.is_dir():
+            # TaskWorkflow._setup normally creates this (via artifacts.init())
+            # for this exact worktree before any steward is ever constructed
+            # against it. If it's still missing here, the verdict-tools
+            # server spawned below (same --meta-root) would silently no-op
+            # its write_verdict call, and read_verdict() further down would
+            # return None indistinguishably from a genuine triage failure —
+            # log distinctly and create it so a misconfigured meta-root is
+            # diagnosable instead of masquerading as an ordinary fallback.
+            logger.warning(
+                'Steward for task %s: pre-triage meta-root %s did not '
+                'exist — creating it now. This should already have been '
+                'created by workflow setup; a missing root here means '
+                'pre-triage would otherwise silently and permanently '
+                'degrade to inline triage.',
+                self.task_id, meta_root,
+            )
+            meta_root.mkdir(parents=True, exist_ok=True)
+        artifacts = TaskArtifacts(self.worktree, meta_root)
+        artifacts.clear_verdict('triage')  # I-FRESH: never consume a stale verdict
+
+        # Base the injected config on the steward's own fused-memory wiring
+        # (not a from-scratch skeleton) so the 'orchestrator' family TRIAGE
+        # declares — and the get_tasks/search dedup step its system prompt
+        # instructs the agent to run — is explicitly wired here, rather than
+        # relying on the ambient project_root/.mcp.json merge that cli_invoke
+        # performs (--mcp-config without --strict-mcp-config). That merge
+        # happens to supply fused-memory today, but it's an accident of cwd
+        # and merge behavior neither of which this method controls; building
+        # from self.mcp.mcp_config_json() makes the wiring match the role
+        # declaration directly. No escalation_url: TRIAGE grants no
+        # escalation tools.
+        mcp_config = _inject_verdict_tools_mcp(
+            self.mcp.mcp_config_json(), self.worktree, TRIAGE,
+        )
 
         try:
             result = await invoke_with_cap_retry(
@@ -687,17 +725,13 @@ class TaskSteward:
                 f'Steward for task {self.task_id} [pre-triage]',
                 invoke_fn=invoke_agent,
                 prompt=prompt,
-                system_prompt=TRIAGE_SYSTEM_PROMPT,
+                system_prompt=TRIAGE.system_prompt,
                 cwd=self.config.project_root,
                 model=self.config.models.triage,
                 max_turns=self.config.max_turns.triage,
                 max_budget_usd=self.config.budgets.triage,
-                allowed_tools=[
-                    'Read', 'Glob', 'Grep',
-                    'mcp__fused-memory__get_tasks',
-                    'mcp__fused-memory__search',
-                ],
-                output_schema=TRIAGE_OUTPUT_SCHEMA,
+                allowed_tools=TRIAGE.allowed_tools,
+                mcp_config=mcp_config,
                 effort=self.config.effort.triage,
                 backend=self.config.backends.triage,
             )
@@ -720,7 +754,8 @@ class TaskSteward:
         self.metrics.total_cost_usd += result.cost_usd
         self.metrics.total_duration_ms += result.duration_ms
 
-        triage_result = parse_triage_result(result)
+        envelope = artifacts.read_verdict('triage')
+        triage_result = extract_triage_verdict(envelope)
         if triage_result is None:
             logger.warning(
                 f'Steward for task {self.task_id}: pre-triage failed, '

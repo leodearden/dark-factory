@@ -2018,14 +2018,24 @@ class TestPreTriageUsageGateCleanup:
 
     @pytest.fixture(autouse=True)
     def _mock_triage(self):
-        """Replace orchestrator.agents.triage so tests focus on usage_gate, not triage logic."""
+        """Replace orchestrator.agents.triage so tests focus on usage_gate, not triage logic.
+
+        TRIAGE is the REAL AgentRole (imported before the module is replaced)
+        so role.name/system_prompt/allowed_tools stay genuine — steward.py's
+        _inject_verdict_tools_mcp(None, self.worktree, TRIAGE) call reads
+        role.name for real, and a MagicMock stand-in would smuggle a Mock
+        object into the --verdict-role subprocess arg. extract_triage_verdict
+        is stubbed to always succeed, standing in for parse_triage_result's
+        old role in these usage_gate-focused tests.
+        """
         import sys as _sys
 
+        from orchestrator.agents.triage import TRIAGE as _REAL_TRIAGE
+
         triage_mod = MagicMock()
-        triage_mod.TRIAGE_OUTPUT_SCHEMA = {'type': 'object'}
-        triage_mod.TRIAGE_SYSTEM_PROMPT = 'You are a classifier.'
+        triage_mod.TRIAGE = _REAL_TRIAGE
         triage_mod.build_triage_prompt = MagicMock(return_value='triage prompt')
-        triage_mod.parse_triage_result = MagicMock(
+        triage_mod.extract_triage_verdict = MagicMock(
             return_value={'accepted': [], 'skipped': [], 'proposed_task_groups': []}
         )
         triage_mod.format_pretriaged_detail = MagicMock(return_value='## Pre-triaged')
@@ -2219,14 +2229,24 @@ class TestPreTriageSuggestionsPath:
 
     @pytest.fixture(autouse=True)
     def _mock_triage(self):
-        """Replace orchestrator.agents.triage so tests focus on path, not triage logic."""
+        """Replace orchestrator.agents.triage so tests focus on path, not triage logic.
+
+        TRIAGE is the REAL AgentRole (imported before the module is replaced)
+        so role.name/system_prompt/allowed_tools stay genuine — steward.py's
+        _inject_verdict_tools_mcp(None, self.worktree, TRIAGE) call reads
+        role.name for real, and a MagicMock stand-in would smuggle a Mock
+        object into the --verdict-role subprocess arg. extract_triage_verdict
+        is stubbed to always succeed, standing in for parse_triage_result's
+        old role in these path/kwarg-focused tests.
+        """
         import sys as _sys
 
+        from orchestrator.agents.triage import TRIAGE as _REAL_TRIAGE
+
         triage_mod = MagicMock()
-        triage_mod.TRIAGE_OUTPUT_SCHEMA = {'type': 'object'}
-        triage_mod.TRIAGE_SYSTEM_PROMPT = 'You are a classifier.'
+        triage_mod.TRIAGE = _REAL_TRIAGE
         triage_mod.build_triage_prompt = MagicMock(return_value='triage prompt')
-        triage_mod.parse_triage_result = MagicMock(
+        triage_mod.extract_triage_verdict = MagicMock(
             return_value={'accepted': [], 'skipped': [], 'proposed_task_groups': []}
         )
         triage_mod.format_pretriaged_detail = MagicMock(return_value='## Pre-triaged')
@@ -2363,7 +2383,25 @@ class TestPreTriageSuggestionsPath:
             'Read', 'Glob', 'Grep',
             'mcp__fused-memory__get_tasks',
             'mcp__fused-memory__search',
+            'mcp__verdict-tools__submit_triage',
         ]
+
+    async def test_pre_triage_invocation_uses_verdict_tools_mcp_config(self, steward):
+        """_pre_triage_suggestions wires the verdict-tools MCP server, drops output_schema.
+
+        The triage verdict now arrives via the submit_triage tool + on-disk
+        artifact, not --json-schema structured output, so mcp_config must
+        carry the injected verdict-tools server (keyed by role.name='triage')
+        and output_schema must no longer be passed at all.
+        """
+        esc = self._esc_with_suggestions(12)
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            await steward._pre_triage_suggestions(esc)
+
+        call_kwargs = mock_invoke.call_args.kwargs
+        assert 'verdict-tools' in call_kwargs['mcp_config']['mcpServers']
+        assert 'output_schema' not in call_kwargs
 
     async def test_pre_triage_uses_project_root_as_cwd(self, steward):
         """_pre_triage_suggestions passes config.project_root (not worktree) as cwd."""
