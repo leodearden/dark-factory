@@ -490,3 +490,30 @@ class TestR3SelfKillRefusal:
         assert esc.level == 2
         assert esc.severity == 'critical'
         assert esc.category == 'infra_issue'
+
+
+# ---------------------------------------------------------------------------
+# step-7/8 — R2: RestartPlan (RP-3). The 2105 exit-127 fix: a systemd --user
+# transient unit's cwd defaults to $HOME, so a RELATIVE deploy script would
+# 127 once the deferred unit fires. Every detached systemd-run argv must
+# carry --working-directory=<cwd> AND an ABSOLUTE script token.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestR2WorkingDirectory:
+    """R2 composition cell (the 2105 bug)."""
+
+    async def test_relative_script_absolutized_and_working_directory_present(self) -> None:
+        argv = await _execute_relative_script_self_restart()
+
+        assert '--working-directory=/proj' in argv, (
+            'a detached systemd-run argv must never omit --working-directory'
+        )
+        wrapped = argv[-1]
+        assert '/proj/scripts/restart-orchestrator.sh' in wrapped, (
+            'the script token inside the /bin/sh -c payload must be absolute'
+        )
+        assert wrapped.split()[0] == '/proj/scripts/restart-orchestrator.sh', (
+            'the bare relative path must never appear as the payload script token'
+        )
