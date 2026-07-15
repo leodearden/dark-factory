@@ -813,6 +813,7 @@ diff is empty or trivial, `substantive_work=false` and `complete=false`.
     ) -> str:
         """Build prompt for resuming after an escalation resolution."""
         context = await self._get_memory_context(task.get('id'))
+        prior_proposal_section = self._format_prior_proposal(task)
 
         return f"""\
 {context}
@@ -827,6 +828,7 @@ This task was paused because an agent escalated a blocking issue.
 ## Handler's Resolution
 {resolution}
 
+{prior_proposal_section}
 ## Action
 Resume the task applying the handler's resolution. The prior agent's work
 is preserved in the worktree. Read .task/plan.json and .task/iterations.jsonl
