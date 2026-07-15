@@ -754,6 +754,13 @@ def create_mcp_server(
         'valid_at timestamps instead of one write describing both the prior and '
         'resulting task status'
     )
+    # Remediation hint returned alongside flag_marker_write_blocked (task 2596):
+    # stage1_flag_marker records are code-managed via the recon_ledger (task
+    # 2406 UPSERT-only path) — no legitimate add_memory call should persist one.
+    _FLAG_MARKER_WRITE_HINT = (
+        'stage1_flag_marker persistence is code-managed via the recon_ledger; '
+        'add_memory is not a valid write path for it'
+    )
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -969,6 +976,22 @@ def create_mcp_server(
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
+        if (
+            isinstance(agent_id, str)
+            and agent_id.startswith('recon-stage-')
+            and isinstance(metadata, dict)
+            and (
+                metadata.get('source') == 'stage1_flag_marker'
+                or metadata.get('kind') == 'stage1_flag_marker'
+            )
+        ):
+            return {
+                'error': 'flag_marker_write_blocked',
+                'error_type': 'ReconFlagMarkerWriteRejected',
+                'agent_id': agent_id,
+                'content_excerpt': content[:200],
+                'hint': _FLAG_MARKER_WRITE_HINT,
+            }
         allow_near_duplicate = (
             isinstance(metadata, dict) and metadata.get('allow_near_duplicate') is True
         )
