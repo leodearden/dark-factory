@@ -4387,6 +4387,46 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         )
 
 
+class TestConfigTestExtras:
+    """`_config_test_extras` pulls `--extra <name>` flags out of a config test_command (task 2641).
+
+    TEST-path twin of the task-2355 cold-verify dev-dep fix: LINT/TYPE
+    fallback commands already preserve a configured ``--extra dev`` verbatim
+    (they parse OPAQUE and pass through untouched), but the synthesized
+    fallback TEST command (``_build_fallback_config``) drops any extras from
+    ``config.test_command`` entirely. This helper extracts them so the
+    synthesized command can carry them forward instead.
+    """
+
+    def test_extracts_multiple_extra_flags_in_order(self):
+        from orchestrator.verify import _config_test_extras
+
+        result = _config_test_extras("uv run --extra dev --extra web pytest -m 'not slow'")
+        assert result == ['--extra', 'dev', '--extra', 'web']
+
+    def test_extracts_equals_form_extra_flag(self):
+        from orchestrator.verify import _config_test_extras
+
+        assert _config_test_extras('uv run --extra=dev pytest') == ['--extra', 'dev']
+
+    def test_no_extras_returns_empty_list(self):
+        from orchestrator.verify import _config_test_extras
+
+        assert _config_test_extras('uv run pytest tests/') == []
+        assert _config_test_extras('pytest') == []
+
+    def test_none_command_returns_empty_list(self):
+        from orchestrator.verify import _config_test_extras
+
+        assert _config_test_extras(None) == []
+
+    def test_unparseable_command_returns_empty_list(self):
+        """Unbalanced quotes degrade to no-extras rather than raising (shlex.split ValueError)."""
+        from orchestrator.verify import _config_test_extras
+
+        assert _config_test_extras('uv run --extra "dev pytest') == []
+
+
 class TestBuildFallbackConfigSubprojectScoped:
     """`_build_fallback_config` scopes TEST to the task's own subproject (task 2344).
 
