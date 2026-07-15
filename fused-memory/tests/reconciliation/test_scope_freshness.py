@@ -10,6 +10,14 @@ cross-project scope-correction threads.  Grown step-by-step per plan.json:
 - TestPrecheckBootstrap               (step-9/10)
 - TestPrecheckFreshSkip               (step-11/12)
 - TestPrecheckChangedAndFailOpen      (step-13/14)
+
+Amendment round (post-plan reviewer findings, all in-scope for this task's
+locked modules):
+
+- TestPoolCapScopeSnapshots           (_pool_cap_scope_snapshots direct coverage)
+- TestPrecheckCatastrophicFailure     (outer, whole-batch fail-open guard)
+- TestPrecheckStatsReconcilable       (candidates/reinvestigated/skipped counters)
+- TestPrecheckConsecutiveSkipCap      (skip_streak + forced re-investigation)
 """
 
 from __future__ import annotations
@@ -739,3 +747,347 @@ class TestPrecheckChangedAndFailOpen:
         taskmaster.get_task.assert_not_awaited()
         memory_service.get_memories_by_metadata.assert_not_awaited()
         memory_service.add_memory.assert_not_awaited()
+
+
+# ── Amendment round: post-plan reviewer findings ──────────────────────────
+#
+# All four classes below were added in the amendment pass (not part of the
+# original step-1..step-18 TDD plan) to address reviewer findings:
+#   - TestPoolCapScopeSnapshots / TestPrecheckCatastrophicFailure:
+#     test_coverage finding — _pool_cap_scope_snapshots and the outer
+#     (whole-batch) fail-open guard had no direct test.
+#   - TestPrecheckStatsReconcilable: observability_stats_inconsistency
+#     finding — scope_freshness_candidates must only count findings with a
+#     resolvable root, and every per-finding failure path must still
+#     increment scope_freshness_reinvestigated.
+#   - TestPrecheckConsecutiveSkipCap: robustness_silent_degradation finding
+#     — a (task_ref, flag_key) pair must not be skipped forever; see
+#     scope_freshness.py's "Consecutive-skip cap" module docstring section.
+
+
+class TestPoolCapScopeSnapshots:
+    """Tests for _pool_cap_scope_snapshots(memory_service, prior_memories, project_id, task_ref)."""
+
+    @pytest.mark.asyncio
+    async def test_deletes_every_prior_memory(self):
+        from fused_memory.reconciliation.scope_freshness import _pool_cap_scope_snapshots
+
+        memory_service = AsyncMock()
+        prior_memories = [
+            {'id': 'a1', 'created_at': 't0', 'metadata': {}},
+            {'id': 'a2', 'created_at': 't1', 'metadata': {}},
+        ]
+
+        await _pool_cap_scope_snapshots(
+            memory_service, prior_memories, 'autopilot_video', 'dark_factory:2405',
+        )
+
+        assert memory_service.delete_memory.await_count == 2
+        memory_service.delete_memory.assert_any_await(
+            memory_id='a1', store='mem0', project_id='autopilot_video',
+        )
+        memory_service.delete_memory.assert_any_await(
+            memory_id='a2', store='mem0', project_id='autopilot_video',
+        )
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_prior_memories(self):
+        from fused_memory.reconciliation.scope_freshness import _pool_cap_scope_snapshots
+
+        memory_service = AsyncMock()
+
+        await _pool_cap_scope_snapshots(
+            memory_service, [], 'autopilot_video', 'dark_factory:2405',
+        )
+
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_swallows_per_item_delete_error_and_continues(self):
+        from fused_memory.reconciliation.scope_freshness import _pool_cap_scope_snapshots
+
+        memory_service = AsyncMock()
+        memory_service.delete_memory.side_effect = [RuntimeError('boom'), None]
+        prior_memories = [
+            {'id': 'a1', 'created_at': 't0', 'metadata': {}},
+            {'id': 'a2', 'created_at': 't1', 'metadata': {}},
+        ]
+
+        # Must not raise even though the first delete fails; both ids are
+        # still attempted.
+        await _pool_cap_scope_snapshots(
+            memory_service, prior_memories, 'autopilot_video', 'dark_factory:2405',
+        )
+
+        assert memory_service.delete_memory.await_count == 2
+
+
+class TestPrecheckCatastrophicFailure:
+    """Tests for precheck_scope_correction_freshness's OUTER fail-open guard —
+    a failure in the pure per-finding triage itself (is_cross_project_scope_correction
+    / compute_scope_signature / select_primary_subject, called OUTSIDE the
+    inner per-finding try/except), not merely a get_task/Mem0 I/O failure."""
+
+    @pytest.mark.asyncio
+    async def test_catastrophic_failure_returns_all_findings_unfiltered(self):
+        from unittest.mock import patch
+
+        from fused_memory.reconciliation.scope_freshness import (
+            precheck_scope_correction_freshness,
+        )
+
+        memory_service = AsyncMock()
+        taskmaster = AsyncMock()
+
+        findings = [
+            {
+                'flag_type': 'cross_project',
+                'cited_tasks': [
+                    {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'},
+                ],
+            },
+            {'flag_type': 'task_memory_mismatch', 'description': 'unrelated'},
+        ]
+
+        with patch(
+            'fused_memory.reconciliation.scope_freshness.is_cross_project_scope_correction',
+            side_effect=RuntimeError('pure helper exploded'),
+        ):
+            result = await precheck_scope_correction_freshness(
+                memory_service=memory_service,
+                taskmaster=taskmaster,
+                project_id='autopilot_video',
+                resolve_project_root=lambda pid: f'/roots/{pid}',
+                run_id='run-8',
+                findings=findings,
+            )
+
+        assert result.to_reinvestigate == findings
+        assert result.skipped == []
+        assert result.stats == {
+            'scope_freshness_candidates': 0,
+            'scope_freshness_reinvestigated': 0,
+            'scope_freshness_skipped': 0,
+            'scope_freshness_forced_reinvestigation': 0,
+        }
+        taskmaster.get_task.assert_not_awaited()
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+
+
+class TestPrecheckStatsReconcilable:
+    """Tests locking in the stats-counter fix (reviewer finding
+    observability_stats_inconsistency): scope_freshness_candidates only
+    counts findings with a resolvable root, and every per-finding failure
+    path still increments scope_freshness_reinvestigated."""
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_root_not_counted_as_candidate(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            precheck_scope_correction_freshness,
+        )
+
+        memory_service = AsyncMock()
+        taskmaster = AsyncMock()
+        finding = {
+            'flag_type': 'cross_project',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'}],
+        }
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: None,
+            run_id='run-9',
+            findings=[finding],
+        )
+
+        assert result.stats['scope_freshness_candidates'] == 0
+        assert result.stats['scope_freshness_reinvestigated'] == 1
+
+    @pytest.mark.asyncio
+    async def test_per_finding_exception_still_increments_reinvestigated(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            precheck_scope_correction_freshness,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.side_effect = RuntimeError('qdrant down')
+        taskmaster = AsyncMock()
+        finding = {
+            'flag_type': 'cross_project',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'}],
+        }
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-10',
+            findings=[finding],
+        )
+
+        # candidates was incremented (root resolved, so a live comparison
+        # was actually attempted) and the exception path still increments
+        # reinvestigated — the two stay reconcilable even on this failure
+        # path.
+        assert result.stats['scope_freshness_candidates'] == 1
+        assert result.stats['scope_freshness_reinvestigated'] == 1
+        assert (
+            result.stats['scope_freshness_candidates']
+            <= result.stats['scope_freshness_reinvestigated']
+            + result.stats['scope_freshness_skipped']
+        )
+
+
+class TestPrecheckConsecutiveSkipCap:
+    """Tests for the consecutive-skip cap (reviewer finding
+    robustness_silent_degradation): a (task_ref, flag_key) pair may be
+    skipped at most `max_consecutive_skips - 1` cycles in a row before
+    precheck_scope_correction_freshness forces a real re-investigation, so a
+    genuinely-stranded thread can never be silently skipped past Stage 3's
+    persistence-escalation window forever."""
+
+    def _prior_snapshot(self, **overrides):
+        from fused_memory.reconciliation.scope_freshness import (
+            build_scope_snapshot_metadata,
+        )
+
+        kwargs: dict[str, Any] = {
+            'task_ref': 'dark_factory:2405',
+            'flag_key': 'cross_project',
+            'subject_project_id': 'dark_factory',
+            'subject_task_id': '2405',
+            'status': 'pending',
+            'updated_at': '2026-07-10T10:00:00Z',
+            'description': 'd',
+            'run_id': 'run-0',
+            'snapshot_at': '2026-07-10T14:29:33Z',
+        }
+        kwargs.update(overrides)
+        return build_scope_snapshot_metadata(**kwargs)
+
+    def _unchanged_finding_and_backends(self, prior_metadata):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'a1', 'created_at': 't0', 'metadata': prior_metadata},
+        ]
+        taskmaster = AsyncMock()
+        taskmaster.get_task.return_value = {
+            'id': 2405, 'status': 'pending',
+            'updatedAt': '2026-07-10T10:00:00Z', 'description': 'd', 'metadata': {},
+        }
+        finding = {
+            'flag_type': 'cross_project',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'}],
+        }
+        return memory_service, taskmaster, finding
+
+    @pytest.mark.asyncio
+    async def test_skip_streak_increments_while_under_cap(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            precheck_scope_correction_freshness,
+        )
+
+        prior_metadata = self._prior_snapshot(skip_streak=1)
+        memory_service, taskmaster, finding = self._unchanged_finding_and_backends(prior_metadata)
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-11',
+            findings=[finding],
+            max_consecutive_skips=4,
+        )
+
+        assert finding in result.skipped
+        assert finding not in result.to_reinvestigate
+        _, add_kwargs = memory_service.add_memory.await_args
+        assert add_kwargs['metadata']['skip_streak'] == 2
+        assert add_kwargs['metadata']['no_change'] is True
+        assert result.stats['scope_freshness_forced_reinvestigation'] == 0
+
+    @pytest.mark.asyncio
+    async def test_forces_reinvestigation_when_cap_reached(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            precheck_scope_correction_freshness,
+        )
+
+        # Already skipped 3 times in a row; max_consecutive_skips=4 means
+        # this 4th consecutive fresh cycle must be forced back for real
+        # re-investigation rather than skipped a 4th time.
+        prior_metadata = self._prior_snapshot(skip_streak=3)
+        memory_service, taskmaster, finding = self._unchanged_finding_and_backends(prior_metadata)
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-12',
+            findings=[finding],
+            max_consecutive_skips=4,
+        )
+
+        assert finding in result.to_reinvestigate
+        assert finding not in result.skipped
+        assert result.stats['scope_freshness_forced_reinvestigation'] == 1
+        assert result.stats['scope_freshness_reinvestigated'] == 1
+        assert result.stats['scope_freshness_skipped'] == 0
+
+        # The rewritten snapshot resets the streak and is NOT a no_change marker.
+        _, add_kwargs = memory_service.add_memory.await_args
+        assert add_kwargs['metadata']['skip_streak'] == 0
+        assert 'no_change' not in add_kwargs['metadata']
+
+    @pytest.mark.asyncio
+    async def test_default_max_consecutive_skips_applies_when_not_passed(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            DEFAULT_MAX_CONSECUTIVE_SKIPS,
+            precheck_scope_correction_freshness,
+        )
+
+        prior_metadata = self._prior_snapshot(skip_streak=DEFAULT_MAX_CONSECUTIVE_SKIPS - 1)
+        memory_service, taskmaster, finding = self._unchanged_finding_and_backends(prior_metadata)
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-13',
+            findings=[finding],
+        )
+
+        assert finding in result.to_reinvestigate
+        assert result.stats['scope_freshness_forced_reinvestigation'] == 1
+
+    @pytest.mark.asyncio
+    async def test_non_integer_prior_skip_streak_treated_as_zero(self):
+        """A pre-amendment snapshot (or a corrupted one) with a malformed
+        skip_streak must not crash the comparison — fail safe to streak=0
+        (first skip under the new regime), not to an immediate force."""
+        from fused_memory.reconciliation.scope_freshness import (
+            precheck_scope_correction_freshness,
+        )
+
+        prior_metadata = self._prior_snapshot()
+        prior_metadata['skip_streak'] = 'not-a-number'
+        memory_service, taskmaster, finding = self._unchanged_finding_and_backends(prior_metadata)
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-14',
+            findings=[finding],
+            max_consecutive_skips=4,
+        )
+
+        assert finding in result.skipped
+        _, add_kwargs = memory_service.add_memory.await_args
+        assert add_kwargs['metadata']['skip_streak'] == 1
