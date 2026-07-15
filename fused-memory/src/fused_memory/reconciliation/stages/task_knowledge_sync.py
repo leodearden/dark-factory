@@ -630,6 +630,13 @@ _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE = 'stage2_cycle_summary_trim'
 # write_cycle_summary's internal-service idiom (task 2229).
 _TASK_COUNT_SNAPSHOT_WRITE_SOURCE = 'stage2_task_count_snapshot_write'
 
+# Audit tag for _prune_task_count_snapshots's prune-before-write delete pass
+# (task 2429) — makes the recurring task_count_snapshot near-duplicate
+# accumulation self-correcting: every kind='task_count_snapshot' Mem0 record
+# is deleted immediately before _write_task_count_snapshot's add_memory call,
+# so at most one canonical snapshot survives per project per cycle.
+_TASK_COUNT_SNAPSHOT_PRUNE_SOURCE = 'stage2_task_count_snapshot_prune'
+
 # Age-based GC for the stage2_persistence_marker Channel-3 persistence-counter
 # family (task 2095), mirroring the stage1_flag_marker age-GC above (task 1944).
 # _track_flag_persistence writes one stage2_persistence_marker per surviving
@@ -1023,6 +1030,121 @@ async def _verify_task_count_snapshot_written(
     return False
 
 
+async def _prune_task_count_snapshots(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    scroll_limit: int = 1000,
+) -> int:
+    """Delete every existing ``kind='task_count_snapshot'`` Mem0 record (task 2429).
+
+    Called by :func:`_write_task_count_snapshot` immediately before its
+    ``add_memory`` call, so the net effect of one cycle is exactly one
+    canonical snapshot surviving per project — self-correcting the
+    near-duplicate accumulation that manual/LLM-driven cleanups failed to
+    keep pruned.
+
+    Enumerates deterministically via ``memory_service.get_memories_by_metadata``
+    (Qdrant payload-filter scroll) — NEVER semantic search, which silently
+    drops low-similarity rows and is unsuitable for exhaustive GC. Unlike
+    :func:`_sweep_stale_persistence_markers`, this applies NO age cutoff:
+    every enumerated ``kind='task_count_snapshot'`` match is deleted —
+    including LLM-authored duplicates — so the caller's subsequent
+    ``add_memory`` leaves exactly one canonical snapshot.
+
+    Multi-cycle convergence on a large backlog (task 2429 review): when the
+    existing backlog exceeds *scroll_limit* records — precisely the
+    accumulation this change targets — only the first *scroll_limit*
+    matches are pruned in a given cycle (see the saturation WARNING
+    below); the remainder drains at up to *scroll_limit* per subsequent
+    cycle rather than being fully pruned in one run. This is an accepted
+    trade-off, not a bug: it is loudly logged (no silent truncation) and
+    strictly improves on the unbounded pre-2429 accumulation either way.
+
+    Best-effort and never raises: an enumeration failure or a per-item
+    delete failure degrades to a WARNING log and is excluded from the
+    returned count, rather than aborting the caller's write.
+
+    Args:
+        memory_service: Service with ``get_memories_by_metadata`` and
+            ``delete_memory``.
+        project_id: Project scope for enumeration and delete calls.
+        run_id: Current reconciliation run identifier used as ``causation_id``
+            in the audit journal.
+        scroll_limit: Max records to enumerate in one scroll (default 1000).
+
+    Returns:
+        Number of memories successfully deleted (0 if nothing matched, or
+        on enumeration failure).
+    """
+    try:
+        members = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={'kind': TASK_COUNT_SNAPSHOT_KIND},
+            limit=scroll_limit,
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._prune_task_count_snapshots: '
+            'get_memories_by_metadata failed for project_id=%s; skipping prune',
+            project_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return 0
+
+    if len(members) >= scroll_limit:
+        logger.warning(
+            'reconciliation._prune_task_count_snapshots: enumerated %d of scroll_limit=%d '
+            'task_count_snapshot records — scroll cap reached; older stale snapshots may '
+            'remain unpruned this cycle; re-run with a higher scroll_limit.',
+            len(members), scroll_limit,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+
+    ids = [member['id'] for member in members if member.get('id')]
+    if not ids:
+        return 0
+
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents this delete pass from silently converting a shutdown
+    # signal into an under-counted deletion tally.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    results = await gather_collect(
+        memory_service.delete_memory(
+            memory_id=mid,
+            store='mem0',
+            project_id=project_id,
+            causation_id=run_id,
+            _source=_TASK_COUNT_SNAPSHOT_PRUNE_SOURCE,
+        )
+        for mid in ids
+    )
+
+    success_count = 0
+    for mid, result in zip(ids, results, strict=True):
+        if isinstance(result, Exception):
+            logger.warning(
+                'reconciliation._prune_task_count_snapshots: delete failed for memory_id=%s; not counted',
+                mid,
+                extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
+            )
+        else:
+            success_count += 1
+
+    if success_count:
+        logger.info(
+            'reconciliation._prune_task_count_snapshots: pruned %d stale task_count_snapshot '
+            'record(s) for project_id=%s prior to canonical write',
+            success_count, project_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+
+    return success_count
+
+
 async def _write_task_count_snapshot(
     memory_service,
     taskmaster,
@@ -1037,6 +1159,35 @@ async def _write_task_count_snapshot(
     plain Python ``add_memory`` call performed unconditionally at the end of
     ``run()`` for non-blocked projects, rather than depending on the Stage-2
     LLM remembering the memory-stored "Snapshot Discipline" norm.
+
+    Self-pruning (task 2429): immediately before ``add_memory``, calls
+    :func:`_prune_task_count_snapshots` to delete every existing
+    ``kind='task_count_snapshot'`` record for this project, so the net
+    effect of one cycle is at most ONE canonical snapshot surviving —
+    self-correcting the near-duplicate accumulation that manual/LLM-driven
+    cleanups repeatedly failed to keep pruned. The prune runs after the
+    ``taskmaster is None`` early-return and after ``content`` is derived, so
+    a skipped/failed fetch never deletes existing snapshots without a
+    replacement in hand; the prune helper is itself best-effort and never
+    raises, so a prune failure cannot abort this write.
+
+    Accepted zero-snapshot window (task 2429 review): if the prune
+    succeeds but the subsequent ``add_memory`` call itself then fails
+    (e.g. a transient mem0 outage), this cycle deletes the prior
+    snapshot(s) without landing a replacement, leaving zero
+    ``task_count_snapshot`` records until the next cycle's write
+    succeeds. This is an accepted, self-correcting trade-off rather than
+    an oversight: the alternative (write-then-prune-all-but-the-just-
+    written-id) avoids the window but must exclude the just-written id
+    under Qdrant scroll eventual-consistency, which is more complex and
+    race-prone for no material safety gain (see the task 2429 plan's
+    design decisions). The window is also no worse than today's
+    escalation path — a failed write already makes
+    ``_verify_task_count_snapshot_written`` return ``None``
+    (inconclusive) rather than a confirmed miss, so it cannot spuriously
+    grow the consecutive-miss streak that drives the stale-snapshot
+    escalation. Pinned by
+    ``test_add_memory_failure_after_successful_prune_returns_none``.
 
     Counts are derived by self-fetching via ``taskmaster.get_tasks`` and
     filtering with :func:`filter_task_tree` — mirroring
@@ -1088,6 +1239,7 @@ async def _write_task_count_snapshot(
             highest_task_id=tree.max_task_id,
             as_of=as_of,
         )
+        await _prune_task_count_snapshots(memory_service, project_id, run_id)
         await memory_service.add_memory(
             content=content,
             category=TASK_COUNT_SNAPSHOT_CATEGORY,
