@@ -265,16 +265,33 @@ You MUST call `submit_triage` exactly once, as your final action.
 """
 
 
+# Per-item required field sets — recovered from the removed
+# TRIAGE_OUTPUT_SCHEMA's per-item `required` lists (git 4d4d32d9c3), which
+# used to be enforced via --json-schema. Now that the payload arrives
+# through the submit_triage verdict-tools artifact instead of structured
+# output, extract_triage_verdict enforces these directly so a malformed
+# item degrades to inline triage here rather than crashing later in
+# format_pretriaged_detail's unguarded per-item indexing.
+_ACCEPTED_ITEM_REQUIRED = {'index', 'suggestion', 'reason', 'files', 'proposed_task_title'}
+_SKIPPED_ITEM_REQUIRED = {'index', 'suggestion', 'reason'}
+_GROUP_ITEM_REQUIRED = {'title', 'description', 'accepted_indices'}
+
+
 def extract_triage_verdict(envelope: dict | None) -> dict | None:
     """Unwrap and validate a verdict-tools envelope's triage payload.
 
     ``envelope`` is the schema-versioned artifact read via
     ``TaskArtifacts.read_verdict('triage')``:
     ``{role, schema_version, session_id, emitted_at, verdict: {...}}``.
-    Returns the inner ``verdict`` dict on success, or None on any failure
-    (no envelope, non-dict envelope, missing/non-dict ``verdict``, or a
-    verdict dict missing one of the required keys) — a fail-safe contract
-    so the caller can fall back to inline triage.
+    Returns the inner ``verdict`` dict on success, or None on any failure —
+    no envelope, non-dict envelope, missing/non-dict ``verdict``, a verdict
+    dict missing one of the required top-level keys, a non-list value for
+    one of those keys, a non-dict item within one of the lists, or an item
+    missing one of its own required fields (see ``_ACCEPTED_ITEM_REQUIRED``
+    / ``_SKIPPED_ITEM_REQUIRED`` / ``_GROUP_ITEM_REQUIRED``) — a fail-safe
+    contract so the caller can fall back to inline triage instead of
+    crashing later in ``format_pretriaged_detail``'s unguarded per-item
+    indexing.
     """
     if not isinstance(envelope, dict):
         logger.warning('Triage verdict envelope missing or not a dict (got %r)', type(envelope).__name__)
@@ -287,6 +304,28 @@ def extract_triage_verdict(envelope: dict | None) -> dict | None:
     if not required <= verdict.keys():
         logger.warning('Triage verdict missing required keys: %s', required - verdict.keys())
         return None
+
+    for key, item_required in (
+        ('accepted', _ACCEPTED_ITEM_REQUIRED),
+        ('skipped', _SKIPPED_ITEM_REQUIRED),
+        ('proposed_task_groups', _GROUP_ITEM_REQUIRED),
+    ):
+        items = verdict[key]
+        if not isinstance(items, list):
+            logger.warning(
+                'Triage verdict "%s" is not a list (got %r)',
+                key, type(items).__name__,
+            )
+            return None
+        for item in items:
+            if not isinstance(item, dict) or not (item_required <= item.keys()):
+                logger.warning(
+                    'Triage verdict "%s" item has malformed shape '
+                    '(expected a dict with keys %s, got %r)',
+                    key, sorted(item_required), item,
+                )
+                return None
+
     return verdict
 
 
