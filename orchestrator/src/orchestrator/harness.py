@@ -527,12 +527,6 @@ class TaskReport:
     block_reason: str = ''
     block_detail: str = ''
     block_phase: str = ''
-    # β (task 1913): True only for the synthetic hard-cancel report constructed
-    # inside `except asyncio.CancelledError` (harness.py:3896).  Process teardown
-    # is NOT "work finished and discardable"; B2 reads this flag to skip the eager
-    # branch-deleting release.  All other TaskReport constructions inherit False so
-    # the genuine terminal-exit release is unaffected (no regression).
-    synthetic_cancel: bool = False
 
 
 @dataclass
@@ -5592,19 +5586,21 @@ Output JSON matching the schema. Every task must appear in the output.
                 'returning synthetic CANCELLED report',
                 assignment.task_id,
             )
-            # Assign to `report` so the B2 guard in the finally block can inspect
-            # `synthetic_cancel=True` and SKIP the eager branch-deleting release.
-            # Process teardown is NOT "work finished and discardable"; β (task 1913)
-            # suppresses the EAGER deletion and leaves the lane ASSIGNED so the
-            # periodic terminal-lane reconciler / next acquire can reclaim it.
-            # NOTE: β alone only DELAYS deletion to the reconciler tick; durable
-            # branch survival across that reclaim requires α (task 1912)'s
-            # branch-preservation guard in release_warm_lane (not yet landed).
+            # This except only fires for a cancel landing OUTSIDE run()'s
+            # CancellationScope (slot setup, post-run() report building, or a
+            # mocked-run() unit test) — the workflow's own kind-aware
+            # on_terminal cleanup (W9-θ) never ran, so it never released the
+            # warm lane either.  The finally block below deliberately has no
+            # lane-release call for this path (the retired B2 belt-and-
+            # suspenders block used to gate that skip on a dedicated report
+            # flag; now there is simply no release call to gate).  Process
+            # teardown is NOT "work finished and discardable" — the lane
+            # stays ASSIGNED and the periodic terminal-lane reconciler / next
+            # acquire reclaims it later.
             report = TaskReport(
                 task_id=assignment.task_id,
                 title=assignment.task.get('title', ''),
                 outcome=WorkflowOutcome.CANCELLED,
-                synthetic_cancel=True,
             )
             return report
         except Exception as e:
@@ -5626,37 +5622,16 @@ Output JSON matching the schema. Every task must appear in the output.
             # _run_slot) and lazily pruned by the sweep's grace-check reader.
             self._workflow_slot_tasks.pop(assignment.task_id, None)
             self._terminal_cancel_counts.pop(assignment.task_id, None)
-            # B2: belt-and-suspenders release for any DONE/CANCELLED that missed B1
-            # (e.g. authoritative-cancel returning normally from workflow.run()).
-            # Uses the default allow_disk_backstop=False: normal exits already freed
-            # the lane in B1 and dropped the in-memory assignment → primitive returns
-            # False immediately (true no-op — no disk scan, no redundant cleanup).
-            # contextlib.suppress swallows any residual error so a hiccup here
-            # never prevents scheduler.release below.
-            #
-            # β guard (task 1913): skip the eager release when the report is a
-            # SYNTHETIC hard-cancel (process teardown ≠ "work finished and
-            # discardable").  The lane stays ASSIGNED; the periodic terminal-lane
-            # reconciler / next acquire will reclaim it later.  Until α (task 1912)
-            # lands its branch-preservation guard in release_warm_lane, that
-            # reconciler reclaim still routes through the unguarded git branch -D
-            # — β only prevents the EAGER deletion at process-teardown time.
-            # Genuine DONE / non-synthetic CANCELLED still release here (regression-
-            # guarded by test_nonsynthetic_terminal_report_still_releases_lane).
-            #
-            # Coordinated with workflow.py B1 (_hard_cancel via sys.exc_info()):
-            # B1 runs first (inside run() finally, before the harness catches the
-            # CancelledError); B2 here is the outer harness guard.  Both are
-            # independent — B1 uses the in-flight exception, B2 uses the explicit
-            # synthetic_cancel flag on the TaskReport.  Together they ensure the
-            # eager branch-deleting release never fires on a hard-cancel path.
-            if (
-                report is not None
-                and report.outcome in (WorkflowOutcome.DONE, WorkflowOutcome.CANCELLED)
-                and not report.synthetic_cancel
-            ):
-                with contextlib.suppress(Exception):
-                    await self.git_ops.release_lane_for_terminal_task(assignment.task_id)
+            # W9-θ: the former B2 belt-and-suspenders release (any DONE/CANCELLED
+            # that missed B1, e.g. authoritative-cancel returning normally from
+            # workflow.run()) is retired.  The workflow's own kind-aware
+            # on_terminal cleanup (_on_terminal_cleanups' release_lane entry) now
+            # SOLELY owns terminal lane release for every run()-scope exit —
+            # hard-cancel, soft-cancel, and genuine DONE/CANCELLED alike — so a
+            # second release here would be redundant at best.  A cancel landing
+            # OUTSIDE run()'s CancellationScope (the `except asyncio.CancelledError`
+            # above) never ran on_terminal either; that is intentional — see the
+            # comment there — the periodic terminal-lane reconciler reclaims it.
             requeued = report is not None and report.outcome == WorkflowOutcome.REQUEUED
             if report is not None:
                 requeued = await self._apply_retry_cap(

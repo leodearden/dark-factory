@@ -1,0 +1,961 @@
+"""Tests for the W9-θ ``CancellationScope`` supervisor and ``WorkflowCancelled``.
+
+PRD: plans/workflow-state-machine-prd.md task θ (§8.1 ``WorkflowCancelled``,
+§8.2 CX-1, §9 boundary rows 14-15). Replaces three coupled cancellation
+mechanisms (harness hard-cancel `task.cancel()` + the ``sys.exc_info()`` B1
+sniff / harness B2 dual-guard; the soft ``_cancel_event`` opt-in awaits) with
+ONE typed ``WorkflowCancelled(kind)`` caught at exactly one place in
+``TaskWorkflow.run()``, and an ordered kind-aware ``on_terminal`` cleanup list.
+
+Test coverage:
+  step-01: pure-unit ``WorkflowCancelled`` construct/raise/catch contract
+  step-03: ``CancellationScope.supervise`` soft-cancel + normal-return paths
+  step-05: ``CancellationScope.supervise`` hard-cancel + repeated-cancel
+    cleanup-survival paths
+  step-07: ``TaskWorkflow.run()`` single-catch site (boundary row 14) — a
+    real workflow, harness-style hard-cancelled mid-VERIFY
+  step-09: ``_on_terminal_cleanups()`` ordering + kind-aware lane release
+    (1:1 replacement of the deleted exc_info ``_hard_cancel`` skip)
+  step-11: boundary row 15 — soft-cancel covers a new (unwrapped) await via
+    the scope's own body-task race, and ``_await_cancellable`` raises
+    ``WorkflowCancelled('soft')`` (orphan-avoidance detach preserved)
+  step-13: harness B2 + ``synthetic_cancel`` retirement — ``TaskReport``
+    can no longer be constructed with the field, the harness's hard-cancel
+    safety-net report carries no such attribute, and the ``except
+    asyncio.CancelledError`` safety net (for cancels landing OUTSIDE
+    run()'s CancellationScope) keeps working without it
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+# Cross-module reuse (task 2610 precedent — see test_workflow_terminal_report.py
+# for the same import shape): these factories live in _workflow_helpers.py, not
+# in any single test module's private namespace.
+from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
+from _workflow_helpers import (
+    AgentStub,
+    _build_workflow,
+    _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
+    _init_repo,
+)
+
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps
+from orchestrator.harness import Harness, TaskReport
+from orchestrator.scheduler import TaskAssignment
+from orchestrator.workflow_types import (
+    CancellationScope,
+    TerminalReport,
+    WorkflowCancelled,
+    WorkflowOutcome,
+    WorkflowState,
+    outcome_allows_status,
+)
+
+
+def _make_recording_on_terminal(
+    log: list[tuple[str, str | None]],
+    names: tuple[str, ...] = ('a', 'b', 'c'),
+    delay: float = 0.0,
+) -> list[tuple[str, Callable[[str | None], Awaitable[None]]]]:
+    """Build an ordered on_terminal list that appends ``(name, kind)`` to
+    *log* for each entry it runs, in the order the scope invokes them —
+    the "recording on_terminal list" the plan's soft/hard-cancel tests use
+    to pin ordering + kind propagation without a real ``TaskWorkflow``.
+
+    *delay*, when non-zero, makes each entry ``await asyncio.sleep(delay)``
+    before recording — giving a robustness test a real window in which to
+    fire a second cancel() while cleanup is genuinely in flight.
+    """
+    entries: list[tuple[str, Callable[[str | None], Awaitable[None]]]] = []
+    for name in names:
+        async def _fn(kind: str | None, _name: str = name) -> None:
+            if delay:
+                await asyncio.sleep(delay)
+            log.append((_name, kind))
+        entries.append((name, _fn))
+    return entries
+
+# ---------------------------------------------------------------------------
+# step-01: WorkflowCancelled construct/raise/catch/read contract
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowCancelledType:
+    """Pins the frozen-dataclass-Exception construct/raise/catch/read contract
+    — the one asyncio-adjacent gotcha to smoke out before anything (the
+    ``CancellationScope`` supervisor, ``run()``'s single catch site) depends
+    on it.
+    """
+
+    def test_constructs_with_hard_kind(self):
+        wc = WorkflowCancelled(kind='hard')
+        assert isinstance(wc, Exception)
+        assert wc.kind == 'hard'
+
+    def test_constructs_with_soft_kind(self):
+        wc = WorkflowCancelled(kind='soft')
+        assert isinstance(wc, Exception)
+        assert wc.kind == 'soft'
+
+    def test_raise_and_catch_hard(self):
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            raise WorkflowCancelled(kind='hard')
+        assert excinfo.value.kind == 'hard'
+
+    def test_raise_and_catch_soft(self):
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            raise WorkflowCancelled(kind='soft')
+        assert excinfo.value.kind == 'soft'
+
+    def test_raise_and_catch_via_except_as_reads_kind(self):
+        # The exact idiom run() uses: `except WorkflowCancelled as wc: ... wc.kind`.
+        caught_kind = None
+        try:
+            raise WorkflowCancelled(kind='soft')
+        except WorkflowCancelled as wc:
+            caught_kind = wc.kind
+        assert caught_kind == 'soft'
+
+    @pytest.mark.asyncio
+    async def test_raise_and_catch_across_an_await_boundary(self):
+        # WorkflowCancelled must survive propagation out of a coroutine —
+        # this is how it will actually travel (out of CancellationScope.supervise,
+        # an `await`, up to run()'s single catch site).
+        async def _raises() -> None:
+            await asyncio.sleep(0)
+            raise WorkflowCancelled(kind='hard')
+
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await _raises()
+        assert excinfo.value.kind == 'hard'
+
+
+# ---------------------------------------------------------------------------
+# step-03: CancellationScope.supervise — soft-cancel + normal-return paths
+# ---------------------------------------------------------------------------
+
+
+class TestCancellationScopeSoftCancel:
+    """No real ``TaskWorkflow`` involved — pure asyncio.Event + recording
+    on_terminal list, per the plan's step-03 spec.
+    """
+
+    @pytest.mark.asyncio
+    async def test_soft_cancel_raises_workflow_cancelled_and_runs_on_terminal_in_order(self):
+        # Pre-setting the event (rather than racing a delayed setter against
+        # supervise()) is deterministic: asyncio.wait({body, waiter},
+        # FIRST_COMPLETED) sees waiter already resolvable and body
+        # (asyncio.sleep(3600)) still pending, so the soft-cancel branch is
+        # the only possible outcome — no timing flakiness.
+        log: list[tuple[str, str | None]] = []
+        on_terminal = _make_recording_on_terminal(log)
+        event = asyncio.Event()
+        event.set()
+        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+
+        body_cancelled = False
+
+        async def _body() -> None:
+            nonlocal body_cancelled
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                # Proves the scope actually cancelled+cleaned-up the inner
+                # body task (rather than e.g. abandoning it) — the closest
+                # observable proxy for "body.cancelled() or done" available
+                # to a caller that only supplies a coroutine, not a Task.
+                body_cancelled = True
+                raise
+
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await scope.supervise(_body())
+
+        assert excinfo.value.kind == 'soft'
+        assert [name for name, _kind in log] == ['a', 'b', 'c']
+        assert all(kind == 'soft' for _name, kind in log)
+        assert body_cancelled is True
+
+    @pytest.mark.asyncio
+    async def test_body_raising_workflow_cancelled_directly_propagates_its_own_kind(self):
+        # W9-θ step-12 discovery: application code inside the body (e.g. the
+        # merge-retry loop's explicit cancel re-check, or _await_cancellable)
+        # can now raise WorkflowCancelled directly as ordinary control flow —
+        # a DIFFERENT detection path than this scope's own event-race (tested
+        # above). supervise() must still capture the raised exception's own
+        # .kind and pass it to on_terminal — not leave `kind` at its default
+        # None, which would make on_terminal treat a real soft-cancel as a
+        # normal exit and silently skip the kind-aware lane-release policy.
+        log: list[tuple[str, str | None]] = []
+        on_terminal = _make_recording_on_terminal(log)
+        event = asyncio.Event()  # never set — the body raises on its own
+        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+
+        async def _body() -> None:
+            await asyncio.sleep(0)
+            raise WorkflowCancelled(kind='soft')
+
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await scope.supervise(_body())
+
+        assert excinfo.value.kind == 'soft'
+        assert [name for name, _kind in log] == ['a', 'b', 'c']
+        assert all(kind == 'soft' for _name, kind in log), (
+            f'on_terminal must see kind=soft when the body raises WorkflowCancelled '
+            f'directly, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_body_returns_normally_runs_on_terminal_once_with_none_kind(self):
+        log: list[tuple[str, str | None]] = []
+        on_terminal = _make_recording_on_terminal(log)
+        event = asyncio.Event()  # never set — body wins on its own
+        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+
+        sentinel = object()
+
+        async def _body() -> object:
+            return sentinel
+
+        result = await scope.supervise(_body())
+
+        assert result is sentinel
+        assert [name for name, _kind in log] == ['a', 'b', 'c']
+        assert all(kind is None for _name, kind in log)
+
+
+# ---------------------------------------------------------------------------
+# step-05: CancellationScope.supervise — hard-cancel + robustness
+# ---------------------------------------------------------------------------
+
+
+class TestCancellationScopeHardCancel:
+    """No real ``TaskWorkflow`` involved — pure asyncio.Task cancellation +
+    recording on_terminal list, per the plan's step-05 spec.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hard_cancel_of_outer_task_raises_workflow_cancelled_hard(self):
+        log: list[tuple[str, str | None]] = []
+        on_terminal = _make_recording_on_terminal(log)
+        event = asyncio.Event()  # never set — only the outer task is cancelled
+        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+
+        async def _body() -> None:
+            await asyncio.sleep(3600)
+
+        async def _runner() -> None:
+            await scope.supervise(_body())
+
+        outer = asyncio.create_task(_runner())
+        await asyncio.sleep(0)  # let supervise() reach its first real await
+        outer.cancel()
+        # asyncio.wait (unlike a bare `await outer`) never itself raises,
+        # even if outer ends up CANCELLED — lets us inspect the outcome.
+        await asyncio.wait({outer}, timeout=5.0)
+
+        assert outer.done()
+        assert not outer.cancelled(), (
+            'CancelledError escaped supervise() instead of being translated '
+            "to WorkflowCancelled(kind='hard')"
+        )
+        exc = outer.exception()
+        assert isinstance(exc, WorkflowCancelled), f'expected WorkflowCancelled, got {exc!r}'
+        assert exc.kind == 'hard'
+        assert [name for name, _kind in log] == ['a', 'b', 'c']
+        assert all(kind == 'hard' for _name, kind in log)
+
+    @pytest.mark.asyncio
+    async def test_body_raising_cancellederror_itself_is_treated_as_hard(self):
+        # A spontaneous CancelledError raised BY the body (a shutdown-race
+        # teardown) — not the outer task being cancelled — must also be
+        # typed 'hard', matching the old exc_info sniff's behaviour of
+        # catching ANY CancelledError propagating through the finally.
+        log: list[tuple[str, str | None]] = []
+        on_terminal = _make_recording_on_terminal(log)
+        event = asyncio.Event()
+        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+
+        async def _body() -> None:
+            await asyncio.sleep(0)
+            raise asyncio.CancelledError()
+
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await scope.supervise(_body())
+
+        assert excinfo.value.kind == 'hard'
+        assert [name for name, _kind in log] == ['a', 'b', 'c']
+        assert all(kind == 'hard' for _name, kind in log)
+
+    @pytest.mark.asyncio
+    async def test_repeated_cancel_during_on_terminal_does_not_truncate_cleanup(self):
+        # Mimics harness.hard_cancel_workflow's poll loop, which can call
+        # task.cancel() more than once on the same slot task.
+        log: list[tuple[str, str | None]] = []
+        on_terminal = _make_recording_on_terminal(log, delay=0.05)
+        event = asyncio.Event()
+        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+
+        async def _body() -> None:
+            await asyncio.sleep(3600)
+
+        async def _runner() -> None:
+            await scope.supervise(_body())
+
+        outer = asyncio.create_task(_runner())
+        await asyncio.sleep(0)
+        outer.cancel()  # 1st cancel: enters hard-cancel, starts on_terminal cleanup
+        await asyncio.sleep(0.02)  # land mid-sleep inside the first on_terminal entry
+        outer.cancel()  # 2nd cancel: must not truncate the still-running cleanup
+
+        await asyncio.wait({outer}, timeout=5.0)
+
+        assert outer.done()
+        assert not outer.cancelled(), (
+            'CancelledError escaped despite repeated cancel() during on_terminal cleanup'
+        )
+        exc = outer.exception()
+        assert isinstance(exc, WorkflowCancelled), f'expected WorkflowCancelled, got {exc!r}'
+        assert exc.kind == 'hard'
+        assert [name for name, _kind in log] == ['a', 'b', 'c'], f'cleanup truncated: {log!r}'
+        assert all(kind == 'hard' for _name, kind in log)
+
+
+# ---------------------------------------------------------------------------
+# step-07: TaskWorkflow.run() single-catch site (boundary row 14)
+# ---------------------------------------------------------------------------
+#
+# Fixtures mirror test_workflow_terminal_report.py's e2e-style setup (task
+# 2610 Group D factories: _build_workflow / AgentStub / _init_repo) — a REAL
+# TaskWorkflow driven through PLAN + EXECUTE via the AgentStub, then wedged
+# inside VERIFY so a harness-style hard-cancel (task.cancel() on the run()
+# task) has something to interrupt.
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    """A bare-minimum git repo with an initial commit."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_init_repo(repo))
+    return repo
+
+
+@pytest.fixture
+def config(git_repo: Path) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        project_root=git_repo,
+        max_concurrent_tasks=1,
+        max_execute_iterations=5,
+        max_verify_attempts=3,
+        max_review_cycles=2,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+
+
+@pytest.fixture
+def git_ops(config: OrchestratorConfig) -> GitOps:
+    return GitOps(config.git, config.project_root)
+
+
+@pytest.fixture
+def task_assignment() -> TaskAssignment:
+    return TaskAssignment(
+        task_id='42',
+        task={
+            'id': '42',
+            'title': 'Add farewell function',
+            'description': 'Add a farewell(name) function to lib.py with tests',
+            'status': 'pending',
+            'metadata': {'files': ['lib']},
+            'dependencies': [],
+        },
+        modules=['lib'],
+    )
+
+
+@pytest.mark.asyncio
+class TestRunSingleCatchHardCancel:
+    """Boundary row 14: ``run()`` must RETURN a ``TerminalReport`` on a
+    harness-style hard-cancel, never let ``CancelledError`` escape — and
+    must not crash on SM-2 (the outcome<->status half is skipped for the
+    hard-cancel exit, since the live scheduler row is still 'in-progress',
+    which is NOT an allowed pairing for outcome==CANCELLED).
+
+    RED until step-8 wires the ``CancellationScope`` into ``run()``: today
+    ``run()`` is a bare ``await self._drive()`` with no catch, so cancelling
+    the run()-task leaves that task itself CANCELLED instead of returning.
+    """
+
+    async def test_hard_cancel_mid_verify_returns_cancelled_report(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+
+        wedged = asyncio.Event()
+
+        async def _wedge_verify() -> WorkflowOutcome:
+            # Entered only after _enter_phase(VERIFY) (workflow.py, just
+            # above the real _verify_debugfix_loop() call) — so by the time
+            # this fires, workflow.machine.state is already VERIFY.
+            wedged.set()
+            await asyncio.sleep(3600)
+            raise AssertionError('unreachable — cancelled before the sleep returns')
+
+        workflow._verify_debugfix_loop = _wedge_verify  # type: ignore[method-assign]
+
+        run_task = asyncio.create_task(workflow.run())
+        await asyncio.wait_for(wedged.wait(), timeout=5.0)
+        assert workflow.machine.state == WorkflowState.VERIFY
+
+        # Harness-style hard-cancel: cancel the task running run() directly
+        # (mirrors harness.hard_cancel_workflow's task.cancel() on the
+        # registered slot task).
+        run_task.cancel()
+        done, _pending = await asyncio.wait({run_task}, timeout=5.0)
+        assert run_task in done, 'run() task did not finish within 5s'
+
+        assert not run_task.cancelled(), (
+            'CancelledError escaped run() instead of being translated into '
+            'a TerminalReport(outcome=CANCELLED)'
+        )
+        report = run_task.result()
+        assert isinstance(report, TerminalReport)
+        assert report.outcome == WorkflowOutcome.CANCELLED
+        assert workflow.machine.state == WorkflowState.CANCELLED
+        assert report.phase == WorkflowState.CANCELLED
+
+        # The live scheduler row was claimed 'in-progress' by
+        # _setup_worktree_and_artifacts and never advanced (no terminal
+        # status write happens on a hard-cancel exit) — proving SM-2's
+        # outcome<->status half really was SKIPPED for this exit, not just
+        # coincidentally satisfied: 'in-progress' is NOT an allowed pairing
+        # for outcome==CANCELLED (_OUTCOME_ALLOWED['cancelled'] == {CANCELLED}
+        # only), yet run() above returned cleanly instead of raising.
+        last_status = await scheduler.get_status(workflow.task_id)
+        assert last_status == 'in-progress'
+        assert not outcome_allows_status(report.outcome, last_status)
+
+
+@pytest.mark.asyncio
+class TestCancelFromMergeDeferred:
+    """Regression (reviewer_comprehensive, esc-2252-26): a cancel — soft or
+    hard — that lands while the machine is parked in ``MERGE_DEFERRED`` (a
+    train member awaiting its GroupMergeRequest future inside
+    ``_maybe_enqueue_group_merge``, after ``set_task_status('merge-deferred')``
+    has persisted the row) must let ``run()`` RETURN a ``TerminalReport``.
+
+    Before the fix, ``_finalise_cancellation`` drove the machine to CANCELLED
+    via ``_enter_phase(CANCELLED)``, but the shared transition table had NO
+    ``(MERGE_DEFERRED, CANCELLED)`` edge → ``IllegalTransition`` escaped run()'s
+    single ``WorkflowCancelled`` catch. The soft path additionally tripped
+    SM-2's outcome<->status half: ``outcome_allows_status('soft-cancelled',
+    'merge-deferred')`` was False. Both are fixed in shared/task_transitions.py.
+    """
+
+    def _wire_cleanup_spies(self, workflow) -> None:
+        async def _noop_async(*_a, **_k) -> None:
+            return None
+
+        async def _release_lane(_task_id: str) -> bool:
+            return True
+
+        workflow._stop_claimant_heartbeat = _noop_async  # type: ignore[method-assign]
+        workflow._steward = SimpleNamespace(stop=_noop_async)
+        workflow._maybe_cleanup_done_worktree = _noop_async  # type: ignore[method-assign]
+        workflow._cleanup_config_dir = lambda *_a, **_k: None  # type: ignore[method-assign]
+        workflow.git_ops.release_lane_for_terminal_task = _release_lane  # type: ignore[method-assign]
+
+    async def _stage_merge_deferred(self, workflow, scheduler) -> None:
+        # Persist the merge-deferred row and stage the machine there — exactly
+        # the state a parked train member sits in at _await_cancellable(future)
+        # (workflow.py:1320), reached after set_task_status('merge-deferred').
+        await scheduler.set_task_status(workflow.task_id, 'merge-deferred')
+        workflow.state = WorkflowState.MERGE_DEFERRED
+        assert workflow.machine.state == WorkflowState.MERGE_DEFERRED
+        self._wire_cleanup_spies(workflow)
+
+    async def test_hard_cancel_from_merge_deferred_returns_cancelled_report(
+        self, config, git_ops, task_assignment,
+    ):
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        await self._stage_merge_deferred(workflow, scheduler)
+
+        async def _drive_raises_hard() -> WorkflowOutcome:
+            raise WorkflowCancelled('hard')
+
+        workflow._drive = _drive_raises_hard  # type: ignore[method-assign]
+
+        report = await workflow.run()
+
+        assert isinstance(report, TerminalReport)
+        assert report.outcome == WorkflowOutcome.CANCELLED
+        assert workflow.machine.state == WorkflowState.CANCELLED
+        assert report.phase == WorkflowState.CANCELLED
+
+    async def test_soft_cancel_from_merge_deferred_returns_soft_cancelled_report(
+        self, config, git_ops, task_assignment,
+    ):
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        await self._stage_merge_deferred(workflow, scheduler)
+        # A soft-cancel: the event is set, and _handle_soft_cancel re-reads the
+        # (non-terminal) merge-deferred row → SOFT_CANCELLED.
+        workflow._cancel_event.set()
+
+        async def _drive_raises_soft() -> WorkflowOutcome:
+            raise WorkflowCancelled('soft')
+
+        workflow._drive = _drive_raises_soft  # type: ignore[method-assign]
+
+        report = await workflow.run()
+
+        assert isinstance(report, TerminalReport)
+        assert report.outcome == WorkflowOutcome.SOFT_CANCELLED
+        assert workflow.machine.state == WorkflowState.CANCELLED
+        assert report.phase == WorkflowState.CANCELLED
+        # SM-2 outcome<->status: the last-persisted row is still merge-deferred
+        # (release_workflow parks it to blocked only after run() returns), and
+        # that pairing must be allowed for the soft-cancelled outcome.
+        last_status = await scheduler.get_status(workflow.task_id)
+        assert last_status == 'merge-deferred'
+        assert outcome_allows_status(report.outcome, last_status)
+
+
+# ---------------------------------------------------------------------------
+# step-09: _on_terminal_cleanups() ordering + kind-aware lane release
+# ---------------------------------------------------------------------------
+#
+# Exercises _on_terminal_cleanups() directly (no run()/_drive() involved) —
+# a real TaskWorkflow (config/git_ops/task_assignment fixtures shared with
+# step-07 above), its .state staged directly (the setter bypasses transition
+# validation), and the five cleanup targets replaced with spies that append
+# their name to a shared `calls` log. This pins the 1:1 replacement of the
+# deleted exc_info `_hard_cancel` skip: release iff
+# `kind != 'hard' and not _worktree_external and (kind is not None or
+# state in {DONE, CANCELLED})`.
+#
+# RED until step-10: _on_terminal_cleanups() is still the step-8 placeholder
+# returning [] — every scenario below observes an empty `calls` log.
+
+
+@pytest.mark.asyncio
+class TestOnTerminalCleanups:
+    """Boundary row 15 prep: ``_on_terminal_cleanups()`` ordering + the
+    kind-aware lane-release guard."""
+
+    def _wire_spies(self, workflow, calls: list[str]) -> None:
+        async def _heartbeat() -> None:
+            calls.append('stop_claimant_heartbeat')
+
+        async def _steward_stop() -> None:
+            calls.append('stop_steward')
+
+        async def _cleanup_worktree() -> None:
+            calls.append('cleanup_done_worktree')
+
+        def _cleanup_config() -> None:
+            calls.append('cleanup_config_dir')
+
+        async def _release_lane(task_id: str) -> bool:
+            calls.append('release_lane')
+            return True
+
+        workflow._stop_claimant_heartbeat = _heartbeat  # type: ignore[method-assign]
+        workflow._steward = SimpleNamespace(stop=_steward_stop)
+        workflow._maybe_cleanup_done_worktree = _cleanup_worktree  # type: ignore[method-assign]
+        workflow._cleanup_config_dir = _cleanup_config  # type: ignore[method-assign]
+        workflow.git_ops.release_lane_for_terminal_task = _release_lane  # type: ignore[method-assign]
+
+    async def _run_cleanups(self, workflow, kind: str | None) -> None:
+        for _name, fn in workflow._on_terminal_cleanups():
+            await fn(kind)
+
+    async def test_ordering_with_kind_none_and_done_state(
+        self, config, git_ops, task_assignment,
+    ):
+        """A genuine DONE exit (kind=None): all five run, in order, release fires."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow.state = WorkflowState.DONE
+        calls: list[str] = []
+        self._wire_spies(workflow, calls)
+
+        await self._run_cleanups(workflow, None)
+
+        assert calls == [
+            'stop_claimant_heartbeat', 'stop_steward', 'cleanup_done_worktree',
+            'release_lane', 'cleanup_config_dir',
+        ]
+
+    async def test_ordering_with_kind_none_and_cancelled_state(
+        self, config, git_ops, task_assignment,
+    ):
+        """The authoritative-cancel exit (kind=None, state already CANCELLED
+        via _handle_cancelled_terminal_exit) also releases — row @263's
+        pre-existing property, preserved."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow.state = WorkflowState.CANCELLED
+        calls: list[str] = []
+        self._wire_spies(workflow, calls)
+
+        await self._run_cleanups(workflow, None)
+
+        assert calls == [
+            'stop_claimant_heartbeat', 'stop_steward', 'cleanup_done_worktree',
+            'release_lane', 'cleanup_config_dir',
+        ]
+
+    async def test_kind_hard_skips_lane_release_but_other_four_still_run(
+        self, config, git_ops, task_assignment,
+    ):
+        """kind='hard' skips release EVEN when state is already terminal —
+        the branch must survive the teardown regardless of state."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow.state = WorkflowState.CANCELLED
+        calls: list[str] = []
+        self._wire_spies(workflow, calls)
+
+        await self._run_cleanups(workflow, 'hard')
+
+        assert 'release_lane' not in calls
+        assert calls == [
+            'stop_claimant_heartbeat', 'stop_steward', 'cleanup_done_worktree',
+            'cleanup_config_dir',
+        ]
+
+    async def test_kind_soft_releases_lane_even_from_a_working_state(
+        self, config, git_ops, task_assignment,
+    ):
+        """kind='soft' releases even mid-flight (state is VERIFY, not yet
+        terminal) — boundary row 15's key property."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow.state = WorkflowState.VERIFY
+        calls: list[str] = []
+        self._wire_spies(workflow, calls)
+
+        await self._run_cleanups(workflow, 'soft')
+
+        assert 'release_lane' in calls
+
+    async def test_kind_none_with_working_state_skips_release(
+        self, config, git_ops, task_assignment,
+    ):
+        """kind=None (a normal _drive() return) with a non-terminal state
+        is not a genuine terminal exit — skip release."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow.state = WorkflowState.VERIFY
+        calls: list[str] = []
+        self._wire_spies(workflow, calls)
+
+        await self._run_cleanups(workflow, None)
+
+        assert 'release_lane' not in calls
+
+    async def test_worktree_external_skips_release_for_every_kind(
+        self, config, git_ops, task_assignment,
+    ):
+        """Eval mode (_worktree_external=True) never releases, regardless
+        of kind."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow._worktree_external = True
+        workflow.state = WorkflowState.CANCELLED
+
+        for kind in ('hard', 'soft', None):
+            calls: list[str] = []
+            self._wire_spies(workflow, calls)
+            await self._run_cleanups(workflow, kind)
+            assert 'release_lane' not in calls, f'release fired for kind={kind!r}'
+
+
+# ---------------------------------------------------------------------------
+# step-11: boundary row 15 — soft-cancel covers a new await + orphan-avoidance
+# ---------------------------------------------------------------------------
+#
+# (a) The CancellationScope races the WHOLE _drive() body-task against
+# _cancel_event (steps 03/06/08) — so ANY long await inside _drive() is
+# cancellable by construction, not just ones wrapped by _await_cancellable.
+# This pins that property end-to-end against a real TaskWorkflow, using a
+# patched steward-shaped wait _await_cancellable never sees.
+#
+# (b) _await_cancellable itself (the merge-submit orphan-avoidance helper)
+# currently returns None on cancel-win; callers do
+# `if result is None: return await self._handle_soft_cancel(...)` — a normal
+# _drive() return that never reaches run()'s single WorkflowCancelled catch
+# with kind='soft'.  RED until step-12 retypes it to RAISE
+# WorkflowCancelled('soft') (keeping the fut.cancel()/on_soft_cancel detach).
+
+
+@pytest.mark.asyncio
+class TestSoftCancelCoversNewAwait:
+    """Boundary row 15(a): a soft-cancel during a long await NOT wrapped by
+    ``_await_cancellable`` is still caught by the ``CancellationScope``'s own
+    body-task race — ``run()`` returns ``TerminalReport(SOFT_CANCELLED)``,
+    ``machine.state == CANCELLED``, and the lane is released (kind='soft')."""
+
+    async def test_soft_cancel_during_unwrapped_await_returns_soft_cancelled_report(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+
+        wedged = asyncio.Event()
+        release_calls: list[str] = []
+
+        async def _wedge_verify() -> WorkflowOutcome:
+            # A stand-in for a long, non-_await_cancellable-wrapped wait (e.g.
+            # a steward wait) — entered only after _enter_phase(VERIFY).
+            wedged.set()
+            await asyncio.sleep(3600)
+            raise AssertionError('unreachable — soft-cancelled before the sleep returns')
+
+        async def _spy_release_lane(task_id: str) -> bool:
+            release_calls.append(task_id)
+            return True
+
+        workflow._verify_debugfix_loop = _wedge_verify  # type: ignore[method-assign]
+        workflow.git_ops.release_lane_for_terminal_task = _spy_release_lane  # type: ignore[method-assign]
+
+        run_task = asyncio.create_task(workflow.run())
+        await asyncio.wait_for(wedged.wait(), timeout=5.0)
+        assert workflow.machine.state == WorkflowState.VERIFY
+
+        # Soft-cancel: set the event directly — no task.cancel() involved.
+        # Mirrors a human release_workflow / watcher-triggered soft-cancel
+        # arriving while wedged on a wait _await_cancellable never sees.
+        workflow._cancel_event.set()
+        done, _pending = await asyncio.wait({run_task}, timeout=5.0)
+        assert run_task in done, 'run() task did not finish within 5s'
+        assert not run_task.cancelled(), (
+            'CancelledError escaped run() on a soft-cancel'
+        )
+
+        report = run_task.result()
+        assert isinstance(report, TerminalReport)
+        assert report.outcome == WorkflowOutcome.SOFT_CANCELLED
+        assert workflow.machine.state == WorkflowState.CANCELLED
+        assert report.phase == WorkflowState.CANCELLED
+        assert release_calls == ['42'], (
+            'kind=soft must release the lane even from a still-working state'
+        )
+
+
+@pytest.mark.asyncio
+class TestAwaitCancellableRaisesWorkflowCancelled:
+    """Boundary row 15(b): ``_await_cancellable`` raises
+    ``WorkflowCancelled(kind='soft')`` on cancel-win instead of returning
+    ``None``, while still performing its orphan-avoidance detach
+    (``fut.cancel()`` / ``on_soft_cancel``) so an enqueued merge request is
+    never orphaned."""
+
+    async def test_hook_called_future_not_cancelled_and_raises(
+        self, config, git_ops, task_assignment,
+    ):
+        """cancel-win with an on_soft_cancel hook: hook fires exactly once,
+        the future is left untouched (registry.detach owns it instead), and
+        WorkflowCancelled('soft') is raised — not a None return."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow._cancel_event.set()  # cancel wins immediately
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        hook_calls: list[int] = []
+
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await workflow._await_cancellable(fut, on_soft_cancel=lambda: hook_calls.append(1))
+
+        assert excinfo.value.kind == 'soft'
+        assert hook_calls == [1], 'hook must be called exactly once'
+        assert not fut.cancelled(), 'future must NOT be cancelled when hook is provided'
+
+    async def test_no_hook_future_is_cancelled_and_raises(
+        self, config, git_ops, task_assignment,
+    ):
+        """cancel-win with no hook (default None): the blanket fut.cancel()
+        orphan-avoidance still fires, and WorkflowCancelled('soft') is raised."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow._cancel_event.set()
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await workflow._await_cancellable(fut)
+
+        assert excinfo.value.kind == 'soft'
+        assert fut.cancelled(), 'future must be cancelled when no hook is provided'
+
+    async def test_future_resolves_first_returns_normally_no_raise(
+        self, config, git_ops, task_assignment,
+    ):
+        """Same-window race: the awaitable's result wins over a set cancel
+        event — no WorkflowCancelled, no hook call (unaffected by step-12)."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        # cancel_event is NOT set.
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        fut.set_result('the_result')
+        hook_calls: list[int] = []
+
+        result = await workflow._await_cancellable(fut, on_soft_cancel=lambda: hook_calls.append(1))
+
+        assert result == 'the_result'
+        assert hook_calls == [], 'hook must NOT be called when future resolves first'
+
+
+# ---------------------------------------------------------------------------
+# step-13: harness B2 + synthetic_cancel retirement (RED)
+# ---------------------------------------------------------------------------
+#
+# With the workflow's kind-aware on_terminal now solely owning terminal lane
+# release for every run() exit (steps 8/10/12), the harness's B2 belt-and-
+# suspenders release block — and its synthetic_cancel skip-signal — is fully
+# redundant. But task.cancel() can still land OUTSIDE run()'s
+# CancellationScope (slot setup, post-run() report building, or a unit test
+# that mocks workflow.run() as a bare coroutine), so the harness's `except
+# asyncio.CancelledError` safety net must survive the retirement — it still
+# has to return a TaskReport(outcome=CANCELLED) so the wrapper task
+# completes normally.
+#
+# RED until step-14 deletes TaskReport.synthetic_cancel and the B2 block
+# from harness.py: today the field still exists (TaskReport(...
+# synthetic_cancel=True) does NOT raise) and the harness's hard-cancel
+# safety-net report still carries the attribute.
+
+
+def _make_harness_for_run_slot() -> Harness:
+    """Harness with all attributes needed to drive ``_run_slot`` directly.
+
+    Mirrors test_harness_cancel_workflow.py's ``harness_for_run_slot``
+    fixture (that file mocks run() as a bare sleep and asserts on
+    outcome/cleanup/sem only — none of which depend on synthetic_cancel, so
+    it is untouched by θ). This local helper reuses the same construction
+    shape for θ's own retirement test below.
+    """
+    h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)
+    h.scheduler = MagicMock()
+    wire_scheduler_liveness_mock(h.scheduler)
+    h._workflow_cancel_events = {}
+    h._workflow_cancel_at = {}
+    h._workflow_slot_tasks = {}
+    h._terminal_cancel_counts = {}
+    h._escalation_events = {}
+    h._escalation_queue = None
+    h._recovered_plans = {}
+    h._recovered_sessions = {}
+    h._preserved_worktrees = set()
+    h.event_store = None
+    h.config = None  # type: ignore[assignment]
+    h.git_ops = None  # type: ignore[assignment]
+    h.briefing = None  # type: ignore[assignment]
+    h.mcp = None  # type: ignore[assignment]
+    h.usage_gate = None
+    h._merge_queue = None  # type: ignore[assignment]
+    h._merge_worker = None
+    h._merge_inflight_registry = None  # type: ignore[assignment]
+    h.cost_store = None
+    h._run_store = None
+    h._run_id = None
+    h.review_checkpoint = None
+    h.scheduler.release = MagicMock()
+    h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
+    h.scheduler.is_deterministic = MagicMock(return_value=False)
+    return h
+
+
+class TestHarnessSyntheticCancelRetirement:
+    """RED (step-13): ``TaskReport`` sheds ``synthetic_cancel`` — it can no
+    longer be constructed with the field, and the harness's hard-cancel
+    safety-net report carries no such attribute (field + B2 release block
+    retired); the ``except asyncio.CancelledError`` safety net keeps
+    returning a CANCELLED report with cleanup/sem intact."""
+
+    def test_task_report_construction_rejects_synthetic_cancel_kwarg(self):
+        with pytest.raises(TypeError):
+            TaskReport(
+                task_id='42', title='t', outcome=WorkflowOutcome.CANCELLED,
+                synthetic_cancel=True,  # type: ignore[call-arg]
+            )
+
+    @pytest.mark.asyncio
+    async def test_hard_cancel_safety_net_returns_cancelled_report_without_synthetic_cancel(
+        self,
+    ):
+        """Mirrors test_harness_cancel_workflow.py's hard-cancel integration
+        test — drive ``_run_slot`` with ``workflow.run`` patched to a bare
+        ``asyncio.sleep(3600)``, hard-cancel it — but additionally pins that
+        the returned report carries no ``synthetic_cancel`` attribute at
+        all, proving the except-CancelledError net still works (outcome,
+        finally cleanup, sem release) without the retired flag."""
+        h = _make_harness_for_run_slot()
+        tid = '42'
+        assignment = TaskAssignment(
+            task_id=tid, task={'title': 'wedged task'}, modules=[],
+        )
+        sem = asyncio.Semaphore(0)
+
+        with patch('orchestrator.harness.TaskWorkflow') as mock_wf_cls:
+            async def _wedge() -> None:
+                await asyncio.sleep(3600)
+
+            mock_wf = MagicMock()
+            mock_wf.run = _wedge
+            mock_wf_cls.return_value = mock_wf
+
+            wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+
+            # Poll until _run_slot registers itself in _workflow_slot_tasks.
+            for _ in range(50):
+                if tid in h._workflow_slot_tasks:
+                    break
+                await asyncio.sleep(0.01)
+            assert tid in h._workflow_slot_tasks, (
+                '_run_slot did not register itself in _workflow_slot_tasks'
+            )
+
+            h.hard_cancel_workflow(tid)
+
+            done, _pending = await asyncio.wait({wrapper_task}, timeout=5.0)
+            assert wrapper_task in done, 'wrapper_task did not finish within 5s'
+
+        assert not wrapper_task.cancelled(), (
+            'Expected _run_slot to return a synthetic CANCELLED TaskReport, '
+            'but the Task ended up in CANCELLED state — CancelledError escaped.'
+        )
+        report = wrapper_task.result()
+        assert report is not None, 'Expected _run_slot to return a TaskReport, got None'
+        assert report.outcome == WorkflowOutcome.CANCELLED, (
+            f'Expected outcome=CANCELLED, got {report.outcome!r}'
+        )
+        assert not hasattr(report, 'synthetic_cancel'), (
+            'TaskReport must no longer carry a synthetic_cancel attribute'
+        )
+
+        # Finally cleanup ran: registries cleared, semaphore released.
+        assert tid not in h._workflow_slot_tasks, 'slot task not cleaned up in finally'
+        assert tid not in h._workflow_cancel_events, 'cancel event not cleaned up in finally'
+        assert sem._value == 1, f'semaphore not released by finally (value={sem._value})'

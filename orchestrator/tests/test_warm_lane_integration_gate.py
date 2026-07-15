@@ -945,28 +945,34 @@ async def _assert_beta_phase(
     task_id: str,
     repo_path: Path,
 ) -> None:
-    """Assert β observable: hard-cancel leaves lane ASSIGNED and branch alive."""
+    """Assert β observable: hard-cancel leaves lane ASSIGNED and branch alive.
+
+    W9-θ (task 2252) retired TaskReport.synthetic_cancel and the harness's
+    B2 release block; a hard-cancel landing outside run()'s CancellationScope
+    is now handled solely by the harness's `except asyncio.CancelledError`
+    safety net, which makes no lane-release call at all (there is no B2 left
+    to gate) — so the lane/branch observables below are unchanged even
+    though the synthetic_cancel signal itself is gone.
+    """
     assert report is not None
     assert report.outcome == WorkflowOutcome.CANCELLED, (
         f'synthetic hard-cancel must produce CANCELLED outcome, got {report.outcome!r}'
     )
-    assert report.synthetic_cancel is True, (
-        'TaskReport.synthetic_cancel must be True on hard-cancel '
-        '(set in harness._run_slot CancelledError handler)'
-    )
     assert pool.assignment_for(task_id) is not None, (
-        'lane assignment must survive hard-cancel (B2 β-guard skipped release)'
+        'lane assignment must survive hard-cancel (harness safety net makes '
+        'no release call)'
     )
     assert pool.state(lane) == LaneState.ASSIGNED, (
         f'lane must stay ASSIGNED after synthetic hard-cancel, got {pool.state(lane)!r}; '
-        'β-revert → B2 fires release_lane_for_terminal_task → lane flips FREE'
+        'the harness except-CancelledError safety net must not release the lane'
     )
     rc_ref, _, _ = await _run(
         ['git', 'rev-parse', '--verify', f'refs/heads/task/{task_id}'],
         cwd=repo_path,
     )
     assert rc_ref == 0, (
-        f'task/{task_id} branch must survive hard-cancel (β skips B2 branch delete)'
+        f'task/{task_id} branch must survive hard-cancel '
+        '(no release call means no git branch -D)'
     )
 
 
@@ -1100,7 +1106,8 @@ class TestOmegaIntegrationGate:
     survives release+restart → merge completes (no unknown_branch), composing α/β/γ.
 
     Negative-control design:
-      β observable: lane stays ASSIGNED after synthetic hard-cancel (B2 skipped)
+      β observable: lane stays ASSIGNED after synthetic hard-cancel (the
+        harness's except-CancelledError safety net makes no release call)
       α observable: branch retained after real reclaim release (commits > main)
       γ observable: commits preserved on re-dispatch reattach (count == n_before)
       merge: _classify_branch_presence is None AND merge_to_main succeeds
@@ -1117,13 +1124,15 @@ class TestOmegaIntegrationGate:
 
         Phase 0: create_worktree(id) → lane on task/<id>; commit unmerged WIP.
         Phase 1 (β): synthetic hard-cancel via harness._run_slot.
-        ASSERT:
-          - report.outcome == CANCELLED and report.synthetic_cancel is True
+        ASSERT (via _assert_beta_phase):
+          - report.outcome == CANCELLED
           - pool.assignment_for(id) is not None AND pool.state(lane) == ASSIGNED
           - git rev-parse --verify refs/heads/task/<id> rc == 0
 
-        Negative control for β: with β reverted, B2 fires release_lane_for_terminal_task
-        → lane flips FREE → the ASSIGNED assertion fails.
+        Negative control for β: the harness's `except asyncio.CancelledError`
+        safety net must make no release call for this out-of-scope cancel; if
+        a release call were reintroduced, the lane would flip FREE and the
+        ASSIGNED assertion would fail.
         """
         task_id = 'omega-beta-1'
         await _add_all_warm_lane_scripts(ig_git_repo)
@@ -1313,7 +1322,7 @@ class TestOmegaIntegrationGate:
         Phase 0 — create_worktree(id) → lane on task/<id>; commit unmerged WIP
                    (mid-pre-merge-rebase state; n_before > 0 beyond main).
         Phase 1 (β) — synthetic hard-cancel via harness._run_slot;
-                   assert synthetic_cancel True, lane ASSIGNED, branch alive.
+                   assert outcome CANCELLED, lane ASSIGNED, branch alive.
         Phase 2 (α) — release_lane_for_terminal_task(id) reclaim;
                    assert branch ref still alive AND lane FREE.
         Phase 3 (γ) — re-dispatch create_worktree(id);
@@ -1324,7 +1333,7 @@ class TestOmegaIntegrationGate:
         Mirrors TestG5Gate.test_all_four_behaviors_on_single_pool structure.
 
         This is the single e2e proof that α+β+γ compose to remove the loss-WINDOW:
-          FAIL if β reverted → eager B2 release → lane FREE → Phase 1 ASSIGNED check FAILS
+          FAIL if β reverted → a release call reintroduced → lane FREE → Phase 1 ASSIGNED check FAILS
           FAIL if α reverted → unconditional branch delete → ref gone → Phase 2 check FAILS
           FAIL if γ reverted → commits reset/collision → count 0 / not WorktreeInfo → FAILS
         """

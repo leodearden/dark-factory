@@ -266,6 +266,11 @@ _CORE_UNION_PAIRS = [
     (TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED, 'cancel: abandon harness.py:8417'),
     (TaskStatus.BLOCKED, TaskStatus.CANCELLED, 'cancel: harness.py:8417'),
     (TaskStatus.DEFERRED, TaskStatus.CANCELLED, 'cancel: recon targeted.py:1001'),
+    (
+        TaskStatus.MERGE_DEFERRED,
+        TaskStatus.CANCELLED,
+        'cancel: W9-θ cancel-of-parked-train-member workflow.py:2639; recon targeted.py:1001',
+    ),
 ]
 
 
@@ -415,6 +420,11 @@ class TestOutcomeAllowsStatus:
         assert outcome_allows_status('soft-cancelled', 'in-progress') is True
         assert outcome_allows_status('soft-cancelled', 'blocked') is True
         assert outcome_allows_status('soft-cancelled', 'pending') is True
+        # W9-θ: a soft-cancel of a train member parked in merge-deferred exits
+        # with SOFT_CANCELLED while the last-persisted row is still
+        # merge-deferred (release_workflow parks it to blocked only after
+        # run() returns) — the same "preserved" case as in-progress.
+        assert outcome_allows_status('soft-cancelled', 'merge-deferred') is True
 
     def test_normalizes_value_attribute(self):
         # W9 may pass a real WorkflowOutcome instance rather than a plain

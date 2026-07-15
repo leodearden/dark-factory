@@ -21,9 +21,13 @@ projection instead of maintaining an independent copy.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import enum
+import logging
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypeVar
 
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import (
@@ -38,6 +42,7 @@ from orchestrator.verify_categories import FailureCategory
 __all__ = [
     "STATE_TO_STATUS",
     "BlockDisposition",
+    "CancellationScope",
     "IllegalTransition",
     "RequeueKind",
     "StewardBudgetExhausted",
@@ -48,10 +53,15 @@ __all__ = [
     "StewardResolved",
     "StewardTerminalDecision",
     "TerminalReport",
+    "WorkflowCancelled",
     "WorkflowOutcome",
     "WorkflowState",
     "WorkflowStateMachine",
 ]
+
+_T = TypeVar('_T')
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowState(enum.Enum):
@@ -666,3 +676,190 @@ class WorkflowStateMachine:
         transition.
         """
         self._state = to
+
+
+@dataclass
+class WorkflowCancelled(Exception):
+    """The ONE typed cancellation signal (CX-1, PRD §8.1).
+
+    Raised by :class:`CancellationScope` and caught at EXACTLY ONE place —
+    ``TaskWorkflow.run()`` — regardless of whether the cancellation
+    originated from the harness's hard ``task.cancel()`` (``kind='hard'``)
+    or from the workflow's own soft ``_cancel_event`` (``kind='soft'``).
+    Replaces the ``sys.exc_info()`` B1 sniff (workflow.py) and the harness's
+    B2 ``synthetic_cancel`` dual-guard — a two-file "both must fire" comment
+    contract — with one exception type carrying the distinction as data.
+
+    Deliberately NOT ``frozen=True`` (unlike this module's other dataclasses):
+    a frozen dataclass overrides ``__setattr__`` to unconditionally raise
+    ``FrozenInstanceError`` for ANY attribute, including ``__traceback__`` —
+    which Python's own exception machinery assigns when an exception is
+    re-raised through a ``@contextlib.contextmanager``-based ``__exit__``
+    (e.g. ``pytest.MonkeyPatch.context()``, hit via ``_await_cancellable``'s
+    raise). ``frozen=True`` was tried first per the plan's step-1/2 risk
+    note; construct/raise/catch/read in isolation (step 1) passed, but the
+    contextmanager-propagation path only surfaced once real call sites
+    started raising it (step 12), confirming the anticipated fallback.
+    """
+
+    kind: Literal['hard', 'soft']
+
+
+# The ordered, kind-aware terminal-cleanup list a CancellationScope runs on
+# every exit from `supervise` (normal return, soft-cancel, or hard-cancel).
+# `kind` is None for a normal (non-cancelled) exit.
+OnTerminalEntry = tuple[str, Callable[[Literal['hard', 'soft'] | None], Awaitable[None]]]
+
+
+class CancellationScope:
+    """Supervises a workflow body coroutine and turns either a hard
+    ``task.cancel()`` or the soft *cancel_event* firing into ONE typed
+    :class:`WorkflowCancelled`, running an ordered ``on_terminal`` cleanup
+    list exactly once on every exit (CX-1, PRD §8.2, this task's design
+    decisions).
+
+    Soft-cancel is DETECTED by racing *cancel_event* against the body task
+    via ``asyncio.wait`` — never injected as a ``CancelledError`` into the
+    body — so it can never be silently swallowed by an inner
+    ``except asyncio.CancelledError`` / ``contextlib.suppress`` block
+    somewhere inside the body (``_drive()`` and its callees have several).
+    Hard-cancel is the outer ``await`` (this coroutine's own await point)
+    being cancelled, or the body itself spontaneously raising
+    ``CancelledError`` (a shutdown-race teardown) — both typed ``'hard'``.
+    """
+
+    def __init__(
+        self,
+        cancel_event: asyncio.Event,
+        on_terminal: Sequence[OnTerminalEntry],
+    ) -> None:
+        self._cancel_event = cancel_event
+        self._on_terminal = on_terminal
+
+    async def supervise(self, body_coro: Awaitable[_T]) -> _T:
+        """Run *body_coro* under supervision; return its result, or raise
+        :class:`WorkflowCancelled` on hard/soft cancellation.
+
+        The resolved cancellation *kind* (``None`` on a normal exit) is
+        always passed to every ``on_terminal`` entry, in order, exactly
+        once — via the ``finally`` below, so it runs on every exit path.
+        """
+        body = asyncio.ensure_future(body_coro)
+        waiter = asyncio.create_task(self._cancel_event.wait())
+        kind: Literal['hard', 'soft'] | None = None
+        try:
+            try:
+                done, _pending = await asyncio.wait(
+                    {body, waiter}, return_when=asyncio.FIRST_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                # This coroutine's own await was cancelled — the harness's
+                # task.cancel() (or any other outer cancellation).  body and
+                # waiter are untouched by asyncio.wait()'s own cancellation
+                # (it never cancels its member futures on our behalf), so
+                # both are handled uniformly by the finally below.
+                kind = 'hard'
+                raise WorkflowCancelled('hard') from None
+            if body in done:
+                if body.cancelled():
+                    # The body itself raised CancelledError spontaneously
+                    # (a shutdown-race teardown) — matches the old exc_info
+                    # sniff, which caught ANY CancelledError propagating
+                    # through the finally, not just an externally-injected
+                    # one.
+                    kind = 'hard'
+                    raise WorkflowCancelled('hard')
+                exc = body.exception()
+                if exc is not None:
+                    # The body itself raised WorkflowCancelled directly as
+                    # ordinary control flow (W9-θ: e.g. the merge-retry
+                    # loop's explicit cancel re-check, or _await_cancellable
+                    # via _submit_to_merge_queue) rather than this scope's
+                    # own event-race detecting it below. Without capturing
+                    # its kind here, `kind` would stay None and on_terminal
+                    # would run as if this were a normal exit — silently
+                    # skipping the kind-aware lane-release policy (e.g. a
+                    # soft-cancel's release, boundary row 15).
+                    if isinstance(exc, WorkflowCancelled):
+                        kind = exc.kind
+                    raise exc
+                return body.result()
+            # waiter resolved first (event fired) and body is still
+            # pending — a genuine soft-cancel, not a same-window race
+            # (the `body in done` branch above already wins any race
+            # where both resolved in the same asyncio.wait() window).
+            kind = 'soft'
+            raise WorkflowCancelled('soft')
+        finally:
+            for t in (waiter, body):
+                if not t.done():
+                    t.cancel()
+                    # Deliberately NOT the shield()+uncancel() discipline
+                    # used by _run_on_terminal below: that pattern relies on
+                    # its background task NEVER being cancelled itself, so
+                    # every CancelledError it catches is unambiguously
+                    # outer-directed. Here `t` is a task WE just cancelled
+                    # on the line above, so a CancelledError surfacing at
+                    # this await is its ordinary, expected completion, not
+                    # an outer re-cancel — shielding and unconditionally
+                    # uncancel()-ing on every catch would misattribute that
+                    # expected completion as a handled outer cancel far more
+                    # often than the imbalance it would fix. A genuine
+                    # repeated outer cancel (the harness's hard_cancel_workflow
+                    # poll loop) CAN still land in this unshielded await and
+                    # leave current_task().cancelling() one higher than
+                    # "balanced" when merely suppressed here — but nothing
+                    # in this codebase reads Task.cancelling(), and this
+                    # method still runs to completion and returns/raises
+                    # correctly either way, so the imbalance is inert.
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await t
+            await self._run_on_terminal(kind)
+
+    async def _run_on_terminal(self, kind: Literal['hard', 'soft'] | None) -> None:
+        """Run every ``on_terminal`` entry, in order, passing *kind*.
+
+        Runs the whole ordered list as a background task shielded behind a
+        retry loop, so it survives being cancelled REPEATEDLY (the harness's
+        ``hard_cancel_workflow`` polls, calling ``task.cancel()`` more than
+        once on the same slot task): each ``asyncio.shield`` only ever
+        detaches OUR await from the background task, never cancels the
+        background task itself, so a second (or third) cancel here can
+        never truncate an in-flight cleanup entry.
+
+        Each entry is also individually try/except-``Exception``-and-logged,
+        so a failure in one cleanup step can never skip the REMAINING
+        steps — notably ``release_lane``/``cleanup_config_dir`` — or escape
+        this method and mask the in-flight ``WorkflowCancelled`` that
+        ``supervise``'s ``finally`` is already unwinding (which would
+        otherwise surface to ``run()`` as an arbitrary exception and have
+        the harness report BLOCKED instead of CANCELLED). This generalizes
+        ``_stop_claimant_heartbeat``'s own bespoke catch-and-log into one
+        uniform per-entry policy, keyed on the entry name — a genuine
+        ``CancelledError`` is deliberately NOT caught here so the
+        done/cancelled bookkeeping below still sees it.
+        """
+        async def _run_all() -> None:
+            for name, fn in self._on_terminal:
+                try:
+                    await fn(kind)
+                except Exception:
+                    logger.exception(
+                        f'CancellationScope on_terminal entry {name!r} '
+                        f'failed (non-fatal — continuing remaining '
+                        f'terminal cleanup)'
+                    )
+
+        task = asyncio.ensure_future(_run_all())
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+        if task.cancelled():
+            raise asyncio.CancelledError()
+        exc = task.exception()
+        if exc is not None:
+            raise exc

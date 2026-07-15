@@ -24,7 +24,7 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
 )
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import TaskWorkflow, WorkflowCancelled, WorkflowOutcome
 
 
 def _make_workflow(
@@ -180,8 +180,17 @@ async def test_worktree_missing_with_get_status_error_falls_through(
 async def test_cancel_event_during_merge_returns_done_when_terminal(
     tmp_path: Path, monkeypatch,
 ):
-    """Set ``_cancel_event`` while merge future is unresolved → workflow
-    re-checks status → returns DONE.
+    """Set ``_cancel_event`` while merge future is unresolved → ``_await_cancellable``
+    raises ``WorkflowCancelled('soft')`` (W9-θ).
+
+    The terminal-status → DONE decision this test's name refers to no longer
+    happens at this layer: ``_await_cancellable`` raises unconditionally on a
+    cancel-win, regardless of scheduler status, and propagates straight to
+    ``run()``'s single ``WorkflowCancelled`` catch. The scheduler-status-aware
+    DONE-vs-SOFT_CANCELLED decision now lives entirely in
+    ``_finalise_cancellation``/``_handle_soft_cancel`` — see
+    ``TestHandleSoftCancelOutcome`` in test_workflow.py, which pins the
+    terminal→DONE branch directly.
     """
     wf = _make_workflow(tmp_path=tmp_path)
     wf.scheduler.get_status = AsyncMock(return_value='done')
@@ -199,18 +208,23 @@ async def test_cancel_event_during_merge_returns_done_when_terminal(
         'orchestrator.merge_queue.enqueue_merge_request', fake_enqueue,
     )
 
-    outcome = await asyncio.wait_for(
-        wf._submit_to_merge_queue('task/x', pre_rebased=False),
-        timeout=2,
-    )
-    assert outcome == WorkflowOutcome.DONE
+    with pytest.raises(WorkflowCancelled) as excinfo:
+        await asyncio.wait_for(
+            wf._submit_to_merge_queue('task/x', pre_rebased=False),
+            timeout=2,
+        )
+    assert excinfo.value.kind == 'soft'
 
 
 @pytest.mark.asyncio
 async def test_cancel_event_during_merge_soft_cancels_when_nonterminal(
     tmp_path: Path, monkeypatch,
 ):
-    """Cancel-event set + status non-terminal → SOFT_CANCELLED (slot exits, requeued=False)."""
+    """Cancel-event set + status non-terminal → ``_await_cancellable`` raises
+    ``WorkflowCancelled('soft')`` (W9-θ) — same raise as the terminal case
+    above; see that test's docstring for where the status-aware decision
+    (SOFT_CANCELLED vs DONE) now lives.
+    """
     wf = _make_workflow(tmp_path=tmp_path)
     wf.scheduler.get_status = AsyncMock(return_value='in-progress')
 
@@ -224,8 +238,9 @@ async def test_cancel_event_during_merge_soft_cancels_when_nonterminal(
         'orchestrator.merge_queue.enqueue_merge_request', fake_enqueue,
     )
 
-    outcome = await asyncio.wait_for(
-        wf._submit_to_merge_queue('task/x', pre_rebased=False),
-        timeout=2,
-    )
-    assert outcome == WorkflowOutcome.SOFT_CANCELLED
+    with pytest.raises(WorkflowCancelled) as excinfo:
+        await asyncio.wait_for(
+            wf._submit_to_merge_queue('task/x', pre_rebased=False),
+            timeout=2,
+        )
+    assert excinfo.value.kind == 'soft'

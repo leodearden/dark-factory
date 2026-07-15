@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 
 # Runtime import of the BORN_AT_L2_SEVERITIES constant from escalation.models.
 # escalation.models is listed under TYPE_CHECKING above (:77-78) for the Escalation
@@ -93,7 +93,9 @@ from orchestrator.verify import (
 from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES, FailureCategory
 from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     BlockDisposition,
+    CancellationScope,
     IllegalTransition,
+    OnTerminalEntry,
     RequeueKind,
     StewardBudgetExhausted,
     StewardInterrupted,
@@ -102,6 +104,7 @@ from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     StewardResolved,
     StewardTerminalDecision,
     TerminalReport,
+    WorkflowCancelled,
     WorkflowOutcome,
     WorkflowState,
     WorkflowStateMachine,
@@ -1181,7 +1184,9 @@ class TaskWorkflow:
           return ``None``.
 
         Outcome mapping after awaiting the future:
-        * ``None`` (soft-cancel) → ``_handle_soft_cancel('group-merge')``
+        * soft-cancel (``_cancel_event`` wins) → ``_await_cancellable`` raises
+          ``WorkflowCancelled('soft')`` (W9-θ), which propagates straight to
+          ``run()``'s single catch — not handled in this method.
         * ``result.status == 'done'`` → ``WorkflowOutcome.DONE``
         * Any other status → ``_mark_blocked(..., escalate_to_human=True)``
 
@@ -1309,9 +1314,10 @@ class TaskWorkflow:
             self.merge_queue, req, self.event_store, self.merge_inflight_registry,
         )
 
+        # W9-θ: a cancel-win now raises WorkflowCancelled('soft') instead of
+        # returning None — it propagates straight to run()'s single catch,
+        # so there is no `result is None` branch to handle here any more.
         result = await self._await_cancellable(future)
-        if result is None:
-            return await self._handle_soft_cancel('group-merge')
         if result.status == 'done':
             if result.merge_sha:
                 self._merge_sha = result.merge_sha
@@ -1977,16 +1983,33 @@ class TaskWorkflow:
     async def _stop_claimant_heartbeat(self) -> None:
         """Cancel and await the heartbeat loop task, if one was started.
 
-        Called from ``run()``'s finally (before the harness clears the
-        claimant at slot release) so the loop can never race a post-clear
-        re-stamp. A no-op when the loop was never started (e.g. dispatch
-        raised before reaching that point).
+        Called first from :meth:`_on_terminal_cleanups` (before the harness
+        clears the claimant at slot release) so the loop can never race a
+        post-clear re-stamp. A no-op when the loop was never started (e.g.
+        dispatch raised before reaching that point).
+
+        W9-θ: this now runs as the first entry of the ordered ``on_terminal``
+        list (moved out of ``_drive()``'s own ``finally``), so an unexpected
+        failure inside the loop itself (vs. the expected ``CancelledError``
+        from the ``.cancel()`` above) would otherwise propagate out of
+        ``CancellationScope.supervise`` and abort every LATER cleanup entry —
+        including lane release.  The loop's own refresh call is already
+        documented as best-effort; catching-and-logging here extends that
+        same guarantee to the loop's teardown, so one bad heartbeat tick can
+        never take down the rest of terminal cleanup.
         """
         if self._claimant_heartbeat_task is None:
             return
         self._claimant_heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        try:
             await self._claimant_heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception(
+                f'Task {self.task_id}: claimant heartbeat loop failed '
+                f'(non-fatal — continuing terminal cleanup)'
+            )
         self._claimant_heartbeat_task = None
 
     async def _drive(  # pyright: ignore[reportGeneralTypeIssues]
@@ -2249,6 +2272,21 @@ class TaskWorkflow:
             await self._await_steward_completion()
             self._enter_phase(WorkflowState.DONE)
             return await self._finalise_merged_done()
+
+        except WorkflowCancelled:
+            # W9-θ: a small handful of call sites inside this try block
+            # (the merge-retry loop's explicit cancel re-check, and
+            # _await_cancellable via _submit_to_merge_queue /
+            # _maybe_enqueue_group_merge) now raise WorkflowCancelled
+            # directly as ordinary control flow — not via CancellationScope's
+            # own event-race, which never enters this method's body at all.
+            # WorkflowCancelled IS an Exception subclass (unlike
+            # asyncio.CancelledError), so without this clause it would be
+            # swallowed by the generic `except Exception` ladder below and
+            # misreported as a BLOCKED workflow error. Bare re-raise lets it
+            # propagate to CancellationScope/run()'s single catch site,
+            # preserving CX-1 ("caught at EXACTLY ONE place").
+            raise
 
         except SetTaskStatusRejected as exc:
             # Fast-path: a terminal-status rejection arrived out-of-band before
@@ -2516,58 +2554,92 @@ class TaskWorkflow:
                 disposition=disp,
             )
 
-        finally:
-            # Stop the claimant heartbeat loop FIRST — before any other
-            # teardown — so it can never race the harness's post-release
-            # claimant clear with a stray refresh (task 2188, PRD
-            # task-status-authority C4/D4).
+    def _on_terminal_cleanups(self) -> list[OnTerminalEntry]:
+        """Ordered, kind-aware terminal-cleanup list run by ``CancellationScope``
+        on every exit from ``run()`` (normal return, soft-cancel, or
+        hard-cancel — ``kind`` is ``None`` for a normal exit).
+
+        Replaces ``_drive()``'s old ``finally`` block (W9-θ): the same five
+        cleanups, in the same order (``stop_claimant_heartbeat`` first —
+        task 2188, PRD task-status-authority C4/D4 — so the heartbeat loop
+        can never race the harness's post-release claimant clear with a
+        stray refresh), relocated here so any long ``await`` anywhere inside
+        the scope is cancellable by construction, without needing its own
+        opt-in.
+
+        The ``release_lane`` entry is the kind-aware 1:1 replacement for the
+        deleted ``sys.exc_info()`` ``_hard_cancel`` sniff (which used to
+        coordinate with harness.py's now-also-deleted B2 dual-guard via a
+        "both must fire" comment contract): it releases the warm lane for
+        every terminal exit EXCEPT a hard-cancel, which must leave the
+        branch/lane assignment untouched so a forcibly-torn-down workflow's
+        branch survives teardown — the harness R3 grace window + reconcile
+        sweep own reclaim from there, not this teardown.
+        ``kind == 'soft'`` releases even from a still-working state
+        (SOFT_CANCELLED can exit mid-phase); ``kind is None`` only releases
+        once the state has genuinely reached DONE/CANCELLED (mirrors the
+        pre-θ non-hard-cancel behaviour). Uses the default
+        ``allow_disk_backstop=False``: if ``_maybe_cleanup_done_worktree``
+        already released the lane and dropped the in-memory assignment
+        (T1/T2 sync-merge path), ``assignment_for`` returns ``None`` →
+        ``release_lane_for_terminal_task`` is a true no-op (no disk scan, no
+        redundant ``cleanup_worktree``/``git branch -D`` retry).
+        """
+        async def _stop_heartbeat(_kind: Literal['hard', 'soft'] | None) -> None:
             await self._stop_claimant_heartbeat()
-            # Stop steward if running
+
+        async def _stop_steward(_kind: Literal['hard', 'soft'] | None) -> None:
             if self._steward:
                 await self._steward.stop()
+
+        async def _cleanup_worktree(_kind: Literal['hard', 'soft'] | None) -> None:
             # Cleanup worktree (only if done AND branch is on main — preserve
-            # otherwise so an agent's update_task(status='done') bypass doesn't
-            # GC unmerged work). Skips externally-managed worktrees (eval mode).
+            # otherwise so an agent's update_task(status='done') bypass
+            # doesn't GC unmerged work). Skips externally-managed worktrees
+            # (eval mode).
             await self._maybe_cleanup_done_worktree()
-            # B1: release warm lane for any terminal exit (DONE or CANCELLED).
-            # Uses the default allow_disk_backstop=False: if
-            # _maybe_cleanup_done_worktree already released the lane and dropped
-            # the in-memory assignment (T1/T2 sync-merge path), assignment_for
-            # returns None → primitive returns False immediately (true no-op —
-            # no disk scan, no redundant cleanup_worktree / git branch -D retry).
-            # Covers T3 (done-at-dispatch, branch not on main yet) and T4 (cancelled).
-            #
-            # β guard (task 1913): also skip when an asyncio.CancelledError is
-            # actively propagating through this finally (process teardown).
-            # _handle_cancelled_terminal_exit (the only writer of state==CANCELLED)
-            # is never reached when the hard-cancel is ignored: the BaseException
-            # propagates directly through run()'s `except Exception` into here.
-            # Detection via sys.exc_info() is the idiomatic Python idiom; a normal
-            # DONE/authoritative-CANCELLED return has exc_info()==(None,None,None),
-            # so the release fires unchanged for genuine terminal exits.
-            #
-            # Skipping the eager release here only DEFERS lane reclaim to the
-            # periodic terminal-lane reconciler / next acquire; durable branch
-            # survival across that later reclaim requires α (task 1912)'s
-            # branch-preservation guard in release_warm_lane (not yet landed).
-            #
-            # Coordinated with harness.py B2 (report.synthetic_cancel=True): both
-            # guards protect the same hard-cancel event via independent mechanisms.
-            # B1 fires first — inside workflow.run() before the harness catches the
-            # CancelledError.  B2 fires in _run_slot's finally after _run_slot
-            # returns.  Neither depends on the other; both must fire to ensure no
-            # eager branch-deleting release escapes on the synthetic-cancel path.
-            _exc_type = sys.exc_info()[0]
-            _hard_cancel = _exc_type is not None and issubclass(_exc_type, asyncio.CancelledError)
+
+        async def _release_lane(kind: Literal['hard', 'soft'] | None) -> None:
             if (
-                self.state in (WorkflowState.DONE, WorkflowState.CANCELLED)
+                kind != 'hard'
                 and not self._worktree_external
-                and not _hard_cancel
+                and (
+                    kind is not None
+                    or self.state in (WorkflowState.DONE, WorkflowState.CANCELLED)
+                )
             ):
                 await self.git_ops.release_lane_for_terminal_task(self.task_id)
-            # Cleanup per-task config dir (preserve-aware — skips when circuit
-            # breaker tripped so the dir is available for forensic analysis).
+
+        async def _cleanup_config(_kind: Literal['hard', 'soft'] | None) -> None:
+            # Preserve-aware — skips when circuit breaker tripped so the dir
+            # is available for forensic analysis.
             self._cleanup_config_dir()
+
+        return [
+            ('stop_claimant_heartbeat', _stop_heartbeat),
+            ('stop_steward', _stop_steward),
+            ('cleanup_done_worktree', _cleanup_worktree),
+            ('release_lane', _release_lane),
+            ('cleanup_config_dir', _cleanup_config),
+        ]
+
+    async def _finalise_cancellation(self, kind: Literal['hard', 'soft']) -> WorkflowOutcome:
+        """Resolve a caught :class:`WorkflowCancelled` into a ``WorkflowOutcome``.
+
+        Drives the machine to ``CANCELLED`` (guarded by ``is_terminal()`` —
+        a no-op if some other path already left it terminal; mirrors the
+        existing ``_handle_cancelled_terminal_exit`` CANCELLED transition).
+        ``kind == 'hard'`` maps straight to ``WorkflowOutcome.CANCELLED``.
+        ``kind == 'soft'`` delegates to the existing ``_handle_soft_cancel``
+        status-derived decision (DONE for a terminal-done scheduler row,
+        else SOFT_CANCELLED) — folded in here rather than duplicated.
+        """
+        working_phase = self.machine.state.value
+        if not self.machine.is_terminal():
+            self._enter_phase(WorkflowState.CANCELLED)
+        if kind == 'hard':
+            return WorkflowOutcome.CANCELLED
+        return await self._handle_soft_cancel(working_phase)
 
     async def run(self) -> TerminalReport:
         """Execute the full state machine and return the terminal contract.
@@ -2605,8 +2677,25 @@ class TaskWorkflow:
         ``not self._worktree_external`` guard for the identical reason —
         eval mode's task row is not the authoritative record real dispatch
         relies on.
+
+        CancellationScope (CX-1, W9-θ): ``_drive()`` runs under a
+        :class:`CancellationScope` supervising both the harness's hard
+        ``task.cancel()`` and the soft ``_cancel_event`` as ONE typed
+        :class:`WorkflowCancelled`, caught at this EXACTLY ONE site.  The
+        outcome<->status half of SM-2 is additionally skipped on a
+        hard-cancel exit (``cancel_kind == 'hard'``): ``_enter_phase``
+        never persists status, so a forcibly-torn-down workflow leaves the
+        live row at whatever it was (typically 'in-progress') — it does not
+        own its terminal row; the harness R3 grace window + reconcile sweep
+        do. The phase-consistency half always still holds.
         """
-        outcome = await self._drive()
+        cancel_kind: Literal['hard', 'soft'] | None = None
+        scope = CancellationScope(self._cancel_event, self._on_terminal_cleanups())
+        try:
+            outcome = await scope.supervise(self._drive())
+        except WorkflowCancelled as wc:
+            cancel_kind = wc.kind
+            outcome = await self._finalise_cancellation(wc.kind)
         report = (
             self._terminal_report
             if (
@@ -2622,7 +2711,7 @@ class TaskWorkflow:
             f'run()-exit SM-2: report.phase {report.phase!r} != '
             f'machine.state {self.machine.state!r} (task {self.task_id})'
         )
-        if not self._worktree_external:
+        if not self._worktree_external and cancel_kind != 'hard':
             try:
                 last_status_row = await self.scheduler.get_status(self.task_id)
             except Exception:
@@ -2763,24 +2852,26 @@ class TaskWorkflow:
             if merge_outcome == WorkflowOutcome.DONE:
                 break
             if merge_outcome != WorkflowOutcome.REQUEUED:
-                # SOFT_CANCELLED / BLOCKED / ESCALATED — exit slot.
-                # SOFT_CANCELLED arrives when _handle_soft_cancel
-                # detected a pending soft-cancel; BLOCKED when the
-                # steward gave up; other non-REQUEUED outcomes are
-                # terminal and must also exit.
+                # BLOCKED / ESCALATED — exit slot. A soft-cancel inside
+                # _submit_to_merge_queue no longer surfaces as a
+                # merge_outcome value (W9-θ): _await_cancellable raises
+                # WorkflowCancelled('soft') straight through this call,
+                # so it never reaches this comparison.
                 return merge_outcome
 
             # Defense-in-depth (root cause #2): _cancel_event is
             # never cleared during a run, so each retry iteration
             # would re-win the cancellable race instantly and burn
             # another pre-merge rebase+verify before exhausting
-            # max_merge_retries.  Checking here — immediately after
+            # max_merge_retries. Checking here — immediately after
             # the REQUEUED guard and BEFORE the anti-thrash/retry
             # path — ensures a soft-cancel that arrived concurrently
             # with a legitimate steward-resolved REQUEUED exits on
             # first detection without any further rebase or log.
+            # W9-θ: raise (not return _handle_soft_cancel(...) inline) so
+            # it propagates to run()'s single WorkflowCancelled catch.
             if self._cancel_event.is_set():
-                return await self._handle_soft_cancel('merge')
+                raise WorkflowCancelled('soft')
 
             # Fix 3 — anti-thrash guard for repeated
             # steward-resolved merge-phase loops on the same
@@ -6092,13 +6183,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         # Race the future against the cancel event so a human marking the
         # task done out-of-band exits the workflow promptly instead of
-        # waiting for the merge worker to finish.
+        # waiting for the merge worker to finish. W9-θ: a cancel-win now
+        # raises WorkflowCancelled('soft') (propagating to run()'s single
+        # catch) instead of returning None — no `result is None` branch.
         result = await self._await_cancellable(
             future,
             on_soft_cancel=_on_soft_cancel_detach,
         )
-        if result is None:
-            return await self._handle_soft_cancel('merge')
 
         if result.status == 'wip_halted':
             return await self._handle_wip_conflict(result, branch_name)
@@ -9611,10 +9702,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
     async def _await_cancellable(self, awaitable, *, on_soft_cancel=None):
         """Race ``awaitable`` against ``self._cancel_event``.
 
-        Returns the awaitable's result, or ``None`` if the cancel event was
-        set first.  When ``None`` is returned the caller should look up the
-        scheduler's truth and decide between DONE / cancelled / normal-blocked
-        via :meth:`_handle_soft_cancel`.
+        Returns the awaitable's result, or raises ``WorkflowCancelled('soft')``
+        (W9-θ) if the cancel event was set first — it propagates straight to
+        ``run()``'s single ``WorkflowCancelled`` catch, which folds in the
+        scheduler-status decision (:meth:`_handle_soft_cancel`) via
+        :meth:`_finalise_cancellation`.
 
         If both the awaitable and the cancel event resolve in the same
         ``asyncio.wait`` window, the awaitable's result wins — the work
@@ -9639,7 +9731,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if fut in done:
                 return fut.result()
             cancel_won = True
-            return None
+            raise WorkflowCancelled('soft')
         finally:
             if not cancel_task.done():
                 cancel_task.cancel()
