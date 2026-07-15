@@ -682,3 +682,80 @@ class TestReverseDependentTestTargets:
         )
 
         assert result == [('escalation', ['escalation/tests/test_server.py'])]
+
+    # -- edge cases (step-3) --------------------------------------------------
+
+    def test_non_source_orchestrator_files_do_not_trigger(self):
+        """(a) trigger gate: only <pkg>/src/**.py triggers — tests/yaml/non-.py do not."""
+        existing_files = [
+            'orchestrator/tests/test_x.py',
+            'orchestrator/orchestrator.yaml',
+            'orchestrator/src/orchestrator/x.txt',
+        ]
+        reverse_dep_map = {'orchestrator': frozenset({'escalation'})}
+        list_pkg_tests = _fake_list_pkg_tests({
+            'escalation': ['escalation/tests/test_server.py'],
+        })
+        read_content = _fake_read_content({
+            'escalation/tests/test_server.py': _ESCALATION_TEST_SERVER_CONTENT,
+        })
+
+        result = reverse_dependent_test_targets(
+            existing_files, reverse_dep_map, list_pkg_tests, read_content,
+        )
+
+        assert result == []
+
+    def test_triggered_dependent_with_no_importing_tests_is_omitted(self):
+        """(b) a triggered dependent whose tests don't import the package is omitted."""
+        existing_files = ['orchestrator/src/orchestrator/merge_queue.py']
+        reverse_dep_map = {'orchestrator': frozenset({'escalation'})}
+        list_pkg_tests = _fake_list_pkg_tests({
+            'escalation': ['escalation/tests/test_unrelated.py'],
+        })
+        read_content = _fake_read_content({
+            'escalation/tests/test_unrelated.py': _ESCALATION_TEST_UNRELATED_CONTENT,
+        })
+
+        result = reverse_dependent_test_targets(
+            existing_files, reverse_dep_map, list_pkg_tests, read_content,
+        )
+
+        assert result == []
+
+    def test_package_with_no_map_entry_yields_empty(self):
+        """(c) a changed package absent from reverse_dep_map triggers nothing."""
+        existing_files = ['dashboard/src/dashboard/app.py']
+        reverse_dep_map = {'orchestrator': frozenset({'escalation'})}
+        list_pkg_tests = _fake_list_pkg_tests({
+            'escalation': ['escalation/tests/test_server.py'],
+        })
+        read_content = _fake_read_content({
+            'escalation/tests/test_server.py': _ESCALATION_TEST_SERVER_CONTENT,
+        })
+
+        result = reverse_dependent_test_targets(
+            existing_files, reverse_dep_map, list_pkg_tests, read_content,
+        )
+
+        assert result == []
+
+    def test_multiple_triggering_files_do_not_duplicate_dependent(self):
+        """(d) multiple triggering source files under one package -> one dependent entry."""
+        existing_files = [
+            'orchestrator/src/orchestrator/merge_queue.py',
+            'orchestrator/src/orchestrator/git_ops.py',
+        ]
+        reverse_dep_map = {'orchestrator': frozenset({'escalation'})}
+        list_pkg_tests = _fake_list_pkg_tests({
+            'escalation': ['escalation/tests/test_server.py'],
+        })
+        read_content = _fake_read_content({
+            'escalation/tests/test_server.py': _ESCALATION_TEST_SERVER_CONTENT,
+        })
+
+        result = reverse_dependent_test_targets(
+            existing_files, reverse_dep_map, list_pkg_tests, read_content,
+        )
+
+        assert result == [('escalation', ['escalation/tests/test_server.py'])]
