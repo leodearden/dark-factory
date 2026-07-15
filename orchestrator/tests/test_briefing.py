@@ -51,6 +51,32 @@ def anti_anchor_task() -> dict:
     }
 
 
+@pytest.fixture
+def task_with_proposal() -> dict:
+    """Task fixture carrying a dry_run_proposals entry.
+
+    Shared across the prior-proposal test classes (C-A1 anti-anchor, the
+    retry/resume golden tests, and the staleness-guard tests) so the sample
+    proposal shape lives in one place.
+    """
+    return {
+        'id': '9001',
+        'title': 'Task with a prior block-time proposal',
+        'description': 'A task that was previously blocked and investigated.',
+        'metadata': {
+            'dry_run_proposals': [
+                {
+                    'proposal_text': 'Root cause is a stale cache entry; fix by invalidating on write.',
+                    'risk_label': 'medium',
+                    'files_referenced': ['orchestrator/x.py'],
+                    'timestamp': '2026-07-13T10:00:00+00:00',
+                    'investigated_at': '2026-07-13T10:00:00+00:00',
+                },
+            ],
+        },
+    }
+
+
 class TestFormatTaskMetadataInvariant:
     def test_dict_metadata_with_files(self, briefing: BriefingAssembler):
         task = {
@@ -279,3 +305,36 @@ class TestAntiAnchorFirstDerivation:
             context='',
         )
         assert '**Files:** orchestrator, shared' in prompt
+
+
+@pytest.mark.asyncio
+class TestPriorProposalAntiAnchor:
+    """C-A1 for prior dry-run block-time proposals.
+
+    First-dispatch (``build_architect_prompt``, default call) must NOT
+    surface a prior block-time investigation — this is the same
+    anti-anchoring concern as ``TestAntiAnchorFirstDerivation`` above, applied
+    to ``metadata.dry_run_proposals`` instead of ``metadata.files``. The
+    re-plan path opts in explicitly via ``include_prior_proposals=True``.
+    """
+
+    async def test_first_dispatch_excludes_proposal(
+        self, briefing: BriefingAssembler, task_with_proposal: dict,
+    ):
+        prompt = await briefing.build_architect_prompt(
+            task_with_proposal, worktree=None, context='',
+        )
+        assert 'Root cause is a stale cache entry' not in prompt
+        assert 'prior block-time investigation' not in prompt
+
+    async def test_replan_includes_proposal(
+        self, briefing: BriefingAssembler, task_with_proposal: dict,
+    ):
+        prompt = await briefing.build_architect_prompt(
+            task_with_proposal,
+            worktree=None,
+            context='',
+            include_prior_proposals=True,
+        )
+        assert 'Root cause is a stale cache entry' in prompt
+        assert 'prior block-time investigation' in prompt
