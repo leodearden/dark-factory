@@ -66,6 +66,14 @@ CYCLE_SUMMARY_TTL_DAYS: int = 30
 # reminder to also check the prompt text, even though that test deliberately
 # cannot (and must not) inspect the prompt text itself (task 2468 amendment
 # pass).
+#
+# record_type is write-only as of task 2468: no reader (dedup/near-duplicate
+# tooling, Path-2 verification, pool-cap trim) filters on it yet — the fix
+# that actually stops the double-write is the removed normal-flow LLM
+# instruction (recon_self_model.py), not this discriminator. That is
+# reviewed and accepted as cheap, well-documented forward-compat metadata;
+# per YAGNI, no consumer is added here speculatively — one lands alongside
+# the dedup/near-duplicate tooling that needs it.
 CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP: str = 'ledger_stamp'
 CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = 'narrative'
 
