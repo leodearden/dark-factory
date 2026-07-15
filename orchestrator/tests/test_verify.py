@@ -4834,6 +4834,47 @@ class TestBuildFallbackConfigSubprojectScoped:
             f'got: {[r.getMessage() for r in caplog.records]}'
         )
 
+    def test_test_command_extras_carried_into_pure_subproject_scoping(
+        self, tmp_path: Path,
+    ) -> None:
+        """A configured `--extra` on test_command is carried into the scoped pytest command.
+
+        Cold-verify dev-dep race, TEST-path twin of task 2355 (task 2641): a
+        project like pump_web_ui declares pytest in a `dev` optional-dependency
+        (extra) rather than a PEP-735 default group, so its canonical
+        test_command is `uv run --extra dev --extra web pytest ...`. The
+        pure-subproject scoped fallback must preserve those `--extra` flags —
+        dropping them means a cold merge worktree's `uv run` never syncs the
+        dev extra and pytest fails to spawn.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(
+            tmp_path, test_command="uv run --extra dev --extra web pytest -m 'not slow'",
+        )
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == (
+            'cd cockpit && uv run --extra dev --extra web pytest tests/test_c3.py'
+        )
+
+    def test_no_extras_in_config_yields_unchanged_pure_subproject_test_command(
+        self, tmp_path: Path,
+    ) -> None:
+        """A no-extra config's scoped test_command is byte-identical (no extras injected)."""
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == 'cd cockpit && uv run pytest tests/test_c3.py'
+
 
 class TestRunScopedVerificationForwardsWorktreeToFallback:
     """`run_scoped_verification` forwards *worktree* into `_build_fallback_config` (task 2344).
