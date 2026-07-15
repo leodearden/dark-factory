@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import types
 from pathlib import Path
 
@@ -687,3 +688,158 @@ class TestBuildAuditReportShape:
             'deliverable_absent': 0, 'unverifiable': 0, 'ok': 1,
         }
         assert report['total'] == 3
+
+
+# ===========================================================================
+# Step-15/16: real git I/O wrappers (_git_show_files, _git_is_ancestor,
+# _git_find_revert, _git_files_missing_on_ref) against a real tmp_path repo.
+# ===========================================================================
+
+def _git(root: Path, *args: str) -> str:
+    """Run a git command synchronously in *root*; return stripped stdout.
+
+    Raises ``CalledProcessError`` on failure — fixture setup should fail
+    loudly, unlike the script's own wrappers under test (which degrade to
+    safe defaults).
+    """
+    result = subprocess.run(
+        ['git', *args], cwd=root, capture_output=True, text=True, check=True,
+    )
+    return result.stdout.strip()
+
+
+def _write(root: Path, rel_path: str, content: str) -> None:
+    path = root / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+def _build_test_repo(root: Path) -> dict[str, str]:
+    """Build a small git repo exercising every wrapper under test.
+
+    Mirrors the ``_setup_repo`` convention in
+    ``orchestrator/tests/test_git_ops.py`` (``git init -b main`` + local
+    user.email/user.name config). Commit graph on ``main``, oldest first:
+
+      1. ``c_init``        — adds README.md.
+      2. ``c_keep_drop``   — adds src/keep.py + src/drop.py together (the
+         "commit under test" for _git_show_files / _git_files_missing_on_ref).
+      3. ``c_drop_removed``— deletes src/drop.py (now missing on main HEAD).
+      4. ``c_revert_target`` — adds src/revert_target.py.
+      5. ``c_revert``      — ``git revert`` of c_revert_target; its message
+         carries the canonical "This reverts commit <full-sha>" trailer.
+
+    Plus a sibling branch (``sidebranch``, off ``c_init``) holding one commit
+    (``c_side``) that is never merged into ``main`` — not an ancestor of it.
+    """
+    _git(root, 'init', '-b', 'main')
+    _git(root, 'config', 'user.email', 'test@test.com')
+    _git(root, 'config', 'user.name', 'Test')
+    # Defensive: don't let a global gpgsign=true / commit hooks make a
+    # throwaway test repo's commits hang or fail (fused-memory precedent —
+    # see test_main_checkout_resolver.py's _init_repo).
+    _git(root, 'config', 'commit.gpgsign', 'false')
+
+    _write(root, 'README.md', '# Test\n')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '--no-verify', '-m', 'chore: init')
+    c_init = _git(root, 'rev-parse', 'HEAD')
+
+    _write(root, 'src/keep.py', 'keep = 1\n')
+    _write(root, 'src/drop.py', 'drop = 1\n')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '--no-verify', '-m', 'feat: add keep and drop')
+    c_keep_drop = _git(root, 'rev-parse', 'HEAD')
+
+    (root / 'src' / 'drop.py').unlink()
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '--no-verify', '-m', 'chore: remove drop')
+    c_drop_removed = _git(root, 'rev-parse', 'HEAD')
+
+    _write(root, 'src/revert_target.py', 'target = 1\n')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '--no-verify', '-m', 'feat: add revert target')
+    c_revert_target = _git(root, 'rev-parse', 'HEAD')
+
+    _git(root, 'revert', '--no-edit', c_revert_target)
+    c_revert = _git(root, 'rev-parse', 'HEAD')
+
+    # Side branch off the initial commit — never merged into main.
+    _git(root, 'checkout', '-q', '-b', 'sidebranch', c_init)
+    _write(root, 'side.py', 'side = 1\n')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '--no-verify', '-m', 'feat: side-only work')
+    c_side = _git(root, 'rev-parse', 'HEAD')
+    _git(root, 'checkout', '-q', 'main')
+
+    return {
+        'c_init': c_init,
+        'c_keep_drop': c_keep_drop,
+        'c_drop_removed': c_drop_removed,
+        'c_revert_target': c_revert_target,
+        'c_revert': c_revert,
+        'c_side': c_side,
+    }
+
+
+@pytest.fixture
+def repo_facts(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    """A real git repo (in tmp_path) plus a dict of named commit shas.
+
+    See :func:`_build_test_repo` for the commit-graph shape.
+    """
+    root = tmp_path / 'repo'
+    root.mkdir()
+    shas = _build_test_repo(root)
+    return root, shas
+
+
+@pytest.mark.asyncio
+class TestGitShowFiles:
+    """_git_show_files returns the changed paths for a real commit."""
+
+    async def test_returns_changed_paths(self, repo_facts):
+        root, shas = repo_facts
+        files = await _git_show_files(str(root), shas['c_keep_drop'])
+        assert sorted(files) == ['src/drop.py', 'src/keep.py']
+
+
+@pytest.mark.asyncio
+class TestGitIsAncestor:
+    """_git_is_ancestor reflects real reachability from the audited ref."""
+
+    async def test_true_for_ancestor(self, repo_facts):
+        root, shas = repo_facts
+        assert await _git_is_ancestor(str(root), shas['c_keep_drop'], 'main') is True
+
+    async def test_false_for_branch_only_commit(self, repo_facts):
+        """A commit that only exists on a sibling branch is not an ancestor of main."""
+        root, shas = repo_facts
+        assert await _git_is_ancestor(str(root), shas['c_side'], 'main') is False
+
+
+@pytest.mark.asyncio
+class TestGitFindRevert:
+    """_git_find_revert locates the `git revert` commit that undid a commit."""
+
+    async def test_returns_reverting_commit_sha(self, repo_facts):
+        root, shas = repo_facts
+        result = await _git_find_revert(str(root), shas['c_revert_target'], 'main')
+        assert result == shas['c_revert']
+
+    async def test_none_when_never_reverted(self, repo_facts):
+        root, shas = repo_facts
+        result = await _git_find_revert(str(root), shas['c_keep_drop'], 'main')
+        assert result is None
+
+
+@pytest.mark.asyncio
+class TestGitFilesMissingOnRef:
+    """_git_files_missing_on_ref distinguishes present vs. deleted declared files."""
+
+    async def test_deleted_file_reported_missing_present_file_is_not(self, repo_facts):
+        root, _shas = repo_facts
+        missing = await _git_files_missing_on_ref(
+            str(root), ['src/keep.py', 'src/drop.py'], 'main',
+        )
+        assert missing == ['src/drop.py']
