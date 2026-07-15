@@ -2152,6 +2152,29 @@ class DeterministicRunner:
             #   (a) self-kill: the blocking deploy would kill this runner mid-run;
             #   (b) double-deploy: the detached transient restart was already scheduled.
             if not self_target:
+                if not target_unit:
+                    # ── target_unit-less cross-unit deploy (task 2632 / esc-2585-1) ──
+                    # A falsy target_unit (an explicit None, or the key
+                    # omitted entirely -> before_done.get('target_unit', '')
+                    # == '') names no specific systemd unit, so there is
+                    # nothing to baseline-inspect or fresh-PID-verify against
+                    # — inspecting the empty unit name returns a degenerate
+                    # ActiveState-less dict that the baseline gate below
+                    # misreads as a wedge (esc-2585-1's exact escalation).
+                    # Skip the baseline gate AND the FreshPidVerify/
+                    # RestartPlan leg entirely (deliberately never reached)
+                    # and drive the outcome on the script's exit code alone.
+                    run_fn = self._script_runner or self._default_run_script
+                    outer_timeout = (
+                        before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
+                    )
+                    rc, tail = await asyncio.wait_for(
+                        run_fn(before_done), timeout=outer_timeout,
+                    )
+                    return await self._writeback_deploy_success(
+                        task_id, metadata, {}, target_unit or '', description,
+                    )
+
                 # Capture baseline unit state before the deploy fires
                 inspect_fn = self._unit_inspector or self._default_inspect_unit
                 baseline = await inspect_fn(target_unit)
