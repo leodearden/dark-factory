@@ -857,6 +857,12 @@ class TaskInterceptor:
             # _persist_state uses to offload a blocking write while holding
             # _persist_lock.
             if is_recon_stage_write:
+                # is_recon_stage_write already guarantees this (it's defined
+                # as `isinstance(agent_id, str) and ...`); re-asserted here
+                # only to keep pyright's narrowing in sync with the hoisted
+                # boolean, matching the recon_write_policy.check(agent_id: str)
+                # signature below.
+                assert isinstance(agent_id, str)
                 verdict = await asyncio.to_thread(
                     recon_write_policy.check,
                     'set_task_status',
@@ -3726,6 +3732,12 @@ class TaskInterceptor:
             # (task 2624) as the lifecycle-reset guard's before-snapshot, so
             # a recon-stage write never issues two before-reads.
             if is_recon_stage_write:
+                # is_recon_stage_write already guarantees this (it's defined
+                # as `isinstance(agent_id, str) and ...`); re-asserted here
+                # only to keep pyright's narrowing in sync with the hoisted
+                # boolean, matching the recon_write_policy.check(agent_id: str)
+                # signature below.
+                assert isinstance(agent_id, str)
                 before = await tm.get_task(task_id, project_root)
                 verdict = recon_write_policy.check(
                     'update_task',

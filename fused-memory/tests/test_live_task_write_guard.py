@@ -14,6 +14,7 @@ tests, then interceptor-boundary tests.
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -40,8 +41,13 @@ LIVE_CLAIMANT = 'run-1/session-1/pid=123'
 RECON_AGENT_ID = 'recon-stage-task_knowledge_sync'
 
 
-def _flat(status='in-progress', claimant_run_id=LIVE_CLAIMANT, heartbeat_at='2026-07-15T12:00:00+00:00', **extra):
-    payload = {
+def _flat(
+    status: str = 'in-progress',
+    claimant_run_id: str | None = LIVE_CLAIMANT,
+    heartbeat_at: str | None = '2026-07-15T12:00:00+00:00',
+    **extra: Any,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         'id': '1',
         'status': status,
         'claimant_run_id': claimant_run_id,
@@ -51,7 +57,12 @@ def _flat(status='in-progress', claimant_run_id=LIVE_CLAIMANT, heartbeat_at='202
     return payload
 
 
-def _nested(status='in-progress', claimant_run_id=LIVE_CLAIMANT, heartbeat_at='2026-07-15T12:00:00+00:00', **extra):
+def _nested(
+    status: str = 'in-progress',
+    claimant_run_id: str | None = LIVE_CLAIMANT,
+    heartbeat_at: str | None = '2026-07-15T12:00:00+00:00',
+    **extra: Any,
+) -> dict[str, Any]:
     return {'data': _flat(status, claimant_run_id, heartbeat_at, **extra)}
 
 
@@ -272,7 +283,7 @@ class TestDetectLifecycleReset:
 SENTINEL_RESULT = {'success': True, 'sentinel': 'do-write-result'}
 
 
-def _live_claimant_before(claimant_run_id=LIVE_CLAIMANT, status='in-progress'):
+def _live_claimant_before(claimant_run_id: str | None = LIVE_CLAIMANT, status: str = 'in-progress') -> dict[str, Any]:
     return _flat(status=status, claimant_run_id=claimant_run_id)
 
 
@@ -301,6 +312,7 @@ class TestGuardedReconTaskWrite:
         assert result == SENTINEL_RESULT
         do_write.assert_awaited_once()
         file_finding.assert_awaited_once()
+        assert file_finding.await_args is not None
         finding = file_finding.await_args.args[0]
         assert isinstance(finding, LifecycleResetFinding)
         assert finding.flag_type == 'task_lifecycle_reset_detected'
@@ -474,6 +486,7 @@ class TestInterceptorUpdateTaskLifecycleGuard:
         await interceptor.update_task('1', '/project', title='x', agent_id=RECON_AGENT_ID)
 
         filer.assert_awaited_once()
+        assert filer.await_args is not None
         finding = filer.await_args.args[0]
         assert finding.flag_type == 'task_lifecycle_reset_detected'
         assert finding.task_id == '1'
@@ -543,6 +556,7 @@ class TestInterceptorSetTaskStatusLifecycleGuard:
         await interceptor.set_task_status('1', 'review', '/project', agent_id=RECON_AGENT_ID)
 
         filer.assert_awaited_once()
+        assert filer.await_args is not None
         finding = filer.await_args.args[0]
         assert finding.flag_type == 'task_lifecycle_reset_detected'
         assert finding.op == 'set_task_status'
