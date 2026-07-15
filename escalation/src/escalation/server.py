@@ -17,7 +17,7 @@ from shared.branch_names import canonical_queued_branch_name
 
 from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
-from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST
+from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, Escalation
@@ -639,7 +639,32 @@ def create_server(
         else:
             effective = parsed
 
-        if effective is not None and rec.level not in effective:
+        # Task 2630: narrow above-ceiling close_only carve-out for the
+        # auto-watcher identity at L2 — only consulted here, where the role
+        # ceiling would otherwise deny the call. l2_auto_close_class re-gates
+        # on identity==watcher/level==2/action=='close_only' internally, so a
+        # header-less connection (identity is None), any other identity, or
+        # any level/action outside that narrow triple returns None
+        # immediately, making the combined condition below equivalent to the
+        # pre-2630 `effective is not None and rec.level not in effective`
+        # check — byte-for-byte unaffected. A returned class name means an
+        # allowlisted class matched AND its required structural evidence was
+        # present in `resolution`; in that case the condition is False and we
+        # fall through, letting the existing identity->resolved_by stamp,
+        # Table B gate, and close path below handle the rest.
+        if (
+            effective is not None
+            and rec.level not in effective
+            and l2_auto_close_class(
+                identity=identity,
+                level=rec.level,
+                action=action,
+                category=rec.category,
+                agent_role=rec.agent_role,
+                resolution=resolution,
+            )
+            is None
+        ):
             return {
                 'error': (
                     f'connection not permitted to change level-{rec.level} '

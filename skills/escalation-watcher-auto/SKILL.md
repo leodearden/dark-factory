@@ -16,7 +16,7 @@ You are running an autonomous, fully non-interactive level-1 escalation handler.
 - **No merge-queue interaction.** Do not call merge-queue or git-merge tools. This skill never submits to the merge queue — no `merge_request` call exists anywhere in this flow and none may be added; if merge interaction is ever introduced, it must use the bounded submit→poll protocol (explicit `wait_secs`, `merge_status` polling — see `skills/escalation-watcher/SKILL.md` §"Merge Submissions — Bounded Submit, Then Poll").
 - **No infra commands.** Do not issue infrastructure commands (docker, systemctl, kill, etc.).
 - **No recovery ref-moves.** NEVER perform red-on-main recovery ref-moves — no `git reset`, `git update-ref refs/heads/main`, or any other direct ref mutation. When main is RED and a recovery ref-move is required, PROMOTE to L2 so the human-driven escalation-watcher can execute the enforce-safe recovery procedure (`skills/escalation-watcher/SKILL.md §"Red-on-main recovery"`). This invariant applies even if a recovery SHA is known — the auto-watcher is read-only and has no sanctioned path to move the main ref.
-- **Never `resolve_issue` on level ≥ 2.** This was always the contract, and the escalation server now **enforces** it structurally (`plans/escalation-connection-capability-guard-prd.md`): this watcher's supervised MCP connection carries `X-Escalation-Levels: 0,1`, so any `resolve_issue` call (any `action`, including `park`) against a level-2 escalation is rejected server-side with `{'error': ..., 'code': 'level_forbidden'}` and makes **no** state change — it is not merely discouraged, it cannot succeed. Resolve L0/L1 admin-class items directly; promote judgement-class and L2-bound items via `promote_to_l2` (which is exempt from the level gate); leave L2 pending for the human either way. The same connection carries `X-Escalation-Identity: orchestrator-escalation-watcher-auto`, which the server stamps onto the archived record's `resolved_by` for every permitted `resolve`/`park` — server-attributed and non-spoofable, regardless of the `resolved_by="escalation-watcher-auto"` tool argument used in the call-shape examples throughout this skill.
+- **`resolve_issue` on level ≥ 2 is forbidden, with one narrow, evidence-gated exception.** This was always the contract, and the escalation server **enforces** it structurally (`plans/escalation-connection-capability-guard-prd.md`, narrowed by task 2630's carve-out — `escalation.authority.l2_auto_close_class`): this watcher's supervised MCP connection carries `X-Escalation-Levels: 0,1`, so `resume` / `restart` / `park` / `abandon` against a level-2 escalation are **always** rejected server-side with `{'error': ..., 'code': 'level_forbidden'}` and make **no** state change — that part of the contract is unchanged and cannot succeed. The one exception: `resolve_issue(action='close_only')` on an L2 record now **succeeds** when (a) the record matches one of three allowlisted classes AND (b) your `resolution` text quotes that class's required evidence verbatim — see [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) below for the classes, evidence, and the NEVER-allowed set (`design_concern` / `milestone_gate` categories, and any record filed by `orchestrator-deterministic` — the born-at-L2 human-gate sentinel role covering deterministic `always_escalates` / operator / acceptance / milestone-predicate gates — are **never** auto-closable, checked before the allowlist). Every other action at L2, and any L2 record outside the three classes or missing its evidence, still returns `level_forbidden` exactly as before. Resolve L0/L1 admin-class items directly; promote judgement-class and L2-bound items via `promote_to_l2` (which is exempt from the level gate); leave every other L2 pending for the human. The same connection carries `X-Escalation-Identity: orchestrator-escalation-watcher-auto`, which the server stamps onto the archived record's `resolved_by` for every permitted `resolve`/`park`/auto-close — server-attributed and non-spoofable, regardless of the `resolved_by="escalation-watcher-auto"` tool argument used in the call-shape examples throughout this skill.
 
 When in doubt, **promote the escalation to L2** (see [Promote to L2](#promote-to-l2)). Leaving items pending at L1 indefinitely is not acceptable; if the tool is unavailable fall back to the legacy digest (see [Graceful Degradation](#graceful-degradation)).
 
@@ -178,6 +178,36 @@ Pass the same `root_cause` string for escalations that share a hypothesis. The s
 **Member L1s stay pending at L1.** They are referenced by the L2 but not promoted. When the human resolves (or dismisses) the L2, the resolution cascades automatically to all member L1s — you do NOT resolve member L1s directly.
 
 Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found in a later drain cycle) is correct and idempotent. However, the **drain-side dedup** (see [Draining pending escalations](#draining-pending-escalations)) filters out ids already present in a pending L2's `members` list _before_ RCA runs — so the server-side dedup is the safety net, not the primary guard against redundant RCA work and counter inflation.
+
+### Auto-closing a rubber-stamp L2 (narrow close_only carve-out)
+
+The server carves out one narrow exception to the level-2 authority boundary described in [Hard Constraints](#hard-constraints--never-violate) (task 2630, `escalation.authority.l2_auto_close_class`): `resolve_issue(action='close_only')` on an L2 record succeeds when the record matches one of three allowlisted classes **and** your `resolution` text quotes that class's required evidence. This exists to stop the human from rubber-stamping closes you already pre-triaged — trace analysis found roughly 45% of human `resolve_issue` clicks were exactly that, and recommendations were rotting while pending (one RCA was 21h stale by the time it was closed). It changes **nothing** else: `resume` / `restart` / `park` / `abandon` at L2 are still always `level_forbidden`, and `design_concern` / `milestone_gate` categories and any record filed by `orchestrator-deterministic` (the born-at-L2 human-gate sentinel — deterministic `always_escalates`, operator/acceptance gates, milestone-predicate gates) are **NEVER** auto-closable no matter how good the evidence looks — the server checks this denylist before the allowlist.
+
+The three classes, and the evidence each requires you to **quote verbatim in `resolution`** (the server only checks that the text is present — it trusts you to have actually verified it, since it cannot itself run git or probe infra):
+
+| Class | Record shape | Required evidence (quote verbatim in `resolution`) |
+|-------|--------------|------------------------------------------------------|
+| **`superseded_main_sweep`** | `agent_role == "orchestrator-main-sweep"` | BOTH: (1) the newer sweep escalation's id (`esc-...`), AND (2) proof the failing tip is an ancestor of a now-green main — a `merge-base`/`is-ancestor` check result or a gate re-run "verifies clean" output |
+| **`self_cleared_infra`** | `category == "infra_issue"` | A quoted live-probe `key=value` liveness token, e.g. `curator paused=false`, `ActiveState=active`, `MainPID=1234` |
+| **`stale_task_scoped`** | any category/role (subject to the denylist above) | A live `get_task` status citation showing the subject task went terminal or moved on — `status=done`, `status=cancelled`, `re-scoped`, or `re-dispatched` |
+
+Example call, closing a superseded main-sweep escalation:
+
+```python
+mcp__escalation__resolve_issue(
+  escalation_id="esc-main-sweep-abc123def456-1",
+  action="close_only",
+  resolution=(
+    "Superseded by newer sweep esc-main-sweep-9f8e7d6c5b4a; main advanced "
+    "and verifies clean — swept SHA abc123def456 is-ancestor of the "
+    "current clean tip."
+  ),
+)
+```
+
+**When unsure, PROMOTE rather than close.** If a record only loosely fits a class, or you cannot honestly quote the required evidence because you didn't actually check it, leave it for the human via `promote_to_l2` — never manufacture evidence text to force a match. `harness-escalation-revalidation-sweep` remains the regression backstop that re-validates closed records, but it is not a substitute for only closing what you can actually back up.
+
+Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Digest Format](#digest-format).
 
 ## Main Loop
 
@@ -573,6 +603,10 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 - PROMOTED cluster (L2 esc-42-8): bad-merge-to-main-breaks-scheduler — 3 members: [esc-42-1, esc-42-3, esc-42-5]
 - PROMOTED (L2 esc-42-9): design_concern — task-88 — architectural question about X
 - PROMOTED (L2 esc-42-10): dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
+
+### Auto-closed L2 (narrow carve-out)
+- AUTO-CLOSED (L2 esc-main-sweep-abc123def456-1): superseded_main_sweep — main-sweep-abc123def456 — newer sweep esc-main-sweep-9f8e7d6c5b4a; swept SHA abc123def456 is-ancestor of clean tip
+- AUTO-CLOSED (L2 esc-77-3): self_cleared_infra — task-77 — live probe: curator paused=false
 
 ### Pending (human review required — LEGACY mode only)
 - PENDING (human): task_failure — task-12 — verify exhausted after 3 attempts

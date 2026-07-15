@@ -862,3 +862,365 @@ class TestPromoteL2Gate:
         assert result.get('status') == 'created', (
             f"Expected status='created', got: {result}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestL2AutoCloseCarveout (task 2630): a narrow above-ceiling close_only
+# carve-out for the auto-watcher identity at L2 — an allowlisted class match
+# plus required structural evidence in the resolution text lets
+# resolve_issue fall through the {0,1} ceiling gate instead of returning
+# level_forbidden. Everything else at L2 (other actions, non-allowlisted
+# categories, missing evidence, the design_concern/milestone_gate/
+# orchestrator-deterministic denylist) stays forbidden; a header-less human
+# connection retains full L2 authority untouched (esc-2087-2).
+# ---------------------------------------------------------------------------
+
+
+class TestL2AutoCloseCarveout:
+    """Task 2630's narrow ``close_only``-only carve-out above the auto-watcher's
+    ``{0,1}`` level ceiling (``escalation.authority.l2_auto_close_class``).
+
+    Unless noted, these drive the REAL
+    ``orchestrator.harness._WATCHER_ESCALATION_HEADERS`` constant
+    (levels='0,1', identity='orchestrator-escalation-watcher-auto') against
+    the running server — the same header pair the deployed watcher sends —
+    for two-way lockstep fidelity (mirrors TestWatcherConstantLockstep).
+
+    RED at this step: ``resolve_issue`` does not yet consult
+    ``l2_auto_close_class``, so both positive scenarios below (which must
+    succeed once step-4 wires the carve-out in) currently return
+    ``level_forbidden`` like everything else at L2.
+    """
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_classes_close_and_stamp_identity(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """(1) Class (a) superseded_main_sweep and class (b) self_cleared_infra
+        both close (dismissed, resolution_action='close_only') with
+        resolved_by stamped from the identity header — NOT the spoofed tool
+        arg — and the record archived out of the queue root."""
+        from orchestrator.harness import _WATCHER_ESCALATION_HEADERS
+
+        base_url, queue = http_server
+        levels = _WATCHER_ESCALATION_HEADERS['X-Escalation-Levels']
+        identity = _WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']
+
+        # (a) superseded_main_sweep — newer sweep esc id + ancestor/green proof,
+        # mirrors harness._close_superseded_main_sweep_escalations's own filing
+        # shape (category='infra_issue', task_id='main-sweep-<sha12>').
+        esc_a = _seed(
+            queue, level=2, task_id='main-sweep-abc123def456',
+            agent_role='orchestrator-main-sweep', category='infra_issue',
+        )
+        result_a = await _resolve_over_http(
+            base_url, levels=levels, identity=identity,
+            escalation_id=esc_a.id, action='close_only',
+            resolution=(
+                'Superseded by newer sweep escalation esc-main-sweep-9f8e7d6c5b4a; '
+                'main advanced and verifies clean; swept SHA abc123def456 '
+                'is-ancestor of the current clean tip.'
+            ),
+            resolved_by='spoofed-by-agent',
+        )
+        assert 'code' not in result_a and 'error' not in result_a, (
+            f'Expected a clean success (allowlisted class + evidence), got: {result_a}'
+        )
+        reread_a = queue.get(esc_a.id)
+        assert reread_a is not None
+        assert reread_a.status == 'dismissed', f'Expected dismissed, got: {reread_a.status}'
+        assert reread_a.resolution_action == 'close_only', (
+            f"Expected resolution_action='close_only', got: {reread_a.resolution_action!r}"
+        )
+        assert reread_a.resolved_by == 'orchestrator-escalation-watcher-auto', (
+            f'Expected the identity header to stamp resolved_by (not the spoofed '
+            f'tool arg), got: {reread_a.resolved_by!r}'
+        )
+        assert not (queue.queue_dir / f'{esc_a.id}.json').exists(), (
+            'Expected the auto-closed record archived out of the queue root'
+        )
+
+        # (b) self_cleared_infra — a quoted live-probe key=value liveness token,
+        # mirrors harness._revalidate_open_deterministic_escalation.
+        esc_b = _seed(
+            queue, level=2, task_id='task-self-cleared-infra',
+            agent_role='escalation-watcher-auto', category='infra_issue',
+        )
+        result_b = await _resolve_over_http(
+            base_url, levels=levels, identity=identity,
+            escalation_id=esc_b.id, action='close_only',
+            resolution='live probe: curator paused=false — transient infra self-cleared',
+            resolved_by='spoofed-by-agent',
+        )
+        assert 'code' not in result_b and 'error' not in result_b, (
+            f'Expected a clean success (allowlisted class + evidence), got: {result_b}'
+        )
+        reread_b = queue.get(esc_b.id)
+        assert reread_b is not None
+        assert reread_b.status == 'dismissed', f'Expected dismissed, got: {reread_b.status}'
+        assert reread_b.resolution_action == 'close_only', (
+            f"Expected resolution_action='close_only', got: {reread_b.resolution_action!r}"
+        )
+        assert reread_b.resolved_by == 'orchestrator-escalation-watcher-auto', (
+            f'Expected the identity header to stamp resolved_by, got: {reread_b.resolved_by!r}'
+        )
+        assert not (queue.queue_dir / f'{esc_b.id}.json').exists(), (
+            'Expected the auto-closed record archived out of the queue root'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_task_scoped_non_infra_category_closes_over_http(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """(1b) Class (c) stale_task_scoped is the broadest, category-agnostic
+        class — unlike (a)/(b) it can auto-close non-infra categories too
+        (e.g. task_failure). Verify the full end-to-end mutation (dismissed,
+        resolution_action stamped, resolved_by from the identity header,
+        archived out of the queue root) over HTTP, not just the pure
+        ``l2_auto_close_class`` unit return value."""
+        from orchestrator.harness import _WATCHER_ESCALATION_HEADERS
+
+        base_url, queue = http_server
+        levels = _WATCHER_ESCALATION_HEADERS['X-Escalation-Levels']
+        identity = _WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']
+
+        esc = _seed(
+            queue, level=2, task_id='task-stale-task-scoped',
+            agent_role='implementer', category='task_failure',
+        )
+        result = await _resolve_over_http(
+            base_url, levels=levels, identity=identity,
+            escalation_id=esc.id, action='close_only',
+            resolution='Subject task status=done per get_task; escalation moot.',
+            resolved_by='spoofed-by-agent',
+        )
+        assert 'code' not in result and 'error' not in result, (
+            f'Expected a clean success (stale_task_scoped class + evidence), got: {result}'
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'dismissed', f'Expected dismissed, got: {reread.status}'
+        assert reread.resolution_action == 'close_only', (
+            f"Expected resolution_action='close_only', got: {reread.resolution_action!r}"
+        )
+        assert reread.resolved_by == 'orchestrator-escalation-watcher-auto', (
+            f'Expected the identity header to stamp resolved_by (not the spoofed '
+            f'tool arg), got: {reread.resolved_by!r}'
+        )
+        assert not (queue.queue_dir / f'{esc.id}.json').exists(), (
+            'Expected the auto-closed record archived out of the queue root'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_allowlisted_category_still_forbidden(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """(2) A category outside the allowlist (scope_violation, no class-c
+        status citation either) stays level_forbidden — no mutation."""
+        from orchestrator.harness import _WATCHER_ESCALATION_HEADERS
+
+        base_url, queue = http_server
+        levels = _WATCHER_ESCALATION_HEADERS['X-Escalation-Levels']
+        identity = _WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']
+        esc = _seed(
+            queue, level=2, task_id='task-non-allowlisted-category',
+            agent_role='implementer', category='scope_violation',
+        )
+
+        result = await _resolve_over_http(
+            base_url, levels=levels, identity=identity,
+            escalation_id=esc.id, action='close_only', resolution='x',
+        )
+        assert result.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result}"
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending', f'Expected pending, got: {reread.status}'
+        assert (queue.queue_dir / f'{esc.id}.json').exists(), (
+            'Denied record must remain in the queue root (not archived)'
+        )
+        assert reread.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread.resolution_action}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_action_other_than_close_only_still_forbidden(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """(3) An otherwise-matching record (infra_issue + valid probe evidence)
+        stays level_forbidden when action is 'resume' or 'park' — only
+        close_only is carved out."""
+        from orchestrator.harness import _WATCHER_ESCALATION_HEADERS
+
+        base_url, queue = http_server
+        levels = _WATCHER_ESCALATION_HEADERS['X-Escalation-Levels']
+        identity = _WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']
+        probe_resolution = 'live probe: curator paused=false — transient infra self-cleared'
+
+        esc_resume = _seed(
+            queue, level=2, task_id='task-action-resume-denied',
+            agent_role='implementer', category='infra_issue',
+        )
+        result_resume = await _resolve_over_http(
+            base_url, levels=levels, identity=identity,
+            escalation_id=esc_resume.id, action='resume', resolution=probe_resolution,
+        )
+        assert result_resume.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result_resume}"
+        )
+        reread_resume = queue.get(esc_resume.id)
+        assert reread_resume is not None
+        assert reread_resume.status == 'pending', (
+            f'Expected pending, got: {reread_resume.status}'
+        )
+        assert reread_resume.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread_resume.resolution_action}'
+        )
+
+        esc_park = _seed(
+            queue, level=2, task_id='task-action-park-denied',
+            agent_role='implementer', category='infra_issue',
+        )
+        result_park = await _resolve_over_http(
+            base_url, levels=levels, identity=identity,
+            escalation_id=esc_park.id, action='park', resolution=probe_resolution,
+        )
+        assert result_park.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result_park}"
+        )
+        reread_park = queue.get(esc_park.id)
+        assert reread_park is not None
+        assert reread_park.status == 'pending', f'Expected pending, got: {reread_park.status}'
+        assert reread_park.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread_park.resolution_action}'
+        )
+        assert reread_park.resolution is None, (
+            f'Expected no park stamp at all, got: {reread_park.resolution!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_evidence_still_forbidden(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """(4) An allowlisted category (infra_issue) with close_only but a
+        resolution carrying no structural evidence token stays level_forbidden."""
+        from orchestrator.harness import _WATCHER_ESCALATION_HEADERS
+
+        base_url, queue = http_server
+        levels = _WATCHER_ESCALATION_HEADERS['X-Escalation-Levels']
+        identity = _WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']
+        esc = _seed(
+            queue, level=2, task_id='task-missing-evidence',
+            agent_role='implementer', category='infra_issue',
+        )
+
+        result = await _resolve_over_http(
+            base_url, levels=levels, identity=identity,
+            escalation_id=esc.id, action='close_only', resolution='looks fine now',
+        )
+        assert result.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result}"
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending', f'Expected pending, got: {reread.status}'
+        assert (queue.queue_dir / f'{esc.id}.json').exists(), (
+            'Denied record must remain in the queue root (not archived)'
+        )
+        assert reread.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread.resolution_action}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_denylist_categories_and_roles_still_forbidden(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """(5) The denylist wins even when a class predicate would otherwise
+        match: a design_concern record carrying valid class-c evidence, and an
+        orchestrator-deterministic-filed infra_issue carrying valid class-b
+        evidence, both stay level_forbidden."""
+        from orchestrator.harness import _WATCHER_ESCALATION_HEADERS
+
+        base_url, queue = http_server
+        levels = _WATCHER_ESCALATION_HEADERS['X-Escalation-Levels']
+        identity = _WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']
+
+        # (a) design_concern — a born-at-L2 human-judgment category — is never
+        # auto-closable even though the resolution cites a terminal task status
+        # (class (c)'s evidence).
+        esc_design = _seed(
+            queue, level=2, task_id='task-denylist-design-concern',
+            agent_role='implementer', category='design_concern',
+        )
+        result_design = await _resolve_over_http(
+            base_url, levels=levels, identity=identity,
+            escalation_id=esc_design.id, action='close_only',
+            resolution='Subject task main-sweep-abc status=done (terminal); safe to close.',
+        )
+        assert result_design.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result_design}"
+        )
+        reread_design = queue.get(esc_design.id)
+        assert reread_design is not None
+        assert reread_design.status == 'pending', (
+            f'Expected pending, got: {reread_design.status}'
+        )
+        assert reread_design.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread_design.resolution_action}'
+        )
+
+        # (b) orchestrator-deterministic — the born-at-L2 human-gate sentinel
+        # role — is never auto-closable even for an infra_issue carrying valid
+        # class (b) evidence.
+        esc_deterministic = _seed(
+            queue, level=2, task_id='task-denylist-deterministic-role',
+            agent_role='orchestrator-deterministic', category='infra_issue',
+        )
+        result_deterministic = await _resolve_over_http(
+            base_url, levels=levels, identity=identity,
+            escalation_id=esc_deterministic.id, action='close_only',
+            resolution='live probe: ActiveState=active',
+        )
+        assert result_deterministic.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result_deterministic}"
+        )
+        reread_deterministic = queue.get(esc_deterministic.id)
+        assert reread_deterministic is not None
+        assert reread_deterministic.status == 'pending', (
+            f'Expected pending, got: {reread_deterministic.status}'
+        )
+        assert reread_deterministic.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread_deterministic.resolution_action}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_header_less_human_connection_unaffected(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """(6) A header-less (human) connection closing a class-matching
+        infra_issue L2 succeeds via its PRE-EXISTING full L2 authority
+        (esc-2087-2) — resolved_by comes from the tool arg, never the carve-out
+        (which never engages: identity is None)."""
+        base_url, queue = http_server
+        esc = _seed(
+            queue, level=2, task_id='task-header-less-infra',
+            agent_role='escalation-watcher-auto', category='infra_issue',
+        )
+
+        result = await _resolve_over_http(
+            base_url,
+            escalation_id=esc.id, action='close_only',
+            resolution='live probe: curator paused=false — transient infra self-cleared',
+            resolved_by='escalation-watcher',
+        )
+        assert 'code' not in result and 'error' not in result, (
+            f'Expected a clean success (header-less keeps full L2 authority), got: {result}'
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'dismissed', f'Expected dismissed, got: {reread.status}'
+        assert reread.resolved_by == 'escalation-watcher', (
+            f'Expected the tool-arg resolved_by (no Identity header to override it), '
+            f'got: {reread.resolved_by!r}'
+        )
