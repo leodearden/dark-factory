@@ -567,6 +567,17 @@ def test_watched_ports_match_configured_escalation_ports() -> None:
             f"({solar_challenge_platform_port})"
         )
 
+    # --- pump-web-ui orchestrator (check if present) ---
+    pump_web_ui_config_path = pathlib.Path("/home/leo/src/pump-web-ui/orchestrator.yaml")
+    if pump_web_ui_config_path.exists():
+        pump_web_ui_cfg = yaml.safe_load(pump_web_ui_config_path.read_text())
+        pump_web_ui_port = _extract_escalation_port(pump_web_ui_cfg, pump_web_ui_config_path)
+        assert unit_to_port["orchestrator-pump-web-ui.service"] == pump_web_ui_port, (
+            f"WATCHED port for orchestrator-pump-web-ui.service "
+            f"({unit_to_port['orchestrator-pump-web-ui.service']}) != "
+            f"pump-web-ui/orchestrator.yaml escalation.port ({pump_web_ui_port})"
+        )
+
     # --- reify orchestrator (skip if absent in this environment) ---
     reify_config_path = pathlib.Path("/home/leo/src/reify/orchestrator.yaml")
     if not reify_config_path.exists():
@@ -596,6 +607,7 @@ def test_main_targets_expected_pairs() -> None:
         (8105, "orchestrator-know-live.service"),
         (8101, "orchestrator-autopilot-video.service"),
         (8107, "orchestrator-solar-challenge-platform.service"),
+        (8108, "orchestrator-pump-web-ui.service"),
     ]
 
 
