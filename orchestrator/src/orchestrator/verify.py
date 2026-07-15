@@ -1825,8 +1825,14 @@ def _build_fallback_config(
         # broader gating for the same reason the pure-sub branch made this
         # trade-off; revisit if source-only subproject regressions start
         # slipping through to merge.
+        # Cold-verify dev-dep sync (task 2641): same twin-bug fix as the
+        # pure-subproject branch above — carry test_command's --extra flags
+        # into the touched subproject's own pytest segment only.
+        # _ROOT_OWNING_TEST_COMMAND is a separate, dark_factory-specific
+        # command and is left untouched.
+        mixed_extras = _config_test_extras(config.test_command if config is not None else None)
         test_cmd = (
-            'cd ' + mixed_sub + ' && uv run pytest ' + ' '.join(mixed_rel_targets)
+            'cd ' + mixed_sub + ' && uv run ' + ' '.join([*mixed_extras, 'pytest', *mixed_rel_targets])
             + ' && cd .. && ' + _ROOT_OWNING_TEST_COMMAND
             if mixed_rel_targets else _ROOT_OWNING_TEST_COMMAND
         )
