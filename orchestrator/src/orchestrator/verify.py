@@ -4265,6 +4265,20 @@ async def run_scoped_verification(
                 # Mirrors the pyright-only reverse-dep precedent in
                 # hooks/project-checks (task 2551), scoped to pytest/import
                 # coupling instead of whole-package lint fan-out.
+                #
+                # `scoped` (surviving) union `skipped` (no matching files) is
+                # every mc.prefix in `module_configs` — the task's OWN
+                # modules — by construction (skipped is defined as
+                # module_configs minus scoped_prefixes above). So when the
+                # task's own diff already touches escalation, 'escalation' is
+                # already in already_scoped and the helper's own dedup
+                # (`if dependent in already_scoped: continue`) skips it — no
+                # double-add. Pinned by TestRunScopedVerificationReverse-
+                # DependencyGuards (test_verify_reverse_dep.py, task 2607
+                # step-9): orchestrator-test-only diffs don't trigger (the
+                # verify_plan `<pkg>/src/` gate), an escalation-in-diff task
+                # isn't double-widened (this union), and a no-map-entry
+                # package (e.g. dashboard) widens to nothing.
                 already_scoped = {mc.prefix for mc in scoped} | set(skipped)
                 widened = _reverse_dependency_module_configs(
                     existing_files, config, worktree, already_scoped,
