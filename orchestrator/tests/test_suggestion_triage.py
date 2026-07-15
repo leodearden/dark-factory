@@ -1271,6 +1271,40 @@ class TestPreTriageSuggestions:
         # Original suggestions are embedded as reference
         assert 'Original Suggestions' in result.detail
 
+    @pytest.mark.asyncio
+    async def test_pre_triage_malformed_item_falls_back(self):
+        """A malformed per-item shape (a proposed_task_groups entry missing
+        'title') must degrade to the original escalation unchanged, not
+        raise KeyError out of format_pretriaged_detail's unguarded
+        g["title"] indexing (steward.py:766, outside the try/except).
+        """
+        steward = _make_steward()
+        suggestions = _make_suggestions(15)
+        esc = _make_escalation(detail=json.dumps(suggestions))
+
+        malformed_triage_output = {
+            'accepted': [
+                {'index': 0, 'suggestion': 'case 0', 'reason': 'merit',
+                 'files': ['src/mod0.py'], 'proposed_task_title': 'Fix 0'},
+            ],
+            'skipped': [],
+            'proposed_task_groups': [
+                # Missing 'title' — malformed per-item shape.
+                {'description': 'Fix it', 'accepted_indices': [0]},
+            ],
+        }
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry',
+            side_effect=_invoke_writing_verdict(steward.worktree, malformed_triage_output),
+        ):
+            result = await steward._pre_triage_suggestions(esc)
+
+        # Must fall back to the ORIGINAL escalation, not raise or return a
+        # broken pre-triaged detail.
+        assert result.detail == esc.detail
+        assert result.summary == esc.summary
+
 
 # ---------------------------------------------------------------------------
 # Pre-triage cap handling
