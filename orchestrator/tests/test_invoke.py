@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1167,6 +1168,62 @@ class TestSpawnEnvForwarding:
             assert captured_env.get(key) == value, (
                 f'{key} not forwarded to _run_subprocess env; captured={captured_env!r}'
             )
+
+    async def test_sandbox_path_scrubs_inherited_session_id_and_launcher_pid(self, tmp_path):
+        """Sandbox-active branch: an inherited CLAUDE_SPAWN_SESSION_ID/
+        CLAUDE_SPAWN_LAUNCHER_PID (this process's own os.environ) must not
+        leak into the subprocess env once spawn_env is provided -- mirrors
+        the non-sandbox scrub in shared.cli_invoke._invoke_claude; see that
+        site's comment for the full rationale (session_hooks.hook_session_slug
+        prefers an inherited CLAUDE_SPAWN_SESSION_ID outright, which would
+        otherwise collapse every spawned agent onto one registry record).
+        """
+        captured_env: dict = {}
+
+        async def mock_run_subprocess(cmd, cwd, env, model, timeout_seconds, **kwargs):
+            captured_env.update(env)
+            return _SubprocessResult(
+                stdout='', stderr='', returncode=0, duration_ms=50, timed_out=False,
+            )
+
+        spawn_env = {
+            'CLAUDE_SPAWN_ROLE': 'implementer',
+            'CLAUDE_SPAWN_PARENT_ID': '2512-abcd1234',
+        }
+        inherited = {
+            'CLAUDE_SPAWN_SESSION_ID': 'inherited-launching-slug',
+            'CLAUDE_SPAWN_LAUNCHER_PID': '99999',
+        }
+
+        with (
+            patch.dict(os.environ, inherited),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.resolve_active_backend',
+                return_value='bwrap',
+            ),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.wrap_command',
+                side_effect=lambda cmd, cwd, mods: cmd,
+            ),
+            patch(
+                'orchestrator.agents.invoke._run_subprocess',
+                side_effect=mock_run_subprocess,
+            ),
+        ):
+            await _invoke_claude_with_sandbox(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=['m'],
+                effort=None, timeout_seconds=30.0,
+                spawn_env=spawn_env,
+            )
+
+        assert 'CLAUDE_SPAWN_SESSION_ID' not in captured_env
+        assert 'CLAUDE_SPAWN_LAUNCHER_PID' not in captured_env
+        assert captured_env.get('CLAUDE_SPAWN_ROLE') == 'implementer'
 
 
 @pytest.mark.asyncio
