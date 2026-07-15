@@ -3130,8 +3130,15 @@ class TaskWorkflow:
             )
             revalidation = True
         else:
+            # include_prior_proposals=True only when an existing_plan fell
+            # through both the completion-pass and revalidation branches
+            # above (a genuine re-plan) — both of those branches require a
+            # truthy existing_plan, so bool(existing_plan) is False ONLY for
+            # a truly-fresh no-plan dispatch, keeping C-A1 anti-anchoring
+            # intact for first dispatch.
             prompt = await self.briefing.build_architect_prompt(
                 self.task, worktree=self.worktree,
+                include_prior_proposals=bool(existing_plan),
             )
 
         # Snapshot pre-architect open L0 ids so the post-loop check can
