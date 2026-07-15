@@ -330,3 +330,43 @@ class TestClassifyCommitNotOnMain:
         )
         verdict, _reasons = classify(audit)
         assert verdict == 'commit_not_on_main'
+
+
+# ===========================================================================
+# Step-7/8: classify — misattributed
+# ===========================================================================
+#
+# The negative cases below intentionally assert `verdict != 'misattributed'`
+# rather than a concrete fallback verdict: at step 8's GREEN, everything past
+# the misattributed check is still an interim placeholder (the
+# deliverable_absent/unverifiable distinction isn't implemented until step
+# 12), so pinning an exact fallback value here would make this test flip
+# once step 12 lands. "Does not flag misattributed" is the actual claim.
+
+class TestClassifyMisattributed:
+    """misattributed: cited commit is on-ref, but its message cites a different task."""
+
+    def test_message_cites_only_a_different_task(self):
+        """Task 50's provenance points at a commit whose subject cites task 77."""
+        audit = _audit(task_id='50', is_ancestor=True, commit_message='Merge task/77 into main')
+        verdict, reasons = classify(audit)
+        assert verdict == 'misattributed'
+        assert reasons
+        assert any('77' in r for r in reasons)
+
+    def test_mixed_citation_does_not_flag_misattributed(self):
+        """A message citing BOTH this task and another task is not misattribution."""
+        audit = _audit(
+            task_id='50', is_ancestor=True,
+            commit_message='Merge task/50 into main\n\nAlso relates to task/77.',
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict != 'misattributed'
+
+    def test_no_citation_at_all_does_not_flag_misattributed(self):
+        """No citation at all means nothing to compare — not misattribution
+        (falls through to a later verdict in the ladder).
+        """
+        audit = _audit(task_id='50', is_ancestor=True, commit_message='chore: general cleanup')
+        verdict, _reasons = classify(audit)
+        assert verdict != 'misattributed'
