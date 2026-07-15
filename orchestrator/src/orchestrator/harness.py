@@ -3462,6 +3462,9 @@ Output JSON matching the schema. Every task must appear in the output.
             the worktree must survive intact for the train-merge worker.
             Mirrors the open-L1 veto pattern — explicit early-return as
             belt-and-suspenders on top of the _RECONCILE_SWEEP_STATUSES filter.
+          - mid-run actively-held short-circuit (below): cheap pre-check for
+            a task recovery_for would classify LEAVE anyway (review
+            amendment, task 2243 W10-θ2 reviewer_comprehensive #1).
         """
         # PRD § 9.8 — train-parked tasks must never be reverted or have their
         # worktree cleaned up; the train-merge worker owns their lifecycle.
@@ -3472,6 +3475,30 @@ Output JSON matching the schema. Every task must appear in the output.
                 'leaving worktree intact',
                 tid,
             )
+            return None
+
+        # Cheap in-memory short-circuit (review amendment, task 2243 W10-θ2
+        # reviewer_comprehensive #1): mid-run, an actively-held task (the
+        # scheduler's own dispatched / module-lock-held / recent-cancel
+        # bookkeeping — the exact signal recovery_for folds into
+        # report.live_claimant) is GUARANTEED to classify LEAVE — no
+        # _RECOVERY row (task_ground_truth.py) has live_claimant=True, so any
+        # live claimant always falls through to the LEAVE default, and
+        # neither sweep-side upgrade above can apply once one is established
+        # (both require report.live_claimant is None). The deep
+        # `is_actively_held` re-check below (kept as defense-in-depth for
+        # mid_run=False and TOCTOU races) would reach the same conclusion —
+        # but only AFTER paying for get_task + recovery_for's derive_truth
+        # (a MergeProvenance lookup and, on a journal miss, up to two git
+        # subprocess calls). This sweep runs periodically over every
+        # in-progress/blocked task, so that cost would otherwise scale with
+        # the number of concurrently-running (i.e. normal, not stranded)
+        # tasks. Outcome-identical to letting recovery_for run — this only
+        # changes WHERE the check happens, not what it decides. The driver
+        # (_reconcile_stranded_in_progress) still calls this function
+        # unconditionally for every candidate (task 2243 step-12 parity — no
+        # driver-level continue reintroduced).
+        if mid_run and self.scheduler.is_actively_held(tid):
             return None
 
         branch = f'{self.git_ops.config.branch_prefix}{tid}'
@@ -3691,6 +3718,30 @@ Output JSON matching the schema. Every task must appear in the output.
                     'escalation/active workflow — re-filed L1 %s (no status '
                     'change)', tid, esc.id,
                 )
+            return None
+
+        # Deploy-phase-tracked in-progress tasks are never auto-recovered by
+        # this generic reaper (review amendment, task 2243 W10-θ2
+        # reviewer_comprehensive #2). θ1's _RECOVERY table (task_ground_truth.py)
+        # requires deploy_phase is None for EVERY MARK_DONE_WITH_PROVENANCE /
+        # REVERT_TO_PENDING row (a/b/c/d) — so an in-progress task carrying a
+        # deploy_phase can only reach this point via the LEAVE default
+        # (VERIFIED / FAILED / SCHEDULED / ESCALATED / DONE, or RAN paired
+        # with a branch state other than GONE_NO_MARKER) or via
+        # RE_FILE_ESCALATION (row h — GONE_NO_MARKER + RAN, the D1
+        # crashed-mid-deploy shape). Both are deliberate: the table's
+        # "Deliberately-unmapped deploy phases" comment explains FAILED /
+        # ESCALATED already own a mandatory DS-2 recovery path, VERIFIED /
+        # DONE are terminal-success, and reverting (or phantom-completing) a
+        # stranded deploy could re-trigger one that already took effect. Row
+        # h's RE_FILE_ESCALATION is likewise handled elsewhere (the runner's
+        # own born-at-L2 escalation), not by this in-progress path. Without
+        # this guard, either action fell through to the generic revert
+        # below, silently overriding the table's LEAVE/defer-to-DS-2 intent
+        # — most notably for a deterministic deploy task, which carries no
+        # task_kind != 'deterministic' exclusion on this path (unlike the
+        # 'blocked' branch above).
+        if report.deploy_phase is not None:
             return None
 
         # task 2243, W10-θ2 step-12: is_actively_held is the scheduler's own

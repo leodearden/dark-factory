@@ -351,6 +351,106 @@ class TestReconcileOneStrandedGroundTruthRevert:
 
 
 # ---------------------------------------------------------------------------
+# Review amendment (task 2243 W10-θ2, reviewer_comprehensive #2) —
+# deploy-phase LEAVE parity.
+#
+# theta1's _RECOVERY table (task_ground_truth.py) requires deploy_phase is
+# None for EVERY MARK_DONE_WITH_PROVENANCE / REVERT_TO_PENDING row — so a
+# stranded in-progress task carrying a deploy_phase can only be classified
+# LEAVE (the common case: VERIFIED / FAILED / SCHEDULED / ESCALATED / DONE,
+# or RAN paired with any branch state other than GONE_NO_MARKER) or
+# RE_FILE_ESCALATION (row h: GONE_NO_MARKER + RAN, the D1 crashed-mid-deploy
+# shape). Both must leave the task untouched: DS-2 (the deploy-phase state
+# machine) owns its own mandatory recovery path, and reverting (or
+# phantom-completing) a stranded deploy could re-trigger one that already
+# took effect. Before this amendment, both actions fell through the generic
+# in-progress tail to _revert_in_progress_if_no_live_claimant, silently
+# overriding the table's LEAVE/defer-to-DS-2 intent.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestReconcileOneStrandedDeployPhaseLeaveParity:
+    async def test_failed_deploy_phase_off_main_left_alone_not_reverted(
+        self, harness: Harness,
+    ):
+        """A stranded in-progress task in a FAILED deploy phase, off-main, no
+        live claimant, no open escalation — the table's deploy_phase gap
+        classifies this LEAVE (not REVERT_TO_PENDING, which requires
+        deploy_phase is None). Must not be reverted: DS-2 owns FAILED's own
+        mandatory recovery path (FAILED -> ESCALATED)."""
+        tid = '9008'
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={
+                'status': 'in-progress',
+                'metadata': {'deploy_state': {'phase': 'failed'}},
+            },
+        )
+        # EXISTS_OFF_MAIN: ref present, not an ancestor of main.
+        harness.git_ops.is_ancestor = AsyncMock(return_value=False)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(  # type: ignore[attr-defined]
+            return_value='deadbeef' + 'a' * 32,
+        )
+
+        result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 0
+
+    async def test_verified_deploy_phase_on_main_left_alone_not_marked_done(
+        self, harness: Harness,
+    ):
+        """A stranded in-progress task in a VERIFIED (terminal-success)
+        deploy phase, even WITH on-main branch evidence, is left alone —
+        deploy_phase != None excludes it from every MARK_DONE row too, so
+        this is a deliberate no-op, not a missed done-flip."""
+        tid = '9009'
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={
+                'status': 'in-progress',
+                'metadata': {'deploy_state': {'phase': 'verified'}},
+            },
+        )
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(  # type: ignore[attr-defined]
+            return_value='deadbeef' + 'a' * 32,
+        )
+
+        result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 0
+
+    async def test_ran_deploy_phase_gone_no_marker_left_alone_not_reverted(
+        self, harness: Harness,
+    ):
+        """D1's crashed-mid-deploy shape (row h: RAN + GONE_NO_MARKER) also
+        must not be reverted by this generic reaper — the table routes it to
+        RE_FILE_ESCALATION (owned elsewhere, not this in-progress path),
+        never a silent revert that could re-run an in-flight deploy."""
+        tid = '9010'
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={
+                'status': 'in-progress',
+                'metadata': {'deploy_state': {'phase': 'ran'}},
+            },
+        )
+        harness.git_ops.is_ancestor = AsyncMock(return_value=False)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+
+        result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 0
+
+
+# ---------------------------------------------------------------------------
 # task 2243 (W10-θ2) step-7 — degenerate-branch parity (RESOLVER GAP).
 #
 # θ1's _RECOVERY table has no degenerate-branch guard: a stranded task whose
@@ -2464,13 +2564,24 @@ async def test_mid_run_cancel_window_grace(harness: Harness, tmp_path: Path):
 @pytest.mark.asyncio
 async def test_mid_run_live_claimant_not_shortcut_by_driver_guard(harness: Harness):
     """A live-claimant (is_actively_held) in-progress task is still left
-    untouched once the driver's own continue-guard is removed — driven
-    purely by recovery_for's LEAVE classification, not a driver short-circuit.
+    untouched once the driver's own continue-guard is removed — the DRIVER
+    still calls _reconcile_one_stranded unconditionally for every candidate
+    (no driver-level continue reintroduced; task 2243 step-12 parity).
 
-    RED under current code: the driver's `if mid_run and
+    RED under the pre-step-12 code: the driver's `if mid_run and
     self.scheduler.is_actively_held(tid): continue` guard 'continue's before
     _reconcile_one_stranded is ever called, so the spy below is never
     invoked and the assertion fails.
+
+    Review amendment (reviewer_comprehensive #1): _reconcile_one_stranded
+    itself now short-circuits on this same is_actively_held signal BEFORE
+    calling recovery_for (cheap, in-memory — avoids paying for
+    derive_truth's git archaeology on every normally-running task), so
+    recovery_for is no longer actually reached for this specific scenario.
+    This test still pins the DRIVER-level contract (called unconditionally
+    for every candidate); see
+    test_mid_run_actively_held_short_circuits_before_recovery_for below for
+    a direct pin of the new function-level short-circuit.
     """
     harness.scheduler._dispatched = {'70'}  # type: ignore[attr-defined]
     harness.scheduler.lock_table = mock_lock_table()  # type: ignore[attr-defined]
@@ -2486,6 +2597,42 @@ async def test_mid_run_live_claimant_not_shortcut_by_driver_guard(harness: Harne
     spy.assert_awaited_once_with('70', 'in-progress', mid_run=True)
     assert changed == 0
     harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_mid_run_actively_held_short_circuits_before_recovery_for(
+    harness: Harness,
+):
+    """Review amendment (task 2243 W10-θ2, reviewer_comprehensive #1): a
+    mid-run actively-held task must not pay for recovery_for's derive_truth
+    (MergeProvenance lookup + git archaeology fallback + get_task) — the
+    outcome is a guaranteed LEAVE (is_actively_held folds into
+    report.live_claimant, and no _RECOVERY row matches a live claimant), so
+    _reconcile_one_stranded returns None before ever building the resolver
+    or fetching the task row.
+    """
+    tid = '72'
+    harness.scheduler._dispatched = {tid}  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = mock_lock_table()  # type: ignore[attr-defined]
+
+    harness._get_ground_truth = MagicMock(  # type: ignore[method-assign]
+        side_effect=AssertionError(
+            '_get_ground_truth must not be called for an actively-held '
+            'mid-run candidate — the short-circuit must fire first',
+        ),
+    )
+    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+        side_effect=AssertionError(
+            'get_task must not be called for an actively-held mid-run '
+            'candidate — the short-circuit must fire first',
+        ),
+    )
+
+    result = await harness._reconcile_one_stranded(tid, 'in-progress', mid_run=True)
+
+    assert result is None
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+    harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
