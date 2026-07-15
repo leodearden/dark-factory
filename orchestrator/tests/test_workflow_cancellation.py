@@ -12,16 +12,39 @@ Test coverage:
   step-03: ``CancellationScope.supervise`` soft-cancel + normal-return paths
   step-05: ``CancellationScope.supervise`` hard-cancel + repeated-cancel
     cleanup-survival paths
+  step-07: ``TaskWorkflow.run()`` single-catch site (boundary row 14) — a
+    real workflow, harness-style hard-cancelled mid-VERIFY
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import pytest
 
-from orchestrator.workflow_types import CancellationScope, WorkflowCancelled
+# Cross-module reuse (task 2610 precedent — see test_workflow_terminal_report.py
+# for the same import shape): these factories live in _workflow_helpers.py, not
+# in any single test module's private namespace.
+from _workflow_helpers import (
+    AgentStub,
+    _build_workflow,
+    _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
+    _init_repo,
+)
+
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps
+from orchestrator.scheduler import TaskAssignment
+from orchestrator.workflow_types import (
+    CancellationScope,
+    TerminalReport,
+    WorkflowCancelled,
+    WorkflowOutcome,
+    WorkflowState,
+    outcome_allows_status,
+)
 
 
 def _make_recording_on_terminal(
@@ -261,3 +284,126 @@ class TestCancellationScopeHardCancel:
         assert exc.kind == 'hard'
         assert [name for name, _kind in log] == ['a', 'b', 'c'], f'cleanup truncated: {log!r}'
         assert all(kind == 'hard' for _name, kind in log)
+
+
+# ---------------------------------------------------------------------------
+# step-07: TaskWorkflow.run() single-catch site (boundary row 14)
+# ---------------------------------------------------------------------------
+#
+# Fixtures mirror test_workflow_terminal_report.py's e2e-style setup (task
+# 2610 Group D factories: _build_workflow / AgentStub / _init_repo) — a REAL
+# TaskWorkflow driven through PLAN + EXECUTE via the AgentStub, then wedged
+# inside VERIFY so a harness-style hard-cancel (task.cancel() on the run()
+# task) has something to interrupt.
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    """A bare-minimum git repo with an initial commit."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_init_repo(repo))
+    return repo
+
+
+@pytest.fixture
+def config(git_repo: Path) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        project_root=git_repo,
+        max_concurrent_tasks=1,
+        max_execute_iterations=5,
+        max_verify_attempts=3,
+        max_review_cycles=2,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+
+
+@pytest.fixture
+def git_ops(config: OrchestratorConfig) -> GitOps:
+    return GitOps(config.git, config.project_root)
+
+
+@pytest.fixture
+def task_assignment() -> TaskAssignment:
+    return TaskAssignment(
+        task_id='42',
+        task={
+            'id': '42',
+            'title': 'Add farewell function',
+            'description': 'Add a farewell(name) function to lib.py with tests',
+            'status': 'pending',
+            'metadata': {'files': ['lib']},
+            'dependencies': [],
+        },
+        modules=['lib'],
+    )
+
+
+@pytest.mark.asyncio
+class TestRunSingleCatchHardCancel:
+    """Boundary row 14: ``run()`` must RETURN a ``TerminalReport`` on a
+    harness-style hard-cancel, never let ``CancelledError`` escape — and
+    must not crash on SM-2 (the outcome<->status half is skipped for the
+    hard-cancel exit, since the live scheduler row is still 'in-progress',
+    which is NOT an allowed pairing for outcome==CANCELLED).
+
+    RED until step-8 wires the ``CancellationScope`` into ``run()``: today
+    ``run()`` is a bare ``await self._drive()`` with no catch, so cancelling
+    the run()-task leaves that task itself CANCELLED instead of returning.
+    """
+
+    async def test_hard_cancel_mid_verify_returns_cancelled_report(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+
+        wedged = asyncio.Event()
+
+        async def _wedge_verify() -> WorkflowOutcome:
+            # Entered only after _enter_phase(VERIFY) (workflow.py, just
+            # above the real _verify_debugfix_loop() call) — so by the time
+            # this fires, workflow.machine.state is already VERIFY.
+            wedged.set()
+            await asyncio.sleep(3600)
+            raise AssertionError('unreachable — cancelled before the sleep returns')
+
+        workflow._verify_debugfix_loop = _wedge_verify  # type: ignore[method-assign]
+
+        run_task = asyncio.create_task(workflow.run())
+        await asyncio.wait_for(wedged.wait(), timeout=5.0)
+        assert workflow.machine.state == WorkflowState.VERIFY
+
+        # Harness-style hard-cancel: cancel the task running run() directly
+        # (mirrors harness.hard_cancel_workflow's task.cancel() on the
+        # registered slot task).
+        run_task.cancel()
+        done, _pending = await asyncio.wait({run_task}, timeout=5.0)
+        assert run_task in done, 'run() task did not finish within 5s'
+
+        assert not run_task.cancelled(), (
+            'CancelledError escaped run() instead of being translated into '
+            'a TerminalReport(outcome=CANCELLED)'
+        )
+        report = run_task.result()
+        assert isinstance(report, TerminalReport)
+        assert report.outcome == WorkflowOutcome.CANCELLED
+        assert workflow.machine.state == WorkflowState.CANCELLED
+        assert report.phase == WorkflowState.CANCELLED
+
+        # The live scheduler row was claimed 'in-progress' by
+        # _setup_worktree_and_artifacts and never advanced (no terminal
+        # status write happens on a hard-cancel exit) — proving SM-2's
+        # outcome<->status half really was SKIPPED for this exit, not just
+        # coincidentally satisfied: 'in-progress' is NOT an allowed pairing
+        # for outcome==CANCELLED (_OUTCOME_ALLOWED['cancelled'] == {CANCELLED}
+        # only), yet run() above returned cleanly instead of raising.
+        last_status = await scheduler.get_status(workflow.task_id)
+        assert last_status == 'in-progress'
+        assert not outcome_allows_status(report.outcome, last_status)
