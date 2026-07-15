@@ -28,7 +28,7 @@ from escalation.models import Escalation  # noqa: F401 — keeps fixture parity
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import TaskWorkflow, WorkflowCancelled, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # Shared fixture helper (mirrors test_workflow_train_state_escalation._make)
@@ -392,10 +392,15 @@ async def test_blocked_outcome_escalates_to_human():
 
 @pytest.mark.asyncio
 async def test_soft_cancel_delegates_to_handle_soft_cancel():
-    """_await_cancellable returns None → _handle_soft_cancel('group-merge') is invoked.
+    """_await_cancellable raises WorkflowCancelled('soft') (W9-θ) → propagates
+    straight out of _maybe_enqueue_group_merge uncaught, to run()'s single
+    WorkflowCancelled catch site.
 
-    Patch _handle_soft_cancel to return WorkflowOutcome.REQUEUED; assert
-    _maybe_enqueue_group_merge returns that value.
+    _handle_soft_cancel is no longer invoked from this layer at all — its
+    scheduler-status decision (DONE / SOFT_CANCELLED / REQUEUED) is folded
+    into _finalise_cancellation, called only from run() after the catch (see
+    TestHandleSoftCancelOutcome in test_workflow.py for that decision's own
+    coverage).
     """
     members = [
         {'id': '101', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 0}}},
@@ -407,13 +412,12 @@ async def test_soft_cancel_delegates_to_handle_soft_cancel():
         metadata={'train': {'id': 'T1', 'order': 2}},
         tasks_by_train_return=members,
     )
-    f.wf._await_cancellable = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    f.wf._await_cancellable = AsyncMock(side_effect=WorkflowCancelled('soft'))  # type: ignore[method-assign]
     handle_soft_cancel = AsyncMock(return_value=WorkflowOutcome.REQUEUED)
     f.wf._handle_soft_cancel = handle_soft_cancel  # type: ignore[method-assign]
 
-    result = await f.wf._maybe_enqueue_group_merge()
+    with pytest.raises(WorkflowCancelled) as excinfo:
+        await f.wf._maybe_enqueue_group_merge()
 
-    handle_soft_cancel.assert_awaited_once_with('group-merge')
-    assert result == WorkflowOutcome.REQUEUED, (
-        f'Expected REQUEUED from _handle_soft_cancel, got {result!r}'
-    )
+    assert excinfo.value.kind == 'soft'
+    handle_soft_cancel.assert_not_awaited()

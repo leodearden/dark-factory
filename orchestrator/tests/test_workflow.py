@@ -35,6 +35,7 @@ from orchestrator.workflow import (
     StewardResolved,
     StewardTerminalDecision,
     TaskWorkflow,
+    WorkflowCancelled,
     WorkflowOutcome,
     WorkflowState,
 )
@@ -1206,7 +1207,13 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
         # Pre-set cancel_event so the workflow soft-cancels after attaching
         wf._cancel_event.set()
 
-        outcome = await wf._submit_to_merge_queue('B', merge_phase=True)
+        # W9-θ: cancel-win now raises WorkflowCancelled('soft') (propagating to
+        # run()'s single catch) instead of returning SOFT_CANCELLED directly —
+        # the DONE-vs-SOFT_CANCELLED status decision moved to
+        # _finalise_cancellation/_handle_soft_cancel (see TestHandleSoftCancelOutcome).
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await wf._submit_to_merge_queue('B', merge_phase=True)
+        assert excinfo.value.kind == 'soft'
 
         # (1) Workflow waiter was detached; only MCP waiter 'mr-mcp' remains
         entry = registry.entry('B')
@@ -1216,9 +1223,6 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
 
         # (2) Primary P is NOT cancelled
         assert not P.cancelled()
-
-        # (3) Outcome is SOFT_CANCELLED (scheduler says in-progress + cancel_event set)
-        assert outcome == WorkflowOutcome.SOFT_CANCELLED
 
     async def test_re_attach_coalesces_after_soft_cancel(
         self, tmp_path, monkeypatch,
@@ -1286,9 +1290,12 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
             lambda *a, **kw: None,
         )
 
-        # First call: soft-cancel → detach
+        # First call: soft-cancel → detach.  W9-θ: raises WorkflowCancelled('soft')
+        # instead of returning — the detach still happens in _await_cancellable's
+        # finally before the raise propagates.
         wf._cancel_event.set()
-        await wf._submit_to_merge_queue('B', merge_phase=True)
+        with pytest.raises(WorkflowCancelled):
+            await wf._submit_to_merge_queue('B', merge_phase=True)
         _entry = registry.entry('B')
         assert _entry is not None
         assert len(_entry.waiters) == 1  # detached
@@ -1327,9 +1334,10 @@ class TestAwaitCancellableSoftCancelHook:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         hook_calls: list[int] = []
 
-        result = await wf._await_cancellable(fut, on_soft_cancel=lambda: hook_calls.append(1))
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await wf._await_cancellable(fut, on_soft_cancel=lambda: hook_calls.append(1))
 
-        assert result is None
+        assert excinfo.value.kind == 'soft'
         assert hook_calls == [1], 'hook must be called exactly once'
         assert not fut.cancelled(), 'future must NOT be cancelled when hook is provided'
 
@@ -1344,9 +1352,10 @@ class TestAwaitCancellableSoftCancelHook:
 
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
 
-        result = await wf._await_cancellable(fut)
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await wf._await_cancellable(fut)
 
-        assert result is None
+        assert excinfo.value.kind == 'soft'
         assert fut.cancelled(), 'future must be cancelled when no hook is provided'
 
     async def test_hook_not_called_when_future_resolves_first(
@@ -1441,7 +1450,11 @@ class TestGroupMergePathUnchangedByGamma3:
         # Soft-cancel fires immediately
         wf._cancel_event.set()
 
-        outcome = await wf._maybe_enqueue_group_merge()
+        # W9-θ: cancel-win now raises WorkflowCancelled('soft') instead of
+        # returning SOFT_CANCELLED — propagates to run()'s single catch site.
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await wf._maybe_enqueue_group_merge()
+        assert excinfo.value.kind == 'soft'
 
         # D9: the GroupMergeRequest future was cancelled (blanket fut.cancel(), no on_soft_cancel).
         # fut.cancel() schedules the done_callback (which releases the registry slot) for the
@@ -1455,9 +1468,6 @@ class TestGroupMergePathUnchangedByGamma3:
         # No attach or detach calls — train path uses acquire/release, not attach/detach
         assert attach_calls == [], f'registry.attach must not be called for train; got {attach_calls}'
         assert detach_calls == [], f'registry.detach must not be called for train; got {detach_calls}'
-
-        # Soft-cancel → SOFT_CANCELLED (non-terminal scheduler status + cancel_event set)
-        assert outcome == WorkflowOutcome.SOFT_CANCELLED
 
 
 @pytest.mark.asyncio
@@ -1522,7 +1532,11 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
         # Pre-set cancel_event; soft-cancel fires as soon as _await_cancellable runs.
         wf._cancel_event.set()
 
-        outcome = await wf._submit_to_merge_queue('B', merge_phase=True)
+        # W9-θ: cancel-win now raises WorkflowCancelled('soft') instead of
+        # returning SOFT_CANCELLED — propagates to run()'s single catch site.
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await wf._submit_to_merge_queue('B', merge_phase=True)
+        assert excinfo.value.kind == 'soft'
 
         # Enqueued (branch slot was free).
         assert real_queue.qsize() == 1
@@ -1532,9 +1546,6 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
         for _ in range(5):
             await asyncio.sleep(0)
         assert registry.entry('B') is None, 'slot must be released after cancel'
-
-        # Outcome is SOFT_CANCELLED (scheduler non-terminal + cancel_event set).
-        assert outcome == WorkflowOutcome.SOFT_CANCELLED
 
     async def test_rev_parse_failure_falls_through_to_enqueue(
         self, tmp_path, monkeypatch,
@@ -1686,8 +1697,12 @@ class TestBoundaryTableWorkflow:
         )
 
         # ── (1)+(2) First call: soft-cancel → detach ───────────────────────
+        # W9-θ: cancel-win now raises WorkflowCancelled('soft') instead of
+        # returning SOFT_CANCELLED — propagates to run()'s single catch site.
         wf._cancel_event.set()
-        outcome1 = await wf._submit_to_merge_queue('B', merge_phase=True)
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await wf._submit_to_merge_queue('B', merge_phase=True)
+        assert excinfo.value.kind == 'soft'
 
         entry = registry.entry('B')
         assert entry is not None, 'entry must remain in-flight after detach'
@@ -1698,9 +1713,6 @@ class TestBoundaryTableWorkflow:
             f'Remaining waiter must be mr-mcp, got: {entry.waiters[0].request_id!r}'
         )
         assert not P.cancelled(), 'Primary P must NOT be cancelled after workflow soft-cancel'
-        assert outcome1 == WorkflowOutcome.SOFT_CANCELLED, (
-            f'Expected SOFT_CANCELLED outcome after soft-cancel, got: {outcome1}'
-        )
 
         # ── (3) Re-attach: coalesces back to 2 waiters ──────────────────────
         wf._cancel_event.clear()

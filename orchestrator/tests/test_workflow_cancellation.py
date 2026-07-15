@@ -177,6 +177,35 @@ class TestCancellationScopeSoftCancel:
         assert body_cancelled is True
 
     @pytest.mark.asyncio
+    async def test_body_raising_workflow_cancelled_directly_propagates_its_own_kind(self):
+        # W9-θ step-12 discovery: application code inside the body (e.g. the
+        # merge-retry loop's explicit cancel re-check, or _await_cancellable)
+        # can now raise WorkflowCancelled directly as ordinary control flow —
+        # a DIFFERENT detection path than this scope's own event-race (tested
+        # above). supervise() must still capture the raised exception's own
+        # .kind and pass it to on_terminal — not leave `kind` at its default
+        # None, which would make on_terminal treat a real soft-cancel as a
+        # normal exit and silently skip the kind-aware lane-release policy.
+        log: list[tuple[str, str | None]] = []
+        on_terminal = _make_recording_on_terminal(log)
+        event = asyncio.Event()  # never set — the body raises on its own
+        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+
+        async def _body() -> None:
+            await asyncio.sleep(0)
+            raise WorkflowCancelled(kind='soft')
+
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await scope.supervise(_body())
+
+        assert excinfo.value.kind == 'soft'
+        assert [name for name, _kind in log] == ['a', 'b', 'c']
+        assert all(kind == 'soft' for _name, kind in log), (
+            f'on_terminal must see kind=soft when the body raises WorkflowCancelled '
+            f'directly, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_body_returns_normally_runs_on_terminal_once_with_none_kind(self):
         log: list[tuple[str, str | None]] = []
         on_terminal = _make_recording_on_terminal(log)

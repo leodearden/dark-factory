@@ -1983,16 +1983,33 @@ class TaskWorkflow:
     async def _stop_claimant_heartbeat(self) -> None:
         """Cancel and await the heartbeat loop task, if one was started.
 
-        Called from ``run()``'s finally (before the harness clears the
-        claimant at slot release) so the loop can never race a post-clear
-        re-stamp. A no-op when the loop was never started (e.g. dispatch
-        raised before reaching that point).
+        Called first from :meth:`_on_terminal_cleanups` (before the harness
+        clears the claimant at slot release) so the loop can never race a
+        post-clear re-stamp. A no-op when the loop was never started (e.g.
+        dispatch raised before reaching that point).
+
+        W9-θ: this now runs as the first entry of the ordered ``on_terminal``
+        list (moved out of ``_drive()``'s own ``finally``), so an unexpected
+        failure inside the loop itself (vs. the expected ``CancelledError``
+        from the ``.cancel()`` above) would otherwise propagate out of
+        ``CancellationScope.supervise`` and abort every LATER cleanup entry —
+        including lane release.  The loop's own refresh call is already
+        documented as best-effort; catching-and-logging here extends that
+        same guarantee to the loop's teardown, so one bad heartbeat tick can
+        never take down the rest of terminal cleanup.
         """
         if self._claimant_heartbeat_task is None:
             return
         self._claimant_heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        try:
             await self._claimant_heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception(
+                f'Task {self.task_id}: claimant heartbeat loop failed '
+                f'(non-fatal — continuing terminal cleanup)'
+            )
         self._claimant_heartbeat_task = None
 
     async def _drive(  # pyright: ignore[reportGeneralTypeIssues]
@@ -2255,6 +2272,21 @@ class TaskWorkflow:
             await self._await_steward_completion()
             self._enter_phase(WorkflowState.DONE)
             return await self._finalise_merged_done()
+
+        except WorkflowCancelled:
+            # W9-θ: a small handful of call sites inside this try block
+            # (the merge-retry loop's explicit cancel re-check, and
+            # _await_cancellable via _submit_to_merge_queue /
+            # _maybe_enqueue_group_merge) now raise WorkflowCancelled
+            # directly as ordinary control flow — not via CancellationScope's
+            # own event-race, which never enters this method's body at all.
+            # WorkflowCancelled IS an Exception subclass (unlike
+            # asyncio.CancelledError), so without this clause it would be
+            # swallowed by the generic `except Exception` ladder below and
+            # misreported as a BLOCKED workflow error. Bare re-raise lets it
+            # propagate to CancellationScope/run()'s single catch site,
+            # preserving CX-1 ("caught at EXACTLY ONE place").
+            raise
 
         except SetTaskStatusRejected as exc:
             # Fast-path: a terminal-status rejection arrived out-of-band before
@@ -9670,10 +9702,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
     async def _await_cancellable(self, awaitable, *, on_soft_cancel=None):
         """Race ``awaitable`` against ``self._cancel_event``.
 
-        Returns the awaitable's result, or ``None`` if the cancel event was
-        set first.  When ``None`` is returned the caller should look up the
-        scheduler's truth and decide between DONE / cancelled / normal-blocked
-        via :meth:`_handle_soft_cancel`.
+        Returns the awaitable's result, or raises ``WorkflowCancelled('soft')``
+        (W9-θ) if the cancel event was set first — it propagates straight to
+        ``run()``'s single ``WorkflowCancelled`` catch, which folds in the
+        scheduler-status decision (:meth:`_handle_soft_cancel`) via
+        :meth:`_finalise_cancellation`.
 
         If both the awaitable and the cancel event resolve in the same
         ``asyncio.wait`` window, the awaitable's result wins — the work
@@ -9698,7 +9731,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if fut in done:
                 return fut.result()
             cancel_won = True
-            return None
+            raise WorkflowCancelled('soft')
         finally:
             if not cancel_task.done():
                 cancel_task.cancel()

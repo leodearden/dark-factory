@@ -675,7 +675,7 @@ class WorkflowStateMachine:
         self._state = to
 
 
-@dataclass(frozen=True)
+@dataclass
 class WorkflowCancelled(Exception):
     """The ONE typed cancellation signal (CX-1, PRD §8.1).
 
@@ -686,6 +686,17 @@ class WorkflowCancelled(Exception):
     Replaces the ``sys.exc_info()`` B1 sniff (workflow.py) and the harness's
     B2 ``synthetic_cancel`` dual-guard — a two-file "both must fire" comment
     contract — with one exception type carrying the distinction as data.
+
+    Deliberately NOT ``frozen=True`` (unlike this module's other dataclasses):
+    a frozen dataclass overrides ``__setattr__`` to unconditionally raise
+    ``FrozenInstanceError`` for ANY attribute, including ``__traceback__`` —
+    which Python's own exception machinery assigns when an exception is
+    re-raised through a ``@contextlib.contextmanager``-based ``__exit__``
+    (e.g. ``pytest.MonkeyPatch.context()``, hit via ``_await_cancellable``'s
+    raise). ``frozen=True`` was tried first per the plan's step-1/2 risk
+    note; construct/raise/catch/read in isolation (step 1) passed, but the
+    contextmanager-propagation path only surfaced once real call sites
+    started raising it (step 12), confirming the anticipated fallback.
     """
 
     kind: Literal['hard', 'soft']
@@ -757,6 +768,17 @@ class CancellationScope:
                     raise WorkflowCancelled('hard')
                 exc = body.exception()
                 if exc is not None:
+                    # The body itself raised WorkflowCancelled directly as
+                    # ordinary control flow (W9-θ: e.g. the merge-retry
+                    # loop's explicit cancel re-check, or _await_cancellable
+                    # via _submit_to_merge_queue) rather than this scope's
+                    # own event-race detecting it below. Without capturing
+                    # its kind here, `kind` would stay None and on_terminal
+                    # would run as if this were a normal exit — silently
+                    # skipping the kind-aware lane-release policy (e.g. a
+                    # soft-cancel's release, boundary row 15).
+                    if isinstance(exc, WorkflowCancelled):
+                        kind = exc.kind
                     raise exc
                 return body.result()
             # waiter resolved first (event fired) and body is still
