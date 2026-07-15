@@ -34,6 +34,7 @@ class _Fixture:
     get_changed_files: AsyncMock
     invoke_called: list[bool]
     event_emit: MagicMock
+    build_architect_prompt: AsyncMock
 
 
 def _make(
@@ -169,6 +170,7 @@ def _make(
         get_changed_files=get_changed_files,
         invoke_called=invoke_called,
         event_emit=event_emit,
+        build_architect_prompt=briefing.build_architect_prompt,
     )
 
 
@@ -366,8 +368,8 @@ async def test_fresh_dispatch_excludes_prior_proposals(tmp_path: Path):
     with pytest.raises(AssertionError, match='architect must NOT'):
         await f.wf._plan()
 
-    f.wf.briefing.build_architect_prompt.assert_awaited_once()
-    _, kwargs = f.wf.briefing.build_architect_prompt.call_args
+    f.build_architect_prompt.assert_awaited_once()
+    _, kwargs = f.build_architect_prompt.call_args
     assert kwargs.get('include_prior_proposals', False) is False
 
 
@@ -386,6 +388,6 @@ async def test_replan_fallthrough_includes_prior_proposals(tmp_path: Path):
     with pytest.raises(AssertionError, match='architect must NOT'):
         await f.wf._plan()
 
-    f.wf.briefing.build_architect_prompt.assert_awaited_once()
-    _, kwargs = f.wf.briefing.build_architect_prompt.call_args
+    f.build_architect_prompt.assert_awaited_once()
+    _, kwargs = f.build_architect_prompt.call_args
     assert kwargs.get('include_prior_proposals') is True

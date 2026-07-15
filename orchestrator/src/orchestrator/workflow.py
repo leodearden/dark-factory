@@ -296,7 +296,8 @@ class _McpLike(Protocol):
 
 class _BriefingLike(Protocol):
     async def build_architect_prompt(
-        self, task: dict, worktree: Path | None = ..., context: str | None = ...
+        self, task: dict, worktree: Path | None = ..., context: str | None = ...,
+        *, include_prior_proposals: bool = ...,
     ) -> str: ...
     async def build_resume_prompt(
         self,
