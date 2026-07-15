@@ -210,8 +210,20 @@ def classify(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
             f'likely proof of a different task, not this one',
         ]
 
-    # TODO(step-10/step-12): reverted / deliverable_absent / unverifiable are
-    # not yet distinguished from this interim fallback.
+    if audit.revert_commit or audit.declared_files_missing_on_main:
+        reasons: list[str] = []
+        if audit.revert_commit:
+            reasons.append(
+                f'commit was later reverted by {audit.revert_commit} '
+                f'(a "This reverts commit" marker was found on the audited ref)',
+            )
+        if audit.declared_files_missing_on_main:
+            missing = ', '.join(audit.declared_files_missing_on_main)
+            reasons.append(f'declared file(s) missing from the ref HEAD: {missing}')
+        return 'reverted', reasons
+
+    # TODO(step-12): deliverable_absent / unverifiable are not yet
+    # distinguished from this interim fallback.
     return 'ok', []
 
 
