@@ -865,6 +865,18 @@ class TestMergeVerifyRedProducesGateableProposal:
                     'orchestrator.dry_run_unblock.invoke_agent',
                     new=AsyncMock(return_value=agent_result),
                 ),
+                # task 2633: run_dry_run_unblock clamps a low-risk
+                # MERGE_VERIFY_RED proposal to 'human-review-required' unless
+                # the run's event history proves merge-completion eligibility
+                # ((b) a passing workflow_verify AND (c) a phase_enter(merge)).
+                # This golden test models the ELIGIBLE happy path (verify+review
+                # passed, landing jammed), so stub the predicate True and the
+                # proposal stays a gateable low-risk one. The ineligible→clamp
+                # path is pinned by TestMergeVerifyRedClampedWithoutCompletionEvidence.
+                patch(
+                    'orchestrator.dry_run_unblock.merge_completion_eligible',
+                    return_value=True,
+                ),
             ):
                 outcome = await _run_post_merge_verify(
                     git_ops, req, merge_wt,
@@ -922,6 +934,112 @@ class TestMergeVerifyRedProducesGateableProposal:
         )
         assert invocation_end_calls[-1].kwargs.get('phase') == 'blocked'
         assert invocation_end_calls[-1].kwargs.get('role') == 'unblock_auto'
+
+
+class TestMergeVerifyRedClampedWithoutCompletionEvidence:
+    """task 2633 clamp (a33b6e1e4d): the ineligible counterpart to the golden
+    test above.
+
+    Same end-to-end merge-verify-RED path and same agent-labelled
+    ``risk_label='low'`` proposal, but the run's event history carries NO
+    merge-completion evidence (a bare MagicMock event_store — the REAL
+    ``merge_completion_eligible`` reads it and returns False). ``run_dry_run_
+    unblock`` must therefore clamp the proposal to ``'human-review-required'``,
+    and ``b3_gate.check_proposal`` must then ABORT it (risk_label != 'low'),
+    routing the merge-verify-RED to a human /unblock instead of autonomous
+    consumption. Pins the clamp the clamp commit itself left untested.
+    """
+
+    def test_merge_verify_red_without_completion_evidence_clamps_to_abort(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        head_sha = _init_git_repo(req.worktree)
+
+        scheduler = _RecordingScheduler({'dry_run_proposals': []})
+        handles = _DryRunInvestigationHandles(scheduler=scheduler)
+        # Bare event_store: no workflow_verify(passed) and no phase_enter(merge)
+        # rows -> the real merge_completion_eligible returns False -> clamp fires.
+        event_store = MagicMock()
+
+        structured = {
+            'proposal_text': 'Fix the scoped lint failure',
+            'risk_label': 'low',
+            'files_referenced': ['orchestrator/src/orchestrator/foo.py'],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        def _fake_run_git(args: list[str], cwd: str) -> tuple[int, str]:
+            """HEAD always matches the recorded sha; footprint diff is empty."""
+            if 'rev-parse' in args:
+                return (0, head_sha)
+            return (0, '')
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(return_value=(False, '')),
+                ),
+                patch(
+                    'orchestrator.dry_run_unblock.invoke_agent',
+                    new=AsyncMock(return_value=agent_result),
+                ),
+                # NOTE: merge_completion_eligible is deliberately NOT patched
+                # here — the real predicate runs against the evidence-free
+                # event_store and returns False, so the clamp fires.
+            ):
+                outcome = await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    dry_run_handles=handles,
+                    event_store=event_store,
+                )
+                await asyncio.sleep(0)
+                if handles.background_tasks:
+                    await asyncio.gather(
+                        *handles.background_tasks, return_exceptions=True,
+                    )
+                return outcome
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+
+        proposals = scheduler._meta.get('dry_run_proposals', [])
+        assert proposals, 'Expected a dry_run_proposals entry to be written'
+        entry = proposals[-1]
+        assert entry['block_class'] == 'merge_verify_red', (
+            f"Expected block_class='merge_verify_red'; got {entry.get('block_class')!r}"
+        )
+        # The clamp downgraded the agent's 'low' -> 'human-review-required'
+        # because (b)+(c) evidence is absent.
+        assert entry['risk_label'] == 'human-review-required', (
+            f"Expected clamp to 'human-review-required'; got {entry.get('risk_label')!r}"
+        )
+
+        # b3_gate must ABORT the clamped proposal (risk_label != 'low'), so it
+        # is never autonomously consumed — it falls to a human /unblock.
+        verdict = check_proposal(
+            entry, worktree=str(req.worktree), category='task_failure',
+            run_git=_fake_run_git,
+        )
+        assert verdict['verdict'] == ABORT, (
+            f'Expected an ABORT (non-gateable) verdict for the clamped '
+            f'human-review-required proposal; got {verdict!r}'
+        )
 
 
 class TestInvestigationWorktreeSurvivesCleanup:

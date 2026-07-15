@@ -824,6 +824,17 @@ class TestMergeVerifyBlockProducesGateableProposal:
                     'orchestrator.dry_run_unblock.invoke_agent',
                     new=AsyncMock(return_value=agent_result),
                 ),
+                # task 2633: run_dry_run_unblock clamps a low-risk
+                # MERGE_VERIFY_RED proposal to 'human-review-required' unless
+                # the run's event history proves merge-completion eligibility
+                # ((b) a passing workflow_verify AND (c) a phase_enter(merge)).
+                # This GOLDEN scenario models the eligible happy path (verify+
+                # review passed, landing jammed), so stub the predicate True and
+                # the proposal stays a gateable low-risk one.
+                patch(
+                    'orchestrator.dry_run_unblock.merge_completion_eligible',
+                    return_value=True,
+                ),
             ):
                 outcome = await _run_post_merge_verify(
                     git_ops, req, merge_wt,
