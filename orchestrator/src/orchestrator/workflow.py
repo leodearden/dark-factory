@@ -2519,68 +2519,74 @@ class TaskWorkflow:
                 disposition=disp,
             )
 
-        finally:
-            # Stop the claimant heartbeat loop FIRST — before any other
-            # teardown — so it can never race the harness's post-release
-            # claimant clear with a stray refresh (task 2188, PRD
-            # task-status-authority C4/D4).
+    def _on_terminal_cleanups(self) -> list[OnTerminalEntry]:
+        """Ordered, kind-aware terminal-cleanup list run by ``CancellationScope``
+        on every exit from ``run()`` (normal return, soft-cancel, or
+        hard-cancel — ``kind`` is ``None`` for a normal exit).
+
+        Replaces ``_drive()``'s old ``finally`` block (W9-θ): the same five
+        cleanups, in the same order (``stop_claimant_heartbeat`` first —
+        task 2188, PRD task-status-authority C4/D4 — so the heartbeat loop
+        can never race the harness's post-release claimant clear with a
+        stray refresh), relocated here so any long ``await`` anywhere inside
+        the scope is cancellable by construction, without needing its own
+        opt-in.
+
+        The ``release_lane`` entry is the kind-aware 1:1 replacement for the
+        deleted ``sys.exc_info()`` ``_hard_cancel`` sniff (which used to
+        coordinate with harness.py's now-also-deleted B2 dual-guard via a
+        "both must fire" comment contract): it releases the warm lane for
+        every terminal exit EXCEPT a hard-cancel, which must leave the
+        branch/lane assignment untouched so a forcibly-torn-down workflow's
+        branch survives teardown — the harness R3 grace window + reconcile
+        sweep own reclaim from there, not this teardown.
+        ``kind == 'soft'`` releases even from a still-working state
+        (SOFT_CANCELLED can exit mid-phase); ``kind is None`` only releases
+        once the state has genuinely reached DONE/CANCELLED (mirrors the
+        pre-θ non-hard-cancel behaviour). Uses the default
+        ``allow_disk_backstop=False``: if ``_maybe_cleanup_done_worktree``
+        already released the lane and dropped the in-memory assignment
+        (T1/T2 sync-merge path), ``assignment_for`` returns ``None`` →
+        ``release_lane_for_terminal_task`` is a true no-op (no disk scan, no
+        redundant ``cleanup_worktree``/``git branch -D`` retry).
+        """
+        async def _stop_heartbeat(_kind: Literal['hard', 'soft'] | None) -> None:
             await self._stop_claimant_heartbeat()
-            # Stop steward if running
+
+        async def _stop_steward(_kind: Literal['hard', 'soft'] | None) -> None:
             if self._steward:
                 await self._steward.stop()
+
+        async def _cleanup_worktree(_kind: Literal['hard', 'soft'] | None) -> None:
             # Cleanup worktree (only if done AND branch is on main — preserve
-            # otherwise so an agent's update_task(status='done') bypass doesn't
-            # GC unmerged work). Skips externally-managed worktrees (eval mode).
+            # otherwise so an agent's update_task(status='done') bypass
+            # doesn't GC unmerged work). Skips externally-managed worktrees
+            # (eval mode).
             await self._maybe_cleanup_done_worktree()
-            # B1: release warm lane for any terminal exit (DONE or CANCELLED).
-            # Uses the default allow_disk_backstop=False: if
-            # _maybe_cleanup_done_worktree already released the lane and dropped
-            # the in-memory assignment (T1/T2 sync-merge path), assignment_for
-            # returns None → primitive returns False immediately (true no-op —
-            # no disk scan, no redundant cleanup_worktree / git branch -D retry).
-            # Covers T3 (done-at-dispatch, branch not on main yet) and T4 (cancelled).
-            #
-            # β guard (task 1913): also skip when an asyncio.CancelledError is
-            # actively propagating through this finally (process teardown).
-            # _handle_cancelled_terminal_exit (the only writer of state==CANCELLED)
-            # is never reached when the hard-cancel is ignored: the BaseException
-            # propagates directly through run()'s `except Exception` into here.
-            # Detection via sys.exc_info() is the idiomatic Python idiom; a normal
-            # DONE/authoritative-CANCELLED return has exc_info()==(None,None,None),
-            # so the release fires unchanged for genuine terminal exits.
-            #
-            # Skipping the eager release here only DEFERS lane reclaim to the
-            # periodic terminal-lane reconciler / next acquire; durable branch
-            # survival across that later reclaim requires α (task 1912)'s
-            # branch-preservation guard in release_warm_lane (not yet landed).
-            #
-            # Coordinated with harness.py B2 (report.synthetic_cancel=True): both
-            # guards protect the same hard-cancel event via independent mechanisms.
-            # B1 fires first — inside workflow.run() before the harness catches the
-            # CancelledError.  B2 fires in _run_slot's finally after _run_slot
-            # returns.  Neither depends on the other; both must fire to ensure no
-            # eager branch-deleting release escapes on the synthetic-cancel path.
-            _exc_type = sys.exc_info()[0]
-            _hard_cancel = _exc_type is not None and issubclass(_exc_type, asyncio.CancelledError)
+
+        async def _release_lane(kind: Literal['hard', 'soft'] | None) -> None:
             if (
-                self.state in (WorkflowState.DONE, WorkflowState.CANCELLED)
+                kind != 'hard'
                 and not self._worktree_external
-                and not _hard_cancel
+                and (
+                    kind is not None
+                    or self.state in (WorkflowState.DONE, WorkflowState.CANCELLED)
+                )
             ):
                 await self.git_ops.release_lane_for_terminal_task(self.task_id)
-            # Cleanup per-task config dir (preserve-aware — skips when circuit
-            # breaker tripped so the dir is available for forensic analysis).
+
+        async def _cleanup_config(_kind: Literal['hard', 'soft'] | None) -> None:
+            # Preserve-aware — skips when circuit breaker tripped so the dir
+            # is available for forensic analysis.
             self._cleanup_config_dir()
 
-    def _on_terminal_cleanups(self) -> list[OnTerminalEntry]:
-        """Ordered, kind-aware terminal-cleanup list for ``CancellationScope``.
-
-        Placeholder for now (task 2252 step-8) — returns an empty list, so
-        ``_drive()``'s own finally block (above) remains the sole owner of
-        terminal cleanup until step-10 relocates its five cleanups here and
-        deletes that finally block.
-        """
-        return []
+        return [
+            ('stop_claimant_heartbeat', _stop_heartbeat),
+            ('stop_steward', _stop_steward),
+            ('cleanup_done_worktree', _cleanup_worktree),
+            ('release_lane', _release_lane),
+            ('cleanup_config_dir', _cleanup_config),
+        ]
 
     async def _finalise_cancellation(self, kind: Literal['hard', 'soft']) -> WorkflowOutcome:
         """Resolve a caught :class:`WorkflowCancelled` into a ``WorkflowOutcome``.
