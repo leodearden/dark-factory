@@ -28,6 +28,32 @@ re-investigation.  A finding is only ever skipped on a POSITIVE freshness
 confirmation — a false skip would silently drop a genuinely-changed thread
 from remediation, which is far worse than a redundant LLM pass.
 
+Single-subject caveat: that "positive freshness confirmation" is a
+confirmation of the finding's PRIMARY subject only (:func:`select_primary_subject`
+— the first foreign ``cited_tasks`` entry, or the first entry when none are
+foreign).  A finding that cites MULTIPLE foreign tasks is skipped whenever
+that one primary subject is unchanged, even if a different, non-primary
+cited task has in fact changed.  This is a deliberate scope decision (one
+``get_task`` call per finding, per the task 2417 plan's design decisions),
+not a claim that every cited fact was re-verified.  Widening this pre-check
+to check freshness across every cited task — at the cost of one
+``get_task`` call per cited task instead of one per finding — is a
+reasonable follow-up if multi-subject scope-correction findings prove
+common in practice, but is out of scope here.
+
+Consecutive-skip cap: a ``(task_ref, flag_key)`` pair is skipped at most
+``max_consecutive_skips - 1`` cycles in a row (see
+:data:`DEFAULT_MAX_CONSECUTIVE_SKIPS`); the cycle after that is always
+forced back into ``to_reinvestigate`` — and the streak reset — even though
+the subject is still unchanged.  Without this cap a genuinely-stranded
+cross-project thread would be skipped by this pre-check forever, and since
+``ReconciliationHarness``'s Stage-3 persistence-gated escalation
+(``_INTEGRITY_FINDING_RECURRENCE_THRESHOLD``) only ever evaluates a finding
+when the CURRENT remediation pass produces its own fresh ``integrity_check``
+stage report, an indefinite skip would silently suppress escalation of a
+stranded issue forever — a project "loud failure over silent degradation"
+norm violation, not merely a missed optimization.
+
 Mirrors :meth:`ReconciliationHarness._reconcile_status_correction` /
 ``_delete_status_correction_memories``'s read-compare-supersede,
 add-then-delete pool-cap pattern, and reuses
@@ -61,6 +87,21 @@ CONSOLIDATED_SCOPE_KIND: str = 'consolidated_scope_correction'
 
 SCOPE_FRESHNESS_SOURCE: str = 'stage_scope_freshness'
 """``_source`` audit tag used for every scope_freshness memory write."""
+
+DEFAULT_MAX_CONSECUTIVE_SKIPS: int = 4
+"""Default cap on consecutive freshness-confirmed skips for one
+``(task_ref, flag_key)`` pair before :func:`precheck_scope_correction_freshness`
+forces a real re-investigation even though the subject is still unchanged —
+see the module docstring's "Consecutive-skip cap" section (task 2417
+amendment: reviewer finding ``robustness_silent_degradation``).
+
+Set to match ``ReconciliationHarness._INTEGRITY_FINDING_RECURRENCE_THRESHOLD``'s
+current value as a plain literal — NOT imported, since this module
+intentionally has no ``harness``/``stages`` import (see module docstring).
+Callers that care about staying in lockstep with the live threshold (e.g.
+the harness itself) should pass ``max_consecutive_skips`` explicitly rather
+than relying on this default.
+"""
 
 
 def is_cross_project_scope_correction(finding: dict[str, Any] | None, project_id: str) -> bool:
@@ -110,6 +151,10 @@ def select_primary_subject(
     Returns None when ``cited_tasks`` is missing/empty, or contains no
     structurally-valid entry.  ``task_id`` is coerced to ``str``.  Pure,
     sync, no I/O.
+
+    This single subject is the ONLY one freshness is ever tracked against —
+    see the module docstring's "Single-subject caveat" for what that means
+    for a finding citing more than one foreign task.
     """
     if not isinstance(finding, dict):
         return None
@@ -164,6 +209,7 @@ def build_scope_snapshot_metadata(
     run_id: str,
     snapshot_at: str,
     no_change: bool = False,
+    skip_streak: int = 0,
 ) -> dict[str, Any]:
     """Build the canonical scope-freshness-snapshot Mem0 metadata payload.
 
@@ -178,7 +224,12 @@ def build_scope_snapshot_metadata(
     ``no_change`` is only included (as ``True``) when explicitly requested —
     set on the lightweight 'still blocked, no change' marker written when a
     finding is skipped; omitted (not merely ``False``) on a snapshot
-    recording a first-sight or changed subject.  Pure, sync, no I/O.
+    recording a first-sight or changed subject.  ``skip_streak`` (always
+    included, default 0) is the number of CONSECUTIVE freshness-confirmed
+    skips this snapshot represents — 0 on a first-sight/changed/forced
+    snapshot, incremented by the caller on each consecutive 'no change'
+    marker; see the module docstring's "Consecutive-skip cap".  Pure, sync,
+    no I/O.
     """
     metadata: dict[str, Any] = {
         'kind': CONSOLIDATED_SCOPE_KIND,
@@ -192,6 +243,7 @@ def build_scope_snapshot_metadata(
         'subject_description_fingerprint': _content_fingerprint(description or ''),
         'run_id': run_id,
         'snapshot_at': snapshot_at,
+        'skip_streak': skip_streak,
     }
     if no_change:
         metadata['no_change'] = True
@@ -294,16 +346,30 @@ class ScopeFreshnessResult(NamedTuple):
     Attributes:
         to_reinvestigate: Findings to feed into the LLM stages — every
             non-scope-correction finding, every scope-correction finding with
-            no usable/resolvable subject, and every scope-correction finding
-            whose subject is new or has changed since the last snapshot.
+            no usable/resolvable subject, every scope-correction finding
+            whose PRIMARY subject (see :func:`select_primary_subject` and
+            the module docstring's "Single-subject caveat") is new or has
+            changed since the last snapshot, AND every scope-correction
+            finding forced back for re-investigation because its
+            consecutive freshness-confirmed-skip streak reached
+            ``max_consecutive_skips`` (see "Consecutive-skip cap").
             Order-preserving relative to the input ``findings`` list.
-        skipped: Cross-project scope-correction findings confirmed unchanged
-            since the last consolidated snapshot — dropped from this cycle's
-            LLM re-derivation.
+        skipped: Cross-project scope-correction findings whose PRIMARY
+            subject was confirmed unchanged since the last consolidated
+            snapshot, and whose consecutive-skip streak was still under
+            ``max_consecutive_skips`` — dropped from this cycle's LLM
+            re-derivation.
         stats: Counters for logging/observability —
             ``scope_freshness_candidates`` (cross-project scope-correction
-            findings with a usable subject and a resolvable project root),
-            ``scope_freshness_reinvestigated``, ``scope_freshness_skipped``.
+            findings with a usable subject and a resolvable project root —
+            i.e. ones this pre-check actually attempted a live comparison
+            for), ``scope_freshness_reinvestigated`` (every candidate kept
+            for re-investigation PLUS every non-candidate finding that was
+            also kept, e.g. an unresolvable root or a per-finding error),
+            ``scope_freshness_skipped``, and
+            ``scope_freshness_forced_reinvestigation`` (the subset of
+            ``scope_freshness_reinvestigated`` that was forced back by the
+            consecutive-skip cap rather than genuinely new/changed).
     """
 
     to_reinvestigate: list[dict[str, Any]]
@@ -319,6 +385,7 @@ async def precheck_scope_correction_freshness(
     resolve_project_root: Callable[[str], str | None],
     run_id: str,
     findings: list[dict[str, Any]],
+    max_consecutive_skips: int = DEFAULT_MAX_CONSECUTIVE_SKIPS,
 ) -> ScopeFreshnessResult:
     """Filter *findings*, skipping re-derivation of unchanged scope-correction threads.
 
@@ -328,10 +395,14 @@ async def precheck_scope_correction_freshness(
     checked against the most recent prior freshness snapshot for
     ``(task_ref, flag_key)``; a single ``taskmaster.get_task`` call reads the
     subject's live state.  When unchanged since the snapshot (see
-    :func:`snapshot_is_fresh`), the finding is skipped and a lightweight
-    'still blocked, no change' marker is written; otherwise (first sight, or
-    the subject changed) the finding is kept and the snapshot is (re)written
-    to record the subject's current state.
+    :func:`snapshot_is_fresh`) AND the pair's consecutive-skip streak is
+    still under *max_consecutive_skips*, the finding is skipped and a
+    lightweight 'still blocked, no change' marker is written (recording the
+    bumped streak); otherwise — first sight, the subject changed, OR the
+    streak just reached *max_consecutive_skips* — the finding is kept and
+    the snapshot is (re)written to record the subject's current state with
+    the streak reset to 0.  See the module docstring's "Consecutive-skip
+    cap" and "Single-subject caveat" sections.
 
     Fail-open: an unresolvable foreign project root, a ``get_task`` failure,
     a Mem0 read/write failure, or any other unexpected per-finding error
@@ -347,6 +418,7 @@ async def precheck_scope_correction_freshness(
         'scope_freshness_candidates': 0,
         'scope_freshness_reinvestigated': 0,
         'scope_freshness_skipped': 0,
+        'scope_freshness_forced_reinvestigation': 0,
     }
 
     try:
@@ -362,7 +434,6 @@ async def precheck_scope_correction_freshness(
                 continue
             task_ref, flag_key = signature
             subject_project_id, subject_task_id = subject
-            stats['scope_freshness_candidates'] += 1
 
             try:
                 subject_root = resolve_project_root(subject_project_id)
@@ -370,6 +441,15 @@ async def precheck_scope_correction_freshness(
                     to_reinvestigate.append(finding)
                     stats['scope_freshness_reinvestigated'] += 1
                     continue
+                # A "candidate" (per ScopeFreshnessResult.stats docstring) is
+                # a finding with BOTH a usable subject AND a resolvable
+                # project root — i.e. one we actually attempt a live
+                # get_task/snapshot comparison for.  Counted here, after the
+                # resolvable-root guard above, not before it (task 2417
+                # amendment — reviewer finding observability_stats_inconsistency:
+                # counting an unresolvable-root finding as a candidate
+                # contradicted this docstring).
+                stats['scope_freshness_candidates'] += 1
 
                 prior_memories = await memory_service.get_memories_by_metadata(
                     project_id=project_id,
@@ -395,44 +475,74 @@ async def precheck_scope_correction_freshness(
                 if latest_prior is not None and snapshot_is_fresh(
                     latest_prior.get('metadata') or {}, live_task,
                 ):
-                    # Unchanged since the last snapshot: skip re-derivation
-                    # and write a lightweight 'still blocked, no change'
-                    # marker instead.
-                    no_change_metadata = build_scope_snapshot_metadata(
-                        task_ref=task_ref, flag_key=flag_key,
-                        subject_project_id=subject_project_id,
-                        subject_task_id=subject_task_id,
-                        status=status, updated_at=updated_at, description=description,
-                        run_id=run_id, snapshot_at=snapshot_at, no_change=True,
-                    )
-                    await memory_service.add_memory(
-                        content=(
-                            f'Scope-correction freshness check for {task_ref} '
-                            f'(flag_type={flag_key!r}): still blocked, no change.'
-                        ),
-                        category='observations_and_summaries',
-                        project_id=project_id,
-                        metadata=no_change_metadata,
-                        _source=SCOPE_FRESHNESS_SOURCE,
-                    )
-                    await _pool_cap_scope_snapshots(
-                        memory_service, prior_memories, project_id, task_ref,
-                    )
-                    skipped.append(finding)
-                    stats['scope_freshness_skipped'] += 1
+                    prior_metadata = latest_prior.get('metadata') or {}
+                    prior_skip_streak = prior_metadata.get('skip_streak')
+                    if not isinstance(prior_skip_streak, int):
+                        prior_skip_streak = 0
+                    new_skip_streak = prior_skip_streak + 1
+
+                    if new_skip_streak < max_consecutive_skips:
+                        # Unchanged since the last snapshot, and still under
+                        # the consecutive-skip cap: skip re-derivation and
+                        # write a lightweight 'still blocked, no change'
+                        # marker instead, recording the bumped streak.
+                        no_change_metadata = build_scope_snapshot_metadata(
+                            task_ref=task_ref, flag_key=flag_key,
+                            subject_project_id=subject_project_id,
+                            subject_task_id=subject_task_id,
+                            status=status, updated_at=updated_at, description=description,
+                            run_id=run_id, snapshot_at=snapshot_at, no_change=True,
+                            skip_streak=new_skip_streak,
+                        )
+                        await memory_service.add_memory(
+                            content=(
+                                f'Scope-correction freshness check for {task_ref} '
+                                f'(flag_type={flag_key!r}): still blocked, no change.'
+                            ),
+                            category='observations_and_summaries',
+                            project_id=project_id,
+                            metadata=no_change_metadata,
+                            _source=SCOPE_FRESHNESS_SOURCE,
+                        )
+                        await _pool_cap_scope_snapshots(
+                            memory_service, prior_memories, project_id, task_ref,
+                        )
+                        skipped.append(finding)
+                        stats['scope_freshness_skipped'] += 1
+                        logger.info(
+                            'reconciliation.scope_freshness_skipped',
+                            extra={
+                                'project_id': project_id, 'task_ref': task_ref,
+                                'flag_type': flag_key, 'skip_streak': new_skip_streak,
+                            },
+                        )
+                        continue
+
+                    # Unchanged, but the consecutive-skip cap is reached:
+                    # force a real re-investigation anyway so a
+                    # genuinely-stranded thread can never be silently skipped
+                    # past Stage 3's persistence-escalation window forever
+                    # (task 2417 amendment — reviewer finding
+                    # robustness_silent_degradation; see module docstring's
+                    # "Consecutive-skip cap").  Falls through to the same
+                    # snapshot-rewrite-and-keep code below as a genuinely
+                    # changed subject, resetting skip_streak to 0.
+                    stats['scope_freshness_forced_reinvestigation'] += 1
                     logger.info(
-                        'reconciliation.scope_freshness_skipped',
+                        'reconciliation.scope_freshness_forced_reinvestigation',
                         extra={
                             'project_id': project_id, 'task_ref': task_ref,
-                            'flag_type': flag_key,
+                            'flag_type': flag_key, 'skip_streak': new_skip_streak,
+                            'max_consecutive_skips': max_consecutive_skips,
                         },
                     )
-                    continue
 
-                # First sight (no prior snapshot), or the subject changed
-                # since the last snapshot: keep for re-investigation and
-                # (re)write the snapshot recording the subject's current
-                # state so the NEXT cycle has something to compare against.
+                # First sight (no prior snapshot), the subject changed since
+                # the last snapshot, or the consecutive-skip cap was just
+                # reached: keep for re-investigation and (re)write the
+                # snapshot recording the subject's current state (skip_streak
+                # reset to 0) so the NEXT cycle has something to compare
+                # against.
                 fresh_metadata = build_scope_snapshot_metadata(
                     task_ref=task_ref, flag_key=flag_key,
                     subject_project_id=subject_project_id,
@@ -467,6 +577,15 @@ async def precheck_scope_correction_freshness(
                         'error': str(exc),
                     },
                 )
+                # Every candidate must land in exactly one of
+                # to_reinvestigate/skipped AND increment the matching stat,
+                # so scope_freshness_candidates stays reconcilable against
+                # scope_freshness_reinvestigated + scope_freshness_skipped
+                # even on a failure path (task 2417 amendment — reviewer
+                # finding observability_stats_inconsistency: this branch
+                # previously appended to to_reinvestigate without
+                # incrementing any counter).
+                stats['scope_freshness_reinvestigated'] += 1
                 to_reinvestigate.append(finding)
     except Exception as exc:
         # Catastrophic failure outside the per-finding guard (e.g. a pure
@@ -483,6 +602,7 @@ async def precheck_scope_correction_freshness(
                 'scope_freshness_candidates': 0,
                 'scope_freshness_reinvestigated': 0,
                 'scope_freshness_skipped': 0,
+                'scope_freshness_forced_reinvestigation': 0,
             },
         )
 

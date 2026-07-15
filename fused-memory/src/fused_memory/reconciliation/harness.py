@@ -2776,6 +2776,14 @@ class ReconciliationHarness:
         # (the pre-check raising before ever assigning it) leaves an
         # unambiguous "pre-check did not run" sentinel for the short-circuit
         # guard just below to key off of.
+        # `max_consecutive_skips` is wired to the SAME
+        # _INTEGRITY_FINDING_RECURRENCE_THRESHOLD used by the persistence-gated
+        # escalation loop below (amendment: reviewer finding
+        # robustness_silent_degradation) — a (task_ref, flag_key) pair can be
+        # skipped by the pre-check at most threshold-1 cycles in a row before
+        # it is forced back through a real Stage 1-3 pass, so a genuinely
+        # stranded cross-project thread still accumulates persistence and
+        # escalates instead of being silently skipped forever.
         freshness: ScopeFreshnessResult | None = None
         try:
             if self.taskmaster is None:
@@ -2787,6 +2795,7 @@ class ReconciliationHarness:
                 resolve_project_root=self._resolve_known_root,
                 run_id=run_id,
                 findings=findings,
+                max_consecutive_skips=_INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
             )
             findings = freshness.to_reinvestigate
             skipped_task_refs = []
