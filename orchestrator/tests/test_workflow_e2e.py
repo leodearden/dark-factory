@@ -8004,6 +8004,36 @@ class TestBuildAgentEnvCpuGovern:
         assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
 
 
+# ---------------------------------------------------------------------------
+# Tests: _build_spawn_env (CLAUDE_SPAWN_* identity vars, task 2512)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBuildSpawnEnv:
+    """Unit tests for TaskWorkflow._build_spawn_env."""
+
+    def _make_workflow(self, config, git_ops, task_assignment):
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        return workflow
+
+    async def test_architect_receives_workflow_root_as_parent(
+        self, config, git_ops, task_assignment,
+    ):
+        """_build_spawn_env(ARCHITECT) is stamped with role/project/task, and
+        CLAUDE_SPAWN_PARENT_ID is the workflow-root session_id (the architect
+        IS the per-task root)."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+
+        env = workflow._build_spawn_env(ARCHITECT)
+
+        assert env['CLAUDE_SPAWN_ROLE'] == 'architect'
+        assert env['CLAUDE_SPAWN_PROJECT'] == workflow.config.fused_memory.project_id
+        assert env['CLAUDE_SPAWN_TASK_ID'] == str(workflow.task_id)
+        assert env['CLAUDE_SPAWN_PARENT_ID'] == workflow.session_id
+
+
 if TYPE_CHECKING:
     from orchestrator.scheduler import Scheduler, SchedulerFacade
 
