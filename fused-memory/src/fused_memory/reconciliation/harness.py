@@ -2033,18 +2033,24 @@ class ReconciliationHarness:
         :meth:`~fused_memory.reconciliation.stages.memory_consolidator.MemoryConsolidator.run`,
         task 2229 W5-λ), which is the last statement of Stage 1's ``run()``
         and so is skipped whenever the Stage 1 turn raises before
-        completing. Called from :meth:`run_full_cycle`'s ``finally`` block,
-        so this runs on every exit path regardless of whether Stage 1
-        completed; it fires only when Stage 1 started but recorded no report
-        (the happy path and a Stage-2/3 failure both no-op). See task 2440's
-        plan for the proof that this gate is exactly equivalent to "Stage 1
-        raised before its own write".
+        completing. Called from both :meth:`run_full_cycle`'s and
+        :meth:`_run_remediation_pass`'s ``finally`` blocks — the harness's two
+        independent S1→S2→S3 drivers — so this runs on every exit path of
+        either, regardless of whether Stage 1 completed; it fires only when
+        Stage 1 started but recorded no report (the happy path and a
+        Stage-2/3 failure both no-op). See task 2440's plan for the proof
+        that this gate is exactly equivalent to "Stage 1 raised before its
+        own write" (task 2626 generalized the same gate to the remediation
+        driver, which has its own run/run_id/current_stage_name locals).
 
         The synthesized report is honestly degraded, not fabricated:
         ``llm_calls``/``tokens_used`` are 0 and ``started_at`` is the
         whole-cycle anchor rather than Stage 1's real start — both are
         unrecoverable once ``run()`` raised without returning a report — so
         the implied duration is an upper bound, not a measurement. The
+        anchor is ``cycle_start_time`` for a full cycle and the remediation
+        run's own ``started_at`` for a remediation pass (it has no separate
+        cycle_start_time local). The
         ``stage1_cycle_summary_degraded_backstop`` stat self-identifies the
         row as harness-synthesized.
 
@@ -2988,6 +2994,9 @@ class ReconciliationHarness:
             )
 
         finally:
+            await self._ensure_stage1_cycle_summary(
+                run, run_id, project_id, current_stage_name, run.started_at,
+            )
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
 
 
