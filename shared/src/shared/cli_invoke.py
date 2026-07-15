@@ -657,6 +657,7 @@ async def invoke_claude_agent(
     session_id: str | None = None,
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
+    spawn_env: dict[str, str] | None = None,
     startup_grace_secs: float = 120.0,
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
     working_idle_secs: float | None = None,
@@ -678,6 +679,12 @@ async def invoke_claude_agent(
 
     *env_overrides*, when set, are merged into the subprocess environment.
     Used to point Claude Code at a vLLM endpoint via ``ANTHROPIC_BASE_URL``.
+
+    *spawn_env*, when set, carries ``CLAUDE_SPAWN_*`` spawn-identity vars
+    (role/project/task/parent) for the SessionStart hook.  Merged into the
+    subprocess environment AFTER *env_overrides* so per-agent spawn identity
+    always wins over any inherited ``CLAUDE_SPAWN_*`` value; keys with an
+    empty/falsy value are skipped so a blank never clobbers an inherited one.
 
     *sandbox_wrap*, when set, is applied to the built claude argv immediately
     before the subprocess is spawned.  The callable receives the full cmd list
@@ -704,6 +711,7 @@ async def invoke_claude_agent(
         resume_session_id=resume_session_id, session_id=session_id,
         config_dir=config_dir,
         env_overrides=env_overrides,
+        spawn_env=spawn_env,
         startup_grace_secs=startup_grace_secs,
         sandbox_wrap=sandbox_wrap,
         working_idle_secs=working_idle_secs,
@@ -1372,6 +1380,7 @@ async def _invoke_claude(
     session_id: str | None = None,
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
+    spawn_env: dict[str, str] | None = None,
     startup_grace_secs: float = 120.0,
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
     working_idle_secs: float | None = None,
@@ -1401,6 +1410,12 @@ async def _invoke_claude(
     # Merge caller-supplied overrides (e.g. ANTHROPIC_BASE_URL for vLLM)
     if env_overrides:
         env.update(env_overrides)
+    # Merge spawn-identity vars (CLAUDE_SPAWN_ROLE/PROJECT/TASK_ID/PARENT_ID) for
+    # the SessionStart hook. Applied after env_overrides so per-agent spawn
+    # identity always wins; empty values are skipped so a blank never clobbers
+    # an inherited CLAUDE_SPAWN_* value.
+    if spawn_env:
+        env.update({k: v for k, v in spawn_env.items() if v})
     # Multi-account failover: inject per-invocation OAuth token
     if oauth_token:
         env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
