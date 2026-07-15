@@ -16,7 +16,7 @@ from enum import Enum, StrEnum
 from typing import Literal
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.verify_cmd import VerifyCmd, parse_config_command, scope_to, strip_cwd
+from orchestrator.verify_cmd import ToolKind, VerifyCmd, parse_config_command, scope_to, strip_cwd
 
 
 class FileKind(Enum):
@@ -206,6 +206,45 @@ class VerifyPlan:
         }
 
 
+def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> VerifyCmd:
+    """Scope *raw* to *files*, first-clause-scoping a raw-retained chain.
+
+    The ``VerifyCmd``-layer counterpart of ``verify._scope_to_keyword`` (which
+    operates on — and returns — a shell string): this returns a ``VerifyCmd``
+    instead, since ``PlannedRun.cmd`` stores structured commands, not strings.
+    The two scopers are deliberately kept in algorithmic lockstep — a future
+    change to one's scoping rule should update the other.
+
+    A structured single-tool command (``parse_config_command(raw).raw is
+    None`` — no ``&&``-chain, not OPAQUE) is scoped directly: byte-identical
+    to this function's pre-remediation derivation, so every existing golden
+    and every real single-command config is unaffected.
+
+    A raw-retained command (OPAQUE, or a recognised-but-unstructurable chain
+    — e.g. dark_factory's real per-subproject ``lint_command``/
+    ``type_check_command`` ``&&``-chains) is handled exactly as
+    ``verify._scope_to_keyword`` handles it: everything up to and including
+    the first occurrence of *keyword* is re-parsed as a single tool
+    invocation and, if THAT prefix parses into a structured, non-OPAQUE
+    command, it is scoped to *files* — first-clause scoped, every trailing
+    ``&&``-chained clause dropped. *keyword* absent from *raw*, or the
+    prefix itself not parsing into one recognised structured invocation
+    (P1), leaves *raw* verbatim — rendering the returned ``VerifyCmd``
+    reproduces *raw* unchanged.
+    """
+    parsed = parse_config_command(raw)
+    if parsed.raw is None:
+        return strip_cwd(scope_to(parsed, files))
+
+    idx = raw.find(keyword)
+    if idx == -1:
+        return parsed
+    prefix_parsed = parse_config_command(raw[: idx + len(keyword)])
+    if prefix_parsed.tool is ToolKind.OPAQUE or prefix_parsed.raw is not None:
+        return parsed
+    return strip_cwd(scope_to(prefix_parsed, files))
+
+
 def _derive_module_runs(
     mc: ModuleConfig,
     existing_files: list[str],
@@ -251,7 +290,7 @@ def _derive_module_runs(
     # cross-file invariant to protect, unlike pyright's Protocol/TypedDict
     # concern (D2), so there is no "widen to full suite" branch here. --
     if mc.lint_command:
-        lint_cmd = strip_cwd(scope_to(parse_config_command(mc.lint_command), scoped))
+        lint_cmd = _scope_prefix_to_keyword(mc.lint_command, 'ruff check', scoped)
         runs.append(PlannedRun(
             mc.prefix, lint_cmd, ScopeKind.FILE_SCOPED, 'lint: file-scoped to touched file(s)',
         ))
@@ -271,7 +310,7 @@ def _derive_module_runs(
                 f'pyright: structural file {structural_trigger} requires unscoped type check',
             ))
         else:
-            type_cmd = strip_cwd(scope_to(parse_config_command(mc.type_check_command), scoped))
+            type_cmd = _scope_prefix_to_keyword(mc.type_check_command, 'pyright', scoped)
             runs.append(PlannedRun(
                 mc.prefix, type_cmd, ScopeKind.FILE_SCOPED,
                 'pyright: file-scoped to touched file(s)',
@@ -301,7 +340,7 @@ def _derive_module_runs(
                 f'pytest: test-data module touched ({test_data_trigger}) — full suite required',
             ))
         elif collectable_tests:
-            test_cmd = strip_cwd(scope_to(parse_config_command(mc.test_command), collectable_tests))
+            test_cmd = _scope_prefix_to_keyword(mc.test_command, 'pytest', collectable_tests)
             runs.append(PlannedRun(
                 mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
                 'pytest: file-scoped to touched test file(s)',
