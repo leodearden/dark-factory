@@ -489,7 +489,56 @@ async def apply_audit_annotations(
     *,
     tag: str | None = None,
 ) -> dict[str, Any]:
-    raise NotImplementedError
+    """Annotate every flagged task's ``metadata.x_provenance_audit``.
+
+    Mirrors ``audit_duplicate_tasks.apply_changes``'s per-op try/except
+    counter pattern: each ``update_task`` call is isolated so one failure
+    does not abort the batch. Only verdicts in ``_FLAGGED_VERDICTS`` are
+    touched — ``ok``/``unverifiable`` tasks are left completely alone.
+
+    This function NEVER reopens a done task (no ``set_task_status`` call
+    of any kind) — every flagged task id is instead surfaced under
+    ``needs_human_review`` in the returned summary, regardless of whether
+    its annotation write succeeded, so a human can decide whether to
+    reopen it to pending or otherwise disposition it.
+
+    Returns:
+        ``{'annotated': int, 'errors': int, 'needs_human_review': [ids]}``.
+    """
+    annotated = 0
+    errors = 0
+    needs_human_review: list[str] = []
+    ref = report.get('ref', 'main')
+
+    for detail in report.get('tasks', []):
+        verdict = detail.get('verdict')
+        if verdict not in _FLAGGED_VERDICTS:
+            continue
+        task_id = detail['task_id']
+        needs_human_review.append(task_id)
+        annotation = {
+            'verdict': verdict,
+            'reasons': detail.get('reasons', []),
+            'ref': ref,
+            'audited_at': datetime.now(UTC).isoformat(),
+        }
+        try:
+            await backend.update_task(
+                task_id, project_root,
+                metadata=json.dumps({'x_provenance_audit': annotation}),
+                tag=tag,
+            )
+            logger.info('Annotated task %s (verdict=%s)', task_id, verdict)
+            annotated += 1
+        except Exception as exc:
+            logger.error('Failed to annotate task %s: %s', task_id, exc)
+            errors += 1
+
+    return {
+        'annotated': annotated,
+        'errors': errors,
+        'needs_human_review': needs_human_review,
+    }
 
 
 # ---------------------------------------------------------------------------
