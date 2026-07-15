@@ -1184,7 +1184,9 @@ class TaskWorkflow:
           return ``None``.
 
         Outcome mapping after awaiting the future:
-        * ``None`` (soft-cancel) → ``_handle_soft_cancel('group-merge')``
+        * soft-cancel (``_cancel_event`` wins) → ``_await_cancellable`` raises
+          ``WorkflowCancelled('soft')`` (W9-θ), which propagates straight to
+          ``run()``'s single catch — not handled in this method.
         * ``result.status == 'done'`` → ``WorkflowOutcome.DONE``
         * Any other status → ``_mark_blocked(..., escalate_to_human=True)``
 
@@ -1312,9 +1314,10 @@ class TaskWorkflow:
             self.merge_queue, req, self.event_store, self.merge_inflight_registry,
         )
 
+        # W9-θ: a cancel-win now raises WorkflowCancelled('soft') instead of
+        # returning None — it propagates straight to run()'s single catch,
+        # so there is no `result is None` branch to handle here any more.
         result = await self._await_cancellable(future)
-        if result is None:
-            return await self._handle_soft_cancel('group-merge')
         if result.status == 'done':
             if result.merge_sha:
                 self._merge_sha = result.merge_sha
@@ -2817,24 +2820,26 @@ class TaskWorkflow:
             if merge_outcome == WorkflowOutcome.DONE:
                 break
             if merge_outcome != WorkflowOutcome.REQUEUED:
-                # SOFT_CANCELLED / BLOCKED / ESCALATED — exit slot.
-                # SOFT_CANCELLED arrives when _handle_soft_cancel
-                # detected a pending soft-cancel; BLOCKED when the
-                # steward gave up; other non-REQUEUED outcomes are
-                # terminal and must also exit.
+                # BLOCKED / ESCALATED — exit slot. A soft-cancel inside
+                # _submit_to_merge_queue no longer surfaces as a
+                # merge_outcome value (W9-θ): _await_cancellable raises
+                # WorkflowCancelled('soft') straight through this call,
+                # so it never reaches this comparison.
                 return merge_outcome
 
             # Defense-in-depth (root cause #2): _cancel_event is
             # never cleared during a run, so each retry iteration
             # would re-win the cancellable race instantly and burn
             # another pre-merge rebase+verify before exhausting
-            # max_merge_retries.  Checking here — immediately after
+            # max_merge_retries. Checking here — immediately after
             # the REQUEUED guard and BEFORE the anti-thrash/retry
             # path — ensures a soft-cancel that arrived concurrently
             # with a legitimate steward-resolved REQUEUED exits on
             # first detection without any further rebase or log.
+            # W9-θ: raise (not return _handle_soft_cancel(...) inline) so
+            # it propagates to run()'s single WorkflowCancelled catch.
             if self._cancel_event.is_set():
-                return await self._handle_soft_cancel('merge')
+                raise WorkflowCancelled('soft')
 
             # Fix 3 — anti-thrash guard for repeated
             # steward-resolved merge-phase loops on the same
@@ -6146,13 +6151,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         # Race the future against the cancel event so a human marking the
         # task done out-of-band exits the workflow promptly instead of
-        # waiting for the merge worker to finish.
+        # waiting for the merge worker to finish. W9-θ: a cancel-win now
+        # raises WorkflowCancelled('soft') (propagating to run()'s single
+        # catch) instead of returning None — no `result is None` branch.
         result = await self._await_cancellable(
             future,
             on_soft_cancel=_on_soft_cancel_detach,
         )
-        if result is None:
-            return await self._handle_soft_cancel('merge')
 
         if result.status == 'wip_halted':
             return await self._handle_wip_conflict(result, branch_name)
