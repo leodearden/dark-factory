@@ -772,6 +772,17 @@ async def run_server():
             known_projects=_known_projects_map,
         )
 
+        # Task 2624: wire the code-enforced before/after live-task-write
+        # self-check's finding filer now that ReconReportState exists (the
+        # filer needs it to resolve the active Stage-2 run_id) — this is why
+        # the filer is injected via a post-construction setter rather than a
+        # TaskInterceptor constructor param; see set_lifecycle_reset_filer.
+        from fused_memory.server.recon_lifecycle_filer import build_lifecycle_reset_filer
+
+        task_interceptor.set_lifecycle_reset_filer(
+            build_lifecycle_reset_filer(recon_report_state)
+        )
+
         # Reviewer finding race_condition: encode the ordering dependency in code.
         # The harness's run_loop() awaits this event before launching any stage
         # subprocess, guaranteeing the recon-report MCP server is accepting
