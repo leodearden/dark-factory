@@ -843,3 +843,150 @@ class TestGitFilesMissingOnRef:
             str(root), ['src/keep.py', 'src/drop.py'], 'main',
         )
         assert missing == ['src/drop.py']
+
+
+# ===========================================================================
+# Step-17/18: apply_audit_annotations (non-destructive apply layer)
+# ===========================================================================
+
+def _flagged_report(extra_ok: bool = True) -> dict:
+    """A report with one task per flagged verdict, plus (by default) an
+    ``ok`` and an ``unverifiable`` task that must be left untouched.
+    """
+    tasks = [
+        {'task_id': '10', 'verdict': 'commit_not_on_main', 'commit': 'a' * 40,
+         'reasons': ['cited commit is not an ancestor of the audited ref']},
+        {'task_id': '20', 'verdict': 'misattributed', 'commit': 'b' * 40,
+         'reasons': ['commit message cites task(s) 77, not task 20']},
+        {'task_id': '30', 'verdict': 'reverted', 'commit': 'c' * 40,
+         'reasons': [f'commit was later reverted by {"d" * 40}']},
+        {'task_id': '40', 'verdict': 'deliverable_absent', 'commit': 'e' * 40,
+         'reasons': ["none of the declared file(s) ['x.py'] appear in the diff"]},
+    ]
+    if extra_ok:
+        tasks.append({'task_id': '50', 'verdict': 'ok', 'commit': 'f' * 40, 'reasons': []})
+        tasks.append({
+            'task_id': '60', 'verdict': 'unverifiable', 'commit': 'g' * 40,
+            'reasons': ['no declared files and the commit message does not cite this task'],
+        })
+    counts = dict.fromkeys(
+        ('commit_not_on_main', 'misattributed', 'reverted', 'deliverable_absent',
+         'unverifiable', 'ok'), 0,
+    )
+    for t in tasks:
+        counts[t['verdict']] += 1
+    return {
+        'ref': 'main', 'dry_run': True, 'total': len(tasks),
+        'verdict_counts': counts, 'tasks': tasks,
+    }
+
+
+class FakeAuditBackend:
+    """Test double recording ``update_task``/``set_task_status`` calls.
+
+    ``fail_for`` names task ids whose ``update_task`` call raises, to
+    exercise :func:`apply_audit_annotations`' per-task error isolation.
+    """
+
+    def __init__(self, fail_for: set[str] | None = None):
+        self.fail_for = fail_for or set()
+        self.update_calls: list[dict] = []
+        self.status_calls: list[tuple] = []
+
+    async def update_task(self, task_id, project_root, metadata=None, tag=None, **kwargs):
+        if task_id in self.fail_for:
+            raise RuntimeError(f'simulated update_task failure for {task_id}')
+        self.update_calls.append({
+            'task_id': task_id, 'project_root': project_root,
+            'metadata': metadata, 'tag': tag,
+        })
+        return {'success': True}
+
+    async def set_task_status(self, *args, **kwargs):
+        self.status_calls.append((args, kwargs))
+
+
+@pytest.mark.asyncio
+class TestApplyAuditAnnotationsFlaggedVerdicts:
+    """Only flagged verdicts get an update_task call annotating x_provenance_audit."""
+
+    async def test_flagged_verdicts_are_annotated(self):
+        report = _flagged_report()
+        backend = FakeAuditBackend()
+        await apply_audit_annotations(backend, '/proj', report)
+        annotated_ids = {c['task_id'] for c in backend.update_calls}
+        assert annotated_ids == {'10', '20', '30', '40'}
+
+    async def test_annotation_contains_verdict_reasons_and_ref(self):
+        report = _flagged_report(extra_ok=False)
+        backend = FakeAuditBackend()
+        await apply_audit_annotations(backend, '/proj', report)
+        by_id = {c['task_id']: c for c in backend.update_calls}
+        call = by_id['20']
+        metadata = call['metadata']
+        parsed = json.loads(metadata) if isinstance(metadata, str) else metadata
+        annotation = parsed['x_provenance_audit']
+        assert annotation['verdict'] == 'misattributed'
+        assert annotation['reasons'] == report['tasks'][1]['reasons']
+        assert annotation['ref'] == 'main'
+
+    async def test_ok_and_unverifiable_left_untouched(self):
+        report = _flagged_report()
+        backend = FakeAuditBackend()
+        await apply_audit_annotations(backend, '/proj', report)
+        annotated_ids = {c['task_id'] for c in backend.update_calls}
+        assert '50' not in annotated_ids
+        assert '60' not in annotated_ids
+
+    async def test_all_ok_report_makes_no_update_calls(self):
+        report = _flagged_report(extra_ok=False)
+        report['tasks'] = [{'task_id': '99', 'verdict': 'ok', 'commit': 'a' * 40, 'reasons': []}]
+        backend = FakeAuditBackend()
+        result = await apply_audit_annotations(backend, '/proj', report)
+        assert backend.update_calls == []
+        assert result['annotated'] == 0
+
+
+@pytest.mark.asyncio
+class TestApplyAuditAnnotationsSummaryAndErrors:
+    """The returned summary counts successes/errors and never aborts the batch."""
+
+    async def test_returned_summary_counts_annotated_and_errors(self):
+        report = _flagged_report()
+        backend = FakeAuditBackend(fail_for={'20'})
+        result = await apply_audit_annotations(backend, '/proj', report)
+        assert result['annotated'] == 3
+        assert result['errors'] == 1
+
+    async def test_per_task_failure_does_not_abort_batch(self):
+        """A failure on the FIRST flagged task must not prevent later ones
+        from being processed."""
+        report = _flagged_report()
+        backend = FakeAuditBackend(fail_for={'10'})
+        await apply_audit_annotations(backend, '/proj', report)
+        annotated_ids = {c['task_id'] for c in backend.update_calls}
+        assert annotated_ids == {'20', '30', '40'}
+
+
+@pytest.mark.asyncio
+class TestApplyAuditAnnotationsNeverReopens:
+    """apply_audit_annotations never calls set_task_status — reopening a
+    done task back to pending is a human decision (see design_decisions)."""
+
+    async def test_no_set_task_status_call_is_made(self):
+        report = _flagged_report()
+        backend = FakeAuditBackend()
+        await apply_audit_annotations(backend, '/proj', report)
+        assert backend.status_calls == []
+
+
+@pytest.mark.asyncio
+class TestApplyAuditAnnotationsNeedsHumanReview:
+    """needs_human_review lists every flagged task id, regardless of whether
+    its annotation write succeeded — a human still needs to disposition it."""
+
+    async def test_needs_human_review_lists_all_flagged_ids(self):
+        report = _flagged_report()
+        backend = FakeAuditBackend(fail_for={'20'})
+        result = await apply_audit_annotations(backend, '/proj', report)
+        assert set(result['needs_human_review']) == {'10', '20', '30', '40'}
