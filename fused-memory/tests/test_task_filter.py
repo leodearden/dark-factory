@@ -3466,17 +3466,43 @@ class TestLiveTaskStatusFraming:
         )
 
     def test_negative_as_of_durable_form(self):
-        """The 'as of <timestamp> the ... check reported ...' durable shape
-        must NOT fire.
+        """The 'as of <timestamp>, status=...' durable shape must NOT fire.
+
+        Uses a fixture that trips LIVE_TASK_STATUS_RE (status=) so this test
+        genuinely exercises the 'as of' branch of POINT_IN_TIME_CHECK_RE,
+        rather than passing merely because the outer live-status marker
+        never matched in the first place.
         """
         from fused_memory.reconciliation.task_filter import (
             frames_live_task_status_as_current_fact,
         )
 
-        text = 'as of 2026-07-14T20:31Z the liveness check reported task 5208 claimed'
+        text = 'as of 2026-07-14T20:31Z, task 5208 status=claimed'
         assert frames_live_task_status_as_current_fact(text) is False, (
-            f"Expected False for the 'as of <timestamp> ... reported' durable "
+            f"Expected False for the 'as of <timestamp>, status=...' durable "
             f'form.\ntext={text!r}'
+        )
+
+    def test_positive_vague_as_of_without_timestamp_still_fires(self):
+        """A vague 'as of' with no attached date/timestamp token must NOT be
+        exempted -- only a genuine timestamped point-in-time check should be.
+
+        Guards against the exemption being trivially bypassable by the bare
+        words "as of" with no real timestamp following (e.g. "as of the
+        latest run"), which would let exactly the current-fact framing this
+        detector targets slip through unblocked.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            frames_live_task_status_as_current_fact,
+        )
+
+        text = (
+            'As of the latest run, task 5207 status=in-progress and '
+            'actively driven by run abc123'
+        )
+        assert frames_live_task_status_as_current_fact(text) is True, (
+            f"Expected True: a vague 'as of' with no timestamp token must "
+            f'not exempt current-fact framing.\ntext={text!r}'
         )
 
     def test_negative_no_live_status_marker(self):

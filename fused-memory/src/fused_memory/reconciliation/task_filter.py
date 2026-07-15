@@ -362,9 +362,15 @@ def is_conflicting_task_status_framing(text: str) -> bool:
 # correct form. POINT_IN_TIME_CHECK_RE is the exemption: it recognizes the
 # timestamped point-in-time-check framing — a "liveness/status/live check"
 # noun phrase co-occurring anywhere in the text with a check
-# verb/"as of" (order-independent, via lookahead), or a check verb
-# immediately followed by "at", or a bare "as of". Requiring
-# LIVE_TASK_STATUS_RE to match AND POINT_IN_TIME_CHECK_RE to NOT match
+# verb/"as of" (order-independent, via lookahead), or a check verb or "as
+# of" immediately followed by a digit (a date/timestamp token, e.g.
+# "at 2026-07-14..." or "as of 2026-07-14..."). The digit lookahead is
+# required on these two bare/standalone alternatives so a vague "as of the
+# latest run" or "checked at some point" cannot exempt genuine current-fact
+# framing merely by containing the words "as of" / "<verb> at" with no
+# actual timestamp attached — that would make the guard trivially
+# bypassable. Requiring LIVE_TASK_STATUS_RE to match AND
+# POINT_IN_TIME_CHECK_RE to NOT match
 # mirrors is_mixed_temporal_framing's two-marker requirement and
 # find_conflicting_task_status_ids's NEGATED_TERMINAL_RE exemption — and the
 # exemption is intentionally generous (a broad exemption only widens
@@ -373,7 +379,6 @@ def is_conflicting_task_status_framing(text: str) -> bool:
 # the task prescribes).
 LIVE_TASK_STATUS_RE: re.Pattern[str] = re.compile(
     r'\b(?:status|claimant_run_id|heartbeat_at|pid)\s*=|'
-    r'\b(?:is|are|being)\s+actively\s+driven\s+by\b|'
     r'\bactively\s+driven\s+by\b|'
     r'\bconfirmed\s+(?:live|in[-\s]?progress)\b|'
     r'\bcurrently\s+(?:live|in[-\s]?progress|claimed|running)\b',
@@ -383,8 +388,8 @@ LIVE_TASK_STATUS_RE: re.Pattern[str] = re.compile(
 POINT_IN_TIME_CHECK_RE: re.Pattern[str] = re.compile(
     r'(?=.*\b(?:liveness|status|live)\s+check\b)'
     r'(?=.*\b(?:performed|ran|checked|verified|observed|reported|recorded|sampled|as\s+of)\b)|'
-    r'\b(?:performed|checked|verified|observed|reported|recorded|sampled)\s+at\b|'
-    r'\bas\s+of\b',
+    r'\b(?:performed|checked|verified|observed|reported|recorded|sampled)\s+at\s+(?=\d)|'
+    r'\bas\s+of\s+(?=\d)',
     re.IGNORECASE | re.DOTALL,
 )
 
