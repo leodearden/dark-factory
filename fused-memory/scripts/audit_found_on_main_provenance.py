@@ -119,8 +119,44 @@ class TaskProvenanceAudit:
 # Selection (pure)
 # ---------------------------------------------------------------------------
 
+def _id_as_int(task_id: str, fallback: int = 0) -> int:
+    """Numeric task id as int for deterministic sort; non-numeric -> fallback.
+
+    Mirrors ``audit_duplicate_tasks._id_as_int``: dotted subtask ids (e.g.
+    ``'1.2'``) and other non-decimal shapes fall back rather than raising
+    ``ValueError`` from a bare ``int()`` call.
+    """
+    return int(task_id) if str(task_id).isdecimal() else fallback
+
+
 def select_found_on_main_tasks(tasks: list[dict]) -> list[TaskProvenanceAudit]:
-    raise NotImplementedError
+    """Filter *tasks* to found_on_main-provenance ones, parsed via ``parse_metadata``.
+
+    Tolerates ``metadata`` given as a dict OR a JSON string (``parse_metadata``
+    handles both) and never raises on malformed metadata — a blob that fails
+    validation resolves ``done_provenance`` to ``None`` via ``parse_metadata``'s
+    warn-and-omit path, which this function treats the same as "no
+    provenance at all" and simply skips.
+
+    Returns audits sorted by ``int(task_id)`` (see :func:`_id_as_int`) for a
+    deterministic report ordering downstream.
+    """
+    selected: list[TaskProvenanceAudit] = []
+    for task in tasks:
+        meta, _warnings = parse_metadata(task.get('metadata'), direction='read')
+        prov = meta.done_provenance
+        if prov is None or prov.kind != 'found_on_main':
+            continue
+        task_id = str(task.get('id', ''))
+        selected.append(TaskProvenanceAudit(
+            task_id=task_id,
+            title=task.get('title') or '',
+            commit=prov.commit,
+            note=prov.note,
+            declared_files=list(meta.files),
+        ))
+    selected.sort(key=lambda a: _id_as_int(a.task_id))
+    return selected
 
 
 # ---------------------------------------------------------------------------
