@@ -82,6 +82,14 @@ CITATION_PATTERN = re.compile(
     re.MULTILINE,
 )
 
+# Every verdict classify() can return, in precedence order. Used to seed
+# build_audit_report's verdict_counts so every verdict is always present
+# (0 when it doesn't occur) rather than silently absent from the report.
+_ALL_VERDICTS: tuple[str, ...] = (
+    'commit_not_on_main', 'misattributed', 'reverted', 'deliverable_absent',
+    'unverifiable', 'ok',
+)
+
 # Verdicts that apply_audit_annotations treats as "flagged" (annotated +
 # surfaced under needs_human_review). `ok` and `unverifiable` are left alone.
 _FLAGGED_VERDICTS = frozenset({
@@ -290,7 +298,56 @@ class GitFacts:
 async def build_audit_report(
     tasks: list[dict], git: Any, ref: str = 'main',
 ) -> dict[str, Any]:
-    raise NotImplementedError
+    """Select found_on_main tasks, gather git facts for each, classify, aggregate.
+
+    *git* is an injected facts provider exposing an async
+    ``gather(commit, ref, declared_files) -> dict`` method (see
+    :class:`GitFacts`) — all git access is routed through it, so this
+    function is fully testable against a fake with canned per-commit facts.
+
+    Returns a report dict:
+      - ``ref``: the audited ref, echoed back.
+      - ``dry_run``: always ``True`` — this function only ever reports; the
+        separate :func:`apply_audit_annotations` call is what may mutate.
+      - ``total``: number of found_on_main tasks audited.
+      - ``verdict_counts``: dict with all of ``_ALL_VERDICTS`` as keys (0 for
+        verdicts that didn't occur), so the shape never silently omits one.
+      - ``tasks``: per-task detail list — ``{task_id, verdict, commit,
+        reasons}`` — in the same deterministic (by ``int(task_id)``) order
+        :func:`select_found_on_main_tasks` already produces.
+    """
+    audits = select_found_on_main_tasks(tasks)
+
+    verdict_counts: dict[str, int] = dict.fromkeys(_ALL_VERDICTS, 0)
+    task_details: list[dict[str, Any]] = []
+    for audit in audits:
+        facts = await git.gather(audit.commit, ref, audit.declared_files)
+        audit.is_ancestor = facts.get('is_ancestor', True)
+        audit.commit_subject = facts.get('commit_subject', '')
+        audit.commit_message = facts.get('commit_message', '')
+        audit.commit_files = facts.get('commit_files') or []
+        audit.revert_commit = facts.get('revert_commit')
+        audit.declared_files_missing_on_main = facts.get('declared_files_missing_on_main') or []
+
+        verdict, reasons = classify(audit)
+        audit.verdict = verdict
+        audit.reasons = reasons
+
+        verdict_counts[verdict] += 1
+        task_details.append({
+            'task_id': audit.task_id,
+            'verdict': verdict,
+            'commit': audit.commit,
+            'reasons': reasons,
+        })
+
+    return {
+        'ref': ref,
+        'dry_run': True,
+        'total': len(audits),
+        'verdict_counts': verdict_counts,
+        'tasks': task_details,
+    }
 
 
 # ---------------------------------------------------------------------------
