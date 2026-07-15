@@ -451,6 +451,92 @@ class TestRunSingleCatchHardCancel:
         assert not outcome_allows_status(report.outcome, last_status)
 
 
+@pytest.mark.asyncio
+class TestCancelFromMergeDeferred:
+    """Regression (reviewer_comprehensive, esc-2252-26): a cancel — soft or
+    hard — that lands while the machine is parked in ``MERGE_DEFERRED`` (a
+    train member awaiting its GroupMergeRequest future inside
+    ``_maybe_enqueue_group_merge``, after ``set_task_status('merge-deferred')``
+    has persisted the row) must let ``run()`` RETURN a ``TerminalReport``.
+
+    Before the fix, ``_finalise_cancellation`` drove the machine to CANCELLED
+    via ``_enter_phase(CANCELLED)``, but the shared transition table had NO
+    ``(MERGE_DEFERRED, CANCELLED)`` edge → ``IllegalTransition`` escaped run()'s
+    single ``WorkflowCancelled`` catch. The soft path additionally tripped
+    SM-2's outcome<->status half: ``outcome_allows_status('soft-cancelled',
+    'merge-deferred')`` was False. Both are fixed in shared/task_transitions.py.
+    """
+
+    def _wire_cleanup_spies(self, workflow) -> None:
+        async def _noop_async(*_a, **_k) -> None:
+            return None
+
+        async def _release_lane(_task_id: str) -> bool:
+            return True
+
+        workflow._stop_claimant_heartbeat = _noop_async  # type: ignore[method-assign]
+        workflow._steward = SimpleNamespace(stop=_noop_async)
+        workflow._maybe_cleanup_done_worktree = _noop_async  # type: ignore[method-assign]
+        workflow._cleanup_config_dir = lambda *_a, **_k: None  # type: ignore[method-assign]
+        workflow.git_ops.release_lane_for_terminal_task = _release_lane  # type: ignore[method-assign]
+
+    async def _stage_merge_deferred(self, workflow, scheduler) -> None:
+        # Persist the merge-deferred row and stage the machine there — exactly
+        # the state a parked train member sits in at _await_cancellable(future)
+        # (workflow.py:1320), reached after set_task_status('merge-deferred').
+        await scheduler.set_task_status(workflow.task_id, 'merge-deferred')
+        workflow.state = WorkflowState.MERGE_DEFERRED
+        assert workflow.machine.state == WorkflowState.MERGE_DEFERRED
+        self._wire_cleanup_spies(workflow)
+
+    async def test_hard_cancel_from_merge_deferred_returns_cancelled_report(
+        self, config, git_ops, task_assignment,
+    ):
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        await self._stage_merge_deferred(workflow, scheduler)
+
+        async def _drive_raises_hard() -> WorkflowOutcome:
+            raise WorkflowCancelled('hard')
+
+        workflow._drive = _drive_raises_hard  # type: ignore[method-assign]
+
+        report = await workflow.run()
+
+        assert isinstance(report, TerminalReport)
+        assert report.outcome == WorkflowOutcome.CANCELLED
+        assert workflow.machine.state == WorkflowState.CANCELLED
+        assert report.phase == WorkflowState.CANCELLED
+
+    async def test_soft_cancel_from_merge_deferred_returns_soft_cancelled_report(
+        self, config, git_ops, task_assignment,
+    ):
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        await self._stage_merge_deferred(workflow, scheduler)
+        # A soft-cancel: the event is set, and _handle_soft_cancel re-reads the
+        # (non-terminal) merge-deferred row → SOFT_CANCELLED.
+        workflow._cancel_event.set()
+
+        async def _drive_raises_soft() -> WorkflowOutcome:
+            raise WorkflowCancelled('soft')
+
+        workflow._drive = _drive_raises_soft  # type: ignore[method-assign]
+
+        report = await workflow.run()
+
+        assert isinstance(report, TerminalReport)
+        assert report.outcome == WorkflowOutcome.SOFT_CANCELLED
+        assert workflow.machine.state == WorkflowState.CANCELLED
+        assert report.phase == WorkflowState.CANCELLED
+        # SM-2 outcome<->status: the last-persisted row is still merge-deferred
+        # (release_workflow parks it to blocked only after run() returns), and
+        # that pairing must be allowed for the soft-cancelled outcome.
+        last_status = await scheduler.get_status(workflow.task_id)
+        assert last_status == 'merge-deferred'
+        assert outcome_allows_status(report.outcome, last_status)
+
+
 # ---------------------------------------------------------------------------
 # step-09: _on_terminal_cleanups() ordering + kind-aware lane release
 # ---------------------------------------------------------------------------

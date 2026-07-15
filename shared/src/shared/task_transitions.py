@@ -124,12 +124,24 @@ _UNION: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset(
         (TaskStatus.DEFERRED, TaskStatus.BLOCKED),  # recon targeted.py:1041
         (TaskStatus.PENDING, TaskStatus.BLOCKED),  # deterministic pure-gate born-at-L2 deterministic_runner.py:755/853; human block of a pending task is an out-of-band manual write with no enumerated call site (unlike the anchored half of this pair)
         # cancel — recon's any-non-terminal->cancelled (targeted.py:1001)
-        # covers pending/blocked/deferred; harness.py:8417 covers the
-        # orchestrator abandon path from in-progress/blocked.
+        # covers pending/blocked/deferred/merge-deferred; harness.py:8417
+        # covers the orchestrator abandon path from in-progress/blocked.
         (TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED),  # abandon harness.py:8417
         (TaskStatus.PENDING, TaskStatus.CANCELLED),  # recon targeted.py:1001
         (TaskStatus.BLOCKED, TaskStatus.CANCELLED),  # harness.py:8417, recon targeted.py:1001
         (TaskStatus.DEFERRED, TaskStatus.CANCELLED),  # recon targeted.py:1001
+        # W9-θ: a cancel (hard task.cancel() or soft _cancel_event) can land
+        # on a train member parked in merge-deferred — it awaits
+        # _await_cancellable(future) inside _maybe_enqueue_group_merge
+        # (workflow.py:1320) and set_task_status('merge-deferred') at :1113,
+        # both after the merge-deferred row is persisted. _finalise_cancellation
+        # then drives the machine to CANCELLED (WorkflowStateMachine.transition
+        # consults this table), so the merge-deferred origin needs its own
+        # cancel edge — completing the "any-non-terminal->cancelled" family the
+        # comment above describes. Also the persisted-write sibling of recon's
+        # any-non-terminal->cancelled (targeted.py:1001), which already sweeps
+        # merge-deferred rows.
+        (TaskStatus.MERGE_DEFERRED, TaskStatus.CANCELLED),  # W9-θ cancel workflow.py:2639; recon targeted.py:1001
         # infra resume-at-verify (D3 migrates this to blocked->infra-hold)
         (TaskStatus.BLOCKED, TaskStatus.IN_PROGRESS),  # harness.py:8713
         # forward-compat D3 infra-hold edges (C7/workflow.py:4842) — live
@@ -269,7 +281,18 @@ _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
     "cancelled": frozenset({TaskStatus.CANCELLED}),
     "merge-deferred": frozenset({TaskStatus.MERGE_DEFERRED}),
     # preserved / release_workflow park->blocked / stranded-sweep->pending.
-    "soft-cancelled": frozenset({TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED, TaskStatus.PENDING}),
+    # MERGE_DEFERRED is included for the W9-θ soft-cancel-of-a-parked-train-
+    # member path: _await_cancellable(future) inside _maybe_enqueue_group_merge
+    # (workflow.py:1320) is reached AFTER set_task_status('merge-deferred') has
+    # persisted the merge-deferred row, so a soft _cancel_event there makes
+    # _handle_soft_cancel return SOFT_CANCELLED while the last-persisted status
+    # is still 'merge-deferred' (release_workflow parks it to blocked only
+    # after run() returns). This is the same "preserved — row left wherever it
+    # was" case as the IN_PROGRESS entry, not a new terminal write.
+    "soft-cancelled": frozenset({
+        TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED, TaskStatus.PENDING,
+        TaskStatus.MERGE_DEFERRED,
+    }),
 }
 
 
