@@ -1151,6 +1151,17 @@ async def _write_task_count_snapshot(
     ``run()`` for non-blocked projects, rather than depending on the Stage-2
     LLM remembering the memory-stored "Snapshot Discipline" norm.
 
+    Self-pruning (task 2429): immediately before ``add_memory``, calls
+    :func:`_prune_task_count_snapshots` to delete every existing
+    ``kind='task_count_snapshot'`` record for this project, so the net
+    effect of one cycle is at most ONE canonical snapshot surviving —
+    self-correcting the near-duplicate accumulation that manual/LLM-driven
+    cleanups repeatedly failed to keep pruned. The prune runs after the
+    ``taskmaster is None`` early-return and after ``content`` is derived, so
+    a skipped/failed fetch never deletes existing snapshots without a
+    replacement in hand; the prune helper is itself best-effort and never
+    raises, so a prune failure cannot abort this write.
+
     Counts are derived by self-fetching via ``taskmaster.get_tasks`` and
     filtering with :func:`filter_task_tree` — mirroring
     ``assemble_payload``'s own self-fetch fallback idiom — rather than
@@ -1201,6 +1212,7 @@ async def _write_task_count_snapshot(
             highest_task_id=tree.max_task_id,
             as_of=as_of,
         )
+        await _prune_task_count_snapshots(memory_service, project_id, run_id)
         await memory_service.add_memory(
             content=content,
             category=TASK_COUNT_SNAPSHOT_CATEGORY,
