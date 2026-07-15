@@ -119,6 +119,7 @@ class TaskProvenanceAudit:
     commit_files: list[str] = field(default_factory=list)
     revert_commit: str | None = None
     declared_files_missing_on_main: list[str] = field(default_factory=list)
+    declared_files_inconclusive: list[str] = field(default_factory=list)
     verdict: str = ''
     reasons: list[str] = field(default_factory=list)
 
@@ -198,7 +199,25 @@ def classify(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
     ``commit_not_on_main`` > ``misattributed`` > ``reverted`` >
     ``deliverable_absent`` > ``unverifiable`` > ``ok`` — first matching rule
     wins (see module docstring for the rationale behind this ordering).
+
+    A non-empty ``audit.declared_files_inconclusive`` never changes the
+    verdict — it is purely advisory, appended as an extra reason so a human
+    reviewer can tell "some declared file's presence on the ref couldn't be
+    confirmed (transient git failure)" apart from a verdict actually earned
+    by confirmed facts.
     """
+    verdict, reasons = _classify_core(audit)
+    if audit.declared_files_inconclusive:
+        reasons = [*reasons, (
+            'git check inconclusive for declared file(s) '
+            f'{sorted(audit.declared_files_inconclusive)} — presence on the audited '
+            'ref could not be confirmed (transient git failure), not asserted as missing'
+        )]
+    return verdict, reasons
+
+
+def _classify_core(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
+    """The precedence ladder itself, over confirmed facts only. See :func:`classify`."""
     if not audit.is_ancestor:
         return 'commit_not_on_main', [
             f'cited commit {audit.commit!r} is not an ancestor of the audited '
@@ -342,35 +361,45 @@ async def _git_find_revert(project_root: str, commit: str, ref: str) -> str | No
 
 async def _git_files_missing_on_ref(
     project_root: str, files: list[str], ref: str,
-) -> list[str]:
-    """Return the subset of *files* that do NOT exist at *ref*'s HEAD.
+) -> tuple[list[str], list[str]]:
+    """Return ``(confirmed_missing, inconclusive)`` subsets of *files* at *ref*.
 
-    Checks each path individually via ``git cat-file -e <ref>:<path>``
-    (rc==0 means it exists). A git-invocation failure (timeout / missing
-    binary) for a given path is treated as "missing" — the conservative
-    choice, since this signal feeds the ``reverted`` verdict and an infra
-    hiccup should not silently mask a real absence.
+    Batches the existence check into a single ``git ls-tree -r --name-only
+    <ref>`` call and set-differences *files* against it, rather than
+    spawning one ``cat-file -e`` subprocess per file — one subprocess for
+    the whole declared-files list regardless of how many there are.
+
+    This single call also cleanly separates two different signals a
+    per-file check would conflate: a clean ``ls-tree`` run (rc==0) makes
+    every non-listed file a *confirmed* absence (``confirmed_missing``). A
+    git-invocation failure (timeout / missing binary / non-zero rc) can't
+    confirm anything, so ALL of *files* come back in *inconclusive*
+    instead — never silently folded into ``confirmed_missing``. This
+    matters because ``confirmed_missing`` feeds the ``reverted`` verdict
+    (see :func:`classify`); an audit-time infra flake must not be
+    indistinguishable from a genuine revert.
     """
-    missing: list[str] = []
-    for path in files:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'git', '-C', project_root, 'ls-tree', '-r', '--name-only', ref,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         try:
-            proc = await asyncio.create_subprocess_exec(
-                'git', '-C', project_root, 'cat-file', '-e', f'{ref}:{path}',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                await asyncio.wait_for(proc.communicate(), timeout=10.0)
-            except TimeoutError:
-                proc.kill()
-                missing.append(path)
-                continue
-        except FileNotFoundError:
-            missing.append(path)
-            continue
-        if proc.returncode != 0:
-            missing.append(path)
-    return missing
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except TimeoutError:
+            proc.kill()
+            return [], list(files)
+    except FileNotFoundError:
+        return [], list(files)
+    if proc.returncode != 0:
+        return [], list(files)
+    present = {
+        ln.strip() for ln in stdout.decode('utf-8', errors='replace').splitlines()
+        if ln.strip()
+    }
+    missing = [path for path in files if path not in present]
+    return missing, []
 
 
 async def _git_commit_message(project_root: str, commit: str) -> str:
@@ -411,11 +440,11 @@ class GitFacts:
         """Gather every git fact :func:`classify` needs about *commit* vs *ref*.
 
         Checks ``is_ancestor`` first and short-circuits the remaining four
-        subprocesses (commit message/diff, revert-log search, and one
-        cat-file check per declared file) when it is False: ``classify()``
-        resolves to ``commit_not_on_main`` at its very first precedence
-        check in that case and never consults any of the other facts, so
-        gathering them would be pure wasted subprocess work.
+        subprocess calls (commit message/diff, revert-log search, and the
+        batched declared-files existence check) when it is False:
+        ``classify()`` resolves to ``commit_not_on_main`` at its very first
+        precedence check in that case and never consults any of the other
+        facts, so gathering them would be pure wasted subprocess work.
         """
         is_ancestor = await _git_is_ancestor(self.project_root, commit, ref)
         if not is_ancestor:
@@ -426,17 +455,20 @@ class GitFacts:
                 'commit_files': [],
                 'revert_commit': None,
                 'declared_files_missing_on_main': [],
+                'declared_files_inconclusive': [],
             }
         message = await _git_commit_message(self.project_root, commit)
+        missing, inconclusive = await _git_files_missing_on_ref(
+            self.project_root, declared_files, ref,
+        )
         return {
             'is_ancestor': True,
             'commit_subject': message.splitlines()[0] if message else '',
             'commit_message': message,
             'commit_files': await _git_show_files(self.project_root, commit),
             'revert_commit': await _git_find_revert(self.project_root, commit, ref),
-            'declared_files_missing_on_main': await _git_files_missing_on_ref(
-                self.project_root, declared_files, ref,
-            ),
+            'declared_files_missing_on_main': missing,
+            'declared_files_inconclusive': inconclusive,
         }
 
 
@@ -485,6 +517,7 @@ async def build_audit_report(
         audit.commit_files = facts.get('commit_files') or []
         audit.revert_commit = facts.get('revert_commit')
         audit.declared_files_missing_on_main = facts.get('declared_files_missing_on_main') or []
+        audit.declared_files_inconclusive = facts.get('declared_files_inconclusive') or []
 
         verdict, reasons = classify(audit)
         audit.verdict = verdict

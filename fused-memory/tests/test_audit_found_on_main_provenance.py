@@ -6,6 +6,7 @@ test_audit_duplicate_memories.py.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import subprocess
@@ -101,6 +102,7 @@ def _audit(
     commit_files: list[str] | None = None,
     revert_commit: str | None = None,
     declared_files_missing_on_main: list[str] | None = None,
+    declared_files_inconclusive: list[str] | None = None,
 ):
     """Build a TaskProvenanceAudit with sensible defaults for classify() tests."""
     return TaskProvenanceAudit(
@@ -117,6 +119,10 @@ def _audit(
         declared_files_missing_on_main=(
             list(declared_files_missing_on_main)
             if declared_files_missing_on_main is not None else []
+        ),
+        declared_files_inconclusive=(
+            list(declared_files_inconclusive)
+            if declared_files_inconclusive is not None else []
         ),
     )
 
@@ -491,6 +497,54 @@ class TestClassifyPrecedence:
         )
         verdict, _reasons = classify(audit)
         assert verdict == 'reverted'
+
+
+# ===========================================================================
+# Amendment: declared_files_inconclusive is advisory-only — an infra hiccup
+# during the declared-files-on-ref check must never masquerade as a verdict
+# earned by confirmed facts (see _git_files_missing_on_ref below).
+# ===========================================================================
+
+class TestClassifyInconclusive:
+    """A non-empty declared_files_inconclusive never changes the verdict —
+    it is surfaced as an extra advisory reason only."""
+
+    def test_inconclusive_files_do_not_change_an_ok_verdict(self):
+        audit = _audit(
+            task_id='50', is_ancestor=True,
+            commit_message='Merge task/50 into main',
+            declared_files=[],
+            declared_files_inconclusive=['src/thing.py'],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'ok'
+        assert any('inconclusive' in r.lower() for r in reasons)
+
+    def test_inconclusive_files_are_appended_alongside_a_reverted_verdict(self):
+        """Even when a real verdict already fires, the inconclusive note is
+        additional context, not a replacement reason."""
+        audit = _audit(
+            is_ancestor=True,
+            commit_message='Merge task/50 into main',
+            revert_commit='f' * 40,
+            declared_files_inconclusive=['src/other.py'],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'reverted'
+        joined = ' '.join(reasons).lower()
+        assert 'revert' in joined
+        assert 'inconclusive' in joined
+
+    def test_no_inconclusive_files_adds_no_extra_reason(self):
+        """The advisory note is opt-in: an empty list changes nothing."""
+        audit = _audit(
+            task_id='50', is_ancestor=True,
+            commit_message='Merge task/50 into main',
+            declared_files=[],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'ok'
+        assert reasons == []
 
 
 # ===========================================================================
@@ -873,14 +927,53 @@ class TestGitFindRevert:
 
 @pytest.mark.asyncio
 class TestGitFilesMissingOnRef:
-    """_git_files_missing_on_ref distinguishes present vs. deleted declared files."""
+    """_git_files_missing_on_ref distinguishes confirmed-missing declared
+    files from a merely inconclusive (failed) existence check — see the
+    module docstring on the function for why the distinction matters."""
 
-    async def test_deleted_file_reported_missing_present_file_is_not(self, repo_facts):
+    async def test_deleted_file_confirmed_missing_present_file_is_not(self, repo_facts):
         root, _shas = repo_facts
-        missing = await _git_files_missing_on_ref(
+        missing, inconclusive = await _git_files_missing_on_ref(
             str(root), ['src/keep.py', 'src/drop.py'], 'main',
         )
         assert missing == ['src/drop.py']
+        assert inconclusive == []
+
+    async def test_git_failure_reports_inconclusive_not_confirmed_missing(self, repo_facts):
+        """An unresolvable ref makes `git ls-tree` fail (rc != 0) — every
+        declared file must come back *inconclusive*, none confirmed missing,
+        so an audit-time infra flake can never masquerade as a genuine
+        revert. The timeout and missing-git-binary failure branches share
+        this exact ``return [], list(files)`` statement in production code.
+        """
+        root, _shas = repo_facts
+        missing, inconclusive = await _git_files_missing_on_ref(
+            str(root), ['src/keep.py', 'src/drop.py'], 'does-not-exist-ref',
+        )
+        assert missing == []
+        assert sorted(inconclusive) == ['src/drop.py', 'src/keep.py']
+
+    async def test_single_subprocess_call_regardless_of_declared_file_count(
+        self, repo_facts, monkeypatch,
+    ):
+        """Batches the existence check into ONE git invocation covering every
+        declared file, rather than spawning one `cat-file -e` subprocess per
+        file (the prior implementation's O(files) subprocess pattern)."""
+        root, _shas = repo_facts
+        calls: list[tuple] = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def _spy_exec(*args, **kwargs):
+            calls.append(args)
+            return await real_exec(*args, **kwargs)
+
+        monkeypatch.setattr(_mod.asyncio, 'create_subprocess_exec', _spy_exec)
+        missing, inconclusive = await _git_files_missing_on_ref(
+            str(root), ['src/keep.py', 'src/drop.py', 'README.md'], 'main',
+        )
+        assert len(calls) == 1
+        assert missing == ['src/drop.py']
+        assert inconclusive == []
 
 
 @pytest.mark.asyncio
@@ -896,6 +989,7 @@ class TestGitFactsGather:
         assert sorted(facts['commit_files']) == ['src/drop.py', 'src/keep.py']
         assert facts['revert_commit'] is None
         assert facts['declared_files_missing_on_main'] == ['src/drop.py']
+        assert facts['declared_files_inconclusive'] == []
         assert facts['commit_subject']  # non-empty: first line of the commit message
         assert facts['commit_message']
 
@@ -930,7 +1024,7 @@ class TestGitFactsGather:
 
         async def _spy_files_missing(project_root, files, ref):
             calls.append('files_missing')
-            return list(files)
+            return list(files), []
 
         monkeypatch.setattr(_mod, '_git_commit_message', _spy_commit_message)
         monkeypatch.setattr(_mod, '_git_show_files', _spy_show_files)
@@ -947,6 +1041,7 @@ class TestGitFactsGather:
             'commit_files': [],
             'revert_commit': None,
             'declared_files_missing_on_main': [],
+            'declared_files_inconclusive': [],
         }
         assert calls == []  # none of the other four wrappers ran
 
