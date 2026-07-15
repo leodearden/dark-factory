@@ -6065,6 +6065,18 @@ class GitOps:
         as "content already landed" — any other git error also falls through
         to False, so this primitive never claims a landing on doubt.
 
+        **Path-quoting caveat**: like :meth:`commit_effect_present_in_main`,
+        the ``--name-only`` diff above is read without ``-z``/``-c
+        core.quotePath=false``, so a changed path containing non-ASCII (or
+        otherwise "unusual") bytes comes back quoted and then fails to
+        match itself as a ``--`` pathspec on the follow-up ``diff --quiet``
+        call — an empty/mismatched pathspec makes that call report "no
+        difference" (rc == 0) rather than erroring, i.e. a FALSE POSITIVE
+        for "content already landed" rather than the intended fail-safe
+        False. Not hardened here; :meth:`commit_effect_present_in_main`
+        carries the ``-z``/``core.quotePath=false`` fix (task 2500
+        amendment) and empirically confirms this exact failure mode.
+
         **Accepted risk — coincidental match on incomplete work**: this
         primitive only compares the files *branch* has touched so far
         against its own merge-base, not the task's full intended scope.  A
@@ -6107,18 +6119,23 @@ class GitOps:
         Companion check to :meth:`is_ancestor` for the found_on_main
         post-hoc-revert blind spot (task 2500): a cited commit can remain
         an ancestor of main forever — ancestry is immutable history — even
-        after a LATER commit on main reverts exactly the paths it
+        after a LATER commit on main changes exactly the paths it
         touched.  ``is_ancestor`` alone cannot see that the commit's own
         effect is gone from current HEAD.
 
-        Computes ``touched = git diff-tree --no-commit-id --name-only -r
-        <commit_sha>`` (plain diff-tree, no ``-m``/``-c`` — this is the
-        commit's own diff against its sole parent for an ordinary commit,
-        and is empty by git's own default behavior for a merge commit)
-        and, when non-empty, returns whether ``git diff --quiet
-        <commit_sha> <main> -- <touched...>`` reports no difference — i.e.
-        main HEAD still carries byte-identical content for every path
-        *commit_sha* touched.
+        Computes ``touched = git -c core.quotePath=false diff-tree
+        --no-commit-id --name-only -r -z <commit_sha>`` (plain diff-tree,
+        no ``-m``/``-c`` — this is the commit's own diff against its sole
+        parent for an ordinary commit, and is empty by git's own default
+        behavior for a merge commit; ``-z`` + ``core.quotePath=false``
+        together make the path list byte-faithful for any filename,
+        including non-ASCII or newline-containing ones — see the
+        path-quoting caveat on :meth:`branch_content_in_main`, which
+        shares this primitive's underlying pattern but not yet this
+        hardening) and, when non-empty, returns whether ``git diff
+        --quiet <commit_sha> <main> -- <touched...>`` reports no
+        difference — i.e. main HEAD still carries byte-identical content
+        for every path *commit_sha* touched.
 
         Returns True (path-based revert detection inapplicable) when:
         - ``touched`` is empty — a merge commit (plain diff-tree shows no
@@ -6135,15 +6152,37 @@ class GitOps:
         - the ``diff --quiet`` call errors for a reason other than "paths
           differ" (rc not in {0, 1}); or
         - any touched path differs between *commit_sha* and main HEAD
-          (rc == 1) — the shape a post-hoc revert produces.
+          (rc == 1) — produced by a post-hoc revert of those paths, but
+          equally by any OTHER later change to the same paths (e.g.
+          another already-landed task's follow-up edit, or this task's
+          own later commit on the same branch overlapping the same
+          files).  This primitive cannot distinguish the two; see the
+          accepted-risk note below.
+
+        **Accepted risk — later evolution reads the same as a revert**:
+        because this primitive only compares *commit_sha*'s own touched
+        paths against current main HEAD, ordinary subsequent evolution of
+        those paths (not just a genuine revert) also returns False here.
+        This is a deliberate fail-safe trade-off, not a bug: the caller's
+        own recovery path on False is idempotent (re-open to pending /
+        withhold the flip — never a wrong terminal state), so the cost of
+        a false negative here is a re-check, whereas a false True would
+        wrongly cement a completion that never happened. Callers with a
+        same-branch multi-commit shape should anchor this check on the
+        branch's own tip rather than a possibly-stale intermediate commit
+        — see ``Harness._already_landed_dispatch_gate``'s citation-lineage
+        handling (task 2500).
         """
         rc, touched_out, _ = await _run(
-            ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', commit_sha],
+            [
+                'git', '-c', 'core.quotePath=false',
+                'diff-tree', '--no-commit-id', '--name-only', '-r', '-z', commit_sha,
+            ],
             cwd=self.project_root,
         )
         if rc != 0:
             return False
-        touched = [f for f in touched_out.strip().splitlines() if f.strip()]
+        touched = [f for f in touched_out.split('\0') if f]
         if not touched:
             return True
         rc, _, _ = await _run(

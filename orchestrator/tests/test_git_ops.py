@@ -4091,19 +4091,30 @@ class TestCommitEffectPresentInMain:
 
     FIX 1 primitive for the found_on_main post-hoc-revert blind spot: a
     cited commit can remain an ancestor of main while a LATER commit on
-    main reverts the paths it touched — is_ancestor alone cannot see that
+    main changes the paths it touched — is_ancestor alone cannot see that
     the commit's own effect is gone.  Cases:
     (a) TRUE when the commit's own touched paths are still byte-identical
         on main (effect present — here the trivial "commit == main HEAD"
         shape).
-    (b) FALSE when a later commit on main reverts those same paths — the
-        commit is STILL an ancestor of main, but its effect is gone (the
-        blind spot this primitive exists to catch).
+    (b) FALSE when a later commit on main changes those same touched
+        paths again — the commit is STILL an ancestor of main, but its
+        own snapshot no longer matches HEAD (the blind spot this
+        primitive exists to catch).  The trigger condition is
+        deliberately broad: a genuine revert and ordinary later evolution
+        (e.g. another task's overlapping follow-up edit) are
+        indistinguishable here and both return False — see the
+        "Accepted risk" note on the primitive's docstring.
     (c) TRUE for a no-ff merge commit whose plain (no -m/-c) diff-tree
         touched-set is empty by git's own default behavior — path-based
         revert detection is inapplicable, so this preserves prior
         mark-done behavior for journal-hit and merge-marker shas (both of
         which are merge commits).
+    (d) FALSE (not a false-positive True) when a touched path contains
+        non-ASCII bytes and a later commit genuinely changes it — pins
+        that the primitive resolves the real path via
+        ``-z``/``core.quotePath=false`` rather than git's quoted
+        ``--name-only`` rendering, which would otherwise fail to match as
+        a pathspec and silently read as "no difference".
     """
 
     async def test_true_when_touched_paths_still_match_main(
@@ -4124,13 +4135,18 @@ class TestCommitEffectPresentInMain:
 
         assert await git_ops.commit_effect_present_in_main(fix_sha) is True
 
-    async def test_false_when_later_commit_reverts_touched_paths(
+    async def test_false_when_later_commit_changes_touched_paths(
         self, git_ops: GitOps, git_repo: Path,
     ) -> None:
-        """The post-hoc-revert blind spot: the fix commit is STILL an
-        ancestor of main (it is never removed from history) but a later
-        commit on main reverts the exact paths it touched — the effect is
-        gone from HEAD even though ancestry alone says "landed".
+        """The blind spot this primitive exists to catch: the fix commit is
+        STILL an ancestor of main (it is never removed from history) but a
+        LATER commit on main changes the exact paths it touched — the
+        effect is gone from HEAD even though ancestry alone says "landed".
+        The trigger is deliberately broad — this later commit need not be
+        an intentional revert; ANY change to the touched paths (a genuine
+        revert, or ordinary subsequent evolution such as another task's
+        overlapping edit) reads as "effect not present" here. See the
+        "Accepted risk" note on commit_effect_present_in_main's docstring.
         """
         (git_repo / 'fileA.py').write_text('fixed\n')
         await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
@@ -4140,10 +4156,10 @@ class TestCommitEffectPresentInMain:
         assert rc == 0, f'rev-parse failed: {err}'
         fix_sha = fix_sha.strip()
 
-        (git_repo / 'fileA.py').write_text('reverted\n')
+        (git_repo / 'fileA.py').write_text('changed again\n')
         await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
-        rc, _, err = await _run(['git', 'commit', '-m', 'revert commit'], cwd=git_repo)
-        assert rc == 0, f'revert commit failed: {err}'
+        rc, _, err = await _run(['git', 'commit', '-m', 'later commit'], cwd=git_repo)
+        assert rc == 0, f'later commit failed: {err}'
 
         assert await git_ops.is_ancestor(fix_sha, 'main') is True, (
             'fix commit must still be an ancestor of main — this is the blind spot'
@@ -4179,6 +4195,36 @@ class TestCommitEffectPresentInMain:
         merge_sha = merge_sha.strip()
 
         assert await git_ops.commit_effect_present_in_main(merge_sha) is True
+
+    async def test_detects_real_change_to_non_ascii_touched_path(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Path-quoting regression: a touched path containing non-ASCII
+        bytes comes back QUOTED/escaped from a plain ``--name-only``
+        diff-tree unless ``-z``/``-c core.quotePath=false`` is used.
+        Without that, the quoted literal string (backslashes, octal
+        escapes and all) fails to match the real file as a ``--``
+        pathspec, so the follow-up ``git diff --quiet`` call silently
+        reports "no difference" against an effectively empty pathspec —
+        a FALSE POSITIVE ("effect present") even though the file's
+        content at main HEAD has genuinely changed since the cited
+        commit. Confirmed False here pins that the primitive resolves
+        the real path, not git's quoted rendering of it.
+        """
+        (git_repo / 'café.py').write_text('fixed\n')
+        await _run(['git', 'add', 'café.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'fix commit'], cwd=git_repo)
+        assert rc == 0, f'fix commit failed: {err}'
+        rc, fix_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        fix_sha = fix_sha.strip()
+
+        (git_repo / 'café.py').write_text('changed again\n')
+        await _run(['git', 'add', 'café.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'later commit'], cwd=git_repo)
+        assert rc == 0, f'later commit failed: {err}'
+
+        assert await git_ops.commit_effect_present_in_main(fix_sha) is False
 
 
 @pytest.mark.asyncio
