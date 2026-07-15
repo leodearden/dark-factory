@@ -1299,6 +1299,58 @@ class TestExecutedPlanRecordsModuleSkips:
 
 
 # ---------------------------------------------------------------------------
+# reviewer_comprehensive remediation (verify.py:3660, behavior_change): pin
+# the dataclasses.replace field-preservation as intended.
+# ---------------------------------------------------------------------------
+
+
+class TestExecutedModuleConfigsPreservesPerModuleFields:
+    """``_executed_module_configs_from_plan`` builds the executed ``ModuleConfig``
+    via ``dataclasses.replace(mc, ...)`` rather than the deleted
+    ``scope_module_config``'s hand-listed ``ModuleConfig(prefix=..., ...)``
+    reconstruction, which OMITTED (reset to defaults) every field other than
+    the three commands and ``lock_depth``/``max_per_module``/
+    ``module_overrides``. This means per-module timeout knobs, ``verify_env``,
+    and ``scope_cargo`` now survive onto the scoped config where they
+    previously did not — documented as intentional in this function's own
+    docstring (and arguably a latent-bug fix for ``scope_cargo``, since
+    ``_apply_cargo_scope`` now reads the real value instead of a reset
+    default) but previously unpinned by any dedicated regression test.
+    """
+
+    def test_per_module_timeout_env_and_scope_cargo_survive_onto_executed_config(self):
+        mc = ModuleConfig(
+            prefix='mymod',
+            test_command='uv run --directory mymod pytest tests/',
+            verify_command_timeout_secs=123.0,
+            verify_cold_command_timeout_secs=456.0,
+            verify_env={'MYVAR': 'myvalue'},
+            scope_cargo=True,
+        )
+        touched = 'mymod/tests/test_thing.py'
+        plan = verify_plan.derive_verify_plan([touched], [mc], None, lambda _path: None)
+        executed = verify._executed_module_configs_from_plan([mc], plan)
+
+        assert len(executed) == 1
+        executed_mc = executed[0]
+        assert executed_mc.verify_command_timeout_secs == 123.0, (
+            'a per-module verify_command_timeout_secs override must survive onto '
+            'the executed config, not reset to the config default'
+        )
+        assert executed_mc.verify_cold_command_timeout_secs == 456.0, (
+            'a per-module verify_cold_command_timeout_secs override must survive '
+            'onto the executed config, not reset to the config default'
+        )
+        assert executed_mc.verify_env == {'MYVAR': 'myvalue'}, (
+            'a per-module verify_env override must survive onto the executed config'
+        )
+        assert executed_mc.scope_cargo is True, (
+            'scope_cargo must survive onto the executed config so _apply_cargo_scope '
+            'reads the real value, not a reset default'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-14/step-15: module-config OPAQUE &&-chain scoping (reviewer_comprehensive
 # remediation, verify_plan.py:253)
 # ---------------------------------------------------------------------------
