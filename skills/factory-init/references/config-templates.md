@@ -164,3 +164,17 @@ Per-project config for the jcodemunch code indexer (the AST-based retrieval the 
 Tailor `languages` and `extra_ignore_patterns` to the repo. The global ignore list (`~/.code-index/config.jsonc`) already covers `.venv/`, `node_modules/`, `target/`, `__pycache__/`, the `*_cache` dirs, `.worktrees/`, `.taskmaster/`, and the common lockfiles — so only add what's *specific* to this project (its data/output dirs, a non-dotfile `venv/`, generated parser sources, etc.).
 
 After writing it, register the repo with the watcher (Stage 6b): append the absolute path to the `--repos` line in `~/.config/systemd/user/jcodemunch-watcher.service`, `daemon-reload`, and `systemctl --user restart jcodemunch-watcher`.
+
+## .claude/settings.json (BASH_MAX_TIMEOUT_MS)
+
+Project-level Claude Code settings, committed with the repo. Required because every dark-factory project runs interactive escalation-watcher sessions whose canonical watcher waits use `--timeout 3600` (see `skills/escalation-watcher/SKILL.md` §"Bash-tool timeout contract"): a foreground wait that long needs the Bash tool's timeout ceiling raised to at least 3660000 ms. Without it, explicit foreground timeouts are capped at 600000 ms (10 min) and a call that omits the timeout parameter is killed at the 2-minute default.
+
+```json
+{
+  "env": {
+    "BASH_MAX_TIMEOUT_MS": "3900000"
+  }
+}
+```
+
+**Merge, never clobber**: if the target repo already has `.claude/settings.json`, add the `env` key (or the one variable) to the existing object. An operator may alternatively set this user-wide in `~/.claude/settings.json` — the project-level copy exists so every collaborator inherits the requirement with the repo.

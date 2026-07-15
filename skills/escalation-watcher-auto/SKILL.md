@@ -30,7 +30,7 @@ At startup, compute a **wall-clock deadline** = start + ROTATION_HOURS × 3600 s
 1. Emit the digest (see [Digest Format](#digest-format)) as your final message
 2. Exit cleanly (return normally — do NOT raise an exception)
 
-The bounded wait (`--timeout min(540, remaining)`) ensures you regain control at your deadline, comfortably before the supervisor's force-kill grace window. The supervisor will restart you immediately with a fresh context. This is the expected, healthy rotation path.
+The bounded wait (`--timeout min(3600, remaining)`) ensures you regain control at your deadline, comfortably before the supervisor's force-kill grace window — it is the `min(…, remaining)` clamp, not the slice size, that guarantees this. The 3600s (1h) slice keeps the wait bounded so each wake doubles as a rotation-deadline re-check and a backstop against missed inotify events, while cutting idle wake turns ~6x versus the previous, shorter slice. The supervisor will restart you immediately with a fresh context. This is the expected, healthy rotation path.
 
 ## Architecture Map (Priors)
 
@@ -231,12 +231,12 @@ After checking rotation limits (step 7), compute `remaining = deadline − now` 
 
 ```bash
 cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
-  --queue-dir <project_root>/data/escalations --level 1 --timeout <min(540, remaining)>
+  --queue-dir <project_root>/data/escalations --level 1 --timeout <min(3600, remaining)>
 ```
 
-The `<min(540, remaining)>` clamp sizes the final wait exactly to the remaining rotation time, so the agent regains control at its deadline rather than overshooting. `scripts/watcher-rearm.sh` is the same canonical bounded-wait + re-arm wrapper around `escalation.watcher` that escalation-watcher (L2) uses (see `skills/escalation-watcher/SKILL.md` §"Starting the watcher").
+The `<min(3600, remaining)>` clamp sizes the final wait exactly to the remaining rotation time, so the agent regains control at its deadline rather than overshooting — the supervisor's force-kill grace window is respected because of the `min(…, remaining)` clamp, regardless of slice size. The 3600s slice itself is a bounded backstop: each wake re-checks the rotation deadline and catches any escalation a missed inotify event would otherwise leave unnoticed, at ~6x fewer idle wake turns than the previous, shorter slice. `scripts/watcher-rearm.sh` is the same canonical bounded-wait + re-arm wrapper around `escalation.watcher` that escalation-watcher (L2) uses (see `skills/escalation-watcher/SKILL.md` §"Starting the watcher").
 
-**Bash-tool timeout contract:** this is a bounded **foreground** call — the calling Bash tool's own timeout must be set to **≥ 600000ms** (10 min) whenever `--timeout` is close to the 540s default, or the harness's 2-minute default kills the wait before it can return (the 07-09 exit-143 failure mode this wrapper exists to prevent).
+**Bash-tool timeout contract:** this is a bounded **foreground** call — always pass the calling Bash tool's `timeout` parameter, sized to **(`--timeout` + 60s margin) × 1000 ms** (e.g. `--timeout 3600` → Bash `timeout: 3660000`). Values above the harness's usual 600000ms ceiling are always legal inside a rotation: the watcher supervisor injects `BASH_MAX_TIMEOUT_MS` at the full rotation length into every auto-watcher rotation, so any `min(3600, remaining)` slice fits. OMITTING the Bash `timeout` parameter gets the harness's 2-minute default kill instead — the 07-09 exit-143 failure mode this wrapper exists to prevent.
 
 **Exit-code contract (preserved verbatim by `scripts/watcher-rearm.sh` from `escalation.watcher`, plus a `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` marker the wrapper emits to stderr on every run):**
 - **exit 0** (`WATCHER_REARM_OUTCOME: FIRED` on stderr) — one matching L1 escalation was printed as JSON to stdout. Parse it, then go to step 3 and drain ALL pending L1s. The watcher event is a wake signal only; the drain is the authoritative source of work. Do not pipe `2>&1` — the stderr outcome line must not land in the stdout JSON you parse.

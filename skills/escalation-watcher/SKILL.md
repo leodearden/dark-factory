@@ -129,7 +129,7 @@ Never process L0 or L1 from this skill, even if explicitly asked — doing so wo
 
 ```bash
 cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
-  --queue-dir <project_root>/data/escalations --level 2 --timeout 540 [--baseline] 2>&1
+  --queue-dir <project_root>/data/escalations --level 2 --timeout 3600 [--baseline] 2>&1
 ```
 
 Run as a **background task** (Bash with `run_in_background`). `scripts/watcher-rearm.sh` is the
@@ -143,11 +143,21 @@ and emits a `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` line
 every run — do NOT pipe `2>&1` when you parse stdout as the escalation JSON, or you'll corrupt the
 parse.
 
-**Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds (540 here) before
-returning. If you ever invoke `watcher-rearm.sh --timeout 540` as a **foreground** call (e.g. while
-debugging outside the background task), the calling Bash tool's own timeout must be set to
-**≥ 600000ms** (10 min) — the harness's 2-minute default will otherwise kill the wait before it can
-return (the 07-09 exit-143 failure mode this wrapper exists to prevent).
+**Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds per slice before
+returning. Run as a **background** task (`run_in_background: true`), it is exempt from the Bash
+tool's foreground timeouts — it runs detached across turns and notifies on exit — so use the long
+canonical slice: `--timeout 3600` yields at most one heartbeat wake per hour (`CEILING`) while a
+real L2 escalation still fires instantly via inotify. A short slice buys no protection in the
+background — the old `--timeout 540` merely forced a wake-notify-rearm turn every 9 minutes.
+Only **foreground** calls (e.g. debugging outside the background task) are governed by the harness
+timeouts. An omitted Bash `timeout` parameter kills the call at the 2-minute default before the
+wait can return (the 07-09 exit-143 failure mode this wrapper exists to prevent). For a foreground
+call, size the Bash `timeout` parameter to at least `(--timeout + 60s) × 1000` ms — e.g.
+`timeout: 3660000` for `--timeout 3600` — which requires `BASH_MAX_TIMEOUT_MS` ≥ that value in the
+settings env (dark-factory onboarding provisions it — see `skills/factory-init`). Only on a
+machine WITHOUT that setting does the harness's 600000ms (10 min) foreground cap apply: there,
+cap the slice at `--timeout 540` and set the Bash tool's `timeout` **≥ 600000ms** so the slice
+can return before the harness kills it.
 
 **Re-arming over deliberately-pending items:** any L2 item you deliberately left pending (Priority
 3b, `design_concern`, `risk_identified`, `infra_issue`, AFK leave-pending paths) sits in the queue

@@ -53,11 +53,17 @@
 # delivered before the handler installs). Callers MUST treat "exit 0 with
 # empty stdout" as a non-fire, never as proof an escalation was printed.
 #
-# Bash-tool contract: a `--timeout 540` call blocks for up to 540s. The
-# CALLER's Bash tool timeout must be >= 600000ms (10 min), or the bounded
-# wait itself gets killed by the harness's 2-minute default before it can
-# return -- this was the 07-09 exit-143 failure mode this wrapper exists to
-# prevent.
+# Bash-tool contract: a `--timeout N` call blocks for up to N seconds, so
+# the CALLER must size its own Bash tool timeout to --timeout plus a margin,
+# i.e. (N + 60) * 1000 ms. OMITTING the Bash timeout parameter gets the
+# harness's 2-minute default kill instead -- the 07-09 exit-143 failure mode
+# this wrapper exists to prevent. Inside supervisor-managed auto rotations
+# the orchestrator injects BASH_MAX_TIMEOUT_MS at the rotation length, so
+# slices up to the full rotation are legal (canonical: --timeout 3600). In a
+# plain interactive session WITHOUT a raised BASH_MAX_TIMEOUT_MS, foreground
+# Bash calls are capped at 600000ms (10 min) -- cap --timeout at 540 there.
+# The default --timeout below is 540, sized for that un-raised interactive
+# cap; auto-rotation callers pass --timeout explicitly.
 set -uo pipefail
 
 QUEUE_DIR=""
