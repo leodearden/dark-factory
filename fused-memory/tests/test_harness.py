@@ -1046,6 +1046,30 @@ class TestStage1CycleSummaryRemediationBackstop:
         yield s
         await s.close()
 
+    @staticmethod
+    def _build_harness(journal, event_buffer, mock_memory_service, ledger_store):
+        """Wire the ledger + a no-op metadata lookup and construct the harness —
+        the setup every test in this class shares; only the stage mocks differ
+        per test."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        return _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    @staticmethod
+    async def _invoke_remediation(harness):
+        """Call _run_remediation_pass with the standard args shared by every
+        test in this class, so the five-argument invocation can't drift out of
+        sync across cases."""
+        from fused_memory.reconciliation.harness import TierConfig
+
+        await harness._run_remediation_pass(
+            'test-project',
+            'parent-run-id',
+            [_make_s3_findings()[0]],
+            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+            scope=_scope('test-project', '/tmp/test-project'),
+        )
+
     @pytest.mark.asyncio
     async def test_remediation_stage1_raise_triggers_degraded_backstop_ledger_write(
         self, journal, event_buffer, mock_memory_service, ledger_store
@@ -1055,22 +1079,12 @@ class TestStage1CycleSummaryRemediationBackstop:
         started_at (task 2626)."""
         import json
 
-        from fused_memory.reconciliation.harness import TierConfig
-
-        mock_memory_service.recon_ledger = ledger_store
-        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness = self._build_harness(journal, event_buffer, mock_memory_service, ledger_store)
         harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage1 exploded'))
 
         # Remediation swallows the Stage-1 exception (parent run already
         # completed) — this must complete without raising.
-        await harness._run_remediation_pass(
-            'test-project',
-            'parent-run-id',
-            [_make_s3_findings()[0]],
-            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
-            scope=_scope('test-project', '/tmp/test-project'),
-        )
+        await self._invoke_remediation(harness)
 
         recent = await journal.get_recent_runs('test-project', limit=1)
         assert recent and recent[0].run_type == 'remediation', (
@@ -1108,11 +1122,7 @@ class TestStage1CycleSummaryRemediationBackstop:
         trigger a second, redundant write_stage1_cycle_summary call — the
         in-stage fast path already wrote it, and current_stage_name has
         moved past Stage 1 by the time the finally block runs."""
-        from fused_memory.reconciliation.harness import TierConfig
-
-        mock_memory_service.recon_ledger = ledger_store
-        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness = self._build_harness(journal, event_buffer, mock_memory_service, ledger_store)
 
         _mock_stage_run(harness.stages[0])
         _mock_stage_run(harness.stages[1])
@@ -1122,13 +1132,7 @@ class TestStage1CycleSummaryRemediationBackstop:
             'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
             AsyncMock(),
         ) as mock_write:
-            await harness._run_remediation_pass(
-                'test-project',
-                'parent-run-id',
-                [_make_s3_findings()[0]],
-                TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
-                scope=_scope('test-project', '/tmp/test-project'),
-            )
+            await self._invoke_remediation(harness)
 
         mock_write.assert_not_called()
 
@@ -1140,11 +1144,7 @@ class TestStage1CycleSummaryRemediationBackstop:
         must leave Stage 1's real report in place and must NOT fire the
         backstop — current_stage_name is 'task_knowledge_sync' by the time
         the exception reaches finally, not 'memory_consolidator'."""
-        from fused_memory.reconciliation.harness import TierConfig
-
-        mock_memory_service.recon_ledger = ledger_store
-        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness = self._build_harness(journal, event_buffer, mock_memory_service, ledger_store)
 
         _mock_stage_run(harness.stages[0])
         harness.stages[1].run = AsyncMock(side_effect=RuntimeError('stage2 exploded'))
@@ -1153,13 +1153,7 @@ class TestStage1CycleSummaryRemediationBackstop:
             'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
             AsyncMock(),
         ) as mock_write:
-            await harness._run_remediation_pass(
-                'test-project',
-                'parent-run-id',
-                [_make_s3_findings()[0]],
-                TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
-                scope=_scope('test-project', '/tmp/test-project'),
-            )
+            await self._invoke_remediation(harness)
 
         mock_write.assert_not_called()
 
@@ -1167,6 +1161,56 @@ class TestStage1CycleSummaryRemediationBackstop:
         assert recent, 'expected the failed run to be persisted by the journal'
         assert 'memory_consolidator' in recent[0].stage_reports, (
             "Stage 1's report must remain present when Stage 2 fails"
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_all_accounts_capped_triggers_degraded_backstop_without_raising(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """AllAccountsCappedException takes the deferral branch (`except
+        AllAccountsCappedException`), which does not re-raise — the same
+        untested-until-now control-flow shape as
+        TestStage1CycleSummaryHarnessBackstop's sibling test, but on the
+        remediation driver. The finally-block backstop must still fire and
+        stamp the breadcrumb even though _run_remediation_pass completes
+        normally instead of raising, and even though this except branch
+        builds a differently-shaped `_error` record (`'deferred': True`, no
+        `error_type` of a raising exception)."""
+        import json
+
+        from shared.cli_invoke import AllAccountsCappedException
+
+        harness = self._build_harness(journal, event_buffer, mock_memory_service, ledger_store)
+        harness.stages[0].run = AsyncMock(
+            side_effect=AllAccountsCappedException(
+                retries=3, elapsed_secs=200.0, label='Reconciliation stage (sonnet)'
+            )
+        )
+
+        await self._invoke_remediation(harness)
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent and recent[0].run_type == 'remediation', (
+            'expected the deferred remediation run to be persisted by the journal'
+        )
+        assert recent[0].status in (RunStatus.failed, 'failed')
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary', flag_type='memory_consolidator', run_id=recent[0].id,
+        )
+        assert record is not None, (
+            'the remediation-pass finally block must write a cycle_summary ledger row '
+            'when Stage 1 defers via AllAccountsCappedException, even though '
+            '_run_remediation_pass returns normally instead of raising'
+        )
+        payload = json.loads(record.payload_json)
+        assert payload['stats'].get('stage1_cycle_summary_degraded_backstop') is True
+
+        err = recent[0].stage_reports.get('_error')
+        assert isinstance(err, dict)
+        assert err['stage1_cycle_summary_backstop_written'] is True, (
+            'the breadcrumb must be stamped on the deferral (return, not raise) '
+            'exit path too'
         )
 
 
