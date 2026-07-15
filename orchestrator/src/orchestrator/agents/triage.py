@@ -276,6 +276,29 @@ _ACCEPTED_ITEM_REQUIRED = {'index', 'suggestion', 'reason', 'files', 'proposed_t
 _SKIPPED_ITEM_REQUIRED = {'index', 'suggestion', 'reason'}
 _GROUP_ITEM_REQUIRED = {'title', 'description', 'accepted_indices'}
 
+# Per-item VALUE-TYPE specs (step-14/15) — recovered from the same removed
+# TRIAGE_OUTPUT_SCHEMA's per-item `items` type constraints, for exactly the
+# two fields format_pretriaged_detail consumes iteratively/arithmetically:
+# - accepted[].files must be list[str]: format_pretriaged_detail does
+#   `group_files.extend(accepted[idx].get('files', []))` (triage.py:410),
+#   which raises TypeError if `files` is present but non-iterable (e.g. an
+#   int).
+# - proposed_task_groups[].accepted_indices must be list[int]:
+#   format_pretriaged_detail does `if 0 <= idx < len(accepted)` over
+#   `g.get('accepted_indices', [])` (triage.py:409/419), which raises
+#   TypeError if an element is non-int (e.g. a str).
+# `index` is deliberately NOT type-checked here — it is only string-formatted
+# (skipped items, triage.py:436) or read behind an existing
+# `isinstance(orig_idx, int)` guard (triage.py:421), so it is not a crash
+# vector and type-checking it would add over-rejection surface for no
+# benefit.
+_ACCEPTED_ITEM_TYPES: dict[str, type] = {'files': str}
+_GROUP_ITEM_TYPES: dict[str, type] = {'accepted_indices': int}
+_ITEM_TYPE_SPECS: dict[str, dict[str, type]] = {
+    'accepted': _ACCEPTED_ITEM_TYPES,
+    'proposed_task_groups': _GROUP_ITEM_TYPES,
+}
+
 
 def extract_triage_verdict(envelope: dict | None) -> dict | None:
     """Unwrap and validate a verdict-tools envelope's triage payload.
@@ -286,12 +309,14 @@ def extract_triage_verdict(envelope: dict | None) -> dict | None:
     Returns the inner ``verdict`` dict on success, or None on any failure —
     no envelope, non-dict envelope, missing/non-dict ``verdict``, a verdict
     dict missing one of the required top-level keys, a non-list value for
-    one of those keys, a non-dict item within one of the lists, or an item
+    one of those keys, a non-dict item within one of the lists, an item
     missing one of its own required fields (see ``_ACCEPTED_ITEM_REQUIRED``
-    / ``_SKIPPED_ITEM_REQUIRED`` / ``_GROUP_ITEM_REQUIRED``) — a fail-safe
-    contract so the caller can fall back to inline triage instead of
-    crashing later in ``format_pretriaged_detail``'s unguarded per-item
-    indexing.
+    / ``_SKIPPED_ITEM_REQUIRED`` / ``_GROUP_ITEM_REQUIRED``), or an item
+    whose ``files`` (accepted) / ``accepted_indices`` (proposed_task_groups)
+    value is present but not a list of the expected element type (see
+    ``_ACCEPTED_ITEM_TYPES`` / ``_GROUP_ITEM_TYPES``) — a fail-safe contract
+    so the caller can fall back to inline triage instead of crashing later
+    in ``format_pretriaged_detail``'s unguarded per-item indexing/iteration.
     """
     if not isinstance(envelope, dict):
         logger.warning('Triage verdict envelope missing or not a dict (got %r)', type(envelope).__name__)
@@ -317,6 +342,7 @@ def extract_triage_verdict(envelope: dict | None) -> dict | None:
                 key, type(items).__name__,
             )
             return None
+        item_types = _ITEM_TYPE_SPECS.get(key, {})
         for item in items:
             if not isinstance(item, dict) or not (item_required <= item.keys()):
                 logger.warning(
@@ -325,6 +351,17 @@ def extract_triage_verdict(envelope: dict | None) -> dict | None:
                     key, sorted(item_required), item,
                 )
                 return None
+            for field, elem_type in item_types.items():
+                value = item[field]
+                if not isinstance(value, list) or not all(
+                    isinstance(elem, elem_type) for elem in value
+                ):
+                    logger.warning(
+                        'Triage verdict "%s" item field %r must be a list '
+                        'of %s (got %r)',
+                        key, field, elem_type.__name__, value,
+                    )
+                    return None
 
     return verdict
 
