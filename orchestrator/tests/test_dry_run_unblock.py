@@ -1793,3 +1793,172 @@ class TestDryRunCapExhaustionRealLoop:
         assert entry['risk_label'] == 'human-review-required'
         assert entry['files_referenced'] == []
         assert 'capped' in entry['proposal_text'].lower()
+
+
+# ---------------------------------------------------------------------------
+# task 2633 step-3: merge-completion risk clamp (RED — clamp not yet implemented)
+# ---------------------------------------------------------------------------
+
+class _FakeCompletionEventStore:
+    """Fake event_store for the merge-completion risk-clamp tests (task 2633).
+
+    Exposes ``fetch_events_by_type(event_type) -> list[dict]``, matching
+    ``orchestrator.event_store.EventStore``'s shape, driven by which task_ids
+    are "wired" to a passing ``workflow_verify`` row (condition b) and a
+    ``phase_enter(phase='merge')`` row (condition c). ``emit`` is a no-op so
+    run_dry_run_unblock's end-of-run ``invocation_end`` emission (guarded by
+    ``if event_store and result is not None``) does not raise.
+    """
+
+    def __init__(self, *, verify_passed_for=(), review_merge_for=()):
+        self.run_id = 'run-test'
+        self._verify_passed_for = set(verify_passed_for)
+        self._review_merge_for = set(review_merge_for)
+
+    def fetch_events_by_type(self, event_type):
+        from orchestrator.event_store import EventType
+        if event_type == EventType.workflow_verify:
+            return [
+                {'task_id': tid, 'phase': None, 'data': {'passed': True}}
+                for tid in self._verify_passed_for
+            ]
+        if event_type == EventType.phase_enter:
+            return [
+                {'task_id': tid, 'phase': 'merge', 'data': {}}
+                for tid in self._review_merge_for
+            ]
+        return []
+
+    def emit(self, *args, **kwargs):
+        pass
+
+
+class TestMergeCompletionRiskClamp:
+    """run_dry_run_unblock clamps risk_label 'low' -> 'human-review-required'
+    for a MERGE_VERIFY_RED proposal when
+    ``merge_completion_eligible(event_store, task_id)`` is False (task 2633,
+    the (b)+(c) generation-time enforcement point — see
+    ``orchestrator.merge_completion``).
+
+    RED today (step-3): the clamp does not exist yet in ``run_dry_run_unblock``,
+    so ``test_low_risk_clamped_when_eligibility_evidence_missing`` fails — the
+    written entry keeps the agent's 'low' label instead of being clamped.
+    step-4 adds the clamp and makes all cases in this class pass.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('event_store', [
+        None,
+        _FakeCompletionEventStore(),  # neither (b) nor (c)
+        _FakeCompletionEventStore(verify_passed_for={'42'}),  # (b) only
+        _FakeCompletionEventStore(review_merge_for={'42'}),  # (c) only
+    ], ids=['no-event-store', 'neither', 'b-only', 'c-only'])
+    async def test_low_risk_clamped_when_eligibility_evidence_missing(self, event_store, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+        from orchestrator.unblock_types import BlockClass
+
+        structured = {
+            'proposal_text': 'Rebase on main and rerun verify',
+            'risk_label': 'low',
+            'files_referenced': ['foo.py'],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='post-merge verify failed',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+                event_store=event_store,
+                block_class=BlockClass.MERGE_VERIFY_RED,
+            )
+
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['risk_label'] == 'human-review-required', (
+            f'expected clamp to human-review-required, got {entry["risk_label"]!r}'
+        )
+        assert entry['block_class'] == 'merge_verify_red'
+
+    @pytest.mark.asyncio
+    async def test_low_risk_not_clamped_when_eligibility_evidence_present(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+        from orchestrator.unblock_types import BlockClass
+
+        structured = {
+            'proposal_text': 'Rebase on main and rerun verify',
+            'risk_label': 'low',
+            'files_referenced': ['foo.py'],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        event_store = _FakeCompletionEventStore(
+            verify_passed_for={'42'}, review_merge_for={'42'},
+        )
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='post-merge verify failed',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+                event_store=event_store,
+                block_class=BlockClass.MERGE_VERIFY_RED,
+            )
+
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['risk_label'] == 'low'
+        assert entry['block_class'] == 'merge_verify_red'
+
+    @pytest.mark.asyncio
+    async def test_clamp_scoped_to_merge_verify_red_agent_failure_untouched(self, tmp_path):
+        """The clamp must NOT fire for block_class=AGENT_FAILURE even with no
+        (b)/(c) events — it is scoped to MERGE_VERIFY_RED only, so the
+        ordinary agent-block low-risk path stays byte-identical.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+        from orchestrator.unblock_types import BlockClass
+
+        structured = {
+            'proposal_text': 'Fix the bug',
+            'risk_label': 'low',
+            'files_referenced': ['foo.py'],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        event_store = _FakeCompletionEventStore()  # neither (b) nor (c)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+                event_store=event_store,
+                block_class=BlockClass.AGENT_FAILURE,
+            )
+
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['risk_label'] == 'low'
+        assert entry['block_class'] == 'agent_failure'

@@ -30,6 +30,7 @@ from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
+from orchestrator.merge_completion import merge_completion_eligible
 from orchestrator.unblock_types import BlockClass, BlockRecord, classify_block_reason
 from orchestrator.workflow_types import BlockDisposition, classify_failure
 
@@ -432,6 +433,32 @@ async def run_dry_run_unblock(
     # diagnostics) are left untouched; risk_label/files_referenced/
     # investigated_at are idempotently re-set to the values already on entry.
     resolved_class = block_class if block_class is not None else classify_block_reason(reason)
+
+    # Merge-stage completion mode (task 2633): the generation-time
+    # enforcement point for the (a)+(b)+(c) eligibility gate. (a) is this
+    # `resolved_class == MERGE_VERIFY_RED` check itself — the structural
+    # discriminator _spawn_merge_verify_dry_run always stamps on the
+    # post-merge-verify path (merge_queue.py). (b)+(c) — VERIFY passed and
+    # REVIEW passed, both run-scoped — are merge_completion_eligible's job.
+    # When the agent labelled 'low' but (b)/(c) are not BOTH present, clamp
+    # to 'human-review-required' so b3_gate.check_proposal's existing
+    # risk_label != 'low' -> abort (step 2) blocks consumption unchanged —
+    # no b3_gate.py edit needed. Only 'low' is clamped; 'medium' and
+    # 'human-review-required' are already non-consumable and left untouched.
+    if (
+        resolved_class == BlockClass.MERGE_VERIFY_RED
+        and entry.get('risk_label') == 'low'
+        and not merge_completion_eligible(event_store, task_id)
+    ):
+        logger.info(
+            'dry_run_unblock: clamping risk_label low -> %s for task %s — '
+            'MERGE_VERIFY_RED proposal without both a passing workflow_verify '
+            "event and a phase_enter(phase='merge') event in this run "
+            '(merge-completion eligibility gate, task 2633)',
+            _HUMAN_REVIEW_REQUIRED, task_id,
+        )
+        entry['risk_label'] = _HUMAN_REVIEW_REQUIRED
+
     record = BlockRecord(
         block_class=resolved_class,
         risk_label=entry.get('risk_label', _HUMAN_REVIEW_REQUIRED),

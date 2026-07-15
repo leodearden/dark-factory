@@ -1819,3 +1819,80 @@ class TestRunCheckSharedConnection:
 
         data = json.loads(capsys.readouterr().out.strip())
         assert data['verdict'] == 'fresh', f'expected fresh, got {data}'
+
+
+# ---------------------------------------------------------------------------
+# step-5 (task 2633): merge-completion consumption-gate contract
+# ---------------------------------------------------------------------------
+
+class TestMergeCompletionConsumptionContract:
+    """Pins the merge-stage completion mode's CONSUMPTION-side acceptance
+    criteria against b3_gate.check_proposal (task 2633).
+
+    These are CONTRACT/regression tests, not tests driving new b3_gate code:
+    the (a)+(b)+(c) eligibility gate is enforced at GENERATION time by the
+    dry_run_unblock.run_dry_run_unblock risk_label clamp (see
+    orchestrator.merge_completion.merge_completion_eligible and
+    TestMergeCompletionRiskClamp in test_dry_run_unblock.py) —
+    check_proposal itself is UNCHANGED by task 2633. This class pins that
+    the EXISTING check_proposal behaviour already delivers the three
+    consumption outcomes the merge-completion mode depends on, so a future
+    refactor of check_proposal cannot silently break merge-completion
+    consumption without failing a test here:
+      (i)   an ineligible (clamped) MERGE_VERIFY_RED entry aborts;
+      (ii)  an eligible (low-risk, fresh) MERGE_VERIFY_RED entry is
+            consumable end-to-end; and
+      (iii) the POST_MERGE_RED_MAIN hard-abort (task 1680) is retained
+            VERBATIM.
+    """
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    def test_clamped_merge_verify_red_entry_aborts(self):
+        """(i) The step-4 clamp shape — MERGE_VERIFY_RED, risk_label clamped
+        to 'human-review-required' by the generation-time (b)+(c) gate —
+        aborts at step 2 (risk_label != 'low'), never reaching git.
+        """
+        from orchestrator.b3_gate import ABORT, check_proposal
+        entry = {
+            **_LOW_RISK_ENTRY,
+            'block_class': 'merge_verify_red',
+            'risk_label': 'human-review-required',
+        }
+        result = check_proposal(
+            entry, worktree='/tmp', category='task_failure',
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
+
+    def test_eligible_merge_verify_red_entry_is_fresh(self):
+        """(ii) An eligible mechanical proposal — block_class=merge_verify_red,
+        risk_label='low' (the (b)+(c) gate passed at generation, so the clamp
+        never fired), matching HEAD, unchanged files_referenced footprint,
+        category='task_failure' (the real category post-merge-verify blocks
+        file, workflow.py:8608) — is consumable end-to-end at the gate.
+        """
+        from orchestrator.b3_gate import FRESH, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'block_class': 'merge_verify_red'}
+        result = check_proposal(
+            entry, worktree='/tmp', category='task_failure',
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
+
+    def test_post_merge_red_main_entry_hard_aborts(self):
+        """(iii) task 1680 retained VERBATIM: a POST_MERGE_RED_MAIN entry
+        hard-aborts before risk_label/git checks even with risk_label='low'
+        (_LOW_RISK_ENTRY's default) — the merge-completion mode must never
+        weaken this highest-blast-radius safety rail.
+        """
+        from orchestrator.b3_gate import ABORT, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'block_class': 'post_merge_red_main'}
+        result = check_proposal(
+            entry, worktree='/tmp', category='task_failure',
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
+        assert 'post-merge red-main fix-forward class' in result['reason'], (
+            f"expected the task-1680 reason text, got: {result['reason']!r}"
+        )
