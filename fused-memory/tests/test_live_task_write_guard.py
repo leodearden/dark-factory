@@ -17,8 +17,10 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 
 from fused_memory.middleware import live_task_write_guard as guard_mod
+from fused_memory.middleware import recon_write_policy
 from fused_memory.middleware.live_task_write_guard import (
     LIFECYCLE_RESET_FLAG_TYPE,
     LifecycleResetFinding,
@@ -27,8 +29,15 @@ from fused_memory.middleware.live_task_write_guard import (
     extract_live_snapshot,
     has_live_claimant,
 )
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.reconciliation.event_buffer import EventBuffer
 
 LIVE_CLAIMANT = 'run-1/session-1/pid=123'
+
+# Recon-stage agent_id used by the interceptor boundary tests — matches
+# test_recon_write_policy.py's AGENT_ID so the recon-stage task-write setup
+# is identical to that module's.
+RECON_AGENT_ID = 'recon-stage-task_knowledge_sync'
 
 
 def _flat(status='in-progress', claimant_run_id=LIVE_CLAIMANT, heartbeat_at='2026-07-15T12:00:00+00:00', **extra):
@@ -405,3 +414,185 @@ class TestGuardedReconTaskWrite:
 
         assert result == SENTINEL_RESULT
         file_finding.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Interceptor boundary fixtures (mirrors test_recon_write_policy.py:376-407)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def taskmaster():
+    tm = AsyncMock()
+    tm.get_task = AsyncMock(return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'})
+    tm.set_task_status = AsyncMock(return_value={'success': True})
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    tm.add_task = AsyncMock(return_value={'id': '2', 'title': 'New Task'})
+    tm.update_task = AsyncMock(return_value={'success': True})
+    tm.remove_tasks = AsyncMock(return_value={'success': True})
+    tm.add_dependency = AsyncMock(return_value={'success': True})
+    tm.remove_dependency = AsyncMock(return_value={'success': True})
+    return tm
+
+
+@pytest.fixture
+def reconciler():
+    r = AsyncMock()
+    r.reconcile_task = AsyncMock(return_value={'actions': [{'type': 'knowledge_captured'}]})
+    return r
+
+
+@pytest_asyncio.fixture
+async def event_buffer(tmp_path):
+    buf = EventBuffer(db_path=tmp_path / 'interceptor_eb_guard.db', buffer_size_threshold=100)
+    await buf.initialize()
+    yield buf
+    await buf.close()
+
+
+@pytest.fixture
+def interceptor(taskmaster, reconciler, event_buffer):
+    return TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+
+# ---------------------------------------------------------------------------
+# Interceptor boundary — update_task recon-stage lifecycle guard
+# ---------------------------------------------------------------------------
+
+
+class TestInterceptorUpdateTaskLifecycleGuard:
+    @pytest.mark.asyncio
+    async def test_claimant_reset_invokes_filer(self, interceptor, taskmaster):
+        """(a) update_task recon-stage write to the in-progress live-claimant
+        task invokes the filer once with flag_type='task_lifecycle_reset_detected'."""
+        before = _live_claimant_before()
+        after = _flat(status='in-progress', claimant_run_id=None)
+        taskmaster.get_task = AsyncMock(side_effect=[before, after])
+        filer = AsyncMock()
+        interceptor.set_lifecycle_reset_filer(filer)
+
+        await interceptor.update_task('1', '/project', title='x', agent_id=RECON_AGENT_ID)
+
+        filer.assert_awaited_once()
+        finding = filer.await_args.args[0]
+        assert finding.flag_type == 'task_lifecycle_reset_detected'
+        assert finding.task_id == '1'
+
+    @pytest.mark.asyncio
+    async def test_benign_after_state_does_not_invoke_filer(self, interceptor, taskmaster):
+        """(c) a benign after-state (claimant unchanged) does NOT invoke the filer."""
+        before = _live_claimant_before()
+        after = _live_claimant_before()
+        taskmaster.get_task = AsyncMock(side_effect=[before, after])
+        filer = AsyncMock()
+        interceptor.set_lifecycle_reset_filer(filer)
+
+        await interceptor.update_task('1', '/project', title='x', agent_id=RECON_AGENT_ID)
+
+        filer.assert_not_awaited()
+        taskmaster.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_recon_agent_id_does_not_invoke_filer(self, interceptor, taskmaster):
+        """(d) a non-recon agent_id does NOT invoke the filer and the write proceeds."""
+        before = _live_claimant_before()
+        taskmaster.get_task = AsyncMock(return_value=before)
+        filer = AsyncMock()
+        interceptor.set_lifecycle_reset_filer(filer)
+
+        await interceptor.update_task('1', '/project', title='x', agent_id=None)
+
+        filer.assert_not_awaited()
+        taskmaster.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_filer_set_write_proceeds_unchanged(self, interceptor, taskmaster):
+        """(e) with NO filer set (default), the write proceeds unchanged and
+        nothing is filed — guards existing behavior."""
+        before = _live_claimant_before()
+        after = _flat(status='in-progress', claimant_run_id=None)
+        taskmaster.get_task = AsyncMock(side_effect=[before, after])
+        # No set_lifecycle_reset_filer call — filer stays at its None default.
+
+        result = await interceptor.update_task('1', '/project', title='x', agent_id=RECON_AGENT_ID)
+
+        taskmaster.update_task.assert_awaited_once()
+        assert taskmaster.get_task.await_count == 1
+        assert result.get('success') is not False
+
+
+# ---------------------------------------------------------------------------
+# Interceptor boundary — set_task_status recon-stage lifecycle guard
+# ---------------------------------------------------------------------------
+
+
+class TestInterceptorSetTaskStatusLifecycleGuard:
+    @pytest.mark.asyncio
+    async def test_claimant_reset_invokes_filer(self, interceptor, taskmaster, monkeypatch):
+        """(b) set_task_status recon-stage transition invokes the filer when
+        the claimant resets un-requested."""
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: False,
+        )
+        before = _live_claimant_before()
+        after = _flat(status='review', claimant_run_id=None)
+        taskmaster.get_task = AsyncMock(side_effect=[before, after])
+        filer = AsyncMock()
+        interceptor.set_lifecycle_reset_filer(filer)
+
+        await interceptor.set_task_status('1', 'review', '/project', agent_id=RECON_AGENT_ID)
+
+        filer.assert_awaited_once()
+        finding = filer.await_args.args[0]
+        assert finding.flag_type == 'task_lifecycle_reset_detected'
+        assert finding.op == 'set_task_status'
+
+    @pytest.mark.asyncio
+    async def test_benign_after_state_does_not_invoke_filer(self, interceptor, taskmaster, monkeypatch):
+        """(c) a benign after-state (claimant unchanged) does NOT invoke the filer."""
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: False,
+        )
+        before = _live_claimant_before()
+        after = _flat(status='review', claimant_run_id=LIVE_CLAIMANT)
+        taskmaster.get_task = AsyncMock(side_effect=[before, after])
+        filer = AsyncMock()
+        interceptor.set_lifecycle_reset_filer(filer)
+
+        await interceptor.set_task_status('1', 'review', '/project', agent_id=RECON_AGENT_ID)
+
+        filer.assert_not_awaited()
+        taskmaster.set_task_status.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_recon_agent_id_does_not_invoke_filer(self, interceptor, taskmaster, monkeypatch):
+        """(d) a non-recon agent_id does NOT invoke the filer and the write proceeds."""
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+        )
+        before = _live_claimant_before()
+        taskmaster.get_task = AsyncMock(return_value=before)
+        filer = AsyncMock()
+        interceptor.set_lifecycle_reset_filer(filer)
+
+        await interceptor.set_task_status('1', 'review', '/project', agent_id=None)
+
+        filer.assert_not_awaited()
+        taskmaster.set_task_status.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_filer_set_write_proceeds_unchanged(self, interceptor, taskmaster, monkeypatch):
+        """(e) with NO filer set (default), the write proceeds unchanged and
+        nothing is filed — guards existing behavior."""
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: False,
+        )
+        before = _live_claimant_before()
+        after = _flat(status='review', claimant_run_id=None)
+        taskmaster.get_task = AsyncMock(side_effect=[before, after])
+        # No set_lifecycle_reset_filer call — filer stays at its None default.
+
+        await interceptor.set_task_status('1', 'review', '/project', agent_id=RECON_AGENT_ID)
+
+        taskmaster.set_task_status.assert_awaited_once()
+        assert taskmaster.get_task.await_count == 1
