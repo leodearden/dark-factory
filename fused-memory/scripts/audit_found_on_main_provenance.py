@@ -189,7 +189,16 @@ def extract_cited_task_ids(message: str) -> set[str]:
 
 
 def commit_cites_task(message: str, task_id: str) -> bool:
-    """Return True iff *task_id* is among the ids cited in *message*."""
+    """Return True iff *task_id* is among the ids cited in *message*.
+
+    Small public convenience wrapper for a single-id citation check.
+    :func:`classify` itself calls :func:`extract_cited_task_ids` directly
+    (it needs the full cited-id set to name the *other* task(s) in a
+    misattributed verdict's reason) — this helper is kept as documented
+    citation-checking API in its own right, mirroring the module's
+    ``extract_cited_task_ids`` / ``commit_cites_task`` pair called out in
+    the design docs, not dead surface.
+    """
     return task_id in extract_cited_task_ids(message)
 
 
@@ -405,10 +414,28 @@ class GitFacts:
     async def gather(
         self, commit: str, ref: str, declared_files: list[str],
     ) -> dict[str, Any]:
-        """Gather every git fact :func:`classify` needs about *commit* vs *ref*."""
+        """Gather every git fact :func:`classify` needs about *commit* vs *ref*.
+
+        Checks ``is_ancestor`` first and short-circuits the remaining four
+        subprocesses (commit message/diff, revert-log search, and one
+        cat-file check per declared file) when it is False: ``classify()``
+        resolves to ``commit_not_on_main`` at its very first precedence
+        check in that case and never consults any of the other facts, so
+        gathering them would be pure wasted subprocess work.
+        """
+        is_ancestor = await _git_is_ancestor(self.project_root, commit, ref)
+        if not is_ancestor:
+            return {
+                'is_ancestor': False,
+                'commit_subject': '',
+                'commit_message': '',
+                'commit_files': [],
+                'revert_commit': None,
+                'declared_files_missing_on_main': [],
+            }
         message = await _git_commit_message(self.project_root, commit)
         return {
-            'is_ancestor': await _git_is_ancestor(self.project_root, commit, ref),
+            'is_ancestor': True,
             'commit_subject': message.splitlines()[0] if message else '',
             'commit_message': message,
             'commit_files': await _git_show_files(self.project_root, commit),
@@ -441,8 +468,11 @@ async def build_audit_report(
       - ``verdict_counts``: dict with all of ``_ALL_VERDICTS`` as keys (0 for
         verdicts that didn't occur), so the shape never silently omits one.
       - ``tasks``: per-task detail list — ``{task_id, verdict, commit,
-        reasons}`` — in the same deterministic (by ``int(task_id)``) order
-        :func:`select_found_on_main_tasks` already produces.
+        commit_subject, reasons}`` — in the same deterministic (by
+        ``int(task_id)``) order :func:`select_found_on_main_tasks` already
+        produces. ``commit_subject`` is carried through for human triage of
+        flagged (``misattributed``/``reverted``/etc.) verdicts even though
+        ``classify()`` itself doesn't consult it.
     """
     audits = select_found_on_main_tasks(tasks)
 
@@ -450,7 +480,12 @@ async def build_audit_report(
     task_details: list[dict[str, Any]] = []
     for audit in audits:
         facts = await git.gather(audit.commit, ref, audit.declared_files)
-        audit.is_ancestor = facts.get('is_ancestor', True)
+        # Conservative-False default: an unconfirmed/omitted is_ancestor fact
+        # must surface as the loud commit_not_on_main verdict, mirroring
+        # _git_is_ancestor's own fail-safe-False semantics, rather than
+        # silently assuming "on main". GitFacts.gather always supplies the
+        # key; this default only matters for an alternate facts provider.
+        audit.is_ancestor = facts.get('is_ancestor', False)
         audit.commit_subject = facts.get('commit_subject', '')
         audit.commit_message = facts.get('commit_message', '')
         audit.commit_files = facts.get('commit_files') or []
@@ -466,6 +501,7 @@ async def build_audit_report(
             'task_id': audit.task_id,
             'verdict': verdict,
             'commit': audit.commit,
+            'commit_subject': audit.commit_subject,
             'reasons': reasons,
         })
 
@@ -541,6 +577,18 @@ async def apply_audit_annotations(
     }
 
 
+def _has_flagged_findings(report: dict[str, Any]) -> bool:
+    """Return True iff *report*'s ``verdict_counts`` show any flagged verdict.
+
+    Pure helper backing ``--fail-on-findings`` (see :func:`_run`): a report
+    where every count sits in ``ok``/``unverifiable`` is "clean"; any count
+    under one of ``_FLAGGED_VERDICTS`` means at least one task needs human
+    disposition. Missing/absent counts are treated as 0, never as a finding.
+    """
+    counts = report.get('verdict_counts') or {}
+    return any(counts.get(v, 0) > 0 for v in _FLAGGED_VERDICTS)
+
+
 # ---------------------------------------------------------------------------
 # CLI / main
 # ---------------------------------------------------------------------------
@@ -575,10 +623,18 @@ async def _run(args: argparse.Namespace) -> int:
         output = {'project': args.project, 'project_root': args.project_root, **report}
         print(json.dumps(output, indent=2, default=str))
 
+        findings = _has_flagged_findings(report)
+        fail_on_findings = args.fail_on_findings
+
         if not args.apply:
             logger.info(
                 'Dry run — nothing was modified. Use --apply to annotate flagged tasks.',
             )
+            if fail_on_findings and findings:
+                logger.warning(
+                    '--fail-on-findings: flagged verdict(s) present in dry-run report',
+                )
+                return 2
             return 0
 
         result = await apply_audit_annotations(backend, args.project_root, report)
@@ -586,7 +642,15 @@ async def _run(args: argparse.Namespace) -> int:
             'Applied: annotated %d flagged task(s); %d error(s); needs_human_review=%s',
             result['annotated'], result['errors'], result['needs_human_review'],
         )
-        return 1 if result['errors'] > 0 else 0
+        if result['errors'] > 0:
+            return 1
+        if fail_on_findings and findings:
+            logger.warning(
+                '--fail-on-findings: flagged verdict(s) present after apply '
+                '(see needs_human_review)',
+            )
+            return 2
+        return 0
     finally:
         await backend.close()
 
@@ -614,6 +678,17 @@ def main() -> int:
         help=(
             "Annotate flagged tasks' metadata.x_provenance_audit "
             '(default: dry-run, report only). Never reopens a done task.'
+        ),
+    )
+    parser.add_argument(
+        '--fail-on-findings', action='store_true',
+        help=(
+            'Exit 2 when verdict_counts shows any flagged verdict '
+            '(commit_not_on_main/misattributed/reverted/deliverable_absent), '
+            'in dry-run or --apply mode alike — distinct from the exit-1 '
+            'apply-error code. Default: always exit 0 on a successful audit '
+            'regardless of findings. Useful for wiring this script into CI '
+            'as a guard so a clean exit only ever means "nothing flagged".'
         ),
     )
     args = parser.parse_args()

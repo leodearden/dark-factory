@@ -50,6 +50,7 @@ classify = _mod.classify
 GitFacts = _mod.GitFacts
 build_audit_report = _mod.build_audit_report
 apply_audit_annotations = _mod.apply_audit_annotations
+_has_flagged_findings = _mod._has_flagged_findings
 _git_show_files = _mod._git_show_files
 _git_is_ancestor = _mod._git_is_ancestor
 _git_find_revert = _mod._git_find_revert
@@ -639,8 +640,24 @@ class TestBuildAuditReportShape:
         })
         report = await build_audit_report(tasks, git, ref='main')
         assert report['tasks'] == [{
-            'task_id': '10', 'verdict': 'ok', 'commit': 'a' * 40, 'reasons': [],
+            'task_id': '10', 'verdict': 'ok', 'commit': 'a' * 40,
+            'commit_subject': '', 'reasons': [],
         }]
+
+    async def test_per_task_detail_carries_commit_subject_for_triage(self):
+        """commit_subject is surfaced on the per-task detail (e.g. for a
+        misattributed verdict, a human can see the offending subject line
+        without a separate git lookup)."""
+        tasks = [_fom_task('30', 'c' * 40)]
+        git = FakeGitFacts({
+            'c' * 40: _facts(
+                commit_subject='Merge task/999 into main',
+                commit_message='Merge task/999 into main',
+            ),
+        })
+        report = await build_audit_report(tasks, git, ref='main')
+        assert report['tasks'][0]['verdict'] == 'misattributed'
+        assert report['tasks'][0]['commit_subject'] == 'Merge task/999 into main'
 
     async def test_deterministic_ordering_by_int_task_id(self):
         """Per-task detail is ordered by numeric task id regardless of input order."""
@@ -688,6 +705,20 @@ class TestBuildAuditReportShape:
             'deliverable_absent': 0, 'unverifiable': 0, 'ok': 1,
         }
         assert report['total'] == 3
+
+
+@pytest.mark.asyncio
+class TestBuildAuditReportMissingFactsDefaultSafe:
+    """A facts provider that omits keys entirely (unlike GitFacts, which
+    always supplies them) must fail safe: is_ancestor defaults to False —
+    the loud commit_not_on_main outcome — never a silent True."""
+
+    async def test_empty_facts_dict_yields_commit_not_on_main(self):
+        tasks = [_fom_task('10', 'a' * 40, files=['src/a.py'])]
+        git = FakeGitFacts({'a' * 40: {}})  # omits every key, including is_ancestor
+        report = await build_audit_report(tasks, git, ref='main')
+        assert report['tasks'][0]['verdict'] == 'commit_not_on_main'
+        assert report['verdict_counts']['commit_not_on_main'] == 1
 
 
 # ===========================================================================
@@ -845,6 +876,65 @@ class TestGitFilesMissingOnRef:
         assert missing == ['src/drop.py']
 
 
+@pytest.mark.asyncio
+class TestGitFactsGather:
+    """GitFacts.gather() aggregates the four _git_* wrappers per commit, and
+    short-circuits all of them when the commit is not on the ref at all."""
+
+    async def test_ancestor_commit_aggregates_all_facts(self, repo_facts):
+        root, shas = repo_facts
+        git = GitFacts(str(root))
+        facts = await git.gather(shas['c_keep_drop'], 'main', ['src/keep.py', 'src/drop.py'])
+        assert facts['is_ancestor'] is True
+        assert sorted(facts['commit_files']) == ['src/drop.py', 'src/keep.py']
+        assert facts['revert_commit'] is None
+        assert facts['declared_files_missing_on_main'] == ['src/drop.py']
+        assert facts['commit_subject']  # non-empty: first line of the commit message
+        assert facts['commit_message']
+
+    async def test_non_ancestor_short_circuits_remaining_git_calls(self, repo_facts, monkeypatch):
+        """When is_ancestor is False, none of the other four subprocesses run
+        — classify() would ignore their facts anyway (commit_not_on_main wins
+        at the very first precedence check), so gathering them is pure waste.
+        """
+        root, shas = repo_facts
+        calls: list[str] = []
+
+        async def _spy_commit_message(project_root, commit):
+            calls.append('commit_message')
+            return 'should not be called'
+
+        async def _spy_show_files(project_root, commit):
+            calls.append('show_files')
+            return ['should-not-be-called.py']
+
+        async def _spy_find_revert(project_root, commit, ref):
+            calls.append('find_revert')
+            return 'f' * 40
+
+        async def _spy_files_missing(project_root, files, ref):
+            calls.append('files_missing')
+            return list(files)
+
+        monkeypatch.setattr(_mod, '_git_commit_message', _spy_commit_message)
+        monkeypatch.setattr(_mod, '_git_show_files', _spy_show_files)
+        monkeypatch.setattr(_mod, '_git_find_revert', _spy_find_revert)
+        monkeypatch.setattr(_mod, '_git_files_missing_on_ref', _spy_files_missing)
+
+        git = GitFacts(str(root))
+        facts = await git.gather(shas['c_side'], 'main', ['src/keep.py'])
+
+        assert facts == {
+            'is_ancestor': False,
+            'commit_subject': '',
+            'commit_message': '',
+            'commit_files': [],
+            'revert_commit': None,
+            'declared_files_missing_on_main': [],
+        }
+        assert calls == []  # none of the other four wrappers ran
+
+
 # ===========================================================================
 # Step-17/18: apply_audit_annotations (non-destructive apply layer)
 # ===========================================================================
@@ -990,3 +1080,52 @@ class TestApplyAuditAnnotationsNeedsHumanReview:
         backend = FakeAuditBackend(fail_for={'20'})
         result = await apply_audit_annotations(backend, '/proj', report)
         assert set(result['needs_human_review']) == {'10', '20', '30', '40'}
+
+
+# ===========================================================================
+# _has_flagged_findings — pure helper backing the CLI's --fail-on-findings
+# ===========================================================================
+
+def _counts(**overrides: int) -> dict:
+    """A verdict_counts dict, all-zero except for *overrides*."""
+    counts: dict[str, int] = dict.fromkeys(
+        ('commit_not_on_main', 'misattributed', 'reverted', 'deliverable_absent',
+         'unverifiable', 'ok'), 0,
+    )
+    counts.update(overrides)
+    return counts
+
+
+class TestHasFlaggedFindings:
+    """True iff verdict_counts shows any flagged verdict; ok/unverifiable
+    counts never trigger it on their own."""
+
+    def test_false_when_all_ok(self):
+        report = {'verdict_counts': _counts(ok=5)}
+        assert _has_flagged_findings(report) is False
+
+    def test_false_when_only_unverifiable(self):
+        report = {'verdict_counts': _counts(unverifiable=3, ok=2)}
+        assert _has_flagged_findings(report) is False
+
+    def test_true_when_misattributed_present(self):
+        report = {'verdict_counts': _counts(misattributed=1, ok=4)}
+        assert _has_flagged_findings(report) is True
+
+    def test_true_when_reverted_present(self):
+        report = {'verdict_counts': _counts(reverted=1)}
+        assert _has_flagged_findings(report) is True
+
+    def test_true_when_commit_not_on_main_present(self):
+        report = {'verdict_counts': _counts(commit_not_on_main=1)}
+        assert _has_flagged_findings(report) is True
+
+    def test_true_when_deliverable_absent_present(self):
+        report = {'verdict_counts': _counts(deliverable_absent=1)}
+        assert _has_flagged_findings(report) is True
+
+    def test_missing_verdict_counts_key_defaults_false(self):
+        """A malformed/absent verdict_counts key is treated as 'nothing
+        flagged' rather than raising — this is a defensive CLI-exit-code
+        helper, not a data-integrity check."""
+        assert _has_flagged_findings({}) is False
