@@ -76,6 +76,7 @@ from orchestrator.scheduler import (
     files_to_modules,
     normalize_lock,
 )
+from orchestrator.session_registry import build_session_slug
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_STATUSES,
@@ -7610,11 +7611,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """
         parent_id = self.session_id
         if role.name != 'architect' and self._architect_spawn_session_id is not None:
+            # The architect's Claude session_id (str) deliberately fills the
+            # launcher_pid slot as the uniqueness token here -- mirrors
+            # session_hooks.hook_session_slug, which does the same for the
+            # identical reason: build_session_slug only ever str()s this
+            # argument, so the int annotation is not a real runtime
+            # constraint.
             parent_id = build_session_slug(
                 'architect',
                 self.config.fused_memory.project_id,
                 str(self.task_id),
-                self._architect_spawn_session_id,
+                self._architect_spawn_session_id,  # type: ignore[arg-type]
             )
         return {
             'CLAUDE_SPAWN_ROLE': role.name,
