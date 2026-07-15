@@ -126,7 +126,9 @@ async def invoke_agent(
     *timeout_seconds*, when set, kills the subprocess after this many seconds.
     *env_overrides*, when set, are merged into the subprocess environment.
     *spawn_env*, when set (claude backend only), carries ``CLAUDE_SPAWN_*``
-    spawn-identity vars (role/project/task/parent) for the SessionStart hook.
+    spawn-identity vars (role/project/task/parent) for the SessionStart hook;
+    any inherited ``CLAUDE_SPAWN_SESSION_ID``/``CLAUDE_SPAWN_LAUNCHER_PID``
+    is scrubbed at the same time (see shared.cli_invoke._invoke_claude).
     *working_idle_secs* / *absolute_cap_secs*, when BOTH set (claude backend
     only), extend the working-regime watchdog past *timeout_seconds* while
     the transcript keeps advancing. Default ``None`` for both → no extension.
@@ -261,6 +263,16 @@ async def _invoke_claude_with_sandbox(
                 env['CLAUDE_CONFIG_DIR'] = str(config_dir)
             if spawn_env:
                 env.update({k: v for k, v in spawn_env.items() if v})
+                # Amendment (task 2512 review): mirrors shared.cli_invoke.
+                # _invoke_claude's non-sandbox injection -- scrub any
+                # inherited CLAUDE_SPAWN_SESSION_ID/LAUNCHER_PID so
+                # session_hooks.hook_session_slug is guaranteed to take the
+                # build_session_slug(role, project, task_id, session_id)
+                # branch Workflow._build_spawn_env's parent-slug
+                # reconstruction assumes; see that site's comment for the
+                # full rationale.
+                env.pop('CLAUDE_SPAWN_SESSION_ID', None)
+                env.pop('CLAUDE_SPAWN_LAUNCHER_PID', None)
 
             try:
                 result = await _run_subprocess(

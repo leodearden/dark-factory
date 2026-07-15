@@ -685,6 +685,12 @@ async def invoke_claude_agent(
     subprocess environment AFTER *env_overrides* so per-agent spawn identity
     always wins over any inherited ``CLAUDE_SPAWN_*`` value; keys with an
     empty/falsy value are skipped so a blank never clobbers an inherited one.
+    Also scrubs any ``CLAUDE_SPAWN_SESSION_ID``/``CLAUDE_SPAWN_LAUNCHER_PID``
+    this process itself inherited (e.g. if the orchestrator was itself
+    fleet-spawned) — ``session_hooks.hook_session_slug`` prefers an inherited
+    ``CLAUDE_SPAWN_SESSION_ID`` outright over reconstructing from
+    role/project/task_id, so leaving it in place would collapse every
+    spawned agent onto ONE registry record instead of each getting its own.
 
     *sandbox_wrap*, when set, is applied to the built claude argv immediately
     before the subprocess is spawned.  The callable receives the full cmd list
@@ -1416,6 +1422,19 @@ async def _invoke_claude(
     # an inherited CLAUDE_SPAWN_* value.
     if spawn_env:
         env.update({k: v for k, v in spawn_env.items() if v})
+        # Amendment (task 2512 review): CLAUDE_SPAWN_SESSION_ID/LAUNCHER_PID
+        # key a DIFFERENT registry record than ROLE/PROJECT/TASK_ID/PARENT_ID
+        # do -- session_hooks.hook_session_slug prefers an inherited
+        # CLAUDE_SPAWN_SESSION_ID outright, bypassing the
+        # build_session_slug(role, project, task_id, session_id)
+        # reconstruction Workflow._build_spawn_env's CLAUDE_SPAWN_PARENT_ID
+        # depends on. If this process's own os.environ carries either (e.g.
+        # the orchestrator itself was fleet-spawned), the plain os.environ
+        # copy above would otherwise carry the SAME value into every spawned
+        # agent, collapsing them all onto one registry record. Scrub both
+        # whenever we assert a fresh spawn identity.
+        env.pop('CLAUDE_SPAWN_SESSION_ID', None)
+        env.pop('CLAUDE_SPAWN_LAUNCHER_PID', None)
     # Multi-account failover: inject per-invocation OAuth token
     if oauth_token:
         env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
