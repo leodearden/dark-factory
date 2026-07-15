@@ -176,6 +176,18 @@ class TestClassifyAgentClass:
         path = Path('/root/-home-leo-src-dark-factory--claude-worktrees-fix-foo/sess.jsonl')
         assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
 
+    def test_reify_warm_lane_worktree_is_orchestrated_task(self):
+        # Faithful encoding of /home/leo/src/reify/.warm-lanes/worktrees/5187
+        # (encode_cwd maps both '/' and '.' to '-'), embedding the
+        # '-warm-lanes-worktrees-' substring (task 2612).
+        path = Path('/root/-home-leo-src-reify--warm-lanes-worktrees-5187/sess.jsonl')
+        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
+
+    def test_reify_build_worktree_is_orchestrated_task(self):
+        # Embeds the '-reify-build-worktrees-' substring (task 2612).
+        path = Path('/root/-home-leo-src-reify-build-worktrees-abc/sess.jsonl')
+        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
+
     def test_reconciliation_run_header_is_recon(self):
         text = '## Reconciliation Run\nStage 1: sync\n'
         assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'recon'

@@ -289,7 +289,21 @@ STRATA: tuple[str, ...] = (
 )
 """The 5 agent-class strata the sampler groups by."""
 
-_WORKTREE_DIR_MARKERS: tuple[str, ...] = ('--worktrees-', '--claude-worktrees-')
+_WORKTREE_DIR_MARKERS: tuple[str, ...] = (
+    '--worktrees-', '--claude-worktrees-',
+    # reify's warm-lane and build-worktree encoded-dir shapes (task 2612):
+    # encode_cwd (inventory.py) maps both '/' and '.' to '-', so
+    # /home/leo/src/reify/.warm-lanes/worktrees/<id> and
+    # .../reify/build-worktrees/<id> never produce the double-dash
+    # '--worktrees-'/'--claude-worktrees-' form above.
+    # The two are deliberately asymmetric: 'build-worktrees' is a generic
+    # enough phrase that an unqualified '-build-worktrees-' marker could
+    # false-match an unrelated repo's own build/worktrees dir (e.g. a repo
+    # named '...-build'), so it's qualified with the repo name; whereas
+    # 'warm-lanes-worktrees' is distinctive enough on its own that no
+    # project qualifier is needed.
+    '-warm-lanes-worktrees-', '-reify-build-worktrees-',
+)
 
 _RECON_HEADER_PREFIXES: tuple[str, ...] = (
     '## Reconciliation Run',
@@ -332,8 +346,10 @@ def classify_agent_class(record: dict[str, Any] | None, path: Path) -> str:
     """Classify a session's agent class (one of :data:`STRATA`).
 
     Priority: *path*'s encoded-dir SHAPE is checked first — only its
-    parent directory's name is inspected, never any file content — a
-    ``--worktrees-``/``--claude-worktrees-`` marker means
+    parent directory's name is inspected, never any file content — an
+    orchestrated-worktree marker (dark_factory's ``--worktrees-``/
+    ``--claude-worktrees-``, or reify's ``-warm-lanes-worktrees-``/
+    ``-reify-build-worktrees-``; see :data:`_WORKTREE_DIR_MARKERS`) means
     ``'orchestrated-task'`` and wins even over a recon-marker turn.
     Otherwise, cheap content markers in *record* (the session's
     already-located first non-sidechain, non-meta user turn) decide:
