@@ -4875,6 +4875,33 @@ class TestBuildFallbackConfigSubprojectScoped:
         assert result is not None
         assert result.test_command == 'cd cockpit && uv run pytest tests/test_c3.py'
 
+    def test_test_command_extras_carried_into_mixed_subproject_scoping(
+        self, tmp_path: Path,
+    ) -> None:
+        """A configured `--extra` on test_command is carried into the mixed-branch pytest segment.
+
+        Twin-bug guard (task 2641): the mixed root+single-subproject branch
+        synthesizes the identical bare `uv run pytest` shape as the pure-sub
+        branch and shares the same dropped-extras defect. The trailing
+        `_ROOT_OWNING_TEST_COMMAND` segment is a distinct, dark_factory-specific
+        command and must stay unchanged — extras are injected only into the
+        touched-subproject's own pytest segment.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(
+            tmp_path, test_command="uv run --extra dev --extra web pytest -m 'not slow'",
+        )
+
+        result = _build_fallback_config(
+            ['cockpit/tests/test_c3.py', 'conftest.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == (
+            'cd cockpit && uv run --extra dev --extra web pytest tests/test_c3.py '
+            '&& cd .. && uv run --project shared pytest tests/scripts/'
+        )
+
 
 class TestRunScopedVerificationForwardsWorktreeToFallback:
     """`run_scoped_verification` forwards *worktree* into `_build_fallback_config` (task 2344).
