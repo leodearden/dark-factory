@@ -65,6 +65,7 @@ class TestAlreadyLandedDispatchGateAncestryHappyPath:
         h.git_ops.resolve_branch_sha = AsyncMock(return_value='f' * 40)
         h.git_ops.is_ancestor = AsyncMock(return_value=True)
         h.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
+        h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)
         h.git_ops.config.branch_prefix = 'task/'
         h.git_ops.config.main_branch = 'main'
 
@@ -95,6 +96,7 @@ def _wired_ancestry_harness(mock_orch_config) -> Harness:
     h.git_ops.resolve_branch_sha = AsyncMock(return_value='f' * 40)
     h.git_ops.is_ancestor = AsyncMock(return_value=True)
     h.git_ops.find_task_citation_commit = AsyncMock(return_value='a' * 40)
+    h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)
     h.git_ops.config.branch_prefix = 'task/'
     h.git_ops.config.main_branch = 'main'
 

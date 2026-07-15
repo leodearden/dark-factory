@@ -7329,6 +7329,14 @@ Output JSON matching the schema. Every task must appear in the output.
             # before any provenance is fabricated.
             if not await self.git_ops.is_ancestor(citation, branch):
                 return False
+            # FIX 1 effect-present guard (task 2500): the citation may be a
+            # real, in-lineage work commit that a LATER commit on main
+            # reverted — ancestry alone doesn't mean the effect survives at
+            # HEAD. Reject the flip unless the citation's own touched paths
+            # still match main (or the citation is a merge/empty commit,
+            # where path-based revert detection is inapplicable).
+            if not await self.git_ops.commit_effect_present_in_main(citation):
+                return False
             await self._mark_in_progress_done(
                 task_id, citation,
                 'reconcile: pre-dispatch check found branch already on main',
