@@ -608,6 +608,27 @@ class TestS1RegistryShutdownBounded:
 # ---------------------------------------------------------------------------
 
 
+async def _derive_after_binding_journal_row(tmp_path: Path, task_id: str, advanced_sha: str):
+    """G1 driver: binds a real LandedOutbox/MergeProvenance journal row for
+    *task_id*, then runs recovery_for() against a real TaskGroundTruth whose
+    git_ops surface is configured but expected UNUSED — TaskGroundTruth's
+    ``_resolve_branch_state`` consults ``MergeProvenance.lookup`` FIRST, so
+    the journal hit must short-circuit ALL git archaeology (TG-1). Returns
+    (report, action, git_ops)."""
+    _bind_landed_row(tmp_path, task_id=task_id, advanced_sha=advanced_sha)
+
+    git_ops = _fake_git_ops()
+    scheduler = _fake_scheduler(task={
+        'status': 'in-progress',
+        'claimant_run_id': None,
+        'heartbeat_at': None,
+        'metadata': {},
+    })
+    resolver = _make_ground_truth(git_ops=git_ops, scheduler=scheduler, escalation_queue=None)
+    report, action = await resolver.recovery_for(task_id)
+    return report, action, git_ops
+
+
 @pytest.mark.asyncio
 class TestG1JournalFirstRecovery:
     """G1 composition cell (journal-first branch resolution, TG-1)."""
