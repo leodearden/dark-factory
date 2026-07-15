@@ -157,6 +157,30 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      BLOCKED instead of silently stranding the task with an empty queue.
    - If ``always_escalates=True``: fall through to gate (act-then-ask).
 
+   Phase γ **cross-unit, target_unit-less** sub-path (``target_unit`` is
+   falsy — an explicit ``None``, or the key omitted entirely so
+   ``before_done.get('target_unit', '')`` is ``''``; the documented
+   "``target_unit=None`` → cross-unit, no named unit" configuration): there
+   is no specific systemd unit to baseline-inspect or fresh-PID-verify
+   against — inspecting the empty unit name returns a degenerate
+   ``{'MainPID': 0, 'ActiveEnterTimestampMonotonic': 0}`` dict with no
+   ``ActiveState``, which the baseline gate above misreads as a wedge (task
+   2632 / esc-2585-1's exact escalation — the 2-key baseline repr
+   byte-matches an inspect of ``''``, not a real wedge). Both the baseline
+   gate and the FreshPidVerify/RestartPlan leg are skipped entirely; the
+   deploy is driven on the script's exit code alone:
+   - ``rc == 0``: hand off to ``_writeback_deploy_success`` (empty
+     ``new_state``, ``pid=0`` — the same helper the named-target path uses)
+     unless ``always_escalates=True``, in which case fall through to the
+     gate (act-then-ask) instead, since the script already ran.
+   - ``rc != 0``, an outer wall-clock guard timeout, or an unexpected
+     ``run_fn`` error: file born-at-L2 ``infra_issue``, return BLOCKED
+     (parallel to B7a); ``before_done_ran_at`` is already stamped (I1), so
+     the deploy is NOT re-run.
+   Named-target genuine-wedge detection (the baseline/verify logic above)
+   is entirely unchanged — this sub-path is reached only when
+   ``target_unit`` itself is falsy.
+
    Phase γ **predicate** sub-path (``before_done['kind'] == 'predicate'``):
    - A read-only exit-code VERDICT check — NOT a deploy.  Dispatched at the
      very top of section 2, above the deploy-only ``target_unit``/I1/baseline
@@ -1691,6 +1715,10 @@ class DeterministicRunner:
         # ── 2. before_done execution (γ) ────────────────────────────────────
         # Cross-unit blocking deploy: stamp → baseline → run script → verify → done.
         # Self-target detection + detached systemd-run is deferred to ε.
+        # A falsy target_unit (cross-unit, no named unit) skips the
+        # baseline/verify legs entirely and drives on rc alone — see the
+        # module docstring's target_unit-less sub-path and the
+        # `if not target_unit:` branch below (task 2632 / esc-2585-1).
         if before_done is not None:
             # γ-predicate: a read-only exit-code verdict check — NOT a deploy.
             # Dispatched FIRST, above target_unit/I1/baseline, so a predicate
