@@ -1003,6 +1003,35 @@ class ReconReportState:
                 })
         return results
 
+    def active_run_for_stage(self, stage: str, project_id: str) -> str | None:
+        """Resolve the run_id currently in-progress on *stage* for *project_id*.
+
+        Scans ``_active`` (run_id -> its CURRENT stage) rather than
+        ``_state`` directly: a run that has since moved on to a later stage
+        still has its earlier ``(run_id, stage)`` entry sitting in
+        ``_state`` (never retroactively deleted), so ``_active`` is what
+        distinguishes "this stage is what the run is doing right now" from
+        "this run passed through this stage at some point". Returns
+        ``None`` when no run is currently active on that stage for that
+        project, or when the ``(run_id, stage)`` entry has since been
+        completed (``complete()`` stamps ``completed_at`` but does not
+        clear ``_active``).
+
+        Used by :mod:`server.recon_lifecycle_filer` (task 2624) to resolve
+        the live Stage-2 (``task_knowledge_sync``) run a code-detected
+        ``task_lifecycle_reset_detected`` finding should land against.
+        """
+        for run_id, active_stage in self._active.items():
+            if active_stage != stage:
+                continue
+            entry = self._state.get((run_id, stage))
+            if entry is None or entry.completed_at is not None:
+                continue
+            if entry.project_id != project_id:
+                continue
+            return run_id
+        return None
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

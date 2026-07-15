@@ -42,6 +42,10 @@ from fused_memory.backends.task_backend_errors import (
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.middleware import recon_write_policy
+from fused_memory.middleware.live_task_write_guard import (
+    FileFindingFn,
+    guarded_recon_task_write,
+)
 from fused_memory.middleware.lock_charter_guard import (
     directory_locks,
     extract_files,
@@ -472,6 +476,16 @@ class TaskInterceptor:
         # helpers no-op.
         self._write_journal: WriteJournal | None = None
 
+        # Task 2624: code-enforced before/after live-task-write self-check.
+        # When wired by the bootstrap (post ReconReportState construction —
+        # see set_lifecycle_reset_filer), recon-stage update_task/
+        # set_task_status writes to a live in-progress claimed task are
+        # routed through live_task_write_guard.guarded_recon_task_write,
+        # which self-files a task_lifecycle_reset_detected finding on
+        # unexpected status/claimant_run_id divergence. None (default) ->
+        # exact current behavior (the pre-existing inline write).
+        self._lifecycle_reset_filer: FileFindingFn | None = None
+
     def set_write_journal(self, journal: 'WriteJournal') -> None:
         """Wire the write journal for durable auditing of task writes.
 
@@ -481,6 +495,18 @@ class TaskInterceptor:
         instrumentation is a no-op.
         """
         self._write_journal = journal
+
+    def set_lifecycle_reset_filer(self, filer: FileFindingFn) -> None:
+        """Wire the async lifecycle-reset finding filer (task 2624).
+
+        Bootstrap calls this once at startup, after the server's
+        ReconReportState is constructed (the filer needs it). Before the
+        call (and for tests that don't configure a filer), the before/after
+        live-task-write self-check around recon-stage writes is dormant and
+        those writes proceed via the pre-existing inline path — zero
+        behavior change.
+        """
+        self._lifecycle_reset_filer = filer
 
     async def _journal_around(
         self,
@@ -791,6 +817,11 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
         resolved_provenance: dict | None = None
         resolved_reopen_reason: str | None = None
+        # Task 2624: computed once and reused both by the recon_write_policy
+        # gate below and by the lifecycle-reset guard around the write
+        # further down, so the two stay in agreement on what counts as a
+        # recon-stage caller.
+        is_recon_stage_write = isinstance(agent_id, str) and agent_id.startswith('recon-stage-')
         async with self._write_lock(project_id):
             # 1. Get before-state
             before = await tm.get_task(task_id, project_root, tag)
@@ -825,7 +856,13 @@ class TaskInterceptor:
             # meanwhile — the same pattern curator_escalator.py's
             # _persist_state uses to offload a blocking write while holding
             # _persist_lock.
-            if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
+            if is_recon_stage_write:
+                # is_recon_stage_write already guarantees this (it's defined
+                # as `isinstance(agent_id, str) and ...`); re-asserted here
+                # only to keep pyright's narrowing in sync with the hoisted
+                # boolean, matching the recon_write_policy.check(agent_id: str)
+                # signature below.
+                assert isinstance(agent_id, str)
                 verdict = await asyncio.to_thread(
                     recon_write_policy.check,
                     'set_task_status',
@@ -1061,14 +1098,39 @@ class TaskInterceptor:
             claimant_kwargs: dict[str, Any] = _maybe_kwargs(
                 _UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
             )
-            result: dict[str, Any] = dict(
-                await self._journal_around(
+
+            async def _do_set_task_status_write() -> Any:
+                return await self._journal_around(
                     'set_task_status',
                     project_root,
                     {'task_id': task_id, 'status': status, 'tag': tag},
                     tm.set_task_status(task_id, status, project_root, tag, **claimant_kwargs),
                 )
-            )
+
+            # Task 2624: code-enforced before/after live-task-write
+            # self-check (incident: dark_factory task 2588 un-claim). Only
+            # engages for recon-stage writes once a filer is wired
+            # (set_lifecycle_reset_filer) — with no filer (the default),
+            # this is the pre-existing inline write, byte-identical.
+            if is_recon_stage_write and self._lifecycle_reset_filer is not None:
+                result: dict[str, Any] = dict(
+                    await guarded_recon_task_write(
+                        task_id=task_id,
+                        project_id=project_id,
+                        op='set_task_status',
+                        get_task=tm.get_task,
+                        do_write=_do_set_task_status_write,
+                        file_finding=self._lifecycle_reset_filer,
+                        project_root=project_root,
+                        tag=tag,
+                        before_task=before,
+                        requested_status=status,
+                        requested_claimant_write=claimant_run_id is not _UNSET,
+                        requested_heartbeat_write=heartbeat_at is not _UNSET,
+                    )
+                )
+            else:
+                result = dict(await _do_set_task_status_write())
 
         # 5. Emit event
         payload: dict[str, Any] = {
@@ -3654,6 +3716,8 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
         # WP-E: serialise the write; re-embed below reads only and stays
         # outside the lock.
+        is_recon_stage_write = isinstance(agent_id, str) and agent_id.startswith('recon-stage-')
+        before: dict[str, Any] | None = None
         async with self._write_lock(project_id):
             # W5-ζ ReconWritePolicy: only consulted for recon-stage callers.
             # `before` is read here — under the lock, immediately ahead of
@@ -3664,8 +3728,16 @@ class TaskInterceptor:
             # `before` before the lock, which let the live task status drift
             # between the check and the write). snapshot_token is extracted
             # from the incoming metadata payload so gate 3 (stale-snapshot)
-            # can fire on this path.
-            if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
+            # can fire on this path. This same `before` read is reused below
+            # (task 2624) as the lifecycle-reset guard's before-snapshot, so
+            # a recon-stage write never issues two before-reads.
+            if is_recon_stage_write:
+                # is_recon_stage_write already guarantees this (it's defined
+                # as `isinstance(agent_id, str) and ...`); re-asserted here
+                # only to keep pyright's narrowing in sync with the hoisted
+                # boolean, matching the recon_write_policy.check(agent_id: str)
+                # signature below.
+                assert isinstance(agent_id, str)
                 before = await tm.get_task(task_id, project_root)
                 verdict = recon_write_policy.check(
                     'update_task',
@@ -3680,19 +3752,43 @@ class TaskInterceptor:
                 )
                 if verdict.is_rejection:
                     return verdict.to_error_dict()
-            try:
-                result: dict[str, Any] = dict(
-                    await self._journal_around(
-                        'update_task',
-                        project_root,
-                        {'task_id': task_id, **{k: _journal_param_clip(v) for k, v in kwargs.items()}},
-                        tm.update_task(
-                            task_id=task_id,
-                            project_root=project_root,
-                            **kwargs,
-                        ),
-                    )
+
+            async def _do_update_task_write() -> Any:
+                return await self._journal_around(
+                    'update_task',
+                    project_root,
+                    {'task_id': task_id, **{k: _journal_param_clip(v) for k, v in kwargs.items()}},
+                    tm.update_task(
+                        task_id=task_id,
+                        project_root=project_root,
+                        **kwargs,
+                    ),
                 )
+
+            try:
+                # Task 2624: code-enforced before/after live-task-write
+                # self-check (incident: dark_factory task 2588 un-claim).
+                # Only engages for recon-stage writes once a filer is wired
+                # (set_lifecycle_reset_filer) — with no filer (the default),
+                # this is the pre-existing inline write, byte-identical.
+                if is_recon_stage_write and self._lifecycle_reset_filer is not None:
+                    result: dict[str, Any] = dict(
+                        await guarded_recon_task_write(
+                            task_id=task_id,
+                            project_id=project_id,
+                            op='update_task',
+                            get_task=tm.get_task,
+                            do_write=_do_update_task_write,
+                            file_finding=self._lifecycle_reset_filer,
+                            project_root=project_root,
+                            before_task=before,
+                            requested_status=None,
+                            requested_claimant_write=False,
+                            requested_heartbeat_write=False,
+                        )
+                    )
+                else:
+                    result = dict(await _do_update_task_write())
             except (StatusWriteAuthorityError, DoneProvenanceWriteAuthorityError) as e:
                 # SqliteTaskBackend write-authority floor (task C1): status /
                 # metadata.done_provenance writes are unconditionally rejected.
