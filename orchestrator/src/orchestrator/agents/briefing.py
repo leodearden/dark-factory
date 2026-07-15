@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from orchestrator.config import OrchestratorConfig
@@ -996,9 +997,15 @@ Handle this escalation, then call `resolve_issue` with a summary.
         at every level) and renders it as a markdown block carrying an
         explicit provenance/verification line — the reader must not assume a
         persisted proposal still holds against the current tree. Returns ''
-        when there is no proposal, the latest entry is not a dict, or (once
-        the staleness guard lands) the proposal predates the task's last
-        block transition.
+        when there is no proposal, the latest entry is not a dict, or the
+        proposal predates the task's last block transition
+        (``metadata.last_blocked_at``).
+
+        The staleness comparison fails OPEN (i.e. includes the proposal)
+        whenever either timestamp is absent or fails to parse via
+        ``datetime.fromisoformat`` — including a naive-vs-aware mismatch,
+        which raises ``TypeError`` on comparison — so a formatting hiccup
+        never silently drops persisted analysis.
 
         Called only from retry/resume prompt builders
         (``build_revalidation_prompt``, ``build_resume_prompt``) and, behind
@@ -1019,6 +1026,16 @@ Handle this escalation, then call `resolve_issue` with a summary.
         files_referenced = proposal.get('files_referenced') or []
         created_at = proposal.get('timestamp') or proposal.get('investigated_at') or ''
         files_str = ', '.join(files_referenced)
+
+        last_blocked_at = (task.get('metadata') or {}).get('last_blocked_at')
+        if created_at and last_blocked_at:
+            try:
+                is_stale = datetime.fromisoformat(created_at) < datetime.fromisoformat(last_blocked_at)
+            except (ValueError, TypeError):
+                pass  # fail open — never silently drop persisted analysis
+            else:
+                if is_stale:
+                    return ''
 
         return f"""\
 ## Prior Block-Time Investigation
