@@ -3369,3 +3369,159 @@ class TestConflictingTaskStatusFraming:
             f'Expected is_conflicting_task_status_framing to return False for two '
             f'different ids, got True.\ntext={text!r}'
         )
+
+
+class TestLiveTaskStatusFraming:
+    """Tests for frames_live_task_status_as_current_fact() in task_filter.py.
+
+    Detects a recon-stage write that frames a point-in-time snapshot of LIVE
+    task-table fields (status=, claimant_run_id=, heartbeat_at=, pid=) — or a
+    clear paraphrase ("is actively driven by", "confirmed LIVE/in-progress")
+    — as a STANDING/current fact rather than a timestamped point-in-time
+    check (Stage-1 reify finding 82c8a42a; 2026-07-14 instances task 5207 /
+    Graphiti episode 2df7dda7 and task 5208 / mem0 memory bc2126d4).
+
+    Exempts the durable form the task prescribes: "a liveness/status check
+    was performed/reported ... at <timestamp>" or "as of <timestamp> ...
+    reported" — content already framed as a point-in-time check must NOT
+    fire even though it necessarily still mentions the live field/value.
+    """
+
+    # ------------------------------------------------------------------ #
+    # positive fixtures (current-fact framing -> True)
+    # ------------------------------------------------------------------ #
+
+    def test_positive_bare_field_token_framing(self):
+        """Bare live-field-token snapshot (status=/claimant_run_id=/heartbeat_at=)
+        framed with no point-in-time-check anchor must fire.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            frames_live_task_status_as_current_fact,
+        )
+
+        text = (
+            'task 5207 status=in-progress, claimant_run_id=run/session/pid=1234, '
+            'heartbeat_at=2026-07-14T20:31:00Z'
+        )
+        assert frames_live_task_status_as_current_fact(text) is True, (
+            f'Expected True for bare live-field-token framing.\ntext={text!r}'
+        )
+
+    def test_positive_pid_only_snapshot(self):
+        """A pid=-only snapshot (no other live-field token) must still fire."""
+        from fused_memory.reconciliation.task_filter import (
+            frames_live_task_status_as_current_fact,
+        )
+
+        text = 'task 5209 pid=48213 on worker-node-3'
+        assert frames_live_task_status_as_current_fact(text) is True, (
+            f'Expected True for a pid=-only snapshot.\ntext={text!r}'
+        )
+
+    def test_positive_actively_driven_by_paraphrase(self):
+        """The 'is actively driven by' paraphrase must fire without any bare
+        field token present.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            frames_live_task_status_as_current_fact,
+        )
+
+        text = 'task 5208 is actively driven by run abc123'
+        assert frames_live_task_status_as_current_fact(text) is True, (
+            f"Expected True for 'is actively driven by' paraphrase.\ntext={text!r}"
+        )
+
+    def test_positive_confirmed_live_paraphrase(self):
+        """The 'confirmed LIVE / in-progress' paraphrase must fire."""
+        from fused_memory.reconciliation.task_filter import (
+            frames_live_task_status_as_current_fact,
+        )
+
+        text = 'task 5208 confirmed LIVE / in-progress'
+        assert frames_live_task_status_as_current_fact(text) is True, (
+            f"Expected True for 'confirmed LIVE / in-progress' paraphrase.\ntext={text!r}"
+        )
+
+    # ------------------------------------------------------------------ #
+    # negative/exemption fixtures (must return False)
+    # ------------------------------------------------------------------ #
+
+    def test_negative_durable_point_in_time_check_form(self):
+        """The canonical durable form ('a liveness check performed at
+        <timestamp> reported ...') contains status= but is a timestamped
+        point-in-time check -> must NOT fire. Proves the guard rewards the
+        correct form instead of blocking it.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            frames_live_task_status_as_current_fact,
+        )
+
+        text = (
+            'A liveness check performed at 2026-07-14T20:31:00Z reported task '
+            '5207 status=in-progress.'
+        )
+        assert frames_live_task_status_as_current_fact(text) is False, (
+            f'Expected False for the durable timestamped point-in-time-check '
+            f'form.\ntext={text!r}'
+        )
+
+    def test_negative_as_of_durable_form(self):
+        """The 'as of <timestamp>, status=...' durable shape must NOT fire.
+
+        Uses a fixture that trips LIVE_TASK_STATUS_RE (status=) so this test
+        genuinely exercises the 'as of' branch of POINT_IN_TIME_CHECK_RE,
+        rather than passing merely because the outer live-status marker
+        never matched in the first place.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            frames_live_task_status_as_current_fact,
+        )
+
+        text = 'as of 2026-07-14T20:31Z, task 5208 status=claimed'
+        assert frames_live_task_status_as_current_fact(text) is False, (
+            f"Expected False for the 'as of <timestamp>, status=...' durable "
+            f'form.\ntext={text!r}'
+        )
+
+    def test_positive_vague_as_of_without_timestamp_still_fires(self):
+        """A vague 'as of' with no attached date/timestamp token must NOT be
+        exempted -- only a genuine timestamped point-in-time check should be.
+
+        Guards against the exemption being trivially bypassable by the bare
+        words "as of" with no real timestamp following (e.g. "as of the
+        latest run"), which would let exactly the current-fact framing this
+        detector targets slip through unblocked.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            frames_live_task_status_as_current_fact,
+        )
+
+        text = (
+            'As of the latest run, task 5207 status=in-progress and '
+            'actively driven by run abc123'
+        )
+        assert frames_live_task_status_as_current_fact(text) is True, (
+            f"Expected True: a vague 'as of' with no timestamp token must "
+            f'not exempt current-fact framing.\ntext={text!r}'
+        )
+
+    def test_negative_no_live_status_marker(self):
+        """Content with no live-status marker at all must NOT fire."""
+        from fused_memory.reconciliation.task_filter import (
+            frames_live_task_status_as_current_fact,
+        )
+
+        text = 'Task 5207 was implemented via a new regex guard.'
+        assert frames_live_task_status_as_current_fact(text) is False, (
+            f'Expected False when no live-status marker is present.\ntext={text!r}'
+        )
+
+    def test_negative_empty_string(self):
+        """Empty string must NOT fire."""
+        from fused_memory.reconciliation.task_filter import (
+            frames_live_task_status_as_current_fact,
+        )
+
+        assert frames_live_task_status_as_current_fact('') is False, (
+            'Expected False for empty string.'
+        )
