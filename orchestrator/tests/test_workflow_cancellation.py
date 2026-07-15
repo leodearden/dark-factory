@@ -14,6 +14,8 @@ Test coverage:
     cleanup-survival paths
   step-07: ``TaskWorkflow.run()`` single-catch site (boundary row 14) — a
     real workflow, harness-style hard-cancelled mid-VERIFY
+  step-09: ``_on_terminal_cleanups()`` ordering + kind-aware lane release
+    (1:1 replacement of the deleted exc_info ``_hard_cancel`` skip)
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -407,3 +410,154 @@ class TestRunSingleCatchHardCancel:
         last_status = await scheduler.get_status(workflow.task_id)
         assert last_status == 'in-progress'
         assert not outcome_allows_status(report.outcome, last_status)
+
+
+# ---------------------------------------------------------------------------
+# step-09: _on_terminal_cleanups() ordering + kind-aware lane release
+# ---------------------------------------------------------------------------
+#
+# Exercises _on_terminal_cleanups() directly (no run()/_drive() involved) —
+# a real TaskWorkflow (config/git_ops/task_assignment fixtures shared with
+# step-07 above), its .state staged directly (the setter bypasses transition
+# validation), and the five cleanup targets replaced with spies that append
+# their name to a shared `calls` log. This pins the 1:1 replacement of the
+# deleted exc_info `_hard_cancel` skip: release iff
+# `kind != 'hard' and not _worktree_external and (kind is not None or
+# state in {DONE, CANCELLED})`.
+#
+# RED until step-10: _on_terminal_cleanups() is still the step-8 placeholder
+# returning [] — every scenario below observes an empty `calls` log.
+
+
+@pytest.mark.asyncio
+class TestOnTerminalCleanups:
+    """Boundary row 15 prep: ``_on_terminal_cleanups()`` ordering + the
+    kind-aware lane-release guard."""
+
+    def _wire_spies(self, workflow, calls: list[str]) -> None:
+        async def _heartbeat() -> None:
+            calls.append('stop_claimant_heartbeat')
+
+        async def _steward_stop() -> None:
+            calls.append('stop_steward')
+
+        async def _cleanup_worktree() -> None:
+            calls.append('cleanup_done_worktree')
+
+        def _cleanup_config() -> None:
+            calls.append('cleanup_config_dir')
+
+        async def _release_lane(task_id: str) -> bool:
+            calls.append('release_lane')
+            return True
+
+        workflow._stop_claimant_heartbeat = _heartbeat  # type: ignore[method-assign]
+        workflow._steward = SimpleNamespace(stop=_steward_stop)
+        workflow._maybe_cleanup_done_worktree = _cleanup_worktree  # type: ignore[method-assign]
+        workflow._cleanup_config_dir = _cleanup_config  # type: ignore[method-assign]
+        workflow.git_ops.release_lane_for_terminal_task = _release_lane  # type: ignore[method-assign]
+
+    async def _run_cleanups(self, workflow, kind: str | None) -> None:
+        for _name, fn in workflow._on_terminal_cleanups():
+            await fn(kind)
+
+    async def test_ordering_with_kind_none_and_done_state(
+        self, config, git_ops, task_assignment,
+    ):
+        """A genuine DONE exit (kind=None): all five run, in order, release fires."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow.state = WorkflowState.DONE
+        calls: list[str] = []
+        self._wire_spies(workflow, calls)
+
+        await self._run_cleanups(workflow, None)
+
+        assert calls == [
+            'stop_claimant_heartbeat', 'stop_steward', 'cleanup_done_worktree',
+            'release_lane', 'cleanup_config_dir',
+        ]
+
+    async def test_ordering_with_kind_none_and_cancelled_state(
+        self, config, git_ops, task_assignment,
+    ):
+        """The authoritative-cancel exit (kind=None, state already CANCELLED
+        via _handle_cancelled_terminal_exit) also releases — row @263's
+        pre-existing property, preserved."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow.state = WorkflowState.CANCELLED
+        calls: list[str] = []
+        self._wire_spies(workflow, calls)
+
+        await self._run_cleanups(workflow, None)
+
+        assert calls == [
+            'stop_claimant_heartbeat', 'stop_steward', 'cleanup_done_worktree',
+            'release_lane', 'cleanup_config_dir',
+        ]
+
+    async def test_kind_hard_skips_lane_release_but_other_four_still_run(
+        self, config, git_ops, task_assignment,
+    ):
+        """kind='hard' skips release EVEN when state is already terminal —
+        the branch must survive the teardown regardless of state."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow.state = WorkflowState.CANCELLED
+        calls: list[str] = []
+        self._wire_spies(workflow, calls)
+
+        await self._run_cleanups(workflow, 'hard')
+
+        assert 'release_lane' not in calls
+        assert calls == [
+            'stop_claimant_heartbeat', 'stop_steward', 'cleanup_done_worktree',
+            'cleanup_config_dir',
+        ]
+
+    async def test_kind_soft_releases_lane_even_from_a_working_state(
+        self, config, git_ops, task_assignment,
+    ):
+        """kind='soft' releases even mid-flight (state is VERIFY, not yet
+        terminal) — boundary row 15's key property."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow.state = WorkflowState.VERIFY
+        calls: list[str] = []
+        self._wire_spies(workflow, calls)
+
+        await self._run_cleanups(workflow, 'soft')
+
+        assert 'release_lane' in calls
+
+    async def test_kind_none_with_working_state_skips_release(
+        self, config, git_ops, task_assignment,
+    ):
+        """kind=None (a normal _drive() return) with a non-terminal state
+        is not a genuine terminal exit — skip release."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow.state = WorkflowState.VERIFY
+        calls: list[str] = []
+        self._wire_spies(workflow, calls)
+
+        await self._run_cleanups(workflow, None)
+
+        assert 'release_lane' not in calls
+
+    async def test_worktree_external_skips_release_for_every_kind(
+        self, config, git_ops, task_assignment,
+    ):
+        """Eval mode (_worktree_external=True) never releases, regardless
+        of kind."""
+        stub = AgentStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow._worktree_external = True
+        workflow.state = WorkflowState.CANCELLED
+
+        for kind in ('hard', 'soft', None):
+            calls: list[str] = []
+            self._wire_spies(workflow, calls)
+            await self._run_cleanups(workflow, kind)
+            assert 'release_lane' not in calls, f'release fired for kind={kind!r}'
