@@ -654,6 +654,7 @@ class TestWriteCycleSummaryMirrorAndTrim:
         metadata = kwargs.get('metadata') or {}
         assert metadata.get('kind') == 'cycle_summary'
         assert metadata.get('run_id') == 'run-no-ledger'
+        assert metadata.get('record_type') == 'ledger_stamp'
         assert 'run-no-ledger' in kwargs.get('content', '')
 
         mock_trim.assert_awaited_once()
