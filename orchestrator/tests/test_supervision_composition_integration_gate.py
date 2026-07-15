@@ -421,3 +421,40 @@ class TestD1CrossUnitVerifyToDone:
         assert restart_outcome.escalated is False
         assert final_phase == DeployPhase.DONE
         assert sink_calls == []
+
+
+# ---------------------------------------------------------------------------
+# step-5/6 — R3: RestartPlan x EscalationQueue. The 2064 self-kill guard: a
+# blocking restart with an UNSET own_unit (ORCH_UNIT unset — cannot prove
+# target_unit != own_unit) refuses BEFORE ever touching runner/inspector,
+# and files a born-at-L2 escalation through the real EscalationQueue.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestR3SelfKillRefusal:
+    """R3 composition cell (the 2064 bug)."""
+
+    async def test_unset_own_unit_refuses_escalates_no_self_kill(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        from orchestrator.proc_supervision import RestartDisposition
+
+        task_id = 'task-2244-r3'
+        outcome, runner = await _execute_unset_own_unit_blocking(tmp_queue_dir, task_id)
+
+        assert outcome.disposition == RestartDisposition.REFUSED
+        assert outcome.escalated is True
+        assert runner.calls == [], (
+            'no blocking self-restart subprocess may ever be spawned when '
+            'own_unit is unknown — this is the 2064 self-kill guard'
+        )
+
+        escalations = read_escalations(
+            tmp_queue_dir, task_id, agent_role='orchestrator-deterministic',
+        )
+        assert len(escalations) == 1
+        esc = escalations[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'infra_issue'
