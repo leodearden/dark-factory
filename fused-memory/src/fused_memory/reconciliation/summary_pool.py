@@ -40,6 +40,43 @@ logger = logging.getLogger(__name__)
 # cleanup code.
 CYCLE_SUMMARY_TTL_DAYS: int = 30
 
+# record_type vocabulary for cycle_summary Mem0 writes (task 2468). There are
+# two distinct writers of kind='cycle_summary': this module's deterministic,
+# terse, auto-generated Mem0 mirror of the authoritative ledger row
+# (LEDGER_STAMP, written unconditionally below), and the LLM-authored
+# reconstruction/self-heal cycle_summary write in
+# ``reconciliation.prompts.stage2`` (NARRATIVE).
+#
+# Only LEDGER_STAMP is actually single-sourced today: it is imported by this
+# module's own write_cycle_summary below, so changing its value here changes
+# the real write. NARRATIVE has no Python consumer yet — prompts/stage2.py
+# and recon_self_model.py hardcode the literal 'narrative' in prose/f-string
+# text instead of importing it, because those prompt modules are deliberately
+# import-light (prompt-import path) and must not pull in this module's
+# recon_ledger -> aiosqlite import chain just to read a string constant (see
+# recon_self_model.py's module docstring). NARRATIVE is therefore a reserved
+# placeholder documenting the intended value for a future Python consumer
+# (e.g. near-duplicate/dedup tooling) that sits on the same import side as
+# this module; until such a consumer exists, keeping the prompt-side literal
+# in sync with this value is a manual, reviewed invariant rather than an
+# enforced one. Both literal values are frozen by convention — plain string
+# discriminators with no anticipated reason to ever change — and are pinned
+# by ``TestCycleSummaryRecordTypeVocabulary`` in ``test_summary_pool.py``, so
+# an accidental future edit to either constant fails loudly there as a
+# reminder to also check the prompt text, even though that test deliberately
+# cannot (and must not) inspect the prompt text itself (task 2468 amendment
+# pass).
+#
+# record_type is write-only as of task 2468: no reader (dedup/near-duplicate
+# tooling, Path-2 verification, pool-cap trim) filters on it yet — the fix
+# that actually stops the double-write is the removed normal-flow LLM
+# instruction (recon_self_model.py), not this discriminator. That is
+# reviewed and accepted as cheap, well-documented forward-compat metadata;
+# per YAGNI, no consumer is added here speculatively — one lands alongside
+# the dedup/near-duplicate tooling that needs it.
+CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP: str = 'ledger_stamp'
+CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = 'narrative'
+
 
 def _assume_utc(dt: datetime) -> datetime:
     """Return *dt* with UTC timezone attached if it is naive; return *dt* unchanged otherwise.
@@ -300,7 +337,18 @@ async def write_cycle_summary(
                 project_id=project_id,
                 agent_id=f'recon-stage-{stage}',
                 category='observations_and_summaries',
-                metadata={'kind': 'cycle_summary', 'stage': stage, 'run_id': run_id},
+                # record_type discriminates this deterministic code mirror
+                # (LEDGER_STAMP) from the distinct LLM-authored reconstruction
+                # write in prompts/stage2.py (NARRATIVE) — task 2468.
+                # _apply_cycle_summary_metadata_tagging (memory_service.py)
+                # is additive-only and never strips unknown keys, so this
+                # survives through to storage unchanged.
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': stage,
+                    'run_id': run_id,
+                    'record_type': CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP,
+                },
                 causation_id=run_id,
                 _source='cycle_summary_mirror',
             )

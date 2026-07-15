@@ -332,19 +332,35 @@ def render_cycle_summary_section() -> str:
     """Render the per-cycle summary metadata convention, faithful to
     reconciliation/prompts/stage2.py:236-302, interpolating the
     stage->recon_pool tags from recon_pool_map (task 2140) so the pool tag
-    strings stay single-sourced rather than re-hardcoded."""
+    strings stay single-sourced rather than re-hardcoded.
+
+    Task 2468: this section used to instruct the LLM to author its own
+    normal-flow per-cycle summary write — that duplicated
+    summary_pool.write_cycle_summary's (task 2229) deterministic Mem0
+    mirror, producing two cycle_summary Mem0 records per run_id (the
+    memory_duplicate finding, run f2bb55b4). The section now tells the
+    agent that Python owns that write and it must NOT duplicate it. The
+    metadata convention below is retained because it still documents (a)
+    the shape of Python's deterministic mirror and (b) the distinct,
+    legitimately-surviving LLM-authored reconstruction/self-heal write (see
+    stage2.py's "Re-Verify Reconstruction Writes Before Carry-Forward").
+    """
     pool_lines = '\n'.join(
         f"  - stage='{stage}' -> recon_pool='{pool}'"
         for stage, pool in CYCLE_SUMMARY_STAGE_TO_RECON_POOL.items()
     )
     return (
         '## Per-Cycle Summary\n'
-        'Each stage writes exactly one per-cycle summary memory via `add_memory`, '
-        "tagged with metadata={'kind': 'cycle_summary', 'stage': <stage_name>, "
-        "'run_id': <run_id>, 'recon_pool': <recon_pool>}. <run_id> is the exact "
-        'run_id from the payload context (the same run_id embedded in the '
-        'summary content). <recon_pool> is looked up from the canonical '
-        'stage->recon_pool map (recon_pool_map.py, task 2140) — currently:\n'
+        'Python writes exactly one per-cycle summary memory per stage, '
+        'deterministically, via `summary_pool.write_cycle_summary` (task 2229) — '
+        'this runs unconditionally every cycle. Do NOT author your own per-cycle '
+        'summary `add_memory` write on the normal flow: doing so creates a second '
+        "cycle_summary record for the same run_id. Python's mirror is tagged with "
+        "metadata={'kind': 'cycle_summary', 'stage': <stage_name>, "
+        "'run_id': <run_id>, 'recon_pool': <recon_pool>, 'record_type': 'ledger_stamp'}. "
+        '<run_id> is the exact run_id from the payload context (the same run_id '
+        'embedded in the summary content). <recon_pool> is looked up from the '
+        'canonical stage->recon_pool map (recon_pool_map.py, task 2140) — currently:\n'
         f'{pool_lines}\n'
         f"(Stage 1 / memory_consolidator writes are tagged '{STAGE1_CYCLE_SUMMARY_RECON_POOL}'; "
         f"Stage 2 / task_knowledge_sync writes are tagged '{STAGE2_CYCLE_SUMMARY_RECON_POOL}'.)\n\n"
@@ -352,6 +368,14 @@ def render_cycle_summary_section() -> str:
         'deleting the oldest members once the cap is exceeded — a summary '
         'written without this tag is invisible to that trim and the pool grows '
         'unboundedly.\n\n'
+        "The `record_type` metadata key discriminates cycle_summary writers by "
+        "purpose, not by shape: `'ledger_stamp'` marks Python's deterministic "
+        "code mirror described above; `'narrative'` marks the distinct "
+        'LLM-authored reconstruction/self-heal write (see "Re-Verify '
+        'Reconstruction Writes Before Carry-Forward") that you make when '
+        "repairing a PRIOR run's missing summary — that write is still yours to "
+        'author and is unrelated to the normal-flow write this section '
+        'describes.\n\n'
         'The summary is deterministically findable by a metadata-keyed lookup — '
         "count_memories_by_metadata(project_id, {'kind': 'cycle_summary', "
         "'run_id': <run_id>, 'stage': <stage_name>}) — which downstream stages "
