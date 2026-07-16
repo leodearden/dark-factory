@@ -60,7 +60,7 @@ class TestHarnessDelegator:
         # attributes the delegator reads — no full Harness construction.
         stub_self = types.SimpleNamespace(git_ops=git_ops, event_store=None)
 
-        result = Harness.task_runtime_snapshot(stub_self)
+        result = Harness.task_runtime_snapshot(stub_self)  # type: ignore[reportArgumentType]
         expected = build_task_runtime_snapshot(git_ops=git_ops, event_store=None)
 
         assert result == expected
