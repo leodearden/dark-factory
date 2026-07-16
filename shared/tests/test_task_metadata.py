@@ -753,6 +753,37 @@ class TestRetryLedgerCounterMigration:
         assert upgraded['consecutive_infra_resume_failures'] == 4
         assert upgraded['last_infra_resume_iteration_count'] == 9
 
+    def test_non_dict_retry_ledger_with_counters_warning_set_is_locked(self):
+        # apply_migrations alone (above) has no warnings to inspect -- this
+        # goes through parse_metadata to pin the resulting CENSUS signal for
+        # this corner. Because the malformed retry_ledger blocks the lift,
+        # the legacy counters stay top-level and unblessed, so they surface
+        # their own unknown_key warnings *in addition to* the invalid_field
+        # warning for the malformed retry_ledger value itself. This double
+        # signal is intentional (malformed data should be loud, not silently
+        # swallowed) -- this test locks it down as such.
+        blob = {
+            'schema_version': 1,
+            'consecutive_infra_resume_failures': 4,
+            'last_infra_resume_iteration_count': 9,
+            'retry_ledger': 'oops',
+        }
+        model, warnings = parse_metadata(blob, direction='read')
+
+        by_code: dict[str, set[str]] = {}
+        for w in warnings:
+            by_code.setdefault(w.code, set()).add(w.field)
+
+        assert by_code.get('invalid_field') == {'retry_ledger'}
+        assert by_code.get('unknown_key') == {
+            'consecutive_infra_resume_failures',
+            'last_infra_resume_iteration_count',
+        }
+        dumped = model.model_dump()
+        assert dumped['retry_ledger'] == 'oops'
+        assert dumped['consecutive_infra_resume_failures'] == 4
+        assert dumped['last_infra_resume_iteration_count'] == 9
+
     def test_v1_blob_with_no_counters_still_upgraded_to_v2(self):
         blob = {'schema_version': 1, 'files': ['a.py']}
         upgraded = apply_migrations(blob)
@@ -770,6 +801,21 @@ class TestRetryLedgerCounterMigration:
         assert blob == original
         # Mutating the *returned* nested dict must not reach back into the
         # caller's blob -- the ledger sub-dict is copied, not shared.
+        upgraded['retry_ledger']['consecutive_no_plan_failures'] = 999
+        assert blob['retry_ledger']['consecutive_no_plan_failures'] == 1
+
+    def test_does_not_mutate_caller_input_when_no_counters_to_lift(self):
+        # No top-level legacy counters at all -- there is nothing to lift,
+        # but an existing dict retry_ledger must still be copied (never the
+        # same object as blob['retry_ledger']), not just when a lift occurs.
+        blob = {
+            'schema_version': 1,
+            'retry_ledger': {'consecutive_no_plan_failures': 1},
+        }
+        original = copy.deepcopy(blob)
+        upgraded = apply_migrations(blob)
+        assert blob == original
+        assert upgraded['retry_ledger'] is not blob['retry_ledger']
         upgraded['retry_ledger']['consecutive_no_plan_failures'] = 999
         assert blob['retry_ledger']['consecutive_no_plan_failures'] == 1
 
