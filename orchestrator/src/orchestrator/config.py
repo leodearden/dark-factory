@@ -2601,6 +2601,14 @@ class OrchestratorConfig(BaseSettings):
     watcher_misconfigured_min_rotation_secs: float = Field(default=120.0)
     watcher_max_misconfigured_clean_exits: int = Field(default=5)
 
+    # Empty-queue rotation skip (task 2629): idle re-check cadence when
+    # _watcher_has_actionable_l1() finds no actionable L1 work. Polling is a
+    # cheap on-disk EscalationQueue scan, so 60s balances responsiveness
+    # against cost. Kept distinct from watcher_subprocess_restart_backoff_secs
+    # (the clean-restart floor / unclean-backoff base) since the two concepts
+    # are independent and would be hard to tune if conflated.
+    watcher_empty_queue_poll_secs: float = Field(default=60.0)
+
     # Invocation knobs for each watcher rotation (per UnblockAutoConfig precedent).
     # watcher_rotation_budget_usd is sized for a full 4h rotation at opus rates;
     # using invoke_agent's default $5 would exhaust within minutes and falsely
@@ -3379,6 +3387,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'watcher_rotation_hours',
         'watcher_max_crashloop_restarts',
         'watcher_crashloop_window_secs',
+        # Empty-queue rotation-skip poll cadence (task 2629) — read live per
+        # loop iteration, same reload tier as the crashloop-window params above.
+        'watcher_empty_queue_poll_secs',
         # Review knobs
         'review.enabled',
         'review.interval',

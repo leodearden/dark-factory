@@ -488,6 +488,9 @@ park_stop_parked_window_hours: 1.0
 #   the crashloop guard (default 5).
 # watcher_crashloop_window_secs: rolling window (s) for the crashloop counter
 #   (default 600 = 10 min).
+# watcher_empty_queue_poll_secs: idle re-check cadence (s) when
+#   _watcher_has_actionable_l1() finds no actionable L1 work — the launch is
+#   skipped and the loop re-polls after this many seconds (default 60).
 #
 # Invocation knobs (per rotation):
 # watcher_model: LLM backend model (default 'opus').
@@ -503,6 +506,7 @@ watcher_rotation_escalations: 50
 watcher_rotation_hours: 4.0
 watcher_max_crashloop_restarts: 5
 watcher_crashloop_window_secs: 600
+watcher_empty_queue_poll_secs: 60.0
 # Cost-runaway guard: a clean rotation shorter than watcher_misconfigured_min_rotation_secs
 # seconds is classified as degenerate (empty queue, SKILL.md drift, misconfigured env).
 # After watcher_max_misconfigured_clean_exits such exits within watcher_crashloop_window_secs,
