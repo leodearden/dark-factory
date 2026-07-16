@@ -96,15 +96,85 @@ function EscalationStatStrip({ analytics, projectFilter }) {
     return projectFilter.includes(p.project);
   });
 
-  // TODO(2660 step-4): replace placeholder tiles below with real windowed
-  // rollups over `projects` (workflow.flow_daily / lifespan.open_items /
-  // workflow.esc_per_done_daily / workflow.churn_daily).
+  // NOTE: still unwindowed here (full-series sums across every row the
+  // payload carries) — the trailing-7d cutoff anchored to generated_at is
+  // added in step-6.
+
+  // (a) benign rate — workflow.flow_daily is the only per-day benign/
+  // actionable series in the payload; sum n by class across every filtered
+  // project (cross-project rollup).
+  let benignN = 0, actionableN = 0;
+  for (const p of projects) {
+    for (const row of (p.workflow || {}).flow_daily || []) {
+      if (row.class === 'benign') benignN += row.n;
+      else if (row.class === 'actionable') actionableN += row.n;
+    }
+  }
+  const benignDenom = benignN + actionableN;
+  const benignRate = benignDenom > 0 ? benignN / benignDenom : null;
+
+  // Stamped-share hint — NO per-day provenance series exists in the payload,
+  // so this is an ALL-TIME aggregate from origin.sources[], weighted by each
+  // source's classified count (benign + actionable). A coarse adoption
+  // indicator, not a windowed figure.
+  let stampedWeighted = 0, classifiedTotal = 0;
+  for (const p of projects) {
+    for (const s of (p.origin || {}).sources || []) {
+      const classified = (s.benign || 0) + (s.actionable || 0);
+      stampedWeighted += (s.stamped_share || 0) * classified;
+      classifiedTotal += classified;
+    }
+  }
+  const stampedPct = classifiedTotal > 0 ? Math.round((stampedWeighted / classifiedTotal) * 100) : null;
+
+  // (b) 6h-breach — live pending queue (lifespan.open_items), NOT windowed;
+  // the payload carries no historical breach series.
+  let openItems = [];
+  for (const p of projects) {
+    openItems = openItems.concat((p.lifespan || {}).open_items || []);
+  }
+  const breachCount = openItems.filter(item => item.breach_6h).length;
+
+  // (c) esc-per-done — aggregate ratio sum(filings)/sum(done), NOT a mean of
+  // daily ratios (undefined/biased on low-volume or done==0 days).
+  let filingsSum = 0, doneSum = 0;
+  for (const p of projects) {
+    for (const row of (p.workflow || {}).esc_per_done_daily || []) {
+      filingsSum += row.filings || 0;
+      doneSum += row.done || 0;
+    }
+  }
+  const escPerDone = doneSum > 0 ? filingsSum / doneSum : null;
+
+  // (d) churn-24h rate — sum(churn_daily)/sum(esc_per_done_daily filings);
+  // both are keyed by filed-date (date(timestamp)), so they reconcile.
+  let churnSum = 0;
+  for (const p of projects) {
+    const churnDaily = (p.workflow || {}).churn_daily || {};
+    for (const n of Object.values(churnDaily)) churnSum += n;
+  }
+  const churnRate = filingsSum > 0 ? churnSum / filingsSum : null;
+
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, marginBottom: 10 }}>
-      <C.StatTile label="tile 1" value="—" />
-      <C.StatTile label="tile 2" value="—" />
-      <C.StatTile label="tile 3" value="—" />
-      <C.StatTile label="tile 4" value="—" />
+      <C.StatTile
+        label="benign rate"
+        value={benignRate != null ? `${Math.round(benignRate * 100)}%` : '—'}
+        hint={stampedPct != null ? `${stampedPct}% stamped` : undefined}
+      />
+      <C.StatTile
+        label="6h breaches"
+        value={breachCount}
+        hint={`of ${openItems.length} pending`}
+      />
+      <C.StatTile
+        label="esc / done"
+        value={escPerDone != null ? escPerDone.toFixed(2) : '—'}
+      />
+      <C.StatTile
+        label="churn 24h"
+        value={churnRate != null ? `${Math.round(churnRate * 100)}%` : '—'}
+      />
     </div>
   );
 }
