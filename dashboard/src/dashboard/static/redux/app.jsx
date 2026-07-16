@@ -2,7 +2,7 @@
 const { useState: uS, useEffect: uE } = React;
 const { Rail, StatStrip, Toolbar } = window.DF_SHELL;
 const { OverviewTab } = window.DF_OVERVIEW;
-const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, EscalationsTab } = window.DF_TABS;
+const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, EscalationsTab, EscalationAnalyticsTab } = window.DF_TABS;
 const { TasksTab } = window.DF_TASKS;
 const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
@@ -84,6 +84,7 @@ function App() {
     { id: 'cost',     label: 'Costs' },
     { id: 'burn',     label: 'Burndown' },
     { id: 'esc',      label: 'Escalations' },
+    { id: 'esc-analytics', label: 'Analytics' },
   ];
   const tabLabel = tabs.find(t => t.id === tab)?.label || 'Overview';
 
@@ -122,6 +123,7 @@ function App() {
       case 'cost':     return <CostsTab projectFilter={projects} />;
       case 'burn':     return <BurnTab projectFilter={projects} displayWindow={win} />;
       case 'esc':      return <EscalationsTab projectFilter={projects} />;
+      case 'esc-analytics': return <EscalationAnalyticsTab projectFilter={projects} />;
       default: return null;
     }
   }
@@ -149,6 +151,7 @@ function App() {
     cost:     { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
     burn:     { showWindow: true,  windows: WIN_BURNDOWN, showAgents: false, search: false },
     esc:      { showWindow: false,                        showAgents: false, search: false },
+    'esc-analytics': { showWindow: false,                 showAgents: false, search: false },
   }[tab] || {};
 
   return (
