@@ -47,6 +47,11 @@ def index_html_body(_client) -> str:
     return _client.get('/static/redux/index.html').text
 
 
+@pytest.fixture(scope='module')
+def tab_analytics_jsx_body(_client) -> str:
+    return _client.get('/static/redux/tab_escalation_analytics.jsx').text
+
+
 # ---------------------------------------------------------------------------
 # Helper: extract a named JS/JSX function body (brace-aware).
 # Copied from test_tab_escalation_analytics.py (itself copied from
@@ -431,4 +436,63 @@ def test_index_html_cache_buster_bumped_for_esc_flow(index_html_body: str) -> No
     v = int(next(iter(versions)))
     assert v >= 33, (
         f'index.html cache-buster version is {v}, expected >= 33 (uniform bump for esc_flow_* registration).'
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-9: tab_escalation_analytics.jsx mounts LifecycleFlowDiagram inside the
+# esc-flow-slot seam.
+# ---------------------------------------------------------------------------
+
+
+def test_tab_analytics_destructures_lifecycle_flow_diagram(tab_analytics_jsx_body: str) -> None:
+    """tab_escalation_analytics.jsx must destructure LifecycleFlowDiagram from
+    window.DF_ESC_FLOW at the top level, alongside its other window.DF_*
+    destructures.
+    """
+    assert re.search(
+        r'const\s*\{[^}]*LifecycleFlowDiagram[^}]*\}\s*=\s*window\.DF_ESC_FLOW\b',
+        tab_analytics_jsx_body,
+    ), (
+        'tab_escalation_analytics.jsx does not destructure LifecycleFlowDiagram '
+        'from window.DF_ESC_FLOW — add `const { LifecycleFlowDiagram } = '
+        'window.DF_ESC_FLOW || {};` near the other window.DF_* destructures.'
+    )
+
+
+def test_workflow_panel_mounts_lifecycle_flow_diagram_in_slot(tab_analytics_jsx_body: str) -> None:
+    """WorkflowPanel must render <LifecycleFlowDiagram flowDaily={flowDaily} />
+    inside the esc-flow-slot seam, and must still preserve the esc-flow-slot
+    class + flow_daily reference (δ's test_tab_analytics_workflow_panel
+    invariants).
+    """
+    body = tab_analytics_jsx_body
+    panel_body = _extract_function_body(body, 'WorkflowPanel')
+    assert panel_body, 'Could not locate the WorkflowPanel( function body.'
+
+    # (c) regression guard — δ's seam markers must survive this edit.
+    assert 'esc-flow-slot' in panel_body, (
+        'WorkflowPanel no longer contains the esc-flow-slot class — this '
+        'seam must be preserved so δ\'s test_tab_analytics_workflow_panel stays green.'
+    )
+    assert 'flow_daily' in panel_body, (
+        'WorkflowPanel no longer references flow_daily — the windowed '
+        'flowDaily derivation from workflow.flow_daily must be preserved.'
+    )
+
+    # (b) LifecycleFlowDiagram is rendered, fed the already-windowed flowDaily.
+    assert re.search(r'<LifecycleFlowDiagram\b', panel_body), (
+        'WorkflowPanel does not render <LifecycleFlowDiagram — mount it '
+        'inside the esc-flow-slot div.'
+    )
+    assert re.search(r'<LifecycleFlowDiagram[^>]*\bflowDaily=\{\s*flowDaily\s*\}', panel_body), (
+        'WorkflowPanel does not pass flowDaily={flowDaily} to LifecycleFlowDiagram.'
+    )
+
+    # LifecycleFlowDiagram must be mounted INSIDE the esc-flow-slot div, not
+    # merely somewhere else in WorkflowPanel.
+    slot_start = panel_body.index('esc-flow-slot')
+    slot_region = panel_body[slot_start : slot_start + 400]
+    assert '<LifecycleFlowDiagram' in slot_region, (
+        'LifecycleFlowDiagram is not rendered inside the esc-flow-slot container.'
     )
