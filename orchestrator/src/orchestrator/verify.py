@@ -439,13 +439,20 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     is present, every ``^FAILED `` line is inspected individually. If ANY
     names a test that is not on the narrow, enumerated
     ``_KNOWN_LOAD_FLAKE_NODEID_RES`` allow-list (or has no extractable
-    node-id), this returns ``False`` — never mask a real failure. If there
-    is at least one ``FAILED`` line and every one of them is an
-    allow-listed known flake, the accompanying ``^E   `` traceback lines
-    and ``=== N failed ===`` summary are attributable to those flakes and
-    this returns ``True``. When there are NO ``FAILED`` lines at all, this
-    falls back to the original strict guard: any ``^E   ``/failure-summary
-    marker suppresses reclassification.
+    node-id), this returns ``False`` — never mask a real failure. A
+    co-occurring ``INTERNALERROR>`` line or ``ERROR`` short-summary line
+    (a fixture/setup error or a whole-module collection failure) is
+    likewise never attributable to a known FAILED-line flake, so either one
+    also forces ``False`` even when every FAILED line is allow-listed —
+    those failure surfaces produce no FAILED line of their own, so the
+    per-FAILED-line check alone would never see them. Only when there is at
+    least one ``FAILED`` line, every one of them is an allow-listed known
+    flake, AND no such ERROR/INTERNALERROR surface is present, are the
+    accompanying ``^E   `` traceback lines and ``=== N failed ===`` summary
+    treated as attributable to those flakes and this returns ``True``. When
+    there are NO ``FAILED`` lines at all, this falls back to the original
+    strict guard: any ``^E   ``/failure-summary marker suppresses
+    reclassification.
 
     Accepted fail-safe tradeoff: a genuine regression IN an allow-listed
     known-flake test, co-occurring with a crash, is discounted here and
@@ -463,6 +470,15 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
         return False
     failed_lines = _PYTEST_FAILED_LINE_RE.findall(output)
     if failed_lines:
+        if (
+            _PYTEST_INTERNALERROR_RE.search(output)
+            or _ERROR_LINE_NODEID_RE.search(output)
+            or _ERROR_LINE_FILE_RE.search(output)
+        ):
+            # A collection/fixture/internal error produces no FAILED line
+            # of its own, so the per-line allow-list check below would
+            # never see it — veto here instead of silently masking it.
+            return False
         for line in failed_lines:
             match = _FAILED_LINE_NODEID_RE.match(line)
             if match is None or not _is_known_load_flake_nodeid(match.group(1)):
