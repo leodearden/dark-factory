@@ -3079,6 +3079,20 @@ async def test_on_task_done_repeat_done_echoes_current_not_stale_snapshot_proven
     CURRENT transition's fresh done_provenance (commit b045a72d...). The
     completion echo must reflect the LIVE value, and the live re-fetch must
     actually run rather than short-circuiting on the stale snapshot."""
+    stale_snapshot_provenance = {
+        'kind': 'merged',
+        'commit': 'f03df179fb9238ebef83b960dc030daf12e9864',
+    }
+    # Premise check: the stale snapshot value must itself be "usable" by
+    # _format_outcome_echo. Otherwise the `'f03df179' not in content`
+    # assertion below would pass trivially because the value can never be
+    # formatted -- not because the fix ignores the snapshot in favor of the
+    # live re-fetch, which is the thing this test exists to prove. Pinning
+    # this keeps the negative assertion meaningful if _format_outcome_echo's
+    # usability rules change later.
+    from fused_memory.reconciliation.targeted import _format_outcome_echo
+    assert _format_outcome_echo(stale_snapshot_provenance) is not None
+
     mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
     mock_taskmaster.get_task = AsyncMock(return_value={
         'id': '2394', 'title': 'Repeat-done task', 'status': 'done',
@@ -3097,10 +3111,7 @@ async def test_on_task_done_repeat_done_echoes_current_not_stale_snapshot_proven
             'title': 'Repeat-done task',
             'status': 'in-progress',
             'metadata': {
-                'done_provenance': {
-                    'kind': 'merged',
-                    'commit': 'f03df179fb9238ebef83b960dc030daf12e9864',
-                },
+                'done_provenance': stale_snapshot_provenance,
                 'reopen_reason': 'reify',
                 'reopen_from': 'done',
             },
