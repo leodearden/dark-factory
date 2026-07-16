@@ -4738,8 +4738,9 @@ async def _check_reopen_freshness(
 
     On stale: ``mode == 'enforce'`` returns the typed
     :func:`_done_evidence_stale_error` rejection (the caller must abort the
-    write); otherwise (warn mode) returns None — S4 adds the warn-mode
-    census WARNING line.
+    write); otherwise (warn mode) emits one ``task_status.done_evidence_stale_warn``
+    census WARNING (stable grep anchor) and returns None (the write
+    proceeds).
 
     ``raw_done_provenance``/``is_recon_stage`` are accepted now (stable
     signature) but not yet used — the ``stale_evidence_override`` handling
@@ -4768,6 +4769,11 @@ async def _check_reopen_freshness(
         return _done_evidence_stale_error(
             task_id, evidence_commit, evidence_committed_at, reopen_at, agent_id,
         )
+    logger.warning(
+        'task_status.done_evidence_stale_warn task_id=%s evidence_commit=%s '
+        'evidence_committed_at=%s reopen_at=%s agent_id=%s',
+        task_id, evidence_commit, evidence_committed_at, reopen_at, agent_id,
+    )
     return None
 
 
