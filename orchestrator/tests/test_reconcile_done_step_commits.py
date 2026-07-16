@@ -303,3 +303,155 @@ class TestReconcileDoneStepCommits:
         await workflow._reconcile_done_step_commits()  # must not raise
 
         assert artifacts.read_plan()['steps'][0]['commit'] == 'deadbeef'
+
+    # -----------------------------------------------------------------
+    # step-5 RED: flag-for-review (non-blocking info escalation) branch
+    # -----------------------------------------------------------------
+    #
+    # None of these can be safely auto-reconciled, so the commit must be
+    # left UNCHANGED and a non-blocking info Escalation filed instead,
+    # mirroring how _escalate_corruption is exercised elsewhere in the
+    # suite (escalation_queue as a MagicMock; assert .submit called once
+    # with an Escalation, inspected via .submit.call_args.args[0]).
+
+    async def test_content_mismatch_flags_for_review_and_leaves_commit_unchanged(
+        self, config, git_ops, task_assignment,
+    ):
+        """CONTENT MISMATCH: the orphaned done-step commit's own file
+        ('feature.py') is NOT a subset of the tip WIP run's files
+        ('other.py') -> cannot be safely auto-reconciled. Flag for review
+        via a non-blocking info escalation naming the step id, and leave
+        the step's commit UNCHANGED (never re-point on an unverified
+        content match)."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        escalation_queue = MagicMock()
+        escalation_queue.make_id.return_value = 'esc-42-1'
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=escalation_queue,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'feature.py').write_text('original implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1 implementation')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_done_step_plan(artifacts, 'step-1', step_commit)
+
+        # Orphan step_commit, then land a WIP commit touching a wholly
+        # DIFFERENT file — {'feature.py'} is not a subset of {'other.py'}.
+        await _run(['git', 'reset', '--hard', wt_info.base_commit], cwd=wt)
+        (wt / 'other.py').write_text('unrelated\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before inter-iteration rebase')
+        assert wip_sha, 'Setup: expected a real WIP commit at HEAD'
+
+        await workflow._reconcile_done_step_commits()
+
+        unchanged = artifacts.read_plan()
+        assert unchanged['steps'][0]['commit'] == step_commit, (
+            'must not re-point the commit on an unverified content match'
+        )
+        escalation_queue.submit.assert_called_once()
+        esc = escalation_queue.submit.call_args.args[0]
+        assert esc.severity == 'info'
+        assert esc.category == 'infra_issue'
+        assert 'step-1' in esc.summary or 'step-1' in esc.detail
+
+    async def test_unresolvable_original_commit_flags_for_review(
+        self, config, git_ops, task_assignment,
+    ):
+        """UNRESOLVABLE ORIGINAL: a done step records a fabricated/GC'd sha
+        (get_commit_changed_files returns []) — content cannot be verified
+        even though a WIP run sits at HEAD -> flag for review, leave the
+        (unresolvable) commit unchanged."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        escalation_queue = MagicMock()
+        escalation_queue.make_id.return_value = 'esc-42-1'
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=escalation_queue,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        fabricated_sha = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
+        workflow.plan = _write_done_step_plan(artifacts, 'step-1', fabricated_sha)
+
+        (wt / 'other.py').write_text('unrelated\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before inter-iteration rebase')
+        assert wip_sha, 'Setup: expected a real WIP commit at HEAD'
+
+        await workflow._reconcile_done_step_commits()
+
+        unchanged = artifacts.read_plan()
+        assert unchanged['steps'][0]['commit'] == fabricated_sha
+        escalation_queue.submit.assert_called_once()
+        esc = escalation_queue.submit.call_args.args[0]
+        assert esc.severity == 'info'
+        assert esc.category == 'infra_issue'
+        assert 'step-1' in esc.summary or 'step-1' in esc.detail
+
+    async def test_no_wip_run_at_head_flags_for_review(
+        self, config, git_ops, task_assignment,
+    ):
+        """NO WIP AT HEAD: the done-step commit was orphaned, but HEAD
+        carries a normal (non-WIP-safety-commit) commit rather than a WIP
+        run -> nothing to reconcile against. Flag for review, commit
+        unchanged."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        escalation_queue = MagicMock()
+        escalation_queue.make_id.return_value = 'esc-42-1'
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=escalation_queue,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'feature.py').write_text('original implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1 implementation')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_done_step_plan(artifacts, 'step-1', step_commit)
+
+        await _run(['git', 'reset', '--hard', wt_info.base_commit], cwd=wt)
+        (wt / 'unrelated.py').write_text('normal, non-WIP work\n')
+        normal_sha = await git_ops.commit(wt, 'feat: unrelated normal commit')
+        assert normal_sha, 'Setup: expected a real (non-WIP) commit at HEAD'
+
+        await workflow._reconcile_done_step_commits()
+
+        unchanged = artifacts.read_plan()
+        assert unchanged['steps'][0]['commit'] == step_commit
+        escalation_queue.submit.assert_called_once()
+        esc = escalation_queue.submit.call_args.args[0]
+        assert esc.severity == 'info'
+        assert esc.category == 'infra_issue'
+        assert 'step-1' in esc.summary or 'step-1' in esc.detail
+
+    async def test_escalation_queue_none_on_flagged_case_does_not_raise(
+        self, config, git_ops, task_assignment,
+    ):
+        """When escalation_queue is None, a would-be-flagged (content
+        mismatch) case must not raise — the escalation is best-effort /
+        guarded, matching _escalate_corruption's own None-queue guard.
+        The stale commit is simply left as today's baseline (unchanged)."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=None,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'feature.py').write_text('original implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1 implementation')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_done_step_plan(artifacts, 'step-1', step_commit)
+
+        await _run(['git', 'reset', '--hard', wt_info.base_commit], cwd=wt)
+        (wt / 'other.py').write_text('unrelated\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before inter-iteration rebase')
+        assert wip_sha, 'Setup: expected a real WIP commit at HEAD'
+
+        await workflow._reconcile_done_step_commits()  # must not raise
+
+        assert artifacts.read_plan()['steps'][0]['commit'] == step_commit
