@@ -874,3 +874,47 @@ def test_tab_escalations_strip_window_anchored_7d(tab_escalations_jsx_body: str)
         '`windowCutoffDate(..., 7)` call in EscalationStatStrip (or an equivalent '
         '`days * 7` expression in the windowCutoffDate helper itself).'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-7 test: strip feeds trend sparklines and retains churn-24h
+# ---------------------------------------------------------------------------
+
+
+def test_tab_escalations_strip_sparklines_and_churn_retained(tab_escalations_jsx_body: str) -> None:
+    """The strip must feed trend sparklines for the three series-backed tiles
+    (benign-rate, esc-per-done, churn) via StatTile's spark prop, and
+    churn-24h must be RETAINED — not the first tile dropped — per the
+    open-question-4 decision (all four tiles kept; responsive grid instead).
+
+    Asserts:
+    (1) at least three `spark=` props are passed to <C.StatTile within the
+        EscalationStatStrip body (one each for the series-backed tiles).
+    (2) churn-24h is retained: a `spark=` occurs within ~200 chars of a churn
+        tile label / churn_daily reference (co-occurrence, not bare
+        presence — a stray spark= elsewhere wouldn't prove churn has one).
+    """
+    strip_fn = _extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
+    assert strip_fn, (
+        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body.'
+    )
+
+    # (1) at least three spark= props within <C.StatTile tiles
+    spark_count = len(re.findall(r'<C\.StatTile[^>]*\bspark=', strip_fn))
+    assert spark_count >= 3, (
+        f'EscalationStatStrip passes spark= to only {spark_count} <C.StatTile tiles, '
+        'expected >= 3 (benign rate, esc/done, and churn are series-backed).'
+    )
+
+    # (2) churn-24h retained: spark= co-occurs near a churn reference
+    found_churn_spark = False
+    for m in re.finditer(r'churn', strip_fn, re.IGNORECASE):
+        window = strip_fn[max(0, m.start() - 200): m.end() + 200]
+        if 'spark=' in window:
+            found_churn_spark = True
+            break
+    assert found_churn_spark, (
+        'No `spark=` prop found within ~200 chars of a churn tile label / '
+        'churn_daily reference — churn-24h must be RETAINED with its own '
+        'sparkline per the open-question-4 decision (keep all four tiles).'
+    )
