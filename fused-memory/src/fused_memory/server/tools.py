@@ -3442,7 +3442,14 @@ def create_mcp_server(
         )
         if _routing_warning is not None and isinstance(result, dict):
             result.update(_routing_warning)
-        if _op_warning is not None and isinstance(result, dict):
+        # Only attach the advisory when the submission actually succeeded —
+        # a rejected/errored result (top-level 'error') should not also
+        # carry a suggestion that applies to an accepted task (task 2679
+        # amendment pass, reviewer_comprehensive robustness finding).
+        # Mirrors this file's existing "act only on success" convention
+        # (see get_tasks above: `isinstance(result, dict) and 'error' not
+        # in result`).
+        if _op_warning is not None and isinstance(result, dict) and 'error' not in result:
             result.update(_op_warning)
         return result
 

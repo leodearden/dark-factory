@@ -999,6 +999,32 @@ async def test_submit_task_clean_normal_submission_has_no_operational_warning(
     task_interceptor.submit_task.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_submit_task_operational_warning_not_merged_when_result_is_error(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """(c) When task_interceptor.submit_task rejects the submission (a
+    top-level 'error'/'error_type' in the result), the operational-
+    suggestion warning is NOT merged in even though the text would
+    otherwise be flagged -- the suggestion only applies to an accepted
+    submission (task 2679 amendment pass, reviewer_comprehensive robustness
+    finding)."""
+    task_interceptor.submit_task = AsyncMock(
+        return_value={'error': 'boom', 'error_type': 'SomeError'}
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'Restart fused-memory',
+            'description': 'Restart the fused-memory service and confirm it is back up.',
+            'agent_id': 'claude-interactive',
+        },
+    )
+    assert 'operational_suggestion_warning' not in result
+    assert result.get('error') == 'boom'
+
+
 # ------------------------------------------------------------------
 # trigger_reconciliation without taskmaster
 # ------------------------------------------------------------------
