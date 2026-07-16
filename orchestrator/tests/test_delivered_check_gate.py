@@ -17,6 +17,7 @@ decisions for the point-by-point mirror rationale.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -1233,6 +1234,39 @@ class TestComputeDeliveredCheckCache:
         # still no hold event / no _streak_delivered_hold bump for errored.
         assert self._held_events(scheduler) == []
         assert scheduler._streak_delivered_hold.value('10') == 0
+
+    # --- (k) check_timeout_secs: a hung check is treated as ERRORED --------
+
+    @pytest.mark.asyncio
+    async def test_check_exceeding_timeout_is_treated_as_errored(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """task 2583 (epsilon): check_timeout_secs is an outer asyncio.wait_for
+        backstop around each run_delivered_check call. A check that hangs
+        past the timeout maps to ERRORED — the same fail-safe outcome as a
+        runner exception (row 7): dep left uncached, no hold event, no
+        streak bump (neither _streak_delivered_hold nor the epsilon
+        _streak_delivered_fail)."""
+        scheduler.config.delivered_checks.check_timeout_secs = 0.01
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+
+        async def _slow_runner(check, *, project_root, ref='main'):
+            await asyncio.sleep(1)
+            return DeliveredCheckResult.DELIVERED
+
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', _slow_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert result == {}
+        assert ('20', 'sha1') not in scheduler._delivered_check_cache
+        assert self._held_events(scheduler) == []
+        assert scheduler._streak_delivered_hold.value('10') == 0
+        assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
 
 
 # ---------------------------------------------------------------------------
