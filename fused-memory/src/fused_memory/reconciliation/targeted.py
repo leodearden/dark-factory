@@ -697,26 +697,30 @@ class TargetedReconciler:
         title = task.get('title', '')
         description = task.get('description', '')
 
-        # Task 2433: on reopen-from-done, delete the stale completion echo
-        # the earlier done-transition wrote (see
-        # _delete_stale_completion_echoes docstring). Isolated in its own
-        # try/except so a Mem0 hiccup here never breaks hint attachment
-        # below.
-        try:
-            deleted_ids = await self._delete_stale_completion_echoes(task_id, scope, run_id)
-            if deleted_ids:
-                result['actions'].append({
-                    'type': 'stale_echo_deleted',
-                    'count': len(deleted_ids),
-                    'memory_ids': deleted_ids,
-                })
-                await self.journal.add_run_action(
-                    run_id, 'delete', 'memory', 'delete_memory',
-                    {'task_id': task_id, 'deleted': len(deleted_ids)},
-                    causation_id=run_id,
-                )
-        except Exception as e:
-            logger.warning(f'Stale completion-echo sweep failed for task {task_id}: {e}')
+        # Task 2433: on reopen-from-done (the PRE-transition status captured
+        # in task_before was 'done'), delete the stale completion echo the
+        # earlier done-transition wrote (see _delete_stale_completion_echoes
+        # docstring). Gated to genuine reopen-from-done transitions only —
+        # an ordinary pending/in-progress->blocked transition has no prior
+        # completion echo to clean up, so it skips the extra Mem0 scroll
+        # entirely. Isolated in its own try/except so a Mem0 hiccup here
+        # never breaks hint attachment below.
+        if task.get('status') == 'done':
+            try:
+                deleted_ids = await self._delete_stale_completion_echoes(task_id, scope, run_id)
+                if deleted_ids:
+                    result['actions'].append({
+                        'type': 'stale_echo_deleted',
+                        'count': len(deleted_ids),
+                        'memory_ids': deleted_ids,
+                    })
+                    await self.journal.add_run_action(
+                        run_id, 'delete', 'memory', 'delete_memory',
+                        {'task_id': task_id, 'deleted': len(deleted_ids)},
+                        causation_id=run_id,
+                    )
+            except Exception as e:
+                logger.warning(f'Stale completion-echo sweep failed for task {task_id}: {e}')
 
         related = await self.memory.search(
             query=f'blockers for: {title} {description}',
