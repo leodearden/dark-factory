@@ -7045,6 +7045,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # contract: only a dict envelope with a dict 'verdict' carrying a
         # bool 'blocked' is trusted; anything else is treated as absent.
         envelope = self.artifacts.read_verdict('merger')
+        if envelope is None and merger_result.success:
+            # Observability (reviewer_comprehensive amendment, task 2483):
+            # a missing meta-root would make the verdict-tools server
+            # silently no-op its write, and read_verdict() then returns
+            # None indistinguishably from a merger that simply never
+            # called submit_merge_disposition — mirrors steward.py's
+            # pre-triage meta-root diagnostic (steward.py:701-719). This
+            # is purely diagnostic; the fail-safe blocked outcome below is
+            # unchanged either way.
+            verdicts_dir = self.artifacts.root / 'verdicts'
+            if not verdicts_dir.is_dir():
+                logger.warning(
+                    'Task %s: merger verdict absent AND %s does not '
+                    'exist — likely a meta-root misconfiguration, not a '
+                    'merger no-op',
+                    self.task_id, verdicts_dir,
+                )
+            else:
+                logger.warning(
+                    'Task %s: merger verdict absent (verdicts dir %s '
+                    'exists) — merger did not call '
+                    'submit_merge_disposition',
+                    self.task_id, verdicts_dir,
+                )
         verdict = envelope.get('verdict') if isinstance(envelope, dict) else None
         if not isinstance(verdict, dict) or not isinstance(verdict.get('blocked'), bool):
             verdict = None
