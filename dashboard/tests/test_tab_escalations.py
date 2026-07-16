@@ -98,25 +98,37 @@ def _extract_function_body(src: str, fn_name: str) -> str:
     named ``function`` declarations — not arrow functions or class methods.
     Returns the empty string if the function is not found.
 
-    This is used to scope token-presence checks to a specific function body
-    rather than searching the entire file (which would give false confidence
-    when a token appears in an unrelated context).
+    Paren-depth walks past the parameter list before looking for the body's
+    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
+    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
+    taking the first ``{`` after the opening ``(`` would return just the
+    destructuring pattern (e.g. ``{ a, b }``) instead of the function body.
     """
     m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
     if m is None:
         return ''
-    start = src.find('{', m.end())
+    paren_depth = 1
+    i = m.end()
+    while i < len(src) and paren_depth > 0:
+        if src[i] == '(':
+            paren_depth += 1
+        elif src[i] == ')':
+            paren_depth -= 1
+        i += 1
+    if paren_depth != 0:
+        return ''
+    start = src.find('{', i)
     if start == -1:
         return ''
     depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
+    for j in range(start, len(src)):
+        c = src[j]
         if c == '{':
             depth += 1
         elif c == '}':
             depth -= 1
             if depth == 0:
-                return src[start : i + 1]
+                return src[start : j + 1]
     return ''
 
 
