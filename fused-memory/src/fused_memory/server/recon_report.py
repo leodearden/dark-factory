@@ -970,7 +970,7 @@ class ReconReportState:
         for this run.  Each ``_Finding`` is projected to the same dict shape
         used by :meth:`get_assembled_report` (finding_id, severity, category,
         description, suggested_action, actionable, task_id, flag_type, and
-        copies of the four cited_* lists).
+        copies of the five cited_* lists).
 
         Unlike :meth:`get_assembled_report`, this method does **NOT** apply
         Fix-1 read-time echo suppression (task-1654), nor the task-2453
@@ -1009,6 +1009,7 @@ class ReconReportState:
                     'cited_edges': list(f.cited_edges),
                     'cited_tasks': list(f.cited_tasks),
                     'cited_memories': list(f.cited_memories),
+                    'cited_runs': list(f.cited_runs),  # task-2595
                 })
         return results
 
