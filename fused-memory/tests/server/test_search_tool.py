@@ -76,6 +76,66 @@ class TestSearchToolDegradedSurfacing:
         )
 
     @pytest.mark.asyncio
+    async def test_degraded_search_includes_failed_store_diagnostics(self):
+        """When service.search returns failure_diagnostics (task 2653), the tool
+        must surface them as result['failed_store_diagnostics'] alongside the
+        existing degraded/failed_stores keys — closing the attribution gap where
+        a caller sees degraded+failed_stores with no root-cause info.
+        """
+        diagnostics = [{
+            'store': 'graphiti',
+            'reason': 'exception',
+            'error_type': 'RuntimeError',
+            'rate_limit_or_quota': False,
+            'query_len': 5,
+            'project_id': 'dark_factory',
+            'error': 'boom',
+        }]
+        mock_service = AsyncMock()
+        mock_service.search = AsyncMock(
+            return_value=SearchResults(
+                [],
+                degraded=True,
+                failed_stores=['graphiti'],
+                failure_diagnostics=diagnostics,
+            )
+        )
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'search',
+            {'query': 'q', 'project_id': _PROJECT_ID},
+        )
+
+        assert result.get('degraded') is True
+        assert result.get('failed_stores') == ['graphiti']
+        assert result.get('failed_store_diagnostics') == diagnostics, (
+            f"Expected result['failed_store_diagnostics'] == {diagnostics!r}, "
+            f'got {result.get("failed_store_diagnostics")!r}. '
+            'RED: the tool does not surface failed_store_diagnostics yet.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_clean_search_omits_failed_store_diagnostics_key(self):
+        """Fault-only loudness: a clean (non-degraded) response must NOT contain
+        the 'failed_store_diagnostics' key."""
+        mock_service = AsyncMock()
+        mock_service.search = AsyncMock(
+            return_value=SearchResults([], degraded=False, failed_stores=[])
+        )
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'search',
+            {'query': 'test query', 'project_id': _PROJECT_ID},
+        )
+
+        assert 'failed_store_diagnostics' not in result, (
+            f"'failed_store_diagnostics' must NOT appear in happy-path response, "
+            f'got result={result!r}.'
+        )
+
+    @pytest.mark.asyncio
     async def test_plain_list_back_compat_does_not_add_degraded_keys(self):
         """When service.search returns a plain list (back-compat), response has no degraded keys."""
         mock_service = AsyncMock()
