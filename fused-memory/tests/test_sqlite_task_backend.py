@@ -4323,8 +4323,11 @@ async def test_get_tasks_tree_fresh_despite_pinned_write_connection(
     ``test_get_statuses_and_get_task_agree_under_pinned_write_connection``
     (above), covering the full-tree read surface (``get_tasks`` /
     ``_get_tasks_internal``), which task 2651 step-2's ``get_task`` reroute
-    does NOT touch — ``_get_tasks_internal`` still reads via the pinnable
-    cached WRITE connection (``_get_connection``) until it is rerouted too.
+    does NOT itself touch. As of task 2651 step-4, ``_get_tasks_internal``
+    is separately rerouted to the same cached unpinnable read connection
+    (:meth:`_get_read_connection`) that ``get_task`` and ``get_statuses``
+    use — that reroute is exactly why the tree read stays fresh here even
+    with the write connection pinned to a stale pre-commit snapshot.
     """
     conn = await _pin_write_connection_then_commit_out_of_band(backend, project_root)
 
