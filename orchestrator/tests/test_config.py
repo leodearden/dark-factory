@@ -2,6 +2,7 @@
 
 import logging
 import os
+import warnings
 from importlib import resources as pkg_resources
 from pathlib import Path
 
