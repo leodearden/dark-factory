@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _orch_helpers import HermeticMcpSession
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
@@ -47,12 +48,12 @@ class TestHarnessOverrideStoreIntegration:
 
         # Harness constructs its own OverrideStore at the same path.
         harness = Harness(config)
-        # Deterministic RED driver (task 2644): this test instance-mocks
-        # get_tasks and seeds empty-dependency tasks below, so it is
-        # data-conditionally hermetic that tick and forbid_live_mcp's network
-        # spy is vacuously green on base. This assertion is the actual
-        # failing-first signal — it fails on base (_mcp_session is None) and
-        # passes once step-8 injects a HermeticMcpSession.
+        harness.scheduler._mcp_session = HermeticMcpSession()
+        # This test instance-mocks get_tasks and seeds empty-dependency tasks
+        # below, so it is data-conditionally hermetic regardless of the
+        # injected session — forbid_live_mcp's network spy alone can't prove
+        # the injection above actually took effect. This assertion is the
+        # real wiring guarantee (task 2644).
         assert harness.scheduler._mcp_session is not None
         # This test drives acquire_next() directly (bypassing Harness.run()'s
         # startup sweeps), so it must call finish_startup() itself (task 2235).
