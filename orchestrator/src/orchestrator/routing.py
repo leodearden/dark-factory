@@ -341,6 +341,10 @@ def _rule_matches(rule: RoutingRule, inputs: RouteInputs) -> bool:
     ``plan_min_modules`` are present, ``plan_min_modules`` counts only the
     prefix-matched modules (not the total) -- this is what reproduces the
     pre-epsilon Rust heuristic (``_select_model_for_role``) exactly.
+
+    CAVEAT: ``task_priority`` matches only ``inputs.task_metadata['priority']``,
+    NOT the task's top-level ``priority`` field -- see ``config.RuleMatch``'s
+    docstring for the full note.
     """
     match = rule.match
 

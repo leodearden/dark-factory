@@ -292,6 +292,14 @@ class RuleMatch(BaseModel):
     a structured ``ValidationError`` naming the key, both at initial config
     load and at hot-reload time (``apply_reload``'s post-apply
     ``model_validate`` re-check) — boundary test 11.
+
+    CAVEAT -- ``task_priority`` matches only ``task_metadata['priority']``,
+    NOT the task's top-level ``priority`` field (where priority actually
+    lives in this codebase, e.g. ``self.task.get('priority')`` in
+    ``workflow.py``). A rule authored against the top-level field will
+    silently never match; populate ``metadata['priority']`` explicitly if
+    you need this condition to fire. See ``orchestrator.routing.
+    _rule_matches``'s docstring for the same note.
     """
 
     model_config = ConfigDict(extra='forbid')
