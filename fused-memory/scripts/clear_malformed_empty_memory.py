@@ -66,6 +66,7 @@ Usage
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 logger = logging.getLogger('clear_malformed_empty_memory')
 
@@ -164,4 +165,88 @@ async def delete_point(qdrant_client, collection: str, memory_id: str) -> None:
     await qdrant_client.delete(
         collection_name=collection,
         points_selector=qmodels.PointIdsList(points=[memory_id]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+def build_report(
+    *,
+    memory_id: str,
+    collection: str,
+    classification: str,
+    dry_run: bool,
+    deleted: bool,
+    payload: dict | None,
+) -> dict:
+    """Assemble the JSON-serializable report dict from already-computed
+    fields. No I/O.
+
+    ``payload`` is included verbatim (including None for an absent record)
+    so the printed report doubles as the investigation artifact the module
+    docstring promises for a dry run.
+    """
+    return {
+        'memory_id': memory_id,
+        'collection': collection,
+        'classification': classification,
+        'dry_run': dry_run,
+        'deleted': deleted,
+        'payload': payload,
+    }
+
+
+def resolve_exit_code(report: dict) -> int:
+    """Exit-code predicate: 1 iff the record was 'healthy' (not the
+    malformed fingerprint) and this was NOT a dry run -- the loud refusal
+    of a mistargeted --apply. Every other case (malformed, absent, or any
+    dry run) exits 0. Pure, sync, no I/O."""
+    if report['classification'] == 'healthy' and not report['dry_run']:
+        return 1
+    return 0
+
+
+async def run(args: Any, qdrant_client: Any, collection_name: str) -> dict:
+    """Retrieve, classify, and (under --apply) delete the fingerprint-
+    confirmed malformed record at args.memory_id.
+
+    Dry-run (``args.apply`` falsy) performs ZERO mutations: the returned
+    report is a preview only. Under ``--apply``:
+      - classification == 'malformed': delete_point is called, deleted=True.
+      - classification == 'healthy': delete is NEVER called -- a WARNING is
+        logged refusing the delete (fail-safe; see module docstring).
+      - classification == 'absent': no delete is attempted (nothing to
+        delete) -- an INFO log notes the idempotent no-op.
+    """
+    payload = await retrieve_payload(qdrant_client, collection_name, args.memory_id)
+    classification = classify_payload(payload)
+    dry_run = not args.apply
+    deleted = False
+
+    if args.apply and classification == 'malformed':
+        await delete_point(qdrant_client, collection_name, args.memory_id)
+        deleted = True
+    elif args.apply and classification == 'healthy':
+        logger.warning(
+            "clear_malformed_empty_memory: refusing to delete memory_id=%s in "
+            "collection=%s -- payload does NOT match the malformed-empty "
+            "fingerprint (classification='healthy'). No mutation performed.",
+            args.memory_id, collection_name,
+        )
+    elif classification == 'absent':
+        logger.info(
+            'clear_malformed_empty_memory: memory_id=%s in collection=%s not '
+            'found (already absent) -- idempotent no-op.',
+            args.memory_id, collection_name,
+        )
+
+    return build_report(
+        memory_id=args.memory_id,
+        collection=collection_name,
+        classification=classification,
+        dry_run=dry_run,
+        deleted=deleted,
+        payload=payload,
     )
