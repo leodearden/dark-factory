@@ -13420,6 +13420,22 @@ class TestTrainLifecycleEvents:
 # ---------------------------------------------------------------------------
 
 
+def _infra_category_verify_result(category: str = 'semaphore_timeout') -> VerifyResult:
+    """A failed VerifyResult classified as infra-transient (task ν,
+
+    verify-scope-inversion-prd.md) bearing no ENOSPC string markers, so the
+    existing ENOSPC prune-and-retry path is not accidentally triggered.
+    """
+    return VerifyResult(
+        passed=False,
+        test_output='semaphore acquisition timed out',
+        lint_output='',
+        type_output='',
+        summary='semaphore timeout',
+        category=category,
+    )
+
+
 @pytest.mark.asyncio
 class TestRunPostMergeVerify:
     """Direct unit tests for the _run_post_merge_verify module-level helper.
@@ -13597,6 +13613,133 @@ class TestRunPostMergeVerify:
         git_ops.prune_stale_merge_worktrees.assert_awaited_once()
         assert enospc_retries.get(req.task_id, 0) == 1, (
             f'expected enospc_retries[task_id]=1, got: {enospc_retries}'
+        )
+
+    async def test_classified_infra_transient_clears_on_retry(self) -> None:
+        """(task ν) RETRY-CLEARS: infra-category result then a pass → None (merge
+
+        proceeds), run_scoped_verification called twice (one bounded retry
+        shared with the ENOSPC budget).
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        enospc_retries: dict[str, int] = {}
+
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='',
+        )
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(side_effect=[_infra_category_verify_result(), passing]),
+            ) as mock_verify,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries=enospc_retries,
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is None, f'expected None (verify eventually passed), got: {result!r}'
+        assert mock_verify.call_count == 2, (
+            f'expected exactly one bounded infra retry (2 total calls), got {mock_verify.call_count}'
+        )
+
+    async def test_classified_infra_transient_persistent_holds_loud_no_attempt(self) -> None:
+        """(task ν) PERSISTENT-HOLD: infra-category result on every dispatch →
+
+        blocked with the TRANSIENT_INFRA_REASON_PREFIX (loud infra_issue hold,
+        not the generic branch-blaming block); no timeout-counter bump (no
+        merge verify attempt consumed) and no dry-run debugger spawn.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        timeouts: dict[str, int] = {}
+        enospc_retries: dict[str, int] = {}
+
+        infra_result = _infra_category_verify_result()
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=infra_result),
+            ) as mock_verify,
+            patch(
+                'orchestrator.merge_queue._spawn_merge_verify_dry_run',
+            ) as mock_spawn_dry_run,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts=timeouts, enospc_retries=enospc_retries,
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'expected transient-infra reason, got: {result.reason!r}'
+        )
+        assert mock_verify.call_count == 2, (
+            f'expected exactly one bounded infra retry (2 total calls), got {mock_verify.call_count}'
+        )
+        assert timeouts == {}, (
+            f'classified-infra outcome must not bump the timeout loop-breaker: {timeouts}'
+        )
+        mock_spawn_dry_run.assert_not_called()
+
+    async def test_genuine_test_failure_not_treated_as_infra_transient(self) -> None:
+        """(task ν) NARROWNESS: a genuine test_failure category is NOT retried
+
+        or routed to the transient-infra hold — it takes the ordinary
+        generic-block path, unchanged.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        test_failure_result = VerifyResult(
+            passed=False,
+            test_output='FAILED tests/test_x.py::test_y',
+            lint_output='',
+            type_output='',
+            summary='tests failed',
+            category='test_failure',
+        )
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=test_failure_result),
+            ) as mock_verify,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.reason.startswith('Post-merge verification failed:'), (
+            f'unexpected reason: {result.reason!r}'
+        )
+        assert not result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'a genuine test_failure must NOT take the transient-infra path: {result.reason!r}'
+        )
+        assert mock_verify.call_count == 1, (
+            f'a non-infra-transient category must not trigger the infra retry, '
+            f'got {mock_verify.call_count} calls'
         )
 
     async def test_verify_exception_propagates_no_cleanup(self) -> None:
