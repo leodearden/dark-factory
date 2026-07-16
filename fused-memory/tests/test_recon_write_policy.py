@@ -613,6 +613,85 @@ class TestInterceptorUpdateTaskTerminalBoundary:
 
 
 # ---------------------------------------------------------------------------
+# P1b — interceptor.update_task terminal-annotation-clear exemption boundary
+# ---------------------------------------------------------------------------
+
+
+class TestInterceptorUpdateTaskAnnotationClearBoundary:
+    @pytest.mark.asyncio
+    async def test_recon_stage_clear_of_possible_scope_mismatch_on_done_task_proceeds(
+        self, interceptor, taskmaster,
+    ):
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={'possible_scope_mismatch': None},
+            agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+        assert 'error_type' not in result
+
+    @pytest.mark.asyncio
+    async def test_clear_with_title_present_still_rejects(self, interceptor, taskmaster):
+        """A content field alongside the clearable metadata key disqualifies
+        the exemption — this is a content mutation, not a pure clear."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={'possible_scope_mismatch': None},
+            title='x',
+            agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clear_with_non_allowlisted_key_still_rejects(self, interceptor, taskmaster):
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={'arbitrary_key': 1},
+            agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clear_with_replace_mode_still_rejects(self, interceptor, taskmaster):
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={'possible_scope_mismatch': None},
+            metadata_mode='replace',
+            agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_recon_agent_id_clear_proceeds_unchanged(self, interceptor, taskmaster):
+        """Recon-scoping negative: unaffected by this change either way —
+        this write was never gated regardless of the exemption."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        await interceptor.update_task(
+            '1', '/project',
+            metadata={'possible_scope_mismatch': None},
+            agent_id=None,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # P2 — interceptor.set_task_status live-workflow boundary
 # ---------------------------------------------------------------------------
 
