@@ -280,3 +280,62 @@ class TestComputeChronicFlakes:
     def test_empty_entries_returns_empty_list(self):
         from orchestrator.chronic_flake import compute_chronic_flakes
         assert compute_chronic_flakes([], threshold=3, window=20) == []
+
+
+# ── Step-7 / Step-8: De-flake fix-task argument builder ───────────────────────
+
+
+class TestBuildChronicFlakeFixTaskArguments:
+    """``build_chronic_flake_fix_task_arguments``: models
+    ``workflow.build_offline_lane_fix_task_arguments`` — deterministic
+    title/priority/project_root, an evidence-bearing description with an
+    explicit root-cause (never blind timeout bumps) instruction, and
+    correlation metadata."""
+
+    def _evidence(self):
+        from orchestrator.chronic_flake import ChronicFlakeEvidence
+        return ChronicFlakeEvidence(
+            test='test_pool_x.sh',
+            count=3,
+            window=20,
+            dates=['2026-07-01T00:00:00Z', '2026-07-05T00:00:00Z', '2026-07-10T00:00:00Z'],
+            roles=['implementer', 'verifier'],
+            entries=[],
+        )
+
+    def test_title_priority_and_project_root(self, tmp_path):
+        from orchestrator.chronic_flake import build_chronic_flake_fix_task_arguments
+        args = build_chronic_flake_fix_task_arguments(self._evidence(), tmp_path)
+        assert args['title'] == 'De-flake test_pool_x.sh: chronic pool flake (auto-filed)'
+        assert args['priority'] == 'medium'
+        assert args['project_root'] == str(tmp_path)
+
+    def test_description_contains_ledger_evidence(self, tmp_path):
+        from orchestrator.chronic_flake import build_chronic_flake_fix_task_arguments
+        args = build_chronic_flake_fix_task_arguments(self._evidence(), tmp_path)
+        description = args['description']
+        assert 'test_pool_x.sh' in description
+        assert '3' in description
+        assert '20' in description
+        assert '2026-07-01T00:00:00Z' in description
+        assert 'implementer' in description
+        assert 'verifier' in description
+
+    def test_description_contains_root_cause_instruction(self, tmp_path):
+        from orchestrator.chronic_flake import build_chronic_flake_fix_task_arguments
+        args = build_chronic_flake_fix_task_arguments(self._evidence(), tmp_path)
+        description = args['description'].lower()
+        assert 'condition-poll' in description or 'condition poll' in description
+        assert 'structural assert' in description
+        assert 'never' in description
+        assert 'blind timeout' in description
+
+    def test_metadata_correlation_keys(self, tmp_path):
+        from orchestrator.chronic_flake import build_chronic_flake_fix_task_arguments
+        args = build_chronic_flake_fix_task_arguments(self._evidence(), tmp_path)
+        metadata = args['metadata']
+        assert metadata['spawn_context'] == 'chronic_flake_auto_file'
+        assert metadata['chronic_flake_test'] == 'test_pool_x.sh'
+        assert metadata['chronic_flake_count'] == 3
+        assert metadata['chronic_flake_window'] == 20
+        assert metadata['roles'] == ['implementer', 'verifier']
