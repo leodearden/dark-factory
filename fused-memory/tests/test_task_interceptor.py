@@ -2861,6 +2861,80 @@ async def test_reopen_freshness_enforce_rejects_stale_evidence_real_backend(
         await backend.close()
 
 
+@pytest.mark.asyncio
+async def test_reopen_freshness_warn_mode_emits_census_line(
+    tmp_path, event_buffer, caplog,
+):
+    """DEFAULT (warn) mode: a stale-evidence re-done write PROCEEDS but emits
+    exactly one task_status.done_evidence_stale_warn census WARNING carrying
+    the same structured fields as the enforce-mode rejection (grep-stable
+    anchor -- see reconciliation.reject_stale_done_evidence in schema.py).
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    _init_git_repo(tmp_path)
+    stale_sha = _commit_on_main(tmp_path, 'stale_evidence.txt', '2020-01-01T00:00:00+00:00')
+
+    # No config override -- reject_stale_done_evidence stays at its 'warn' default.
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer)
+
+        stale_provenance = {'kind': 'found_on_main', 'commit': stale_sha, 'note': 'sibling'}
+
+        first_done = await interceptor.set_task_status(
+            '1', 'done', project_root, done_provenance=stale_provenance,
+        )
+        assert 'error' not in first_done, first_done
+
+        reopen_result = await interceptor.set_task_status(
+            '1', 'pending', project_root, reopen_reason='reverting: regression found',
+        )
+        assert 'error' not in reopen_result, reopen_result
+        reopened_task = await backend.get_task('1', project_root=project_root)
+        reopen_at = reopened_task['metadata']['reopen_at']
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+            result = await interceptor.set_task_status(
+                '1',
+                'done',
+                project_root,
+                done_provenance=stale_provenance,
+                agent_id='claude-interactive',
+            )
+
+        assert 'error' not in result, result
+
+        # Independent fresh backend confirms the write actually persisted.
+        fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await fresh.start()
+        try:
+            task = await fresh.get_task('1', project_root=project_root)
+        finally:
+            await fresh.close()
+        assert task['status'] == 'done', task
+
+        stale_warn_records = [
+            r for r in caplog.records
+            if r.message.startswith('task_status.done_evidence_stale_warn')
+        ]
+        assert len(stale_warn_records) == 1, (
+            f'expected exactly one census line, got: {[r.message for r in caplog.records]}'
+        )
+        msg = stale_warn_records[0].message
+        assert 'task_id=1' in msg
+        assert stale_sha in msg
+        assert '2020-01-01T00:00:00+00:00' in msg  # evidence_committed_at
+        assert reopen_at in msg
+        assert 'claude-interactive' in msg
+    finally:
+        await backend.close()
+
+
 # ── Tests for done_provenance.kind discriminator (2026-04-27 hardening) ────
 
 
