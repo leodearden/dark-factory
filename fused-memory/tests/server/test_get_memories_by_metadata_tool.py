@@ -9,11 +9,13 @@ Mirrors test_count_by_metadata_tool.py exactly.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.server.tools import create_mcp_server
+from fused_memory.services.memory_service import MemoryService
 
 _PROJECT_ID = 'dark_factory'
 _FILTERS = {'source': 'stage1_flag_marker'}
@@ -157,6 +159,39 @@ class TestGetMemoriesByMetadataTool:
         )
         assert 'filters must not be empty' in result.get('error', ''), (
             f"Expected original error message in result: {result!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_scroll_read_timeout_surfaces_as_error_not_empty_list(self, mock_config):
+        """A Qdrant scroll timeout surfaces as {'error', 'error_type': 'TimeoutError'} —
+        it must NOT masquerade as an empty {'memories': []} result (no-silent-fail
+        invariant; esc-2655-3).
+
+        Drives a REAL MemoryService + REAL Mem0Backend (only the underlying async
+        Qdrant client is patched) so this test genuinely exercises the whole
+        scroll_by_metadata -> get_memories_by_metadata -> @mcp_tool_errors chain —
+        a fully-mocked service would pass even against the pre-fix swallow-to-[]
+        behaviour.
+        """
+        svc = MemoryService(mock_config)
+        svc.mem0 = Mem0Backend(mock_config)
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(side_effect=TimeoutError('qdrant scroll timed out'))
+        server = create_mcp_server(svc)
+
+        with patch.object(svc.mem0, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await server._tool_manager.call_tool(
+                'get_memories_by_metadata',
+                {'project_id': _PROJECT_ID, 'filters': _FILTERS},
+            )
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}: {result!r}'
+        assert 'error' in result, f"Expected error key in result: {result!r}"
+        assert result.get('error_type') == 'TimeoutError', (
+            f"Expected error_type='TimeoutError', got: {result!r}"
+        )
+        assert result.get('memories') is None, (
+            f"Timeout must not masquerade as an empty memories list: {result!r}"
         )
 
 

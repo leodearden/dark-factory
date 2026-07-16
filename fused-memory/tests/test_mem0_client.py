@@ -175,23 +175,25 @@ class TestMem0BackendScrollByMetadata:
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_timeout_logs_warning_and_returns_empty(self, backend, caplog):
-        """On TimeoutError, logs WARNING and returns [] without raising."""
-        import logging
+    async def test_timeout_propagates_not_swallowed(self, backend):
+        """On TimeoutError, the exception propagates — it is NOT swallowed into [].
 
+        Mirrors count_by_metadata's propagate-by-default contract (no
+        try/except around asyncio.wait_for): a timed-out scroll must never be
+        indistinguishable from a genuinely-empty result (no-silent-fail
+        invariant).
+        """
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
 
-        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
-                caplog.at_level(logging.WARNING, logger='fused_memory.backends.mem0_client'):
-            result = await backend.scroll_by_metadata(
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            pytest.raises(TimeoutError),
+        ):
+            await backend.scroll_by_metadata(
                 scope=Scope(project_id='p'),
                 filters={'recon_pool': 'stage2_cycle_summary'},
             )
-
-        assert result == []
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert len(warning_records) >= 1
 
     @pytest.mark.asyncio
     async def test_limit_reached_logs_truncation_warning(self, backend, caplog):

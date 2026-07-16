@@ -286,7 +286,10 @@ async def fetch_procedural_memories(
             ``scroll_by_metadata``).
 
     Returns:
-        Normalised memory dicts; ``[]`` for an empty/timed-out scan.
+        Normalised memory dicts; ``[]`` for an empty scan. A Qdrant
+        read-timeout now PROPAGATES as ``TimeoutError`` (``scroll_by_metadata``
+        no longer swallows it into an empty list), so this function raises
+        rather than silently returning ``[]`` on timeout.
     """
     from fused_memory.models.scope import Scope  # noqa: PLC0415
 
