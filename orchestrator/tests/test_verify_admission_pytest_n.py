@@ -51,7 +51,13 @@ _TYPE_CMD = 'pyright'
 
 
 def _leg_for_cmd(cmd: str) -> str:
-    if _TEST_CMD in cmd:
+    """Label which leg *cmd* belongs to. Checks 'pytest'/'tests/' as two
+    separate substrings (not the single _TEST_CMD substring test_verify_
+    admission_wiring.py's version checks) because a `-n` injection splices
+    new flags between them (``pytest tests/`` -> ``pytest -n 16 tests/``),
+    breaking containment of the whole ``_TEST_CMD`` string.
+    """
+    if 'pytest' in cmd and 'tests/' in cmd:
         return 'test'
     if _LINT_CMD in cmd:
         return 'lint'
