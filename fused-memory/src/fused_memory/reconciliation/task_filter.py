@@ -407,6 +407,59 @@ def frames_live_task_status_as_current_fact(text: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Proposed/conditional resolution-option framing detection (task 2447)
+# --------------------------------------------------------------------------- #
+#
+# A task description's "RESOLUTION OPTIONS (architect call — pick one, land
+# as a RED/GREEN pair): (a) ..." section describes proposed/imperative fix
+# prose, not verified current-state behavior. When such a description is
+# ingested via add_episode without temporal_context='planning' (episode
+# 7882dcdc, causation_id 3427792c-4ab5-4893-b52e-82bbbe576a1d, sourced from
+# task 2444's description), Graphiti's extraction pipeline atomizes an
+# unchosen proposed option into an unqualified present-tense edge (e.g.
+# "entry.verify_task is awaited before the registry transition to FINALIZING
+# occurs") that contradicts verified current code. This detector is the
+# ingest-time signal used to auto-upgrade temporal_context to 'planning' for
+# exactly this shape (sibling to is_batch_plan_framing above, task 2022).
+#
+# Detection is deterministic lexical matching (word-boundary alternation over
+# a fixed set of STRUCTURALLY SPECIFIC, multi-word anchor phrases), mirroring
+# is_batch_plan_framing and the other detectors in this module rather than
+# semantic/LLM classification: no fragile thresholds, fully unit-testable.
+# This may occasionally false-positive on prose that coincidentally contains
+# one of the anchor phrases without actually proposing a resolution; the
+# impact is bounded — a mis-tagged episode is merely hidden from default
+# search (recoverable via include_planned=True), the same tolerance
+# documented for the sibling detectors in this module.
+#
+# Deliberately does NOT fire on bare modal verbs (should/would/could/propose)
+# in isolation — those are ubiquitous in legitimate current-state facts
+# ("X should fire after the await" can describe verified behavior) and a
+# bare-modal detector would massively over-fire, hiding large amounts of real
+# fact. This mirrors task 2276's documented decision to drop generic markers
+# ('closed'/'resolved') that "describe non-task things just as often." The
+# real incident text matches on "resolution options" AND "architect call".
+PROPOSED_RESOLUTION_ANCHOR_RE: re.Pattern[str] = re.compile(
+    r"resolution\s+options?|"
+    r"architect(?:'s)?\s+call|"
+    r'proposed\s+(?:fix|resolution|approach|change|option|design)|'
+    r'candidate\s+(?:fix|resolution|approach)(?:es)?|'
+    r'not[-\s]yet[-\s]implemented',
+    re.IGNORECASE,
+)
+
+
+def is_proposed_resolution_framing(text: str) -> bool:
+    """Return True when text frames a proposed/conditional resolution option
+    (e.g. "RESOLUTION OPTIONS (architect call ...)", "Proposed fix: ...",
+    "candidate fixes") rather than verified current-state fact — the
+    ingest-time shape that must be auto-tagged temporal_context='planning'
+    (see module comment above).
+    """
+    return bool(PROPOSED_RESOLUTION_ANCHOR_RE.search(text))
+
+
+# --------------------------------------------------------------------------- #
 # Status constants
 # --------------------------------------------------------------------------- #
 
