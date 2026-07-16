@@ -153,6 +153,7 @@ class ModelsConfig(BaseModel):
     module_tagger: str = Field(default='sonnet')
     deep_reviewer: str = Field(default='opus')
     judge: str = Field(default='sonnet')
+    simple_task: str = Field(default='sonnet')
 
 
 class BudgetsConfig(BaseModel):
@@ -168,6 +169,7 @@ class BudgetsConfig(BaseModel):
     module_tagger: float = Field(default=2.0)
     deep_reviewer: float = Field(default=15.0)
     judge: float = Field(default=0.50)
+    simple_task: float = Field(default=1.50)
 
 
 class TurnsConfig(BaseModel):
@@ -183,6 +185,7 @@ class TurnsConfig(BaseModel):
     module_tagger: int = Field(default=30)
     deep_reviewer: int = Field(default=100)
     judge: int = Field(default=15)
+    simple_task: int = Field(default=30)
 
 
 class EffortConfig(BaseModel):
@@ -198,6 +201,7 @@ class EffortConfig(BaseModel):
     module_tagger: str = Field(default='medium')
     deep_reviewer: str = Field(default='max')
     judge: str = Field(default='medium')
+    simple_task: str = Field(default='high')
 
 
 class TimeoutsConfig(BaseModel):
@@ -223,6 +227,12 @@ class TimeoutsConfig(BaseModel):
     module_tagger: float = Field(default=300.0)
     deep_reviewer: float = Field(default=2400.0)
     judge: float = Field(default=300.0)
+    # Dedicated per-role knob (deliberately decoupled from
+    # OrchestratorConfig.invocation_timeout — see that field's docstring):
+    # today simple_task's timeout comes from the getattr(timeouts_cfg,
+    # role_key, self.config.invocation_timeout) fallback, so at stock config
+    # (invocation_timeout=7200.0) this literal is byte-equivalent.
+    simple_task: float = Field(default=7200.0)
     startup_grace_secs: float = Field(
         default=120.0,
         description=(
@@ -268,6 +278,7 @@ class BackendsConfig(BaseModel):
     module_tagger: str = Field(default='claude')
     deep_reviewer: str = Field(default='claude')
     judge: str = Field(default='claude')
+    simple_task: str = Field(default='claude')
 
 
 class RoutingConfig(BaseModel):
@@ -2054,8 +2065,21 @@ class OrchestratorConfig(BaseSettings):
     # (sonnet) agent when the classifier matches a trivial doc/comment/
     # rename/typo task with at most a couple of files in scope.
     simple_task_enabled: bool = Field(default=True)
-    simple_task_budget_usd: float = Field(default=1.50)
-    simple_task_max_turns: int = Field(default=30)
+    # Deprecated (routing alpha, task 2531): superseded by budgets.simple_task
+    # / max_turns.simple_task, the real per-role resolution path _invoke uses.
+    # Formally honored, not dead: _honor_deprecated_simple_task_scalars below
+    # migrates a non-default value into the matching submodel field (only
+    # when that field is still at its own default) with a loud WARNING.
+    simple_task_budget_usd: float = Field(
+        default=1.50,
+        deprecated=True,
+        description='Deprecated — set budgets.simple_task instead.',
+    )
+    simple_task_max_turns: int = Field(
+        default=30,
+        deprecated=True,
+        description='Deprecated — set max_turns.simple_task instead.',
+    )
 
     # Auto-eval — when the optimistic path (B-skip or C-simple) blocks at
     # plan/execute/verify/review, automatically rerun the same task from the
@@ -2534,14 +2558,22 @@ class OrchestratorConfig(BaseSettings):
     )
 
     # Two LIVE uses: (1) per-role timeout FALLBACK — workflow._invoke reads
-    # `getattr(timeouts_cfg, role_key, self.config.invocation_timeout)`, so
-    # any role whose split role_key misses a TimeoutsConfig field (e.g.
-    # module_tagger/deep_reviewer) falls through to this scalar; (2) the
-    # working-regime ABSOLUTE CAP — the outer bound on the post-turn-1
-    # progress extension (see TimeoutsConfig.working_idle_secs), regardless
-    # of how much the transcript keeps advancing. Default 7200.0 matches
-    # defaults.yaml, which has shipped this value since before this scalar
-    # was repurposed as the absolute cap.
+    # `getattr(timeouts_cfg, role_key, self.config.invocation_timeout)` keyed
+    # on the role's FULL name (role_key = role.name; routing alpha, task
+    # 2531 retired the old split('_')[0] derivation), so this only engages
+    # for a role whose full name has no matching TimeoutsConfig field —
+    # every role _invoke currently routes (architect/implementer/debugger/
+    # judge/merger/reviewer_*/simple_task) has one, so today this is a
+    # defensive catch-all for a future role added without a submodel field,
+    # not a live fallback. module_tagger and deep_reviewer never reach this
+    # path at all — both are dispatched out-of-band (harness.py /
+    # review_checkpoint.py) via their own full-name config lookups, not
+    # through _invoke; (2) the working-regime ABSOLUTE CAP — the outer
+    # bound on the post-turn-1 progress extension (see
+    # TimeoutsConfig.working_idle_secs), regardless of how much the
+    # transcript keeps advancing. Default 7200.0 matches defaults.yaml,
+    # which has shipped this value since before this scalar was repurposed
+    # as the absolute cap.
     invocation_timeout: float = Field(default=7200.0)
 
     # Models, budgets, turns, timeouts per role
@@ -2819,6 +2851,65 @@ class OrchestratorConfig(BaseSettings):
                 'Raise timeouts.steward to >= steward_completion_timeout, or lower '
                 'steward_completion_timeout in your orchestrator.yaml.'
             )
+        return self
+
+    @model_validator(mode='after')
+    def _honor_deprecated_simple_task_scalars(self) -> 'OrchestratorConfig':
+        """Formally honor the deprecated simple_task_budget_usd /
+        simple_task_max_turns scalars (routing alpha, task 2531) rather than
+        leave them dead: a non-default scalar migrates into the matching
+        submodel field (budgets.simple_task / max_turns.simple_task) — but
+        ONLY when that submodel field is still at its own default, so an
+        explicitly-configured submodel value always wins and the scalar is
+        then silently ignored (no migration, no warning). Every migration
+        logs a loud deprecation WARNING naming the replacement, honoring the
+        project's loud-over-silent-degradation norm — OrchestratorConfig
+        uses extra='ignore', so a removed field set in an existing
+        orchestrator.yaml would otherwise vanish with no signal at all.
+
+        Idempotent under apply_reload's post-apply
+        model_validate(model_dump()) round-trip: once migrated, the
+        submodel field is no longer at its default, so a second pass is a
+        no-op (the precedence check above skips migration and logs nothing).
+
+        Reads both scalars via ``self.__dict__`` rather than plain attribute
+        access — both fields are marked ``Field(deprecated=True)`` below, so
+        a normal ``self.simple_task_...`` read would itself fire pydantic's
+        deprecated-field access warning on every single config construction,
+        not just the ones where an operator actually set a non-default
+        value. ``__dict__`` holds the same validated raw value pydantic
+        already stored; this only bypasses the deprecated-access warning
+        wrapper, not validation.
+        """
+        budget_default = type(self).model_fields['simple_task_budget_usd'].default
+        raw_budget = self.__dict__['simple_task_budget_usd']
+        if (
+            raw_budget != budget_default
+            and self.budgets.simple_task == type(self.budgets).model_fields['simple_task'].default
+        ):
+            logger.warning(
+                'simple_task_budget_usd is deprecated and will be removed; '
+                'migrating its value (%s) into budgets.simple_task. Set '
+                'budgets.simple_task directly in orchestrator.yaml instead.',
+                raw_budget,
+            )
+            self.budgets.simple_task = raw_budget
+
+        max_turns_default = type(self).model_fields['simple_task_max_turns'].default
+        raw_max_turns = self.__dict__['simple_task_max_turns']
+        if (
+            raw_max_turns != max_turns_default
+            and self.max_turns.simple_task
+            == type(self.max_turns).model_fields['simple_task'].default
+        ):
+            logger.warning(
+                'simple_task_max_turns is deprecated and will be removed; '
+                'migrating its value (%s) into max_turns.simple_task. Set '
+                'max_turns.simple_task directly in orchestrator.yaml instead.',
+                raw_max_turns,
+            )
+            self.max_turns.simple_task = raw_max_turns
+
         return self
 
     @model_validator(mode='after')
@@ -3162,12 +3253,20 @@ def _iter_leaves(model: BaseModel):
     are yielded whole as atomic leaves compared by equality. PrivateAttrs
     (e.g. _module_configs) are never visited because they are not in
     model_fields.
+
+    Reads values via ``__dict__`` rather than plain ``getattr`` — a field
+    marked ``Field(deprecated=True)`` (e.g. simple_task_budget_usd) wraps
+    attribute access with a DeprecationWarning, and this generic diff sweep
+    reads every leaf on every call regardless of whether it is deprecated,
+    so a plain getattr would fire that warning on every diff_config() call.
+    ``__dict__`` holds the same validated value pydantic already stored;
+    this only bypasses the deprecated-access warning, not validation.
     """
     for name in type(model).model_fields:
-        value = getattr(model, name)
+        value = model.__dict__[name]
         if isinstance(value, BaseModel):
             for sub in type(value).model_fields:
-                yield f'{name}.{sub}', getattr(value, sub)
+                yield f'{name}.{sub}', value.__dict__[sub]
         else:
             yield name, value
 

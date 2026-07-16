@@ -156,8 +156,13 @@ steward_max_timeouts_per_escalation: 3
 suggestion_triage_threshold: 10
 
 # Wall-clock backstop for any single agent invocation (seconds). Two live
-# uses: (1) per-role timeout fallback for a role whose split role_key misses
-# a field below; (2) the working-regime absolute cap on the post-turn-1
+# uses: (1) per-role timeout fallback for a role whose FULL name (routing
+# alpha, task 2531 retired the old split('_')[0] derivation) has no
+# matching field below — every role _invoke currently routes has one, so
+# today this is a defensive catch-all rather than a live fallback;
+# module_tagger/deep_reviewer never reach this path at all, since both are
+# dispatched out-of-band via their own full-name config lookups, not
+# through _invoke; (2) the working-regime absolute cap on the post-turn-1
 # progress extension (see timeouts.working_idle_secs).
 invocation_timeout: 7200.0
 
@@ -173,6 +178,9 @@ timeouts:
   module_tagger: 300
   deep_reviewer: 2400
   judge: 300
+  # Dedicated per-role knob, deliberately decoupled from invocation_timeout
+  # above (see that field's comment) — byte-equivalent at stock config.
+  simple_task: 7200.0
   # Post-turn-1 no-progress idle bound (seconds) — the working-regime
   # watchdog kills only after no NEW assistant turn for
   # max(working_idle_secs, the per-role ceiling above).
@@ -190,6 +198,7 @@ models:
   module_tagger: "sonnet"
   deep_reviewer: "opus"
   judge: "sonnet"
+  simple_task: "sonnet"
 
 # Budget per invocation (USD)
 budgets:
@@ -203,6 +212,7 @@ budgets:
   module_tagger: 2.0
   deep_reviewer: 15.0
   judge: 0.50
+  simple_task: 1.50
 
 # Turn limits per invocation
 max_turns:
@@ -216,6 +226,7 @@ max_turns:
   module_tagger: 30
   deep_reviewer: 100
   judge: 15
+  simple_task: 30
 
 # Reasoning effort per role
 effort:
@@ -229,6 +240,7 @@ effort:
   module_tagger: "medium"
   deep_reviewer: "max"
   judge: "medium"
+  simple_task: "high"
 
 # Backend CLI per role (claude, codex, gemini, pi)
 backends:
@@ -242,6 +254,7 @@ backends:
   module_tagger: "claude"
   deep_reviewer: "claude"
   judge: "claude"
+  simple_task: "claude"
 
 # Review checkpoints
 review:
