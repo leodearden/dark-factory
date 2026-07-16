@@ -37,6 +37,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import _init_git_repo
 from shared.task_claimant import compose_claimant_run_id, is_stranded
 from shared.task_statuses import TaskStatus
 
@@ -101,40 +102,6 @@ async def backend(tmp_path):
 @pytest_asyncio.fixture
 async def project_root(tmp_path):
     return str(tmp_path / 'proj')
-
-
-def _init_git_repo(path) -> str:
-    """Create a minimal git repo at path with one commit; return full SHA.
-
-    Mirrors ``test_task_interceptor.py``'s ``_init_git_repo`` — needed here
-    so a ``done_provenance={'kind': 'merged', 'commit': ...}`` write has a
-    real ``main`` branch for the interceptor's ``_verify_commit_on_main``
-    ancestor backstop (``git merge-base --is-ancestor <sha> main``) to
-    resolve against.
-    """
-    import subprocess
-
-    subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
-    subprocess.run(
-        ['git', '-C', str(path), 'config', 'user.email', 't@e.example'],
-        check=True,
-    )
-    subprocess.run(
-        ['git', '-C', str(path), 'config', 'user.name', 'T'],
-        check=True,
-    )
-    (path / 'seed.txt').write_text('seed\n')
-    subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)
-    subprocess.run(
-        ['git', '-C', str(path), 'commit', '-q', '-m', 'seed'],
-        check=True,
-    )
-    return subprocess.run(
-        ['git', '-C', str(path), 'rev-parse', 'HEAD'],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
 
 
 def test_taskstatus_vocabulary_includes_a_row_status_literals() -> None:

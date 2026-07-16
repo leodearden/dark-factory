@@ -658,6 +658,39 @@ async def poll_until(
 # ---------------------------------------------------------------------------
 
 
+def _init_git_repo(path) -> str:
+    """Create a minimal git repo at path with one commit; return full SHA.
+
+    Shared by test_task_interceptor.py and test_status_authority_gate.py: a
+    ``done_provenance={'kind': 'merged', 'commit': ...}`` write needs a real
+    ``main`` branch for the interceptor's ``_verify_commit_on_main`` ancestor
+    backstop (``git merge-base --is-ancestor <sha> main``) to resolve against.
+    """
+    import subprocess
+
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
+    subprocess.run(
+        ['git', '-C', str(path), 'config', 'user.email', 't@e.example'],
+        check=True,
+    )
+    subprocess.run(
+        ['git', '-C', str(path), 'config', 'user.name', 'T'],
+        check=True,
+    )
+    (path / 'seed.txt').write_text('seed\n')
+    subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)
+    subprocess.run(
+        ['git', '-C', str(path), 'commit', '-q', '-m', 'seed'],
+        check=True,
+    )
+    return subprocess.run(
+        ['git', '-C', str(path), 'rev-parse', 'HEAD'],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def _make_rate_limit_error(
     message: str = 'Rate limit exceeded.',
     code: str = 'insufficient_quota',
