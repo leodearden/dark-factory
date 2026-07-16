@@ -378,3 +378,46 @@ class TestApplyCorrectionsAnnotate:
 
         assert summary['annotated'] == 1
         assert summary['needs_human_review'] == ['9999']
+
+
+# ===========================================================================
+# Step-7/8: apply_corrections — reopen happy path
+# ===========================================================================
+
+@pytest.mark.asyncio
+class TestApplyCorrectionsReopenHappyPath:
+    """apply=True on a reopen correction flips status to pending, verifies
+    the flip persisted, and also writes an audit-trail annotation."""
+
+    async def test_reopen_happy_path(self):
+        correction = _correction(
+            '1175', ACTION_REOPEN, label=LABEL_REOPENED, ref='main',
+            reasons=['declared file(s) missing from the ref HEAD: fused-memory/tests/x.py'],
+            reopen_reason=REOPEN_DISPOSITIONS['1175'],
+        )
+        # Defaults already shape the happy path: set_task_status returns a
+        # success DTO, get_task's post-write re-read reports 'pending'.
+        backend = FakeCorrectionsBackend()
+        summary = await apply_corrections(backend, '/proj', [correction], apply=True)
+
+        assert len(backend.status_calls) == 1
+        status_call = backend.status_calls[0]
+        assert status_call['task_id'] == '1175'
+        assert status_call['status'] == 'pending'
+        assert status_call['project_root'] == '/proj'
+
+        assert len(backend.get_task_calls) == 1
+        assert backend.get_task_calls[0]['task_id'] == '1175'
+
+        assert summary['reopened'] == 1
+        assert '1175' not in summary['reopen_failed']
+        assert summary['errors'] == 0
+
+        # An audit-trail annotation is also written on a successful reopen.
+        assert len(backend.update_calls) == 1
+        call = backend.update_calls[0]
+        assert call['task_id'] == '1175'
+        payload = json.loads(call['metadata'])
+        annotation = payload['x_provenance_audit']
+        assert annotation['label'] == LABEL_REOPENED
+        assert annotation['reopen_reason'] == REOPEN_DISPOSITIONS['1175']
