@@ -25,7 +25,10 @@ import pytest
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
-from orchestrator.service_restart import StaleServiceRestartCoordinator
+from orchestrator.service_restart import (
+    FLEET_DEPLOY_CLOCK_RELPATH,
+    StaleServiceRestartCoordinator,
+)
 
 # ---------------------------------------------------------------------------
 # Fixture
@@ -660,6 +663,42 @@ class TestBuildOrchestratorRestartCoordinator:
 
         assert coord._min_interval_secs == 0.0
         assert coord._state_path is None
+
+    def test_orchestrator_coordinator_stamp_clock_on_fire_is_false(self, harness: Harness):
+        """The orchestrator's own coordinator never persists the clock on fire (task 2396).
+
+        restart-all-orchestrators.sh becomes the SOLE on-disk clock writer,
+        stamping only on its verified-fresh exit-0 path — closing the
+        "failed-detached-deploy silences the backstop for 8h" hole (I2).
+        """
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._stamp_clock_on_fire is False
+
+    def test_fused_memory_coordinator_stamp_clock_on_fire_is_true(self, harness: Harness):
+        """fused-memory keeps the stamp_clock_on_fire default (True) — byte-identical."""
+        coord = harness._build_service_restart_coordinator()
+
+        assert coord._stamp_clock_on_fire is True
+
+    def test_dashboard_coordinator_stamp_clock_on_fire_is_true(self, harness: Harness):
+        """dashboard keeps the stamp_clock_on_fire default (True) — byte-identical."""
+        coord = harness._build_dashboard_restart_coordinator()
+
+        assert coord._stamp_clock_on_fire is True
+
+    def test_state_path_value_preserved_via_fleet_deploy_clock_relpath(self, harness: Harness):
+        """The state_path VALUE survives the FLEET_DEPLOY_CLOCK_RELPATH refactor.
+
+        test_state_path_under_data_orchestrator (above) already pins the
+        literal path; this guards that the same value is produced once
+        harness.py builds it from the single-source-of-truth constant
+        (FLEET_DEPLOY_CLOCK_RELPATH) instead of an inline literal.
+        """
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        expected = Path(harness.config.project_root) / FLEET_DEPLOY_CLOCK_RELPATH
+        assert coord._state_path == expected
 
 
 # ---------------------------------------------------------------------------
