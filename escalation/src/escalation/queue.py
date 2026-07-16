@@ -16,6 +16,7 @@ from pathlib import Path
 from shared.timestamps import parse_timestamp_or_warn
 
 from escalation import archive
+from escalation.classify import default_resolution_class_for_resolver
 from escalation.models import RESOLUTION_CLASSES, Escalation
 
 logger = logging.getLogger(__name__)
@@ -469,7 +470,10 @@ class EscalationQueue:
                 esc.resolved_by = resolved_by
             if resolution_turns is not None:
                 esc.resolution_turns = resolution_turns
-            esc.resolution_class = resolution_class
+            esc.resolution_class = (
+                resolution_class if resolution_class is not None
+                else default_resolution_class_for_resolver(resolved_by)
+            )
 
             self._atomic_write(escalation_id, esc.to_json())
             self._archive_resolved(escalation_id, esc.resolved_at)
