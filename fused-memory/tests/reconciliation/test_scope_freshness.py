@@ -18,6 +18,12 @@ locked modules):
 - TestPrecheckCatastrophicFailure     (outer, whole-batch fail-open guard)
 - TestPrecheckStatsReconcilable       (candidates/reinvestigated/skipped counters)
 - TestPrecheckConsecutiveSkipCap      (skip_streak + forced re-investigation)
+
+Second amendment round (task 2417 amendment pass #2 — reviewer findings on
+the FIRST amendment round's own fixes):
+
+- TestPrecheckCreatedAtTypeSafety     (max() sort-key non-str created_at)
+- TestPrecheckReinvestigatedExactCount (reinvestigated == len(to_reinvestigate))
 """
 
 from __future__ import annotations
@@ -1091,3 +1097,225 @@ class TestPrecheckConsecutiveSkipCap:
         assert finding in result.skipped
         _, add_kwargs = memory_service.add_memory.await_args
         assert add_kwargs['metadata']['skip_streak'] == 1
+
+
+class TestPrecheckCreatedAtTypeSafety:
+    """Tests for precheck_scope_correction_freshness — reviewer finding
+    robustness (task 2417 amendment pass #2): the latest-prior-snapshot
+    selection assumed every record's created_at was a string. A non-str
+    created_at (e.g. a Mem0 backend returning a datetime or numeric
+    timestamp) must not raise, must still pick the correct latest snapshot,
+    and must log loudly rather than silently and permanently falling back
+    to full re-investigation every cycle."""
+
+    @pytest.mark.asyncio
+    async def test_non_str_created_at_does_not_raise_and_picks_latest(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            build_scope_snapshot_metadata,
+            precheck_scope_correction_freshness,
+        )
+
+        older_metadata = build_scope_snapshot_metadata(
+            task_ref='dark_factory:2405', flag_key='cross_project',
+            subject_project_id='dark_factory', subject_task_id='2405',
+            status='pending', updated_at='2026-07-09T10:00:00Z',
+            description='old', run_id='run-0', snapshot_at='2026-07-09T10:00:00Z',
+        )
+        newer_metadata = build_scope_snapshot_metadata(
+            task_ref='dark_factory:2405', flag_key='cross_project',
+            subject_project_id='dark_factory', subject_task_id='2405',
+            status='pending', updated_at='2026-07-10T10:00:00Z',
+            description='new', run_id='run-1', snapshot_at='2026-07-10T10:00:00Z',
+        )
+
+        from datetime import UTC, datetime
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {
+                'id': 'old-id',
+                'created_at': datetime(2026, 7, 9, 10, 0, tzinfo=UTC),
+                'metadata': older_metadata,
+            },
+            {
+                'id': 'new-id',
+                'created_at': datetime(2026, 7, 10, 10, 0, tzinfo=UTC),
+                'metadata': newer_metadata,
+            },
+        ]
+        taskmaster = AsyncMock()
+        # Matches the NEWER snapshot only — proves max() picked 'new-id'
+        # despite neither created_at being a str.
+        taskmaster.get_task.return_value = {
+            'id': 2405, 'status': 'pending',
+            'updatedAt': '2026-07-10T10:00:00Z', 'description': 'new', 'metadata': {},
+        }
+
+        finding = {
+            'flag_type': 'cross_project',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'}],
+        }
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-15',
+            findings=[finding],
+        )
+
+        # Did not raise (no catastrophic fallback) and correctly compared
+        # against the newer of the two snapshots.
+        assert result.stats['scope_freshness_candidates'] == 1
+        assert finding in result.skipped
+        assert finding not in result.to_reinvestigate
+
+    @pytest.mark.asyncio
+    async def test_non_str_created_at_logs_loudly(self, caplog):
+        import logging
+        from datetime import UTC, datetime
+
+        from fused_memory.reconciliation.scope_freshness import (
+            build_scope_snapshot_metadata,
+            precheck_scope_correction_freshness,
+        )
+
+        prior_metadata = build_scope_snapshot_metadata(
+            task_ref='dark_factory:2405', flag_key='cross_project',
+            subject_project_id='dark_factory', subject_task_id='2405',
+            status='pending', updated_at='2026-07-10T10:00:00Z',
+            description='d', run_id='run-0', snapshot_at='2026-07-10T10:00:00Z',
+        )
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {
+                'id': 'a1',
+                'created_at': datetime(2026, 7, 10, 10, 0, tzinfo=UTC),
+                'metadata': prior_metadata,
+            },
+        ]
+        taskmaster = AsyncMock()
+        taskmaster.get_task.return_value = {
+            'id': 2405, 'status': 'pending',
+            'updatedAt': '2026-07-10T10:00:00Z', 'description': 'd', 'metadata': {},
+        }
+        finding = {
+            'flag_type': 'cross_project',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'}],
+        }
+
+        with caplog.at_level(logging.WARNING):
+            await precheck_scope_correction_freshness(
+                memory_service=memory_service,
+                taskmaster=taskmaster,
+                project_id='autopilot_video',
+                resolve_project_root=lambda pid: f'/roots/{pid}',
+                run_id='run-16',
+                findings=[finding],
+            )
+
+        drift_logs = [
+            r for r in caplog.records
+            if r.message == 'reconciliation.scope_freshness_created_at_type_drift'
+        ]
+        assert drift_logs, (
+            f'Expected a loud warning on created_at type drift, got: '
+            f'{[r.message for r in caplog.records]}'
+        )
+
+
+class TestPrecheckReinvestigatedExactCount:
+    """Tests for precheck_scope_correction_freshness — reviewer finding
+    observability (task 2417 amendment pass #2): scope_freshness_reinvestigated
+    must equal len(to_reinvestigate) EXACTLY, including for findings that
+    never become scope-correction "candidates" at all (plain pass-through,
+    and scope-correction findings with no usable subject/signature) — a
+    prior fix only covered the unresolvable-root and per-finding-error
+    kept-branches."""
+
+    @pytest.mark.asyncio
+    async def test_non_scope_correction_finding_increments_reinvestigated(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            precheck_scope_correction_freshness,
+        )
+
+        memory_service = AsyncMock()
+        taskmaster = AsyncMock()
+        plain_finding = {
+            'flag_type': 'task_memory_mismatch',
+            'category': 'memory_stale',
+            'description': 'unrelated finding',
+        }
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-17',
+            findings=[plain_finding],
+        )
+
+        assert result.to_reinvestigate == [plain_finding]
+        assert result.stats['scope_freshness_reinvestigated'] == len(result.to_reinvestigate)
+        taskmaster.get_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_usable_subject_finding_increments_reinvestigated(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            precheck_scope_correction_freshness,
+        )
+
+        memory_service = AsyncMock()
+        taskmaster = AsyncMock()
+        # Cross-project-flagged but no cited_tasks at all -> no usable subject.
+        no_subject_finding = {
+            'flag_type': 'cross_project',
+            'description': 'malformed scope-correction finding',
+            'cited_tasks': [],
+        }
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-18',
+            findings=[no_subject_finding],
+        )
+
+        assert result.to_reinvestigate == [no_subject_finding]
+        assert result.stats['scope_freshness_reinvestigated'] == len(result.to_reinvestigate)
+        taskmaster.get_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_reinvestigated_equals_to_reinvestigate_length(self):
+        """A batch mixing a plain pass-through finding, a no-subject finding,
+        and an unresolvable-root candidate must still satisfy the exact
+        identity — not merely the older inequality."""
+        from fused_memory.reconciliation.scope_freshness import (
+            precheck_scope_correction_freshness,
+        )
+
+        memory_service = AsyncMock()
+        taskmaster = AsyncMock()
+        plain_finding = {'flag_type': 'task_memory_mismatch', 'category': 'memory_stale'}
+        no_subject_finding = {'flag_type': 'cross_project', 'cited_tasks': []}
+        unresolvable_root_finding = {
+            'flag_type': 'cross_project',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'}],
+        }
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: None,
+            run_id='run-19',
+            findings=[plain_finding, no_subject_finding, unresolvable_root_finding],
+        )
+
+        assert len(result.to_reinvestigate) == 3
+        assert result.stats['scope_freshness_reinvestigated'] == 3
+        assert result.stats['scope_freshness_skipped'] == len(result.skipped) == 0

@@ -363,13 +363,28 @@ class ScopeFreshnessResult(NamedTuple):
             ``scope_freshness_candidates`` (cross-project scope-correction
             findings with a usable subject and a resolvable project root —
             i.e. ones this pre-check actually attempted a live comparison
-            for), ``scope_freshness_reinvestigated`` (every candidate kept
-            for re-investigation PLUS every non-candidate finding that was
-            also kept, e.g. an unresolvable root or a per-finding error),
-            ``scope_freshness_skipped``, and
-            ``scope_freshness_forced_reinvestigation`` (the subset of
+            for), ``scope_freshness_reinvestigated`` (every finding kept in
+            ``to_reinvestigate`` — scope-correction candidates AND
+            plain pass-through findings alike: non-scope-correction, no
+            usable subject/signature, unresolvable root, per-finding error,
+            genuinely changed, and cap-forced), ``scope_freshness_skipped``,
+            and ``scope_freshness_forced_reinvestigation`` (the subset of
             ``scope_freshness_reinvestigated`` that was forced back by the
             consecutive-skip cap rather than genuinely new/changed).
+
+            Two exact identities hold ALWAYS (task 2417 amendment — reviewer
+            finding observability: a prior version of this pre-check left
+            two kept-finding branches uncounted, so ``reinvestigated`` could
+            be less than ``len(to_reinvestigate)``):
+            ``scope_freshness_reinvestigated == len(to_reinvestigate)`` and
+            ``scope_freshness_skipped == len(skipped)``.
+            ``scope_freshness_candidates`` is a subset count — only
+            scope-correction findings with a resolvable root are
+            "candidates" — so it relates to the other two only as an
+            inequality: every skipped finding is necessarily a candidate,
+            but not every candidate that was kept is a non-candidate, so
+            ``scope_freshness_candidates <= scope_freshness_reinvestigated +
+            scope_freshness_skipped``, not equality.
     """
 
     to_reinvestigate: list[dict[str, Any]]
@@ -425,12 +440,19 @@ async def precheck_scope_correction_freshness(
         for finding in safe_findings:
             if not is_cross_project_scope_correction(finding, project_id):
                 to_reinvestigate.append(finding)
+                # task 2417 amendment — reviewer finding observability: every
+                # finding kept in to_reinvestigate increments this counter so
+                # scope_freshness_reinvestigated == len(to_reinvestigate)
+                # always (not just for scope-correction candidates), matching
+                # the ScopeFreshnessResult stats docstring.
+                stats['scope_freshness_reinvestigated'] += 1
                 continue
 
             signature = compute_scope_signature(finding, project_id)
             subject = select_primary_subject(finding, project_id)
             if signature is None or subject is None:
                 to_reinvestigate.append(finding)
+                stats['scope_freshness_reinvestigated'] += 1
                 continue
             task_ref, flag_key = signature
             subject_project_id, subject_task_id = subject
@@ -467,10 +489,29 @@ async def precheck_scope_correction_freshness(
                 )
                 snapshot_at = datetime.now(UTC).isoformat()
 
-                latest_prior = (
-                    max(prior_memories, key=lambda m: m.get('created_at') or '')
-                    if prior_memories else None
-                )
+                if prior_memories:
+                    for _prior in prior_memories:
+                        _created = _prior.get('created_at')
+                        if _created is not None and not isinstance(_created, str):
+                            # Loud, not silent: a non-str created_at still sorts
+                            # (via the str() coercion below) so this can never
+                            # crash the precheck, but a Mem0 backend shape drift
+                            # here would otherwise permanently and silently
+                            # defeat correct latest-snapshot selection every
+                            # cycle (task 2417 amendment — reviewer finding
+                            # robustness: max() sort-key type assumption).
+                            logger.warning(
+                                'reconciliation.scope_freshness_created_at_type_drift',
+                                extra={
+                                    'project_id': project_id,
+                                    'task_ref': task_ref,
+                                    'memory_id': _prior.get('id'),
+                                    'created_at_type': type(_created).__name__,
+                                },
+                            )
+                    latest_prior = max(prior_memories, key=lambda m: str(m.get('created_at') or ''))
+                else:
+                    latest_prior = None
 
                 if latest_prior is not None and snapshot_is_fresh(
                     latest_prior.get('metadata') or {}, live_task,
@@ -577,13 +618,12 @@ async def precheck_scope_correction_freshness(
                         'error': str(exc),
                     },
                 )
-                # Every candidate must land in exactly one of
+                # Every finding must land in exactly one of
                 # to_reinvestigate/skipped AND increment the matching stat,
-                # so scope_freshness_candidates stays reconcilable against
-                # scope_freshness_reinvestigated + scope_freshness_skipped
-                # even on a failure path (task 2417 amendment — reviewer
-                # finding observability_stats_inconsistency: this branch
-                # previously appended to to_reinvestigate without
+                # so scope_freshness_reinvestigated == len(to_reinvestigate)
+                # holds even on a failure path (task 2417 amendment —
+                # reviewer finding observability_stats_inconsistency: this
+                # branch previously appended to to_reinvestigate without
                 # incrementing any counter).
                 stats['scope_freshness_reinvestigated'] += 1
                 to_reinvestigate.append(finding)
