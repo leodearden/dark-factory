@@ -40,6 +40,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
+from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE, SIMPLE_TASK
@@ -60,8 +61,6 @@ from orchestrator.harness import Harness
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow
-
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 
 # ---------------------------------------------------------------------------
 # Fixtures -- mirrors test_agent_capability_wiring.py's git_repo/git_ops/
@@ -343,6 +342,7 @@ class TestCapstoneHotReloadFlipsSimpleTaskModel:
             await workflow._invoke(SIMPLE_TASK, 'p', wt_info.path)
 
         assert mock_cap_retry.await_count == 1
+        assert mock_cap_retry.await_args is not None, 'await_args must be set after one await'
         assert mock_cap_retry.await_args.kwargs.get('model') == 'haiku', (
             'the next simple_task _invoke after a hot reload must resolve '
             'the freshly-reloaded models.simple_task value, not a stale one'
