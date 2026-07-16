@@ -4290,6 +4290,21 @@ async def run_scoped_verification(
                 role=role,
             )
         if module_configs:
+            # λ (task 2589, R1): the broad merge gate. role=='merge' +
+            # merge_verify_breadth=='full' expands module_configs from the
+            # FULL registry (config.module_configs_or_empty) — not just the
+            # task's/train's OWN modules passed in — so every REGISTERED
+            # module is covered, not only the ones this diff happens to
+            # touch (the gap the task-role pytest floor, R3, deliberately
+            # leaves open — see verify_plan._derive_full_suite_runs'
+            # docstring). Placed ahead of BOTH the file-scoped and
+            # unscoped-fan-out sub-branches below, so it broadens either
+            # execution path uniformly. An empty registry (e.g. a
+            # direct-instantiated config in most unit tests) falls back to
+            # the passed module_configs unchanged — degrades safely rather
+            # than silently verifying nothing.
+            if role == 'merge' and config.merge_verify_breadth == 'full':
+                module_configs = list(config.module_configs_or_empty.values()) or module_configs
             # Apply file-level scoping within each subproject when task_files given
             if task_files:
                 # Filter to files that still exist — tasks may delete files as part of their work
