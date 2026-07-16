@@ -3972,6 +3972,7 @@ async def test_validate_done_provenance_accepts_operational_verified(tmp_path):
     )
 
     assert err is None
+    assert resolved is not None
     assert resolved == {
         'kind': 'operational-verified',
         'escalation_id': 'esc-123',
