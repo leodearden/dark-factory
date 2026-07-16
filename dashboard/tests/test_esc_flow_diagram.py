@@ -4,18 +4,20 @@ Follows the source-assertion idiom established in test_tab_escalations.py /
 test_tab_escalation_analytics.py: static text checks against the served .jsx
 (no JS runtime in this project — .jsx needs Babel, so behavioral geometry
 correctness lives in esc_flow_layout.js's node:test suite instead; see
-dashboard/tests/js/esc_flow_layout.test.mjs). This file only checks wiring:
+dashboard/tests/js/esc_flow_layout.test.mjs). This file checks wiring only:
 that esc_flow_diagram.jsx exists, consumes the layout module correctly,
-renders the expected SVG shape, and (in later steps) that index.html loads
-it in the right order and tab_escalation_analytics.jsx mounts it.
+renders the expected SVG shape, that index.html loads everything in the
+right order, and that tab_escalation_analytics.jsx mounts it.
 
-Helpers below (_client, _extract_function_body) are copied — not imported —
-from test_tab_escalation_analytics.py, per that suite's established
-copy-not-import convention for these cross-file test helpers.
+Helpers below (_client, _extract_function_body, _ScriptTagCollector,
+_find_script_position, _assert_script_loads_before) are copied — not
+imported — from test_tab_escalation_analytics.py, per that suite's
+established copy-not-import convention for these cross-file test helpers.
 """
 
 from __future__ import annotations
 
+import html.parser
 import re
 
 import pytest
@@ -38,6 +40,11 @@ def esc_flow_diagram_jsx_response(_client):
 @pytest.fixture(scope='module')
 def esc_flow_diagram_jsx_body(esc_flow_diagram_jsx_response) -> str:
     return esc_flow_diagram_jsx_response.text
+
+
+@pytest.fixture(scope='module')
+def index_html_body(_client) -> str:
+    return _client.get('/static/redux/index.html').text
 
 
 # ---------------------------------------------------------------------------
