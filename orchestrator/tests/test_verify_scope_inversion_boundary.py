@@ -528,6 +528,31 @@ class TestRow3DocsOnlyTrivialBothRoles:
 # Row 4: "new-vs-preexisting" baseline attribution (μ, B1). Consumer-only.
 # ---------------------------------------------------------------------------
 
+ROW4_MAIN_SHA: str = 'r4main0000000000000000000000000000000000'
+ROW4_PREEXISTING_TEST_ID: str = 'moda/tests/test_x.py::test_x'
+ROW4_NEW_TEST_ID: str = 'modb/tests/test_y.py::test_y'
+
+
+def _row4_mixed_baseline_diff(
+    tmp_path: Path,
+) -> tuple[ModuleConfig, ModuleConfig, dict[str, str]]:
+    """Build row 4's mixed-baseline diff: a merge directly touching TWO
+    registered modules (moda, modb) — moda's failure will be seeded into
+    the main baseline as pre-existing (:data:`ROW4_PREEXISTING_TEST_ID`);
+    modb's is new (:data:`ROW4_NEW_TEST_ID`).
+
+    Returns ``(mod_a, mod_b, task_files_content)`` — *task_files_content*
+    is written into the MERGE worktree by :func:`_drive_merge_gate` (see its
+    docstring's footgun paragraph), keyed by relative path.
+    """
+    mod_a, mod_b, _config = _two_module_registry(tmp_path, breadth='full')
+    task_files_content = {
+        'moda/thing.py': 'x = 1\n',
+        'modb/thing.py': 'y = 1\n',
+    }
+    return mod_a, mod_b, task_files_content
+
+
 class TestRow4NewVsPreexistingBaselineAttribution:
     """Row 4 (PRD boundary-test sketch): baseline seeded with
     ``ROW4_PREEXISTING_TEST_ID`` (moda); the branch fails BOTH moda (the
