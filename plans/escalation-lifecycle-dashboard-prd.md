@@ -332,6 +332,14 @@ each leaf self-declares its execution path.
   benign-rate 7d (with stamped share), pending 6h-breach count, esc-per-done
   7d, churn-24h 7d. Signal: strip renders on the Escalations tab from the
   same endpoint. Prereqs: γ.
+- **θ — Integration gate: boundary-test matrix end-to-end** (escalation
+  pkg + dashboard). Live round-trip on a test queue dir: file + resolve
+  escalations (stamped / unstamped / cascade-inherited / rejected-class /
+  age-out) through the real server chokepoint, archive them, run the
+  aggregator over that archive, and assert boundary-test rows 1–11;
+  confirms δ/ε/ζ source-assertion suites green in the same run. Signal:
+  the full boundary-test matrix green in one CI invocation. Prereqs: α, β,
+  γ, δ, ε, ζ.
 - **η₀ — Immediate perf predicate** (`task_kind='deterministic'`,
   `before_done.kind='predicate'`, script above, no milestone). Signal: task
   goes `done` with `done_provenance.kind='deterministic-milestone'` carrying

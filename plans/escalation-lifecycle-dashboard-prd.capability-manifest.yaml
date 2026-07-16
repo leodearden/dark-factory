@@ -1,0 +1,158 @@
+# Machine-readable twin of escalation-lifecycle-dashboard-prd.capability-manifest.md
+# Schema: shared/src/shared/capability_manifest.py (CapabilityManifestDoc);
+# field reference plans/capability-delivered-checks-prd.md §Contract.
+prd: plans/escalation-lifecycle-dashboard-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: null
+    title: "resolution_class stamping at the escalation queue chokepoint"
+    capabilities:
+      - name: "resolve-chokepoint-exists"
+        binding: "capability→producer (wired) — grep:escalation/src/escalation/queue.py:399 def resolve("
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "resolution_class"
+          paths: ["escalation/src/escalation/"]
+          expect: present
+      - name: "cascade-inheritance"
+        binding: "capability→producer (wired) — l2-cascade attribution models.py:85; cascade dispatch task 1620 done"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "inheritance is a test property of α's suite, not mechanically greppable"
+  - label: "β"
+    task_id: null
+    title: "Auto-watcher passes resolution_class on its closes"
+    capabilities:
+      - name: "allowlisted-close-path-exists"
+        binding: "producer:2630 upstream (done 2026-07-15)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "resolution_class"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "γ"
+    task_id: null
+    title: "Escalation-analytics backend aggregator + endpoint"
+    capabilities:
+      - name: "archive-walk-helper"
+        binding: "capability→producer (wired) — grep:escalation/src/escalation/queue.py:91 iter_all_escalation_paths"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "escalation-analytics"
+          paths: ["dashboard/src/dashboard/app.py"]
+          expect: present
+      - name: "aggregator-module-delivered"
+        binding: "capability→producer (wired) — performance.py archive-walk precedent; archive fields 100% coverage measured 2026-07-15"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "flow_daily"
+          paths: ["dashboard/src/dashboard/data/"]
+          expect: present
+      - name: "regime-markers-loader"
+        binding: "capability→producer (built by γ; seed entries named in PRD)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "regime_markers"
+          paths: ["dashboard/src/dashboard/"]
+          expect: present
+  - label: "δ"
+    task_id: null
+    title: "Analytics tab frontend (Origin / Lifespan / Workflow panels)"
+    capabilities:
+      - name: "chart-primitives-exist"
+        binding: "capability→producer (wired) — charts.jsx:101 LineChart, :161 StackedAreaChart, :302 Donut, :333 StatTile, :42 Sparkline"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "escalation-analytics"
+          paths: ["dashboard/src/dashboard/static/redux/"]
+          expect: present
+  - label: "ε"
+    task_id: null
+    title: "Escalations-tab StatTile summary strip"
+    capabilities:
+      - name: "stat-tile-with-spark"
+        binding: "capability→producer (wired) — charts.jsx:333 StatTile spark prop"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "benign"
+          paths: ["dashboard/src/dashboard/static/redux/tab_escalations.jsx"]
+          expect: present
+  - label: "ζ"
+    task_id: null
+    title: "Lifecycle flow diagram (mini-Sankey)"
+    capabilities:
+      - name: "flow-cube-from-gamma"
+        binding: "producer:task-γ upstream (intra-batch dep wired) — flow_daily sparse cube"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "flow_daily"
+          paths: ["dashboard/src/dashboard/static/redux/"]
+          expect: present
+      - name: "no-graph-library"
+        binding: "rejection-mechanism — standing no-graph-lib constraint (task-graph PRD barycenter precedent)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "d3|plotly|recharts|cytoscape"
+          paths: ["dashboard/src/dashboard/static/redux/"]
+          expect: absent
+  - label: "θ"
+    task_id: null
+    title: "Integration gate: boundary-test matrix end-to-end"
+    capabilities:
+      - name: "boundary-matrix-legs-produced-upstream"
+        binding: "DAG-direction — all legs produced upstream (α, β, γ, δ, ε, ζ)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the task IS the check suite; its signal is the CI-green boundary matrix"
+  - label: "η0"
+    task_id: null
+    title: "Immediate perf predicate (deterministic)"
+    capabilities:
+      - name: "perf-script-committed-executable"
+        binding: "capability→producer (wired) — scripts/check_esc_analytics_perf.sh 100755, commit 17d839caba"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the task's own before_done predicate is the check"
+  - label: "η1"
+    task_id: null
+    title: "Perf re-check +30d (deterministic, delayed milestone)"
+    capabilities:
+      - name: "milestone-predicate-machinery"
+        binding: "capability→producer (wired) — shared/src/shared/task_metadata.py:222 Milestone, :58 kind predicate; guard :304-314"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the task's own before_done predicate is the check"
+  - label: "η2"
+    task_id: null
+    title: "Perf re-check +90d (deterministic, delayed milestone)"
+    capabilities:
+      - name: "milestone-predicate-machinery"
+        binding: "capability→producer (wired) — same as η1"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the task's own before_done predicate is the check"
+  - label: "η3"
+    task_id: null
+    title: "Perf re-check +180d (deterministic, delayed milestone)"
+    capabilities:
+      - name: "milestone-predicate-machinery"
+        binding: "capability→producer (wired) — same as η1"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the task's own before_done predicate is the check"
