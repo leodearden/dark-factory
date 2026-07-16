@@ -1298,12 +1298,22 @@ class SqliteTaskBackend:
     async def _fetch_dependencies(
         self, conn: aiosqlite.Connection, tag: str,
     ) -> dict[int, list[int]]:
-        """Return ``{task_id: [depends_on, ...]}`` for *tag*."""
-        cursor = await conn.execute(
+        """Return ``{task_id: [depends_on, ...]}`` for *tag*.
+
+        Closes its cursor deterministically via ``async with conn.execute(
+        ...) as cursor:`` — required when *conn* is the cached AUTOCOMMIT
+        read connection from :meth:`_get_read_connection` (as of task 2651,
+        :meth:`get_task`/:meth:`_get_tasks_internal` call this helper with
+        that connection) so the implicit WAL read transaction this SELECT
+        opens is always released; see that method's docstring's Guardrail
+        note. Safe for the write-connection callers too (``fetchall()``
+        already exhausts the cursor there).
+        """
+        async with conn.execute(
             'SELECT task_id, depends_on FROM dependencies WHERE tag = ?',
             (tag,),
-        )
-        rows = await cursor.fetchall()
+        ) as cursor:
+            rows = await cursor.fetchall()
         out: dict[int, list[int]] = {}
         for row in rows:
             out.setdefault(row['task_id'], []).append(row['depends_on'])
@@ -1353,13 +1363,13 @@ class SqliteTaskBackend:
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
-        conn = await self._get_connection(project_root)
+        conn = await self._get_read_connection(project_root)
 
-        cursor = await conn.execute(
+        async with conn.execute(
             'SELECT * FROM tasks WHERE tag = ? AND id = ?',
             (tag, tid),
-        )
-        row = await cursor.fetchone()
+        ) as cursor:
+            row = await cursor.fetchone()
         if row is None:
             # Definitive zero-row absence: the query executed successfully
             # and found nothing, under this specific (project, tag) scope —
@@ -1456,29 +1466,29 @@ class SqliteTaskBackend:
         so metadata columns are never decoded.
 
         Reads via the cached per-project AUTOCOMMIT connection returned by
-        :meth:`_get_read_connection` (task 2455) rather than the cached
-        WRITE connection (:meth:`_get_connection`) that :meth:`get_task`/
-        :meth:`get_tasks` use — see :meth:`_get_read_connection` and
-        :meth:`get_statuses_fresh` for why a pinnable connection can go
-        stale here.
+        :meth:`_get_read_connection` (task 2455). As of task 2651,
+        :meth:`get_task`/:meth:`get_tasks` read via this same cached
+        connection too, rather than the cached WRITE connection
+        (:meth:`_get_connection`) they used before — see
+        :meth:`_get_read_connection` and :meth:`get_statuses_fresh` for why
+        a pinnable connection could otherwise go stale.
 
-        Snapshot consistency: because this reads a different connection —
-        and therefore potentially a different WAL snapshot — than
-        :meth:`get_task`/:meth:`get_tasks`, a caller that reads both is NOT
-        guaranteed to see them agree to the instant; a status committed
-        between the two calls can show up in one and not the other,
-        regardless of call order. No in-tree caller currently depends on
-        the two being snapshot-consistent: the one caller that compares a
+        Snapshot consistency: because :meth:`get_task`/:meth:`get_tasks`
+        now read the SAME cached connection as this method (task 2651), the
+        two can no longer disagree due to one side being pinned to a stale
+        WAL snapshot while the other reads fresh — the specific defect this
+        convergence closes. They remain independent calls, though (each
+        opens and closes its own cursor against the shared connection), so
+        a status committed between two separate calls can still show up in
+        one and not the other — the ordinary read-skew any two sequential
+        reads have. No in-tree caller currently depends on
+        stronger-than-that consistency: the one caller that compares a
         ``get_tasks`` tree against a status census
         (``cross_verify_task_counts`` in ``reconciliation/task_filter.py``)
         is fed by :meth:`get_statuses_fresh`, not this method — see
         ``reconciliation/harness.py``'s ``_fetch_task_count_census`` — and
         that comparison already treats single-cycle divergence as an
-        advisory read-skew artifact rather than an error. A future caller
-        that needs single-instant consistency between the tree and the
-        status map should read both from :meth:`get_task`/:meth:`get_tasks`
-        (which still share :meth:`_get_connection`) rather than assume it
-        from this method.
+        advisory read-skew artifact rather than an error.
 
         Args:
             project_root: Absolute path to the project root.
@@ -1545,18 +1555,20 @@ class SqliteTaskBackend:
         cached WRITE connection is opened via ``connect_daemon(str(db_path))``
         *without* ``isolation_level=None`` — Python sqlite3's legacy
         deferred transaction mode. If a read transaction is ever left open
-        on that connection, every subsequent read on it — including the
-        ``get_task``/``get_tasks`` tree read, which still uses it (task 2455
-        did not touch it) — is pinned to that transaction's WAL snapshot and
-        silently returns stale data, even after other connections/processes
-        have committed newer writes. Before task 2455,
-        ``get_statuses``/``get_statuses_raw`` also shared that cached write
-        connection, so a pin made the tree read and the census go stale
-        *together* — they still agreed with each other, so
-        ``cross_verify_task_counts`` reported a false ``consistent: true``
-        instead of surfacing the drift. That history is why this method's
-        never-shared connection exists independently of whichever
-        connection ``get_statuses`` happens to use.
+        on that connection, every subsequent read still issued against it —
+        today, the write-path pre-read/verify reads inside ``_txn`` — is
+        pinned to that transaction's WAL snapshot and silently returns
+        stale data, even after other connections/processes have committed
+        newer writes. Before task 2455, ``get_statuses``/``get_statuses_raw``
+        also shared that cached write connection, so a pin made the tree
+        read and the census go stale *together* — they still agreed with
+        each other, so ``cross_verify_task_counts`` reported a false
+        ``consistent: true`` instead of surfacing the drift. As of task
+        2651, ``get_task``/``get_tasks`` no longer share the write
+        connection either — see :meth:`_get_read_connection` — but that
+        history is why this method's never-shared, dedicated connection
+        still exists independently of whichever connection ``get_statuses``
+        happens to use.
 
         Fails open to ``{}`` on any error (including a not-yet-created DB
         file) — this is a best-effort freshness upgrade for a cross-check,

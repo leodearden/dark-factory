@@ -3957,9 +3957,17 @@ async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root, mo
     recorded_sql: list[str] = []
     _orig_execute = conn.execute
 
-    async def _spy_execute(sql: str, *args, **kwargs):
+    # NOT `async def`: aiosqlite's Connection.execute is a plain method that
+    # returns a Result wrapper supporting both `await conn.execute(...)` and
+    # `async with conn.execute(...) as cursor:` (see aiosqlite.core's
+    # `@contextmanager` helper). An `async def` spy would instead return a
+    # bare coroutine — awaitable, but not usable as an async context
+    # manager — breaking any caller that does `async with conn.execute(...)`
+    # (e.g. _fetch_dependencies, task 2651). Passing the Result straight
+    # through preserves both calling conventions.
+    def _spy_execute(sql: str, *args, **kwargs):
         recorded_sql.append(sql)
-        return await _orig_execute(sql, *args, **kwargs)
+        return _orig_execute(sql, *args, **kwargs)
 
     monkeypatch.setattr(conn, 'execute', _spy_execute)
 
