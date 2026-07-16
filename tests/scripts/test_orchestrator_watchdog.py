@@ -2599,6 +2599,98 @@ def test_report_unknown_verdict_does_not_force_exit_1(monkeypatch: pytest.Monkey
     assert wdog.report() == 0
 
 
+def test_report_includes_deploy_age_column(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """report() gains a DEPLOY-AGE column: the fleet-wide age since the
+    shared fleet-deploy clock (task 2396 β), rendered in hours to one
+    decimal and repeated on every row — like the existing NEWEST WATCHED
+    COMMIT column. Pre-existing UNIT/START/NEWEST WATCHED COMMIT/VERDICT
+    columns must still be present. Fails today: report() has no DEPLOY-AGE
+    column yet.
+    """
+    wdog = _load_watchdog()
+
+    commit_epoch = 1_800_000_000
+    unit = "orchestrator-unit0.service"
+    start_epoch = commit_epoch + 100  # fresh
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{unit} loaded active running desc\n", stderr=""
+            )
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epoch}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    now = 2_000_000_000.0
+    clock_file = tmp_path / "clock.json"
+    clock_file.write_text(
+        f'{{"ts": {now - 3 * 3600}, "iso": "2026-07-15T21:00:00+00:00"}}'
+    )
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    wdog.report()
+
+    captured = capsys.readouterr()
+    header_line = next(line for line in captured.out.splitlines() if line.startswith("UNIT"))
+    for col in ("UNIT", "START", "NEWEST WATCHED COMMIT", "VERDICT", "DEPLOY-AGE"):
+        assert col in header_line, f"expected column {col!r} in header: {header_line!r}"
+
+    unit_line = next(line for line in captured.out.splitlines() if line.startswith(unit))
+    assert "3.0h" in unit_line, f"expected DEPLOY-AGE ~3.0h in row: {unit_line!r}"
+
+
+def test_report_deploy_age_unknown_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """DEPLOY-AGE renders 'unknown' when the shared fleet-deploy clock file
+    is absent (no fleet deploy has ever verified fresh, or a fresh checkout
+    with no data/ yet) — mirrors _read_last_fleet_deploy_epoch's fail-open
+    contract. Fails today: report() has no DEPLOY-AGE column yet.
+    """
+    wdog = _load_watchdog()
+
+    commit_epoch = 1_800_000_000
+    unit = "orchestrator-unit0.service"
+    start_epoch = commit_epoch + 100  # fresh
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{unit} loaded active running desc\n", stderr=""
+            )
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epoch}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(tmp_path / "absent.json"))
+    monkeypatch.setattr(wdog.time, "time", lambda: 2_000_000_000.0)
+
+    wdog.report()
+
+    captured = capsys.readouterr()
+    unit_line = next(line for line in captured.out.splitlines() if line.startswith(unit))
+    assert "unknown" in unit_line, f"expected DEPLOY-AGE 'unknown' in row: {unit_line!r}"
+
+
 # ---------------------------------------------------------------------------
 # _cli tests
 # ---------------------------------------------------------------------------
