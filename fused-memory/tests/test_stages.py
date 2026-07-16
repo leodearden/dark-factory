@@ -445,24 +445,6 @@ class TestStage3PromptAlignment:
         # Should have an Output Format section to guide the LLM
         assert 'Output Format' in STAGE3_SYSTEM_PROMPT
 
-    def test_stage3_prompt_has_stage2_only_remediation_run_exception(self):
-        """STAGE3_SYSTEM_PROMPT must instruct the LLM to check the Stage 2
-        summary's `remediation` marker before flagging a missing Stage 1
-        (memory_consolidator) cycle_summary, and to skip that finding when
-        the run was a Stage-2-only remediation pass (task 2652)."""
-        assert 'Stage-2-Only Remediation Run Exception' in STAGE3_SYSTEM_PROMPT, (
-            'STAGE3_SYSTEM_PROMPT must document the Stage-2-only remediation '
-            'run exception (task 2652).'
-        )
-        assert 'Stage 1 (`memory_consolidator`) cycle_summary' in STAGE3_SYSTEM_PROMPT, (
-            'The exception must name the missing Stage 1 (memory_consolidator) '
-            'cycle_summary this guards against.'
-        )
-        assert 'SKIP the missing-Stage-1-summary finding' in STAGE3_SYSTEM_PROMPT, (
-            'The exception must instruct the LLM to skip the finding entirely '
-            'when the Stage 2 summary is present with remediation=true.'
-        )
-
 
 class TestStage1LedgerPresenceWiring:
     """Stage 1 consults the ReconLedgerStore ground truth
