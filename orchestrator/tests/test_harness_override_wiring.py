@@ -26,7 +26,7 @@ def config(tmp_path: Path) -> OrchestratorConfig:
 class TestHarnessOverrideStoreIntegration:
     @pytest.mark.asyncio
     async def test_scheduler_dispatches_pinned_override_through_canonical_db_path(
-        self, config: OrchestratorConfig
+        self, config: OrchestratorConfig, forbid_live_mcp
     ):
         """A pin pre-written to config.overrides_db_path drives Harness
         scheduler's dispatch order — proves the OverrideStore reaches the
@@ -47,6 +47,13 @@ class TestHarnessOverrideStoreIntegration:
 
         # Harness constructs its own OverrideStore at the same path.
         harness = Harness(config)
+        # Deterministic RED driver (task 2644): this test instance-mocks
+        # get_tasks and seeds empty-dependency tasks below, so it is
+        # data-conditionally hermetic that tick and forbid_live_mcp's network
+        # spy is vacuously green on base. This assertion is the actual
+        # failing-first signal — it fails on base (_mcp_session is None) and
+        # passes once step-8 injects a HermeticMcpSession.
+        assert harness.scheduler._mcp_session is not None
         # This test drives acquire_next() directly (bypassing Harness.run()'s
         # startup sweeps), so it must call finish_startup() itself (task 2235).
         harness.scheduler.finish_startup()
