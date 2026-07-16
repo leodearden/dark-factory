@@ -493,10 +493,15 @@ park_stop_parked_window_hours: 1.0
 #   skipped and the loop re-polls after this many seconds (default 60).
 #
 # Invocation knobs (per rotation):
-# watcher_model: LLM backend model (default 'opus').
-# watcher_rotation_budget_usd: per-rotation budget ($); must be sized for a
-#   full rotation — invoke_agent default $5 would exhaust within minutes of a
-#   4h rotation and falsely trip the crashloop guard (default 40.0).
+# watcher_model: LLM backend model (default 'sonnet', task 2629). The
+#   top-level rotation is cheap mechanical triage/orchestration; hard or
+#   investigation-class items are delegated to an opus subagent via the Task
+#   tool instead of running the whole rotation on opus (see SKILL.md).
+# watcher_rotation_budget_usd: per-rotation budget ($); retained at its
+#   opus-era sizing — sonnet/high is ~5x cheaper, so the ceiling now doubles
+#   as headroom for opus subagents spawned within a rotation. Must be sized
+#   for a full rotation — invoke_agent default $5 would exhaust within
+#   minutes of a 4h rotation and falsely trip the crashloop guard (default 40.0).
 # watcher_max_turns: max agent turns per rotation (default 400).
 # watcher_effort: effort level for the agent (default 'high').
 # watcher_backend: backend provider (default 'claude').
@@ -513,7 +518,7 @@ watcher_empty_queue_poll_secs: 60.0
 # the supervisor trips pause_scheduler('watcher_misconfigured') and stops.
 watcher_misconfigured_min_rotation_secs: 120
 watcher_max_misconfigured_clean_exits: 5
-watcher_model: opus
+watcher_model: sonnet
 watcher_rotation_budget_usd: 40.0
 watcher_max_turns: 400
 watcher_effort: high

@@ -2610,10 +2610,15 @@ class OrchestratorConfig(BaseSettings):
     watcher_empty_queue_poll_secs: float = Field(default=60.0)
 
     # Invocation knobs for each watcher rotation (per UnblockAutoConfig precedent).
-    # watcher_rotation_budget_usd is sized for a full 4h rotation at opus rates;
-    # using invoke_agent's default $5 would exhaust within minutes and falsely
-    # trip the crashloop guard.
-    watcher_model: str = Field(default='opus')
+    # watcher_model defaults to sonnet (task 2629): the top-level rotation is
+    # cheap mechanical triage/orchestration; hard or investigation-class items
+    # are delegated to an opus subagent via the Task tool instead of running
+    # the whole rotation on opus (see SKILL.md). watcher_rotation_budget_usd
+    # is retained at its opus-era sizing — sonnet/high is ~5x cheaper, so the
+    # $40 ceiling now doubles as headroom for opus subagents spawned within a
+    # rotation; using invoke_agent's default $5 would exhaust within minutes
+    # and falsely trip the crashloop guard.
+    watcher_model: str = Field(default='sonnet')
     watcher_rotation_budget_usd: float = Field(default=40.0)
     watcher_max_turns: int = Field(default=400)
     watcher_effort: str = Field(default='high')
