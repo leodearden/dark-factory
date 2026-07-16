@@ -3001,6 +3001,89 @@ async def test_reopen_freshness_valid_override_accepted_and_recorded(
         await backend.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'agent_id, override',
+    [
+        pytest.param(
+            'recon-stage-2',
+            {'escalation_id': 'esc-1', 'reason': 'well-formed but recon-stage'},
+            id='recon_stage_caller',
+        ),
+        pytest.param(
+            'claude-interactive',
+            {'escalation_id': 'esc-2'},
+            id='missing_reason',
+        ),
+        pytest.param(
+            'claude-interactive',
+            {'reason': 'missing escalation id'},
+            id='missing_escalation_id',
+        ),
+    ],
+)
+async def test_reopen_freshness_invalid_override_rejected(
+    agent_id, override, tmp_path, event_buffer,
+):
+    """An invalid ``stale_evidence_override`` -- a recon-stage caller, or a
+    malformed shape missing ``escalation_id``/``reason`` -- is rejected
+    with a typed ``done_evidence_stale_override_invalid`` error rather
+    than silently falling back to the plain ``done_evidence_stale``
+    rejection or (worse) being accepted. The write must not persist.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    _init_git_repo(tmp_path)
+    stale_sha = _commit_on_main(tmp_path, 'stale_evidence.txt', '2020-01-01T00:00:00+00:00')
+
+    cfg = FusedMemoryConfig()
+    cfg.reconciliation.reject_stale_done_evidence = 'enforce'
+
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg)
+
+        stale_provenance = {'kind': 'found_on_main', 'commit': stale_sha, 'note': 'sibling'}
+
+        first_done = await interceptor.set_task_status(
+            '1', 'done', project_root, done_provenance=stale_provenance,
+        )
+        assert 'error' not in first_done, first_done
+
+        reopen_result = await interceptor.set_task_status(
+            '1', 'pending', project_root, reopen_reason='reverting: regression found',
+        )
+        assert 'error' not in reopen_result, reopen_result
+
+        result = await interceptor.set_task_status(
+            '1',
+            'done',
+            project_root,
+            done_provenance={**stale_provenance, 'stale_evidence_override': override},
+            agent_id=agent_id,
+        )
+
+        assert result['success'] is False
+        assert result['error'] == 'done_evidence_stale_override_invalid'
+        assert result['task_id'] == '1'
+        assert result['agent_id'] == agent_id
+
+        # Independent fresh backend confirms the write did not persist.
+        fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await fresh.start()
+        try:
+            task = await fresh.get_task('1', project_root=project_root)
+        finally:
+            await fresh.close()
+        assert task['status'] == 'pending', task
+    finally:
+        await backend.close()
+
+
 # ── Tests for done_provenance.kind discriminator (2026-04-27 hardening) ────
 
 
