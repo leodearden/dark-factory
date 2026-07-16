@@ -253,6 +253,7 @@ def _derive_module_runs(
     mc: ModuleConfig,
     existing_files: list[str],
     worktree_reader: Callable[[str], str | None],
+    role: Literal['merge', 'task'] = 'task',
 ) -> list[PlannedRun]:
     """Derive one ModuleConfig's PlannedRuns — one per (module, tool) slot.
 
@@ -269,6 +270,16 @@ def _derive_module_runs(
     Each per-tool run's ``reason`` is prefixed with the tool name
     (``'lint:'``/``'pyright:'``/``'pytest:'``) so a caller can recover tool
     identity even for a SKIPPED slot, whose ``cmd`` is ``None``.
+
+    *role* (λ, task 2589, R3) is the task-role pytest floor's policy fork:
+    when the pytest branch would otherwise fall through to the "no
+    collectable test files touched" SKIPPED (a source-only or
+    structural-only diff — no conftest, no test-data, no collectable test),
+    ``role == 'task'`` runs the owning module's full ``test_command`` instead
+    — a source-only diff at task verify pre-λ produced ZERO pytest signal.
+    ``role == 'merge'`` keeps the legacy SKIPPED shape (R4): the broad merge
+    gate is a separate, knob-gated widening (see
+    ``_derive_full_suite_runs``/``merge_verify_breadth``), not this floor.
     """
     prefix = mc.prefix + '/'
     scoped = [f for f in existing_files if f.startswith(prefix) and f.endswith('.py')]
