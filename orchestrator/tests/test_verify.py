@@ -1964,6 +1964,147 @@ class TestVerifyResultFailingTestIds:
         assert restored.failing_test_ids is not None
 
 
+# ---------------------------------------------------------------------------
+# Task μ (verify-scope-inversion-prd.md) step-07: run_verification injects
+# --junitxml into the test leg and parses the report into
+# VerifyResult.failing_test_ids — but ONLY for role=='merge',
+# merge_verify_breadth=='full', and a structured (non-OPAQUE, non-raw-chain)
+# pytest test_command. Every other combination leaves failing_test_ids at
+# its None default (B3 degrade): no injection happens, so no junit report
+# is ever written, so parsing (when attempted) finds nothing.
+#
+# RED today: run_verification neither injects nor parses.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunVerificationJunitxmlInjection:
+    """Integration tests for the merge+full junitxml injection/parse wiring."""
+
+    _FAILING_JUNIT_XML = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuites>\n'
+        '<testsuite name="pytest" errors="0" failures="1" tests="1">\n'
+        '<testcase classname="tests.test_sample" name="test_fail" time="0.001">\n'
+        '<failure message="assert False">AssertionError</failure>\n'
+        '</testcase>\n'
+        '</testsuite>\n'
+        '</testsuites>\n'
+    )
+
+    def _make_config(self, tmp_path: Path, *, breadth: str = 'full') -> OrchestratorConfig:
+        return OrchestratorConfig(project_root=tmp_path, merge_verify_breadth=breadth)
+
+    def _module_config(self, test_command: str = 'pytest tests/') -> ModuleConfig:
+        return ModuleConfig(
+            prefix='pkg',
+            test_command=test_command,
+            lint_command=None,
+            type_check_command=None,
+        )
+
+    def _fake_run_cmd_writing_junit(self):
+        """Fake _run_cmd: when the (possibly-injected) cmd carries --junitxml,
+        write a one-failure report at the injected path and fail the run —
+        mimicking real pytest's --junitxml-writing behaviour."""
+        captured: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured.append(cmd)
+            if '--junitxml' in cmd:
+                parts = cmd.split()
+                junit_path = Path(parts[parts.index('--junitxml') + 1])
+                junit_path.parent.mkdir(parents=True, exist_ok=True)
+                junit_path.write_text(self._FAILING_JUNIT_XML)
+                return 1, 'FAILED tests/test_sample.py::test_fail', False
+            return 0, 'ok', False
+
+        return fake_run_cmd, captured
+
+    async def test_merge_full_structured_pytest_injects_and_parses_failing_ids(self, tmp_path: Path):
+        config = self._make_config(tmp_path, breadth='full')
+        module_config = self._module_config()
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+            )
+
+        test_cmds = [c for c in captured if 'pytest' in c]
+        assert test_cmds, f'expected a pytest invocation; got {captured}'
+        assert '--junitxml' in test_cmds[0], (
+            f'expected --junitxml injected into merge+full structured pytest cmd; got {test_cmds[0]!r}'
+        )
+        assert result.failing_test_ids == ['tests.test_sample::test_fail'], (
+            f'expected failing_test_ids parsed from the injected junit report; got {result.failing_test_ids!r}'
+        )
+
+    async def test_task_role_does_not_inject_or_collect(self, tmp_path: Path):
+        """role='task' (default) never injects junitxml, even under breadth='full'."""
+        config = self._make_config(tmp_path, breadth='full')
+        module_config = self._module_config()
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='task',
+            )
+
+        assert all('--junitxml' not in c for c in captured), (
+            f'role=task must never inject junitxml; got {captured}'
+        )
+        assert result.failing_test_ids is None
+
+    async def test_scoped_breadth_does_not_inject_or_collect(self, tmp_path: Path):
+        """merge_verify_breadth='scoped' (the default) — merge role but no injection."""
+        config = self._make_config(tmp_path, breadth='scoped')
+        module_config = self._module_config()
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+            )
+
+        assert all('--junitxml' not in c for c in captured), (
+            f'breadth=scoped must never inject junitxml; got {captured}'
+        )
+        assert result.failing_test_ids is None
+
+    async def test_opaque_test_command_degrades_to_none(self, tmp_path: Path):
+        """An OPAQUE (unparseable) test_command under merge+full: no injection, no crash."""
+        config = self._make_config(tmp_path, breadth='full')
+        module_config = self._module_config(test_command='pytest tests/ "unterminated')
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+            )
+
+        assert all('--junitxml' not in c for c in captured), (
+            f'OPAQUE test_command must never be regex-injected; got {captured}'
+        )
+        assert result.failing_test_ids is None
+
+    async def test_non_pytest_structured_command_degrades_to_none(self, tmp_path: Path):
+        """A structured but non-pytest (cargo test) command under merge+full: no junit collected."""
+        config = self._make_config(tmp_path, breadth='full')
+        module_config = self._module_config(test_command='cargo test --workspace')
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+            )
+
+        assert all('--junitxml' not in c for c in captured), (
+            f'non-pytest command must never receive --junitxml; got {captured}'
+        )
+        assert result.failing_test_ids is None
+
+
 class TestExtractCauseHint:
     """Tests for the ``_extract_cause_hint(output: str) -> str`` helper.
 
