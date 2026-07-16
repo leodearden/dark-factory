@@ -822,3 +822,172 @@ class TestMainBaselineFailingIds:
             f'a None probe result must not be cached — expected a re-probe; '
             f'got {len(probe_calls)} call(s)'
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 10 — step-15 (task μ, verify-scope-inversion-prd.md): the baseline-diff
+#           fork of verify_failure_is_preexisting_on_main.  When
+#           failing_result.failing_test_ids is not None, the helper decides
+#           via main_baseline_failing_ids + is_wholly_preexisting instead of
+#           probing main and comparing (category, cause_hint).  A None
+#           baseline (degrade, B3) falls through to the legacy probe path;
+#           failing_test_ids=None always takes the legacy path unchanged.
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyFailureIsPreexistingBaselineDiffFork:
+    """Step-15: baseline-diff decision core wired into the shared classifier.
+
+    Each test stubs out main_baseline_failing_ids AND run_scoped_verification
+    (the legacy probe's engine) as separate AsyncMocks so assertions can pin
+    exactly which path ran, rather than relying on the returned (bool, str)
+    tuple alone — a swallowed-exception fallback could otherwise coincidentally
+    reproduce the expected tuple for the wrong reason.
+    """
+
+    def _run(
+        self, tmp_path: Path, failing_result: VerifyResult, baseline: object,
+    ) -> tuple[tuple[bool, str], AsyncMock, AsyncMock]:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        baseline_mock = AsyncMock(return_value=baseline)
+        # A legacy-probe stub that would produce a DEFINITE, DIFFERENT verdict
+        # if wrongly invoked — so an accidental fallthrough to the legacy path
+        # can't coincidentally reproduce the expected baseline-diff verdict.
+        legacy_probe_mock = AsyncMock(return_value=DIFFERENT_RESULT)
+
+        with (
+            patch.object(verify_module, 'main_baseline_failing_ids', new=baseline_mock),
+            patch.object(verify_module, 'run_scoped_verification', new=legacy_probe_mock),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], failing_result, mock_git_ops,
+                )
+            )
+        return result, baseline_mock, legacy_probe_mock
+
+    def test_branch_wholly_subset_of_baseline_returns_true_and_skips_legacy_probe(
+        self, tmp_path: Path,
+    ) -> None:
+        """row-5 shape: branch={X} subset of baseline={X,Z} -> (True, main_sha);
+        the legacy category+cause_hint probe must NOT run."""
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['X'],
+        )
+        result, baseline_mock, legacy_probe_mock = self._run(
+            tmp_path, failing_result, frozenset({'X', 'Z'}),
+        )
+        assert result == (True, MAIN_SHA), (
+            f'branch wholly covered by baseline must route MAIN_HEALTH_RED -> '
+            f'(True, main_sha); got {result!r}'
+        )
+        baseline_mock.assert_awaited_once()
+        legacy_probe_mock.assert_not_awaited()
+
+    def test_branch_with_new_id_returns_false_and_skips_legacy_probe(
+        self, tmp_path: Path,
+    ) -> None:
+        """row-4 shape: branch={X,Y}, baseline={X} -> new id Y present -> (False, '');
+        the legacy category+cause_hint probe must NOT run."""
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['X', 'Y'],
+        )
+        result, baseline_mock, legacy_probe_mock = self._run(
+            tmp_path, failing_result, frozenset({'X'}),
+        )
+        assert result == (False, ''), (
+            f"branch with a new id not on main must blame the branch -> (False, ''); got {result!r}"
+        )
+        baseline_mock.assert_awaited_once()
+        legacy_probe_mock.assert_not_awaited()
+
+    def test_baseline_none_falls_back_to_legacy_probe_path(self, tmp_path: Path) -> None:
+        """A None baseline (degrade signal, B3) must fall through to today's
+        category+cause_hint probe — NOT short-circuit to (False, '')."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='',
+            type_output='error TS2769: foo.tsx:12',
+            summary='TS2769 compile_error', cause_hint='error TS2769: foo.tsx:12',
+            category='compile_error', failing_test_ids=['X'],
+        )
+
+        baseline_mock = AsyncMock(return_value=None)
+        legacy_probe_mock = AsyncMock(return_value=SAME_RESULT)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            patch.object(verify_module, 'main_baseline_failing_ids', new=baseline_mock),
+            patch.object(verify_module, 'run_scoped_verification', new=legacy_probe_mock),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], failing_result, mock_git_ops,
+                )
+            )
+
+        assert result == (True, MAIN_SHA), (
+            f'a None baseline must degrade to the legacy probe path (same '
+            f'signature reproduces on main -> True); got {result!r}'
+        )
+        baseline_mock.assert_awaited_once()
+        legacy_probe_mock.assert_awaited_once()
+
+    def test_failing_test_ids_none_takes_legacy_path_unchanged(self, tmp_path: Path) -> None:
+        """failing_test_ids=None (e.g. task-verify at workflow.py:5848) must take
+        the EXISTING category+cause_hint path byte-identically; the new
+        baseline-diff helper must not even be called."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        assert FAILING_RESULT.failing_test_ids is None  # sanity: legacy fixture shape
+
+        baseline_mock = AsyncMock(return_value=frozenset())
+        legacy_probe_mock = AsyncMock(return_value=SAME_RESULT)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            patch.object(verify_module, 'main_baseline_failing_ids', new=baseline_mock),
+            patch.object(verify_module, 'run_scoped_verification', new=legacy_probe_mock),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], FAILING_RESULT, mock_git_ops,
+                )
+            )
+
+        assert result == (True, MAIN_SHA), (
+            f'failing_test_ids=None must take the legacy probe path unchanged; got {result!r}'
+        )
+        baseline_mock.assert_not_awaited()
+        legacy_probe_mock.assert_awaited_once()
