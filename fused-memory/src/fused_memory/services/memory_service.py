@@ -3014,6 +3014,11 @@ class MemoryService:
         A ``task_id`` filter is normalized to str here too — see
         ``count_memories_by_metadata`` above and ``_normalize_task_id_metadata``'s
         docstring (task 2620 amendment).
+
+        A Qdrant read-timeout is PROPAGATED (raises ``TimeoutError``), not
+        returned as ``[]`` — aligning with ``count_memories_by_metadata`` — and
+        is surfaced at the MCP boundary as ``{'error', 'error_type':
+        'TimeoutError'}`` via the ``@mcp_tool_errors`` decorator.
         """
         scope = Scope(project_id=project_id)
         filters = dict(filters)
