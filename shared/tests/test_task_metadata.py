@@ -467,7 +467,7 @@ class TestMilestone:
 class TestTaskMetadataFields:
     def test_empty_defaults(self):
         tm = TaskMetadata()
-        assert tm.schema_version == 1
+        assert tm.schema_version == 2
         assert tm.task_kind == 'normal'
         assert tm.always_escalates is False
         assert tm.before_done is None
@@ -663,12 +663,16 @@ class TestMigrations:
         upgraded = apply_migrations(blob)
         assert upgraded['memory_hints'] == {'entities': ['E'], 'queries': ['Q']}
 
-    def test_missing_schema_version_treated_as_v0_and_stamped_to_1(self):
+    def test_missing_schema_version_treated_as_v0_and_stamped_to_2(self):
+        # Chains v0->v1->v2 (no legacy retry-ledger counters present, so the
+        # v1->v2 step is a no-op beyond the version stamp).
         upgraded = apply_migrations({})
-        assert upgraded['schema_version'] == 1
+        assert upgraded['schema_version'] == 2
 
-    def test_already_v1_blob_returned_untouched(self):
-        blob = {'schema_version': 1, 'memory_hints': [{'entity': 'E', 'query': 'Q'}]}
+    def test_already_v2_blob_returned_untouched(self):
+        # schema_version=2 is now terminal (v1->v2 registered), so a blob
+        # already at v2 has no further migration to chain through.
+        blob = {'schema_version': 2, 'memory_hints': [{'entity': 'E', 'query': 'Q'}]}
         upgraded = apply_migrations(blob)
         assert upgraded == blob
 
