@@ -3594,6 +3594,21 @@ class TestIsProposedResolutionFraming:
             f"architect's-call + candidate-fixes shape, got False.\ntext={text!r}"
         )
 
+    def test_positive_architects_call_unicode_apostrophe(self):
+        """amendment (reviewer_comprehensive): the Unicode right single quote
+        (U+2019) possessive form "architect’s call" must fire, not just the
+        ASCII straight-apostrophe spelling — LLM-generated prose commonly emits
+        the curly quote."""
+        from fused_memory.reconciliation.task_filter import (
+            is_proposed_resolution_framing,
+        )
+
+        text = 'architect’s call — pick one of the options below'
+        assert is_proposed_resolution_framing(text) is True, (
+            f'Expected is_proposed_resolution_framing to return True for a '
+            f"Unicode-apostrophe 'architect’s call' shape, got False.\ntext={text!r}"
+        )
+
     # ------------------------------------------------------------------ #
     # negative fixtures (precision guards — must return False)
     # ------------------------------------------------------------------ #
@@ -3651,3 +3666,24 @@ class TestIsProposedResolutionFraming:
             f'Expected is_proposed_resolution_framing to return False when '
             f"'resolved'/'option' appear apart, got True.\ntext={text!r}"
         )
+
+    def test_negative_bare_resolution_options_no_structural_cue(self):
+        """amendment (reviewer_comprehensive precision finding): a bare
+        'resolution options' substring with no nearby 'architect call' / 'pick
+        one' structural cue must NOT fire — proves the anchor requires the
+        co-occurrence, not just the standalone substring, since add_episode
+        applies this detector to all ingested content, not only task
+        descriptions."""
+        from fused_memory.reconciliation.task_filter import (
+            is_proposed_resolution_framing,
+        )
+
+        for text in (
+            'We evaluated the display resolution options and picked 1920x1080.',
+            'The merge-conflict resolution options were reviewed in standup.',
+        ):
+            assert is_proposed_resolution_framing(text) is False, (
+                f'Expected is_proposed_resolution_framing to return False for a bare '
+                f"'resolution options' substring with no structural cue, got True."
+                f'\ntext={text!r}'
+            )

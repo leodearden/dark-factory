@@ -439,9 +439,29 @@ def frames_live_task_status_as_current_fact(text: str) -> bool:
 # fact. This mirrors task 2276's documented decision to drop generic markers
 # ('closed'/'resolved') that "describe non-task things just as often." The
 # real incident text matches on "resolution options" AND "architect call".
+#
+# NOTE (amendment, reviewer_comprehensive precision finding, task 2447): a
+# bare "resolution options" was the weakest anchor here — add_episode applies
+# this detector to ALL ingested content, not just task descriptions, so the
+# unqualified substring would also auto-tag unrelated current-state prose
+# like "We evaluated the display resolution options" or "the merge-conflict
+# resolution options were reviewed" as planning. Every real task-description
+# incident shape pairs "resolution options" with an "architect call" / "pick
+# one" structural cue in the same text (see the incident text and fixtures
+# below), so the bare substring is replaced with a whole-text lookahead
+# conjunction requiring that co-occurrence (same technique POINT_IN_TIME_CHECK_RE
+# above already uses) instead of firing on the substring alone. "architect
+# call" and "pick one" remain load-bearing anchors and continue to fire on
+# their own. As with every detector in this module, a residual false
+# positive is bounded and recoverable via include_planned=True.
+#
+# The "architect call" anchor's apostrophe is a character class (['’])
+# rather than a bare ASCII "'" so it matches both the straight apostrophe and
+# the Unicode right single quote (U+2019) LLM-generated prose commonly emits
+# for possessives ("architect's call" / "architect’s call").
 PROPOSED_RESOLUTION_ANCHOR_RE: re.Pattern[str] = re.compile(
-    r"resolution\s+options?|"
-    r"architect(?:'s)?\s+call|"
+    r"(?=.*\bresolution\s+options?\b)(?=.*(?:\barchitect(?:['’]s)?\s+call\b|\bpick\s+one\b))|"
+    r"architect(?:['’]s)?\s+call|"
     r'proposed\s+(?:fix|resolution|approach|change|option|design)|'
     r'candidate\s+(?:fix|resolution|approach)(?:es)?|'
     r'not[-\s]yet[-\s]implemented',
