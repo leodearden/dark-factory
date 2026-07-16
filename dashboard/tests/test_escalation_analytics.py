@@ -460,3 +460,116 @@ class TestPredictablyBenign:
         assert low_rate['benign'] == 20
         assert low_rate['actionable'] == 5
         assert low_rate['predictably_benign'] is False
+
+
+# ---------------------------------------------------------------------------
+# step-7: Lifespan block
+# ---------------------------------------------------------------------------
+
+
+class TestAggregateProjectLifespan:
+    """_aggregate_project(...)['lifespan'] over the golden mini-archive."""
+
+    def test_percentiles_samples_and_promotion(self, tmp_path):
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+
+        entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        lifespan = entry['lifespan']
+
+        # percentiles_by_level: level 0 -> [101-1, 102-1] both 1 day (86400s);
+        # level 1 -> [103-1] alone at 2h (7200s); level 2 -> [104-1 @ 3h=10800s,
+        # 105-1 @ 1h=3600s].
+        by_level = lifespan['percentiles_by_level']
+        assert by_level['0']['p50'] == 86400.0
+        assert by_level['0']['p90'] == 86400.0
+        assert by_level['1']['p50'] == 7200.0
+        assert by_level['1']['p90'] == 7200.0
+        assert by_level['2']['p50'] == 7200.0
+        assert by_level['2']['p90'] == 10080.0
+
+        # samples: one [date, tier, level, secs] row per terminal-with-valid
+        # -times record, dated by resolved_at (matches flow_daily's key so
+        # row-11's marginal-reconciliation can hold in a later step).
+        samples = {tuple(row) for row in lifespan['samples']}
+        assert samples == {
+            ((now - timedelta(days=9)).date().isoformat(), 'reaper-sweep', 0, 86400.0),
+            ((now - timedelta(days=7)).date().isoformat(), 'human', 0, 86400.0),
+            (
+                (now - timedelta(days=6) + timedelta(hours=2)).date().isoformat(),
+                'auto-watcher', 1, 7200.0,
+            ),
+            (
+                (now - timedelta(days=5) + timedelta(hours=3)).date().isoformat(),
+                'human', 2, 10800.0,
+            ),
+            (
+                (now - timedelta(days=4) + timedelta(hours=1)).date().isoformat(),
+                'human', 2, 3600.0,
+            ),
+        }
+
+        # open_items: the 5 pending records, all aged past the 6h breach
+        # threshold in this fixture (breach_6h False is covered by a
+        # dedicated fixture below — the golden archive has no young item).
+        open_by_id = {item['id']: item for item in lifespan['open_items']}
+        assert set(open_by_id) == {
+            'esc-102-2', 'esc-102-3', 'esc-104-0', 'esc-105-0', 'esc-106-1',
+        }
+        assert all(item['breach_6h'] for item in open_by_id.values())
+        root_item = open_by_id['esc-106-1']
+        assert root_item['task_id'] == '106'
+        assert root_item['level'] == 0
+        assert root_item['age_secs'] == timedelta(hours=7).total_seconds()
+
+        # l1_to_l2_promotion: two L2 clusters, each with one resolvable
+        # member -> deltas [7200 (104), 3600 (105)] sorted [3600, 7200].
+        promo = lifespan['l1_to_l2_promotion']
+        assert promo['count'] == 2
+        assert promo['p50_secs'] == 5400.0
+        assert promo['p90_secs'] == 6840.0
+
+        # Open question #7: no L0->L1 timing sub-metric (un-derivable; see
+        # design_decisions).
+        assert 'l0_to_l1' not in lifespan
+
+    def test_promotion_zero_when_member_missing_and_young_item_not_breached(self, tmp_path):
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+
+        # L2 cluster whose only member id isn't present anywhere in the
+        # archive -> l1_to_l2_promotion must stay count=0 (no crash).
+        orphan_l2 = {
+            'id': 'esc-200-1', 'task_id': '200', 'agent_role': 'architect',
+            'severity': 'blocking', 'category': 'design_concern', 'summary': 'orphaned cluster',
+            'timestamp': _iso(now - timedelta(days=1)),
+            'status': 'resolved', 'level': 2,
+            'resolved_at': _iso(now - timedelta(days=1) + timedelta(hours=1)),
+            'resolved_by': 'interactive',
+            'members': ['esc-does-not-exist'],
+        }
+        _write_escalation(esc_dir, orphan_l2, archived=True)
+
+        # A fresh pending item aged 3h (<=6h) -> breach_6h False.
+        young_item = {
+            'id': 'esc-201-1', 'task_id': '201', 'agent_role': 'architect',
+            'severity': 'info', 'category': 'cleanup_needed', 'summary': 'just filed',
+            'timestamp': _iso(now - timedelta(hours=3)),
+            'status': 'pending', 'level': 0,
+        }
+        _write_escalation(esc_dir, young_item, archived=False)
+
+        entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        lifespan = entry['lifespan']
+
+        promo = lifespan['l1_to_l2_promotion']
+        assert promo == {'count': 0, 'p50_secs': None, 'p90_secs': None}
+
+        open_by_id = {item['id']: item for item in lifespan['open_items']}
+        assert open_by_id['esc-201-1']['breach_6h'] is False
+        assert open_by_id['esc-201-1']['age_secs'] == timedelta(hours=3).total_seconds()
