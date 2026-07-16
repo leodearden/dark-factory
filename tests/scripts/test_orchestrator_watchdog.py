@@ -3645,3 +3645,34 @@ def test_boundary9_report_mixed_fleet_seven_columns(
         "report() must never write the shared fleet-deploy clock file"
     )
 
+
+def test_boundary10_recover_pending_merges_link_seam() -> None:
+    """Scenario 10 (I9) -- crash-safe force-restart, existing-behavior LINK
+    test. The drain gate's force-restart-after-grace path (scenario 5 above)
+    can safely kill a unit mid-merge only because a crash-safe recovery path
+    exists: on boot, `recover_pending_merges` replays the durable merge-queue
+    journal and re-enqueues surviving records while dropping any branch
+    that's gone / already an ancestor of main (idempotency -- no double-land)
+    -- so a force-restarted merge is neither double-landed nor lost.
+
+    That behavior -- idempotent recovery, no double-land, task-not-lost -- is
+    owned and already exercised by
+    orchestrator/tests/test_merge_queue_restart_hook.py and is NOT
+    re-derived here, per the task's explicit "existing-behavior link test"
+    framing (PRD scenario 10 / I9). ε only asserts the integration seam: the
+    recovery function the drain gate's crash-safety story depends on is
+    present and callable.
+
+    Uses pytest.importorskip("orchestrator.merge_queue_store") so the
+    otherwise stdlib-only watchdog suite still collects and passes in a
+    minimal env where the orchestrator package/venv is not importable.
+    """
+    pytest.importorskip("orchestrator.merge_queue_store")
+    from orchestrator.merge_queue_store import recover_pending_merges
+
+    assert callable(recover_pending_merges), (
+        "the drain gate's force-restart-mid-merge path (scenario 5) relies "
+        "on recover_pending_merges for crash-safe recovery on boot -- it "
+        "must be present and callable"
+    )
+
