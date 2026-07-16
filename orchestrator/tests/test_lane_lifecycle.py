@@ -284,11 +284,50 @@ class TestCorruptRecord:
 
 
 # ---------------------------------------------------------------------------
+# all_records — enumerate every lane's durable record (task 2634)
+# ---------------------------------------------------------------------------
+
+
+class TestAllRecords:
+    def test_returns_records_keyed_by_lane_name(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane0 = tmp_path / '_lane-0'
+        lane1 = tmp_path / '_lane-1'
+        lifecycle.note_assigned(lane0, task_id='42', branch='task/42')
+        lifecycle.note_assigned(lane1, task_id='43', branch='task/43')
+        # A third lane whose record file is unparseable — must be skipped,
+        # not raise.
+        _seed_corrupt_record(tmp_path, tmp_path / '_lane-2')
+
+        records = lifecycle.all_records()
+
+        assert set(records) == {'_lane-0', '_lane-1'}
+        assert records['_lane-0'].task_id == '42'
+        assert records['_lane-0'].state == LaneState.ASSIGNED
+        assert records['_lane-1'].task_id == '43'
+        assert records['_lane-1'].state == LaneState.ASSIGNED
+
+    def test_empty_state_dir_yields_empty_dict(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lifecycle.state_dir.mkdir(parents=True)
+
+        assert lifecycle.all_records() == {}
+
+    def test_absent_state_dir_yields_empty_dict(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+
+        assert not lifecycle.state_dir.exists()
+        assert lifecycle.all_records() == {}
+
+
+# ---------------------------------------------------------------------------
 # Quarantine helper
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
+
+
 class TestQuarantine:
     async def test_quarantine_delegates_and_persists_quarantined_state(
         self, tmp_path: Path,
