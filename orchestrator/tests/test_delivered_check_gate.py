@@ -1427,6 +1427,47 @@ class TestDeliveredCheckGraceEscalation:
         scheduler._callbacks.on_delivered_check_block.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_re_escalates_after_grace_cycles_more_failures(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Clear-then-fire contract: once the fail-streak is cleared by a
+        first escalation, ``grace_cycles`` MORE consecutive FAILED ticks
+        (e.g. an operator re-pends the task but the underlying capability
+        is still broken) re-fires a SECOND escalation rather than staying
+        silent forever."""
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner({'cap-one': DeliveredCheckResult.FAILED}),
+        )
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+        callback = scheduler._callbacks.on_delivered_check_block
+        assert callback is not None
+
+        # First 3 consecutive FAILED ticks -> streak hits grace_cycles (3)
+        # -> first escalation, streak cleared.
+        for _ in range(3):
+            await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        callback.assert_called_once()
+        assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
+
+        # 3 MORE consecutive FAILED ticks (still the same SHA, still
+        # failing) -> the cleared streak climbs back to grace_cycles and
+        # re-fires a second, independent escalation.
+        for _ in range(3):
+            await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert callback.call_count == 2
+        assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
+        second_call_args, second_call_kwargs = callback.call_args_list[1]
+        assert second_call_args[0] == '10'
+        assert 'DEP_CAPABILITY_NOT_DELIVERED' in second_call_kwargs['summary']
+        assert 'cap-one' in second_call_kwargs['summary']
+
+    @pytest.mark.asyncio
     async def test_per_dependent_dep_keying_escalates_independently(
         self, scheduler: Scheduler, monkeypatch
     ):
