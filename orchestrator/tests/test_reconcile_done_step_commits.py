@@ -202,6 +202,20 @@ def _write_done_step_plan(artifacts: TaskArtifacts, step_id: str, commit: str) -
     return artifacts.read_plan()
 
 
+def _write_steps_plan(artifacts: TaskArtifacts, steps: list[dict]) -> dict:
+    """Like :func:`_write_done_step_plan`, but for multiple pre-built step
+    dicts — used by the multi-orphaned-done-step coverage below."""
+    plan = {
+        'task_id': '42',
+        'title': 'X',
+        'analysis': 'A',
+        'prerequisites': [],
+        'steps': steps,
+    }
+    artifacts.write_plan(plan)
+    return artifacts.read_plan()
+
+
 @pytest.mark.asyncio
 class TestReconcileDoneStepCommits:
     async def test_orphaned_done_step_commit_matching_wip_tip_is_reconciled(
@@ -237,6 +251,46 @@ class TestReconcileDoneStepCommits:
         assert reconciled['steps'][0]['commit'] == wip_sha, (
             f'Expected step-1 commit re-pointed to WIP tip {wip_sha}, '
             f"got {reconciled['steps'][0]['commit']}"
+        )
+        assert reconciled['steps'][0]['status'] == 'done'
+
+    async def test_orphaned_commit_subset_of_larger_wip_run_is_reconciled(
+        self, config, git_ops, task_assignment,
+    ):
+        """PARTIAL MATCH: the orphaned done-step commit's file set
+        ({'feature.py'}) is a STRICT SUBSET of the tip WIP run's changed
+        files ({'feature.py', 'other.py'}, i.e. the WIP run is a superset,
+        not an exact match) -> still auto-reconciles. Exercises the
+        subset-not-equality branch of the match predicate, which the
+        exact-same-single-file happy path above doesn't distinguish from a
+        stricter equality check."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'feature.py').write_text('original implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1 implementation')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_done_step_plan(artifacts, 'step-1', step_commit)
+
+        # Orphan step_commit, then land a WIP commit that reintroduces
+        # feature.py AND an unrelated additional file — the WIP run's files
+        # are a strict superset of the orphaned commit's files.
+        await _run(['git', 'reset', '--hard', wt_info.base_commit], cwd=wt)
+        (wt / 'feature.py').write_text('original implementation\n')
+        (wt / 'other.py').write_text('unrelated but also present\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before inter-iteration rebase')
+        assert wip_sha, 'Setup: expected a real WIP commit at HEAD'
+
+        await workflow._reconcile_done_step_commits()
+
+        reconciled = artifacts.read_plan()
+        assert reconciled['steps'][0]['commit'] == wip_sha, (
+            f'Expected step-1 commit re-pointed to WIP tip {wip_sha} even '
+            f"though the WIP run is a strict superset, got "
+            f"{reconciled['steps'][0]['commit']}"
         )
         assert reconciled['steps'][0]['status'] == 'done'
 
@@ -455,6 +509,103 @@ class TestReconcileDoneStepCommits:
         await workflow._reconcile_done_step_commits()  # must not raise
 
         assert artifacts.read_plan()['steps'][0]['commit'] == step_commit
+
+    # -----------------------------------------------------------------
+    # Amendment coverage: multiple orphaned done steps in one plan, and
+    # the escalate-at-most-once-per-orphan dedup guard.
+    # -----------------------------------------------------------------
+
+    async def test_multiple_orphaned_done_steps_mixed_reconcile_and_escalate(
+        self, config, git_ops, task_assignment,
+    ):
+        """Two done steps are orphaned in the SAME reconcile pass: step-1's
+        file reappears in the tip WIP run (auto-reconciled) while step-2's
+        file does not (left unchanged + flagged). Guards against the scan
+        being accidentally single-item — e.g. stopping after the first
+        reconcile/escalate, or a shared-state bug that lets one step's
+        outcome leak into the other's."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        escalation_queue = MagicMock()
+        escalation_queue.make_id.return_value = 'esc-42-1'
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=escalation_queue,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'feature.py').write_text('step-1 implementation\n')
+        step1_commit = await git_ops.commit(wt, 'feat: GREEN — step-1 implementation')
+        assert step1_commit, 'Setup: expected a real commit to be made'
+
+        (wt / 'orphan.py').write_text('step-2 implementation\n')
+        step2_commit = await git_ops.commit(wt, 'feat: GREEN — step-2 implementation')
+        assert step2_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_steps_plan(artifacts, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'done', 'commit': step1_commit},
+            {'id': 'step-2', 'type': 'impl', 'status': 'done', 'commit': step2_commit},
+        ])
+
+        # Orphan both, then land a WIP run that reintroduces ONLY step-1's
+        # file — step-2's file is absent from the WIP run entirely.
+        await _run(['git', 'reset', '--hard', wt_info.base_commit], cwd=wt)
+        (wt / 'feature.py').write_text('step-1 implementation\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before inter-iteration rebase')
+        assert wip_sha, 'Setup: expected a real WIP commit at HEAD'
+
+        await workflow._reconcile_done_step_commits()
+
+        reconciled = artifacts.read_plan()
+        step_1 = next(s for s in reconciled['steps'] if s['id'] == 'step-1')
+        step_2 = next(s for s in reconciled['steps'] if s['id'] == 'step-2')
+        assert step_1['commit'] == wip_sha, 'step-1 must auto-reconcile to the WIP tip'
+        assert step_2['commit'] == step2_commit, (
+            'step-2 has no matching WIP content and must be left unchanged'
+        )
+        escalation_queue.submit.assert_called_once()
+        esc = escalation_queue.submit.call_args.args[0]
+        assert 'step-2' in esc.summary or 'step-2' in esc.detail
+
+    async def test_unreconcilable_orphan_escalates_only_once_across_repeated_calls(
+        self, config, git_ops, task_assignment,
+    ):
+        """Calling _reconcile_done_step_commits twice for the SAME
+        unreconcilable orphan (as happens across successive
+        _execute_iterations loop iterations while the step remains
+        unreconciled — the method deliberately leaves the commit unchanged
+        on a mismatch) must only submit ONE info escalation, not one per
+        call. Without a dedup guard, a single stuck orphan would otherwise
+        flood the escalation queue with a duplicate escalation every
+        iteration up to max_execute_iterations."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        escalation_queue = MagicMock()
+        escalation_queue.make_id.return_value = 'esc-42-1'
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=escalation_queue,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'feature.py').write_text('original implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1 implementation')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_done_step_plan(artifacts, 'step-1', step_commit)
+
+        # Orphan step_commit, then land a WIP commit touching a wholly
+        # DIFFERENT file — never reconciles, so the condition recurs.
+        await _run(['git', 'reset', '--hard', wt_info.base_commit], cwd=wt)
+        (wt / 'other.py').write_text('unrelated\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before inter-iteration rebase')
+        assert wip_sha, 'Setup: expected a real WIP commit at HEAD'
+
+        await workflow._reconcile_done_step_commits()
+        workflow.plan = artifacts.read_plan()
+        await workflow._reconcile_done_step_commits()  # same unresolved orphan, again
+
+        unchanged = artifacts.read_plan()
+        assert unchanged['steps'][0]['commit'] == step_commit
+        escalation_queue.submit.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
