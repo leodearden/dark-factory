@@ -109,6 +109,7 @@ from test_verify_scope_lambda import _two_module_registry
 
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     MergeOutcome,
@@ -248,6 +249,7 @@ async def _drive_merge_gate(
     task_files_content: dict[str, str],
     main_sha: str,
     run_verification_fake: AsyncMock,
+    git_ops: GitOps | None = None,
 ) -> MergeOutcome | None:
     """Drive the REAL merge-gate consumer chokepoint, ``_run_post_merge_verify``.
 
@@ -276,10 +278,22 @@ async def _drive_merge_gate(
     *task_id* must be distinct per call within a test that drives the gate
     more than once (e.g. row 5's two-merge cache-hit scenario), since it
     seeds the task/merge worktree directory names. Shared by rows 1, 4, and 5.
+
+    *git_ops* lets a caller share ONE ``GitOps`` double across multiple
+    drives against the same main SHA — default ``None`` builds a fresh one
+    via ``_make_git_ops`` (byte-identical to every pre-existing call site).
+    Row 5 shares one across its two merges so it can assert
+    ``git_ops.ephemeral_worktree`` was never invoked: the direct, accurate
+    "no real main-probe worktree was created" signal for a μ B2 baseline
+    cache hit (see :func:`orchestrator.verify.main_baseline_failing_ids`) —
+    the cache lives one layer inside ``verify_failure_is_preexisting_on_main``,
+    so that entry point itself is still called once per merge; only the
+    expensive worktree-probe fallback is what the cache actually elides.
     """
     config = _make_config(tmp_path, merge_verify_breadth='full')
     config._module_configs = dict(module_configs_registry)
-    git_ops = _make_git_ops(tmp_path)
+    if git_ops is None:
+        git_ops = _make_git_ops(tmp_path)
     git_ops.get_main_sha = AsyncMock(return_value=main_sha)
 
     task_wt = tmp_path / f'task-wt-{task_id}'
@@ -612,6 +626,24 @@ ROW5_MAIN_SHA: str = 'r5main0000000000000000000000000000000000'
 ROW5_PREEXISTING_TEST_ID: str = 'moda/tests/test_z.py::test_z'
 
 
+def _row5_wholly_preexisting_diff(
+    tmp_path: Path,
+) -> tuple[ModuleConfig, dict[str, str]]:
+    """Build row 5's wholly-pre-existing diff: a merge touching ONE registered
+    module (moda) whose only failing id is the SAME id seeded into the main
+    baseline (:data:`ROW5_PREEXISTING_TEST_ID`) — the branch introduces no
+    failure of its own, mirroring :func:`_row4_mixed_baseline_diff` but
+    scoped to a single module (row 5 has no NEW-failing sibling).
+
+    Returns ``(mod_a, task_files_content)`` — *task_files_content* is written
+    into the MERGE worktree by :func:`_drive_merge_gate` (see its docstring's
+    footgun paragraph), keyed by relative path.
+    """
+    mod_a, _mod_b, _config = _two_module_registry(tmp_path, breadth='full')
+    task_files_content = {'moda/thing.py': 'x = 1\n'}
+    return mod_a, task_files_content
+
+
 class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
     """Row 5 (PRD boundary-test sketch): main already carries a pre-existing
     red (``ROW5_PREEXISTING_TEST_ID``, seeded into the per-main-SHA
@@ -633,6 +665,11 @@ class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
         mod_a, task_files_content = _row5_wholly_preexisting_diff(tmp_path)
         seed_main_baseline(ROW5_MAIN_SHA, frozenset({ROW5_PREEXISTING_TEST_ID}))
 
+        # Shared across both drives (not the default fresh-per-call double)
+        # so ``ephemeral_worktree`` — the real, expensive main-probe
+        # worktree the μ B2 baseline cache is supposed to make unnecessary —
+        # can be inspected once, after both merges, below.
+        shared_git_ops = _make_git_ops(tmp_path)
         probe_spy = AsyncMock(wraps=verify_failure_is_preexisting_on_main)
         with patch(
             'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
@@ -649,6 +686,7 @@ class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
                 run_verification_fake=_fake_run_verification_by_module(
                     {mod_a.prefix: (False, [ROW5_PREEXISTING_TEST_ID])},
                 ),
+                git_ops=shared_git_ops,
             )
             outcome2 = await _drive_merge_gate(
                 tmp_path,
@@ -661,6 +699,7 @@ class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
                 run_verification_fake=_fake_run_verification_by_module(
                     {mod_a.prefix: (False, [ROW5_PREEXISTING_TEST_ID])},
                 ),
+                git_ops=shared_git_ops,
             )
 
         for label, outcome in (('first', outcome1), ('second', outcome2)):
@@ -674,8 +713,28 @@ class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
                 f'{outcome.reason!r}'
             )
 
-        assert probe_spy.await_count <= 1, (
-            f'expected the main-probe entry point to be consulted at most '
-            f'once across both merges against the same main SHA (cache hit '
-            f'on the second); got {probe_spy.await_count} call(s)'
+        # The classification entry point (_classify_main_health_red ->
+        # verify_failure_is_preexisting_on_main) is dispatched fresh on
+        # EVERY failing merge — that's expected, not a cache miss: the μ B2
+        # baseline cache lives ONE LAYER INSIDE this entry point (see
+        # main_baseline_failing_ids's _BASELINE_FAILING_IDS_CACHE lookup),
+        # so the entry point itself is genuinely called once per merge. This
+        # assertion is a sanity check that classification was truly engaged
+        # both times, not skipped or short-circuited some other way.
+        assert probe_spy.await_count == 2, (
+            f'expected the classification entry point to be consulted once '
+            f'per merge (both merges must independently engage main-health '
+            f'classification); got {probe_spy.await_count} call(s)'
+        )
+        # The actual "cache hit, never re-probed" guarantee (B2): a real
+        # main-probe worktree is the EXPENSIVE operation the baseline cache
+        # exists to avoid. The baseline was pre-seeded above, so
+        # main_baseline_failing_ids must cache-hit on BOTH calls and never
+        # fall through to git_ops.ephemeral_worktree at all.
+        assert shared_git_ops.ephemeral_worktree.call_count == 0, (
+            f'expected ZERO real main-probe worktrees across both merges '
+            f'against the same pre-seeded main SHA; got '
+            f'{shared_git_ops.ephemeral_worktree.call_count} call(s) — the '
+            f'μ B2 baseline cache should have short-circuited before ever '
+            f'reaching a cold probe'
         )
