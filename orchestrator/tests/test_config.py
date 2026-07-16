@@ -1951,6 +1951,77 @@ class TestSimpleTaskRoleConfigAddressability:
         } <= RELOADABLE_FIELDS
 
 
+class TestSimpleTaskDeprecatedScalarHonoring:
+    """simple_task_budget_usd / simple_task_max_turns (config.py's dead
+    scalars, never read by _invoke) must be formally HONORED -- not left
+    dead -- now that budgets.simple_task / max_turns.simple_task exist as
+    the real resolution path (PRD invariant 4: 'honored' or 'removed', never
+    silently dropped).
+
+    A model_validator migrates a non-default scalar into the matching
+    submodel field, ONLY when that submodel field is still at its own
+    default (an explicit submodel value always wins), and emits a loud
+    deprecation WARNING naming the replacement -- honoring the project's
+    loud-over-silent-degradation norm.
+    """
+
+    def test_non_default_scalars_migrate_into_submodel_fields_with_warning(
+        self, monkeypatch, tmp_path, caplog: pytest.LogCaptureFixture,
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            config = OrchestratorConfig(
+                simple_task_budget_usd=3.33,
+                simple_task_max_turns=7,
+            )
+
+        assert config.budgets.simple_task == 3.33, (
+            'Non-default simple_task_budget_usd must migrate into '
+            'budgets.simple_task (still at its own default).'
+        )
+        assert config.max_turns.simple_task == 7, (
+            'Non-default simple_task_max_turns must migrate into '
+            'max_turns.simple_task (still at its own default).'
+        )
+
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'simple_task_budget_usd' in r.getMessage() and 'budgets.simple_task' in r.getMessage()
+            for r in warning_records
+        ), (
+            'Expected a loud deprecation WARNING naming simple_task_budget_usd '
+            f'and its budgets.simple_task replacement; got: '
+            f'{[r.getMessage() for r in warning_records]}'
+        )
+        assert any(
+            'simple_task_max_turns' in r.getMessage() and 'max_turns.simple_task' in r.getMessage()
+            for r in warning_records
+        ), (
+            'Expected a loud deprecation WARNING naming simple_task_max_turns '
+            f'and its max_turns.simple_task replacement; got: '
+            f'{[r.getMessage() for r in warning_records]}'
+        )
+
+    def test_explicit_submodel_value_wins_over_deprecated_scalar(self, monkeypatch, tmp_path):
+        """An explicitly-set budgets.simple_task takes precedence -- the
+        deprecated scalar is ignored (no migration) when the submodel field
+        is no longer at its default."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+        config = OrchestratorConfig(
+            simple_task_budget_usd=3.33,
+            budgets=BudgetsConfig(simple_task=5.55),
+        )
+
+        assert config.budgets.simple_task == 5.55, (
+            'An explicitly-set budgets.simple_task must win over the '
+            'deprecated simple_task_budget_usd scalar.'
+        )
+
+
 class TestDiffConfig:
     """diff_config(live, fresh, allowlist) categorizes every differing leaf
     into applied_candidates (allowlisted) or restart_required (not), and
