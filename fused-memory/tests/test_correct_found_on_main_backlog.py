@@ -10,6 +10,8 @@ import importlib.util
 import types
 from pathlib import Path
 
+import pytest
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'correct_found_on_main_backlog.py'
 
 
@@ -46,6 +48,7 @@ ACTION_ANNOTATE = _mod.ACTION_ANNOTATE
 LABEL_REOPENED = _mod.LABEL_REOPENED
 LABEL_REVIEWED_BENIGN = _mod.LABEL_REVIEWED_BENIGN
 LABEL_PRESUMED_BENIGN_HISTORICAL = _mod.LABEL_PRESUMED_BENIGN_HISTORICAL
+apply_corrections = _mod.apply_corrections
 
 
 # ---------------------------------------------------------------------------
@@ -222,3 +225,116 @@ class TestCorrectionDataclassShape:
         assert isinstance(correction.reasons, list)
         assert correction.reopen_reason is None or isinstance(correction.reopen_reason, str)
         assert isinstance(correction.ref, str)
+
+
+# ===========================================================================
+# Step-3+: apply_corrections — fixtures
+# ===========================================================================
+
+def _correction(
+    task_id: str,
+    action: str = ACTION_ANNOTATE,
+    *,
+    label: str = LABEL_PRESUMED_BENIGN_HISTORICAL,
+    ref: str = 'main',
+    reasons: list[str] | None = None,
+    reopen_reason: str | None = None,
+) -> Correction:
+    """Build a Correction directly, bypassing plan_corrections, for
+    apply_corrections-focused tests."""
+    return Correction(
+        task_id=task_id, action=action, label=label, ref=ref,
+        reasons=list(reasons) if reasons is not None else ['some audit reason'],
+        reopen_reason=reopen_reason,
+    )
+
+
+class FakeCorrectionsBackend:
+    """Recording fake backend for apply_corrections tests.
+
+    - ``update_task`` calls are recorded (metadata/tag included, so tests
+      can decode the persisted x_provenance_audit payload); raises for any
+      task_id in ``fail_update_for``.
+    - ``set_task_status`` calls are recorded; returns
+      ``status_results[task_id]`` when configured, else a synthesized
+      success DTO shaped like the real backend's ``SetTaskStatusResult``
+      (no ``'success'`` key on success — mirrors the real wire shape).
+    - ``get_task`` calls are recorded; returns ``get_task_results[task_id]``
+      when configured, else ``{'status': 'pending'}`` — the common
+      happy-path shape for a post-reopen re-read.
+    """
+
+    def __init__(
+        self,
+        *,
+        status_results: dict[str, dict] | None = None,
+        get_task_results: dict[str, dict] | None = None,
+        fail_update_for: set[str] | None = None,
+    ):
+        self.status_results = status_results or {}
+        self.get_task_results = get_task_results or {}
+        self.fail_update_for = fail_update_for or set()
+        self.update_calls: list[dict] = []
+        self.status_calls: list[dict] = []
+        self.get_task_calls: list[dict] = []
+
+    async def update_task(self, task_id, project_root, metadata=None, tag=None, **kwargs):
+        if task_id in self.fail_update_for:
+            raise RuntimeError(f'simulated update_task failure for {task_id}')
+        self.update_calls.append({
+            'task_id': task_id, 'project_root': project_root,
+            'metadata': metadata, 'tag': tag, 'kwargs': kwargs,
+        })
+        return {'success': True}
+
+    async def set_task_status(self, task_id, status, project_root, tag=None):
+        self.status_calls.append({
+            'task_id': task_id, 'status': status, 'project_root': project_root, 'tag': tag,
+        })
+        if task_id in self.status_results:
+            return self.status_results[task_id]
+        return {
+            'message': f'Successfully updated 1 task(s) to "{status}"',
+            'tasks': [{'taskId': task_id, 'oldStatus': 'done', 'newStatus': status}],
+        }
+
+    async def get_task(self, task_id, project_root, tag=None):
+        self.get_task_calls.append({
+            'task_id': task_id, 'project_root': project_root, 'tag': tag,
+        })
+        if task_id in self.get_task_results:
+            return self.get_task_results[task_id]
+        return {'status': 'pending'}
+
+
+# ===========================================================================
+# Step-3/4: apply_corrections — dry run
+# ===========================================================================
+
+@pytest.mark.asyncio
+class TestApplyCorrectionsDryRun:
+    """apply=False performs no backend calls and reports the intended plan."""
+
+    async def test_dry_run_makes_no_backend_calls(self):
+        corrections = [
+            _correction('1175', ACTION_REOPEN, label=LABEL_REOPENED, reopen_reason='evidence'),
+            _correction('9999', ACTION_ANNOTATE, label=LABEL_PRESUMED_BENIGN_HISTORICAL),
+        ]
+        backend = FakeCorrectionsBackend()
+        summary = await apply_corrections(backend, '/proj', corrections, apply=False)
+        assert backend.status_calls == []
+        assert backend.update_calls == []
+        assert backend.get_task_calls == []
+        assert summary['dry_run'] is True
+
+    async def test_dry_run_lists_intended_task_id_and_action_per_correction(self):
+        corrections = [
+            _correction('1175', ACTION_REOPEN, label=LABEL_REOPENED, reopen_reason='evidence'),
+            _correction('9999', ACTION_ANNOTATE, label=LABEL_PRESUMED_BENIGN_HISTORICAL),
+        ]
+        backend = FakeCorrectionsBackend()
+        summary = await apply_corrections(backend, '/proj', corrections, apply=False)
+        planned = summary['planned']
+        assert {(p['task_id'], p['action']) for p in planned} == {
+            ('1175', ACTION_REOPEN), ('9999', ACTION_ANNOTATE),
+        }
