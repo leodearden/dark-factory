@@ -93,6 +93,94 @@ def _extract_function_body(src: str, fn_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Load-order helpers (copied from test_tab_escalation_analytics.py, itself
+# copied from test_tab_escalations.py / test_index_html.py)
+# ---------------------------------------------------------------------------
+
+
+class _ScriptTagCollector(html.parser.HTMLParser):
+    """Collects the attribute dicts for every <script> start-tag encountered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.script_attrs: list[dict[str, str | None]] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag == 'script':
+            self.script_attrs.append(dict(attrs))
+
+
+def _find_script_position(
+    body: str, src_prefix: str
+) -> tuple[int, dict[str, str | None]] | None:
+    """Return ``(index, attrs)`` for the first <script> tag whose ``src``
+    starts with ``src_prefix``, or ``None`` if no such tag exists.
+    """
+    collector = _ScriptTagCollector()
+    collector.feed(body)
+    for i, attrs in enumerate(collector.script_attrs):
+        if (attrs.get('src') or '').startswith(src_prefix):
+            return i, attrs
+    return None
+
+
+def _assert_script_loads_before(
+    body: str,
+    before_src_prefix: str,
+    after_src_prefix: str,
+    before_label: str,
+    after_label: str,
+    consumer_note: str = '',
+) -> None:
+    """Assert that the script for ``before_src_prefix`` loads BEFORE the
+    script for ``after_src_prefix`` in ``body``.  Combines a
+    defer/async/type=module false-pass guard with the document-order
+    position comparison.
+    """
+    before_result = _find_script_position(body, before_src_prefix)
+    assert before_result is not None, (
+        f'No <script src="{before_src_prefix}..."> tag found in index.html. '
+        f'{consumer_note}'
+    )
+    before_pos, before_attrs = before_result
+    before_src = before_attrs.get('src')
+
+    after_result = _find_script_position(body, after_src_prefix)
+    assert after_result is not None, (
+        f'<script src="{after_src_prefix}..."> not found in index.html — '
+        f'cannot verify load-order invariant for {before_label}.'
+    )
+    after_pos, after_attrs = after_result
+
+    # Both tags must be classic synchronous scripts — otherwise document order
+    # diverges from execution order and the position comparison below is moot.
+    for _label, _attrs in [
+        (before_label, before_attrs),
+        (after_label, after_attrs),
+    ]:
+        assert 'defer' not in _attrs, (
+            f'{_label} has a defer attribute; document order no longer implies '
+            f'execution order, so the load-order check below may give a false pass.'
+        )
+        assert 'async' not in _attrs, (
+            f'{_label} has an async attribute; document order no longer implies '
+            f'execution order, so the load-order check below may give a false pass.'
+        )
+        assert (_attrs.get('type') or '').lower() != 'module', (
+            f'{_label} has type="module"; ES modules are deferred by default, '
+            f'so document order no longer implies execution order.'
+        )
+
+    assert before_pos < after_pos, (
+        f'{before_label} (position {before_pos}, src={before_src!r}) must load '
+        f'BEFORE {after_label} (position {after_pos}). '
+        f'{consumer_note}'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-5: esc_flow_diagram.jsx exists and wires up correctly
 # ---------------------------------------------------------------------------
 
@@ -233,4 +321,114 @@ def test_window_df_esc_flow_export_is_additive_and_not_clobbered(esc_flow_diagra
     export_block = body[export_block_start : export_block_start + 200]
     assert 'LifecycleFlowDiagram' in export_block, (
         'window.DF_ESC_FLOW export does not include LifecycleFlowDiagram.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-7: index.html registers esc_flow_layout.js + esc_flow_diagram.jsx in
+# the correct load order, and the shared cache-buster version is bumped.
+# ---------------------------------------------------------------------------
+
+
+def test_index_html_registers_esc_flow_layout_load_order(index_html_body: str) -> None:
+    """esc_flow_layout.js is a classic script that must load BEFORE
+    esc_flow_diagram.jsx (whose top-level destructure reads
+    window.DF_ESC_FLOW_LAYOUT at parse time) and BEFORE
+    tab_escalation_analytics.jsx (which mounts LifecycleFlowDiagram).
+    """
+    _LAYOUT_PREFIX = '/static/redux/esc_flow_layout.js'
+    _DIAGRAM_PREFIX = '/static/redux/esc_flow_diagram.jsx'
+    _TAB_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
+
+    result = _find_script_position(index_html_body, _LAYOUT_PREFIX)
+    assert result is not None, (
+        f'No <script src="{_LAYOUT_PREFIX}..."> tag found in index.html — '
+        'add it as a classic script (e.g. after runtime_format.js).'
+    )
+
+    # (a) esc_flow_layout.js loads before esc_flow_diagram.jsx
+    _assert_script_loads_before(
+        index_html_body,
+        _LAYOUT_PREFIX,
+        _DIAGRAM_PREFIX,
+        'esc_flow_layout.js',
+        'esc_flow_diagram.jsx',
+        'esc_flow_layout.js must load before esc_flow_diagram.jsx so '
+        'window.DF_ESC_FLOW_LAYOUT is defined before the destructure runs.',
+    )
+
+    # (c) esc_flow_layout.js loads before tab_escalation_analytics.jsx too
+    _assert_script_loads_before(
+        index_html_body,
+        _LAYOUT_PREFIX,
+        _TAB_ANALYTICS_PREFIX,
+        'esc_flow_layout.js',
+        'tab_escalation_analytics.jsx',
+        'esc_flow_layout.js must load before tab_escalation_analytics.jsx.',
+    )
+
+
+def test_index_html_registers_esc_flow_diagram_load_order(index_html_body: str) -> None:
+    """esc_flow_diagram.jsx must be a classic Babel script that loads AFTER
+    charts.jsx (needs C.PALETTE) and BEFORE tab_escalation_analytics.jsx
+    (the consumer that mounts LifecycleFlowDiagram in the esc-flow-slot).
+    """
+    _CHARTS_PREFIX = '/static/redux/charts.jsx'
+    _DIAGRAM_PREFIX = '/static/redux/esc_flow_diagram.jsx'
+    _TAB_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
+
+    result = _find_script_position(index_html_body, _DIAGRAM_PREFIX)
+    assert result is not None, (
+        f'No <script src="{_DIAGRAM_PREFIX}..."> tag found in index.html — '
+        'add it as a Babel script before tab_escalation_analytics.jsx.'
+    )
+    _, diagram_attrs = result
+
+    # Must be a classic (non-deferred, non-module) Babel script.
+    assert 'defer' not in diagram_attrs, (
+        'esc_flow_diagram.jsx script tag has defer= — remove it; classic '
+        'synchronous scripts are required for Babel-standalone transpilation.'
+    )
+    assert 'async' not in diagram_attrs, (
+        'esc_flow_diagram.jsx script tag has async= — remove it.'
+    )
+    assert (diagram_attrs.get('type') or '').lower() in ('text/babel', ''), (
+        'esc_flow_diagram.jsx script must have type="text/babel" (or no type) — '
+        f'got {diagram_attrs.get("type")!r}.'
+    )
+
+    # (b) Loads after charts.jsx
+    _assert_script_loads_before(
+        index_html_body,
+        _CHARTS_PREFIX,
+        _DIAGRAM_PREFIX,
+        'charts.jsx',
+        'esc_flow_diagram.jsx',
+        'charts.jsx must load before esc_flow_diagram.jsx so window.DF_CHARTS/C.PALETTE is available.',
+    )
+
+    # (b) Loads before tab_escalation_analytics.jsx
+    _assert_script_loads_before(
+        index_html_body,
+        _DIAGRAM_PREFIX,
+        _TAB_ANALYTICS_PREFIX,
+        'esc_flow_diagram.jsx',
+        'tab_escalation_analytics.jsx',
+        'esc_flow_diagram.jsx must load before tab_escalation_analytics.jsx so window.DF_ESC_FLOW is available to mount.',
+    )
+
+
+def test_index_html_cache_buster_bumped_for_esc_flow(index_html_body: str) -> None:
+    """All /static/redux/*?v= cache-busters must still share a single
+    version, and that version must be >= 33 (the uniform bump that
+    accompanies registering the two new esc_flow_* files).
+    """
+    versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
+    assert len(versions) == 1, (
+        f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
+        'bump all of them uniformly to the same value.'
+    )
+    v = int(next(iter(versions)))
+    assert v >= 33, (
+        f'index.html cache-buster version is {v}, expected >= 33 (uniform bump for esc_flow_* registration).'
     )
