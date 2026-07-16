@@ -69,6 +69,22 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Fleet-deploy clock path (task 2396, fleet-redeploy β) — single source of
+# truth
+# ---------------------------------------------------------------------------
+
+# Relative path (from project_root) of the shared fleet-deploy clock file:
+# the coordinator's own last-fire-wall persistence AND (as of task 2396) the
+# file restart-all-orchestrators.sh stamps on a verified-fresh fleet restart
+# and scripts/orchestrator-watchdog.py reads to gate its staleness backstop.
+# Neither the stdlib watchdog (no orchestrator package import) nor the bash
+# script (no Python) can import this constant directly, so both hardcode a
+# mirror of this literal value — guarded by drift/consistency tests so the
+# three copies cannot silently diverge.
+FLEET_DEPLOY_CLOCK_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
+
+
+# ---------------------------------------------------------------------------
 # Path-filter helper
 # ---------------------------------------------------------------------------
 
@@ -297,7 +313,23 @@ class StaleServiceRestartCoordinator:
         restart / redeploy.  ``None`` (default) → the cap is in-memory only
         (no persistence).  At construction the file is read (fail-open: a
         missing / corrupt / unreadable file → no seeded timestamp, never
-        raises); after each successful fire it is rewritten atomically.
+        raises); after each successful fire it is rewritten atomically —
+        UNLESS ``stamp_clock_on_fire`` is False, in which case the read still
+        happens (seeding) but the post-fire write is skipped (see below).
+    stamp_clock_on_fire:
+        When True (default), a successful fire persists the new last-fire
+        epoch to ``state_path`` (task-2371 behavior, byte-identical).  When
+        False, the on-disk file is NEVER written by this coordinator — only
+        the in-memory ``_last_fire_wall`` advances (retaining within-process
+        double-fire gating).  Used by the orchestrator's own coordinator
+        (task 2396, fleet-redeploy β): ``restart-all-orchestrators.sh``
+        becomes the SOLE on-disk clock writer, and only on its verified-fresh
+        exit-0 path — so a detached restart that later fails at fire time
+        never silences the watchdog backstop for a full
+        ``min_interval_secs`` window (closes the "failed-detached-deploy
+        silences the backstop" hole).  Default True keeps the fused-memory
+        and dashboard coordinators (which pass no ``state_path`` anyway)
+        byte-identical.
     """
 
     def __init__(
@@ -320,6 +352,7 @@ class StaleServiceRestartCoordinator:
         min_interval_secs: float = 0.0,
         wall_clock: Callable[[], float] = time.time,
         state_path: Path | None = None,
+        stamp_clock_on_fire: bool = True,
     ) -> None:
         self._git_ops = git_ops
         self._event_store = event_store
@@ -358,6 +391,11 @@ class StaleServiceRestartCoordinator:
         self._min_interval_secs = min_interval_secs
         self._wall_clock = wall_clock
         self._state_path = state_path
+        # When False, the on-disk state_path is never written by this
+        # coordinator — a script (e.g. restart-all-orchestrators.sh) becomes
+        # the sole verified-success writer. Default True preserves
+        # byte-identical task-2371 behavior (see docstring above).
+        self._stamp_clock_on_fire = stamp_clock_on_fire
         # Persisted epoch of the last successful fire (None → never fired, or
         # no persisted state). Seeded fail-open from state_path at construction:
         # a missing / corrupt / unreadable file must never raise here.
@@ -582,12 +620,17 @@ class StaleServiceRestartCoordinator:
         # (note_merge re-arming does NOT reset it — only success/exhaustion do.)
         self._consecutive_executor_failures = 0
 
-        # Stamp the min-interval rate cap AFTER the fire succeeded, then persist
-        # it (restart-safe). Persist failures are non-fatal: the restart already
-        # happened, so a lost timestamp merely relaxes the cap once — never
-        # blocks the pipeline.
+        # Stamp the min-interval rate cap AFTER the fire succeeded. The
+        # in-memory update is unconditional (retains within-process
+        # double-fire gating even when stamp_clock_on_fire is False); the
+        # on-disk persist is skipped when stamp_clock_on_fire is False — a
+        # script (e.g. restart-all-orchestrators.sh) is then the sole
+        # verified-success writer of state_path (task 2396). Persist failures
+        # are non-fatal: the restart already happened, so a lost timestamp
+        # merely relaxes the cap once — never blocks the pipeline.
         self._last_fire_wall = self._wall_clock()
-        self._persist_last_fire_wall(self._last_fire_wall)
+        if self._stamp_clock_on_fire:
+            self._persist_last_fire_wall(self._last_fire_wall)
 
         return True
 
