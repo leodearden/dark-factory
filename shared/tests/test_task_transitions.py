@@ -203,6 +203,30 @@ class TestIsLegalTransitionCore:
             ActorClass.ESCALATION,
         ],
     )
+    def test_deferred_to_done_legal(self, actor):
+        # operator/vehicle direct-complete of a deferred task (planning-mode
+        # / merge-vehicle task created directly in `deferred`) whose
+        # deliverable genuinely landed on main out-of-band (task 2668) — the
+        # deferred-origin sibling of test_pending_to_done_legal's
+        # pending-origin pair (task 2614). RECONCILIATION is included (not
+        # just the safe-open actors) because the RECONCILIATION restriction
+        # (task-1655) only strips in-progress-ORIGIN pairs — this
+        # deferred-origin pair is unaffected and stays in RECONCILIATION's
+        # safe-open subset. ESCALATION is included for symmetry with the
+        # other actor-parametrized tests in this module, same as
+        # test_pending_to_done_legal above.
+        assert is_legal_transition(TaskStatus.DEFERRED, TaskStatus.DONE, actor) is True
+
+    @pytest.mark.parametrize(
+        'actor',
+        [
+            ActorClass.HUMAN,
+            ActorClass.ORCHESTRATOR,
+            ActorClass.DETERMINISTIC,
+            ActorClass.RECONCILIATION,
+            ActorClass.ESCALATION,
+        ],
+    )
     def test_pending_to_blocked_legal(self, actor):
         # Deterministic pure-gate born-at-L2 path (deterministic_runner.py:
         # 755/853, set_task_status(task_id, 'blocked') while still pending,
@@ -232,6 +256,12 @@ _CORE_UNION_PAIRS = [
         TaskStatus.PENDING,
         TaskStatus.DONE,
         'completion: recon found_on_main; operator direct-complete is an out-of-band manual write, no enumerated call site',
+    ),
+    (
+        TaskStatus.DEFERRED,
+        TaskStatus.DONE,
+        'completion: operator/vehicle direct-complete of a deferred task landed out-of-band '
+        '(planning-mode/merge-vehicle via merge queue), manual write, no enumerated call site',
     ),
     # park
     (TaskStatus.IN_PROGRESS, TaskStatus.MERGE_DEFERRED, 'park: workflow.py:867/896'),
