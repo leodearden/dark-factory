@@ -10625,3 +10625,564 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
         await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
 
         harness._escalate.assert_called_once()
+
+
+# ── Tests for Task 2417: reconciliation freshness pre-check wiring ───────
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_wires_scope_freshness_precheck(
+    journal, event_buffer, mock_memory_service,
+):
+    """_run_remediation_pass calls precheck_scope_correction_freshness and feeds
+    Stage 1 the FILTERED findings list, not the original.
+
+    Task 2417: the harness-level findings list fed to
+    _configure_consolidator(..., remediation_findings=findings, ...)
+    (harness.py:~2649, attribute set at ~675) is the single choke point shared
+    by both Stage 1 (remediation_findings) and Stage 2 (remediation_mode=True
+    — no findings list of its own) remediation re-derivation, so gating it
+    there covers both stages with one edit.
+    """
+    from fused_memory.reconciliation.harness import TierConfig
+    from fused_memory.reconciliation.scope_freshness import ScopeFreshnessResult
+    from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {'autopilot_video': '/r/av', 'dark_factory': '/r/df'},
+    )
+    stages = harness._make_stages(_scope('autopilot_video', '/r/av'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
+
+    stage1 = stages[0]
+    assert isinstance(stage1, MemoryConsolidator)
+    for stage in stages:
+        _mock_stage_run(stage)
+
+    findings = _make_s3_findings()[:2]  # two actionable findings
+    kept_finding = findings[1]
+    freshness_result = ScopeFreshnessResult(
+        to_reinvestigate=[kept_finding],
+        skipped=[findings[0]],
+        stats={
+            'scope_freshness_candidates': 1,
+            'scope_freshness_reinvestigated': 1,
+            'scope_freshness_skipped': 1,
+        },
+    )
+    mock_precheck = AsyncMock(return_value=freshness_result)
+
+    tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+
+    with patch(
+        'fused_memory.reconciliation.harness.precheck_scope_correction_freshness',
+        new=mock_precheck,
+    ):
+        await harness._run_remediation_pass(
+            'autopilot_video',
+            'parent-run-id',
+            findings,
+            tier,
+            scope=_scope('autopilot_video', '/r/av'),
+        )
+
+    mock_precheck.assert_awaited_once()
+    assert mock_precheck.await_args is not None
+    call_kwargs = mock_precheck.await_args.kwargs
+    assert call_kwargs.get('findings') == findings, (
+        'precheck must be called with the ORIGINAL (unfiltered) findings list'
+    )
+    assert call_kwargs.get('project_id') == 'autopilot_video'
+    run_id_arg = call_kwargs.get('run_id')
+    assert isinstance(run_id_arg, str) and run_id_arg, (
+        f'Expected a non-empty run_id string, got {run_id_arg!r}'
+    )
+    resolve_project_root = call_kwargs.get('resolve_project_root')
+    assert callable(resolve_project_root), (
+        'precheck must be given a resolve_project_root callable'
+    )
+    assert resolve_project_root('dark_factory') == '/r/df', (
+        'the injected resolve_project_root must resolve via the harness known-projects registry'
+    )
+
+    # Stage 1 must receive the FILTERED (post-precheck) findings list, not the
+    # original two-item list _run_remediation_pass was called with.
+    assert stage1.remediation_findings == freshness_result.to_reinvestigate, (
+        f'Expected stage1.remediation_findings == {freshness_result.to_reinvestigate!r} '
+        f'(the pre-check-filtered list), got {stage1.remediation_findings!r}'
+    )
+    assert stage1.remediation_findings != findings, (
+        'stage1.remediation_findings must be the FILTERED list, not the original two-item findings'
+    )
+
+    # _resolve_known_root: thin lookup into _known_projects, used to build the
+    # resolve_project_root callable threaded into the pre-check above.
+    assert harness._resolve_known_root('dark_factory') == '/r/df'
+    assert harness._resolve_known_root('nope') is None
+
+
+def _stage_run_mock(stage) -> AsyncMock:
+    """Build an AsyncMock replacement for stage.run returning a minimal StageReport.
+
+    Unlike the module-level _mock_stage_run helper (which installs a plain
+    async function so tests can attach a before_return capture callback),
+    this returns the AsyncMock ITSELF so callers can assert_awaited /
+    assert_not_awaited on it directly — needed to prove a short-circuited
+    remediation pass never launches a stage (task 2417).
+    """
+    mock = AsyncMock(return_value=StageReport(
+        stage=stage.stage_id,
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        items_flagged=[],
+        stats={},
+        llm_calls=0,
+        tokens_used=0,
+    ))
+    stage.run = mock
+    return mock
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_short_circuits_when_all_fresh(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """_run_remediation_pass must skip building/running any stage — and still
+    journal-complete the run — when the freshness pre-check confirms EVERY
+    finding is unchanged (to_reinvestigate=[], skipped non-empty).
+
+    Task 2417: this is the guard against the redundant full LLM re-derivation
+    the incident described — an all-fresh remediation batch must never reach
+    a stage.run() call (no LLM subprocess launches).
+    """
+    from fused_memory.reconciliation.harness import TierConfig
+    from fused_memory.reconciliation.scope_freshness import ScopeFreshnessResult
+
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {'autopilot_video': '/r/av', 'dark_factory': '/r/df'},
+    )
+    stages = harness._make_stages(_scope('autopilot_video', '/r/av'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
+    stage_run_mocks = [_stage_run_mock(s) for s in stages]
+
+    findings = _make_s3_findings()[:2]
+    freshness_result = ScopeFreshnessResult(
+        to_reinvestigate=[],
+        skipped=list(findings),
+        stats={
+            'scope_freshness_candidates': 2,
+            'scope_freshness_reinvestigated': 0,
+            'scope_freshness_skipped': 2,
+        },
+    )
+    mock_precheck = AsyncMock(return_value=freshness_result)
+
+    original_complete_run = harness.journal.complete_run
+    complete_run_calls: list[tuple[str, str]] = []
+
+    async def spy_complete_run(run_id, status):
+        complete_run_calls.append((run_id, status))
+        return await original_complete_run(run_id, status)
+
+    harness.journal.complete_run = spy_complete_run
+
+    tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+
+    with (
+        patch(
+            'fused_memory.reconciliation.harness.precheck_scope_correction_freshness',
+            new=mock_precheck,
+        ),
+        caplog.at_level(logging.INFO),
+    ):
+        await harness._run_remediation_pass(
+            'autopilot_video',
+            'parent-run-id',
+            findings,
+            tier,
+            scope=_scope('autopilot_video', '/r/av'),
+        )
+
+    for mock in stage_run_mocks:
+        mock.assert_not_awaited()
+
+    assert mock_precheck.await_args is not None
+    run_id_arg = mock_precheck.await_args.kwargs.get('run_id')
+    assert complete_run_calls == [(run_id_arg, 'completed')], (
+        f"Expected the run to be journal-completed exactly once with status "
+        f"'completed', got {complete_run_calls!r}"
+    )
+
+    skip_logs = [
+        r for r in caplog.records
+        if r.message == 'reconciliation.remediation_skipped_all_fresh'
+    ]
+    assert skip_logs, (
+        f'Expected a reconciliation.remediation_skipped_all_fresh log, got: '
+        f'{[r.message for r in caplog.records]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_runs_stages_when_findings_remain_after_precheck(
+    journal, event_buffer, mock_memory_service,
+):
+    """Guard against an over-eager short-circuit: when the pre-check keeps at
+    least one finding in to_reinvestigate, every stage MUST still run.
+    """
+    from fused_memory.reconciliation.harness import TierConfig
+    from fused_memory.reconciliation.scope_freshness import ScopeFreshnessResult
+
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {'autopilot_video': '/r/av', 'dark_factory': '/r/df'},
+    )
+    stages = harness._make_stages(_scope('autopilot_video', '/r/av'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
+    stage_run_mocks = [_stage_run_mock(s) for s in stages]
+
+    findings = _make_s3_findings()[:2]
+    freshness_result = ScopeFreshnessResult(
+        to_reinvestigate=[findings[1]],
+        skipped=[findings[0]],
+        stats={
+            'scope_freshness_candidates': 2,
+            'scope_freshness_reinvestigated': 1,
+            'scope_freshness_skipped': 1,
+        },
+    )
+    mock_precheck = AsyncMock(return_value=freshness_result)
+
+    tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+
+    with patch(
+        'fused_memory.reconciliation.harness.precheck_scope_correction_freshness',
+        new=mock_precheck,
+    ):
+        await harness._run_remediation_pass(
+            'autopilot_video',
+            'parent-run-id',
+            findings,
+            tier,
+            scope=_scope('autopilot_video', '/r/av'),
+        )
+
+    for mock in stage_run_mocks:
+        mock.assert_awaited_once()
+
+
+# ── Amendment round: post-plan reviewer finding test_coverage ─────────────
+#
+# The three tests below were added in the amendment pass (not part of the
+# original step-1..step-18 TDD plan) to cover the harness-level wiring the
+# reviewer flagged as untested: a raising pre-check's fallback to the
+# original findings (no short-circuit), and the scope_freshness_precheck
+# log's skipped_task_refs content.
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_precheck_exception_falls_back_to_unfiltered_findings(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """If precheck_scope_correction_freshness itself raises, _run_remediation_pass
+    must fall back to the ORIGINAL, unfiltered findings and run every stage
+    normally — never short-circuit, never drop a finding because the
+    pre-check itself misbehaved (task 2417 amendment: reviewer test_coverage
+    finding).
+    """
+    from fused_memory.reconciliation.harness import TierConfig
+    from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {'autopilot_video': '/r/av', 'dark_factory': '/r/df'},
+    )
+    stages = harness._make_stages(_scope('autopilot_video', '/r/av'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
+    stage1 = stages[0]
+    assert isinstance(stage1, MemoryConsolidator)
+    stage_run_mocks = [_stage_run_mock(s) for s in stages]
+
+    findings = _make_s3_findings()[:2]
+    mock_precheck = AsyncMock(side_effect=RuntimeError('precheck exploded'))
+
+    tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+
+    with (
+        patch(
+            'fused_memory.reconciliation.harness.precheck_scope_correction_freshness',
+            new=mock_precheck,
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        await harness._run_remediation_pass(
+            'autopilot_video',
+            'parent-run-id',
+            findings,
+            tier,
+            scope=_scope('autopilot_video', '/r/av'),
+        )
+
+    # Every stage still ran — no short-circuit — fed the ORIGINAL findings.
+    for mock in stage_run_mocks:
+        mock.assert_awaited_once()
+    assert stage1.remediation_findings == findings, (
+        'a raising pre-check must fall back to the ORIGINAL unfiltered findings, '
+        f'got {stage1.remediation_findings!r}'
+    )
+
+    fail_logs = [
+        r for r in caplog.records
+        if r.message == 'reconciliation.scope_freshness_precheck_wiring_failed'
+    ]
+    assert fail_logs, (
+        f'Expected a reconciliation.scope_freshness_precheck_wiring_failed log, got: '
+        f'{[r.message for r in caplog.records]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_logs_skipped_task_refs(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """The reconciliation.scope_freshness_precheck log must carry the
+    project-qualified task_ref of every finding the pre-check skipped, so a
+    freshness-confirmed skip stays observable (task 2417 amendment: reviewer
+    test_coverage finding).
+    """
+    from fused_memory.reconciliation.harness import TierConfig
+    from fused_memory.reconciliation.scope_freshness import ScopeFreshnessResult
+
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {'autopilot_video': '/r/av', 'dark_factory': '/r/df'},
+    )
+    stages = harness._make_stages(_scope('autopilot_video', '/r/av'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
+    for stage in stages:
+        _mock_stage_run(stage)
+
+    findings = _make_s3_findings()[:2]
+    skipped_finding = {
+        'flag_type': 'cross_project',
+        'description': 'scope correction thread',
+        'cited_tasks': [
+            {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'},
+        ],
+    }
+    freshness_result = ScopeFreshnessResult(
+        to_reinvestigate=list(findings),
+        skipped=[skipped_finding],
+        stats={
+            'scope_freshness_candidates': 1,
+            'scope_freshness_reinvestigated': 2,
+            'scope_freshness_skipped': 1,
+            'scope_freshness_forced_reinvestigation': 0,
+        },
+    )
+    mock_precheck = AsyncMock(return_value=freshness_result)
+
+    tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+
+    with (
+        patch(
+            'fused_memory.reconciliation.harness.precheck_scope_correction_freshness',
+            new=mock_precheck,
+        ),
+        caplog.at_level(logging.INFO),
+    ):
+        await harness._run_remediation_pass(
+            'autopilot_video',
+            'parent-run-id',
+            findings,
+            tier,
+            scope=_scope('autopilot_video', '/r/av'),
+        )
+
+    precheck_logs = [
+        r for r in caplog.records
+        if r.message == 'reconciliation.scope_freshness_precheck'
+    ]
+    assert precheck_logs, (
+        f'Expected a reconciliation.scope_freshness_precheck log, got: '
+        f'{[r.message for r in caplog.records]}'
+    )
+    assert precheck_logs[0].skipped_task_refs == ['dark_factory:2405']
+    assert precheck_logs[0].scope_freshness_skipped == 1
+
+
+# ── Second amendment round: post-plan reviewer finding behavior_change ────
+#
+# The two tests below (plan.json step-19) lock in the persistence-window
+# stamp (step-20): an all-fresh short-circuited remediation run must still
+# count toward _finding_persistence_count's lookback window, so a
+# perpetually-fresh-but-unresolved stranded thread still escalates within a
+# bounded number of cycles instead of being silently suppressed forever by
+# the consecutive-skip cap alone.
+
+
+@pytest.mark.asyncio
+async def test_remediation_short_circuit_stamps_integrity_check_for_persistence(
+    journal, event_buffer, mock_memory_service,
+):
+    """The all-fresh short-circuit must stamp freshness.skipped into a
+    synthetic integrity_check stage report BEFORE journal-completing the
+    run, so the short-circuited run counts toward
+    _finding_persistence_count's lookback window exactly as a real Stage 3
+    re-flag would have (task 2417 amendment — reviewer finding
+    behavior_change).
+    """
+    from fused_memory.reconciliation.harness import TierConfig
+    from fused_memory.reconciliation.scope_freshness import ScopeFreshnessResult
+
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {'autopilot_video': '/r/av', 'dark_factory': '/r/df'},
+    )
+    stages = harness._make_stages(_scope('autopilot_video', '/r/av'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
+    stage_run_mocks = [_stage_run_mock(s) for s in stages]
+
+    findings = _make_s3_findings()[:2]
+    freshness_result = ScopeFreshnessResult(
+        to_reinvestigate=[],
+        skipped=list(findings),
+        stats={
+            'scope_freshness_candidates': 2,
+            'scope_freshness_reinvestigated': 0,
+            'scope_freshness_skipped': 2,
+        },
+    )
+    mock_precheck = AsyncMock(return_value=freshness_result)
+
+    tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+
+    with patch(
+        'fused_memory.reconciliation.harness.precheck_scope_correction_freshness',
+        new=mock_precheck,
+    ):
+        await harness._run_remediation_pass(
+            'autopilot_video',
+            'parent-run-id',
+            findings,
+            tier,
+            scope=_scope('autopilot_video', '/r/av'),
+        )
+
+    # Still no stage launched — the stamp must not defeat the short-circuit.
+    for mock in stage_run_mocks:
+        mock.assert_not_awaited()
+
+    recent = await journal.get_recent_runs('autopilot_video', limit=1)
+    assert len(recent) == 1, f'Expected exactly one persisted run, got {len(recent)}'
+    run = recent[0]
+    assert run.status == 'completed'
+    s3_report = run.stage_reports.get('integrity_check')
+    assert s3_report is not None, (
+        'Expected a synthetic integrity_check report stamped onto the '
+        'short-circuited run, got none'
+    )
+    items_flagged = (
+        s3_report.get('items_flagged') if isinstance(s3_report, dict) else s3_report.items_flagged
+    )
+    assert items_flagged == findings, (
+        f'Expected the stamped integrity_check report to carry the skipped '
+        f'findings {findings!r}, got {items_flagged!r}'
+    )
+
+    persistence = await harness._finding_persistence_count(
+        'autopilot_video', findings[0], lookback=5,
+    )
+    assert persistence >= 1, (
+        'Expected the short-circuited run to count toward '
+        '_finding_persistence_count, got 0'
+    )
+
+
+@pytest.mark.asyncio
+async def test_perpetually_fresh_thread_escalates_within_bounded_cycles(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """A cross-project thread that the freshness pre-check confirms fresh
+    (and therefore short-circuits) every cycle but for one forced
+    re-investigation must still escalate no later than the forced
+    (cap-reached) cycle — the persistence-gated escalation gate must never
+    be permanently starved by an unbroken run of short-circuited skips
+    (task 2417 amendment — reviewer finding behavior_change: the reviewer's
+    explicit end-to-end ask, regression-protecting the interaction between
+    the consecutive-skip cap and the persistence stamp rather than arguing
+    it only in prose).
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    import fused_memory.reconciliation.harness as harness_module
+    from fused_memory.reconciliation.harness import (
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+        TierConfig,
+    )
+    from fused_memory.reconciliation.scope_freshness import ScopeFreshnessResult
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', lambda *a, **kw: False)
+
+    finding = _make_finding_with_cited_task('9999')
+
+    # Stage 1/2 always empty; Stage 3 (integrity_check) re-flags `finding`
+    # whenever a cycle actually runs stages (only the forced cycle below).
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=[finding])
+
+    skip_result = ScopeFreshnessResult(
+        to_reinvestigate=[], skipped=[finding],
+        stats={
+            'scope_freshness_candidates': 1,
+            'scope_freshness_reinvestigated': 0,
+            'scope_freshness_skipped': 1,
+        },
+    )
+    forced_result = ScopeFreshnessResult(
+        to_reinvestigate=[finding], skipped=[],
+        stats={
+            'scope_freshness_candidates': 1,
+            'scope_freshness_reinvestigated': 1,
+            'scope_freshness_skipped': 0,
+            'scope_freshness_forced_reinvestigation': 1,
+        },
+    )
+    mock_precheck = AsyncMock(
+        side_effect=(
+            [skip_result] * (_INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 1) + [forced_result]
+        )
+    )
+
+    tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+
+    with patch(
+        'fused_memory.reconciliation.harness.precheck_scope_correction_freshness',
+        new=mock_precheck,
+    ):
+        for _ in range(_INTEGRITY_FINDING_RECURRENCE_THRESHOLD):
+            await harness._run_remediation_pass(
+                'test-project',
+                'parent-run-id',
+                [finding],
+                tier,
+                scope=_scope('test-project', '/tmp/test-project'),
+            )
+
+    pending = esc_queue.get_pending()
+    stranded_escalations = [
+        e for e in pending
+        if e.category == 'recon_integrity_issue' and 'Persistently unresolved' in e.summary
+    ]
+    assert stranded_escalations, (
+        f'Expected the perpetually-fresh-but-unresolved thread to escalate '
+        f'within {_INTEGRITY_FINDING_RECURRENCE_THRESHOLD} cycles; '
+        f'got pending: {[e.summary for e in pending]}'
+    )

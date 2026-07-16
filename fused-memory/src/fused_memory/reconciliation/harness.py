@@ -44,6 +44,11 @@ from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
+from fused_memory.reconciliation.scope_freshness import (
+    ScopeFreshnessResult,
+    compute_scope_signature,
+    precheck_scope_correction_freshness,
+)
 from fused_memory.reconciliation.stages.memory_consolidator import (
     MemoryConsolidator,
     write_stage1_cycle_summary,
@@ -549,6 +554,19 @@ class ReconciliationHarness:
                 f'Set DASHBOARD_KNOWN_PROJECT_ROOTS env var or add a '
                 f'TaskmasterConfig.project_root that resolves to a known project.'
             ) from None
+
+    def _resolve_known_root(self, project_id: str) -> str | None:
+        """Return the registered project_root for *project_id*, or None if unknown.
+
+        Thin lookup into ``self._known_projects``.  Unlike
+        ``_known_project_scope_for`` (which raises ``UnknownProjectError`` for
+        an unrecognised project_id), this returns ``None`` on a miss so it can
+        be injected as the ``resolve_project_root`` callable for
+        :func:`fused_memory.reconciliation.scope_freshness.precheck_scope_correction_freshness`,
+        whose fail-open contract treats an unresolvable foreign project as
+        "keep for re-investigation" rather than raising (task 2417).
+        """
+        return self._known_projects.get(project_id)
 
     def drain(self) -> None:
         """Signal the harness to stop starting new reconciliation cycles.
@@ -2743,6 +2761,111 @@ class ReconciliationHarness:
             task_kind_by_id[tid] = _metadata.get('task_kind') if isinstance(_metadata, dict) else None
 
         current_stage_name: str | None = None
+
+        # Task 2417: cheap, deterministic freshness pre-check — BEFORE any
+        # stage is built or run. Filters cross-project scope-correction
+        # findings whose subject task is unchanged since the last
+        # consolidated snapshot out of `findings`, the single choke point
+        # shared by both Stage 1 (remediation_findings, wired below via
+        # _configure_consolidator) and Stage 2 (remediation_mode=True — no
+        # findings list of its own) remediation re-derivation. Best-effort:
+        # any failure here (unresolvable project, get_task/Mem0 errors, ...)
+        # falls back to the original, unfiltered `findings` — see the
+        # fused_memory.reconciliation.scope_freshness module docstring.
+        # `freshness` is pre-initialized to None so the except branch below
+        # (the pre-check raising before ever assigning it) leaves an
+        # unambiguous "pre-check did not run" sentinel for the short-circuit
+        # guard just below to key off of.
+        # `max_consecutive_skips` is wired to the SAME
+        # _INTEGRITY_FINDING_RECURRENCE_THRESHOLD used by the persistence-gated
+        # escalation loop below (amendment: reviewer finding
+        # robustness_silent_degradation) — a (task_ref, flag_key) pair can be
+        # skipped by the pre-check at most threshold-1 cycles in a row before
+        # it is forced back through a real Stage 1-3 pass. The cap ALONE is
+        # not sufficient for the loud-failure guarantee, though: the
+        # persistence-gated escalation loop only counts a run toward a
+        # finding's recurrence if that run's stage_reports carries an
+        # integrity_check entry, and a short-circuited run built none.  The
+        # short-circuit block below also stamps `freshness.skipped` into a
+        # synthetic integrity_check report before completing the run
+        # (amendment — reviewer finding behavior_change), so BOTH the cap's
+        # periodic forced re-investigation AND every intervening
+        # short-circuited skip contribute to the window — only together do
+        # they guarantee a genuinely stranded cross-project thread escalates
+        # within a bounded number of cycles instead of being silently
+        # suppressed forever.
+        freshness: ScopeFreshnessResult | None = None
+        try:
+            if self.taskmaster is None:
+                raise RuntimeError('taskmaster is not configured')
+            freshness = await precheck_scope_correction_freshness(
+                memory_service=self.memory,
+                taskmaster=self.taskmaster,
+                project_id=project_id,
+                resolve_project_root=self._resolve_known_root,
+                run_id=run_id,
+                findings=findings,
+                max_consecutive_skips=_INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+            )
+            findings = freshness.to_reinvestigate
+            skipped_task_refs = []
+            for _skipped in freshness.skipped:
+                _sig = compute_scope_signature(_skipped, project_id)
+                if _sig is not None:
+                    skipped_task_refs.append(_sig[0])
+            logger.info(
+                'reconciliation.scope_freshness_precheck',
+                extra={
+                    'run_id': run_id,
+                    'project_id': project_id,
+                    'skipped_task_refs': skipped_task_refs,
+                    **freshness.stats,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                'reconciliation.scope_freshness_precheck_wiring_failed',
+                extra={'run_id': run_id, 'project_id': project_id, 'error': str(exc)},
+            )
+
+        # Short-circuit: every finding was confirmed fresh (unchanged) by the
+        # pre-check above — skip building/running any stage entirely (no LLM
+        # subprocess launches) and journal-complete the run as-is. Guarded on
+        # `freshness is not None` so a pre-check that raised (and therefore
+        # fell back to the original, unfiltered `findings` above) never
+        # short-circuits — only a POSITIVE freshness confirmation may skip
+        # remediation, never an error/uncertainty path.
+        if freshness is not None and not findings and freshness.skipped:
+            logger.info(
+                'reconciliation.remediation_skipped_all_fresh',
+                extra={
+                    'run_id': run_id,
+                    'project_id': project_id,
+                    'parent_run_id': parent_run_id,
+                    **freshness.stats,
+                },
+            )
+            # Stamp the skipped findings into a synthetic integrity_check
+            # stage report BEFORE completing the run, so this short-circuited
+            # run still counts toward _finding_persistence_count's lookback
+            # window exactly as a real Stage 3 re-flag would have (task 2417
+            # amendment — reviewer finding behavior_change).  Without this,
+            # a short-circuited run occupied a slot in the persistence
+            # window while contributing 0, and the loud-failure guarantee
+            # described above depended on BOTH the consecutive-skip cap's
+            # periodic forced re-investigation AND this stamp — the cap
+            # alone forces a real pass only every threshold-th cycle, which
+            # is not by itself enough to saturate the persistence window.
+            # No stage is built or run here — this uses the plain-dict
+            # report shape the journal/tests already accept elsewhere
+            # ({'integrity_check': {'items_flagged': [...]}}).
+            run.stage_reports['integrity_check'] = {'items_flagged': list(freshness.skipped)}
+            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+            run.completed_at = datetime.now(UTC)
+            run.status = RunStatus.completed
+            await self.journal.complete_run(run_id, 'completed')
+            return
+
         stages = self._make_stages(scope)
         try:
             # Configure stages for remediation mode
