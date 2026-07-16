@@ -172,6 +172,17 @@ curator:
   # fused-memory/config/recon_code_fix_premise_registry.yaml for the schema.
   recon_code_fix_premise_registry_path: "config/recon_code_fix_premise_registry.yaml"
 
+  # Recon claim-verification backstop (task 2438): when true, specific
+  # code-level tokens a Stage 2 candidate attributes to a completed
+  # task/commit/ACTION (a metadata key, a stamp like foo=true, a named
+  # identifier) are verified against the live source tree + git history
+  # before the candidate is filed. Unlike recon_code_fix_premise_registry_path
+  # above, an unverified token is never dropped — it is only logged as an
+  # advisory recon_claim_verification.unverified WARNING for human review.
+  # Schema default is false (byte-identical for other deployments); enabled
+  # here for dark_factory.
+  recon_claim_verification_enabled: true
+
   # Operational-ask registry: YAML file listing recurring operational
   # live-data/live-mutation asks (already-built+unit-tested scripts whose
   # remaining work is dry-run -> human-review -> apply against live external
