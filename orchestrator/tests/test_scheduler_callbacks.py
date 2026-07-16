@@ -1,11 +1,11 @@
 """Tests for ``SchedulerCallbacks`` — the constructor-injected Harness↔Scheduler
 callback seam (task 2235, W10-α).
 
-Replaces the nine post-construction ``scheduler._on_*`` monkey-patches with a
+Replaces the post-construction ``scheduler._on_*`` monkey-patches with a
 single frozen dataclass passed to ``Scheduler.__init__``.
 
 Covers:
-  (a) ``SchedulerCallbacks`` shape — frozen dataclass, 9 fields, all default
+  (a) ``SchedulerCallbacks`` shape — frozen dataclass, 10 fields, all default
       ``None``.
   (b) ``Scheduler(config, callbacks=...)`` construction, with and without an
       explicit ``callbacks=`` argument (omitting it must collapse to an
@@ -28,12 +28,13 @@ from orchestrator.scheduler import Scheduler, SchedulerCallbacks
 
 
 class TestSchedulerCallbacksDataclass:
-    """(a) SchedulerCallbacks: frozen dataclass, 9 fields, all default None."""
+    """(a) SchedulerCallbacks: frozen dataclass, 10 fields, all default None."""
 
-    def test_all_nine_fields_default_none(self):
+    def test_all_fields_default_none(self):
         callbacks = SchedulerCallbacks()
         assert callbacks.on_park_stop_trip is None
         assert callbacks.on_external_dep_block is None
+        assert callbacks.on_delivered_check_block is None
         assert callbacks.on_starvation_warn is None
         assert callbacks.on_starvation_resolve is None
         assert callbacks.warm_base_health_probe is None
@@ -42,11 +43,12 @@ class TestSchedulerCallbacksDataclass:
         assert callbacks.on_warm_base_resolve is None
         assert callbacks.suppress_blocked_write is None
 
-    def test_field_count_is_exactly_nine(self):
+    def test_field_count_is_exactly_ten(self):
         field_names = {f.name for f in dataclasses.fields(SchedulerCallbacks)}
         assert field_names == {
             'on_park_stop_trip',
             'on_external_dep_block',
+            'on_delivered_check_block',
             'on_starvation_warn',
             'on_starvation_resolve',
             'warm_base_health_probe',
