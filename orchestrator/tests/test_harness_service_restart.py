@@ -68,6 +68,11 @@ def harness(tmp_path: Path, mock_orch_config):
     # default (8h). Only the orchestrator's own coordinator receives this — the
     # fused-memory/dashboard builders keep the 0.0 default (no gating).
     mock_orch_config.orchestrator_restart_min_interval_secs = 28800.0
+    # Force-fire escape (fleet-redeploy PRD task delta — task 2398). Mirrors
+    # the real Config default (75 min). Only the orchestrator's own
+    # coordinator receives this — the fused-memory/dashboard builders keep
+    # the 0.0 default (force-fire disabled, byte-identical behaviour).
+    mock_orch_config.orchestrator_restart_force_fire_after_secs = 4500.0
 
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
@@ -642,6 +647,19 @@ class TestBuildOrchestratorRestartCoordinator:
 
         assert coord._min_interval_secs == 28800.0
 
+    def test_force_fire_after_secs_matches_config(self, harness: Harness):
+        """The orchestrator coordinator gets the config's force-fire bound (4500.0).
+
+        Fleet-redeploy PRD task delta (task 2398): only the orchestrator's
+        own coordinator receives a non-zero force_fire_after_secs — the
+        fused-memory/dashboard builders keep the 0.0 (disabled) default,
+        see test_fused_memory_coordinator_has_no_force_fire and
+        test_dashboard_coordinator_has_no_force_fire below.
+        """
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._force_fire_after_secs == 4500.0
+
     def test_state_path_under_data_orchestrator(self, harness: Harness):
         """The rate-cap state file lives beside the merge-queue journal.
 
@@ -672,6 +690,18 @@ class TestBuildOrchestratorRestartCoordinator:
 
         assert coord._min_interval_secs == 0.0
         assert coord._state_path is None
+
+    def test_fused_memory_coordinator_has_no_force_fire(self, harness: Harness):
+        """fused-memory keeps the 0.0 default → force-fire stays disabled (byte-identical)."""
+        coord = harness._build_service_restart_coordinator()
+
+        assert coord._force_fire_after_secs == 0.0
+
+    def test_dashboard_coordinator_has_no_force_fire(self, harness: Harness):
+        """dashboard keeps the 0.0 default → force-fire stays disabled (byte-identical)."""
+        coord = harness._build_dashboard_restart_coordinator()
+
+        assert coord._force_fire_after_secs == 0.0
 
     def test_orchestrator_coordinator_stamp_clock_on_fire_is_false(self, harness: Harness):
         """The orchestrator's own coordinator never persists the clock on fire (task 2396).
