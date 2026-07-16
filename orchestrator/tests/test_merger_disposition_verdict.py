@@ -111,6 +111,33 @@ class TestResolveAndResubmitVerdictRouting:
         f.wf._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
         assert outcome == WorkflowOutcome.BLOCKED
 
+    async def test_blocked_true_empty_reason_falls_back_to_output(
+        self, tmp_path: Path,
+    ):
+        """(b2) verdict blocked=True with an empty reason falls back to an
+        output-derived reason string.
+
+        Exercises the ``verdict.get('reason') or f'Merger blocked:
+        {output[:200]}'`` fallback in ``_resolve_and_resubmit`` — case (b)
+        above always supplies a non-empty reason, so the ``or`` branch is
+        otherwise never asserted.
+        """
+        f = self._setup(tmp_path)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_with_verdict(
+                f, blocked=True, reason='', output='could not resolve safely',
+            ),
+        )
+
+        outcome = await f.wf._resolve_and_resubmit('B', 'conflict_X', merge_phase=True)
+
+        f.wf._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
+        args, _kwargs = f.wf._mark_blocked.await_args  # type: ignore[attr-defined]
+        assert 'Merger blocked:' in args[0]
+        assert 'could not resolve safely' in args[0]
+        f.wf._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
+        assert outcome == WorkflowOutcome.BLOCKED
+
     async def test_absent_verdict_is_failsafe_blocked(self, tmp_path: Path):
         """(c) no verdict written at all => fail-safe blocked-equivalent."""
         f = self._setup(tmp_path)
