@@ -900,6 +900,11 @@ class TestWriteTaskCountSnapshot:
     async def test_success_writes_once_and_returns_true(self):
         memory_service = AsyncMock()
         memory_service.get_memories_by_metadata.return_value = []
+        # Task 2655: an empty scroll now triggers the prune's count
+        # cross-check (TestPruneSilentEmptyGuard); a confirmed count of 0
+        # is what makes this a genuine empty pool that the write-gate
+        # (TestWriteTaskCountSnapshot below) lets through.
+        memory_service.count_memories_by_metadata.return_value = 0
         memory_service.add_memory.return_value = {'memory_ids': ['m1']}
         taskmaster = self._taskmaster()
 
@@ -1064,6 +1069,101 @@ class TestWriteTaskCountSnapshot:
             call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
         }
         assert deleted_ids == {'stale-1', 'stale-2'}
+        memory_service.add_memory.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# _write_task_count_snapshot -- enumeration-failure write-gate (task 2655)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteTaskCountSnapshotEnumerationGate:
+    """_write_task_count_snapshot skips the deterministic write (returns
+    None, never calls add_memory) when the prune reports
+    enumeration_ok=0 (task 2655).
+
+    Writing a fresh snapshot when the prior ones could not be
+    enumerated/pruned is exactly what grows the byte-identical duplicate
+    pile (the recurring incident this task exists to fix). Skipping is
+    self-correcting: the next healthy cycle enumerates and prunes all
+    accumulated duplicates, then writes one. Deliberately supersedes task
+    2646's pinned "write still proceeds on enumeration failure" behavior --
+    see TestRunSurfacesPruneObservability.
+    test_live_silent_enumeration_failure_surfaces_as_not_ok, updated
+    alongside this class.
+    """
+
+    def _taskmaster(self):
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {
+            'tasks': [
+                {'id': 1, 'status': 'pending'},
+                {'id': 2, 'status': 'in-progress'},
+                {'id': 3, 'status': 'done'},
+                {'id': 4, 'status': 'cancelled'},
+            ],
+        }
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_enumeration_raises_skips_write(self):
+        """(a) The prune's own scroll call raises outright -- the write
+        must be skipped (returns None, add_memory never called) rather
+        than proceeding to add a fresh snapshot on top of an unprunable
+        pile."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.side_effect = RuntimeError('mem0 down')
+        taskmaster = self._taskmaster()
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+        )
+
+        assert result is None
+        memory_service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_fingerprint_skips_write(self):
+        """(b) Empty scroll + count cross-check reports 2 existing
+        snapshots -- the swallowed-timeout fingerprint. The write must be
+        skipped so the cycle doesn't add another duplicate on top of the
+        un-enumerable pile."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+        memory_service.count_memories_by_metadata.return_value = 2
+        taskmaster = self._taskmaster()
+        observed = {}
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+            stats=observed,
+        )
+
+        assert result is None
+        memory_service.add_memory.assert_not_awaited()
+        assert observed[SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY] == 0
+
+    @pytest.mark.asyncio
+    async def test_healthy_enumeration_still_writes(self):
+        """(c) Positive guard: a normal non-empty scroll (enumeration_ok=1)
+        must still write -- the gate must not over-skip a healthy cycle."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {
+                'id': 'stale-1',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'kind': 'task_count_snapshot'},
+            },
+        ]
+        memory_service.delete_memory.return_value = None
+        memory_service.add_memory.return_value = {'memory_ids': ['fresh-1']}
+        taskmaster = self._taskmaster()
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+        )
+
+        assert result is True
         memory_service.add_memory.assert_awaited_once()
 
 
@@ -1581,10 +1681,12 @@ class TestRunSurfacesPruneObservability:
     @pytest.mark.asyncio
     async def test_live_silent_enumeration_failure_surfaces_as_not_ok(self, mock_deps):
         """Case (b), the incident fingerprint: enumeration RAISES inside the
-        real prune, yet the canonical add_memory write still proceeds.
-        report.stats must show enumeration_ok=0 / enumerated=0 -- runtime-
-        observably distinct from a genuine empty result -- rather than
-        silently looking like nothing was ever there to prune."""
+        real prune. report.stats must show enumeration_ok=0 / enumerated=0
+        -- runtime-observably distinct from a genuine empty result -- and
+        (task 2655) the canonical add_memory write must now be SKIPPED
+        rather than proceeding and adding another duplicate on top of an
+        unprunable pile. This supersedes task 2646's pinned
+        write-proceeds-on-enumeration-failure behavior."""
 
         def _get_memories_by_metadata(*, project_id, filters, **kwargs):
             if filters == {'kind': TASK_COUNT_SNAPSHOT_KIND}:
@@ -1612,4 +1714,40 @@ class TestRunSurfacesPruneObservability:
 
         assert report.stats['task_count_snapshot_prune_enumeration_ok'] == 0
         assert report.stats['task_count_snapshot_prune_enumerated'] == 0
-        mock_deps['memory_service'].add_memory.assert_awaited_once()
+        mock_deps['memory_service'].add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_timeout_fingerprint_skips_write_no_duplicate_added(self, mock_deps):
+        """Case (c), task 2655's core fix: the scroll comes back EMPTY
+        (no exception -- the swallowed-timeout shape) while the count
+        cross-check reports 2 existing snapshots. The real prune must
+        surface enumeration_ok=0, and the canonical write must be skipped
+        entirely -- no duplicate added on top of the un-enumerable pile."""
+
+        def _get_memories_by_metadata(*, project_id, filters, **kwargs):
+            if filters == {'kind': TASK_COUNT_SNAPSHOT_KIND}:
+                return []
+            return []
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            side_effect=_get_memories_by_metadata,
+        )
+        mock_deps['memory_service'].count_memories_by_metadata.return_value = 2
+
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('reify', '/tmp/test'),
+            **mock_deps,
+        )
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=self._fake_cli_result()),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='run-prune-live-timeout-fingerprint',
+            )
+
+        assert report.stats['task_count_snapshot_prune_enumeration_ok'] == 0
+        mock_deps['memory_service'].add_memory.assert_not_awaited()
