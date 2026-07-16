@@ -30,19 +30,52 @@ test passes on arrival).
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import types
 from pathlib import Path
 
 import pytest
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
-from test_task_runtime import _init_repo, _make_task_artifacts, _warm_config
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.lane_lifecycle import LaneState
 from orchestrator.task_runtime import build_task_runtime_snapshot
+
+# ---------------------------------------------------------------------------
+# Sibling-fixture reuse, loaded by explicit file path rather than a bare
+# `from test_task_runtime import ...`. dashboard/tests/test_task_runtime.py
+# shares this module's bare name and defines none of `_init_repo` /
+# `_make_task_artifacts` / `_warm_config`. Both subprojects' conftest.py
+# insert their own tests/ dir at sys.path[0] (orchestrator/tests/conftest.py,
+# dashboard/tests/conftest.py), so a bare import's resolution is conftest-
+# load-order-dependent: collecting both suites together (e.g. `pytest
+# orchestrator/tests/test_task_runtime_snapshot.py dashboard/tests/
+# test_task_runtime_boundary.py`) reproducibly binds to the wrong module and
+# fails collection with a confusing ImportError (verified). Loading by
+# explicit path bypasses sys.path/sys.modules bare-name resolution entirely.
+# ---------------------------------------------------------------------------
+
+
+def _load_sibling_test_module(filename: str, unique_name: str):
+    """Load *filename* from this tests/ dir under *unique_name*, independent
+    of sys.path order or any bare-name entry already cached in sys.modules.
+    """
+    spec = importlib.util.spec_from_file_location(unique_name, Path(__file__).parent / filename)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_task_runtime_fixtures = _load_sibling_test_module(
+    'test_task_runtime.py', '_orchestrator_test_task_runtime_fixtures',
+)
+_init_repo = _task_runtime_fixtures._init_repo
+_make_task_artifacts = _task_runtime_fixtures._make_task_artifacts
+_warm_config = _task_runtime_fixtures._warm_config
 
 # ---------------------------------------------------------------------------
 # Repo fixture — mirrors test_task_runtime.py's git_repo fixture (redefined
