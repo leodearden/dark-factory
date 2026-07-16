@@ -3818,6 +3818,19 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         worktree_log_paths.extend(r.worktree_log_paths)
         archive_log_paths.extend(r.archive_log_paths)
 
+    # Task μ: aggregate failing_test_ids — None iff EVERY child's is None
+    # (nothing collected anywhere: no merge+full module in this run, or
+    # every junit report was unreadable), else the sorted, de-duped union of
+    # every non-None child list. A None child contributes nothing but does
+    # NOT suppress a sibling's collected ids, and a child that collected an
+    # empty list ([] — "clean") still makes the aggregate non-None, distinct
+    # from a child that never collected at all (None) — see
+    # VerifyResult.failing_test_ids's docstring.
+    _child_failing_ids = [r.failing_test_ids for r in results if r.failing_test_ids is not None]
+    failing_test_ids = (
+        sorted({fid for ids in _child_failing_ids for fid in ids}) if _child_failing_ids else None
+    )
+
     return VerifyResult(
         passed=passed,
         test_output=test_output,
@@ -3833,6 +3846,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # so the slowest module dominates the total elapsed time.  Single-module
         # tasks hit the len==1 fast path above and carry the exact value.
         duration_secs=max((r.duration_secs for r in results), default=0.0),
+        failing_test_ids=failing_test_ids,
     )
 
 
