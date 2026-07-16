@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from escalation.models import BORN_AT_L2_SEVERITIES, Escalation, TrainState
+from escalation.models import BORN_AT_L2_SEVERITIES, RESOLUTION_CLASSES, Escalation, TrainState
 
 
 class TestBornAtL2Severities:
@@ -426,4 +426,118 @@ class TestEscalationResolutionAction:
         restored = Escalation.from_json(old_json)
         assert restored.resolution_action is None, (
             f"Expected resolution_action=None for legacy JSON, got {restored.resolution_action!r}"
+        )
+
+
+class TestEscalationResolutionClass:
+    """Escalation dataclass has a resolution_class field (escalation-lifecycle-dashboard-prd.md Seam 1)."""
+
+    def _make_base_esc(self) -> Escalation:
+        return Escalation(
+            id='esc-task-300-0001',
+            task_id='300',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='scope_violation',
+            summary='test escalation for resolution_class',
+        )
+
+    # --- (a) default is None ---
+
+    def test_resolution_class_default_is_none(self):
+        """Escalation constructed without resolution_class has resolution_class=None."""
+        esc = self._make_base_esc()
+        assert esc.resolution_class is None
+
+    # --- (b) RESOLUTION_CLASSES constant ---
+
+    def test_resolution_classes_is_frozenset(self):
+        """RESOLUTION_CLASSES is a frozenset."""
+        assert isinstance(RESOLUTION_CLASSES, frozenset)
+
+    def test_resolution_classes_contains_exactly_benign_and_actionable(self):
+        """RESOLUTION_CLASSES contains exactly {'benign', 'actionable'} — no extras."""
+        assert RESOLUTION_CLASSES == frozenset({'benign', 'actionable'})
+
+    # --- (c) round-trip to_dict/from_dict and to_json/from_json ---
+
+    def test_resolution_class_round_trip_via_to_dict_from_dict(self):
+        """resolution_class='benign' is preserved through to_dict() / from_dict()."""
+        esc = Escalation(
+            id='esc-task-300-0001',
+            task_id='300',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='scope_violation',
+            summary='test resolution_class round-trip',
+            resolution_class='benign',
+        )
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.resolution_class == 'benign'
+
+    def test_resolution_class_round_trip_via_to_json_from_json(self):
+        """resolution_class='benign' is preserved through to_json() / from_json()."""
+        esc = Escalation(
+            id='esc-task-300-0001',
+            task_id='300',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='scope_violation',
+            summary='test resolution_class json round-trip',
+            resolution_class='benign',
+        )
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.resolution_class == 'benign'
+
+    def test_resolution_class_appears_in_to_json_output(self):
+        """resolution_class is serialised (not silently dropped) when set."""
+        esc = Escalation(
+            id='esc-task-300-0001',
+            task_id='300',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='scope_violation',
+            summary='test resolution_class in json',
+            resolution_class='actionable',
+        )
+        d = json.loads(esc.to_json())
+        assert 'resolution_class' in d
+        assert d['resolution_class'] == 'actionable'
+
+    # --- (d) legacy JSON backward compat ---
+
+    def test_from_dict_legacy_json_omits_resolution_class(self):
+        """from_json() on JSON without resolution_class key returns resolution_class=None (backward compat)."""
+        old_dict = {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without resolution_class',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'train_state': None,
+            'resolution_action': None,
+            # NOTE: resolution_class is intentionally absent
+        }
+        old_json = json.dumps(old_dict)
+        restored = Escalation.from_json(old_json)
+        assert restored.resolution_class is None, (
+            f"Expected resolution_class=None for legacy JSON, got {restored.resolution_class!r}"
         )
