@@ -829,3 +829,106 @@ class TestFlowCubeConsistency:
             source = s['source']
             assert flow_source_class_counts.get((source, 'benign'), 0) == s['benign']
             assert flow_source_class_counts.get((source, 'actionable'), 0) == s['actionable']
+
+
+# ---------------------------------------------------------------------------
+# step-14: deterministic stratified-by-tier downsample of lifespan.samples
+# ---------------------------------------------------------------------------
+
+
+class TestSamplesDownsampling:
+    """lifespan.samples: deterministic stratified-by-tier downsample above threshold.
+
+    ``_aggregate_project`` takes a ``downsample_threshold`` kwarg (mirroring
+    ``build_escalation_analytics``'s top-level parameter). Above threshold,
+    ``samples`` is capped with a per-tier-proportional, RNG-free selection;
+    the payload carries a loud ``samples_downsampled`` marker plus
+    ``samples_total`` (the pre-downsample count) — no silent truncation.
+    Below/at threshold, ``samples`` is untouched and neither key appears.
+    """
+
+    # 3 tiers at a 3:2:1 ratio (60/40/20 of 120 total) so a threshold=40
+    # downsample gives every tier a comfortably non-zero quota.
+    _TIER_RESOLVERS = {
+        'human': 'interactive',
+        'auto-watcher': 'escalation-watcher-auto',
+        'reaper-sweep': 'auto-dismissed',
+    }
+    _TIER_COUNTS = {'human': 60, 'auto-watcher': 40, 'reaper-sweep': 20}
+
+    def _build_fixture(self, esc_dir: Path, now: datetime) -> int:
+        """Write ``_TIER_COUNTS`` terminal records per tier; return the total count."""
+        total = 0
+        for tier, resolved_by in self._TIER_RESOLVERS.items():
+            for i in range(self._TIER_COUNTS[tier]):
+                esc = {
+                    'id': f'esc-ds-{tier}-{i}', 'task_id': f'ds-{tier}-{i}',
+                    'agent_role': 'implementer',
+                    'severity': 'info', 'category': 'cleanup_needed',
+                    'summary': 'downsample fixture',
+                    'timestamp': _iso(now - timedelta(days=100) + timedelta(hours=i)),
+                    'status': 'resolved', 'level': 0,
+                    'resolved_at': _iso(
+                        now - timedelta(days=100) + timedelta(hours=i, minutes=30)
+                    ),
+                    'resolved_by': resolved_by,
+                }
+                _write_escalation(esc_dir, esc, archived=True)
+                total += 1
+        return total
+
+    def test_downsamples_above_threshold_roughly_proportional_and_deterministic(self, tmp_path):
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        total = self._build_fixture(esc_dir, now)
+        assert total == sum(self._TIER_COUNTS.values())
+
+        threshold = 40
+        entry1, _ = _aggregate_project(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+            downsample_threshold=threshold,
+        )
+        lifespan1 = entry1['lifespan']
+        samples1 = lifespan1['samples']
+
+        assert len(samples1) <= threshold
+        assert lifespan1['samples_downsampled'] is True
+        assert lifespan1['samples_total'] == total
+
+        # No tier zeroed out; representation roughly proportional to each
+        # tier's original share (generous tolerance — the exact per-tier
+        # quota algorithm is an implementation detail this test isn't
+        # pinned to).
+        downsampled_tier_counts = Counter(row[1] for row in samples1)
+        assert set(downsampled_tier_counts) == set(self._TIER_COUNTS)
+        for tier, orig_n in self._TIER_COUNTS.items():
+            expected_share = orig_n / total
+            actual_share = downsampled_tier_counts[tier] / len(samples1)
+            assert abs(actual_share - expected_share) < 0.15
+
+        # Deterministic: a second independent call over the same fixture
+        # yields the exact same samples (no RNG involved).
+        entry2, _ = _aggregate_project(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+            downsample_threshold=threshold,
+        )
+        assert entry2['lifespan']['samples'] == samples1
+
+    def test_no_downsample_when_threshold_at_or_above_sample_count(self, tmp_path):
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        total = self._build_fixture(esc_dir, now)
+
+        entry, _ = _aggregate_project(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+            downsample_threshold=total + 1,
+        )
+        lifespan = entry['lifespan']
+
+        assert len(lifespan['samples']) == total
+        assert 'samples_downsampled' not in lifespan
+        assert 'samples_total' not in lifespan
