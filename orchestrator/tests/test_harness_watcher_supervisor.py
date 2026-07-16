@@ -2554,6 +2554,12 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
         h.config = h.config.model_copy(update={'watcher_misconfigured_min_rotation_secs': min_secs})
         h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
 
+        # task 2629: the empty-queue precheck only launches a rotation when an
+        # actionable L1 is pending — realistic here too, since a watcher
+        # outage is exactly when L1s pile up unhandled (_file_watcher_outage_l2's
+        # own summary reports the pending-L1 count).
+        _submit_sample_l1(queue)
+
         # Pre-file the outage L2
         h._file_watcher_outage_l2('watcher_crashloop')
         pending_before = [
@@ -2586,6 +2592,12 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
         min_secs = 30.0
         h.config = h.config.model_copy(update={'watcher_misconfigured_min_rotation_secs': min_secs})
         h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
+
+        # task 2629: the empty-queue precheck only launches a rotation when an
+        # actionable L1 is pending — realistic here too, since a watcher
+        # outage is exactly when L1s pile up unhandled (_file_watcher_outage_l2's
+        # own summary reports the pending-L1 count).
+        _submit_sample_l1(queue)
 
         # Pre-file the outage L2
         h._file_watcher_outage_l2('watcher_crashloop')

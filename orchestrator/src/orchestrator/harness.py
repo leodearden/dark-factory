@@ -7915,6 +7915,26 @@ Output JSON matching the schema. Every task must appear in the output.
         consecutive_unclean: int = 0
         consecutive_degenerate_clean: int = 0  # task 1430: exponential floor on fast-clean exits
         while True:
+            # task 2629: pre-boot empty-queue precheck.  Skip the (expensive)
+            # rotation launch entirely when the L1 queue has no actionable
+            # work; fails open (see _watcher_has_actionable_l1) so a precheck
+            # bug can never silently stop real L1 handling.  Deliberately
+            # placed before `start = time.monotonic()` and does not touch the
+            # clean/unclean/degenerate counters, the guards, or
+            # _maybe_write_digest — this is a pure pre-boot bypass, not a
+            # rotation outcome.
+            if not self._watcher_has_actionable_l1():
+                poll = self.config.watcher_empty_queue_poll_secs
+                logger.debug(
+                    'Escalation-watcher-auto: L1 queue has no actionable work; '
+                    'skipping rotation launch (poll=%.1fs)', poll,
+                )
+                try:
+                    await asyncio.sleep(poll)
+                except asyncio.CancelledError:
+                    raise  # clean shutdown
+                continue
+
             start = time.monotonic()
             try:
                 result = await self._run_watcher_rotation()
