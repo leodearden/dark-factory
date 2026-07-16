@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 
 import layout from '../../src/dashboard/static/redux/esc_flow_layout.js';
 
-const { aggregateFlow } = layout;
+const { aggregateFlow, layoutFlow } = layout;
 
 // Mirrors test_escalation_analytics.py::build_golden_archive's 5 terminal
 // escalations' flow_daily cells (dashboard/tests/test_escalation_analytics.py:
@@ -215,4 +215,134 @@ test('aggregateFlow: empty rows yield empty columns/links and total 0, without t
   assert.equal(model.links.length, 0);
   assert.equal(model.columns.length, 4);
   for (const col of model.columns) assert.equal(col.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// layoutFlow — pixel geometry over the golden model (model = aggregateFlow(
+// GOLDEN_FLOW_ROWS)). A single shared px-per-count scale must make node
+// heights AND ribbon widths both exactly proportional to their counts, so
+// that Σ ribbon w incident on any interior node equals that node's own h
+// (flow conservation in pixels, not just in the count model).
+// ---------------------------------------------------------------------------
+
+const DIMS = { width: 640, height: 260, nodeWidth: 14, nodePad: 4 };
+
+function nodeAt(nodes, col, id) {
+  return nodes.find(n => n.col === col && n.id === id);
+}
+
+function ribbonsIncidentOn(ribbons, col, id) {
+  // A node in column `col` is the `to` side of links with `col: col - 1`
+  // and the `from` side of links with `col: col` (col numbering matches
+  // aggregateFlow: link.col c connects columns[c] -> columns[c+1]).
+  return ribbons.filter(r => (r.col === col && r.from === id) || (r.col === col - 1 && r.to === id));
+}
+
+test('layoutFlow: golden model — node heights are proportional to counts under one shared scale', () => {
+  const model = aggregateFlow(GOLDEN_FLOW_ROWS);
+  const { nodes } = layoutFlow(model, DIMS);
+
+  // Level column (col 1) has counts {0: 2, 1: 1, 2: 2} — compare any two.
+  const level0 = nodeAt(nodes, 1, '0');
+  const level1 = nodeAt(nodes, 1, '1');
+  assert.ok(level0 && level1, 'expected level nodes 0 and 1 to exist');
+  assert.ok(level1.count > 0);
+  assert.ok(
+    Math.abs(level0.h / level1.h - level0.count / level1.count) < 1e-9,
+    `expected h ratio (${level0.h}/${level1.h}) to match count ratio (${level0.count}/${level1.count})`,
+  );
+});
+
+test('layoutFlow: a count-0 node has h == 0 (hand-built model, independent of aggregateFlow output)', () => {
+  // aggregateFlow never emits a 0-count node (rows with n=0 are skipped), so
+  // this constructs a small synthetic model directly to pin layoutFlow's
+  // handling of a zero-count node sharing a column with a nonzero one.
+  const model = {
+    columns: [
+      [{ id: 'a', label: 'a', count: 0 }, { id: 'b', label: 'b', count: 4 }],
+      [{ id: 'x', label: 'x', count: 4 }],
+    ],
+    links: [{ col: 0, from: 'b', to: 'x', count: 4 }],
+    total: 4,
+  };
+  const { nodes } = layoutFlow(model, DIMS);
+  const a = nodeAt(nodes, 0, 'a');
+  const b = nodeAt(nodes, 0, 'b');
+  assert.ok(a && b);
+  assert.equal(a.h, 0);
+  assert.ok(b.h > 0);
+});
+
+test('layoutFlow: golden model — column x increases strictly with col index; every node stays within [0,width]', () => {
+  const model = aggregateFlow(GOLDEN_FLOW_ROWS);
+  const { nodes, width } = layoutFlow(model, DIMS);
+
+  const xByCol = new Map();
+  for (const n of nodes) {
+    if (!xByCol.has(n.col)) xByCol.set(n.col, n.x);
+    assert.equal(n.x, xByCol.get(n.col), 'every node in the same column should share the same x');
+    assert.ok(n.x >= -1e-9, `node.x (${n.x}) should be >= 0`);
+    assert.ok(n.x + n.w <= width + 1e-9, `node.x + node.w (${n.x + n.w}) should be <= width (${width})`);
+  }
+  const cols = [...xByCol.keys()].sort((a, b) => a - b);
+  for (let i = 1; i < cols.length; i++) {
+    assert.ok(
+      xByCol.get(cols[i]) > xByCol.get(cols[i - 1]),
+      `column ${cols[i]}'s x (${xByCol.get(cols[i])}) should be strictly greater than column ${cols[i - 1]}'s x (${xByCol.get(cols[i - 1])})`,
+    );
+  }
+});
+
+test('layoutFlow: golden model — ribbon widths are proportional to counts under the SAME scale as node heights', () => {
+  const model = aggregateFlow(GOLDEN_FLOW_ROWS);
+  const { nodes, ribbons } = layoutFlow(model, DIMS);
+
+  // Derive the shared scale from a known node (level '0': count 2), then
+  // check every ribbon's w matches count * scale.
+  const level0 = nodeAt(nodes, 1, '0');
+  const scale = level0.h / level0.count;
+  assert.ok(scale > 0);
+  for (const r of ribbons) {
+    assert.ok(
+      Math.abs(r.w - r.count * scale) < 1e-9,
+      `ribbon (col ${r.col} ${r.from}->${r.to}) w=${r.w} should equal count(${r.count})*scale(${scale})=${r.count * scale}`,
+    );
+  }
+});
+
+test('layoutFlow: golden model — pixel conservation: Σ ribbon w incident on each interior node ≈ node.h', () => {
+  const model = aggregateFlow(GOLDEN_FLOW_ROWS);
+  const { nodes, ribbons } = layoutFlow(model, DIMS);
+
+  // Interior columns are level (1) and tier (2) — origin (0) is source-only
+  // and class (3) is sink-only, so neither has "incident from both sides".
+  for (const col of [1, 2]) {
+    for (const node of nodes.filter(n => n.col === col)) {
+      const incidentW = ribbonsIncidentOn(ribbons, col, node.id).reduce((s, r) => s + r.w, 0);
+      assert.ok(
+        Math.abs(incidentW - node.h) < 1e-6,
+        `node (col ${col} id ${node.id}) incident ribbon width sum (${incidentW}) should equal its h (${node.h})`,
+      );
+    }
+  }
+});
+
+test('layoutFlow: golden model — every ribbon.d is a non-empty cubic-bezier band ("M...C...")', () => {
+  const model = aggregateFlow(GOLDEN_FLOW_ROWS);
+  const { ribbons } = layoutFlow(model, DIMS);
+  assert.ok(ribbons.length > 0);
+  for (const r of ribbons) {
+    assert.equal(typeof r.d, 'string');
+    assert.ok(r.d.length > 0);
+    assert.ok(r.d.startsWith('M'), `ribbon.d should start with 'M' (got: ${r.d.slice(0, 20)}...)`);
+    assert.ok(r.d.includes('C'), `ribbon.d should contain a 'C' cubic-bezier command (got: ${r.d})`);
+  }
+});
+
+test('layoutFlow: empty model yields empty nodes/ribbons, without throwing', () => {
+  const emptyModel = aggregateFlow([]);
+  assert.doesNotThrow(() => layoutFlow(emptyModel, DIMS));
+  const { nodes, ribbons } = layoutFlow(emptyModel, DIMS);
+  assert.deepEqual(nodes, []);
+  assert.deepEqual(ribbons, []);
 });
