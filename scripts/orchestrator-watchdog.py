@@ -547,6 +547,56 @@ def main() -> None:
             log(f"watchdog error for {unit} (port {port}): {exc}")
 
 
+def _delegate_fleet_restart() -> None:
+    """Delegate a fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain.
+
+    Fires a detached, named transient unit via ``systemd-run --user`` rather
+    than restarting units in-process (task 2396, fleet-redeploy β): drain and
+    clock-stamping are then defined ONCE in the script and identical whether
+    the fleet restart was triggered by this backstop or by the event-driven
+    coordinator / an operator.
+
+    - ``--unit=orch-fleet-staleness-redeploy.service`` is a FIXED transient
+      unit name — the natural overlap guard. A second staleness_pass tick
+      while a redeploy is still running fails to re-register the same unit
+      name (systemd-run exits non-zero) and no-ops, so this stateless
+      oneshot needs no cross-tick bookkeeping to avoid piling up concurrent
+      fleet restarts.
+    - ``--collect`` removes the transient unit once it exits (success or
+      failure) so a LATER tick can re-register the same name.
+    - ``--no-block`` detaches: this call returns as soon as the transient
+      unit is *registered*, without waiting for restart-all-orchestrators.sh
+      to finish. Essential once γ's per-unit merge-drain gate can defer a
+      restart for up to ORCH_RESTART_FORCE_FIRE_AFTER_SECS (75 min default)
+      — the 60s oneshot watchdog (and its liveness pass) must never block on
+      that.
+    - ``--drain`` enables γ's per-unit merge-drain gate, so a watchdog-
+      initiated fleet restart drains + stamps identically to an operator- or
+      coordinator-driven ``restart-all-orchestrators.sh --drain``.
+
+    Fail-soft: a missing systemd-run binary, a timeout, or any other
+    registration error is logged and swallowed, never raised — a
+    registration hiccup must not crash the oneshot watchdog. The NEXT tick's
+    staleness_pass will simply try again (stateless — I6).
+    """
+    try:
+        subprocess.run(
+            [
+                "systemd-run",
+                "--user",
+                "--collect",
+                "--no-block",
+                "--unit=orch-fleet-staleness-redeploy.service",
+                os.path.join(REPO_DIR, "scripts", "restart-all-orchestrators.sh"),
+                "--drain",
+            ],
+            check=False,
+            timeout=10,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"_delegate_fleet_restart: systemd-run registration failed: {exc!r}")
+
+
 def staleness_pass() -> None:
     """Restart any running orchestrator unit stale w.r.t. the newest watched commit.
 
@@ -574,6 +624,13 @@ def staleness_pass() -> None:
     at most once per ORCH_RESTART_MIN_INTERVAL_SECS, honoring a redeploy
     verified by EITHER tier (restart-all-orchestrators.sh is the sole on-disk
     writer, stamped only on its verified-fresh exit-0 path).
+
+    Delegation (task 2396): once ANY eligible unit is found stale, the
+    per-unit loop below no longer restarts it directly — instead the whole
+    fleet-wide restart is delegated ONCE, after the loop, to
+    _delegate_fleet_restart(). restart_unit() remains used ONLY by main()
+    (liveness stays uncapped, non-clock-gated, and non-stamping — I5:
+    brokenness is not a scheduled deploy).
     """
     if _within_fleet_deploy_min_interval():
         log("skip: <8h since last fleet deploy")
@@ -588,6 +645,7 @@ def staleness_pass() -> None:
         # limitation" paragraph above for the rapid-landing suppression case.
         return
 
+    stale_found = False
     for unit in _enumerate_running_units():
         try:
             if not is_unit_enabled(unit):
@@ -610,12 +668,15 @@ def staleness_pass() -> None:
             if start_epoch < commit_epoch:
                 log(
                     f"WARNING: {unit} started at {start_epoch} before the newest "
-                    f"watched commit ({commit_epoch}); restarting for staleness"
+                    f"watched commit ({commit_epoch}); flagging for fleet-wide staleness redeploy"
                 )
-                restart_unit(unit)
-                log(f"{unit} staleness restart issued")
+                stale_found = True
         except Exception as exc:  # noqa: BLE001
             log(f"staleness probe error for {unit}: {exc}")
+
+    if stale_found:
+        log("delegating fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain")
+        _delegate_fleet_restart()
 
 
 def _format_epoch(epoch: int | None) -> str:
