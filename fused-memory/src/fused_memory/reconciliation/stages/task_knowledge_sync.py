@@ -1119,6 +1119,16 @@ async def _prune_task_count_snapshots(
     # cross-check, or a confirmed count > 0, is the swallowed-timeout
     # fingerprint. Only runs on an empty scroll -- a non-empty page skips
     # the extra count call entirely. Best-effort: never raises.
+    #
+    # Benign false-positive note (reviewer finding, amendment round): the
+    # fingerprint assumes scroll and count agree for committed records. If a
+    # task_count_snapshot was authored earlier in this SAME cycle by the
+    # still-live Stage-2 LLM path (see the duplicate-write note in run()) and
+    # Qdrant's scroll vs. count views momentarily disagree under eventual
+    # consistency, this guard can flip enumeration_ok to 0 against an
+    # otherwise healthy pool. That is an accepted, self-correcting trigger --
+    # it costs one skipped write, recovered next cycle -- so not every
+    # enumeration_ok == 0 log below is a confirmed Qdrant timeout.
     if enumeration_ok and not members:
         try:
             snapshot_count = await memory_service.count_memories_by_metadata(
@@ -1979,6 +1989,23 @@ class TaskKnowledgeSync(BaseStage):
         # (inconclusive) instead. When the key is absent entirely (taskmaster
         # None, or write-blocked project -- the prune never ran) or
         # enumeration_ok == 1, behavior is unchanged: verify still runs.
+        #
+        # Accepted trade-off (reviewer finding, amendment round): a
+        # SUSTAINED enumeration failure (e.g. a Qdrant read timeout that
+        # persists across cycles) is now invisible to the harness's
+        # consecutive-stale-snapshot escalation -- every affected cycle skips
+        # both the write and the verify fallback, so 'task_count_snapshot_
+        # written' stays absent (never a CONFIRMED miss) and the streak never
+        # advances. The only signal is the per-cycle WARNING logged in
+        # _prune_task_count_snapshots / _write_task_count_snapshot. Before
+        # this change a sustained timeout still produced a fresh (duplicated)
+        # snapshot each cycle, so freshness was maintained at the cost of the
+        # duplicate pile this task exists to stop. A bounded backstop --
+        # escalate once consecutive enumeration_ok == 0 cycles cross a
+        # threshold, mirroring the harness's existing consecutive-miss streak
+        # -- would close this blind spot; it needs a harness-side consumer of
+        # the prune stats and is left as a possible follow-up rather than
+        # folded into this task.
         if (
             task_count_snapshot_written is None
             and report.stats.get(SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY) != 0
