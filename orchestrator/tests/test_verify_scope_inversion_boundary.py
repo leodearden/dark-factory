@@ -522,3 +522,53 @@ class TestRow3DocsOnlyTrivialBothRoles:
             f'docs-only diff must execute zero commands at the merge gate; '
             f'got {consumer_fake.await_count} call(s)'
         )
+
+
+# ---------------------------------------------------------------------------
+# Row 4: "new-vs-preexisting" baseline attribution (μ, B1). Consumer-only.
+# ---------------------------------------------------------------------------
+
+class TestRow4NewVsPreexistingBaselineAttribution:
+    """Row 4 (PRD boundary-test sketch): baseline seeded with
+    ``ROW4_PREEXISTING_TEST_ID`` (moda); the branch fails BOTH moda (the
+    seeded pre-existing id) AND modb (a genuinely new id). The merge gate
+    must block citing ONLY the new modb id — never the pre-existing moda id
+    — and must NOT route MAIN_HEALTH_RED (that route is reserved for a
+    WHOLLY pre-existing failure — row 5).
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.exercise_merge_verify
+    async def test_row4_new_failure_blocked_preexisting_routes_main_health(
+        self, tmp_path: Path,
+    ) -> None:
+        mod_a, mod_b, task_files_content = _row4_mixed_baseline_diff(tmp_path)
+        seed_main_baseline(ROW4_MAIN_SHA, frozenset({ROW4_PREEXISTING_TEST_ID}))
+
+        outcome = await _drive_merge_gate(
+            tmp_path,
+            task_id='row4-6061',
+            module_configs_registry={'moda': mod_a, 'modb': mod_b},
+            touched_module_configs=[mod_a, mod_b],
+            task_files=list(task_files_content),
+            task_files_content=task_files_content,
+            main_sha=ROW4_MAIN_SHA,
+            run_verification_fake=_fake_run_verification_by_module({
+                mod_a.prefix: (False, [ROW4_PREEXISTING_TEST_ID]),
+                mod_b.prefix: (False, [ROW4_NEW_TEST_ID]),
+            }),
+        )
+
+        assert outcome is not None, 'expected a blocked MergeOutcome, got the verify-passed sentinel'
+        assert outcome.status == 'blocked', f'expected blocked; got {outcome.status!r}'
+        assert not outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'a MIXED failure (one new id alongside a pre-existing one) must '
+            f'never route MAIN_HEALTH_RED; got {outcome.reason!r}'
+        )
+        assert ROW4_NEW_TEST_ID in outcome.reason, (
+            f'expected the NEW modb test id to be cited; got {outcome.reason!r}'
+        )
+        assert ROW4_PREEXISTING_TEST_ID not in outcome.reason, (
+            f'the PRE-EXISTING moda test id must NOT be charged to the '
+            f'branch; got {outcome.reason!r}'
+        )
