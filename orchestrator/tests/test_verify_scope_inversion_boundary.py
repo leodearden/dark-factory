@@ -170,6 +170,109 @@ def _row1_golden_diff(
     return mod_a, mod_b, config
 
 
+def _fake_run_verification_by_module(
+    results: dict[str, tuple[bool, list[str]]],
+    *, category: str = 'test_failure',
+) -> AsyncMock:
+    """Instrumented fake for ``orchestrator.verify.run_verification``.
+
+    Returns a DIFFERENT canned per-module ``VerifyResult`` keyed by
+    ``ModuleConfig.prefix`` — never spawns a real subprocess. *results* maps
+    ``prefix -> (passed, failing_test_ids)``; a prefix absent from *results*
+    (or the ``module_config=None`` global-fallback call shape) defaults to a
+    clean pass with ``failing_test_ids=[]`` — never ``None``, so merge+full's
+    junit-collection signal (VerifyResult.failing_test_ids's B3 None-vs-``[]``
+    contract) stays present for every executed module, exactly as a real
+    merge+full pytest run would collect an empty junit report for a clean
+    module.
+
+    Patch via ``patch.object(verify, 'run_verification', new=...)`` — the
+    SAME seam :func:`test_verify_scope_kappa._run_verification_spy` patches
+    — and recover the ordered executed ``ModuleConfig``(s) afterward via
+    :func:`_executed_module_configs`. Shared by rows 1, 4, and 5 (only the
+    *results* mapping and baseline seeding differ per row).
+    """
+    async def _fake(worktree, config, module_config=None, **kwargs):
+        prefix = module_config.prefix if module_config is not None else None
+        passed, failing_ids = results.get(prefix, (True, []))
+        if passed:
+            return VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary='All checks passed', failing_test_ids=list(failing_ids),
+            )
+        return VerifyResult(
+            passed=False, test_output='FAILED some test', lint_output='', type_output='',
+            summary='Failures: tests failed', category=category,
+            cause_hint='AssertionError: sibling contract broken',
+            failing_test_ids=list(failing_ids),
+        )
+    return AsyncMock(side_effect=_fake)
+
+
+async def _drive_merge_gate(
+    tmp_path: Path,
+    *,
+    task_id: str,
+    module_configs_registry: dict[str, ModuleConfig],
+    touched_module_configs: list[ModuleConfig],
+    task_files: list[str],
+    task_files_content: dict[str, str],
+    main_sha: str,
+    run_verification_fake: AsyncMock,
+) -> MergeOutcome | None:
+    """Drive the REAL merge-gate consumer chokepoint, ``_run_post_merge_verify``.
+
+    Builds a merge+full ``OrchestratorConfig`` (with *module_configs_registry*
+    installed as its module registry — mirrors ``_two_module_registry``'s
+    ``config._module_configs`` assignment), a ``MergeRequest`` touching only
+    *touched_module_configs* / *task_files* (mirrors a real branch diff —
+    untouched-but-registered modules are discovered via the registry, not
+    listed here), and a ``GitOps`` double whose ``get_main_sha`` resolves to
+    *main_sha*. Patches ``orchestrator.verify.run_verification`` with
+    *run_verification_fake* for the duration of the drive so the REAL
+    ``run_scoped_verification`` (unmocked — the caller must mark its test
+    ``@pytest.mark.exercise_merge_verify`` to opt out of the autouse
+    ``_mock_merge_queue_verification`` stub) executes against canned
+    per-module results, never a real subprocess.
+
+    *task_files_content* (``{relative path: file content}``) is written into
+    the MERGE worktree (``merge_wt`` — the actual worktree
+    ``_run_post_merge_verify`` scopes against), not the outer *tmp_path*
+    scratch dir. Omitting this (an empty dict, or a path *task_files* names
+    but *task_files_content* doesn't cover) leaves ``merge_wt`` without the
+    touched file on disk, which degrades plan derivation to the TRIVIAL
+    "no source files" short-circuit — zero ``run_verification`` calls and a
+    silent fall-through to the real (unmocked) unscoped type-check gate.
+
+    *task_id* must be distinct per call within a test that drives the gate
+    more than once (e.g. row 5's two-merge cache-hit scenario), since it
+    seeds the task/merge worktree directory names. Shared by rows 1, 4, and 5.
+    """
+    config = _make_config(tmp_path, merge_verify_breadth='full')
+    config._module_configs = dict(module_configs_registry)
+    git_ops = _make_git_ops(tmp_path)
+    git_ops.get_main_sha = AsyncMock(return_value=main_sha)
+
+    task_wt = tmp_path / f'task-wt-{task_id}'
+    task_wt.mkdir(parents=True, exist_ok=True)
+    merge_wt = tmp_path / f'merge-wt-{task_id}'
+    merge_wt.mkdir(parents=True, exist_ok=True)
+    for rel_path, content in task_files_content.items():
+        full = merge_wt / rel_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(content)
+
+    req = _make_req(task_id, task_wt, config)
+    req.task_files = list(task_files)
+    req.module_configs = list(touched_module_configs)
+
+    with patch.object(verify, 'run_verification', new=run_verification_fake):
+        return await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Row 1: "the hole, closed" — source-only sibling break rejected at the
 # merge gate. Builds the shared row-1 harness (instrumented fake
@@ -237,6 +340,7 @@ class TestRow1SourceOnlySiblingBreakRejectedAtMergeGate:
             module_configs_registry={'moda': mod_a, 'modb': mod_b},
             touched_module_configs=[mod_a],
             task_files=[MODA_SOURCE_PATH],
+            task_files_content={MODA_SOURCE_PATH: MODA_SOURCE_CONTENT},
             main_sha=ROW1_MAIN_SHA,
             run_verification_fake=_fake_run_verification_by_module(
                 {mod_b.prefix: (False, [MODB_FAILING_TEST_ID])},
