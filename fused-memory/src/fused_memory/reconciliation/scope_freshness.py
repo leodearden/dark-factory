@@ -48,11 +48,23 @@ forced back into ``to_reinvestigate`` — and the streak reset — even though
 the subject is still unchanged.  Without this cap a genuinely-stranded
 cross-project thread would be skipped by this pre-check forever, and since
 ``ReconciliationHarness``'s Stage-3 persistence-gated escalation
-(``_INTEGRITY_FINDING_RECURRENCE_THRESHOLD``) only ever evaluates a finding
-when the CURRENT remediation pass produces its own fresh ``integrity_check``
-stage report, an indefinite skip would silently suppress escalation of a
-stranded issue forever — a project "loud failure over silent degradation"
-norm violation, not merely a missed optimization.
+(``_INTEGRITY_FINDING_RECURRENCE_THRESHOLD``) only ever counts a run toward
+a finding's recurrence when that run's ``stage_reports`` carries an
+``integrity_check`` entry, an indefinite skip would silently suppress
+escalation of a stranded issue forever — a project "loud failure over
+silent degradation" norm violation, not merely a missed optimization.
+
+The cap alone is NOT sufficient for that guarantee, though (task 2417
+amendment — reviewer finding behavior_change): forcing a real
+re-investigation only every ``max_consecutive_skips``-th cycle means the
+intervening short-circuited cycles must ALSO count toward the persistence
+window, or the count still never saturates. ``ReconciliationHarness``
+achieves this by stamping every short-circuited run's ``skipped`` findings
+into a synthetic ``integrity_check`` stage report before completing the
+run (see ``_run_remediation_pass``'s all-fresh short-circuit block) — so
+each skip cycle contributes to persistence exactly as a real Stage 3
+re-flag would have. The loud-failure guarantee is the product of BOTH
+mechanisms together, not the cap in isolation.
 
 Mirrors :meth:`ReconciliationHarness._reconcile_status_correction` /
 ``_delete_status_correction_memories``'s read-compare-supersede,
@@ -93,7 +105,11 @@ DEFAULT_MAX_CONSECUTIVE_SKIPS: int = 4
 ``(task_ref, flag_key)`` pair before :func:`precheck_scope_correction_freshness`
 forces a real re-investigation even though the subject is still unchanged —
 see the module docstring's "Consecutive-skip cap" section (task 2417
-amendment: reviewer finding ``robustness_silent_degradation``).
+amendment: reviewer finding ``robustness_silent_degradation``). This cap is
+one of TWO mechanisms the loud-failure-over-silent-degradation guarantee
+depends on — see that section for why the cap alone is not sufficient and
+what the harness's short-circuit path additionally stamps to close the gap
+(task 2417 amendment: reviewer finding ``behavior_change``).
 
 Set to match ``ReconciliationHarness._INTEGRITY_FINDING_RECURRENCE_THRESHOLD``'s
 current value as a plain literal — NOT imported, since this module

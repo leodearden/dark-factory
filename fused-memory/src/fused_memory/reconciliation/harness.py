@@ -2781,9 +2781,19 @@ class ReconciliationHarness:
         # escalation loop below (amendment: reviewer finding
         # robustness_silent_degradation) — a (task_ref, flag_key) pair can be
         # skipped by the pre-check at most threshold-1 cycles in a row before
-        # it is forced back through a real Stage 1-3 pass, so a genuinely
-        # stranded cross-project thread still accumulates persistence and
-        # escalates instead of being silently skipped forever.
+        # it is forced back through a real Stage 1-3 pass. The cap ALONE is
+        # not sufficient for the loud-failure guarantee, though: the
+        # persistence-gated escalation loop only counts a run toward a
+        # finding's recurrence if that run's stage_reports carries an
+        # integrity_check entry, and a short-circuited run built none.  The
+        # short-circuit block below also stamps `freshness.skipped` into a
+        # synthetic integrity_check report before completing the run
+        # (amendment — reviewer finding behavior_change), so BOTH the cap's
+        # periodic forced re-investigation AND every intervening
+        # short-circuited skip contribute to the window — only together do
+        # they guarantee a genuinely stranded cross-project thread escalates
+        # within a bounded number of cycles instead of being silently
+        # suppressed forever.
         freshness: ScopeFreshnessResult | None = None
         try:
             if self.taskmaster is None:
@@ -2835,6 +2845,22 @@ class ReconciliationHarness:
                     **freshness.stats,
                 },
             )
+            # Stamp the skipped findings into a synthetic integrity_check
+            # stage report BEFORE completing the run, so this short-circuited
+            # run still counts toward _finding_persistence_count's lookback
+            # window exactly as a real Stage 3 re-flag would have (task 2417
+            # amendment — reviewer finding behavior_change).  Without this,
+            # a short-circuited run occupied a slot in the persistence
+            # window while contributing 0, and the loud-failure guarantee
+            # described above depended on BOTH the consecutive-skip cap's
+            # periodic forced re-investigation AND this stamp — the cap
+            # alone forces a real pass only every threshold-th cycle, which
+            # is not by itself enough to saturate the persistence window.
+            # No stage is built or run here — this uses the plain-dict
+            # report shape the journal/tests already accept elsewhere
+            # ({'integrity_check': {'items_flagged': [...]}}).
+            run.stage_reports['integrity_check'] = {'items_flagged': list(freshness.skipped)}
+            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
             run.completed_at = datetime.now(UTC)
             run.status = RunStatus.completed
             await self.journal.complete_run(run_id, 'completed')
