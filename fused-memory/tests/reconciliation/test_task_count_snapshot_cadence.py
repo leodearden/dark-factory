@@ -1751,3 +1751,83 @@ class TestRunSurfacesPruneObservability:
 
         assert report.stats['task_count_snapshot_prune_enumeration_ok'] == 0
         mock_deps['memory_service'].add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_timeout_fingerprint_skips_verify_fallback(self, mock_deps):
+        """Task 2655 step-5/6: when the prune reports enumeration_ok=0, run()
+        must NOT fall back to _verify_task_count_snapshot_written -- that
+        helper's own scroll swallows timeouts the same way and would
+        mis-read the empty page as a CONFIRMED miss (False), spuriously
+        growing the harness's consecutive-miss streak
+        (_maybe_escalate_stale_task_count_snapshot). report.stats must
+        instead leave 'task_count_snapshot_written' absent (inconclusive)."""
+
+        def _get_memories_by_metadata(*, project_id, filters, **kwargs):
+            if filters == {'kind': TASK_COUNT_SNAPSHOT_KIND}:
+                return []
+            return []
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            side_effect=_get_memories_by_metadata,
+        )
+        mock_deps['memory_service'].count_memories_by_metadata.return_value = 2
+
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('reify', '/tmp/test'),
+            **mock_deps,
+        )
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._verify_task_count_snapshot_written',
+                new=AsyncMock(),
+            ) as mock_verify,
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='run-prune-live-timeout-no-verify',
+            )
+
+        assert 'task_count_snapshot_written' not in report.stats
+        mock_verify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_taskmaster_none_still_falls_back_to_verify(self, mock_deps):
+        """Contrast case: when the prune never ran at all (no taskmaster,
+        so _write_task_count_snapshot early-returns before ever calling
+        _prune_task_count_snapshots), SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY
+        is absent from report.stats entirely (not 0) -- the new step-6
+        guard must read that as "unknown", not "confirmed failed", and
+        still fall back to verify exactly as before this task."""
+        mock_deps['taskmaster'] = None
+
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('reify', '/tmp/test'),
+            **mock_deps,
+        )
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._verify_task_count_snapshot_written',
+                new=AsyncMock(return_value=True),
+            ) as mock_verify,
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='run-no-taskmaster-verify-fallback',
+            )
+
+        mock_verify.assert_awaited_once()
+        assert report.stats['task_count_snapshot_written'] == 1
