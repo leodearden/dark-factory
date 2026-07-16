@@ -248,6 +248,142 @@ function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
   );
 }
 
+// ── Lifespan panel ──
+//
+// Percentile tiles by level + a resolver-tier-overlaid ECDF of resolution
+// time (log-x, since escalation lifetimes span seconds to weeks) with a
+// vertical 6h freshness marker, an open-items list ranked by pending age,
+// and a render-when-present filed→triaged→resolved segment block (2555
+// forward-compat).
+const _RESOLVER_TIERS = ['human', 'cascade', 'auto-watcher', 'steward', 'reaper-sweep', 'unknown', 'other-auto'];
+const _TIER_COLORS = {
+  human: C.PALETTE.ok,
+  cascade: C.PALETTE.accent,
+  'auto-watcher': C.PALETTE.info,
+  steward: C.PALETTE.accent2,
+  'reaper-sweep': C.PALETTE.warn,
+  unknown: C.PALETTE.fg3,
+  'other-auto': C.PALETTE.bad,
+};
+
+function LifespanPanel({ lifespan, win, generatedAt }) {
+  const levels = Object.keys(lifespan.percentiles_by_level || {}).sort();
+  // lifespan.samples rows are [date, tier, level, secs] — date is date(resolved_at).
+  const samples = sliceRowsByWindow(lifespan.samples || [], generatedAt, win, row => row[0]);
+
+  // Log-spaced ECDF threshold grid: ~60s .. ~30d (2,592,000s). Even spacing in
+  // log-space lets the (index-spaced) LineChart primitive read as a log-x
+  // axis without charts.jsx needing log-scale support.
+  const GRID_STEPS = 24;
+  const logLo = Math.log(60), logHi = Math.log(2592000);
+  const grid = Array.from({ length: GRID_STEPS }, (_, i) => Math.exp(logLo + ((logHi - logLo) * i) / (GRID_STEPS - 1)));
+  const gridLabels = grid.map(fmtUptime);
+
+  // Vertical 6h (21600s) freshness marker — the grid index whose threshold
+  // lands nearest 21600, rendered via the same overlay technique as
+  // RegimeMarkers/TimeChart (a synthetic single-marker array).
+  const BREACH_SECS = 21600;
+  let breachIdx = 0;
+  for (let i = 1; i < grid.length; i++) {
+    if (Math.abs(grid[i] - BREACH_SECS) < Math.abs(grid[breachIdx] - BREACH_SECS)) breachIdx = i;
+  }
+  const breachMarker = [{ date: gridLabels[breachIdx], label: '6h' }];
+
+  const secsByTier = {};
+  for (const row of samples) {
+    const tier = row[1], secs = row[3];
+    (secsByTier[tier] = secsByTier[tier] || []).push(secs);
+  }
+  const series = _RESOLVER_TIERS
+    .filter(t => (secsByTier[t] || []).length > 0)
+    .map(t => {
+      const sorted = [...secsByTier[t]].sort((a, b) => a - b);
+      const n = sorted.length;
+      return {
+        key: t,
+        color: _TIER_COLORS[t] || C.PALETTE.fg3,
+        values: grid.map(threshold => sorted.filter(s => s <= threshold).length / n),
+      };
+    });
+
+  const openItems = [...(lifespan.open_items || [])].sort((a, b) => b.age_secs - a.age_secs);
+
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+        Lifespan — resolution time
+      </div>
+      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
+        {levels.map(level => {
+          const pct = lifespan.percentiles_by_level[level];
+          return (
+            <C.StatTile
+              key={level}
+              label={`L${level} resolution time`}
+              value={fmtUptime(pct.p50)}
+              hint={`p50 · p90 ${fmtUptime(pct.p90)}`}
+            />
+          );
+        })}
+        {lifespan.l1_to_l2_promotion && lifespan.l1_to_l2_promotion.count > 0 && (
+          <C.StatTile
+            label="L1→L2 promotion"
+            value={fmtUptime(lifespan.l1_to_l2_promotion.p50_secs)}
+            hint={`p50 · p90 ${fmtUptime(lifespan.l1_to_l2_promotion.p90_secs)}`}
+          />
+        )}
+      </div>
+      {series.length > 0 && (
+        <>
+          <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>
+            Resolution-time ECDF by resolver tier (log-x; dashed line = 6h freshness)
+          </div>
+          <TimeChart labels={gridLabels} markers={breachMarker}>
+            <C.LineChart series={series} labels={gridLabels} formatY={v => `${Math.round(v * 100)}%`} formatX={v => v} />
+          </TimeChart>
+        </>
+      )}
+      {lifespan.samples_downsampled && (
+        <div style={{ fontSize: 10, color: 'var(--fg-3)', marginTop: 4 }}>
+          showing {samples.length} of {lifespan.samples_total} resolution samples (downsampled)
+        </div>
+      )}
+      <div style={{ marginTop: 10 }}>
+        <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Open items — ranked by age</div>
+        <table className="tbl">
+          <thead>
+            <tr><th>ID</th><th>Task</th><th>Level</th><th className="num">Age</th></tr>
+          </thead>
+          <tbody>
+            {openItems.map(item => (
+              <tr key={item.id}>
+                <td className="mono">{item.id}</td>
+                <td className="mono">{taskId(item.task_id)}</td>
+                <td>
+                  <span className={`badge esc-level-${item.level === 2 ? 2 : item.level === 1 ? 1 : 0}`}>
+                    L{item.level}
+                  </span>
+                </td>
+                <td className="num mono">
+                  {fmtUptime(item.age_secs)}
+                  {item.breach_6h && <span className="badge bad" style={{ marginLeft: 6, fontSize: 9 }}>6h+</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {lifespan.triage_segments && (
+        <div style={{ marginTop: 10, fontSize: 11, color: 'var(--fg-3)' }}>
+          Filed→triaged {fmtUptime(lifespan.triage_segments.filed_to_triaged.p50)} p50 / {fmtUptime(lifespan.triage_segments.filed_to_triaged.p90)} p90
+          {' · '}Triaged→resolved {fmtUptime(lifespan.triage_segments.triaged_to_resolved.p50)} p50 / {fmtUptime(lifespan.triage_segments.triaged_to_resolved.p90)} p90
+          {' '}(n={lifespan.triage_segments.count})
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── EscalationAnalyticsTab ──
 
 function EscalationAnalyticsTab({ projectFilter }) {
@@ -294,7 +430,12 @@ function EscalationAnalyticsTab({ projectFilter }) {
               generatedAt={analytics.generated_at}
               regimeMarkers={regimeMarkers}
             />
-            {/* Lifespan / Workflow panels land in later steps */}
+            <LifespanPanel
+              lifespan={p.lifespan}
+              win={win}
+              generatedAt={analytics.generated_at}
+            />
+            {/* Workflow panel lands in a later step */}
           </ProjectGroup>
         </div>
       ))}
