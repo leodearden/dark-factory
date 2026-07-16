@@ -5,7 +5,27 @@ effective-benign predicate, and the per-path benign default helper
 
 from __future__ import annotations
 
-from escalation.classify import classify_resolver_tier
+from escalation.classify import classify_resolver_tier, effective_benign
+from escalation.models import Escalation
+
+
+def _make_escalation(
+    esc_id: str = 'esc-1-1',
+    *,
+    status: str = 'pending',
+    resolution_class: str | None = None,
+) -> Escalation:
+    esc = Escalation(
+        id=esc_id,
+        task_id='1',
+        agent_role='orchestrator',
+        severity='blocking',
+        category='task_failure',
+        summary='Something failed',
+    )
+    esc.status = status
+    esc.resolution_class = resolution_class
+    return esc
 
 
 class TestClassifyResolverTierHuman:
@@ -83,3 +103,32 @@ class TestClassifyResolverTierUnknownAndOther:
     def test_random_role_is_other_auto(self):
         """resolved_by='random-role' (unrecognised) classifies as 'other-auto'."""
         assert classify_resolver_tier('random-role') == 'other-auto'
+
+
+class TestEffectiveBenign:
+    """effective_benign(record) -> (class, provenance): stamp-first, proxy-fallback."""
+
+    def test_stamped_benign_dismissed(self):
+        """Stamped resolution_class='benign' on a dismissed record -> ('benign', 'stamped')."""
+        record = _make_escalation(status='dismissed', resolution_class='benign')
+        assert effective_benign(record) == ('benign', 'stamped')
+
+    def test_stamped_actionable_resolved(self):
+        """Stamped resolution_class='actionable' on a resolved record -> ('actionable', 'stamped')."""
+        record = _make_escalation(status='resolved', resolution_class='actionable')
+        assert effective_benign(record) == ('actionable', 'stamped')
+
+    def test_unstamped_dismissed_infers_benign(self):
+        """Unstamped (resolution_class=None) dismissed record -> ('benign', 'inferred')."""
+        record = _make_escalation(status='dismissed', resolution_class=None)
+        assert effective_benign(record) == ('benign', 'inferred')
+
+    def test_unstamped_resolved_infers_actionable(self):
+        """Unstamped (resolution_class=None) resolved record -> ('actionable', 'inferred')."""
+        record = _make_escalation(status='resolved', resolution_class=None)
+        assert effective_benign(record) == ('actionable', 'inferred')
+
+    def test_pending_is_excluded(self):
+        """Pending record (resolution_class=None, status='pending') -> (None, 'excluded')."""
+        record = _make_escalation(status='pending', resolution_class=None)
+        assert effective_benign(record) == (None, 'excluded')
