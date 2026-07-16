@@ -13,7 +13,7 @@ import shutil
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -857,6 +857,42 @@ def _failure_anchored_excerpt(output: str, *, cap: int = 3000, window: int = 10)
 # Key: (main_sha, category, normalised_cause_hint); Value: (probe_time, is_preexisting).
 _PROBE_CACHE: dict[tuple[str, str, str], tuple[float, bool]] = {}
 _PROBE_CACHE_TTL: float = 300.0  # 5 minutes; main_sha changes on every hotfix merge
+
+
+# ---------------------------------------------------------------------------
+# Task μ (verify-scope-inversion-prd.md) — per-main-SHA baseline attribution:
+# pure failing-test-id diff helpers.  Both operate on plain iterables of test
+# ids (typically VerifyResult.failing_test_ids) and are entirely side-effect
+# free — no cache, no I/O.  They are the decision core of B1 ("a broad gate
+# blocks a branch only for failing test ids NOT already red on main"); the
+# surrounding cache/probe machinery (_BASELINE_FAILING_IDS_CACHE and friends,
+# added alongside verify_failure_is_preexisting_on_main) feeds them a
+# *baseline* set collected from a real main-tip probe.
+# ---------------------------------------------------------------------------
+
+
+def diff_new_failures(branch: Iterable[str], baseline: Iterable[str]) -> frozenset[str]:
+    """Return the ids present in *branch* but absent from *baseline*.
+
+    Plain set difference (``frozenset(branch) - frozenset(baseline)``), just
+    named/typed for the baseline-attribution call sites.  Pure; no I/O, no
+    caching, no ordering guarantee beyond frozenset's own (callers that need
+    a stable order should ``sorted()`` the result).
+    """
+    return frozenset(branch) - frozenset(baseline)
+
+
+def is_wholly_preexisting(branch: Iterable[str], baseline: Iterable[str]) -> bool:
+    """True iff *branch* is non-empty and every id in it already appears in *baseline*.
+
+    An empty *branch* (no failing ids at all) returns False — "wholly
+    preexisting" is meaningless with nothing to attribute; a passing verify
+    is the caller's concern, not this classifier's.
+    """
+    branch_set = frozenset(branch)
+    if not branch_set:
+        return False
+    return not diff_new_failures(branch_set, baseline)
 
 
 def _worst_category(categories: list[str]) -> str:
