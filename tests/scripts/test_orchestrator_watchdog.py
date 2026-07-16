@@ -1802,6 +1802,116 @@ def test_staleness_pass_commit_grace(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# staleness_pass fleet-deploy clock gate tests (task 2396, fleet-redeploy β,
+# step 9)
+#
+# These wire _within_fleet_deploy_min_interval() into staleness_pass() as a
+# top-priority, fleet-wide restraint gate — ahead of the existing
+# commit-grace/per-unit gates — so the once-per-8h fleet-deploy bound is
+# honored by the backstop, not just the event-driven coordinator. main()
+# (liveness) is untouched (I5): brokenness is not a scheduled deploy.
+# ---------------------------------------------------------------------------
+
+
+def test_staleness_pass_skips_when_within_fleet_deploy_min_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """staleness_pass returns immediately when the shared fleet-deploy clock
+    reports we are still inside the min-interval window: no enumeration, no
+    delegation, no restart_unit call — even with a would-be-stale unit
+    present — and it logs a line naming the skip (the PRD journal signal).
+
+    _newest_watched_commit_epoch, _enumerate_running_units, and restart_unit
+    are all monkeypatched to fail the test outright if consulted, so this
+    also pins that the fleet-deploy gate is checked BEFORE the existing
+    commit-grace gate (top priority) rather than merely somewhere in the
+    pass.
+    """
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(
+        wdog,
+        "_newest_watched_commit_epoch",
+        lambda: pytest.fail("must not be consulted when the fleet-deploy gate is closed"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_enumerate_running_units",
+        lambda: pytest.fail("must not enumerate units when the fleet-deploy gate is closed"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "restart_unit",
+        lambda u: pytest.fail("must not restart_unit when the fleet-deploy gate is closed"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.staleness_pass()
+
+    assert any("skip" in m and "8h since last fleet deploy" in m for m in log_messages), (
+        f"Expected a skip log line naming the 8h fleet-deploy window: {log_messages}"
+    )
+
+
+def test_staleness_pass_proceeds_when_fleet_deploy_gate_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """staleness_pass proceeds to its existing detection path when the
+    fleet-deploy gate is open (disabled, or the clock is absent/elapsed):
+    _enumerate_running_units must still be consulted.
+    """
+    wdog = _load_watchdog()
+    enumerated: list[str] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace
+
+    def fake_enumerate():
+        enumerated.append("called")
+        return []
+
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "_enumerate_running_units", fake_enumerate)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert enumerated == ["called"], (
+        "staleness_pass must still reach enumeration when the fleet-deploy gate is open"
+    )
+
+
+def test_main_liveness_unaffected_by_fleet_deploy_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """I5: the fleet-deploy clock gate must never affect main()'s liveness restarts.
+
+    main() still restarts a port-down unit via restart_unit even when
+    _within_fleet_deploy_min_interval() would report True (inside the 8h
+    fleet-deploy window) — liveness is uncapped, non-clock-gated, and
+    non-stamping; brokenness is not a scheduled deploy.
+    """
+    wdog = _load_watchdog()
+    restarted: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: port != 8102)  # df probe fails
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main()
+
+    assert restarted == ["orchestrator-dark-factory.service"], (
+        f"main() must still restart a port-down unit even when the fleet-deploy "
+        f"clock gate is engaged; got {restarted}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # staleness_pass END-TO-END tests (δ task 2027, scenarios 1-4)
 #
 # α's staleness_pass tests above stub every helper function directly
