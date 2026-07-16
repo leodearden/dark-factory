@@ -380,6 +380,52 @@ def _derive_module_runs(
     return runs
 
 
+def _merge_breadth_is_full(config: OrchestratorConfig | None) -> bool:
+    """True iff *config* opts into the broad ``merge_verify_breadth='full'`` gate.
+
+    A ``None`` *config* (every role='task' caller, and most existing tests)
+    is treated as the shipped default ('scoped') — never accidentally widens
+    to the broad merge gate.
+    """
+    return config is not None and config.merge_verify_breadth == 'full'
+
+
+def _derive_full_suite_runs(
+    mc: ModuleConfig,
+    role: Literal['merge', 'task'] = 'merge',
+) -> list[PlannedRun]:
+    """One ModuleConfig's PlannedRuns under the broad ``merge_verify_breadth='full'``
+    gate (λ, task 2589, R1).
+
+    Unlike :func:`_derive_module_runs`, this never file-scopes and never
+    consults which files the diff touched — every configured command
+    (lint/pyright/pytest) runs FULL_SUITE unconditionally, so a module the
+    diff never touched at all is still covered (the "only the touched
+    modules are protected" gap the task-role floor deliberately leaves open —
+    see :func:`_derive_module_runs`'s docstring; closing it broadly is this
+    knob-gated gate's job, not the floor's). A tool with no command
+    configured gets an explicit reasoned SKIPPED — the same "no X configured"
+    shape :func:`_derive_module_runs` uses — never a fabricated run.
+    """
+    runs: list[PlannedRun] = []
+    for tool_word, attr in (
+        ('lint', 'lint_command'),
+        ('pyright', 'type_check_command'),
+        ('pytest', 'test_command'),
+    ):
+        cmd_str: str | None = getattr(mc, attr)
+        if cmd_str:
+            runs.append(PlannedRun(
+                mc.prefix, parse_config_command(cmd_str), ScopeKind.FULL_SUITE,
+                f'{tool_word}: {role} role, full breadth — registered-module full suite',
+            ))
+        else:
+            runs.append(PlannedRun(
+                mc.prefix, None, ScopeKind.SKIPPED, f'{tool_word}: no {attr} configured',
+            ))
+    return runs
+
+
 # Sentinel module_prefix for the fallback (no-module_configs) branch — mirrors
 # _build_fallback_config's own '__fallback__' ModuleConfig.prefix literal.
 _FALLBACK_PREFIX = '__fallback__'
@@ -664,8 +710,12 @@ def derive_verify_plan(
         )
     if module_configs:
         runs: list[PlannedRun] = []
+        merge_full = role == 'merge' and _merge_breadth_is_full(config)
         for mc in module_configs:
-            runs.extend(_derive_module_runs(mc, existing_files, worktree_reader, role=role))
+            if merge_full:
+                runs.extend(_derive_full_suite_runs(mc, role))
+            else:
+                runs.extend(_derive_module_runs(mc, existing_files, worktree_reader, role=role))
         return VerifyPlan(runs=tuple(runs))
     return VerifyPlan(runs=tuple(_derive_fallback_runs(existing_files, config, worktree_reader)))
 
