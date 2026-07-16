@@ -5070,6 +5070,24 @@ async def verify_failure_is_preexisting_on_main(
         # through to the existing signature-comparison path unchanged, and
         # failing_test_ids=None (today's callers, e.g. task-verify at
         # workflow.py) always takes that legacy path too.
+        #
+        # Cost note (reviewer_comprehensive finding 2, task 2590): on a cold
+        # cache, main_baseline_failing_ids below pays for a FULL-SUITE
+        # merge-role probe (task_files=None) rather than the cheaper scoped
+        # role='task' probe further down this function — this applies to
+        # every caller that reaches here with a non-None failing_test_ids,
+        # sync (train/merge_gates/solo-reverify, via _classify_main_health_red)
+        # and deferred alike. This is confirmed acceptable, not an oversight:
+        # (1) it is opt-in — failing_test_ids is only ever non-None under
+        # merge_verify_breadth='full' (default remains 'scoped', so every
+        # caller that hasn't opted in pays exactly zero extra cost, byte-
+        # identical to pre-μ behaviour); (2) it is required for correctness
+        # — a full-suite branch id-set is only meaningfully diffable against
+        # an equally full-suite baseline id-set, a scoped signature
+        # comparison would not be apples-to-apples here; and (3) steady-state
+        # cost is amortized to a cache read by the pass-path seeding (B2,
+        # see seed_main_baseline) — a cold probe only happens on the first
+        # gate run against a given main tip, or after a TTL expiry / restart.
         if failing_result.failing_test_ids is not None:
             baseline = await main_baseline_failing_ids(
                 config, module_configs, git_ops, main_sha,
