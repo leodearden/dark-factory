@@ -3049,10 +3049,12 @@ class MemoryService:
         sourced from the row's ``payload_json['remediation']`` marker (see
         ``summary_pool.write_cycle_summary``): ``True``/``False`` for a
         present row written under this change, or ``None`` when the row is
-        absent, the ledger is unwired, or the row predates this change and
-        lacks the key (legacy) — lets Stage 3 disambiguate a Stage-2-only
-        remediation run's expected missing Stage 1 (``memory_consolidator``)
-        cycle_summary from a genuine Stage 1 write failure.
+        absent, the ledger is unwired, the row predates this change and
+        lacks the key (legacy), or the key is present but holds a non-bool
+        value (corrupted/hand-edited row) — lets Stage 3 disambiguate a
+        Stage-2-only remediation run's expected missing Stage 1
+        (``memory_consolidator``) cycle_summary from a genuine Stage 1 write
+        failure.
         """
         ledger = getattr(self, 'recon_ledger', None)
         if ledger is None:
@@ -3089,7 +3091,14 @@ class MemoryService:
                 payload = json.loads(record.payload_json)
             except (TypeError, ValueError):
                 payload = None
-            remediation = payload.get('remediation') if isinstance(payload, dict) else None
+            raw_remediation = payload.get('remediation') if isinstance(payload, dict) else None
+            # write_cycle_summary always stamps a bool, so this should
+            # already be True/False/absent — but coerce defensively: a
+            # corrupted/hand-edited row with a non-bool value (e.g. the
+            # string "yes") must degrade to None (report-as-missing), not
+            # be trusted as a suppression signal for Stage 3 (task 2652
+            # amendment).
+            remediation = raw_remediation if isinstance(raw_remediation, bool) else None
         return {
             'present': record is not None,
             'ledger_available': True,
