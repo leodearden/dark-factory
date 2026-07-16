@@ -93,22 +93,38 @@ def _extract_function_body(src: str, fn_name: str) -> str:
     Uses the same brace-depth walk as ``_extract_df_data_block``.  Only matches
     named ``function`` declarations — not arrow functions or class methods.
     Returns the empty string if the function is not found.
+
+    Paren-depth walks past the parameter list before looking for the body's
+    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
+    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
+    taking the first ``{`` after the opening ``(`` would return just the
+    destructuring pattern (e.g. ``{ a, b }``) instead of the function body.
     """
     m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
     if m is None:
         return ''
-    start = src.find('{', m.end())
+    paren_depth = 1
+    i = m.end()
+    while i < len(src) and paren_depth > 0:
+        if src[i] == '(':
+            paren_depth += 1
+        elif src[i] == ')':
+            paren_depth -= 1
+        i += 1
+    if paren_depth != 0:
+        return ''
+    start = src.find('{', i)
     if start == -1:
         return ''
     depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
+    for j in range(start, len(src)):
+        c = src[j]
         if c == '{':
             depth += 1
         elif c == '}':
             depth -= 1
             if depth == 0:
-                return src[start : i + 1]
+                return src[start : j + 1]
     return ''
 
 
@@ -600,4 +616,99 @@ def test_shell_jsx_registers_analytics_rail_and_glyph(shell_jsx_body: str) -> No
     assert "case 'esc-analytics':" in shell_jsx_body, (
         "shell.jsx Glyph switch does not have a `case 'esc-analytics':` branch — "
         'add an esc-analytics case returning a simple stroke SVG.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-9 test: cross-cutting foundation — window toggle, slice helper,
+# parse_failures chip, regime-marker overlay
+# ---------------------------------------------------------------------------
+
+
+def test_tab_analytics_window_toggle_and_crosscutting(tab_analytics_jsx_body: str) -> None:
+    """tab_escalation_analytics.jsx must have the cross-cutting foundation every
+    panel (Origin/Lifespan/Workflow) builds on:
+
+    (a) EscalationAnalyticsTab renders a `<Segmented` window toggle with
+        '7d'/'28d'/'all' options, default '28d', persisted via
+        `usePersistedState('df.escanalytics.window', '28d')`.
+    (b) A `windowCutoffDate`/`sliceDailyByWindow` helper pair anchors window
+        slicing to the payload's `generated_at` — NOT the browser clock
+        (`Date.now`).
+    (c) A `parse_failures` warning chip, rendered only when `> 0`.
+    (d) A reusable `RegimeMarkers` (or `ChartMarkers`) overlay component fed
+        the payload's real `regime_markers` data (not just the
+        empty-defaults literal), plus a `TimeChart` wrapper that composes it
+        with a chart primitive.
+    """
+    body = tab_analytics_jsx_body
+
+    # (a) Window toggle, scoped to EscalationAnalyticsTab's own body.
+    tab_body = _extract_function_body(body, 'EscalationAnalyticsTab')
+    assert tab_body, (
+        'Could not locate the `function EscalationAnalyticsTab(` body in '
+        'tab_escalation_analytics.jsx.'
+    )
+    assert re.search(
+        r"usePersistedState\(\s*['\"]df\.escanalytics\.window['\"]\s*,\s*['\"]28d['\"]\s*\)",
+        tab_body,
+    ), (
+        "EscalationAnalyticsTab does not call "
+        "usePersistedState('df.escanalytics.window', '28d') — the window toggle "
+        'must default to 28d and persist under that key.'
+    )
+    assert '<Segmented' in tab_body, (
+        'EscalationAnalyticsTab does not render a <Segmented toggle for the '
+        '7d/28d/all window control.'
+    )
+    for option in ("'7d'", "'28d'", "'all'"):
+        assert option in tab_body, (
+            f'EscalationAnalyticsTab window Segmented is missing the {option} option.'
+        )
+
+    # (c) parse_failures warning chip, guarded by > 0, also in the tab body.
+    assert re.search(r'analytics\.parse_failures\s*>\s*0', tab_body), (
+        'EscalationAnalyticsTab does not guard a parse_failures warning chip with '
+        '`analytics.parse_failures > 0` — add one so a corrupt-archive count is '
+        'surfaced loudly (INV-4) instead of silently.'
+    )
+
+    # (b) Client-side window-slice helpers, anchored to generated_at.
+    assert 'function windowCutoffDate(' in body, (
+        'tab_escalation_analytics.jsx does not define `function windowCutoffDate(` — '
+        'add the helper that computes the window cutoff relative to generated_at.'
+    )
+    cutoff_body = _extract_function_body(body, 'windowCutoffDate')
+    assert cutoff_body, 'Could not locate the windowCutoffDate( function body.'
+    assert 'generatedAt' in cutoff_body, (
+        'windowCutoffDate does not reference its generatedAt parameter — the window '
+        'cutoff must be anchored to the payload clock, not the browser clock.'
+    )
+    assert 'Date.now(' not in cutoff_body, (
+        'windowCutoffDate calls Date.now() — window slicing must be anchored to the '
+        "payload's generated_at, immune to browser-clock skew, not the live clock."
+    )
+    assert 'function sliceDailyByWindow(' in body, (
+        'tab_escalation_analytics.jsx does not define `function sliceDailyByWindow(` — '
+        'add the helper that filters date-keyed daily buckets down to the active window.'
+    )
+
+    # (d) Reusable regime-marker overlay, fed the real regime_markers field,
+    # plus the TimeChart wrapper every panel chart will render through.
+    assert (
+        'function RegimeMarkers(' in body or 'function ChartMarkers(' in body
+    ), (
+        'tab_escalation_analytics.jsx does not define a RegimeMarkers/ChartMarkers '
+        'overlay component — add one so time charts can render vertical regime '
+        'markers without modifying charts.jsx.'
+    )
+    assert re.search(r'\.regime_markers\b', body), (
+        'tab_escalation_analytics.jsx never dot-references `.regime_markers` off the '
+        'analytics payload — the marker overlay must be fed the real '
+        'analytics.regime_markers data, not just the empty-defaults literal.'
+    )
+    assert 'function TimeChart(' in body, (
+        'tab_escalation_analytics.jsx does not define `function TimeChart(` — add the '
+        'wrapper that composes a chart primitive with the RegimeMarkers overlay so '
+        'every panel chart gets regime markers consistently.'
     )
