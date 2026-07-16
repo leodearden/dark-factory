@@ -107,7 +107,7 @@ def _make_request(
 
 def _mock_verify_pass() -> AsyncMock:
     """Return a mock that makes run_scoped_verification always pass."""
-    return AsyncMock(return_value=type('VR', (), {'passed': True, 'summary': ''})())
+    return AsyncMock(return_value=type('VR', (), {'passed': True, 'summary': '', 'failing_test_ids': None})())
 
 
 def _make_fake_escalation_queue() -> MagicMock:

@@ -981,7 +981,7 @@ async def main_baseline_failing_ids(
                     role='merge',
                 )
             except Exception:
-                logger.debug(
+                logger.warning(
                     'main_baseline_failing_ids: probe verify raised', exc_info=True,
                 )
                 return None
@@ -1006,7 +1006,7 @@ async def main_baseline_failing_ids(
         )
         return None
     except Exception:
-        logger.debug('main_baseline_failing_ids: unexpected error', exc_info=True)
+        logger.warning('main_baseline_failing_ids: unexpected error', exc_info=True)
         return None
 
 
