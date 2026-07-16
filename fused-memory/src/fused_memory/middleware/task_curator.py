@@ -211,6 +211,9 @@ class CandidateTask:
     priority: str = DEFAULT_PRIORITY
     spawned_from: str | None = None  # task id of the review-chain anchor
     spawn_context: str = 'manual'  # review | steward-triage | planning | manual
+    # metadata.execution_class ('code_tdd' | 'operational' | 'decision' | None) —
+    # feeds operational_ask_registry.match_candidate's routing axis (task 2687).
+    execution_class: str | None = None
 
     def payload_hash(self) -> str:
         """Stable hash over fields the curator actually reads.
