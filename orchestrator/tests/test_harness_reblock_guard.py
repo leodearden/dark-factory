@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from _orch_helpers import _init_harness_state_for_test
+from _orch_helpers import HermeticMcpSession, _init_harness_state_for_test
 
 import orchestrator.harness as harness_module
 from orchestrator.config import OrchestratorConfig
@@ -105,7 +105,9 @@ class TestSlotSetupFailureReblockGuard:
         GREEN after the fix (arm_requeue_cooldown flag ORed into scheduler.release).
         """
         clock = [1000.0]
-        scheduler = Scheduler(config, time_source=lambda: clock[0])
+        scheduler = Scheduler(
+            config, time_source=lambda: clock[0], mcp_session=HermeticMcpSession(),
+        )
         harness = _make_harness(config, scheduler)
 
         monkeypatch.setattr(harness_module, 'TaskWorkflow', _RaisingWorkflow)
@@ -149,7 +151,9 @@ class TestSlotSetupFailureReblockGuard:
         This test passes on both the base branch and after the fix (scope check).
         """
         clock = [1000.0]
-        scheduler = Scheduler(config, time_source=lambda: clock[0])
+        scheduler = Scheduler(
+            config, time_source=lambda: clock[0], mcp_session=HermeticMcpSession(),
+        )
         harness = _make_harness(config, scheduler)
 
         monkeypatch.setattr(harness_module, 'TaskWorkflow', _CancelledWorkflow)
