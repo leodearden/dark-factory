@@ -85,3 +85,15 @@ class TestKnownRoleNamesDriftGuard:
 
     def test_every_dispatchable_role_is_a_known_role_name(self):
         assert set(ROLES) <= KNOWN_ROLE_NAMES
+
+    def test_every_models_config_field_is_a_known_role_name(self):
+        """KNOWN_ROLE_NAMES's docstring also claims it is a superset of
+        ModelsConfig's collapsed keys (e.g. 'reviewer', 'triage',
+        'module_tagger') -- accepted-but-inert at resolve time (they never
+        match `inputs.role_name`), but still meant to shape-validate without
+        an unknown_key rejection. This tripwires that second mirrored
+        authority: a ModelsConfig field added without a matching
+        KNOWN_ROLE_NAMES update would otherwise be unpinnable under its own
+        config key with no test failure.
+        """
+        assert set(ModelsConfig.model_fields) <= KNOWN_ROLE_NAMES
