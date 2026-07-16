@@ -270,7 +270,18 @@ async def _scheduled_self_restart_then_crash_at_ran(tmp_queue_dir: Path):
     fault: no further VERIFIED write ever happens — the deploy 'crashed'
     with metadata frozen at phase=ran. A real TaskGroundTruth then reads
     that frozen metadata back through recovery_for(). Returns
-    (restart_outcome, truth_report, recovery_action)."""
+    (restart_outcome, truth_report, recovery_action, sink_calls).
+
+    Scope note: the RAN write here is driven directly via
+    enforce_transition() + DeployState.to_metadata() — the same primitives
+    DeterministicRunner's own ``_compute_deploy_phase_advance`` /
+    ``_advance_deploy_phase`` compose — rather than by invoking that
+    higher-level orchestrator component itself. This cell proves the
+    DeployState half of the seam is REAL and correctly read back by
+    TaskGroundTruth; it does not exercise DeterministicRunner's own
+    phase-write ordering/atomicity, which is covered by
+    test_deterministic_runner.py.
+    """
     from orchestrator.deploy_state import DeployPhase, DeployState, enforce_transition
     from orchestrator.proc_supervision import EscalationSpec, RestartPlan
 
@@ -316,7 +327,7 @@ async def _scheduled_self_restart_then_crash_at_ran(tmp_queue_dir: Path):
         escalation_queue=None,
     )
     truth_report, action = await resolver.recovery_for(tid)
-    return restart_outcome, truth_report, action
+    return restart_outcome, truth_report, action, sink_calls
 
 
 @pytest.mark.asyncio
@@ -331,14 +342,16 @@ class TestD1SelfRestartDeployCrash:
         from orchestrator.proc_supervision import RestartDisposition
         from orchestrator.task_ground_truth import RecoveryAction
 
-        restart_outcome, truth_report, action = await _scheduled_self_restart_then_crash_at_ran(
+        restart_outcome, truth_report, action, sink_calls = await _scheduled_self_restart_then_crash_at_ran(
             tmp_queue_dir,
         )
 
         assert restart_outcome.disposition == RestartDisposition.SCHEDULED
         assert truth_report.deploy_phase == DeployPhase.RAN
         assert action == RecoveryAction.RE_FILE_ESCALATION
-        assert action != RecoveryAction.MARK_DONE_WITH_PROVENANCE
+        assert sink_calls == [], (
+            'the initial None->RAN write is not a transition and must never escalate'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +368,15 @@ async def _cross_unit_verify_then_advance_to_done():
     PID + strictly-later monotonic, RP-5), and the real DeployState chain
     then advances RAN->VERIFIED->DONE, every edge legal per `_LEGAL` (the
     recording escalation_sink is never invoked). Returns
-    (restart_outcome, final_phase, sink_calls)."""
+    (restart_outcome, final_phase, sink_calls).
+
+    Scope note: like D1a, the RAN->VERIFIED->DONE writes are driven
+    directly via enforce_transition() + DeployState.to_metadata() rather
+    than by invoking DeterministicRunner's own ``_advance_deploy_phase``.
+    This cell proves the DeployState objects and legality table are REAL,
+    not that DeterministicRunner writes them in this order; that ordering
+    is covered by test_deterministic_runner.py.
+    """
     from orchestrator.deploy_state import DeployPhase, DeployState, enforce_transition
     from orchestrator.proc_supervision import EscalationSpec, FreshPidVerify, RestartPlan
 
