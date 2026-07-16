@@ -479,6 +479,7 @@ class TestTickContextField:
         """Default factory must not share a mutable default across instances."""
         ctx1 = TickContext(tasks=[], status_map={}, tasks_by_id={})
         ctx2 = TickContext(tasks=[], status_map={}, tasks_by_id={})
+        assert ctx1.delivered_check_cache is not None
         ctx1.delivered_check_cache['x'] = True
         assert ctx2.delivered_check_cache == {}
 
@@ -1355,6 +1356,7 @@ class TestDeliveredCheckGraceEscalation:
         status_map = {'20': 'done'}
         tasks_by_id = {'20': dep, '10': task}
         callback = scheduler._callbacks.on_delivered_check_block
+        assert callback is not None
 
         await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
         await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
@@ -1403,6 +1405,7 @@ class TestDeliveredCheckGraceEscalation:
         await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
 
         assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
+        assert scheduler._callbacks.on_delivered_check_block is not None
         scheduler._callbacks.on_delivered_check_block.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1420,6 +1423,7 @@ class TestDeliveredCheckGraceEscalation:
         await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
 
         assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
+        assert scheduler._callbacks.on_delivered_check_block is not None
         scheduler._callbacks.on_delivered_check_block.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1437,6 +1441,7 @@ class TestDeliveredCheckGraceEscalation:
         status_map = {'20': 'done'}
         tasks_by_id = {'20': dep, '10': task_a, '11': task_b}
         callback = scheduler._callbacks.on_delivered_check_block
+        assert callback is not None
 
         for _ in range(3):
             await scheduler._compute_delivered_check_cache(
