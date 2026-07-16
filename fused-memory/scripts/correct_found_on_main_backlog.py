@@ -24,9 +24,11 @@ evidence text):
     "Merge task/1175 into main" marker that never carried it. Prior
     reconciliation reopens silently failed to persist the done -> pending
     flip (metadata.reopen_* fields were written but ``status`` never
-    changed). This script reopens it, with a post-write read-back verify so
-    a silent non-persist is caught loudly rather than repeating that
-    history.
+    changed). This script reopens it via a single atomic status+audit write
+    (the status flip and both audit trails commit or roll back together —
+    never as two independently-failable commits), with a post-write
+    read-back verify so a silent non-persist is caught loudly rather than
+    repeating that history.
   - **Task 2273** (``deliverable_absent``) — a BENIGN false positive. It is
     a deterministic pure-gate task (``task_kind=deterministic``,
     ``always_escalates=true``) whose declared files are sibling-produced
@@ -289,13 +291,20 @@ async def apply_corrections(
     return summary
 
 
-def _annotation_metadata(correction: Correction, *, extra: dict[str, Any] | None = None) -> str:
-    """Build the JSON-encoded ``{'x_provenance_audit': {...}}`` metadata patch.
+def _annotation_payload(
+    correction: Correction, *, extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the ``{'x_provenance_audit': {...}}`` metadata-patch dict (unserialized).
 
     Always carries ``label``/``reasons``/``ref``/``audited_at``; *extra*
     (e.g. ``reopen_reason`` for the reopen audit trail) is merged in on top.
     Freshly stamps ``audited_at`` on every call — this is a write-time
     fact, never carried over from the Correction itself.
+
+    Returns a plain dict (not JSON) so callers can either serialize it for
+    ``update_task``'s ``metadata: str`` contract (:func:`_annotation_metadata`)
+    or splice it directly into a ``set_status_and_stamp_audit`` ``audit_fields``
+    dict alongside other top-level keys (:func:`_apply_reopen`).
     """
     annotation: dict[str, Any] = {
         'label': correction.label,
@@ -305,7 +314,12 @@ def _annotation_metadata(correction: Correction, *, extra: dict[str, Any] | None
     }
     if extra:
         annotation.update(extra)
-    return json.dumps({'x_provenance_audit': annotation})
+    return {'x_provenance_audit': annotation}
+
+
+def _annotation_metadata(correction: Correction, *, extra: dict[str, Any] | None = None) -> str:
+    """JSON-encode :func:`_annotation_payload` for ``update_task``'s ``metadata: str`` contract."""
+    return json.dumps(_annotation_payload(correction, extra=extra))
 
 
 async def _apply_annotate(
@@ -334,10 +348,21 @@ async def _apply_reopen(
 
     Task 1175's own metadata documents that prior reconciliation reopens
     wrote ``metadata.reopen_*`` fields but the top-level ``status`` silently
-    never flipped — so a bare ``set_task_status`` call is not trusted on its
-    own. Success requires BOTH:
+    never flipped — so a bare status write is not trusted on its own, AND
+    the status flip and its audit trail must never be split across two
+    independently-failable writes (that split-write window is exactly what
+    let a prior reopen's ``metadata.reopen_*`` land while ``status`` did
+    not). The status flip, the canonical ``reopen_reason``/``reopen_from``/
+    ``reopen_at`` fields (the same audit-field convention
+    ``TaskInterceptor``'s terminal-exit gate stamps on every reopen — see
+    ``middleware/task_interceptor.py``), and this script's own
+    non-destructive ``x_provenance_audit`` correction record are all merged
+    into metadata and written in a SINGLE call to ``backend``'s
+    ``set_status_and_stamp_audit`` (task 2649's sole atomic status+audit
+    writer), so every one of them commits or rolls back together. Success
+    requires BOTH:
 
-      1. ``set_task_status`` did not return the typed
+      1. ``set_status_and_stamp_audit`` did not return the typed
          :class:`StatusWriteNotPersistedResult` failure DTO
          (``result.get('success') is False`` or
          ``result.get('error') == 'status_write_not_persisted'``).
@@ -345,19 +370,32 @@ async def _apply_reopen(
          — a belt-and-suspenders check against exactly the class of silent
          non-persistence task 1175 suffered.
 
-    Only on a verified success is the audit-trail annotation written (the
-    same non-destructive ``x_provenance_audit`` merge path as
-    :func:`_apply_annotate`, with ``reopen_reason`` merged in) and ``True``
-    returned.
+    ``reopen_from`` is hardcoded to ``'done'`` rather than read back from
+    the task: every Correction this script plans is sourced from the
+    found_on_main audit, which only ever selects ``done`` tasks (see
+    ``audit_found_on_main_provenance.select_found_on_main_tasks``), so every
+    reopen this script performs is, by construction, a done -> pending flip.
 
     On any not-persisted outcome — the not-persisted DTO OR a re-read that
     still shows a non-``'pending'`` status — this logs loudly at ERROR
-    (never silently), skips the audit annotation entirely (a corrective
-    annotation must not claim a reopen that didn't happen), and returns
-    ``False`` without raising. The caller is responsible for
-    ``reopen_failed``/``errors`` accounting and for continuing the batch.
+    (never silently) and returns ``False`` without raising. Because the
+    write is atomic, a not-persisted outcome means NEITHER the status NOR
+    either audit trail was committed — there is no partial state to
+    separately reconcile (unlike the pre-amendment split-write version of
+    this function). The caller is responsible for ``reopen_failed``/
+    ``errors`` accounting and for continuing the batch.
     """
-    result = await backend.set_task_status(correction.task_id, 'pending', project_root, tag)
+    audit_fields: dict[str, Any] = {
+        'reopen_reason': correction.reopen_reason,
+        'reopen_from': 'done',
+        'reopen_at': datetime.now(UTC).isoformat(),
+        **_annotation_payload(
+            correction, extra={'reopen_reason': correction.reopen_reason},
+        ),
+    }
+    result = await backend.set_status_and_stamp_audit(
+        correction.task_id, 'pending', project_root, tag, audit_fields=audit_fields,
+    )
     write_persisted = (
         result.get('success') is not False
         and result.get('error') != 'status_write_not_persisted'
@@ -369,21 +407,17 @@ async def _apply_reopen(
     if not (write_persisted and reread_confirms_pending):
         actual_status = result.get('actual_status', fresh.get('status'))
         logger.error(
-            'Reopen for task %s did NOT persist (set_task_status '
+            'Reopen for task %s did NOT persist (set_status_and_stamp_audit '
             "reported error=%r, get_task re-read status=%r) - recording as "
-            'reopen_failed_to_persist and skipping the audit annotation.',
+            'reopen_failed_to_persist.',
             correction.task_id, result.get('error'), actual_status,
         )
         return False
 
-    await backend.update_task(
-        correction.task_id, project_root,
-        metadata=_annotation_metadata(
-            correction, extra={'reopen_reason': correction.reopen_reason},
-        ),
-        tag=tag,
+    logger.info(
+        'Reopened task %s (done -> pending, atomic status+audit write)',
+        correction.task_id,
     )
-    logger.info('Reopened task %s (done -> pending)', correction.task_id)
     return True
 
 
