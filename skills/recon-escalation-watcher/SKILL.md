@@ -81,7 +81,9 @@ no worktree).
 4. Read the escalation from watcher output; fetch full detail via MCP
 5. Drain any other pending escalations
 6. Handle each
-7. Go to 2
+7. Run `reap-decisions` to close any parked DecisionRecord whose escalation has since resolved
+   (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
+8. Go to 2
 ```
 
 ### Draining
@@ -232,6 +234,35 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
 - The verb always files `state=open` and is fail-soft (a registry fault is logged and swallowed,
   never raised) — filing a decision can never crash the watch loop or block the "leave pending"
   action itself.
+
+### Closing parked decisions on resolve
+
+A filed DecisionRecord stays `state=open` — and therefore visible in the cockpit decision queue —
+until its escalation reaches a terminal status. The watcher that files a decision is almost never
+the one that resolves it: resolution typically happens later, via the human acting on the
+dashboard or an L2 cascade. So closing a parked decision is a separate, recurring step, not
+something the `write-decision` call itself can do.
+
+Once per Main Loop cycle (see step 7 above), run:
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py reap-decisions \
+  --project <project> --escalations-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations
+```
+
+**Note the queue dir**: recon escalations live under `data/reconciliation/escalations/` (the
+flat recon queue on port 8103), **not** `data/escalations/` (the levelled orchestrator queue that
+`escalation-watcher` reaps). Pointing `--escalations-dir` at `data/escalations` here would make
+the reaper a permanent no-op — it would scan the wrong directory, never find a recon escalation's
+terminal status, and never close a recon-watcher decision.
+
+This closes (`answered`/`dropped`) any `state=open`, `escalation_id`-bearing decision whose
+escalation has since resolved (`resolved` → `answered`) or been dismissed (`dismissed` →
+`dropped`) — regardless of who resolved it. It is read-only with respect to escalations (it only
+ever writes the decision's own state field) and fail-soft, exactly like `write-decision` — a
+registry fault is logged and swallowed, never raised, so it can never crash the watch loop. A
+decision filed with **no** `escalation_id` is never auto-closed this way and needs explicit human
+closure.
 
 ## Caveat: recon re-files until the go-forward fix lands
 
