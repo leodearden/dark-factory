@@ -197,6 +197,46 @@ class TestCheckGate1Terminal:
         assert 'set_task_status' in hint
         assert 'done_provenance' in hint
 
+    def test_annotation_clear_exempts_done_task_from_gate_1(self):
+        verdict = _check('update_task', live_status='done', is_annotation_clear=True)
+        assert verdict.is_rejection is False
+        assert verdict.error_type != 'ReconTerminalWriteRejected'
+
+    def test_annotation_clear_exempts_cancelled_task_from_gate_1(self):
+        verdict = _check('update_task', live_status='cancelled', is_annotation_clear=True)
+        assert verdict.is_rejection is False
+        assert verdict.error_type != 'ReconTerminalWriteRejected'
+
+    def test_annotation_clear_false_still_rejects(self):
+        verdict = _check('update_task', live_status='done', is_annotation_clear=False)
+        assert verdict.is_rejection is True
+        assert verdict.error_type == 'ReconTerminalWriteRejected'
+
+    def test_annotation_clear_omitted_defaults_false_still_rejects(self):
+        """Backward compatibility: existing callers that never pass
+        is_annotation_clear must see unchanged Gate 1 behavior."""
+        verdict = _check('update_task', live_status='done')
+        assert verdict.is_rejection is True
+        assert verdict.error_type == 'ReconTerminalWriteRejected'
+
+    def test_annotation_clear_still_subject_to_gate_3_stale_snapshot(self):
+        """The exemption bypasses Gate 1 only — Gate 3 (stale snapshot)
+        still composes and fires on a clear write carrying a stale token."""
+        verdict = _check(
+            'update_task',
+            live_status='done',
+            is_annotation_clear=True,
+            snapshot_token='pending',
+        )
+        assert verdict.is_rejection is True
+        assert verdict.error_type == 'ReconStaleSnapshotRejected'
+
+    def test_annotation_clear_on_non_terminal_task_is_unaffected(self):
+        verdict = _check(
+            'update_task', live_status='in-progress', is_annotation_clear=False,
+        )
+        assert verdict.is_rejection is False
+
 
 # ---------------------------------------------------------------------------
 # check() gate 2 — live workflow (set_task_status only)
@@ -369,6 +409,178 @@ class TestExtractSnapshotToken:
 
 
 # ---------------------------------------------------------------------------
+# CLEARABLE_ANNOTATION_KEYS / is_terminal_annotation_clear
+# ---------------------------------------------------------------------------
+
+
+class TestIsTerminalAnnotationClear:
+    def test_clearable_annotation_keys_contains_possible_scope_mismatch(self):
+        assert 'possible_scope_mismatch' in recon_write_policy.CLEARABLE_ANNOTATION_KEYS
+
+    # -- positive: exemption applies ---------------------------------------
+
+    def test_clear_to_none_default_mode_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}},
+        ) is True
+
+    def test_clear_via_json_string_metadata_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': '{"possible_scope_mismatch": {"matched_paths": ["a"]}}'},
+        ) is True
+
+    def test_explicit_merge_mode_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {
+                'metadata': {'possible_scope_mismatch': None},
+                'metadata_mode': 'merge',
+            },
+        ) is True
+
+    def test_overwrite_to_non_null_value_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {
+                'metadata': {
+                    'possible_scope_mismatch': {
+                        'matched_paths': ['a'],
+                        'suggested_project': 'other_project',
+                        'source': 'prose',
+                    },
+                },
+            },
+        ) is True
+
+    # -- negative: task-content fields disqualify ---------------------------
+
+    def test_title_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'title': 'x'},
+        ) is False
+
+    def test_description_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'description': 'd'},
+        ) is False
+
+    def test_details_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'details': 'd'},
+        ) is False
+
+    def test_prompt_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'prompt': 'p'},
+        ) is False
+
+    def test_priority_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'priority': 'high'},
+        ) is False
+
+    def test_dependencies_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'dependencies': [1, 2]},
+        ) is False
+
+    # -- negative: unrecognized kwargs fail closed (robustness amendment) ---
+
+    def test_unrecognized_future_kwarg_is_false(self):
+        """A hypothetical `update_task` parameter that doesn't exist yet (and
+        so cannot be on any denylist) must still disqualify the exemption —
+        the allowlist (_ANNOTATION_CLEAR_ALLOWED_KWARGS) fails CLOSED for any
+        kwarg it doesn't recognize, unlike a denylist which would silently
+        let an unenumerated field through."""
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'owner': 'alice'},
+        ) is False
+
+    def test_unrecognized_kwarg_alone_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'some_new_field': 'x'},
+        ) is False
+
+    # -- positive: allowlisted non-content kwargs don't disqualify -----------
+
+    def test_tag_present_is_still_true(self):
+        """`tag` selects the tag-scoped row (addressing); it is never itself
+        written, so it is not a content mutation."""
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'tag': 'master'},
+        ) is True
+
+    def test_status_present_is_still_true(self):
+        """`status` is deliberately excluded from consideration here (same
+        rationale as CLEARABLE_ANNOTATION_KEYS): the write-authority floor
+        unconditionally rejects a non-None status for every caller before
+        any DB write, regardless of this predicate's verdict."""
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'status': 'done'},
+        ) is True
+
+    # -- negative: non-allowlisted metadata keys -----------------------------
+
+    def test_non_allowlisted_key_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'arbitrary': 1}},
+        ) is False
+
+    def test_files_key_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'files': ['a/b.py']}},
+        ) is False
+
+    def test_done_provenance_key_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'done_provenance': {'kind': 'merged'}}},
+        ) is False
+
+    def test_mixed_allowlisted_and_non_allowlisted_keys_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None, 'arbitrary': 1}},
+        ) is False
+
+    # -- negative: non-merge modes -------------------------------------------
+
+    def test_metadata_mode_replace_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {
+                'metadata': {'possible_scope_mismatch': None},
+                'metadata_mode': 'replace',
+            },
+        ) is False
+
+    def test_append_true_additive_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'append': True},
+        ) is False
+
+    def test_append_false_replace_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'append': False},
+        ) is False
+
+    # -- negative: absent / empty / unparseable metadata ---------------------
+
+    def test_metadata_absent_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear({}) is False
+
+    def test_metadata_none_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear({'metadata': None}) is False
+
+    def test_metadata_empty_dict_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear({'metadata': {}}) is False
+
+    def test_metadata_non_dict_int_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear({'metadata': 42}) is False
+
+    def test_metadata_json_list_string_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear({'metadata': '[1,2]'}) is False
+
+    def test_metadata_unparseable_string_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear({'metadata': 'not json'}) is False
+
+
+# ---------------------------------------------------------------------------
 # Interceptor boundary fixtures (mirrors test_task_write_agent_id.py)
 # ---------------------------------------------------------------------------
 
@@ -431,6 +643,85 @@ class TestInterceptorUpdateTaskTerminalBoundary:
         taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
 
         await interceptor.update_task('1', '/project', title='x', agent_id=None)
+
+        taskmaster.update_task.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# P1b — interceptor.update_task terminal-annotation-clear exemption boundary
+# ---------------------------------------------------------------------------
+
+
+class TestInterceptorUpdateTaskAnnotationClearBoundary:
+    @pytest.mark.asyncio
+    async def test_recon_stage_clear_of_possible_scope_mismatch_on_done_task_proceeds(
+        self, interceptor, taskmaster,
+    ):
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={'possible_scope_mismatch': None},
+            agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+        assert 'error_type' not in result
+
+    @pytest.mark.asyncio
+    async def test_clear_with_title_present_still_rejects(self, interceptor, taskmaster):
+        """A content field alongside the clearable metadata key disqualifies
+        the exemption — this is a content mutation, not a pure clear."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={'possible_scope_mismatch': None},
+            title='x',
+            agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clear_with_non_allowlisted_key_still_rejects(self, interceptor, taskmaster):
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={'arbitrary_key': 1},
+            agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clear_with_replace_mode_still_rejects(self, interceptor, taskmaster):
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={'possible_scope_mismatch': None},
+            metadata_mode='replace',
+            agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_recon_agent_id_clear_proceeds_unchanged(self, interceptor, taskmaster):
+        """Recon-scoping negative: unaffected by this change either way —
+        this write was never gated regardless of the exemption."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        await interceptor.update_task(
+            '1', '/project',
+            metadata={'possible_scope_mismatch': None},
+            agent_id=None,
+        )
 
         taskmaster.update_task.assert_awaited_once()
 

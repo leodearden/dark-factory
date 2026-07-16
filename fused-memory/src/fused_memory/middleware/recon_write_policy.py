@@ -11,7 +11,11 @@ them is downstream consumer W5-μ's job, NOT this module's.
 Three independent early-return gates in :func:`check`:
 
 1. ``op == 'update_task'`` AND ``live_status`` is terminal (done/cancelled)
-   -> ``ReconTerminalWriteRejected``.
+   AND NOT ``is_annotation_clear`` -> ``ReconTerminalWriteRejected``. The
+   ``is_annotation_clear`` bypass (task 2684) exempts a non-load-bearing,
+   metadata-only, merge-mode write touching only
+   :data:`CLEARABLE_ANNOTATION_KEYS` (e.g. ``possible_scope_mismatch``) —
+   see :func:`is_terminal_annotation_clear`. It never loosens Gates 2/3.
 2. ``op == 'set_task_status'`` AND a live workflow is detected for the task
    -> ``ReconLiveWorkflowWriteRejected``.
 3. ``snapshot_token is not None`` AND it disagrees with ``live_status``
@@ -54,6 +58,58 @@ SNAPSHOT_TOKEN_KEYS: tuple[str, ...] = ('snapshot_status', 'observed_status')
 # rather than the destructive reopen path. Never used by the Gate 2
 # (live-workflow) or Gate 3 (stale-snapshot) rejections — see :class:`Verdict`.
 TERMINAL_CORRECTIVE_PATH = 'set_task_status_done_provenance_repair'
+
+# Frozen-by-default allowlist (task 2684) of metadata keys a terminal-task
+# ``update_task`` write may clear via :func:`is_terminal_annotation_clear`.
+# Mirrors the ``_BLESSED_METADATA_KEYS`` convention in
+# ``shared.task_metadata``: a newly introduced metadata key stays BLOCKED on
+# terminal tasks until deliberately added here — the guard can never be
+# silently loosened by an unrelated new key. Seeded with the one known
+# non-load-bearing annotation marker
+# (``TaskInterceptor._attach_possible_scope_mismatch`` — an advisory
+# ``{matched_paths, suggested_project, source}`` blob with no bearing on
+# lifecycle/scheduling/locks/provenance). ``status`` and ``done_provenance``
+# are intentionally never eligible here — the ``update_task`` write-authority
+# floor already unconditionally rejects both for every caller, so they can
+# never reach this predicate.
+CLEARABLE_ANNOTATION_KEYS: frozenset[str] = frozenset({'possible_scope_mismatch'})
+
+# Allowlist (robustness amendment, task 2684) of ``update_task`` kwargs that
+# NEVER disqualify the terminal-annotation-clear exemption. Deliberately an
+# allowlist of permitted kwargs, NOT a denylist of known content fields: a
+# denylist (title/description/details/prompt/priority/dependencies) has the
+# OPPOSITE default-safety posture from :data:`CLEARABLE_ANNOTATION_KEYS`'s
+# frozen-by-default allowlist — a *new* content-mutating ``update_task``
+# parameter added later (e.g. a hypothetical ``owner`` or ``subtasks`` field)
+# would silently pass through a denylist until someone remembered to add it
+# there, permitting a content mutation on a terminal task alongside a
+# sanctioned annotation clear. An allowlist fails CLOSED instead: an
+# unrecognized kwarg disqualifies the exemption until deliberately added
+# here, matching :data:`CLEARABLE_ANNOTATION_KEYS`'s posture so both checks
+# in :func:`is_terminal_annotation_clear` agree.
+#
+# This is a *kwarg-name* allowlist (is this top-level ``update_task``
+# parameter one the exemption may ignore?) — a different axis from
+# :data:`CLEARABLE_ANNOTATION_KEYS`, which is a *metadata-key* allowlist
+# (is this key inside the ``metadata`` dict one the exemption may clear?).
+# The two compose: both must hold for the exemption to apply.
+#
+# ``metadata``/``metadata_mode``/``append`` are specially inspected below
+# (not merely ignored). ``tag`` selects the tag-scoped row
+# (``WHERE tag = ? AND id = ?`` in ``sqlite_task_backend.update_task``) and
+# is never itself written — addressing, not content. ``status`` is included
+# for the same reason :data:`CLEARABLE_ANNOTATION_KEYS` never eligibility-
+# checks it: the write-authority floor unconditionally rejects a non-None
+# ``status`` for every caller, before any DB write is attempted, regardless
+# of this predicate's verdict — carrying forward the original design
+# decision rather than silently reversing it. ``agent_id`` never actually
+# reaches ``update_kwargs`` in practice (the ``task_interceptor.update_task``
+# call site captures it as a separate keyword-only parameter, out of
+# ``**kwargs``) — listed here only so a direct caller of this predicate is
+# not surprised.
+_ANNOTATION_CLEAR_ALLOWED_KWARGS: frozenset[str] = frozenset({
+    'metadata', 'metadata_mode', 'append', 'tag', 'status', 'agent_id',
+})
 
 # ---------------------------------------------------------------------------
 # Verdict
@@ -171,6 +227,7 @@ def check(
     target_status: str | None,
     live_status: str,
     snapshot_token: str | None,
+    is_annotation_clear: bool = False,
 ) -> Verdict:
     """Decide whether a recon-stage caller may perform *op* on *task_id*.
 
@@ -179,7 +236,14 @@ def check(
     ``task_interceptor.py``, not here.
 
     Gate 1 (terminal): ``op == 'update_task'`` AND ``live_status`` is
-    terminal (done/cancelled) -> ``ReconTerminalWriteRejected``.
+    terminal (done/cancelled) AND NOT ``is_annotation_clear`` ->
+    ``ReconTerminalWriteRejected``. ``is_annotation_clear`` (task 2684,
+    default ``False`` for full backward compatibility) is a non-load-bearing
+    exemption: the caller should pass
+    ``is_terminal_annotation_clear(update_kwargs)`` so a metadata-only,
+    merge-mode write touching only :data:`CLEARABLE_ANNOTATION_KEYS` bypasses
+    this gate. It bypasses Gate 1 ONLY — Gates 2/3 still compose (e.g. a
+    stale ``snapshot_token`` still fails Gate 3).
 
     Gate 2 (live workflow): ``op == 'set_task_status'`` AND a live workflow
     is detected for ``task_id`` -> ``ReconLiveWorkflowWriteRejected``. The
@@ -194,7 +258,7 @@ def check(
     ``ReconStaleSnapshotRejected``. Checked last so a terminal/live-workflow
     rejection takes precedence over a stale-snapshot one.
     """
-    if op == 'update_task' and live_status in TERMINAL_STATUSES:
+    if op == 'update_task' and live_status in TERMINAL_STATUSES and not is_annotation_clear:
         return _reject(
             op=op,
             task_id=task_id,
@@ -284,28 +348,40 @@ def check(
 # ---------------------------------------------------------------------------
 
 
-def extract_snapshot_token(metadata: object) -> str | None:
-    """Extract the snapshot status token from ``update_task``'s ``metadata`` kwarg.
+def _coerce_metadata_dict(metadata: object) -> dict | None:
+    """Coerce an ``update_task``-style ``metadata`` payload to a ``dict``.
 
-    Coerces *metadata* via dict/``json.loads`` — mirroring
-    ``_reject_done_provenance_in_update_metadata``'s inline coercion idiom
-    in ``task_interceptor.py``. Returns the value of the first
-    :data:`SNAPSHOT_TOKEN_KEYS` entry present, when that value is itself a
-    non-empty ``str``. Returns ``None`` when *metadata* is not a dict /
-    JSON-object string, contains neither key, or the first present key's
-    value is not a non-empty string (e.g. ``None``, a number, or a bool) —
-    such values are treated as an absent token rather than coerced via
-    ``str()``, so they can never spuriously disagree with a live status.
+    Shared coercion idiom (factored out of :func:`extract_snapshot_token`,
+    task 2684) mirroring ``_reject_done_provenance_in_update_metadata``'s
+    inline coercion in ``task_interceptor.py``. A ``dict`` passes through
+    unchanged; a ``str`` is parsed via ``json.loads`` and kept only if the
+    result is itself a ``dict``. Anything else — including a JSON string
+    that parses to a non-dict (e.g. a list), invalid JSON, or a non-str/dict
+    value such as ``None`` or ``42`` — returns ``None``.
     """
-    parsed: dict | None = None
     if isinstance(metadata, dict):
-        parsed = metadata
-    elif isinstance(metadata, str):
+        return metadata
+    if isinstance(metadata, str):
         try:
             loaded = json.loads(metadata)
         except (ValueError, TypeError):
             return None
-        parsed = loaded if isinstance(loaded, dict) else None
+        return loaded if isinstance(loaded, dict) else None
+    return None
+
+
+def extract_snapshot_token(metadata: object) -> str | None:
+    """Extract the snapshot status token from ``update_task``'s ``metadata`` kwarg.
+
+    Coerces *metadata* via :func:`_coerce_metadata_dict`. Returns the value
+    of the first :data:`SNAPSHOT_TOKEN_KEYS` entry present, when that value
+    is itself a non-empty ``str``. Returns ``None`` when *metadata* is not a
+    dict / JSON-object string, contains neither key, or the first present
+    key's value is not a non-empty string (e.g. ``None``, a number, or a
+    bool) — such values are treated as an absent token rather than coerced
+    via ``str()``, so they can never spuriously disagree with a live status.
+    """
+    parsed = _coerce_metadata_dict(metadata)
     if parsed is None:
         return None
     for key in SNAPSHOT_TOKEN_KEYS:
@@ -313,3 +389,49 @@ def extract_snapshot_token(metadata: object) -> str | None:
             val = parsed[key]
             return val if isinstance(val, str) and val else None
     return None
+
+
+def is_terminal_annotation_clear(update_kwargs: dict) -> bool:
+    """Is *update_kwargs* a pure, allowlisted, terminal-task annotation clear?
+
+    True iff ALL of the following hold — used to compute Gate 1's
+    ``is_annotation_clear`` bypass (task 2684) for a non-load-bearing
+    annotation-only ``update_task`` write against a terminal task:
+
+    (a) Every key in *update_kwargs* with a non-``None`` value is in
+        :data:`_ANNOTATION_CLEAR_ALLOWED_KWARGS` — an unrecognized kwarg
+        (any ``update_task`` parameter not on that allowlist, including a
+        content-mutating field added after this predicate was written)
+        disqualifies unconditionally: fail CLOSED, not open.
+    (b) The effective metadata merge mode is ``'merge'`` — mirroring
+        ``sqlite_task_backend._resolve_metadata_mode``'s precedence
+        (``metadata_mode`` wins; else ``append`` True->additive/False->replace;
+        else default merge) without importing the backend (keeps this module
+        dependency-light). ``replace`` would clobber load-bearing keys;
+        ``additive`` cannot overwrite/clear the target key (scalar-collision
+        old-wins) — only ``merge`` both preserves other keys and overwrites
+        the target.
+    (c) ``update_kwargs['metadata']`` coerces (via :func:`_coerce_metadata_dict`)
+        to a non-empty ``dict``.
+    (d) Every top-level key of that dict is in :data:`CLEARABLE_ANNOTATION_KEYS`.
+
+    A "clear" is a merge-overwrite (including to ``None``); this predicate
+    has no notion of key deletion (metadata has no such primitive).
+    """
+    if any(
+        key not in _ANNOTATION_CLEAR_ALLOWED_KWARGS and value is not None
+        for key, value in update_kwargs.items()
+    ):
+        return False
+
+    metadata_mode = update_kwargs.get('metadata_mode')
+    append = update_kwargs.get('append')
+    is_merge_mode = metadata_mode == 'merge' or (metadata_mode is None and append is None)
+    if not is_merge_mode:
+        return False
+
+    parsed = _coerce_metadata_dict(update_kwargs.get('metadata'))
+    if not parsed:
+        return False
+
+    return all(key in CLEARABLE_ANNOTATION_KEYS for key in parsed)
