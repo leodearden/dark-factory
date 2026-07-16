@@ -932,3 +932,83 @@ class TestSamplesDownsampling:
         assert len(lifespan['samples']) == total
         assert 'samples_downsampled' not in lifespan
         assert 'samples_total' not in lifespan
+
+
+# ---------------------------------------------------------------------------
+# step-16: row 7 — perf: cold ~10k-record build_escalation_analytics() < 5s
+# ---------------------------------------------------------------------------
+
+_PERF_SOURCES = ('implementer', 'architect', 'orchestrator-merge-worker', 'harness-orphan-reaper')
+_PERF_RESOLVERS = (
+    'interactive', 'escalation-watcher-auto', 'auto-dismissed',
+    'harness-orphan-reaper', 'l2-cascade:esc-perf-anchor', 'claude-task-9-steward',
+)
+
+
+def _write_perf_archive(esc_dir: Path, now: datetime, n: int) -> int:
+    """Write *n* synthetic escalation records spread across dated subdirs.
+
+    Deterministic (no RNG, for a reproducible perf run): mixed levels
+    (0/1/2), mixed ``agent_role`` sources, mixed ``resolved_by`` tiers,
+    ~90% terminal (resolved/dismissed, resolved_at spread across ~90
+    distinct ``archive/YYYY-MM-DD`` dirs) / ~10% pending (root-tier).
+    ``task_id`` repeats with a small period so the workflow block's
+    per-task churn scan sees realistic (bounded, not O(n) group size)
+    re-filing groups. Returns the terminal (resolved/dismissed) count.
+    """
+    terminal_count = 0
+    for i in range(n):
+        is_pending = i % 10 == 9
+        timestamp = now - timedelta(days=90 - (i % 90), hours=i % 24, minutes=i % 60)
+        esc = {
+            'id': f'esc-perf-{i}', 'task_id': f'perf-{i % 4000}',
+            'agent_role': _PERF_SOURCES[i % len(_PERF_SOURCES)],
+            'severity': 'info', 'category': 'cleanup_needed', 'summary': 'perf fixture',
+            'timestamp': _iso(timestamp),
+            'status': 'pending' if is_pending else ('dismissed' if i % 2 == 0 else 'resolved'),
+            'level': i % 3,
+        }
+        if not is_pending:
+            esc['resolved_at'] = _iso(timestamp + timedelta(hours=1 + i % 48))
+            esc['resolved_by'] = _PERF_RESOLVERS[i % len(_PERF_RESOLVERS)]
+            terminal_count += 1
+        _write_escalation(esc_dir, esc, archived=not is_pending)
+    return terminal_count
+
+
+class TestBuildEscalationAnalyticsPerf:
+    """PRD boundary row 7: a cold ~10k-record archive walk completes in < 5s."""
+
+    def test_cold_10k_archive_under_5_seconds(self, tmp_path):
+        import time
+
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        terminal_count = _write_perf_archive(esc_dir, now, 10_000)
+
+        runs_db = _make_runs_db(tmp_path, [
+            ('perf-done-1', 'done', f'{(now - timedelta(days=1)).date().isoformat()}T09:00:00+00:00'),
+        ])
+
+        started = time.monotonic()
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 5.0, f'cold build_escalation_analytics took {elapsed:.2f}s (budget 5.0s)'
+
+        # Well-formed at scale: parse_failures==0 (every fixture record is
+        # valid), one per-project entry with non-empty samples.
+        assert result['parse_failures'] == 0
+        assert len(result['per_project']) == 1
+        project = result['per_project'][0]
+        assert project['project'] == 'dark_factory'
+        samples = project['lifespan']['samples']
+        assert len(samples) > 0
+
+        # terminal_count (9000) is below the default downsample_threshold
+        # (10_000) at this scale, so samples must carry every terminal
+        # record 1:1 — no downsampling triggered.
+        assert len(samples) == terminal_count
+        assert 'samples_downsampled' not in project['lifespan']
