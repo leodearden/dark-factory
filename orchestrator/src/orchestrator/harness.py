@@ -7047,6 +7047,17 @@ Output JSON matching the schema. Every task must appear in the output.
         if self.review_checkpoint is not None:
             self.review_checkpoint.escalation_queue = self._escalation_queue
 
+        # Wire escalation queue into the scheduler (task 2408, mechanism 2):
+        # the blocked-redispatch sweep (_phase_redispatch_stranded_blocked)
+        # needs it to verify "no open escalation" before flipping a
+        # genuinely-stranded blocked task back to pending. The Scheduler is
+        # constructed long before self._escalation_queue exists, so
+        # constructor injection is impossible — attribute injection here
+        # mirrors the review_checkpoint line immediately above. Fails safe:
+        # without this, scheduler.escalation_queue stays None and the sweep
+        # never flips anything (see Scheduler._phase_redispatch_stranded_blocked).
+        self.scheduler.escalation_queue = self._escalation_queue
+
         mcp_server = create_server(  # type: ignore[possibly-unbound]
             self._escalation_queue,
             merge_queue=self._merge_queue,
