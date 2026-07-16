@@ -580,6 +580,53 @@ class TestDeliveredChecksConfig:
 
 
 # ---------------------------------------------------------------------------
+# TestDeliveredCheckGateEnabledSwitch (task 2583 — step-5 RED / step-6 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestDeliveredCheckGateEnabledSwitch:
+    """``Scheduler._phase_delivered_check_gate`` kill switch: with
+    ``delivered_checks.enabled=False``, the phase must short-circuit to
+    ``ctx.delivered_check_cache = None`` WITHOUT running the sweep at all —
+    no git, no streaks, no escalation. Must be ``None``, not ``{}``:
+    ``_deps_satisfied`` only disables its delivered-check arm when the cache
+    is exactly ``None`` (an empty dict still activates the arm and withholds
+    every checked dep)."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+        scheduler.finish_startup()
+        return scheduler
+
+    @pytest.mark.asyncio
+    async def test_disabled_short_circuits_to_none_cache_and_skips_sweep(
+        self, scheduler: Scheduler
+    ):
+        scheduler.config.delivered_checks.enabled = False
+        sweep = AsyncMock(side_effect=AssertionError('sweep must not run when disabled'))
+        scheduler._compute_delivered_check_cache = sweep
+        ctx = TickContext(tasks=[], status_map={}, tasks_by_id={})
+
+        await scheduler._phase_delivered_check_gate(ctx)
+
+        assert ctx.delivered_check_cache is None
+        sweep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enabled_default_runs_sweep_and_sets_dict(self, scheduler: Scheduler):
+        sweep = AsyncMock(return_value={'20': True})
+        scheduler._compute_delivered_check_cache = sweep
+        ctx = TickContext(tasks=[], status_map={}, tasks_by_id={})
+
+        await scheduler._phase_delivered_check_gate(ctx)
+
+        assert ctx.delivered_check_cache == {'20': True}
+        sweep.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # TestNoteDeliveredHold (task 2580 — step-11 RED / step-12 GREEN)
 # ---------------------------------------------------------------------------
 
