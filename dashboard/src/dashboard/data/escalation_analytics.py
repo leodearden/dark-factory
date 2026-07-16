@@ -31,7 +31,7 @@ from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
 
 from dashboard.data.stats_utils import percentile
-from dashboard.data.utils import parse_utc
+from dashboard.data.utils import parse_utc, resolve_now
 
 logger = logging.getLogger(__name__)
 
@@ -410,6 +410,132 @@ def _lifespan_block(records: list[tuple[Escalation, dict]], *, now: datetime) ->
 
 
 # ---------------------------------------------------------------------------
+# Workflow block
+# ---------------------------------------------------------------------------
+
+_CHURN_LOOKBACK = timedelta(hours=24)
+
+
+def _workflow_block(records: list[tuple[Escalation, dict]], runs_db: Path) -> dict:
+    """Workflow aggregates over *records*: tier/action mix, churn, throughput, flow cube.
+
+    - ``tier_weekly``: ISO-week (``YYYY-Www``) -> ``{tier: count}``, over
+      terminal records with a parseable ``resolved_at``
+      (:func:`~escalation.classify.classify_resolver_tier` of ``resolved_by``).
+    - ``action_mix``: terminal ``resolution_action`` counts, ``None`` ->
+      ``'unspecified'`` (visible adoption gap — INV-4).
+    - ``churn_daily``: ``date(timestamp) -> count`` of filings whose
+      ``task_id`` had ANY other escalation resolved/dismissed within the
+      24h before this filing's own ``timestamp``.
+    - ``esc_per_done_daily``: per ``date(timestamp)``,
+      ``{date, filings, done, ratio}`` — ``done`` from :func:`_done_by_day`
+      against *runs_db*; ``ratio`` is ``None`` when ``done == 0`` (no div0).
+    - ``flow_daily``: sparse ``[{date,source,level,tier,class,n}]`` cube over
+      terminal-with-valid-times records (same population as
+      ``lifespan.samples`` — both gate on parseable ``timestamp`` AND
+      ``resolved_at`` — so their counts reconcile per row 11).
+    """
+    by_task: dict[str, list[Escalation]] = {}
+    for esc, _raw in records:
+        by_task.setdefault(esc.task_id, []).append(esc)
+
+    tier_weekly: dict[str, dict[str, int]] = {}
+    action_mix: dict[str, int] = {}
+    flow_cube: dict[tuple[str, str, int, str, str], int] = {}
+
+    for esc, _raw in records:
+        if esc.status not in ('resolved', 'dismissed'):
+            continue
+
+        try:
+            resolved_at = parse_utc(esc.resolved_at)
+        except (TypeError, ValueError):
+            logger.warning(
+                '_workflow_block: unparseable resolved_at on terminal %s: %r',
+                esc.id, esc.resolved_at,
+            )
+            continue
+
+        tier = classify_resolver_tier(esc.resolved_by)
+        iso = resolved_at.isocalendar()
+        week_key = f'{iso.year}-W{iso.week:02d}'
+        week_bucket = tier_weekly.setdefault(week_key, {})
+        week_bucket[tier] = week_bucket.get(tier, 0) + 1
+
+        action_key = esc.resolution_action or 'unspecified'
+        action_mix[action_key] = action_mix.get(action_key, 0) + 1
+
+        cls, _provenance = effective_benign(esc)
+        if cls is None:
+            continue
+        try:
+            parse_utc(esc.timestamp)  # gate: same "valid-times" population as lifespan.samples
+        except (TypeError, ValueError):
+            logger.warning(
+                '_workflow_block: unparseable timestamp on terminal %s: %r',
+                esc.id, esc.timestamp,
+            )
+            continue
+        key = (resolved_at.date().isoformat(), esc.agent_role, esc.level, tier, cls)
+        flow_cube[key] = flow_cube.get(key, 0) + 1
+
+    churn_daily: dict[str, int] = {}
+    filings_by_date: dict[str, int] = {}
+    for esc, _raw in records:
+        try:
+            filed_at = parse_utc(esc.timestamp)
+        except (TypeError, ValueError):
+            logger.warning(
+                '_workflow_block: unparseable timestamp on %s: %r', esc.id, esc.timestamp,
+            )
+            continue
+
+        date_key = filed_at.date().isoformat()
+        filings_by_date[date_key] = filings_by_date.get(date_key, 0) + 1
+
+        window_start = filed_at - _CHURN_LOOKBACK
+        churned = False
+        for other in by_task.get(esc.task_id, []):
+            if other.id == esc.id or other.status not in ('resolved', 'dismissed'):
+                continue
+            try:
+                other_resolved_at = parse_utc(other.resolved_at)
+            except (TypeError, ValueError):
+                continue
+            if window_start <= other_resolved_at < filed_at:
+                churned = True
+                break
+        if churned:
+            churn_daily[date_key] = churn_daily.get(date_key, 0) + 1
+
+    done_by_date = _done_by_day(Path(runs_db))
+    esc_per_done_daily = [
+        {
+            'date': d,
+            'filings': filings_by_date.get(d, 0),
+            'done': done_by_date.get(d, 0),
+            'ratio': (
+                filings_by_date.get(d, 0) / done_by_date[d] if done_by_date.get(d) else None
+            ),
+        }
+        for d in sorted(set(filings_by_date) | set(done_by_date))
+    ]
+
+    flow_daily = [
+        {'date': d, 'source': source, 'level': level, 'tier': tier, 'class': cls, 'n': n}
+        for (d, source, level, tier, cls), n in sorted(flow_cube.items())
+    ]
+
+    return {
+        'tier_weekly': tier_weekly,
+        'action_mix': action_mix,
+        'churn_daily': churn_daily,
+        'esc_per_done_daily': esc_per_done_daily,
+        'flow_daily': flow_daily,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Per-project aggregation
 # ---------------------------------------------------------------------------
 
@@ -423,16 +549,59 @@ def _aggregate_project(
 ) -> tuple[dict, int]:
     """Aggregate one project's escalation archive into a Seam-2 payload entry.
 
-    Returns ``(entry, parse_failures)``. *runs_db* is accepted here (rather
-    than only by the workflow block) so the per-project signature is stable
-    across steps — it is not yet read by the origin/lifespan blocks; the
-    workflow block's ``esc_per_done_daily`` (via ``_done_by_day``) consumes
-    it in a later step.
+    Returns ``(entry, parse_failures)``.
     """
     records, parse_failures = _load_escalation_records(Path(escalations_dir))
     entry = {
         'project': project,
         'origin': _origin_block(records, now=now),
         'lifespan': _lifespan_block(records, now=now),
+        'workflow': _workflow_block(records, Path(runs_db)),
     }
     return entry, parse_failures
+
+
+# ---------------------------------------------------------------------------
+# Top-level payload assembly
+# ---------------------------------------------------------------------------
+
+
+def build_escalation_analytics(
+    project_dirs: list[tuple[str, Path, Path]],
+    *,
+    now: datetime | None = None,
+    regime_markers_path: Path | None = None,
+) -> dict:
+    """Build the full Seam-2 escalation-analytics payload across *project_dirs*.
+
+    *project_dirs* is ``[(label, escalations_dir, runs_db), ...]``, primary
+    project first. This is the PURE-SYNC core — the only permitted clock
+    read in this module: ``now`` is resolved once via :func:`resolve_now`
+    and threaded through every per-project aggregation, so no per-project
+    call reads the live clock independently.
+
+    ``parse_failures`` combines archive-record parse failures (summed
+    across all project dirs) AND the regime-markers load's
+    ``parse_failures_delta`` into a single loud count (INV-4) — there is
+    only one ``parse_failures`` field in the payload.
+    """
+    resolved_now = resolve_now(now)
+
+    parse_failures = 0
+    per_project = []
+    for project, escalations_dir, runs_db in project_dirs:
+        entry, project_parse_failures = _aggregate_project(
+            project, escalations_dir, runs_db, now=resolved_now,
+        )
+        parse_failures += project_parse_failures
+        per_project.append(entry)
+
+    markers, markers_parse_failures = load_regime_markers(regime_markers_path)
+    parse_failures += markers_parse_failures
+
+    return {
+        'generated_at': resolved_now.isoformat(),
+        'parse_failures': parse_failures,
+        'regime_markers': markers,
+        'per_project': per_project,
+    }
