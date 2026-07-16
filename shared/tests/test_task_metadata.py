@@ -205,6 +205,34 @@ class TestDoneProvenance:
         with pytest.raises(ValidationError):
             DoneProvenance(kind='deterministic-bogus')  # type: ignore[arg-type]
 
+    def test_operational_verified_with_escalation_id_and_note_constructs(self):
+        dp = DoneProvenance(
+            kind='operational-verified',
+            escalation_id='esc-123',
+            note='restarted fused-memory',
+        )
+        assert dp.kind == 'operational-verified'
+        assert dp.escalation_id == 'esc-123'
+        assert dp.note == 'restarted fused-memory'
+        dumped = dp.model_dump()
+        assert dumped['kind'] == 'operational-verified'
+        assert dumped['escalation_id'] == 'esc-123'
+        assert dumped['note'] == 'restarted fused-memory'
+
+    def test_operational_verified_requires_escalation_id(self):
+        with pytest.raises(ValidationError):
+            DoneProvenance(kind='operational-verified', note='x')
+
+    def test_operational_verified_requires_note(self):
+        with pytest.raises(ValidationError):
+            DoneProvenance(kind='operational-verified', escalation_id='esc-1')
+
+    def test_operational_bogus_kind_still_rejected(self):
+        # Regression guard: adding 'operational-verified' must not open the
+        # Literal up to arbitrary operational-* strings.
+        with pytest.raises(ValidationError):
+            DoneProvenance(kind='operational-bogus')  # type: ignore[arg-type]
+
 
 class TestMemoryHints:
     def test_constructs_with_values(self):
