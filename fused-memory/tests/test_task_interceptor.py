@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import make_8df8_scenario
+from _fm_helpers import _init_git_repo, make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
@@ -2286,33 +2286,6 @@ async def test_done_gate_does_not_fire_for_non_done_transitions(
 
 
 # ── Tests for done_provenance gate ─────────────────────────────────────────
-
-
-def _init_git_repo(path) -> str:
-    """Create a minimal git repo at path with one commit; return full SHA."""
-    import subprocess
-
-    subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
-    subprocess.run(
-        ['git', '-C', str(path), 'config', 'user.email', 't@e.example'],
-        check=True,
-    )
-    subprocess.run(
-        ['git', '-C', str(path), 'config', 'user.name', 'T'],
-        check=True,
-    )
-    (path / 'seed.txt').write_text('seed\n')
-    subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)
-    subprocess.run(
-        ['git', '-C', str(path), 'commit', '-q', '-m', 'seed'],
-        check=True,
-    )
-    return subprocess.run(
-        ['git', '-C', str(path), 'rev-parse', 'HEAD'],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
 
 
 @pytest.fixture
