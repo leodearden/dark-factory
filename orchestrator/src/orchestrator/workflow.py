@@ -5604,35 +5604,54 @@ class TaskWorkflow:
         base. Reuses ``status.entries`` from the guard call rather than
         re-reading the iteration log.
 
+        Best-effort and defensive, identical posture to
+        :meth:`_detect_tip_wip_commits` / :meth:`_reconcile_done_step_commits`:
+        returns ``[]`` on any missing collaborator (``worktree``/``git_ops``/
+        ``artifacts``), unset ``base_commit``, or internal error — a false
+        negative here just reverts to today's (buggy) baseline rather than
+        sinking the iteration loop.
+
         Returns the list of step IDs re-derived.
         """
-        head = await self._get_head_commit()
-        status = self._has_prior_implementation(wt_head=head)
-        if not status.has_work:
+        if self.worktree is None or self.git_ops is None or self.artifacts is None:
             return []
+        base = self.artifacts.read_base_commit()
+        if not base:
+            return []
+        try:
+            head = await self._get_head_commit()
+            status = self._has_prior_implementation(wt_head=head)
+            if not status.has_work:
+                return []
 
-        completed_ids: set[str] = set()
-        commit_by_id: dict[str, str] = {}
-        for entry in status.entries:
-            for step_id in entry.get('steps_completed') or []:
-                completed_ids.add(step_id)
-                entry_commit = entry.get('commit')
-                if entry_commit:
-                    commit_by_id[step_id] = entry_commit
+            completed_ids: set[str] = set()
+            commit_by_id: dict[str, str] = {}
+            for entry in status.entries:
+                for step_id in entry.get('steps_completed') or []:
+                    completed_ids.add(step_id)
+                    entry_commit = entry.get('commit')
+                    if entry_commit:
+                        commit_by_id[step_id] = entry_commit
 
-        plan = self.artifacts.read_plan()
-        rederived: list[str] = []
-        for collection in ('prerequisites', 'steps'):
-            for item in plan.get(collection, []):
-                if not isinstance(item, dict):
-                    continue
-                if item.get('status') == 'pending' and item.get('id') in completed_ids:
-                    step_id = item['id']
-                    self.artifacts.update_step_status(
-                        step_id, 'done', commit=commit_by_id.get(step_id, head),
-                    )
-                    rederived.append(step_id)
-        return rederived
+            plan = self.artifacts.read_plan()
+            rederived: list[str] = []
+            for collection in ('prerequisites', 'steps'):
+                for item in plan.get(collection, []):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get('status') == 'pending' and item.get('id') in completed_ids:
+                        step_id = item['id']
+                        self.artifacts.update_step_status(
+                            step_id, 'done', commit=commit_by_id.get(step_id, head),
+                        )
+                        rederived.append(step_id)
+            return rederived
+        except Exception:
+            logger.warning(
+                'Plan step status re-derivation failed; leaving plan.json unchanged',
+                exc_info=True,
+            )
+            return []
 
     async def _inter_iteration_rebase(
         self, *, event_label: str = 'rebase',
