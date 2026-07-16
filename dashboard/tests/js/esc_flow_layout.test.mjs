@@ -231,11 +231,19 @@ function nodeAt(nodes, col, id) {
   return nodes.find(n => n.col === col && n.id === id);
 }
 
-function ribbonsIncidentOn(ribbons, col, id) {
-  // A node in column `col` is the `to` side of links with `col: col - 1`
-  // and the `from` side of links with `col: col` (col numbering matches
-  // aggregateFlow: link.col c connects columns[c] -> columns[c+1]).
-  return ribbons.filter(r => (r.col === col && r.from === id) || (r.col === col - 1 && r.to === id));
+// A node in column `col` is the `to` side of links with `col: col - 1`
+// (incoming) and the `from` side of links with `col: col` (outgoing) — col
+// numbering matches aggregateFlow: link.col c connects columns[c] ->
+// columns[c+1]. These conserve to node.h SEPARATELY (incoming alone == h,
+// outgoing alone == h) — summing both together would double-count and is
+// NOT the right invariant (an earlier version of this test made exactly
+// that mistake).
+function incomingRibbons(ribbons, col, id) {
+  return ribbons.filter(r => r.col === col - 1 && r.to === id);
+}
+
+function outgoingRibbons(ribbons, col, id) {
+  return ribbons.filter(r => r.col === col && r.from === id);
 }
 
 test('layoutFlow: golden model — node heights are proportional to counts under one shared scale', () => {
@@ -310,18 +318,23 @@ test('layoutFlow: golden model — ribbon widths are proportional to counts unde
   }
 });
 
-test('layoutFlow: golden model — pixel conservation: Σ ribbon w incident on each interior node ≈ node.h', () => {
+test('layoutFlow: golden model — pixel conservation: Σ incoming ribbon w == Σ outgoing ribbon w == node.h, for each interior node', () => {
   const model = aggregateFlow(GOLDEN_FLOW_ROWS);
   const { nodes, ribbons } = layoutFlow(model, DIMS);
 
   // Interior columns are level (1) and tier (2) — origin (0) is source-only
-  // and class (3) is sink-only, so neither has "incident from both sides".
+  // (no incoming side) and class (3) is sink-only (no outgoing side).
   for (const col of [1, 2]) {
     for (const node of nodes.filter(n => n.col === col)) {
-      const incidentW = ribbonsIncidentOn(ribbons, col, node.id).reduce((s, r) => s + r.w, 0);
+      const incomingW = incomingRibbons(ribbons, col, node.id).reduce((s, r) => s + r.w, 0);
+      const outgoingW = outgoingRibbons(ribbons, col, node.id).reduce((s, r) => s + r.w, 0);
       assert.ok(
-        Math.abs(incidentW - node.h) < 1e-6,
-        `node (col ${col} id ${node.id}) incident ribbon width sum (${incidentW}) should equal its h (${node.h})`,
+        Math.abs(incomingW - node.h) < 1e-6,
+        `node (col ${col} id ${node.id}) incoming ribbon width sum (${incomingW}) should equal its h (${node.h})`,
+      );
+      assert.ok(
+        Math.abs(outgoingW - node.h) < 1e-6,
+        `node (col ${col} id ${node.id}) outgoing ribbon width sum (${outgoingW}) should equal its h (${node.h})`,
       );
     }
   }
