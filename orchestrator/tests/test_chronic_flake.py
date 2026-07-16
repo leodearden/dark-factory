@@ -23,8 +23,11 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from importlib import resources as pkg_resources
+from unittest.mock import MagicMock
 
+import pytest
 import yaml
+from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 
@@ -407,3 +410,206 @@ class TestFilingLedger:
         reloaded = FilingLedger(path)
         assert reloaded.should_file('test_a.sh', now, 7) is False
         assert reloaded.should_file('test_b.sh', now, 7) is True
+
+
+# ── Step-11 / Step-12: maybe_file_chronic_flake_tasks happy-path/dedup/rate-limit ──
+
+
+class _FakeChronicFlakeTaskClient:
+    """Fake ``ChronicFlakeTaskClient`` (submit_task/search_tasks) — records
+    every ``submit_task`` call and returns canned ``search_tasks`` results
+    regardless of the query text, since the dedup contract under test is
+    "does an OPEN result's title match the test", not the exact query
+    ``maybe_file_chronic_flake_tasks`` happens to build."""
+
+    def __init__(self, search_results: list[dict] | None = None):
+        self.search_results = search_results if search_results is not None else []
+        self.submit_calls: list[dict] = []
+
+    async def submit_task(self, arguments: dict) -> str:
+        self.submit_calls.append(arguments)
+        return 'ticket-fake-123'
+
+    async def search_tasks(self, query: str) -> list[dict]:
+        return self.search_results
+
+
+class TestMaybeFileChronicFlakeTasks:
+    """``maybe_file_chronic_flake_tasks``: enabled-gate, union(marker, ledger)
+    chronic-test detection, and the dedup/rate-limit contract — an OPEN
+    (non-terminal, non-deferred) search_tasks title match or an
+    unexpired FilingLedger entry both suppress a submit; a CHRONIC-FLAKY
+    marker is an authoritative trigger even when the ledger itself is
+    sub-threshold for that test."""
+
+    NOW = datetime(2026, 7, 17, tzinfo=UTC)
+
+    def _config(self, tmp_path, **overrides):
+        from orchestrator.config import ChronicFlakeConfig
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.project_root = tmp_path
+        kwargs = {
+            'enabled': True,
+            'threshold': 3,
+            'window': 20,
+            'rate_limit_days': 7,
+            'ledger_relpath': 'data/verify-logs/flaky-ledger.jsonl',
+        }
+        kwargs.update(overrides)
+        config.chronic_flake = ChronicFlakeConfig(**kwargs)
+        return config
+
+    def _write_ledger(self, path, entries):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('\n'.join(json.dumps(e) for e in entries) + '\n')
+
+    def _chronic_entries(self, test='test_a.sh', n=3):
+        return [
+            {
+                'ts': f'2026-07-0{i}T00:00:00Z',
+                'test': test,
+                'role': 'verifier',
+                'flaky_count_window': i,
+            }
+            for i in range(1, n + 1)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_disabled_config_returns_empty_and_zero_submits(self, tmp_path):
+        from orchestrator.chronic_flake import maybe_file_chronic_flake_tasks
+        ledger_path = tmp_path / 'ledger.jsonl'
+        self._write_ledger(ledger_path, self._chronic_entries())
+        client = _FakeChronicFlakeTaskClient()
+        result = await maybe_file_chronic_flake_tasks(
+            '',
+            self._config(tmp_path, enabled=False),
+            client,
+            now=self.NOW,
+            ledger_path=ledger_path,
+            filings_path=tmp_path / 'filings.json',
+        )
+        assert result == []
+        assert client.submit_calls == []
+
+    @pytest.mark.asyncio
+    async def test_enabled_chronic_ledger_files_exactly_once_and_records_ledger(self, tmp_path):
+        from orchestrator.chronic_flake import FilingLedger, maybe_file_chronic_flake_tasks
+        ledger_path = tmp_path / 'ledger.jsonl'
+        self._write_ledger(ledger_path, self._chronic_entries())
+        filings_path = tmp_path / 'filings.json'
+        client = _FakeChronicFlakeTaskClient()
+
+        result = await maybe_file_chronic_flake_tasks(
+            '',
+            self._config(tmp_path),
+            client,
+            now=self.NOW,
+            ledger_path=ledger_path,
+            filings_path=filings_path,
+        )
+
+        assert result == ['test_a.sh']
+        assert len(client.submit_calls) == 1
+        args = client.submit_calls[0]
+        assert args['title'] == 'De-flake test_a.sh: chronic pool flake (auto-filed)'
+        assert args['project_root'] == str(tmp_path)
+        assert args['metadata']['chronic_flake_test'] == 'test_a.sh'
+        # The rate-limit ledger durably recorded the filing (save() was called).
+        reloaded = FilingLedger(filings_path)
+        assert reloaded.should_file('test_a.sh', self.NOW, 7) is False
+
+    @pytest.mark.asyncio
+    async def test_marker_triggers_even_when_ledger_is_subthreshold(self, tmp_path):
+        """The marker is reify's own authoritative "this is chronic" signal
+        — a test that hasn't yet reached DF's own threshold in the ledger
+        still files when the marker says so."""
+        from orchestrator.chronic_flake import maybe_file_chronic_flake_tasks
+        ledger_path = tmp_path / 'ledger.jsonl'
+        self._write_ledger(ledger_path, self._chronic_entries(test='test_b.sh', n=2))
+        verify_output = '=== CHRONIC-FLAKY test=test_b.sh count=5 window=20 ===\n'
+        client = _FakeChronicFlakeTaskClient()
+
+        result = await maybe_file_chronic_flake_tasks(
+            verify_output,
+            self._config(tmp_path),
+            client,
+            now=self.NOW,
+            ledger_path=ledger_path,
+            filings_path=tmp_path / 'filings.json',
+        )
+
+        assert result == ['test_b.sh']
+        assert len(client.submit_calls) == 1
+        assert client.submit_calls[0]['metadata']['chronic_flake_test'] == 'test_b.sh'
+
+    @pytest.mark.asyncio
+    async def test_open_search_match_skips_submit(self, tmp_path):
+        from orchestrator.chronic_flake import maybe_file_chronic_flake_tasks
+        ledger_path = tmp_path / 'ledger.jsonl'
+        self._write_ledger(ledger_path, self._chronic_entries())
+        client = _FakeChronicFlakeTaskClient(
+            search_results=[
+                {'title': 'De-flake test_a.sh: chronic pool flake (auto-filed)', 'status': 'pending'},
+            ]
+        )
+
+        result = await maybe_file_chronic_flake_tasks(
+            '',
+            self._config(tmp_path),
+            client,
+            now=self.NOW,
+            ledger_path=ledger_path,
+            filings_path=tmp_path / 'filings.json',
+        )
+
+        assert result == []
+        assert client.submit_calls == []
+
+    @pytest.mark.asyncio
+    async def test_closed_search_match_does_not_block_submit(self, tmp_path):
+        """A DONE/cancelled/deferred search hit is NOT an open dedup match
+        (mirrors workflow.py's TERMINAL_STATUSES-or-deferred idiom) — the
+        test still files."""
+        from orchestrator.chronic_flake import maybe_file_chronic_flake_tasks
+        ledger_path = tmp_path / 'ledger.jsonl'
+        self._write_ledger(ledger_path, self._chronic_entries())
+        client = _FakeChronicFlakeTaskClient(
+            search_results=[
+                {'title': 'De-flake test_a.sh: chronic pool flake (auto-filed)', 'status': 'done'},
+            ]
+        )
+
+        result = await maybe_file_chronic_flake_tasks(
+            '',
+            self._config(tmp_path),
+            client,
+            now=self.NOW,
+            ledger_path=ledger_path,
+            filings_path=tmp_path / 'filings.json',
+        )
+
+        assert result == ['test_a.sh']
+        assert len(client.submit_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_recent_filing_in_ledger_skips_submit(self, tmp_path):
+        from orchestrator.chronic_flake import FilingLedger, maybe_file_chronic_flake_tasks
+        ledger_path = tmp_path / 'ledger.jsonl'
+        self._write_ledger(ledger_path, self._chronic_entries())
+        filings_path = tmp_path / 'filings.json'
+        pre = FilingLedger(filings_path)
+        pre.record('test_a.sh', self.NOW - timedelta(days=1))
+        pre.save()
+        client = _FakeChronicFlakeTaskClient()
+
+        result = await maybe_file_chronic_flake_tasks(
+            '',
+            self._config(tmp_path),
+            client,
+            now=self.NOW,
+            ledger_path=ledger_path,
+            filings_path=filings_path,
+        )
+
+        assert result == []
+        assert client.submit_calls == []
