@@ -168,10 +168,29 @@ class HermeticMcpSession:
     returning a silent empty stub, per this project's loud-over-silent-
     degradation norm: an unanticipated phase call should surface as a test
     failure, not a quietly-wrong pass.
+
+    ``get_external_statuses`` is the one exception to "responses are
+    empty": per the production contract (Scheduler.get_external_statuses,
+    scheduler.py:2286-2312), a response missing any requested dep key is
+    parsed as resolver-degraded (``(partial_dict, ExternalResolverError)``,
+    the fail-safe/wait branch) rather than success — so an unconditional
+    ``{}`` would silently exercise that degraded branch for any future test
+    that seeds ``metadata.external_deps``. This stub instead echoes back
+    every requested dep key (defaulting to the ``'unknown_task'`` sentinel
+    unless overridden via ``external_statuses=``), so the response always
+    satisfies "every requested key present" and resolves ``(statuses,
+    None)`` unless the caller deliberately seeds a degraded/sentinel value.
     """
 
-    def __init__(self, tasks: list[dict] | None = None) -> None:
+    def __init__(
+        self,
+        tasks: list[dict] | None = None,
+        external_statuses: dict[str, str] | None = None,
+    ) -> None:
         self._tasks: list[dict] = tasks if tasks is not None else []
+        self._external_statuses: dict[str, str] = (
+            external_statuses if external_statuses is not None else {}
+        )
         self._request_id = 0
 
     def _next_id(self) -> int:
@@ -208,8 +227,17 @@ class HermeticMcpSession:
             # Flat {dep: status} dict, no wrapper key — matches the
             # production get_external_statuses contract (Scheduler.
             # get_external_statuses parses via parse_tool_result(result,
-            # None, dict), i.e. whole-inner-dict mode).
-            return self._envelope(json.dumps({}))
+            # None, dict), i.e. whole-inner-dict mode). Echo a status for
+            # every requested dep (defaulting to 'unknown_task' unless
+            # overridden via the constructor's external_statuses= map) so
+            # the response never falls into the resolver-degraded
+            # missing-key branch by accident — see class docstring.
+            deps = arguments.get('deps') or []
+            statuses = {
+                dep: self._external_statuses.get(dep, 'unknown_task')
+                for dep in deps
+            }
+            return self._envelope(json.dumps(statuses))
         if name == 'set_task_claimant':
             return self._envelope(json.dumps({}))
         if name == 'set_task_status':
