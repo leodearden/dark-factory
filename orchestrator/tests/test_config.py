@@ -1134,6 +1134,19 @@ class TestMergeVerifyBreadthConfig:
         with pytest.raises(ValidationError):
             OrchestratorConfig(merge_verify_breadth='branch')  # type: ignore[arg-type]
 
+    def test_not_in_reloadable_fields(self):
+        """Regression pin (reviewer amendment): merge_verify_breadth is
+        deliberately restart-only (see the class docstring's rationale) —
+        a mid-process flip could split behaviour across an in-flight merge
+        on the most load-bearing lane. A future edit must not add it to
+        RELOADABLE_FIELDS without also revisiting that rationale.
+        """
+        assert 'merge_verify_breadth' not in RELOADABLE_FIELDS, (
+            'merge_verify_breadth requires a process restart to take effect '
+            '(flipped by the σ capstone, activated by the τ fleet restart) '
+            'and must NOT be in RELOADABLE_FIELDS'
+        )
+
     def test_defaults_yaml_carries_scoped(self, monkeypatch, tmp_path):
         """The shipped defaults.yaml explicitly carries merge_verify_breadth:
         scoped (same guard pattern as test_defaults_yaml_has_park_stop_block
