@@ -492,3 +492,40 @@ class TestApplyCorrectionsReopenNotPersisted:
         assert summary['errors'] >= 1
         assert summary['reopened'] == 0
         assert all(call['task_id'] != '1175' for call in backend.update_calls)
+
+
+# ===========================================================================
+# Step-11/12: apply_corrections — per-op error isolation
+# ===========================================================================
+
+@pytest.mark.asyncio
+class TestApplyCorrectionsErrorIsolation:
+    """One correction's backend failure must not abort the batch — mirrors
+    apply_audit_annotations' per-op try/except isolation guarantee."""
+
+    async def test_one_failing_update_task_does_not_abort_the_batch(self):
+        failing_annotate = _correction(
+            '1111', ACTION_ANNOTATE, label=LABEL_PRESUMED_BENIGN_HISTORICAL,
+        )
+        ok_annotate = _correction(
+            '2222', ACTION_ANNOTATE, label=LABEL_PRESUMED_BENIGN_HISTORICAL,
+        )
+        ok_reopen = _correction(
+            '1175', ACTION_REOPEN, label=LABEL_REOPENED,
+            reopen_reason=REOPEN_DISPOSITIONS['1175'],
+        )
+        backend = FakeCorrectionsBackend(fail_update_for={'1111'})
+
+        # apply_corrections itself must not raise, even though one of the
+        # three corrections' update_task call raises RuntimeError.
+        summary = await apply_corrections(
+            backend, '/proj', [failing_annotate, ok_annotate, ok_reopen], apply=True,
+        )
+
+        # The raising correction is counted as an error...
+        assert summary['errors'] >= 1
+        # ...but the OTHER corrections still applied successfully.
+        assert summary['annotated'] == 1
+        assert summary['reopened'] == 1
+        assert any(call['task_id'] == '2222' for call in backend.update_calls)
+        assert all(call['task_id'] != '1111' for call in backend.update_calls)
