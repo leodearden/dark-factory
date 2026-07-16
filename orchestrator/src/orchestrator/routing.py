@@ -547,8 +547,13 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
         break
 
     # Layer 1: per-task metadata override (highest precedence; model only).
+    # isinstance-guarded rather than a truthy check: a hand-edited or legacy
+    # task can carry a non-dict model_overrides (stray string/list), and
+    # this resolver must fail open to "no override" rather than raise
+    # AttributeError out of TaskWorkflow._invoke -- mirrors
+    # _task_simple_saturated's tolerant-degrade guard above.
     overrides = inputs.task_metadata.get('model_overrides') if inputs.task_metadata else None
-    override_model = overrides.get(inputs.role_name) if overrides else None
+    override_model = overrides.get(inputs.role_name) if isinstance(overrides, dict) else None
     if override_model is not None:
         reason = (
             _model_rejection_reason(override_model, config, inputs.spend_by_model)
