@@ -1766,7 +1766,13 @@ async def _run_post_merge_verify(
         # category, pytest INTERNALERROR, env_transient) but was NOT ENOSPC-
         # string-matched above.  Mirrors the ENOSPC branch's shape and shares its
         # enospc_retries/max_enospc budget (no new config knob); no worktree
-        # prune since this is not disk-specific.
+        # prune since this is not disk-specific.  Note the shared-budget
+        # coupling: if an earlier ENOSPC event already spent this task's
+        # budget, a later classified-infra failure gets ZERO in-place retry
+        # here and falls straight through to the persistent-hold branch below
+        # — still a loud infra_issue hold, never branch-blaming, just with no
+        # retry chance (see test_classified_infra_transient_zero_retry_after_
+        # shared_budget_exhausted in test_merge_queue.py).
         elif not verify.passed and (verify.category or '') in INFRA_TRANSIENT_CATEGORIES:
             prior_infra = enospc_retries.get(req.task_id, 0)
             if prior_infra < max_enospc:
