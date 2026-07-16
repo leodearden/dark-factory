@@ -2675,6 +2675,99 @@ class TestResolveResolutionClassDefaults:
             )
 
 
+class TestResolveCascadeResolutionClass:
+    """EscalationQueue.resolve() cascade forwards the L2's stamped resolution_class to members."""
+
+    def _make_l1(self, queue: EscalationQueue, esc_id: str, task_id: str = 'task-1') -> Escalation:
+        """Submit a pending L1 escalation."""
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='L1 test escalation',
+            level=1,
+        )
+        queue.submit(esc)
+        return esc
+
+    def _make_l2_with_members(
+        self,
+        queue: EscalationQueue,
+        l2_id: str,
+        member_ids: list[str],
+    ) -> Escalation:
+        """Submit a pending L2 escalation referencing the given member ids."""
+        esc = Escalation(
+            id=l2_id,
+            task_id='task-cluster',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster',
+            level=2,
+            root_cause='Bad merge strategy',
+            members=list(member_ids),
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_members_inherit_explicit_benign_stamp(self, tmp_path: Path):
+        """(boundary row 2) resolve(L2, resolution_class='benign') -> both members archive resolution_class='benign'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l1(queue, 'esc-1-2', 'task-2')
+        self._make_l1(queue, 'esc-1-3', 'task-3')
+        l2 = self._make_l2_with_members(queue, 'esc-1-1', ['esc-1-2', 'esc-1-3'])
+
+        queue.resolve(l2.id, 'Resolved the root cause', resolution_class='benign')
+
+        for member_id in ('esc-1-2', 'esc-1-3'):
+            member = queue.get(member_id)
+            assert member is not None
+            assert member.status == 'resolved', f'Expected {member_id} resolved, got {member.status!r}'
+            assert member.resolution_class == 'benign', (
+                f"Expected {member_id} resolution_class='benign'; got {member.resolution_class!r}"
+            )
+
+    def test_members_inherit_benign_stamp_on_dismiss_path(self, tmp_path: Path):
+        """resolve(L2, dismiss=True, resolution_class='benign') -> members dismissed AND stamped benign."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l1(queue, 'esc-1-2', 'task-2')
+        self._make_l1(queue, 'esc-1-3', 'task-3')
+        l2 = self._make_l2_with_members(queue, 'esc-1-1', ['esc-1-2', 'esc-1-3'])
+
+        queue.resolve(l2.id, 'Dismissed: not actionable', dismiss=True, resolution_class='benign')
+
+        for member_id in ('esc-1-2', 'esc-1-3'):
+            member = queue.get(member_id)
+            assert member is not None
+            assert member.status == 'dismissed', f'Expected {member_id} dismissed, got {member.status!r}'
+            assert member.resolution_class == 'benign', (
+                f"Expected {member_id} resolution_class='benign'; got {member.resolution_class!r}"
+            )
+
+    def test_members_inherit_none_when_parent_class_resolves_to_none(self, tmp_path: Path):
+        """resolve(L2, resolved_by='interactive', no explicit class) -> parent stays None -> members inherit None."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l1(queue, 'esc-1-2', 'task-2')
+        self._make_l1(queue, 'esc-1-3', 'task-3')
+        l2 = self._make_l2_with_members(queue, 'esc-1-1', ['esc-1-2', 'esc-1-3'])
+
+        queue.resolve(l2.id, 'Resolved by a human', resolved_by='interactive')
+
+        parent = queue.get(l2.id)
+        assert parent is not None
+        assert parent.resolution_class is None
+
+        for member_id in ('esc-1-2', 'esc-1-3'):
+            member = queue.get(member_id)
+            assert member is not None
+            assert member.resolution_class is None, (
+                f"Expected {member_id} resolution_class=None (inherited from parent); got {member.resolution_class!r}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Step-1: Unit tests for the escalation_id_lock exported helper
 # ---------------------------------------------------------------------------
