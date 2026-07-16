@@ -380,8 +380,14 @@ class TestModuleConfigScopeGoldens:
         )
 
     @pytest.mark.asyncio
-    async def test_source_only_diff_skips_pytest_entirely(self, tmp_path: Path):
-        """(d) SOURCE_ONLY_ZERO_PYTEST_DIFF -> test_command is None (verify_plan.py:318-322)."""
+    async def test_source_only_diff_floors_pytest_to_full_suite_at_task_role(
+        self, tmp_path: Path,
+    ):
+        """(d) SOURCE_ONLY_ZERO_PYTEST_DIFF at role='task' -> test_command == the
+        owning module's verbatim full suite (λ, task 2589 R3: the task-role pytest
+        floor). Pre-λ this fabricated ZERO pytest signal (test_command was None);
+        see test_source_only_diff_skips_pytest_entirely_at_merge_role below for the
+        preserved legacy SKIPPED shape (R4)."""
         source_path = SOURCE_ONLY_ZERO_PYTEST_DIFF[0]
         full = tmp_path / source_path
         full.parent.mkdir(parents=True, exist_ok=True)
@@ -395,15 +401,46 @@ class TestModuleConfigScopeGoldens:
         mock_run_verification = _run_verification_spy()
         with patch.object(verify, 'run_verification', new=mock_run_verification):
             result = await run_scoped_verification(
-                tmp_path, config, module_configs, task_files=[source_path],
+                tmp_path, config, module_configs, task_files=[source_path], role='task',
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert executed[0].test_command == module_configs[0].test_command, (
+            f'a source-only diff at task role must full-suite the owning module\'s '
+            f'pytest (the task-role floor): {executed[0].test_command!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_source_only_diff_skips_pytest_entirely_at_merge_role(self, tmp_path: Path):
+        """(d) R4 rollback golden: the SAME diff at role='merge' + merge_verify_breadth=
+        'scoped' preserves the pre-λ legacy shape -> test_command is None
+        (verify_plan.py's pytest else-branch SKIPPED). The task-role floor (R3) never
+        widens the merge gate itself — that widening is the separate, knob-gated
+        merge_verify_breadth='full' path."""
+        source_path = SOURCE_ONLY_ZERO_PYTEST_DIFF[0]
+        full = tmp_path / source_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('def helper():\n    return 1\n')
+
+        config = OrchestratorConfig(project_root=tmp_path, merge_verify_breadth='scoped')
+        module_configs = [
+            ModuleConfig(prefix='mymod', test_command='uv run --directory mymod pytest tests/'),
+        ]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=[source_path], role='merge',
             )
 
         assert result.passed
         executed = _executed_module_configs(mock_run_verification)
         assert len(executed) == 1
         assert executed[0].test_command is None, (
-            f'a source-only diff with no collectable tests must never fabricate '
-            f'a pytest run: {executed[0].test_command!r}'
+            f'merge role + scoped breadth must preserve the legacy SKIPPED shape: '
+            f'{executed[0].test_command!r}'
         )
 
     @pytest.mark.asyncio

@@ -4277,6 +4277,70 @@ async def run_scoped_verification(
         # so this path runs `cargo test --workspace` (or the configured command)
         # unchanged against the worktree branch tip.
         if force_workspace:
+            # λ (task 2589, T1): merge_verify_breadth forks WHAT this
+            # bypassed-scoping path executes, not WHETHER it executes.
+            # role=='merge' + breadth=='full' replaces the single OPAQUE
+            # global command below with a per-module full-suite fan-out
+            # across every REGISTERED module (config.module_configs_or_empty),
+            # reusing the SAME _derive_full_suite_runs /
+            # _executed_module_configs_from_plan bridge the module_configs-
+            # branch merge+full expansion above uses (PRD Resolved decision
+            # 2: the broad gate must be per-module parseable commands, never
+            # the opaque chain). breadth=='scoped' (the shipped default)
+            # falls through to the legacy single global call below,
+            # byte-identical (R4 rollback golden). This is the
+            # merge_verify_workspace=True routing
+            # verify_runner.LocalRunner._run threads role='merge' into; the
+            # role=='task' train-member override (workflow.py,
+            # _run_scoped_verification_with_infra_retry) never takes this
+            # fork — breadth is merge-role-gated only, so that call stays on
+            # the legacy path unconditionally regardless of the knob.
+            if role == 'merge' and verify_plan._merge_breadth_is_full(config):
+                registered_modules = list(config.module_configs_or_empty.values()) or module_configs
+                if registered_modules:
+                    plan = verify_plan.VerifyPlan(runs=tuple(
+                        run
+                        for mc in registered_modules
+                        for run in verify_plan._derive_full_suite_runs(mc, role)
+                    ))
+                    scoped = _executed_module_configs_from_plan(registered_modules, plan)
+                    # Guard this block's own stated intent ("degrade ...
+                    # rather than silently verifying nothing"): a registered
+                    # module always survives into `scoped` here —
+                    # _derive_full_suite_runs always emits 3 runs per module
+                    # (never the single-SKIPPED shape
+                    # _executed_module_configs_from_plan drops) — but if
+                    # EVERY module has zero configured commands (all
+                    # lint/pyright/test None), every surviving ModuleConfig
+                    # is itself all-None, and gathering over them would be a
+                    # vacuous per-module pass that aggregates to an overall
+                    # passed=True with nothing actually executed. Only take
+                    # this path when at least one module contributes at
+                    # least one real command; otherwise fall through to the
+                    # legacy global call below (loud-over-silent-degradation).
+                    if any(
+                        mc.test_command or mc.lint_command or mc.type_check_command
+                        for mc in scoped
+                    ):
+                        logger.info(
+                            'Verification mode: workspace (merge_verify_breadth=full — '
+                            'per-module full suite across %d registered module(s))',
+                            len(registered_modules),
+                        )
+                        results = await asyncio.gather(*(_verify_module(mc) for mc in scoped))
+                        aggregated = _aggregate_results(list(results))
+                        aggregated.plan = plan.to_dict()
+                        return aggregated
+                    logger.warning(
+                        'Verification mode: workspace (merge_verify_breadth=full) found '
+                        'no configured commands across %d registered module(s) — '
+                        'falling back to the legacy global command rather than '
+                        'silently verifying nothing',
+                        len(registered_modules),
+                    )
+                # No registered modules AND nothing passed to fall back to —
+                # degrade to the legacy global call below rather than
+                # silently verifying nothing.
             logger.info(
                 'Verification mode: workspace (train member — file-scoping bypassed)'
             )
@@ -4290,6 +4354,21 @@ async def run_scoped_verification(
                 role=role,
             )
         if module_configs:
+            # λ (task 2589, R1): the broad merge gate. role=='merge' +
+            # merge_verify_breadth=='full' expands module_configs from the
+            # FULL registry (config.module_configs_or_empty) — not just the
+            # task's/train's OWN modules passed in — so every REGISTERED
+            # module is covered, not only the ones this diff happens to
+            # touch (the gap the task-role pytest floor, R3, deliberately
+            # leaves open — see verify_plan._derive_full_suite_runs'
+            # docstring). Placed ahead of BOTH the file-scoped and
+            # unscoped-fan-out sub-branches below, so it broadens either
+            # execution path uniformly. An empty registry (e.g. a
+            # direct-instantiated config in most unit tests) falls back to
+            # the passed module_configs unchanged — degrades safely rather
+            # than silently verifying nothing.
+            if role == 'merge' and verify_plan._merge_breadth_is_full(config):
+                module_configs = list(config.module_configs_or_empty.values()) or module_configs
             # Apply file-level scoping within each subproject when task_files given
             if task_files:
                 # Filter to files that still exist — tasks may delete files as part of their work

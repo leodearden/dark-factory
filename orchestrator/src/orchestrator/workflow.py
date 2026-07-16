@@ -5736,6 +5736,16 @@ class TaskWorkflow:
 
         for infra_attempt in range(max_attempts):
             try:
+                # Routing note (λ, task 2589, T1): role='task' here means
+                # merge_verify_breadth never forks this call — the knob is
+                # merge-role-gated only (see run_scoped_verification's
+                # force_workspace branch).  A train member's own verify
+                # always takes the legacy single global workspace command
+                # when force_workspace=True, byte-identical regardless of
+                # the knob's value; the task-role pytest floor (R3) still
+                # applies independently, in the non-force_workspace
+                # module-config branch, for any train member whose task
+                # verify isn't force_workspace'd.
                 return await run_scoped_verification(
                     self.worktree, self.config, self._module_configs,
                     task_files=self._task_files,

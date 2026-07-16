@@ -4147,6 +4147,14 @@ async def _do_train_merge(
     # verification (with ENOSPC prune-retry), and the timeout loop-breaker
     # bookkeeping.  Returns None when verify passes; returns a MergeOutcome
     # (and cleans up merge_wt) when any controlled failure fires.
+    # Routing note (λ, task 2589, T1): this ultimately threads role='merge'
+    # and force_workspace=req.config.merge_verify_workspace into
+    # run_scoped_verification (via LocalRunner._run, verify_runner.py) —
+    # no control-flow change here.  When merge_verify_workspace is True,
+    # this call now consumes the breadth-aware plan run_scoped_verification
+    # builds for role='merge': merge_verify_breadth=='full' fans out to
+    # every REGISTERED module's full suite per-module; =='scoped' (the
+    # shipped default) stays the pre-λ opaque global workspace command.
     verify_outcome = await _run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts=worker._post_merge_verify_timeouts,

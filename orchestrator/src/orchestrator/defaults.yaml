@@ -541,6 +541,14 @@ merge_train_former_enabled: false
 merge_train_max_members: 3
 merge_train_coalesce_enabled: false
 
+# merge_verify_breadth: staged-rollout gate for the broad merge gate (λ, task
+#   2589).  'scoped' (shipped default) is the legacy per-touched-module verify
+#   plan.  'full' makes merge-role verify run every REGISTERED module's full
+#   suite, not just the touched ones.  Restart-only (NOT hot-reloadable — see
+#   config.py's merge_verify_breadth field).  Flipped 'scoped' -> 'full' by
+#   the σ capstone and activated by the τ deterministic-deploy fleet restart.
+merge_verify_breadth: scoped
+
 # Lever C: remote-verify host availability monitoring (task 1795).
 #
 # verify_host_unreachable_escalate_after_n: raise a verify_host_unreachable L1

@@ -253,6 +253,7 @@ def _derive_module_runs(
     mc: ModuleConfig,
     existing_files: list[str],
     worktree_reader: Callable[[str], str | None],
+    role: Literal['merge', 'task'] = 'task',
 ) -> list[PlannedRun]:
     """Derive one ModuleConfig's PlannedRuns — one per (module, tool) slot.
 
@@ -269,6 +270,16 @@ def _derive_module_runs(
     Each per-tool run's ``reason`` is prefixed with the tool name
     (``'lint:'``/``'pyright:'``/``'pytest:'``) so a caller can recover tool
     identity even for a SKIPPED slot, whose ``cmd`` is ``None``.
+
+    *role* (λ, task 2589, R3) is the task-role pytest floor's policy fork:
+    when the pytest branch would otherwise fall through to the "no
+    collectable test files touched" SKIPPED (a source-only or
+    structural-only diff — no conftest, no test-data, no collectable test),
+    ``role == 'task'`` runs the owning module's full ``test_command`` instead
+    — a source-only diff at task verify pre-λ produced ZERO pytest signal.
+    ``role == 'merge'`` keeps the legacy SKIPPED shape (R4): the broad merge
+    gate is a separate, knob-gated widening (see
+    ``_derive_full_suite_runs``/``merge_verify_breadth``), not this floor.
     """
     prefix = mc.prefix + '/'
     scoped = [f for f in existing_files if f.startswith(prefix) and f.endswith('.py')]
@@ -349,6 +360,13 @@ def _derive_module_runs(
                 mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
                 'pytest: file-scoped to touched test file(s)',
             ))
+        elif role == 'task':
+            test_cmd = parse_config_command(mc.test_command)
+            runs.append(PlannedRun(
+                mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
+                'pytest: source-only diff — owning-module full suite (task role); '
+                'sibling modules NOT run',
+            ))
         else:
             runs.append(PlannedRun(
                 mc.prefix, None, ScopeKind.SKIPPED,
@@ -359,6 +377,52 @@ def _derive_module_runs(
             mc.prefix, None, ScopeKind.SKIPPED, 'pytest: no test_command configured',
         ))
 
+    return runs
+
+
+def _merge_breadth_is_full(config: OrchestratorConfig | None) -> bool:
+    """True iff *config* opts into the broad ``merge_verify_breadth='full'`` gate.
+
+    A ``None`` *config* (every role='task' caller, and most existing tests)
+    is treated as the shipped default ('scoped') — never accidentally widens
+    to the broad merge gate.
+    """
+    return config is not None and config.merge_verify_breadth == 'full'
+
+
+def _derive_full_suite_runs(
+    mc: ModuleConfig,
+    role: Literal['merge', 'task'] = 'merge',
+) -> list[PlannedRun]:
+    """One ModuleConfig's PlannedRuns under the broad ``merge_verify_breadth='full'``
+    gate (λ, task 2589, R1).
+
+    Unlike :func:`_derive_module_runs`, this never file-scopes and never
+    consults which files the diff touched — every configured command
+    (lint/pyright/pytest) runs FULL_SUITE unconditionally, so a module the
+    diff never touched at all is still covered (the "only the touched
+    modules are protected" gap the task-role floor deliberately leaves open —
+    see :func:`_derive_module_runs`'s docstring; closing it broadly is this
+    knob-gated gate's job, not the floor's). A tool with no command
+    configured gets an explicit reasoned SKIPPED — the same "no X configured"
+    shape :func:`_derive_module_runs` uses — never a fabricated run.
+    """
+    runs: list[PlannedRun] = []
+    for tool_word, attr in (
+        ('lint', 'lint_command'),
+        ('pyright', 'type_check_command'),
+        ('pytest', 'test_command'),
+    ):
+        cmd_str: str | None = getattr(mc, attr)
+        if cmd_str:
+            runs.append(PlannedRun(
+                mc.prefix, parse_config_command(cmd_str), ScopeKind.FULL_SUITE,
+                f'{tool_word}: {role} role, full breadth — registered-module full suite',
+            ))
+        else:
+            runs.append(PlannedRun(
+                mc.prefix, None, ScopeKind.SKIPPED, f'{tool_word}: no {attr} configured',
+            ))
     return runs
 
 
@@ -646,8 +710,12 @@ def derive_verify_plan(
         )
     if module_configs:
         runs: list[PlannedRun] = []
+        merge_full = role == 'merge' and _merge_breadth_is_full(config)
         for mc in module_configs:
-            runs.extend(_derive_module_runs(mc, existing_files, worktree_reader))
+            if merge_full:
+                runs.extend(_derive_full_suite_runs(mc, role))
+            else:
+                runs.extend(_derive_module_runs(mc, existing_files, worktree_reader, role=role))
         return VerifyPlan(runs=tuple(runs))
     return VerifyPlan(runs=tuple(_derive_fallback_runs(existing_files, config, worktree_reader)))
 
