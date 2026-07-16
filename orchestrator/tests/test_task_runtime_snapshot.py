@@ -128,3 +128,37 @@ class TestB1PooledRoundtrip:
         assert entry['lane_state'] == 'assigned'
         assert entry['has_worktree'] is True
         assert entry['error'] is None
+
+
+# ---------------------------------------------------------------------------
+# B2 — Non-pooled task
+# ---------------------------------------------------------------------------
+
+
+class TestB2NonPooled:
+    def test_non_pooled_task_derives_phase_with_null_lane(self, git_repo: Path, tmp_path: Path):
+        """A non-pooled (per-task-worktree) layout round-trips with lane/
+        lane_state null and phase derived from plan.json's mixed steps — the
+        accessor abstracts pooled vs non-pooled and the tool passes that
+        through unchanged.
+        """
+        git_ops = GitOps(GitConfig(), git_repo)
+        assert not git_ops.pool_in_use()
+        worktree_base = git_ops.worktree_base
+
+        ta = _make_task_artifacts(worktree_base, '42', '42')
+        ta.write_plan({'steps': [
+            {'id': 's1', 'status': 'done'},
+            {'id': 's2', 'status': 'pending'},
+        ]})
+        ta.append_iteration_log({'note': 'iter-1'})
+        ta.append_iteration_log({'note': 'iter-2'})
+
+        by_task, offline = _tool_runtime_tasks(git_ops, tmp_path)
+
+        assert offline is False
+        entry = by_task[42]
+        assert entry['loops'] == 2
+        assert entry['lane'] is None
+        assert entry['lane_state'] is None
+        assert entry['phase'] == 'EXECUTE'
