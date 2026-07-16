@@ -114,7 +114,12 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     _run_post_merge_verify,
 )
-from orchestrator.verify import VerifyResult, run_scoped_verification, seed_main_baseline
+from orchestrator.verify import (
+    VerifyResult,
+    run_scoped_verification,
+    seed_main_baseline,
+    verify_failure_is_preexisting_on_main,
+)
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES  # noqa: F401 — row 6 (later iteration)
 
 # ---------------------------------------------------------------------------
@@ -596,4 +601,81 @@ class TestRow4NewVsPreexistingBaselineAttribution:
         assert ROW4_PREEXISTING_TEST_ID not in outcome.reason, (
             f'the PRE-EXISTING moda test id must NOT be charged to the '
             f'branch; got {outcome.reason!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Row 5: "wholly pre-existing" + cache hit (μ, B1/B2). Consumer-only.
+# ---------------------------------------------------------------------------
+
+ROW5_MAIN_SHA: str = 'r5main0000000000000000000000000000000000'
+ROW5_PREEXISTING_TEST_ID: str = 'moda/tests/test_z.py::test_z'
+
+
+class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
+    """Row 5 (PRD boundary-test sketch): main already carries a pre-existing
+    red (``ROW5_PREEXISTING_TEST_ID``, seeded into the per-main-SHA
+    baseline); the branch introduces NO new failure — every failing id it
+    reports is already in the baseline. TWO separate merges against the
+    SAME main SHA must BOTH route MAIN_HEALTH_RED (the branch is never
+    charged), and the baseline cache must be consulted rather than
+    re-probed: the REAL main-probe entry point
+    (``verify_failure_is_preexisting_on_main``) — wrapped, not replaced, so
+    its real cache-hit logic genuinely runs — is invoked at most once
+    across the two merges.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.exercise_merge_verify
+    async def test_row5_wholly_preexisting_main_health_red_and_cache_hit(
+        self, tmp_path: Path,
+    ) -> None:
+        mod_a, task_files_content = _row5_wholly_preexisting_diff(tmp_path)
+        seed_main_baseline(ROW5_MAIN_SHA, frozenset({ROW5_PREEXISTING_TEST_ID}))
+
+        probe_spy = AsyncMock(wraps=verify_failure_is_preexisting_on_main)
+        with patch(
+            'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+            new=probe_spy,
+        ):
+            outcome1 = await _drive_merge_gate(
+                tmp_path,
+                task_id='row5-8081-a',
+                module_configs_registry={'moda': mod_a},
+                touched_module_configs=[mod_a],
+                task_files=list(task_files_content),
+                task_files_content=task_files_content,
+                main_sha=ROW5_MAIN_SHA,
+                run_verification_fake=_fake_run_verification_by_module(
+                    {mod_a.prefix: (False, [ROW5_PREEXISTING_TEST_ID])},
+                ),
+            )
+            outcome2 = await _drive_merge_gate(
+                tmp_path,
+                task_id='row5-8081-b',
+                module_configs_registry={'moda': mod_a},
+                touched_module_configs=[mod_a],
+                task_files=list(task_files_content),
+                task_files_content=task_files_content,
+                main_sha=ROW5_MAIN_SHA,
+                run_verification_fake=_fake_run_verification_by_module(
+                    {mod_a.prefix: (False, [ROW5_PREEXISTING_TEST_ID])},
+                ),
+            )
+
+        for label, outcome in (('first', outcome1), ('second', outcome2)):
+            assert outcome is not None, f'expected a blocked MergeOutcome ({label} merge)'
+            assert outcome.status == 'blocked', (
+                f'expected blocked ({label} merge); got {outcome.status!r}'
+            )
+            assert outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+                f'a wholly pre-existing failure ({label} merge) must route '
+                f'MAIN_HEALTH_RED — the branch must never be charged; got '
+                f'{outcome.reason!r}'
+            )
+
+        assert probe_spy.await_count <= 1, (
+            f'expected the main-probe entry point to be consulted at most '
+            f'once across both merges against the same main SHA (cache hit '
+            f'on the second); got {probe_spy.await_count} call(s)'
         )
