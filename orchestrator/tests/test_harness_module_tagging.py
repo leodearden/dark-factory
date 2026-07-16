@@ -623,6 +623,75 @@ async def test_tag_accepts_new_flat_predictions(harness):
 
 
 # ---------------------------------------------------------------------------
+# Sentinel persist for empty/omitted predictions (task 2561 defect 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tag_persists_sentinel_for_empty_and_omitted(harness):
+    """Every task in the untagged batch must get files_tagged_at persisted,
+    even when the agent predicts empty files or omits the task entirely.
+
+    Without this sentinel, a task the agent can't (or won't) predict files
+    for re-enters the tagging batch every cycle forever — 73 tagger
+    sessions mined in one month, an LLM-spend leak.
+
+    Fails now: the persist gate `if task_id and files:` writes nothing for
+    an empty or omitted prediction, so neither '1' nor '2' get an
+    update_task call.
+    """
+    tasks = [
+        {
+            'id': '1', 'title': 'Task A', 'description': '',
+            'status': 'pending', 'metadata': {}, 'dependencies': [],
+        },
+        {
+            'id': '2', 'title': 'Task B', 'description': '',
+            'status': 'pending', 'metadata': {}, 'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+    mock_seed_modules = Mock(return_value=[])
+    harness.scheduler.seed_modules = mock_seed_modules
+
+    # '1' gets an explicit empty files prediction; '2' is omitted entirely.
+    agent_response = {'predictions': [{'id': '1', 'files': []}]}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await harness._tag_task_modules()
+
+    assert harness.scheduler.update_task.call_count == 2, (
+        f'Expected update_task for both tasks; got '
+        f'{harness.scheduler.update_task.call_args_list!r}'
+    )
+    calls = harness.scheduler.update_task.call_args_list
+    call_ids = {c.args[0] for c in calls}
+    assert call_ids == {'1', '2'}
+
+    for call in calls:
+        task_id, metadata_json = call.args
+        metadata = json.loads(metadata_json)
+        tagged_at = metadata.get('files_tagged_at')
+        assert isinstance(tagged_at, str) and tagged_at, (
+            f'Expected a truthy files_tagged_at string for task {task_id}; '
+            f'got metadata={metadata!r}'
+        )
+        assert not metadata.get('files'), (
+            f'Expected no non-empty files for task {task_id} (empty/omitted '
+            f'prediction); got metadata={metadata!r}'
+        )
+
+    mock_seed_modules.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # _extract_tagger_entries: StructuredOutput wrapper-peeling normalizer
 # (task 2561 defect 3 / acceptance c)
 # ---------------------------------------------------------------------------
