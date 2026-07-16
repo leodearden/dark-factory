@@ -749,6 +749,42 @@ class TestMilestoneRegistration:
             parse_metadata({'milestone': {'mode': 'delayed'}}, direction='write', enforce=True)
 
 
+class TestRoutingRegistration:
+    """``routing``'s registration with the W10 extension point + parse_metadata integration."""
+
+    _VALID_ROUTING = {
+        'latest': {
+            'role': 'implementer',
+            'model': 'sonnet',
+            'effort': 'high',
+            'budget_usd': 10.0,
+            'max_turns': 80,
+            'source_layer': 'config',
+        },
+        'history': [],
+    }
+
+    def test_registered_at_import(self):
+        assert task_metadata_module._SUBMODEL_REGISTRY['routing'] is RoutingState
+
+    def test_round_trip_no_warnings(self):
+        model, warnings = parse_metadata({'routing': self._VALID_ROUTING}, direction='write')
+        assert warnings == []
+        assert isinstance(model.routing, RoutingState)  # type: ignore[attr-defined]
+        dumped_routing = model.model_dump()['routing']
+        assert not isinstance(dumped_routing, BaseModel)
+        assert dumped_routing['latest']['role'] == 'implementer'
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'routing' not in unknown_key_fields
+
+    def test_malformed_slice_read_warns_and_retains_raw(self):
+        model, warnings = parse_metadata({'routing': {'history': 'bad'}}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == 'routing'
+        assert warnings[0].code == 'invalid_submodel'
+        assert model.model_dump()['routing'] == {'history': 'bad'}
+
+
 class TestMigrations:
     """The versioned v0->v1 migration registry (PRD §3/§5).
 
