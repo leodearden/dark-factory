@@ -578,3 +578,26 @@ def test_app_jsx_wires_analytics_tab(app_jsx_body: str) -> None:
         "app.jsx toolbarConfig 'esc-analytics' entry does not set `showWindow: false` — "
         'the tab owns its own client-side window toggle, not the global chip.'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-7 test: shell.jsx registers the analytics rail entry + glyph
+# ---------------------------------------------------------------------------
+
+
+def test_shell_jsx_registers_analytics_rail_and_glyph(shell_jsx_body: str) -> None:
+    """shell.jsx must include a Rail item with id 'esc-analytics' and a Glyph
+    case 'esc-analytics'.
+
+    Asserts only the routing-relevant id and glyph-key wiring.  Cosmetic
+    fields (label, SVG path data) are intentionally omitted — they can be
+    renamed without breaking the routing.
+    """
+    assert "id: 'esc-analytics'" in shell_jsx_body, (
+        "shell.jsx Rail items array does not contain an entry with "
+        "`id: 'esc-analytics'` — add the analytics item to the Rail items array."
+    )
+    assert "case 'esc-analytics':" in shell_jsx_body, (
+        "shell.jsx Glyph switch does not have a `case 'esc-analytics':` branch — "
+        'add an esc-analytics case returning a simple stroke SVG.'
+    )
