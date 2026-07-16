@@ -505,6 +505,59 @@ class TestStewardInvokeWithCapRetryWiring:
         )
         assert result == 'Full steward briefing.'
 
+    async def test_forwards_cost_telemetry_kwargs(
+        self, steward, worktree, mock_mcp, mock_config,
+    ):
+        """cost_store/run_id/task_id/project_id/role='steward' are forwarded to
+        invoke_with_cap_retry so its guarded save_invocation block fires
+        (task 2461). FAILS RED today: none of these kwargs are forwarded."""
+        steward.cost_store = MagicMock()
+        steward.event_store = MagicMock(run_id='run-abc')
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-x')
+            await steward._invoke_with_session(
+                prompt='handle this escalation',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=3.0,
+                escalation=esc,
+            )
+
+        kwargs = mock_iwcr.call_args.kwargs
+        assert kwargs['cost_store'] is steward.cost_store
+        assert kwargs['role'] == 'steward'
+        assert kwargs['run_id'] == 'run-abc'
+        assert kwargs['task_id'] == '42'
+        assert kwargs['project_id'] == steward.config.fused_memory.project_id
+
+    async def test_forwards_empty_run_id_when_no_event_store(
+        self, steward, worktree, mock_mcp,
+    ):
+        """run_id falls back to '' when the steward has no event_store."""
+        steward.cost_store = MagicMock()
+        steward.event_store = None
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-x')
+            await steward._invoke_with_session(
+                prompt='handle this escalation',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=3.0,
+                escalation=esc,
+            )
+
+        assert mock_iwcr.call_args.kwargs['run_id'] == ''
+
 
 # ---------------------------------------------------------------------------
 # B7 wedge-guard inheritance (exercises the REAL invoke_with_cap_retry)
