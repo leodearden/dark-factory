@@ -6276,6 +6276,31 @@ class GitOps:
         )
         return [f for f in output.strip().splitlines() if f.strip()]
 
+    async def get_commit_changed_files(self, sha: str) -> list[str]:
+        """Return the files *sha* itself changed relative to its parent.
+
+        Uses ``git diff-tree --no-commit-id --name-only -r --root <sha>`` —
+        ``--root`` makes a ROOT commit (no parent) diff against the empty
+        tree instead of showing nothing, which plain ``diff-tree``/the
+        ``{sha}^..{sha}`` idiom used by :meth:`get_changed_files` cannot
+        express for a parentless commit.
+
+        Returns ``[]`` (never raises) on any git error — e.g. *sha* is a
+        garbage/nonexistent or GC'd object — so an unresolvable commit
+        yields an empty changed-file set rather than propagating a failure.
+
+        Used by ``TaskWorkflow._reconcile_done_step_commits`` (task 2386) to
+        content-match an orphaned done-step commit against the tip WIP
+        safety-commit run's changed-file set.
+        """
+        rc, output, _ = await _run(
+            ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', '--root', sha],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return []
+        return [f for f in output.strip().splitlines() if f.strip()]
+
     async def get_rebase_distance(self, old_base: str, new_base: str) -> int:
         """Count commits in ``old_base..new_base`` (i.e. how far main advanced).
 
