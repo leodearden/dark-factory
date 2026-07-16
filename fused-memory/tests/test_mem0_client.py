@@ -186,12 +186,14 @@ class TestMem0BackendScrollByMetadata:
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
 
-        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
-            with pytest.raises(TimeoutError):
-                await backend.scroll_by_metadata(
-                    scope=Scope(project_id='p'),
-                    filters={'recon_pool': 'stage2_cycle_summary'},
-                )
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            pytest.raises(TimeoutError),
+        ):
+            await backend.scroll_by_metadata(
+                scope=Scope(project_id='p'),
+                filters={'recon_pool': 'stage2_cycle_summary'},
+            )
 
     @pytest.mark.asyncio
     async def test_limit_reached_logs_truncation_warning(self, backend, caplog):
