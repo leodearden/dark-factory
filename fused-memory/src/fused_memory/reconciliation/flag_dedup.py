@@ -2116,6 +2116,129 @@ def confirm_task_present(get_task_result: object) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Phantom task-creation guard (task-2525)
+# --------------------------------------------------------------------------- #
+
+#: Flag types that assert a Stage 2 self-reported ``tasks_created`` count is
+#: phantom (no corroborating task found in the origin project).  Flags of
+#: these types must be validated by filter_false_phantom_task_creation_flags
+#: before being treated as a genuine phantom, because the created task may
+#: legitimately live in a DIFFERENT known project via documented
+#: cross-project routing (``submit_task`` called with another project's
+#: ``project_root``) — an origin-project-only check cannot see that.
+PHANTOM_TASK_CREATION_FLAG_TYPES: frozenset[str] = frozenset({
+    'phantom_tasks_created',
+    'tasks_created_phantom',
+})
+
+
+async def filter_false_phantom_task_creation_flags(
+    taskmaster: Any,
+    known_projects: dict[str, str],
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop phantom-tasks_created findings corroborated by a cross-project task.
+
+    For each flag whose ``flag_type`` is in :data:`PHANTOM_TASK_CREATION_FLAG_TYPES`,
+    resolves every ``cited_tasks`` entry's ``project_id`` to a root via
+    ``known_projects`` and calls ``taskmaster.get_task(task_id, root)`` for each
+    resolvable entry, concurrently. DROPS the flag iff :func:`confirm_task_present`
+    returns True for ANY resolved cited task (the "phantom" premise is positively
+    disproven — the task actually exists in a known project). Keeps the flag
+    otherwise: absent, inconclusive, or unresolvable-project citations all fail
+    safe, mirroring :func:`confirm_task_absent`'s fail-safe posture applied in the
+    corroboration direction — never suppress a genuine phantom on uncertain data.
+
+    A ``cited_tasks`` entry is unresolvable (and therefore skipped, issuing no
+    get_task call) when its ``project_id`` is missing from ``known_projects``,
+    or when either ``project_id`` or ``task_id`` is absent from the entry.
+
+    Non-phantom flags, and phantom flags with no resolvable cited task, pass
+    through unchanged without issuing any get_task call.
+
+    Degrades to a no-op pass-through when ``taskmaster`` or ``known_projects`` is
+    falsy (e.g. stage running without cross-project routing configured).
+
+    Structured drop observations are logged via
+    ``logger.info('reconciliation.false_phantom_task_creation_flag_dropped', ...)``.
+
+    Args:
+        taskmaster: Object with an async ``get_task(task_id, project_root)``
+            method, typically ``self.taskmaster`` in IntegrityCheck.
+        known_projects: Map of ``project_id -> project_root`` for every project
+            the harness knows about, typically ``self.known_projects``.
+        flags: List of flag dicts from Stage 3 ``items_flagged``.
+
+    Returns:
+        Filtered list with corroborated false-phantom findings removed, in the
+        same relative order as the input.
+    """
+    if not taskmaster or not known_projects:
+        return list(flags)
+
+    async def _safe_get_task(task_id: Any, project_root: str) -> Any:
+        """Fetch task with normalised exception handling.
+
+        Returns the raw get_task result on success, or a normalised
+        ``{'error': ..., 'error_type': ...}`` dict on any exception so that
+        ``confirm_task_present`` can classify both paths identically.
+        """
+        try:
+            return await taskmaster.get_task(task_id, project_root)
+        except Exception as exc:
+            return {'error': str(exc), 'error_type': type(exc).__name__}
+
+    # Collect resolvable cited-task lookups, grouped by owning flag index.
+    # Multiple cited_tasks entries (possibly across different flags) run
+    # concurrently in a single flat asyncio.gather batch.
+    lookup_flag_indices: list[int] = []  # flat lookup index -> owning flag index
+    lookup_coros = []
+
+    for i, flag in enumerate(flags):
+        if flag.get('flag_type') not in PHANTOM_TASK_CREATION_FLAG_TYPES:
+            continue
+        cited_tasks = flag.get('cited_tasks')
+        if not isinstance(cited_tasks, list):
+            continue
+        for cited in cited_tasks:
+            if not isinstance(cited, dict):
+                continue
+            cited_task_id = cited.get('task_id')
+            cited_project_id = cited.get('project_id')
+            if cited_task_id is None or cited_project_id is None:
+                continue
+            root = known_projects.get(cited_project_id)
+            if not root:
+                continue  # unresolvable project -> not corroborated -> skip lookup
+            lookup_flag_indices.append(i)
+            lookup_coros.append(_safe_get_task(cited_task_id, root))
+
+    if not lookup_coros:
+        return list(flags)
+
+    lookup_results: list[Any] = await asyncio.gather(*lookup_coros)
+
+    corroborated_flag_indices: set[int] = set()
+    for flag_idx, result in zip(lookup_flag_indices, lookup_results, strict=True):
+        if confirm_task_present(result):
+            corroborated_flag_indices.add(flag_idx)
+
+    kept: list[dict[str, Any]] = []
+    for i, flag in enumerate(flags):
+        if i in corroborated_flag_indices:
+            logger.info(
+                'reconciliation.false_phantom_task_creation_flag_dropped '
+                'flag_type=%s task_id=%s',
+                flag.get('flag_type'), flag.get('task_id'),
+            )
+            # drop: a cited task is positively present in a known project
+            continue
+        kept.append(flag)
+
+    return kept
+
+
+# --------------------------------------------------------------------------- #
 # Already-tracked systemic-pattern guard (task-2416)
 # --------------------------------------------------------------------------- #
 
