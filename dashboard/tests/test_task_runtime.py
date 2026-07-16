@@ -7,7 +7,6 @@ import json
 
 import httpx
 import pytest
-
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 

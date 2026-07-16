@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
@@ -16,7 +17,6 @@ from dashboard.data.active_tasks import (
     collect_done_counts,
     collect_tasks_with_counts,
 )
-from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 # ---------------------------------------------------------------------------
 # helpers used inside the aggregator

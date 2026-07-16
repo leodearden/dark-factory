@@ -37,12 +37,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from dashboard.config import DashboardConfig
 from dashboard.data.task_runtime import fetch_task_runtime
 from dashboard.data.tasks import fetch_external_statuses, fetch_statuses, fetch_tasks
 from dashboard.data.utils import resolve_now
-from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 logger = logging.getLogger(__name__)
 
