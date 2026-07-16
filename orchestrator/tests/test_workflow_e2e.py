@@ -12,7 +12,7 @@ import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _workflow_helpers import (
@@ -627,6 +627,45 @@ class TestCompletionJudge:
         # Architect must NOT receive REIFY_DEBUG_PORT.
         arch_env = stub.env_overrides_by_role.get('architect') or {}
         assert 'REIFY_DEBUG_PORT' not in arch_env
+
+    async def test_judge_invocation_recorded_with_role_judge(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Regression guard (task 2461): the judge already records cost
+        telemetry via the shared workflow._invoke chokepoint (role=role.name),
+        so this CHARACTERIZES already-correct behavior — no production change
+        accompanies this test. Confirms role='judge' rows keep landing rather
+        than re-instrumenting the judge."""
+        judge_cfg = _config_with_judge(config, enabled=True)
+        stub = AgentStub(judge_verdicts=[{
+            'complete': True,
+            'reasoning': 'diff implements both plan steps end-to-end.',
+            'uncovered_plan_steps': [],
+            'substantive_work': True,
+        }])
+        workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
+        workflow.cost_store = MagicMock()
+        workflow.cost_store.save_invocation = AsyncMock()
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        await workflow.run()
+
+        judge_calls = [
+            c for c in workflow.cost_store.save_invocation.call_args_list
+            if c.kwargs.get('role') == 'judge'
+        ]
+        assert judge_calls, (
+            "expected save_invocation to be awaited with role='judge' at "
+            'least once via the workflow._invoke chokepoint'
+        )
 
 
 # ---------------------------------------------------------------------------

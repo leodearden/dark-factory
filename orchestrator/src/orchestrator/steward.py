@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
     from shared.config_dir import TaskConfigDir
+    from shared.cost_store import CostStore
 
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.config import OrchestratorConfig
@@ -97,6 +98,7 @@ class TaskSteward:
         usage_gate: UsageGate | None = None,
         config_dir: TaskConfigDir | None = None,
         event_store: EventStore | None = None,
+        cost_store: CostStore | None = None,
     ):
         self.task_id = task_id
         self.task = task
@@ -108,6 +110,7 @@ class TaskSteward:
         self.usage_gate = usage_gate
         self._config_dir = config_dir
         self.event_store = event_store
+        self.cost_store = cost_store
 
         self._session_id: str | None = None
         self._stopped = False
@@ -649,6 +652,19 @@ class TaskSteward:
             max_cap_retries=_MAX_CAP_RETRIES,
             rebuild_prompt=rebuild_prompt,
             resume_delivers_prompt=True,
+            # NOTE: cost_store/run_id/task_id/project_id/role below are
+            # consumed by invoke_with_cap_retry's OWN internal guarded
+            # save_invocation call (cli_invoke.py, capped=unattributed_cap)
+            # — unlike workflow._invoke/review_checkpoint.py, which don't
+            # pass cost_store through and instead call save_invocation
+            # externally afterward (capped=False). Do not add a second,
+            # external save_invocation call here — that would double-count
+            # this invocation's cost.
+            cost_store=self.cost_store,
+            run_id=self.event_store.run_id if self.event_store else '',
+            task_id=self.task_id,
+            project_id=self.config.fused_memory.project_id,
+            role='steward',
             **kwargs,
         )
 
@@ -734,6 +750,16 @@ class TaskSteward:
                 mcp_config=mcp_config,
                 effort=self.config.effort.triage,
                 backend=self.config.backends.triage,
+                # NOTE: same internal-save delegation as _invoke_with_session
+                # above — cost_store here feeds invoke_with_cap_retry's own
+                # guarded save_invocation (capped=unattributed_cap); do not
+                # add a second, external save_invocation call for this
+                # invocation (see the fuller note above).
+                cost_store=self.cost_store,
+                run_id=self.event_store.run_id if self.event_store else '',
+                task_id=self.task_id,
+                project_id=self.config.fused_memory.project_id,
+                role='triage',
             )
         except AllAccountsCappedException as e:
             # BD-1: the reason text is single-sourced from the SAME

@@ -234,6 +234,39 @@ def _make_pre_triage_gate(token: str = 'tok-a', cap_effects=None) -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
+# Cost telemetry: constructor wiring (task 2461)
+# ---------------------------------------------------------------------------
+
+
+class TestStewardCostStoreConstructor:
+    """TaskSteward accepts an optional cost_store dependency and stores it verbatim.
+
+    FAILS RED today: TaskSteward.__init__ (steward.py:88-110) has no
+    cost_store parameter, so passing cost_store= raises TypeError, and the
+    attribute is absent (AttributeError) when omitted.
+    """
+
+    def test_cost_store_stored_when_provided(
+        self, worktree, mock_config, mock_mcp, mock_briefing, mock_queue,
+    ):
+        sentinel = MagicMock()
+        steward = TaskSteward(
+            task_id='42',
+            task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
+            worktree=worktree,
+            config=mock_config,
+            mcp=mock_mcp,
+            escalation_queue=mock_queue,
+            briefing=mock_briefing,
+            cost_store=sentinel,
+        )
+        assert steward.cost_store is sentinel
+
+    def test_cost_store_defaults_to_none(self, steward):
+        assert steward.cost_store is None
+
+
+# ---------------------------------------------------------------------------
 # Session Persistence
 # ---------------------------------------------------------------------------
 
@@ -471,6 +504,65 @@ class TestStewardInvokeWithCapRetryWiring:
             worktree=steward.worktree,
         )
         assert result == 'Full steward briefing.'
+
+    async def test_forwards_cost_telemetry_kwargs(
+        self, steward, worktree, mock_mcp, mock_config,
+    ):
+        """cost_store/run_id/task_id/project_id/role='steward' are forwarded to
+        invoke_with_cap_retry so its guarded save_invocation block fires
+        (task 2461). FAILS RED today: none of these kwargs are forwarded."""
+        steward.cost_store = MagicMock()
+        steward.event_store = MagicMock(run_id='run-abc')
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-x')
+            await steward._invoke_with_session(
+                prompt='handle this escalation',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=3.0,
+                escalation=esc,
+            )
+
+        kwargs = mock_iwcr.call_args.kwargs
+        assert kwargs['cost_store'] is steward.cost_store
+        assert kwargs['role'] == 'steward'
+        assert kwargs['run_id'] == 'run-abc'
+        assert kwargs['task_id'] == '42'
+        assert kwargs['project_id'] == steward.config.fused_memory.project_id
+        # The recorded cost row's model comes from invoke_kwargs['model']
+        # inside invoke_with_cap_retry (cli_invoke.py), not from the
+        # cost-telemetry kwargs asserted above — pin it too so a dropped
+        # `model` kwarg (which would silently fall back to 'opus' in the
+        # recorded row) is caught here.
+        assert kwargs['model'] == mock_config.models.steward
+
+    async def test_forwards_empty_run_id_when_no_event_store(
+        self, steward, worktree, mock_mcp,
+    ):
+        """run_id falls back to '' when the steward has no event_store."""
+        steward.cost_store = MagicMock()
+        steward.event_store = None
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-x')
+            await steward._invoke_with_session(
+                prompt='handle this escalation',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=3.0,
+                escalation=esc,
+            )
+
+        assert mock_iwcr.call_args.kwargs['run_id'] == ''
 
 
 # ---------------------------------------------------------------------------
@@ -2216,6 +2308,34 @@ class TestPreTriageUsageGateCleanup:
         assert isinstance(result, Escalation)
         # invoke_with_cap_retry sets account_name='' when no gate is provided
         assert mock_result.account_name == ''
+
+    async def test_forwards_cost_telemetry_kwargs(
+        self, steward: TaskSteward, mock_config,
+    ):
+        """cost_store/run_id/task_id/project_id/role='triage' are forwarded to
+        invoke_with_cap_retry so its guarded save_invocation block fires
+        (task 2461). FAILS RED today: none of these kwargs are forwarded."""
+        steward.cost_store = MagicMock()
+        steward.event_store = MagicMock(run_id='run-abc')
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-triage')
+            await steward._pre_triage_suggestions(self._esc())
+
+        kwargs = mock_iwcr.call_args.kwargs
+        assert kwargs['cost_store'] is steward.cost_store
+        assert kwargs['role'] == 'triage'
+        assert kwargs['run_id'] == 'run-abc'
+        assert kwargs['task_id'] == '42'
+        assert kwargs['project_id'] == steward.config.fused_memory.project_id
+        # The recorded cost row's model comes from invoke_kwargs['model']
+        # inside invoke_with_cap_retry (cli_invoke.py), not from the
+        # cost-telemetry kwargs asserted above — pin it too so a dropped
+        # `model` kwarg (which would silently fall back to 'opus' in the
+        # recorded row) is caught here.
+        assert kwargs['model'] == mock_config.models.triage
 
 
 # ---------------------------------------------------------------------------
