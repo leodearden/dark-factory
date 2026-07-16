@@ -4410,7 +4410,21 @@ class TestFindTaskCitationCommit:
     that commit's sha, both before and after the fix — pins no
     regression on the legitimate citation shapes.
 
-    Fail-safe guard (e): an override ``pattern_template`` that is not a
+    Ordering guard (e): the walk-order-plus-subject-retest interaction
+    introduced by dropping ``--max-count=1`` — a NEWER commit whose BODY
+    (not subject) matches the coarse ``--grep`` pre-filter must not
+    shadow an OLDER commit with a genuine SUBJECT citation; the result
+    must still be the older commit's sha. This is precisely the
+    ordering guarantee documented on ``find_task_citation_commit``
+    ("a body-only false match on a newer commit can never shadow an
+    older genuine subject citation"), combining the RED shape from
+    (a)/(b) with the GUARD shape from (c)/(d) in one history so a
+    regression that returned the newer body-only sha, or that stopped
+    at the first ``--grep`` hit instead of walking to the first
+    SUBJECT match, would fail here while still passing (a)-(d) in
+    isolation.
+
+    Fail-safe guard (f): an override ``pattern_template`` that is not a
     valid Python ``re`` pattern must return None and log a WARNING
     rather than raise ``re.error``.
     """
@@ -4506,6 +4520,57 @@ class TestFindTaskCitationCommit:
         commit_sha = commit_sha.strip()
 
         assert await git_ops.find_task_citation_commit('1175') == commit_sha
+
+    async def test_returns_older_subject_citation_when_newer_commit_only_matches_body(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Ordering guard: an OLDER commit with a genuine SUBJECT citation
+        must win even when a NEWER commit's BODY (not subject) separately
+        satisfies the coarse ``--grep`` pre-filter.
+
+        This pins the exact walk-order-plus-subject-retest interaction
+        that dropping ``--max-count=1`` introduces: git-log yields the
+        newer commit first (most-recent-first order), but its subject
+        (``chore: notes``) does not match, so it must be skipped in
+        favor of the older commit's genuine ``impl(1175): add thing``
+        subject. A regression that returned the newer body-only match
+        (e.g. reverting to a bare ``--grep --max-count=1`` without the
+        subject post-filter, or one that stopped at the first ``--grep``
+        hit instead of continuing the walk) would return the NEWER
+        commit's sha here and fail, even though it would still pass the
+        independent RED cases (a)/(b) and GUARD cases (c)/(d) above.
+        """
+        (git_repo / 'thing.py').write_text('thing\n')
+        await _run(['git', 'add', 'thing.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'impl(1175): add thing'], cwd=git_repo,
+        )
+        assert rc == 0, f'older commit failed: {err}'
+        rc, older_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        older_sha = older_sha.strip()
+
+        (git_repo / 'notes.py').write_text('notes\n')
+        await _run(['git', 'add', 'notes.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            [
+                'git', 'commit',
+                '-m', 'chore: notes',
+                '-m', 'Merge task/1175 into main was reverted',
+            ],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'newer commit failed: {err}'
+        rc, newer_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        newer_sha = newer_sha.strip()
+        assert newer_sha != older_sha
+
+        result = await git_ops.find_task_citation_commit('1175')
+        assert result == older_sha, (
+            f'expected the OLDER genuine-subject commit {older_sha!r}, '
+            f'got {result!r} (newer body-only commit is {newer_sha!r})'
+        )
 
     async def test_none_and_warns_for_uncompilable_pattern_template(
         self, git_ops: GitOps, caplog,
