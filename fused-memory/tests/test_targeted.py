@@ -3241,6 +3241,63 @@ async def test_on_task_done_unverified_completion_reframe(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    'get_task_return, expected_unverified_completion',
+    [
+        pytest.param(
+            {'id': '9', 'title': 'T', 'metadata': {}},
+            True,
+            id='unverified',
+        ),
+        pytest.param(
+            {
+                'id': '9', 'title': 'T',
+                'metadata': {'done_provenance': {'note': 'x'}},
+            },
+            False,
+            id='verified',
+        ),
+    ],
+)
+async def test_on_task_done_unverified_completion_journal_flag(
+    reconciler, mock_memory_service, mock_taskmaster, journal,
+    get_task_return, expected_unverified_completion,
+):
+    """The journal audit row for the fast-path completion write must carry a
+    queryable echo_unverified_completion flag (task 2622), mirroring task
+    1984's echo_suppressed and task 2049's echo_used_provenance journal
+    conventions, so operators can query which completion echoes asserted an
+    unverified completion vs. a verified landed outcome. Before the journal
+    detail dict is wired up, `.get('echo_unverified_completion')` returns
+    None and the 'unverified' param's `is True` assertion is RED."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(return_value=get_task_return)
+
+    await reconciler.reconcile_task(
+        task_id='9', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '9', 'title': 'T', 'status': 'in-progress', 'description': 'Nine description'},
+    )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1
+    actions = await journal.get_run_actions(runs[0].id)
+    completion_rows = [
+        a for a in actions
+        if a['operation'] == 'add_memory' and a['detail'].get('type') == 'completion_fast'
+    ]
+    assert len(completion_rows) == 1, (
+        f'Expected exactly one completion_fast journal row, got: {completion_rows}'
+    )
+    assert (
+        completion_rows[0]['detail'].get('echo_unverified_completion')
+        is expected_unverified_completion
+    ), (
+        f'Expected echo_unverified_completion={expected_unverified_completion}, '
+        f'got detail: {completion_rows[0]["detail"]}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     'get_task_kwargs',
     [
         pytest.param({'side_effect': RuntimeError('tm down')}, id='refetch_raises'),
