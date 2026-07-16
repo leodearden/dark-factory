@@ -276,6 +276,23 @@ class LaneLifecycle:
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise CorruptLaneRecord(f'unparseable lane record at {path}') from exc
 
+    def all_records(self) -> dict[str, LaneRecord]:
+        """Return every lane's durable record, keyed by lane name.
+
+        Scans ``state_dir``/*.json — reuses ``read()`` per file, so a
+        corrupt record is skipped (logged, mapped to ``None`` by ``read()``)
+        rather than raising. Returns ``{}`` when ``state_dir`` doesn't exist
+        (never created, or an empty/pre-record host).
+        """
+        if not self.state_dir.is_dir():
+            return {}
+        records: dict[str, LaneRecord] = {}
+        for path in sorted(self.state_dir.glob('*.json')):
+            record = self.read(path.stem)
+            if record is not None:
+                records[path.stem] = record
+        return records
+
     def _write(self, lane: Path | str, record: LaneRecord) -> None:
         """Atomically write *record* for *lane* (tmp file + os.replace).
 
