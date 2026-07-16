@@ -972,9 +972,14 @@ REAP_BATCH_LIMIT = 100
 (spawn-path) reap removes -- see reap_stale_records' `limit` param. Caps a
 single spawn's synchronous prune cost regardless of how large the on-disk
 backlog has grown, at the cost of draining a large backlog over several
-spawns rather than in one call. The CLI `reap` verb (_run_reap) stays
-unbounded (limit=None) so an operator can still drain the entire backlog in
-a single invocation."""
+spawns rather than in one call. Drain order follows reap_stale_records'
+sorted(iterdir()) (directory-name) order, not oldest-first, so if the
+on-disk backlog ever grows faster than spawns can drain it,
+alphabetically-later stale dirs can persist longer than
+alphabetically-earlier ones (TERMINAL_TTL eligibility itself is unaffected
+either way). The CLI `reap` verb (_run_reap) stays unbounded (limit=None)
+so an operator wanting a full, immediate drain can still clear the entire
+backlog in a single invocation."""
 
 NON_TERMINAL_HEARTBEAT_TTL = timedelta(hours=1)
 """How long a non-terminal record survives with a dead launcher_pid and no
@@ -1059,11 +1064,17 @@ def reap_stale_records(
 
     *limit* is None (the default) for an unbounded full sweep -- today's
     behavior, unchanged. A positive int stops the sweep once *limit*
-    directories have actually been removed, bounding both the rmtree work
-    and the O(N) directory scan cost of this call -- this is what lets an
-    opportunistic per-spawn caller stay cheap regardless of backlog size. A
-    directory whose removal is attempted and fails (logged, see below) does
-    NOT count against *limit*.
+    directories have actually been removed, bounding the rmtree work (the
+    dominant reclamation cost) per call -- this is what lets an
+    opportunistic per-spawn caller stay cheap regardless of backlog size.
+    The directory *scan* itself is NOT bounded by *limit* in the worst
+    case: directories are visited in sorted(iterdir()) (name) order and the
+    sweep only breaks after a removal, so if enough kept (non-stale)
+    directories sort ahead of the *limit*-th stale one, every one of them
+    is still stat'd and read before the sweep stops -- the scan remains
+    O(N) in the total directory count, short-circuiting only once *limit*
+    removals have occurred. A directory whose removal is attempted and
+    fails (logged, see below) does NOT count against *limit*.
     """
     if now is None:
         now = datetime.now(UTC)
