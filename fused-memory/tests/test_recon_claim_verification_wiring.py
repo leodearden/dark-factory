@@ -188,3 +188,40 @@ class TestMaybeFlagUnverifiedClaims:
         assert all(isinstance(c, AttributedClaim) for c in result)
         assert not isinstance(result, CuratorDecision)
         assert (candidate.title, candidate.description, candidate.details) == before
+
+    async def test_probe_runs_off_event_loop(self, tmp_path):
+        """Remediation RED for the reviewer's performance-async-blocking
+        finding: probe verification must run off the event-loop thread.
+
+        make_source_and_history_probe's probe() runs blocking git
+        subprocesses (git grep, and — on the exact fabricated-token path
+        this guard targets — a full-history `git log --all -S` pickaxe
+        too), so calling it synchronously inside this async hook stalls
+        the curator/reconciliation event loop for every other coroutine
+        sharing it. Proves the offload by recording the thread each probe
+        call actually executes on and comparing it to the event loop's
+        own thread.
+        """
+        import threading
+
+        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+
+        loop_thread_id = threading.get_ident()
+        probe_thread_ids: list[int] = []
+
+        def recording_probe(token: str) -> bool:
+            probe_thread_ids.append(threading.get_ident())
+            return False
+
+        config = _make_config(recon_claim_verification_enabled=True)
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+        candidate = CandidateTask(title="T", description=_INCIDENT_DESCRIPTION)
+
+        result = await curator._maybe_flag_unverified_claims(
+            candidate, probe=recording_probe,
+        )
+
+        assert len(probe_thread_ids) >= 1
+        assert all(tid != loop_thread_id for tid in probe_thread_ids)
+        assert len(result) == 1
+        assert result[0].token == "done_provenance_invalidated"
