@@ -491,6 +491,11 @@ park_stop_parked_window_hours: 1.0
 # watcher_empty_queue_poll_secs: idle re-check cadence (s) when
 #   _watcher_has_actionable_l1() finds no actionable L1 work — the launch is
 #   skipped and the loop re-polls after this many seconds (default 60).
+#   Tradeoff: a newly-arrived L1 during an idle period now waits up to this
+#   long before the first rotation picks it up (previously a warm rotation
+#   blocked on the next L1 and reacted near-immediately). Hot-reloadable
+#   (green-tier) — lower it if 60s worst-case responsiveness is too slow for
+#   a given deployment.
 #
 # Invocation knobs (per rotation):
 # watcher_model: LLM backend model (default 'sonnet', task 2629). The

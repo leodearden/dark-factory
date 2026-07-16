@@ -2607,6 +2607,11 @@ class OrchestratorConfig(BaseSettings):
     # against cost. Kept distinct from watcher_subprocess_restart_backoff_secs
     # (the clean-restart floor / unclean-backoff base) since the two concepts
     # are independent and would be hard to tune if conflated.
+    # Tradeoff: a newly-arrived L1 during an idle period now waits up to this
+    # long before the first rotation picks it up (previously a warm rotation
+    # blocked on the next L1 and reacted near-immediately). Hot-reloadable
+    # (green-tier) — lower it if this worst-case responsiveness is too slow
+    # for a given deployment.
     watcher_empty_queue_poll_secs: float = Field(default=60.0)
 
     # Invocation knobs for each watcher rotation (per UnblockAutoConfig precedent).
