@@ -152,8 +152,11 @@ function EscalationStatStrip({ analytics, projectFilter }) {
   }
   const benignDenom = benignN + actionableN;
   const benignRate = benignDenom > 0 ? benignN / benignDenom : null;
-  // Per-day benign rate; 0 (not omitted) when a windowed date had no
-  // classified rows at all, so the sparkline stays aligned to the window.
+  // Per-day benign rate, one point per date that appears in flow_daily (i.e.
+  // had at least one row that day). Windowed dates with NO flow_daily rows
+  // are OMITTED here, not zero-filled, so the sparkline is not fully
+  // window-aligned when flow_daily has gaps — it only covers dates the
+  // payload actually reported.
   const benignSpark = Object.keys(benignByDate).sort().map(d => {
     const { benign, actionable } = benignByDate[d];
     const denom = benign + actionable;
@@ -222,7 +225,16 @@ function EscalationStatStrip({ analytics, projectFilter }) {
     }
   }
   const churnRate = filingsSum > 0 ? churnSum / filingsSum : null;
-  const churnSpark = Object.keys(churnByDate).sort().map(d => churnByDate[d]);
+  // Per-day churn RATE (that day's churn / that day's filings), matching the
+  // quantity the tile displays — plotting raw per-day counts here would show
+  // a different quantity than the tile value and mislead when daily filing
+  // volume varies. Reuses epdByDate's per-day filings (already collected for
+  // the esc-per-done tile, same filed-date keying). Days with zero filings
+  // that day are OMITTED (undefined rate), mirroring epdSpark's done==0
+  // omission above.
+  const churnSpark = Object.keys(churnByDate).sort()
+    .filter(d => (epdByDate[d] || {}).filings > 0)
+    .map(d => churnByDate[d] / epdByDate[d].filings);
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, marginBottom: 10 }}>
