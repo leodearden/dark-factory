@@ -494,6 +494,32 @@ def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
     return replace(cmd, base_flags=(*cmd.base_flags, '-p', 'no:xdist', '-o', 'addopts='))
 
 
+def apply_pytest_numprocesses(cmd: VerifyCmd, n: str) -> VerifyCmd:
+    """Return *cmd* with a `-n <n>` pytest-xdist worker-count flag applied.
+
+    Appends ``-n <n>`` to a structured command's ``base_flags``, or — for a
+    raw-retained pytest chain — to every ``pytest`` invocation's arguments in
+    ``raw`` via the same localised regex rewrite ``serial_pytest`` uses, so
+    each chained invocation gets its own cap independently.
+
+    A no-op (returns *cmd* unchanged) unless ``cmd.tool is ToolKind.PYTEST``
+    (covers OPAQUE and every other tool — P1), and also when *n* is ``''`` or
+    ``'auto'`` — the byte-identical guard: the pyproject ``-n auto`` addopts
+    already picks a worker count, so there is nothing to override.
+    """
+    if cmd.tool is not ToolKind.PYTEST or n in {'', 'auto'}:
+        return cmd
+    if cmd.raw is not None:
+        def _rewrite(match: re.Match[str]) -> str:
+            segment = match.group(0)
+            stripped = segment.rstrip()
+            trailing = segment[len(stripped) :]
+            return f'{stripped} -n {n}{trailing}'
+
+        return replace(cmd, raw=_PYTEST_INVOCATION_RE.sub(_rewrite, cmd.raw))
+    return replace(cmd, base_flags=(*cmd.base_flags, '-n', n))
+
+
 def govern_cpu(cmd: VerifyCmd, exec_path: str | None) -> VerifyCmd:
     """Return *cmd* with a cpu-governed-exec wrapper appended to ``wrappers``.
 
