@@ -32,13 +32,19 @@ Usage::
 
 from __future__ import annotations
 
+import logging
 import re
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "AttributedClaim",
     "extract_attributed_claims",
+    "make_source_and_history_probe",
     "unverified_claims_in_text",
     "verify_attributed_claims",
 ]
@@ -187,3 +193,86 @@ def unverified_claims_in_text(
     if not claims:
         return []
     return verify_attributed_claims(claims, probe)
+
+
+# Wall-clock budget for each individual git subprocess call. Generous enough
+# for a large repo's grep/pickaxe, but bounded so a wedged git process can
+# never hang the caller — a timeout is treated the same as any other git
+# error and fails open (see probe() below).
+_GIT_PROBE_TIMEOUT_SECS = 10.0
+
+
+def make_source_and_history_probe(repo_root: Path) -> Callable[[str], bool]:
+    """Build a ``probe(token) -> bool`` backed by *repo_root*'s live tree + git history.
+
+    Encodes the architect's exact manual refutation check for the task-2433
+    incident: ``git grep`` against the working tree, falling back on a tree
+    miss to ``git log --all -S<token>`` (the pickaxe) against the FULL
+    history. A token found in EITHER is treated as present (``True``) — this
+    avoids false-flagging a token that was legitimately REMOVED from the
+    tree but still exists in history (e.g. "task N removed X").
+
+    Fails OPEN (returns ``True``, i.e. "assume present") on ANY git error —
+    a non-zero/non-"no match" exit code, a timeout, or the git binary being
+    unavailable — so an infrastructure hiccup (or *repo_root* not being a
+    git repository at all) can never itself produce a false "fabrication"
+    flag. Never raises.
+    """
+
+    def probe(token: str) -> bool:
+        try:
+            grep_result = subprocess.run(
+                ['git', 'grep', '--quiet', '--fixed-strings', '--', token],
+                cwd=repo_root,
+                timeout=_GIT_PROBE_TIMEOUT_SECS,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning(
+                'recon_claim_verification_guard: git grep failed for token=%r '
+                'under %s — probe fails open: %s',
+                token, repo_root, exc,
+            )
+            return True
+
+        if grep_result.returncode == 0:
+            return True
+        if grep_result.returncode != 1:
+            # Not a clean "no match" (1) — an actual git/infra error (e.g.
+            # repo_root is not a git repository). Fail open rather than
+            # treat this as a genuine miss.
+            logger.warning(
+                'recon_claim_verification_guard: git grep errored (exit=%d) for '
+                'token=%r under %s — probe fails open: %s',
+                grep_result.returncode, token, repo_root, grep_result.stderr.strip(),
+            )
+            return True
+
+        try:
+            log_result = subprocess.run(
+                ['git', 'log', '--all', f'-S{token}', '--oneline', '-1'],
+                cwd=repo_root,
+                timeout=_GIT_PROBE_TIMEOUT_SECS,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning(
+                'recon_claim_verification_guard: git log failed for token=%r '
+                'under %s — probe fails open: %s',
+                token, repo_root, exc,
+            )
+            return True
+
+        if log_result.returncode != 0:
+            logger.warning(
+                'recon_claim_verification_guard: git log errored (exit=%d) for '
+                'token=%r under %s — probe fails open: %s',
+                log_result.returncode, token, repo_root, log_result.stderr.strip(),
+            )
+            return True
+
+        return bool(log_result.stdout.strip())
+
+    return probe
