@@ -105,3 +105,123 @@ class TestExtractAttributedClaims:
         assert "task 100" in claims[0].attribution
         assert "task 300" not in claims[0].attribution
         assert "task 200" in claims[1].attribution
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-2438 step-03 RED: TestVerifyAttributedClaims / TestUnverifiedClaimsInText
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestVerifyAttributedClaims:
+    """Tests for verify_attributed_claims(claims, probe) with an injected
+    fake probe (dict/set membership) — no git, no I/O.
+    """
+
+    def test_absent_token_is_returned_as_unverified(self):
+        """(a) A claim whose token the probe reports absent is returned."""
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            AttributedClaim,
+            verify_attributed_claims,
+        )
+
+        claim = AttributedClaim(
+            token="done_provenance_invalidated", attribution="task 2372", span="...",
+        )
+        probe = (lambda present: lambda token: token in present)(set())
+
+        result = verify_attributed_claims([claim], probe)
+
+        assert result == [claim]
+
+    def test_present_token_is_filtered_out(self):
+        """(b) A claim whose token the probe reports present is filtered out
+        (self-correcting — an existing token like `get_statuses` verifies clean)."""
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            AttributedClaim,
+            verify_attributed_claims,
+        )
+
+        claim = AttributedClaim(token="get_statuses", attribution="task 100", span="...")
+        probe = (lambda present: lambda token: token in present)({"get_statuses"})
+
+        result = verify_attributed_claims([claim], probe)
+
+        assert result == []
+
+    def test_empty_claims_returns_empty(self):
+        """(c) Empty claims => []."""
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            verify_attributed_claims,
+        )
+
+        result = verify_attributed_claims([], lambda token: True)
+
+        assert result == []
+
+    def test_mixed_claims_returns_only_absent_subset(self):
+        """Mixed input: only the tokens the probe reports absent survive."""
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            AttributedClaim,
+            verify_attributed_claims,
+        )
+
+        present = AttributedClaim(token="get_statuses", attribution="task 1", span="...")
+        absent = AttributedClaim(token="totally_fake_stamp", attribution="task 2", span="...")
+        probe = (lambda present_set: lambda token: token in present_set)({"get_statuses"})
+
+        result = verify_attributed_claims([present, absent], probe)
+
+        assert result == [absent]
+
+
+class TestUnverifiedClaimsInText:
+    """Tests for unverified_claims_in_text(text, probe) — composes
+    extract_attributed_claims + verify_attributed_claims, mirroring
+    premise_refuted_entry's composition shape.
+    """
+
+    INCIDENT_TEXT = (
+        "This is the same site that stamps "
+        "metadata.done_provenance_invalidated=true per task 2372 ACTION #5 "
+        "on task reopen."
+    )
+
+    def test_incident_sentence_unverified_when_probe_lacks_token(self):
+        """(d1) A probe lacking the token => one unverified claim."""
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            unverified_claims_in_text,
+        )
+
+        probe = (lambda present: lambda token: token in present)(set())
+
+        result = unverified_claims_in_text(self.INCIDENT_TEXT, probe)
+
+        assert len(result) == 1
+        assert result[0].token == "done_provenance_invalidated"
+
+    def test_incident_sentence_verified_when_probe_has_token(self):
+        """(d2) A probe that has the token => []."""
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            unverified_claims_in_text,
+        )
+
+        probe = (lambda present: lambda token: token in present)(
+            {"done_provenance_invalidated"},
+        )
+
+        result = unverified_claims_in_text(self.INCIDENT_TEXT, probe)
+
+        assert result == []
+
+    def test_text_with_no_claims_returns_empty_without_calling_probe(self):
+        """No attributed claims in the text => [] and the probe is never invoked."""
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            unverified_claims_in_text,
+        )
+
+        def probe(token: str) -> bool:
+            raise AssertionError("probe must not be called when there are no claims")
+
+        result = unverified_claims_in_text("Plain prose with no claims at all.", probe)
+
+        assert result == []
