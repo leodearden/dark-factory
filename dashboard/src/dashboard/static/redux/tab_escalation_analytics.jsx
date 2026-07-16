@@ -12,6 +12,7 @@ const { useState: uS, useEffect: uE } = React;
 const DF = window.DF_DATA;
 const { ProjectGroup, Segmented, fmtUptime, fmtDateTime, taskId } = window.DF_SHELL;
 const C = window.DF_CHARTS;
+const { LifecycleFlowDiagram } = window.DF_ESC_FLOW || {};
 
 // ── Local helpers (tab_escalations.jsx-compatible copies; not exported from
 //    any namespace) ──
@@ -522,12 +523,10 @@ function WorkflowPanel({ workflow, win, generatedAt, regimeMarkers }) {
           </TimeChart>
         </>
       )}
-      {/* ζ lifecycle flow diagram / mini-Sankey mounts here, fed the windowed
-          `flowDaily` computed above (dep on δ) — reserved seam, not yet built. */}
+      {/* ζ lifecycle flow diagram / mini-Sankey — origin → level → tier →
+          class, fed the windowed `flowDaily` computed above (dep on δ). */}
       <div className="esc-flow-slot">
-        <span style={{ fontSize: 10, color: 'var(--fg-3)' }}>
-          {flowDaily.length} flow row{flowDaily.length !== 1 ? 's' : ''} in window — lifecycle flow diagram pending
-        </span>
+        <LifecycleFlowDiagram flowDaily={flowDaily} />
       </div>
     </div>
   );
