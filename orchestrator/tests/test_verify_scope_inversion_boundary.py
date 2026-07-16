@@ -98,20 +98,23 @@ diff breaking a sibling module's suite escapes a scoped merge gate.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _serial_merge_worker import MergeWorker
 from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
+from test_train_integration import _SpyEventStore, build_group_merge_request, make_stacked_member
 from test_verify_scope_kappa import _executed_module_configs, _run_verification_spy
 from test_verify_scope_lambda import _two_module_registry
 from test_workflow_verify_infra_resume import _infra_category_result
 from test_workflow_verify_infra_resume import _make as _make_workflow
 
 from orchestrator import verify
-from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
@@ -885,3 +888,169 @@ class TestRow6InfraTransientConsumesNoAttemptBothConsumers:
             f'in-place retry) to exhaust rather than retry silently forever; '
             f'got {merge_fake.await_count} call(s)'
         )
+
+
+# ---------------------------------------------------------------------------
+# Row 7: "train amortization" (λ/σ, T1). A 3-member line-stacked Python
+# train lands via exactly ONE broad, per-module merge-role verify of the
+# TIP — the amortization win — driven through the REAL
+# ``MergeWorker._do_merge`` -> ``_do_train_merge`` -> ``_run_post_merge_verify``
+# chokepoint chain. Adapts test_train_integration.py's real-git train harness
+# (``make_stacked_member`` / ``build_group_merge_request`` / ``_SpyEventStore``
+# / the test-local ``MergeWorker`` reference) to non-cargo Python modules
+# with an instrumented fake ``run_verification`` — no cargo, no ssh.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_train_workspace_repo(tmp_path: Path) -> Path:
+    """Git-init a fresh repo seeded with a trivial 3-module Python layout
+    (``moda``/``modb``/``modc``, one placeholder source file each) and an
+    initial commit on ``main``.
+
+    Row 7's non-cargo analogue of
+    ``test_train_integration.seed_workspace_repo`` (which copies a REAL
+    cargo fixture) — no cargo and no real pytest: row 7's verify is driven
+    entirely through an instrumented fake ``run_verification``, so the
+    on-disk module contents only need to exist for real ``git diff``/rebase
+    plumbing to have something to operate on.
+    """
+    repo = tmp_path
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    for prefix in ('moda', 'modb', 'modc'):
+        mod_dir = repo / prefix
+        mod_dir.mkdir(parents=True, exist_ok=True)
+        (mod_dir / 'thing.py').write_text(f'{prefix}_value = 0\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'initial workspace'], cwd=repo)
+    return repo
+
+
+def _three_module_train_registry(
+    repo: Path,
+) -> tuple[ModuleConfig, ModuleConfig, ModuleConfig, OrchestratorConfig]:
+    """A 3-module registry (moda/modb/modc), ``merge_verify_breadth='full'``,
+    for the row-7 train — the ``_two_module_registry`` shape extended to a
+    third module (one per stacked member).
+
+    Unlike :func:`test_verify_scope_lambda._two_module_registry`,
+    ``type_check_command``/``lint_command`` are left at their ``None``
+    default. Row 7 is the ONLY row in this module whose scoped verify phase
+    actually PASSES (the merge must land, unlike every other row here, which
+    asserts a blocked/held outcome) — so it uniquely reaches
+    ``LocalRunner.run_merge_verify``'s post-scoped unscoped-pyright gate
+    (``_run_unscoped_typechecks``, called once pre-advance and again inside
+    ``_finalize_advanced_merge`` post-advance). Every other row's scoped
+    phase fails first, short-circuiting before that gate ever runs (see
+    ``LocalRunner.run_merge_verify``: ``if not scoped.passed: return
+    scoped``). A ``None`` ``type_check_command`` keeps
+    ``_run_unscoped_typechecks``'s ``active`` list empty, so neither call
+    ever spawns a real, unpatched ``pyright`` subprocess — that function is
+    reached via ``orchestrator.merge_queue``'s OWN imported
+    ``run_verification`` reference, a DIFFERENT binding from the
+    ``orchestrator.verify.run_verification`` seam this module patches
+    everywhere else, so it would not be faked away like the scoped phase is.
+    """
+    mod_a = ModuleConfig(prefix='moda', test_command='uv run --directory moda pytest tests/')
+    mod_b = ModuleConfig(prefix='modb', test_command='uv run --directory modb pytest tests/')
+    mod_c = ModuleConfig(prefix='modc', test_command='uv run --directory modc pytest tests/')
+    config = OrchestratorConfig(
+        project_root=repo,
+        merge_verify_breadth='full',
+        git=GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False,
+        ),
+    )
+    config._module_configs = {'moda': mod_a, 'modb': mod_b, 'modc': mod_c}
+    return mod_a, mod_b, mod_c, config
+
+
+class TestRow7TrainAmortizationOneFullBreadthVerify:
+    """Row 7 (PRD boundary-test sketch): a 3-member line-stacked Python train
+    lands via exactly ONE post-merge verify (``is_merge_verify=True,
+    role='merge'``) of the tip — the amortization win (λ/σ, T1) — and that
+    ONE verify's executed configs are PER-MODULE (each registered module's
+    own ``test_command``), never a single opaque global &&-chain call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_row7_three_member_train_one_full_breadth_verify(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = await _seed_train_workspace_repo(tmp_path)
+        mod_a, mod_b, mod_c, config = _three_module_train_registry(repo)
+        git_ops = GitOps(config.git, repo)
+
+        def edit_a(wt: Path) -> None:
+            (wt / 'moda' / 'thing.py').write_text('moda_value = 1\n')
+
+        def edit_b(wt: Path) -> None:
+            (wt / 'modb' / 'thing.py').write_text('modb_value = 1\n')
+
+        def edit_c(wt: Path) -> None:
+            (wt / 'modc' / 'thing.py').write_text('modc_value = 1\n')
+
+        _, main_sha, _ = await _run(['git', 'rev-parse', 'main'], cwd=repo)
+        main_sha = main_sha.strip()
+
+        wt_1, sha_1 = await make_stacked_member(git_ops, 'row7_m1', main_sha, edit_a)
+        wt_2, sha_2 = await make_stacked_member(git_ops, 'row7_m2', sha_1, edit_b)
+        wt_3, _sha_3 = await make_stacked_member(git_ops, 'row7_m3', sha_2, edit_c)
+        del wt_1, wt_2  # only the tip worktree is threaded into the merge request
+
+        verify_calls: list[dict] = []
+
+        async def _spy_verify(*args, **kwargs):
+            verify_calls.append({'args': args, 'kwargs': kwargs})
+            return await run_scoped_verification(*args, **kwargs)
+
+        spy_events = _SpyEventStore()
+        req = build_group_merge_request(
+            git_ops=git_ops, config=config, train_id='train-row7',
+            member_names=['row7_m1', 'row7_m2', 'row7_m3'],
+            tip_name='row7_m3', tip_worktree=wt_3,
+        )
+
+        run_verification_fake = _fake_run_verification_by_module({
+            mod_a.prefix: (True, []), mod_b.prefix: (True, []), mod_c.prefix: (True, []),
+        })
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=spy_events)
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', side_effect=_spy_verify),
+            patch.object(verify, 'run_verification', new=run_verification_fake),
+        ):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'done', f'expected the train to land; got {outcome!r}'
+
+        merge_verify_calls = [
+            c for c in verify_calls if c['kwargs'].get('is_merge_verify') is True
+        ]
+        assert len(merge_verify_calls) == 1, (
+            f'expected exactly ONE post-merge verify — the amortization win '
+            f'across 3 members, not one verify per member; got '
+            f'{len(merge_verify_calls)}: {verify_calls}'
+        )
+        assert merge_verify_calls[0]['kwargs'].get('role') == 'merge', (
+            f"expected role='merge' on the post-merge call; got "
+            f"{merge_verify_calls[0]['kwargs']!r}"
+        )
+
+        executed = {mc.prefix: mc for mc in _executed_module_configs(run_verification_fake)}
+        assert set(executed) == {'moda', 'modb', 'modc'}, (
+            f'expected the one broad verify to fan out per-module across '
+            f'every REGISTERED module (never a single opaque global-chain '
+            f'call); got {set(executed)!r}'
+        )
+        for mc in (mod_a, mod_b, mod_c):
+            assert executed[mc.prefix].test_command == mc.test_command, (
+                f"expected {mc.prefix} to run its OWN verbatim full-suite "
+                f'test command, not a combined/opaque command; got '
+                f'{executed[mc.prefix].test_command!r}'
+            )
