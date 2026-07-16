@@ -98,25 +98,37 @@ def _extract_function_body(src: str, fn_name: str) -> str:
     named ``function`` declarations — not arrow functions or class methods.
     Returns the empty string if the function is not found.
 
-    This is used to scope token-presence checks to a specific function body
-    rather than searching the entire file (which would give false confidence
-    when a token appears in an unrelated context).
+    Paren-depth walks past the parameter list before looking for the body's
+    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
+    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
+    taking the first ``{`` after the opening ``(`` would return just the
+    destructuring pattern (e.g. ``{ a, b }``) instead of the function body.
     """
     m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
     if m is None:
         return ''
-    start = src.find('{', m.end())
+    paren_depth = 1
+    i = m.end()
+    while i < len(src) and paren_depth > 0:
+        if src[i] == '(':
+            paren_depth += 1
+        elif src[i] == ')':
+            paren_depth -= 1
+        i += 1
+    if paren_depth != 0:
+        return ''
+    start = src.find('{', i)
     if start == -1:
         return ''
     depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
+    for j in range(start, len(src)):
+        c = src[j]
         if c == '{':
             depth += 1
         elif c == '}':
             depth -= 1
             if depth == 0:
-                return src[start : i + 1]
+                return src[start : j + 1]
     return ''
 
 
@@ -641,4 +653,258 @@ def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
         'tab_escalations.jsx sidebar does not have a `task_unresolved` fallback branch — '
         'add `{row.task_unresolved ? <unresolved note> : <task card>}` to handle '
         'escalations whose linked task could not be resolved.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-1 test: EscalationStatStrip is declared, wired to DF_CHARTS/analytics,
+# and mounted at the top of EscalationsTab
+# ---------------------------------------------------------------------------
+
+
+def test_tab_escalations_strip_mounted_and_wired(tab_escalations_jsx_body: str) -> None:
+    """EscalationStatStrip must be declared, use DF_CHARTS, read the analytics
+    payload, render StatTiles, and mount at the top of EscalationsTab (above
+    the level-filter controls).
+
+    Asserts:
+    (1) file declares `function EscalationStatStrip(`.
+    (2) file declares `const C = window.DF_CHARTS` (charts primitives available).
+    (3) scoped to the EscalationStatStrip body: references ESCALATION_ANALYTICS
+        (reads the analytics payload) and renders <C.StatTile.
+    (4) scoped to the EscalationsTab body: renders <EscalationStatStrip, and
+        that render's index is BEFORE the "Level:" filter-chip controls — the
+        strip must sit at the top of the tab.
+    """
+    body = tab_escalations_jsx_body
+
+    # (1) Component declared
+    assert 'function EscalationStatStrip(' in body, (
+        'tab_escalations.jsx does not define `function EscalationStatStrip(` — '
+        'add the summary-strip component as a named function.'
+    )
+
+    # (2) Charts primitives available
+    assert re.search(r'const\s+C\s*=\s*window\.DF_CHARTS', body), (
+        'tab_escalations.jsx does not alias `const C = window.DF_CHARTS` — add it '
+        'near the top alongside the existing `const DF = window.DF_DATA;` so '
+        'EscalationStatStrip can render <C.StatTile.'
+    )
+
+    # (3) Scoped to the EscalationStatStrip body: reads the analytics payload,
+    # renders StatTile.
+    strip_fn = _extract_function_body(body, 'EscalationStatStrip')
+    assert strip_fn, (
+        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body — '
+        'add the component definition.'
+    )
+    assert 'ESCALATION_ANALYTICS' in strip_fn, (
+        'EscalationStatStrip does not reference ESCALATION_ANALYTICS — it should read '
+        'the analytics payload (e.g. `analytics || DF.ESCALATION_ANALYTICS`).'
+    )
+    assert '<C.StatTile' in strip_fn, (
+        'EscalationStatStrip does not render <C.StatTile — add the tile container.'
+    )
+
+    # (4) Scoped to the EscalationsTab body: strip mounts before the level-filter
+    # controls (top-of-tab placement).
+    tab_fn = _extract_function_body(body, 'EscalationsTab')
+    assert tab_fn, (
+        'tab_escalations.jsx does not define a `function EscalationsTab(` body.'
+    )
+    strip_idx = tab_fn.find('<EscalationStatStrip')
+    assert strip_idx != -1, (
+        'EscalationsTab does not render <EscalationStatStrip — mount it as the first '
+        'child of the returned JSX, above the controls header.'
+    )
+    level_idx = tab_fn.find('Level:')
+    assert level_idx != -1, (
+        'EscalationsTab does not render the "Level:" filter-chip label — cannot '
+        'verify strip placement relative to the controls header.'
+    )
+    assert strip_idx < level_idx, (
+        f'EscalationsTab renders <EscalationStatStrip AFTER the level-filter controls '
+        f'(index {strip_idx} vs {level_idx}) — the strip must sit at the TOP of the '
+        f'tab, above the controls header.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-3 test: EscalationStatStrip computes all four metrics from the
+# payload's existing daily series (no duplicated computation)
+# ---------------------------------------------------------------------------
+
+
+def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> None:
+    """EscalationStatStrip must compute all four metrics from series the
+    backend aggregator already emits, and render four labeled tiles.
+
+    Asserts, scoped to the EscalationStatStrip body:
+    (a) benign-rate — references flow_daily, the 'benign'/'actionable' class
+        literals, and stamped_share (the hint).
+    (b) 6h-breach — references open_items and breach_6h.
+    (c) esc-per-done — references esc_per_done_daily.
+    (d) churn — references churn_daily.
+    (e) at least four <C.StatTile tiles are rendered.
+    """
+    strip_fn = _extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
+    assert strip_fn, (
+        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body — '
+        'add the component definition.'
+    )
+
+    # (a) benign-rate substrate
+    assert 'flow_daily' in strip_fn, (
+        'EscalationStatStrip does not reference flow_daily — the benign-rate tile '
+        'must be computed from workflow.flow_daily (the only per-day benign/'
+        'actionable series in the payload).'
+    )
+    assert "'benign'" in strip_fn, (
+        "EscalationStatStrip does not reference the 'benign' class literal — "
+        "sum flow_daily rows where class == 'benign'."
+    )
+    assert "'actionable'" in strip_fn, (
+        "EscalationStatStrip does not reference the 'actionable' class literal — "
+        "sum flow_daily rows where class == 'actionable'."
+    )
+    assert 'stamped_share' in strip_fn, (
+        'EscalationStatStrip does not reference stamped_share — add the all-time '
+        'stamped-share hint computed from origin.sources[].'
+    )
+
+    # (b) 6h-breach substrate
+    assert 'open_items' in strip_fn, (
+        'EscalationStatStrip does not reference lifespan.open_items — the '
+        '6h-breach tile must count the live pending queue.'
+    )
+    assert 'breach_6h' in strip_fn, (
+        'EscalationStatStrip does not reference breach_6h — count open_items '
+        'where breach_6h is truthy.'
+    )
+
+    # (c) esc-per-done substrate
+    assert 'esc_per_done_daily' in strip_fn, (
+        'EscalationStatStrip does not reference workflow.esc_per_done_daily — '
+        'the esc-per-done tile must be computed from it.'
+    )
+
+    # (d) churn substrate
+    assert 'churn_daily' in strip_fn, (
+        'EscalationStatStrip does not reference workflow.churn_daily — the '
+        'churn-24h tile must be computed from it.'
+    )
+
+    # (e) at least four StatTile occurrences
+    tile_count = len(re.findall(r'<C\.StatTile', strip_fn))
+    assert tile_count >= 4, (
+        f'EscalationStatStrip renders {tile_count} <C.StatTile tiles, expected >= 4 '
+        '(benign rate, 6h breaches, esc/done, churn).'
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-5 test: strip windows its series to a trailing 7d anchored to
+# analytics.generated_at (never Date.now())
+# ---------------------------------------------------------------------------
+
+
+def test_tab_escalations_strip_window_anchored_7d(tab_escalations_jsx_body: str) -> None:
+    """The strip's series must be windowed to a trailing 7d anchored to the
+    payload's own generated_at clock, never Date.now() — immune to
+    browser-clock skew (matches the analytics tab's clock discipline).
+
+    Asserts:
+    (1) a `function windowCutoffDate(` helper is defined whose body
+        references `generatedAt` and does NOT call `Date.now(`.
+    (2) the EscalationStatStrip body references `generated_at` (reads the
+        payload clock).
+    (3) `Date.now(` does not appear anywhere in the EscalationStatStrip body.
+    (4) a 7-day window is expressed near the cutoff/window logic.
+    """
+    body = tab_escalations_jsx_body
+
+    # (1) windowCutoffDate helper, generatedAt-anchored, no Date.now()
+    cutoff_fn = _extract_function_body(body, 'windowCutoffDate')
+    assert cutoff_fn, (
+        'tab_escalations.jsx does not define `function windowCutoffDate(` — add a '
+        'local generated_at-anchored cutoff helper (copy the pattern from '
+        'tab_escalation_analytics.jsx).'
+    )
+    assert 'generatedAt' in cutoff_fn, (
+        'windowCutoffDate does not reference `generatedAt` in its body — it must '
+        'anchor the cutoff to the payload clock, not the browser clock.'
+    )
+    assert 'Date.now(' not in cutoff_fn, (
+        'windowCutoffDate calls Date.now( — the cutoff must be anchored exclusively '
+        'to generatedAt (immune to browser-clock skew), never Date.now().'
+    )
+
+    # (2)/(3) EscalationStatStrip anchors to generated_at, never Date.now()
+    strip_fn = _extract_function_body(body, 'EscalationStatStrip')
+    assert strip_fn, (
+        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body.'
+    )
+    assert 'generated_at' in strip_fn, (
+        'EscalationStatStrip does not reference generated_at — anchor the window '
+        'cutoff to analytics.generated_at.'
+    )
+    assert 'Date.now(' not in strip_fn, (
+        'EscalationStatStrip calls Date.now( — the window must be anchored '
+        'exclusively to analytics.generated_at, never the browser clock.'
+    )
+
+    # (4) 7-day window literal expressed near the cutoff/window logic — either
+    # a `windowCutoffDate(..., 7)` call site in the strip, or a `days * 7`
+    # (or `7 * days`) expression inside the helper itself.
+    assert (
+        re.search(r'windowCutoffDate\([^)]*,\s*7\s*\)', strip_fn)
+        or re.search(r'days\s*\*\s*7\b|\b7\s*\*\s*days', cutoff_fn)
+    ), (
+        'No 7-day window literal found — express the trailing-7d window via a '
+        '`windowCutoffDate(..., 7)` call in EscalationStatStrip (or an equivalent '
+        '`days * 7` expression in the windowCutoffDate helper itself).'
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-7 test: strip feeds trend sparklines and retains churn-24h
+# ---------------------------------------------------------------------------
+
+
+def test_tab_escalations_strip_sparklines_and_churn_retained(tab_escalations_jsx_body: str) -> None:
+    """The strip must feed trend sparklines for the three series-backed tiles
+    (benign-rate, esc-per-done, churn) via StatTile's spark prop, and
+    churn-24h must be RETAINED — not the first tile dropped — per the
+    open-question-4 decision (all four tiles kept; responsive grid instead).
+
+    Asserts:
+    (1) at least three `spark=` props are passed to <C.StatTile within the
+        EscalationStatStrip body (one each for the series-backed tiles).
+    (2) churn-24h is retained: a `spark=` occurs within ~200 chars of a churn
+        tile label / churn_daily reference (co-occurrence, not bare
+        presence — a stray spark= elsewhere wouldn't prove churn has one).
+    """
+    strip_fn = _extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
+    assert strip_fn, (
+        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body.'
+    )
+
+    # (1) at least three spark= props within <C.StatTile tiles
+    spark_count = len(re.findall(r'<C\.StatTile[^>]*\bspark=', strip_fn))
+    assert spark_count >= 3, (
+        f'EscalationStatStrip passes spark= to only {spark_count} <C.StatTile tiles, '
+        'expected >= 3 (benign rate, esc/done, and churn are series-backed).'
+    )
+
+    # (2) churn-24h retained: spark= co-occurs near a churn reference
+    found_churn_spark = False
+    for m in re.finditer(r'churn', strip_fn, re.IGNORECASE):
+        window = strip_fn[max(0, m.start() - 200): m.end() + 200]
+        if 'spark=' in window:
+            found_churn_spark = True
+            break
+    assert found_churn_spark, (
+        'No `spark=` prop found within ~200 chars of a churn tile label / '
+        'churn_daily reference — churn-24h must be RETAINED with its own '
+        'sparkline per the open-question-4 decision (keep all four tiles).'
     )
