@@ -18,6 +18,13 @@ Design decisions (captured in plan.json):
   progress", "1505 done / 148 cancelled") — these are OUT OF SCOPE,
   stale-by-design audit trail per Snapshot Discipline, and must never be
   invalidated by this sweep.
+- extract_snapshot_edge_task_ids anchors the status marker directly to its
+  own task reference (INDIVIDUAL_SNAPSHOT_RE) rather than gating on
+  whole-fact marker presence, so an incidental status word describing
+  something else in the same fact (e.g. "Task 142 landed on the active
+  branch" — the active BRANCH, not task 142) is never wrongly attributed to
+  the reference. (amendment, reviewer_comprehensive precision finding, task
+  2613)
 - Invalidate-only-on-positively-terminal: an unknown/missing/still-active
   status for a referenced id never triggers invalidation (fail-safe,
   mirrors flag_dedup.filter_terminal_metadata_flags) — a transient census
@@ -61,13 +68,41 @@ SNAPSHOT_STATUS_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# NOTE (amendment, reviewer_comprehensive correctness-recall finding, task
+# 2613): individual-form extraction used to run against a COUNT_QUANTITY_RE-
+# stripped copy of the WHOLE fact, so a verb-less snapshot like 'Task 5 in
+# progress' or 'Task 5 pending' had its own digit stripped out first (it
+# matches '\d+\s+in[-\s]?progress' / '\d+\s+pending') before the id
+# extraction ever ran — a silent false negative. INDIVIDUAL_SNAPSHOT_RE
+# below anchors the status marker directly to its own task reference
+# instead (see its docstring), so COUNT_QUANTITY_RE is now only ever
+# applied to an already list-scoped aggregate segment, never to the whole
+# fact — see the aggregate-form loop in extract_snapshot_edge_task_ids.
+
 # Strips 'N <count-noun>' spans (e.g. '8 tasks', '148 cancelled', '3 pending')
-# BEFORE id extraction, so a count operand is never mistaken for a task id —
-# this is what keeps pure task-COUNT snapshots ('There are 8 tasks in
-# progress') from ever contributing a candidate id.
+# from an aggregate list segment before bare-digit extraction, so an
+# embedded count phrase (e.g. '...tasks: 142, 148, and 200 total remain')
+# never contributes a spurious id.
 COUNT_QUANTITY_RE: re.Pattern[str] = re.compile(
     r'\b\d+\s+(?:tasks?|active|pending|in[-\s]?progress|done|cancell?ed|'
     r'blocked|deferred|review|total|merge[-\s]?deferred)\b',
+    re.IGNORECASE,
+)
+
+# NOTE (amendment, reviewer_comprehensive correctness-precision finding, task
+# 2613): the individual form used to extract a task id via TASK_REF_RE
+# anywhere in the fact as long as SNAPSHOT_STATUS_RE matched ANYWHERE else in
+# the same fact — so 'Task 142 landed on the active branch' (the BRANCH is
+# active, not task 142) wrongly yielded {142}. INDIVIDUAL_SNAPSHOT_RE anchors
+# the status marker directly to its own task reference: 'task N' (or '#N' /
+# 'df N') optionally followed by a copula ('is'/'are'/'was'/'were') and/or an
+# article ('a'/'an'), then the status marker itself — with nothing else (e.g.
+# an intervening verb like 'landed') allowed in between. Built directly from
+# TASK_REF_RE.pattern (not a hand-copied duplicate) so the two stay in sync
+# if the shared task-reference grammar ever changes.
+INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
+    TASK_REF_RE.pattern
+    + r'\s*(?:is|are|was|were)?\s*(?:an?\s+)?(?:active|pending|in[-\s]?progress)\b',
     re.IGNORECASE,
 )
 
@@ -119,19 +154,24 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
       (e.g. 'Task 5 is done', 'Task 7 landed as merge commit'); or
     - *fact* is a pure count-only snapshot with no specific task-id
       reference (e.g. 'There are 8 tasks in progress', '1505 done / 148
-      cancelled') — out of scope per Snapshot Discipline.
+      cancelled') — out of scope per Snapshot Discipline; or
+    - a task id is only incidentally near an unrelated status word (e.g.
+      'Task 142 landed on the active branch' — the active BRANCH, not task
+      142 — see INDIVIDUAL_SNAPSHOT_RE).
 
     Algorithm:
       1. Gate on SNAPSHOT_STATUS_RE against the raw fact text; short-circuit
          to the empty set when absent.
-      2. Strip COUNT_QUANTITY_RE spans so a count operand ('8' in '8
-         tasks') is never treated as an id.
-      3. Extract ids via the union of:
-         - TASK_REF_RE matches (individual form: 'task N' / '#N' / 'df N'),
-           imported from task_filter for consistency with the rest of the
-           reconciliation detector family; and
-         - bare digit tokens found ONLY inside a detected aggregate list
-           segment (introduced by 'tasks are [...]' / 'tasks: ...').
+      2. Individual form: extract ids via INDIVIDUAL_SNAPSHOT_RE, which
+         anchors 'task N' / '#N' / 'df N' (TASK_REF_RE's own grammar)
+         directly to an adjacent status marker (only an optional copula/
+         article may sit in between) — so an incidental status word
+         elsewhere in the fact is never wrongly attributed to the
+         reference.
+      3. Aggregate form: for each detected list segment ('tasks are
+         [...]' / 'tasks: ...'), strip COUNT_QUANTITY_RE spans from that
+         segment only (so an embedded count phrase doesn't contribute a
+         spurious id) and collect its bare digit tokens.
 
     Pure: no I/O, no side effects.
     """
@@ -139,12 +179,10 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
     if not SNAPSHOT_STATUS_RE.search(fact):
         return set()
 
-    stripped = COUNT_QUANTITY_RE.sub(' ', fact)
+    ids: set[int] = {int(m.group(1)) for m in INDIVIDUAL_SNAPSHOT_RE.finditer(fact)}
 
-    ids: set[int] = {int(m) for m in TASK_REF_RE.findall(stripped)}
-
-    for intro in LIST_INTRODUCER_RE.finditer(stripped):
-        segment = _list_segment(stripped, intro.end(), intro.group('open'))
+    for intro in LIST_INTRODUCER_RE.finditer(fact):
+        segment = COUNT_QUANTITY_RE.sub(' ', _list_segment(fact, intro.end(), intro.group('open')))
         ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(segment))
 
     return ids
@@ -183,7 +221,12 @@ def flatten_dedup_edges(grouped: dict[str, list[dict]]) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 
-def select_stale_status_snapshot_edges(edges: list[dict], statuses: dict[str, str]) -> list[dict]:
+def select_stale_status_snapshot_edges(
+    edges: list[dict],
+    statuses: dict[str, str],
+    *,
+    edge_ids: dict[str, set[int]] | None = None,
+) -> list[dict]:
     """Return the subset of *edges* whose asserted status is now contradicted.
 
     An edge is selected (stale) iff ``extract_snapshot_edge_task_ids`` returns
@@ -199,11 +242,26 @@ def select_stale_status_snapshot_edges(edges: list[dict], statuses: dict[str, st
     only under-select (self-heals next cycle), never wrongly select a valid
     edge.
 
+    Args:
+        edges: Candidate edges (as returned by ``flatten_dedup_edges``).
+        statuses: ``{task_id_str: status_str}`` census.
+        edge_ids: Optional precomputed ``{edge['uuid']: extract_snapshot_edge_task_ids(fact)}``
+            mapping. A caller that already extracted ids for its own purposes
+            (e.g. ``sweep_stale_status_snapshot_edges``, which needs them to
+            build its candidate-id set) passes this to avoid re-running the
+            extraction regex pipeline a second time per edge. When omitted
+            (the default), ids are computed directly from each edge's fact —
+            unchanged standalone behavior. (amendment, reviewer_comprehensive
+            efficiency finding, task 2613)
+
     Pure: no I/O, no side effects.
     """
     selected: list[dict] = []
     for edge in edges:
-        ids = extract_snapshot_edge_task_ids(edge.get('fact') or '')
+        if edge_ids is not None:
+            ids = edge_ids.get(edge['uuid'], set())
+        else:
+            ids = extract_snapshot_edge_task_ids(edge.get('fact') or '')
         if not ids:
             continue
         if any(statuses.get(str(i)) in INACTIVE_TASK_STATUSES for i in ids):
@@ -297,9 +355,18 @@ async def sweep_stale_status_snapshot_edges(
     edges = flatten_dedup_edges(grouped)
     stats['scanned'] = len(edges)
 
+    # Extract each edge's ids exactly once — reused below both to build
+    # candidate_ids and (via select_stale_status_snapshot_edges's edge_ids
+    # kwarg) for the final selection, instead of re-running the extraction
+    # regex pipeline a second time per edge. (amendment,
+    # reviewer_comprehensive efficiency finding, task 2613)
+    edge_ids: dict[str, set[int]] = {
+        edge['uuid']: extract_snapshot_edge_task_ids(edge.get('fact') or '') for edge in edges
+    }
+
     candidate_ids: set[int] = set()
-    for edge in edges:
-        candidate_ids |= extract_snapshot_edge_task_ids(edge.get('fact') or '')
+    for ids in edge_ids.values():
+        candidate_ids |= ids
 
     if not candidate_ids:
         return stats
@@ -318,7 +385,7 @@ async def sweep_stale_status_snapshot_edges(
         stats['errors'] += 1
         return stats
 
-    stale = select_stale_status_snapshot_edges(edges, statuses)
+    stale = select_stale_status_snapshot_edges(edges, statuses, edge_ids=edge_ids)
     stats['candidate_edges'] = len(stale)
 
     invalidate_at = now or datetime.now(UTC)

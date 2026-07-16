@@ -110,6 +110,38 @@ class TestExtractSnapshotEdgeTaskIds:
         )
         assert result == {142}
 
+    def test_individual_form_no_copula_in_progress(self):
+        """'Task 5 in progress' -> {5} (no linking verb).
+
+        Regression test (reviewer_comprehensive correctness-recall finding,
+        task 2613): the status-word-adjacent digit used to be stripped by
+        COUNT_QUANTITY_RE (it matches '\\d+\\s+in[-\\s]?progress') before id
+        extraction ever ran, silently dropping this id.
+        """
+        assert extract_snapshot_edge_task_ids('Task 5 in progress') == {5}
+
+    def test_individual_form_no_copula_pending(self):
+        """'Task 5 pending' -> {5} (no linking verb).
+
+        Regression test (reviewer_comprehensive correctness-recall finding,
+        task 2613): same COUNT_QUANTITY_RE false-negative class as the
+        'in progress' case above, via '\\d+\\s+pending'.
+        """
+        assert extract_snapshot_edge_task_ids('Task 5 pending') == {5}
+
+    def test_incidental_status_word_describing_something_else_excluded(self):
+        """'Task 142 landed on the active branch' -> set().
+
+        'active' describes the BRANCH, not task 142's status. Regression
+        test (reviewer_comprehensive correctness-precision finding, task
+        2613): the status marker must be anchored to its own task reference
+        rather than merely co-occurring anywhere in the fact, else this
+        genuinely-terminal fact ('landed') would be wrongly treated as an
+        active/pending snapshot of task 142.
+        """
+        result = extract_snapshot_edge_task_ids('Task 142 landed on the active branch')
+        assert result == set()
+
 
 # --------------------------------------------------------------------------- #
 # flatten_dedup_edges
@@ -254,6 +286,26 @@ class TestSelectStaleStatusSnapshotEdges:
         assert len(result) == 1
         assert result[0]['uuid'] == 'edge-carries-uuid'
 
+    def test_incidental_status_word_not_selected_even_if_task_done(self):
+        """'Task 142 landed on the active branch' with statuses={'142': 'done'}
+        -> not selected.
+
+        Regression test (reviewer_comprehensive correctness-precision
+        finding, task 2613): 'active' describes the branch, not task 142, so
+        no id is extracted at all and the edge must never be treated as a
+        stale status-snapshot regardless of task 142's real status —
+        otherwise a genuinely-true terminal fact would be wrongly retired.
+        """
+        edge = {
+            'uuid': 'edge-incidental',
+            'fact': 'Task 142 landed on the active branch',
+            'name': '',
+        }
+
+        result = select_stale_status_snapshot_edges([edge], {'142': 'done'})
+
+        assert result == []
+
 
 # --------------------------------------------------------------------------- #
 # sweep_stale_status_snapshot_edges — core behavior
@@ -302,6 +354,14 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'Expected update_edge called with a datetime invalid_at'
         )
         assert update_call.kwargs.get('project_id') == 'test_project'
+        assert update_call.kwargs.get('agent_id') == 'recon-stage-memory_consolidator', (
+            "Expected update_edge stamped with the sweep's stable agent_id "
+            f'(reviewer_comprehensive test-coverage finding, task 2613), got {update_call!r}'
+        )
+        assert update_call.kwargs.get('causation_id') == 'run-1', (
+            'Expected update_edge threaded the reconciliation run_id as causation_id '
+            f'(reviewer_comprehensive test-coverage finding, task 2613), got {update_call!r}'
+        )
 
         taskmaster.get_statuses.assert_awaited_once()
         get_statuses_call = taskmaster.get_statuses.await_args
