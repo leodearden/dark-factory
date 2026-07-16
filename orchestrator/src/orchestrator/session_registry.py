@@ -824,6 +824,46 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
         os.close(fd)
 
 
+_ESCALATION_ARCHIVE_SUBDIR = 'archive'
+"""Mirrors escalation.archive.ARCHIVE_SUBDIR BY CONVENTION, not by import:
+this module is deliberately stdlib-only with no intra-orchestrator imports
+(see module docstring), so it cannot import escalation.archive directly.
+Kept in sync by hand with that constant."""
+
+
+def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> str | None:
+    """Best-effort read of *escalation_id*'s ``status`` field (Fleet Cockpit C8 reaper).
+
+    Tries the queue-root file ``<escalations_dir>/<escalation_id>.json`` first
+    (a still-pending escalation lives there); if absent, falls back to a
+    recursive search under ``<escalations_dir>/archive/`` (a resolved/
+    dismissed escalation is moved into a dated ``archive/YYYY-MM-DD/`` subdir
+    by ``escalation.queue.EscalationQueue._archive_resolved``) and takes the
+    newest match (sorted, last).
+
+    Returns the raw ``status`` string, or None when: the id is unknown (no
+    root file, no archive match); the body is missing/unreadable or fails to
+    parse as JSON; or its ``status`` field is absent/not a string. Reads the
+    on-disk contract directly via stdlib ``json`` rather than importing
+    ``escalation.queue``/``escalation.models`` -- this module stays
+    stdlib-only and import-free of the rest of the orchestrator/escalation
+    packages (see module docstring). Fail-soft: never raises.
+    """
+    base = Path(escalations_dir)
+    candidate = base / f'{escalation_id}.json'
+    if not candidate.is_file():
+        matches = sorted((base / _ESCALATION_ARCHIVE_SUBDIR).rglob(f'{escalation_id}.json'))
+        candidate = matches[-1] if matches else None
+    if candidate is None:
+        return None
+    try:
+        data = json.loads(candidate.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    status = data.get('status') if isinstance(data, dict) else None
+    return status if isinstance(status, str) else None
+
+
 # ---------------------------------------------------------------------------
 # TTL / pid stale-record reaper (PRD §4.8)
 # ---------------------------------------------------------------------------
