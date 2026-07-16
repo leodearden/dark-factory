@@ -3252,3 +3252,38 @@ def test_boundary2_all_idle_restarts_and_stamps_clock(tmp_path: pathlib.Path) ->
     stamped = json.loads(clock_file.read_text())
     assert isinstance(stamped["ts"], (int, float)), f"ts must be numeric; got {stamped!r}"
 
+
+def test_boundary3_failed_verify_leaves_clock_unchanged(tmp_path: pathlib.Path) -> None:
+    """Scenario 3 (I2 negative) -- stamp-on-verify only, WITH --drain: when
+    one unit's fake systemctl never advances ActiveEnterTimestampMonotonic
+    (never verifies fresh) after --drain restarts it, the script exits 1 and
+    the shared fleet-deploy clock is left byte-identical -- a failed/partial
+    verify must NOT stamp even under --drain, so a failed detached deploy
+    can never silence the watchdog backstop for a full min-interval window.
+    """
+    fleet_dir = tmp_path / "fleet"
+    unit_ok = "orchestrator-alpha.service"
+    unit_bad = "orchestrator-bravo.service"
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path,
+        running_units=[unit_ok, unit_bad],
+        units={unit_ok: {"scenario": "fresh"}, unit_bad: {"scenario": "stale"}},
+    )
+    _boundary_write_heartbeat(fleet_dir, unit_ok, merge_idle=True, ts_epoch=time.time())
+    _boundary_write_heartbeat(fleet_dir, unit_bad, merge_idle=True, ts_epoch=time.time())
+
+    clock_file = tmp_path / "clock.json"
+    sentinel = '{"ts": 1.0}'
+    clock_file.write_text(sentinel)
+
+    result = _boundary_run_drain_script(
+        bin_dir, state_path, fleet_dir, clock_file,
+        env={"RESTART_VERIFY_TIMEOUT": "2"},
+    )
+
+    assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert clock_file.read_text() == sentinel, (
+        f"clock file must be byte-identical after a failed verify even under "
+        f"--drain; got {clock_file.read_text()!r}"
+    )
+
