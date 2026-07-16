@@ -4789,16 +4789,19 @@ async def _check_reopen_freshness(
     this is Stage-2 audit substrate, not a live cross-service escalation
     lookup (fused-memory has no orchestrator-escalation client).
 
-    Absent a valid override: ``mode == 'enforce'`` returns the typed
+    Absent any override: ``mode == 'enforce'`` returns the typed
     :func:`_done_evidence_stale_error` rejection (the caller must abort the
     write); otherwise (warn mode) emits one ``task_status.done_evidence_stale_warn``
     census WARNING (stable grep anchor) and returns None (the write
     proceeds).
 
     A present-but-invalid override (malformed shape, or a recon-stage
-    caller) is NOT yet distinguished from "no override" — it falls through
-    to the mode dispatch above. The loud ``done_evidence_stale_override_invalid``
-    rejection for that case lands in S8.
+    caller) is distinguished from "no override": it returns the typed
+    :func:`_done_evidence_stale_override_invalid_error` rejection,
+    mode-independently (enforce and warn alike) — an explicit malformed
+    override is always a loud caller error, never a silent fall-through to
+    the plain ``done_evidence_stale`` rejection or (worse) an accept. Only
+    the no-override stale path proceeds to the enforce/warn mode dispatch.
     """
     if not isinstance(resolved_provenance, dict):
         return None
@@ -4824,16 +4827,18 @@ async def _check_reopen_freshness(
         if isinstance(raw_done_provenance, dict)
         else None
     )
-    if override is not None and _valid_stale_evidence_override(override, is_recon_stage):
-        resolved_provenance['stale_evidence_override'] = {
-            'escalation_id': override['escalation_id'],
-            'reason': override['reason'],
-        }
-        logger.info(
-            'task_status.done_evidence_stale_override_accepted task_id=%s escalation_id=%s',
-            task_id, override['escalation_id'],
-        )
-        return None
+    if override is not None:
+        if _valid_stale_evidence_override(override, is_recon_stage):
+            resolved_provenance['stale_evidence_override'] = {
+                'escalation_id': override['escalation_id'],
+                'reason': override['reason'],
+            }
+            logger.info(
+                'task_status.done_evidence_stale_override_accepted task_id=%s escalation_id=%s',
+                task_id, override['escalation_id'],
+            )
+            return None
+        return _done_evidence_stale_override_invalid_error(task_id, agent_id)
 
     if mode == 'enforce':
         return _done_evidence_stale_error(
