@@ -105,17 +105,46 @@ def _extract_task_id(dirname: str) -> int | None:
     return int(match.group(1))
 
 
-def _earliest_task_started(event_store, task_id: str) -> str | None:
-    """Return the earliest emitted ``EventType.task_started`` event's
-    timestamp for *task_id*, or ``None`` if none match.
+class _StartedFallbackCache:
+    """Lazily fetches and memoizes the earliest ``task_started`` timestamp
+    per task_id, at most once per :func:`build_task_runtime_snapshot` call.
 
-    ``fetch_events_by_type`` returns rows already ordered by id (insertion
-    order), so the first matching row is the earliest.
+    Efficiency note (task 2634 amendment): the ``started`` fallback is only
+    consulted for a task whose ``created_at`` is ``None`` (rare — every task
+    stamps ``created_at`` via ``TaskArtifacts.init()``), but previously each
+    such task re-queried and re-scanned the *entire* ``task_started`` event
+    set individually (a fresh DB connection each time) — O(tasks x events)
+    in the worst case. This cache fetches that set once, lazily (a task
+    whose ``created_at`` is present never calls :meth:`get`, so on a host
+    where every task has one the fetch never happens at all), and serves
+    every subsequent lookup within the same snapshot call from an in-memory
+    map.
+
+    Scoping caveat: ``fetch_events_by_type`` filters ``WHERE run_id =
+    self.run_id`` — only ``task_started`` events emitted in the *current*
+    orchestrator run are visible here. A task started in a prior run
+    (before a restart) whose ``metadata.json`` is somehow missing
+    ``created_at`` will NOT be recovered via this fallback. ``created_at``
+    (stamped once at ``TaskArtifacts.init()`` time and durable across
+    restarts) is the primary source precisely because this fallback cannot
+    see across runs.
     """
-    for row in event_store.fetch_events_by_type(EventType.task_started):
-        if row.get('task_id') == task_id:
-            return row.get('timestamp')
-    return None
+
+    def __init__(self, event_store) -> None:
+        self._event_store = event_store
+        self._map: dict[str, str] | None = None
+
+    def get(self, task_id: str) -> str | None:
+        if self._event_store is None:
+            return None
+        if self._map is None:
+            earliest: dict[str, str] = {}
+            for row in self._event_store.fetch_events_by_type(EventType.task_started):
+                tid = row.get('task_id')
+                if tid is not None and tid not in earliest:
+                    earliest[tid] = row.get('timestamp')
+            self._map = earliest
+        return self._map.get(task_id)
 
 
 def _read_task_entry(
@@ -126,7 +155,7 @@ def _read_task_entry(
     has_worktree: bool,
     lane: str | None,
     lane_state: str | None,
-    event_store=None,
+    started_fallback: _StartedFallbackCache,
 ) -> TaskRuntimeState:
     """Read one task's artifacts into a :class:`TaskRuntimeState`.
 
@@ -144,9 +173,10 @@ def _read_task_entry(
     regardless of whether the read below succeeds.
 
     ``started`` resolution: ``metadata.json``'s ``created_at`` wins outright
-    when present; only when it's ``None`` (and an ``event_store`` was
-    supplied) does the earliest ``task_started`` event's timestamp serve as
-    a fallback. A read failure already ``None``s ``started`` below, so the
+    when present; only when it's ``None`` does *started_fallback* (backed by
+    an ``event_store``, when one was supplied — see
+    :class:`_StartedFallbackCache` for its run_id-scoping caveat) serve as a
+    fallback. A read failure already ``None``s ``started`` below, so the
     fallback only ever applies on the success path.
     """
     artifacts = TaskArtifacts(worktree, meta_root)
@@ -155,11 +185,7 @@ def _read_task_entry(
         loops = len(entries)
         attempts = len(artifacts.read_reviews())
         phase = _derive_phase(artifacts.read_plan())
-        started = (
-            artifacts.read_created_at()
-            or (event_store and _earliest_task_started(event_store, str(task_id)))
-            or None
-        )
+        started = artifacts.read_created_at() or started_fallback.get(str(task_id))
         error = None
     except Exception as exc:
         logger.warning(
@@ -180,7 +206,7 @@ def _read_task_entry(
     )
 
 
-def _build_non_pooled_snapshot(*, git_ops, event_store) -> list[TaskRuntimeState]:
+def _build_non_pooled_snapshot(*, git_ops, started_fallback: _StartedFallbackCache) -> list[TaskRuntimeState]:
     """Enumerate <worktree_base>/<task-id-dir> — per-task worktrees, no
     lane concept (dark_factory-style non-pooled layout).
     """
@@ -202,13 +228,13 @@ def _build_non_pooled_snapshot(*, git_ops, event_store) -> list[TaskRuntimeState
             has_worktree=True,
             lane=None,
             lane_state=None,
-            event_store=event_store,
+            started_fallback=started_fallback,
         ))
     results.sort(key=lambda r: r.task_id)
     return results
 
 
-def _build_pooled_snapshot(*, git_ops, event_store) -> list[TaskRuntimeState]:
+def _build_pooled_snapshot(*, git_ops, started_fallback: _StartedFallbackCache) -> list[TaskRuntimeState]:
     """Enumerate durable ``<worktree_base>/.lane-state/*.json`` records —
     pooled (reify, autopilot-video, …) layout where a lane, not a per-task
     worktree dir, is the durable task<->host binding.
@@ -234,7 +260,7 @@ def _build_pooled_snapshot(*, git_ops, event_store) -> list[TaskRuntimeState]:
             has_worktree=(worktree_base / lane).is_dir(),
             lane=lane,
             lane_state=lane_state,
-            event_store=event_store,
+            started_fallback=started_fallback,
         ))
     results.sort(key=lambda r: r.task_id)
     return results
@@ -248,7 +274,15 @@ def build_task_runtime_snapshot(*, git_ops, event_store=None) -> list[TaskRuntim
     durable ``.lane-state`` records; non-pooled projects (dark_factory)
     enumerate per-task worktree dirs directly. Returns a list sorted by
     ``task_id``.
+
+    ``event_store`` (optional) backs the ``started`` fallback for tasks
+    missing a ``created_at``. It is wrapped once in a lazily-populated
+    :class:`_StartedFallbackCache` shared across every enumerated task, so
+    the underlying event set is fetched at most once per call (see that
+    class for the efficiency rationale and its run_id-scoping caveat)
+    rather than once per task.
     """
+    started_fallback = _StartedFallbackCache(event_store)
     if not git_ops.pool_in_use():
-        return _build_non_pooled_snapshot(git_ops=git_ops, event_store=event_store)
-    return _build_pooled_snapshot(git_ops=git_ops, event_store=event_store)
+        return _build_non_pooled_snapshot(git_ops=git_ops, started_fallback=started_fallback)
+    return _build_pooled_snapshot(git_ops=git_ops, started_fallback=started_fallback)
