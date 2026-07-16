@@ -243,3 +243,57 @@ class TestPooled:
         entry_44 = by_task[44]
         assert entry_44.loops == 0
         assert entry_44.error is None
+
+
+# ---------------------------------------------------------------------------
+# INV-2 structured-facts-at-failure: a per-task artifact READ FAILURE is
+# marked (error set, loops/attempts/phase/started all None) — never coerced
+# to a fabricated 0/'PLAN'. Honest-empty artifacts stay 0/'PLAN'/error=None.
+# ---------------------------------------------------------------------------
+
+
+class TestReadFailureMarked:
+    def test_corrupt_plan_json_marks_error_not_zero(self, git_repo: Path):
+        git_ops = GitOps(GitConfig(), git_repo)
+        worktree_base = git_ops.worktree_base
+
+        _make_task_artifacts(worktree_base, '50', '50')
+        meta_root = TaskArtifacts.meta_root_for(worktree_base, '50')
+        (meta_root / 'plan.json').write_text('{not valid json')
+
+        result = build_task_runtime_snapshot(git_ops=git_ops)
+
+        assert len(result) == 1
+        entry = result[0]
+        assert entry.task_id == 50
+        assert entry.error is not None and entry.error != '', (
+            f'expected a non-empty error diagnostic; got {entry.error!r}'
+        )
+        assert entry.loops is None
+        assert entry.attempts is None
+        assert entry.phase is None
+        assert entry.started is None
+        # lane/lane_state/has_worktree are sourced from the enumeration
+        # itself (dir/record), not the failed artifact read — they must
+        # remain populated even though the artifact read failed.
+        assert entry.has_worktree is True
+        assert entry.lane is None
+        assert entry.lane_state is None
+
+    def test_empty_iteration_log_is_honest_zero_not_a_failure(self, git_repo: Path):
+        """Contrast case: a merely empty iterations.jsonl is honest-empty,
+        not a read failure — loops stays 0 and error stays None."""
+        git_ops = GitOps(GitConfig(), git_repo)
+        worktree_base = git_ops.worktree_base
+
+        _make_task_artifacts(worktree_base, '51', '51')
+        meta_root = TaskArtifacts.meta_root_for(worktree_base, '51')
+        (meta_root / 'iterations.jsonl').write_text('')
+
+        result = build_task_runtime_snapshot(git_ops=git_ops)
+
+        assert len(result) == 1
+        entry = result[0]
+        assert entry.task_id == 51
+        assert entry.loops == 0
+        assert entry.error is None
