@@ -3512,6 +3512,7 @@ class Scheduler:
         external_status_cache: dict[str, str] | None = None,
         external_resolver_failed: bool = False,
         delivered_check_cache: dict[str, bool] | None = None,
+        terminal_dep_records: dict[str, dict] | None = None,
     ) -> bool:
         """Return True if every dependency of *task* is in a terminal status.
 
@@ -3557,7 +3558,22 @@ class Scheduler:
         satisfied (fail-safe wait).  A dep whose record carries no
         ``metadata.delivered_checks`` is never consulted — byte-identical.
 
-        Defaulting all three new parameters to ``None``/``False`` makes the
+        **``terminal_dep_records`` fallback (task 2692, δ/ε follow-up):**
+        the active-only ``get_tasks`` fetch that seeds *tasks_by_id*
+        excludes DONE/CANCELLED tasks, so a just-completed dep is often
+        genuinely ABSENT from *tasks_by_id* even though its TERMINAL
+        status is already in *status_map*.  When the delivered-check arm's
+        ``tasks_by_id.get(dep_id)`` misses (``None``) and
+        *terminal_dep_records* is not ``None``, the dep record is looked up
+        there instead — a purely ADDITIVE fallback consulted ONLY in this
+        arm (never the intra-train merge-deferred allowance above, which
+        deals exclusively with non-terminal deps already present in
+        *tasks_by_id*).  If the dep is present in *tasks_by_id*,
+        *terminal_dep_records* is never consulted (*tasks_by_id* wins).  If
+        the dep is absent from BOTH, the arm skips it exactly as before —
+        byte-identical when *terminal_dep_records* is ``None``/omitted.
+
+        Defaulting all four new parameters to ``None``/``False`` makes the
         legacy 3-arg call from ``_park_gc`` and all existing tests
         byte-identical. Side effects (escalation, counter increments) MUST
         NOT live here — this method is a pure predicate called from
@@ -3653,6 +3669,12 @@ class Scheduler:
                 if dep_status not in TERMINAL_STATUSES:
                     continue
                 dep_task = tasks_by_id.get(dep_id)
+                if dep_task is None and terminal_dep_records is not None:
+                    # Fallback (task 2692): the active-only get_tasks fetch
+                    # excludes this TERMINAL dep from tasks_by_id — consult
+                    # the per-tick backfilled record instead. Only reached
+                    # when tasks_by_id genuinely misses (tasks_by_id wins).
+                    dep_task = terminal_dep_records.get(dep_id)
                 if dep_task is None:
                     continue
                 dep_checks = (dep_task.get('metadata') or {}).get('delivered_checks')
