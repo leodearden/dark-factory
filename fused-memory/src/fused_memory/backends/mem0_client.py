@@ -370,10 +370,13 @@ class Mem0Backend:
             List of dicts ``{'id': ..., 'created_at': ..., 'metadata': {...}}``
             where ``created_at`` is the raw string from the Qdrant payload (or
             ``None`` if absent) and ``metadata`` is the full payload dict.
-            Returns ``[]`` on timeout (logs WARNING, does not raise).
 
         Raises:
             ValueError: If *filters* is empty.
+            TimeoutError: If the Qdrant scroll exceeds the read timeout —
+                propagated (NOT swallowed into an empty list), matching
+                count_by_metadata, so a timed-out read is never mistaken for
+                an empty result (no-silent-fail invariant).
         """
         if not filters:
             raise ValueError(
@@ -389,22 +392,15 @@ class Mem0Backend:
             for k, v in filters.items()
         ]
         qdrant_filter = qmodels.Filter(must=must)
-        try:
-            points, _next_offset = await asyncio.wait_for(
-                client.scroll(
-                    collection_name=collection_name,
-                    scroll_filter=qdrant_filter,
-                    with_payload=True,
-                    limit=limit,
-                ),
-                timeout=self._read_timeout,
-            )
-        except TimeoutError:
-            logger.warning(
-                f'Mem0 scroll_by_metadata timed out after {self._read_timeout}s '
-                f'(collection={collection_name}, filters={filters})'
-            )
-            return []
+        points, _next_offset = await asyncio.wait_for(
+            client.scroll(
+                collection_name=collection_name,
+                scroll_filter=qdrant_filter,
+                with_payload=True,
+                limit=limit,
+            ),
+            timeout=self._read_timeout,
+        )
 
         result = []
         for point in points:
