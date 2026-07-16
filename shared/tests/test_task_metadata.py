@@ -1400,6 +1400,24 @@ class TestParseMetadataFailurePolicy:
         unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
         assert blessed_key not in unknown_key_fields
 
+    def test_files_tagged_at_metadata_key_is_blessed(self):
+        """The module tagger's tagged-at sentinel must not census-warn (task 2561).
+
+        files_tagged_at is a new *_at timestamp sentinel (alongside
+        gate_escalated_at / before_done_ran_at / combined_at) written by
+        Harness._tag_task_modules on every tagging pass, including
+        empty-prediction and omitted-task writes. Unblessed, every real
+        tagger write would emit a code=unknown_key census line. RED until
+        'files_tagged_at' is added to _BLESSED_METADATA_KEYS.
+        """
+        _, warnings = parse_metadata(
+            {'files_tagged_at': '2026-07-16T00:00:00+00:00'}, direction='read'
+        )
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'files_tagged_at'
+        ]
+        assert offending == [], f'Expected no unknown_key warning for files_tagged_at; got: {offending}'
+
     def test_deterministic_invariant_violation_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)
