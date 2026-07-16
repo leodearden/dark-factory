@@ -2614,6 +2614,82 @@ async def test_plain_transition_does_not_use_atomic_audit_write(
     taskmaster.set_status_and_stamp_audit.assert_not_called()
 
 
+# ── Regression guard: composed atomic-reopen contract, end-to-end (task 2649,
+#    requirement #5) ─────────────────────────────────────────────────────
+#
+# The tests above assert call-routing against a mocked taskmaster. This
+# drives a REAL SqliteTaskBackend behind a real TaskInterceptor so the
+# atomic set_status_and_stamp_audit writer is exercised against actual
+# persistence — the original task-1175 bug was a partial write that a
+# routing-only mock assertion cannot detect.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['found_on_main', 'merged'])
+async def test_reopen_atomic_contract_persists_against_real_backend(
+    kind, tmp_path, event_buffer,
+):
+    """done->pending reopen, with a pre-existing done_provenance of either
+    kind, must persist the status column AND the reopen_*/done_provenance
+    audit metadata TOGETHER against a real backend — locking the composed
+    atomic-reopen contract against the original task-1175 partial-write.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    sha = _init_git_repo(tmp_path)
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+
+        done_provenance = {'kind': kind, 'commit': sha}
+        if kind == 'found_on_main':
+            done_provenance['note'] = 'shipped via a sibling task'
+
+        interceptor = TaskInterceptor(backend, None, event_buffer)
+        done_result = await interceptor.set_task_status(
+            '1', 'done', project_root, done_provenance=done_provenance,
+        )
+        assert 'error' not in done_result, done_result
+
+        result = await interceptor.set_task_status(
+            '1', 'pending', project_root,
+            reopen_reason='reopening: real regression remains',
+        )
+
+        # (a) grounded success — newStatus reflects an actual read-back,
+        # never a fabricated echo of the requested status.
+        assert 'error' not in result, result
+        assert result['tasks'][0]['newStatus'] == 'pending', result
+
+        # (b) an INDEPENDENT fresh backend instance (its own connection,
+        # opened cold against the same on-disk db) confirms the status
+        # column actually persisted — not merely an in-memory echo.
+        fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await fresh.start()
+        try:
+            task = await fresh.get_task('1', project_root=project_root)
+        finally:
+            await fresh.close()
+        assert task['status'] == 'pending', task
+
+        # (c) reopen_* audit fields persisted alongside the status flip.
+        md = task['metadata']
+        assert md['reopen_reason'] == 'reopening: real regression remains'
+        assert md['reopen_from'] == 'done'
+        assert 'reopen_at' in md
+
+        # (d) the pre-existing done_provenance (kind preserved) survives
+        # the reopen — the atomic writer's metadata merge does not clobber
+        # sibling keys.
+        assert md['done_provenance']['kind'] == kind
+        assert md['done_provenance']['commit'] == sha
+    finally:
+        await backend.close()
+
+
 # ── Tests for done_provenance.kind discriminator (2026-04-27 hardening) ────
 
 
