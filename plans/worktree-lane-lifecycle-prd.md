@@ -110,11 +110,17 @@ Every mechanism has a named consumer:
   escalation record on an illegal transition.
 - **`TaskArtifacts` single path-derivation owner over `.task-meta/`** — consumed by
   `workflow.py` (execution), `harness.py` (recovery reads), `git_ops.py`
-  (disk-backstop read + interactive stamp), `dashboard/data/orchestrator.py`
-  (`read_task_artifacts`), and `agents`/`mcp_lifecycle` (the path handed to task
-  agents via config). M3's `dashboard-alignment` stream **documents** this coupling
-  (its task ζ format-coupling doc block) but explicitly **cedes derivation ownership
-  to W11** (M3 PRD §G4).
+  (disk-backstop read + interactive stamp), and `agents`/`mcp_lifecycle` (the path
+  handed to task agents via config). M3's `dashboard-alignment` stream **documented**
+  this coupling (its task ζ format-coupling doc block) but explicitly **ceded
+  derivation ownership to W11** (M3 PRD §G4).
+
+  **Retirement note (2026-07-16):** the dashboard-reader hand-off this bullet
+  describes (`dashboard/data/orchestrator.py`'s `read_task_artifacts`) is retired.
+  `plans/dashboard-task-runtime-endpoint-prd.md` deleted that hand-rolled reader
+  and replaced it with the escalation `get_task_runtime_state` MCP tool, sourced
+  from `TaskArtifacts` on the orchestrator side — W11 never needs to migrate a
+  dashboard-side reader because there is no longer one to migrate.
 - **Fold of the `.pool-root` sentinel protocol into `LaneLifecycle`** — consumed by
   the same acquire/recovery paths; removes the "scattered sentinel + hidden writer"
   finding.
@@ -254,12 +260,13 @@ Because M1 δ/ε are not yet filed, W11's M1-δ/ε-dependent tasks are **anchore
 | Other stream/PRD | Direction | Seam mechanism | Owner | Status |
 |---|---|---|---|---|
 | M1 `gitops-chokepoints` | W11 consumes | `_prune_registrations` (2185), `_abort_lane_acquisition` (δ), `PROTECTED_PREFIXES` (ε) | **M1** | α wired (2185); δ/ε to-wire when filed |
-| M3 `dashboard-alignment` | W11 owns derivation; M3 documents the reader | `.task/` path derivation (`TaskArtifacts`) + dashboard `read_task_artifacts` | **W11** | M3 ζ = doc-only signpost (soft-coord; same file) |
+| M3 `dashboard-alignment` | W11 owns derivation; M3 documented the reader | `.task/` path derivation (`TaskArtifacts`) + dashboard `read_task_artifacts` | **W11** | **retired** — dashboard reader deleted; per-task runtime now served via the escalation `get_task_runtime_state` MCP tool (`plans/dashboard-task-runtime-endpoint-prd.md`), so M3 ζ's doc-only signpost has no reader left to hand off |
 | W10 `harness-supervision` | independent | `proc_supervision` restart plans | W10 | no seam (W11 restart capstone is a plain deterministic task) |
 | W7 `verify-plan` | independent | `ephemeral_worktree` verify probes | W7 | no seam (verify probe worktrees out of W11 scope) |
 
 No contested/reciprocal ownership: M3 explicitly cedes `.task/` derivation to W11;
-M1 owns its three primitives outright.
+M1 owns its three primitives outright. (The M3 seam itself is now moot per the
+retirement note above — there is no more dashboard reader for W11 to take over.)
 
 ## Contract (B+H)
 
