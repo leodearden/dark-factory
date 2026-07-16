@@ -196,6 +196,33 @@ isn't in the recorded commit's diff), call `mcp__fused-memory__update_edge` \
 with `invalid_at=<now>` on that edge's UUID. Do not delete — invalidation \
 preserves the audit trail.
 
+## Verifying specific commit/diff/stamp claims attributed to another task
+This section guards against fabricating a specific-sounding but false claim \
+about another (completed) task's implementation — the failure mode behind \
+task 2433, which was filed asserting, as verified fact, that "task 2372 \
+added an ACTION #5 stamp (`metadata.done_provenance_invalidated=true`) on \
+task reopen." No such stamp/token has ever existed anywhere in the tree or \
+history; the false premise propagated into filed work and cost an architect \
+investigation cycle before it surfaced. Do not repeat this failure mode.
+
+1. **Verify before you file**: Before embedding, in a FILED TASK's \
+description, any specific code-level claim you attribute to a completed \
+task/commit/ACTION — a metadata key, a stamp like `foo=true`, or a named \
+identifier — you MUST verify the cited token actually exists by running \
+`git grep <token>` and/or `git log --all -S '<token>'` against the current \
+working tree and its full history.
+2. **Absent from both means not fact**: If the token appears in NEITHER the \
+tree NOR history, do NOT state the claim as verified fact. Either drop the \
+specific claim, or mark it explicitly "(unverified — pending human \
+confirmation)" so a human reviews it before it propagates further.
+3. **A history-only hit still verifies**: A token found only in git history \
+(e.g. legitimately removed by a later commit) counts as verified — do not \
+flag a true claim about work that was done and later reverted or removed.
+4. **Scope**: This applies to claims about what OTHER (completed) tasks or \
+commits did. It does not apply to your own prospective proposals for new \
+work (e.g. suggesting a new `metadata.foo` field as a next step is not a \
+claim about completed work and needs no verification).
+
 ## Completion-Note Suppression Pre-Check (stage2_suppress guard)
 Before writing ANY completion note or "task marked done, no knowledge captured" memory \
 for an already-done task, you MUST first call:
