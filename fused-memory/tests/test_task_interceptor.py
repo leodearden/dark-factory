@@ -2034,7 +2034,10 @@ async def test_set_task_status_allows_done_to_blocked_with_reopen_reason(
         reopen_reason='manual re-scope',
     )
 
-    taskmaster.set_task_status.assert_called_once()
+    # reopen_reason makes this an audit-carrying write (task 2649): routed
+    # through the single atomic set_status_and_stamp_audit, not plain
+    # set_task_status.
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
     assert 'error' not in result
 
 
@@ -2229,8 +2232,9 @@ async def test_done_gate_skipped_when_verified_provenance_supplied(
 
     # Gate skipped — no done_gate_missing_files.
     assert result.get('error') != 'done_gate_missing_files'
-    # Transition succeeded.
-    taskmaster.set_task_status.assert_called_once()
+    # Transition succeeded — done_provenance makes this an audit-carrying
+    # write (task 2649), routed through the atomic set_status_and_stamp_audit.
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -2416,9 +2420,12 @@ async def test_done_provenance_resolves_short_sha_and_persists(
     )
 
     assert 'error' not in result
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    kwargs = taskmaster.stamp_audit_metadata.call_args.kwargs
-    persisted = kwargs['fields']
+    # done_provenance makes this an audit-carrying write (task 2649): routed
+    # through the single atomic set_status_and_stamp_audit, not the old
+    # separate stamp_audit_metadata call.
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    kwargs = taskmaster.set_status_and_stamp_audit.call_args.kwargs
+    persisted = kwargs['audit_fields']
     assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
     assert persisted['done_provenance']['commit_input'] == sha[:7]
@@ -2444,7 +2451,7 @@ async def test_done_provenance_commit_plus_note_both_persisted(
     )
 
     assert 'error' not in result
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
     assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
     assert persisted['done_provenance']['note'] == 'ff-merged after review'
@@ -2478,7 +2485,8 @@ async def test_done_provenance_reopen_does_not_require_provenance(
     )
 
     assert 'error' not in result, result
-    taskmaster.set_task_status.assert_called_once()
+    # reopen_reason makes this an audit-carrying write (task 2649).
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -2829,8 +2837,8 @@ async def test_done_provenance_found_on_main_with_on_main_commit_passes(
     )
 
     assert 'error' not in result
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
     dp = persisted['done_provenance']
     assert dp['kind'] == 'found_on_main'
     assert dp['commit'] == sha
@@ -2859,7 +2867,7 @@ async def test_done_provenance_found_on_main_short_sha_resolved(
     )
 
     assert 'error' not in result
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
     dp = persisted['done_provenance']
     assert dp['commit'] == sha  # resolved to full SHA
     assert dp['commit_input'] == sha[:7]  # original short ref preserved
@@ -2892,9 +2900,10 @@ async def test_done_provenance_accepts_deterministic_deploy_with_pid(
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
-    taskmaster.set_task_status.assert_called_once()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
+    # done_provenance makes this an audit-carrying write (task 2649): routed
+    # through the single atomic set_status_and_stamp_audit.
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy'
     assert persisted['pid'] == 4242
     assert persisted['unit'] == 'orchestrator-reify.service'
@@ -2924,9 +2933,8 @@ async def test_done_provenance_accepts_deterministic_deploy_resume_shape(
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
-    taskmaster.set_task_status.assert_called_once()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy'
     assert persisted['note'] == 'resumed after human resolution'
     assert persisted['unit'] == 'orchestrator-reify.service'
@@ -2957,12 +2965,12 @@ async def test_done_provenance_accepts_deterministic_gate(
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
-    taskmaster.set_task_status.assert_called_once()
-    # done_provenance is persisted through the privileged stamp_audit_metadata
-    # seam (task 2201 floor: update_task now rejects metadata.done_provenance).
+    # done_provenance is persisted through the single atomic
+    # set_status_and_stamp_audit call (task 2649; task 2201 floor:
+    # update_task rejects metadata.done_provenance).
     taskmaster.update_task.assert_not_called()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-gate'
     assert persisted['note'] == 'pure gate resolved'
 
@@ -2997,9 +3005,8 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled(
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
-    taskmaster.set_task_status.assert_called_once()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy-scheduled'
     assert persisted['unit'] == 'orchestrator-dark-factory.service'
     assert persisted['transient_unit'] == 'orch-redeploy-restart-1.service'
@@ -3032,9 +3039,8 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_sha
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
-    taskmaster.set_task_status.assert_called_once()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy-scheduled'
     assert persisted['note'] == 'resumed after self-restart scheduled (crash before done write)'
     assert persisted['unit'] == 'orchestrator-dark-factory.service'
@@ -4325,15 +4331,15 @@ async def test_terminal_exit_accepts_with_reopen_reason(
         reopen_reason='un-defer script',
     )
     assert result.get('success') or 'error' not in result, result
-    taskmaster.set_task_status.assert_called_once()
-    # reopen_* audit fields are persisted through the privileged
-    # stamp_audit_metadata seam, NOT update_task: a task reopened out of a
-    # terminal status may carry a metadata.done_provenance stamped when it was
-    # marked done, and update_task now UNCONDITIONALLY rejects
-    # metadata.done_provenance (task 2201 backend floor).
+    # reopen_* audit fields are persisted through the single atomic
+    # set_status_and_stamp_audit call (task 2649), NOT update_task: a task
+    # reopened out of a terminal status may carry a metadata.done_provenance
+    # stamped when it was marked done, and update_task now UNCONDITIONALLY
+    # rejects metadata.done_provenance (task 2201 backend floor).
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
     taskmaster.update_task.assert_not_called()
-    assert taskmaster.stamp_audit_metadata.called, 'reopen_reason must be persisted'
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    assert taskmaster.set_status_and_stamp_audit.called, 'reopen_reason must be persisted'
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
     assert persisted['reopen_reason'] == 'un-defer script'
     assert persisted['reopen_from'] == 'done'
     assert 'reopen_at' in persisted
@@ -4520,13 +4526,18 @@ async def test_set_task_status_csv_done_to_pending_tripping_guard_rejects_and_es
     esc_files = list(esc_dir.glob('esc-bulk-reset-*.json'))
     assert len(esc_files) >= 1, f'Expected at least 1 escalation file, found {esc_files}'
 
-    # (e) tm.set_task_status NOT called for tasks 4 and 5 (guard short-circuited)
-    called_ids = {call.args[0] for call in taskmaster.set_task_status.call_args_list}
-    assert '4' not in called_ids, 'set_task_status should not have been called for task 4'
-    assert '5' not in called_ids, 'set_task_status should not have been called for task 5'
+    # (e) tm.set_status_and_stamp_audit NOT called for tasks 4 and 5 (guard
+    # short-circuited). reopen_reason makes this an audit-carrying write
+    # (task 2649), so successful applies route through the atomic writer
+    # rather than plain set_task_status.
+    called_ids = {
+        call.args[0] for call in taskmaster.set_status_and_stamp_audit.call_args_list
+    }
+    assert '4' not in called_ids, 'set_status_and_stamp_audit should not have been called for task 4'
+    assert '5' not in called_ids, 'set_status_and_stamp_audit should not have been called for task 5'
     # Tasks 1, 2, 3 were called
     for tid in ('1', '2', '3'):
-        assert tid in called_ids, f'set_task_status should have been called for task {tid}'
+        assert tid in called_ids, f'set_status_and_stamp_audit should have been called for task {tid}'
 
 
 @pytest.mark.asyncio
@@ -7067,16 +7078,16 @@ async def test_set_task_status_with_reopen_reason_preserves_metadata(
     reconciler,
     event_buffer,
 ):
-    """Reopening a done task persists reopen_* via the privileged stamp seam.
+    """Reopening a done task persists reopen_* via the atomic audit writer.
 
     The reopen audit write is WRITE-AUTHORITY: a task reopened out of a
     terminal status may carry a metadata.done_provenance stamped when it was
     marked done, and update_task now UNCONDITIONALLY rejects
     metadata.done_provenance (task C1 floor). The interceptor therefore routes
-    the reopen_* write through the privileged stamp_audit_metadata seam,
-    passing ONLY the reopen_* fields — preservation of sibling keys
-    (files / memory_hints / done_provenance / …) is the seam's own fresh-read
-    RMW merge, exercised end-to-end against a real backend in
+    the reopen_* write through the single atomic set_status_and_stamp_audit
+    call (task 2649), passing ONLY the reopen_* fields — preservation of
+    sibling keys (files / memory_hints / done_provenance / …) is the writer's
+    own fresh-read RMW merge, exercised end-to-end against a real backend in
     test_set_task_status_reopen_from_done_preserves_provenance_real_backend.
     """
     taskmaster.get_task = AsyncMock(
@@ -7102,12 +7113,13 @@ async def test_set_task_status_with_reopen_reason_preserves_metadata(
     )
 
     assert 'error' not in result
-    # Routed through the privileged seam, NOT update_task (the pre-merged
-    # `before` blob would carry done_provenance, which update_task rejects).
+    # Routed through the single atomic set_status_and_stamp_audit call
+    # (task 2649), NOT update_task (the pre-merged `before` blob would carry
+    # done_provenance, which update_task rejects).
     taskmaster.update_task.assert_not_called()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
-    # Only the reopen_* audit fields are passed to the seam.
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
+    # Only the reopen_* audit fields are passed to the writer.
     assert persisted['reopen_reason'] == 'manual reopen'
     assert persisted['reopen_from'] == 'done'
     assert 'reopen_at' in persisted
@@ -7146,15 +7158,16 @@ async def test_set_task_status_done_with_provenance_preserves_metadata(
     )
 
     assert 'error' not in result
-    # done_provenance is persisted through the privileged stamp_audit_metadata
-    # seam (task C1 floor: update_task now rejects metadata.done_provenance).
-    # The interceptor passes ONLY the field being stamped — preservation of
-    # sibling keys (files / memory_hints / …) is the seam's own fresh-read RMW
-    # merge, exercised end-to-end in
+    # done_provenance is persisted through the single atomic
+    # set_status_and_stamp_audit call (task 2649; task C1 floor: update_task
+    # rejects metadata.done_provenance). The interceptor passes ONLY the
+    # field being stamped — preservation of sibling keys (files /
+    # memory_hints / …) is the writer's own fresh-read RMW merge, exercised
+    # end-to-end in
     # test_set_task_status_done_provenance_persists_against_real_backend.
     taskmaster.update_task.assert_not_called()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
     assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
 
@@ -7633,7 +7646,8 @@ async def test_transition_gate_authorized_reopen_no_false_warning(
         )
 
     assert 'error' not in result, result
-    taskmaster.set_task_status.assert_called_once()
+    # reopen_reason makes this an audit-carrying write (task 2649).
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
     assert not any(
         'illegal_transition would-reject' in r.message for r in caplog.records
     ), f'unexpected would-reject warning on an authorized reopen: {[r.message for r in caplog.records]}'
