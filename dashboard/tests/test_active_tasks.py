@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 
@@ -108,7 +109,7 @@ def _make_project(root, *, project_dir, tasks):
 
 def _runtime_entry(task_id: int, **overrides) -> TaskRuntimeEntry:
     """A ``TaskRuntimeEntry`` with sane defaults; ``overrides`` replace fields."""
-    base = dict(
+    base: dict[str, Any] = dict(
         task_id=task_id,
         has_worktree=True,
         loops=0,

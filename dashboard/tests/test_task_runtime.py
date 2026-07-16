@@ -92,8 +92,15 @@ def _urls(*ports: int) -> dict[str, str]:
     return {f'proj{p}': f'http://127.0.0.1:{p}/mcp' for p in ports}
 
 
-def _entry_kwargs(task_id: int = 1, **overrides) -> dict:
-    """Valid TaskRuntimeEntry constructor kwargs, with overrides applied."""
+def _entry_kwargs(task_id: int | str = 1, **overrides) -> dict:
+    """Valid TaskRuntimeEntry constructor kwargs, with overrides applied.
+
+    ``task_id`` accepts ``str`` too so callers can deliberately build an
+    out-of-contract wire payload (e.g. ``task_id='not-an-int'``) to exercise
+    the malformed-payload decode path — this dict is a raw JSON-shaped
+    payload, not passed through TaskRuntimeEntry's own validation until the
+    code under test decodes it.
+    """
     base = dict(
         task_id=task_id,
         has_worktree=True,
