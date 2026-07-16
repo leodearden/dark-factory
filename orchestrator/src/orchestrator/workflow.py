@@ -5905,7 +5905,13 @@ class TaskWorkflow:
                     self.task_id, exc.phase, exc.errno,
                     infra_attempt + 1, max_attempts, delay,
                 )
-                await asyncio.sleep(delay)
+                # Skip the backoff sleep on the final attempt: the loop is
+                # about to exhaust and block regardless, so sleeping here
+                # would only add up to max_backoff latency to the block path
+                # with no subsequent retry to wait for (task 2591 amendment,
+                # reviewer_comprehensive/efficiency).
+                if infra_attempt < max_attempts - 1:
+                    await asyncio.sleep(delay)
                 continue
 
             # Task ν (verify-scope-inversion-prd.md): a RETURNED failing
@@ -5924,7 +5930,9 @@ class TaskWorkflow:
                     self.task_id, result.category,
                     infra_attempt + 1, max_attempts, delay,
                 )
-                await asyncio.sleep(delay)
+                # Same final-attempt sleep-skip as the exception branch above.
+                if infra_attempt < max_attempts - 1:
+                    await asyncio.sleep(delay)
                 continue
 
             return result
