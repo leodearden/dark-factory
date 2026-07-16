@@ -2601,11 +2601,29 @@ class OrchestratorConfig(BaseSettings):
     watcher_misconfigured_min_rotation_secs: float = Field(default=120.0)
     watcher_max_misconfigured_clean_exits: int = Field(default=5)
 
+    # Empty-queue rotation skip (task 2629): idle re-check cadence when
+    # _watcher_has_actionable_l1() finds no actionable L1 work. Polling is a
+    # cheap on-disk EscalationQueue scan, so 60s balances responsiveness
+    # against cost. Kept distinct from watcher_subprocess_restart_backoff_secs
+    # (the clean-restart floor / unclean-backoff base) since the two concepts
+    # are independent and would be hard to tune if conflated.
+    # Tradeoff: a newly-arrived L1 during an idle period now waits up to this
+    # long before the first rotation picks it up (previously a warm rotation
+    # blocked on the next L1 and reacted near-immediately). Hot-reloadable
+    # (green-tier) — lower it if this worst-case responsiveness is too slow
+    # for a given deployment.
+    watcher_empty_queue_poll_secs: float = Field(default=60.0)
+
     # Invocation knobs for each watcher rotation (per UnblockAutoConfig precedent).
-    # watcher_rotation_budget_usd is sized for a full 4h rotation at opus rates;
-    # using invoke_agent's default $5 would exhaust within minutes and falsely
-    # trip the crashloop guard.
-    watcher_model: str = Field(default='opus')
+    # watcher_model defaults to sonnet (task 2629): the top-level rotation is
+    # cheap mechanical triage/orchestration; hard or investigation-class items
+    # are delegated to an opus subagent via the Task tool instead of running
+    # the whole rotation on opus (see SKILL.md). watcher_rotation_budget_usd
+    # is retained at its opus-era sizing — sonnet/high is ~5x cheaper, so the
+    # $40 ceiling now doubles as headroom for opus subagents spawned within a
+    # rotation; using invoke_agent's default $5 would exhaust within minutes
+    # and falsely trip the crashloop guard.
+    watcher_model: str = Field(default='sonnet')
     watcher_rotation_budget_usd: float = Field(default=40.0)
     watcher_max_turns: int = Field(default=400)
     watcher_effort: str = Field(default='high')
@@ -3379,6 +3397,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'watcher_rotation_hours',
         'watcher_max_crashloop_restarts',
         'watcher_crashloop_window_secs',
+        # Empty-queue rotation-skip poll cadence (task 2629) — read live per
+        # loop iteration, same reload tier as the crashloop-window params above.
+        'watcher_empty_queue_poll_secs',
         # Review knobs
         'review.enabled',
         'review.interval',

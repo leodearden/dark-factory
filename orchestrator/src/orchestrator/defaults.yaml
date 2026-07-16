@@ -488,12 +488,25 @@ park_stop_parked_window_hours: 1.0
 #   the crashloop guard (default 5).
 # watcher_crashloop_window_secs: rolling window (s) for the crashloop counter
 #   (default 600 = 10 min).
+# watcher_empty_queue_poll_secs: idle re-check cadence (s) when
+#   _watcher_has_actionable_l1() finds no actionable L1 work — the launch is
+#   skipped and the loop re-polls after this many seconds (default 60).
+#   Tradeoff: a newly-arrived L1 during an idle period now waits up to this
+#   long before the first rotation picks it up (previously a warm rotation
+#   blocked on the next L1 and reacted near-immediately). Hot-reloadable
+#   (green-tier) — lower it if 60s worst-case responsiveness is too slow for
+#   a given deployment.
 #
 # Invocation knobs (per rotation):
-# watcher_model: LLM backend model (default 'opus').
-# watcher_rotation_budget_usd: per-rotation budget ($); must be sized for a
-#   full rotation — invoke_agent default $5 would exhaust within minutes of a
-#   4h rotation and falsely trip the crashloop guard (default 40.0).
+# watcher_model: LLM backend model (default 'sonnet', task 2629). The
+#   top-level rotation is cheap mechanical triage/orchestration; hard or
+#   investigation-class items are delegated to an opus subagent via the Task
+#   tool instead of running the whole rotation on opus (see SKILL.md).
+# watcher_rotation_budget_usd: per-rotation budget ($); retained at its
+#   opus-era sizing — sonnet/high is ~5x cheaper, so the ceiling now doubles
+#   as headroom for opus subagents spawned within a rotation. Must be sized
+#   for a full rotation — invoke_agent default $5 would exhaust within
+#   minutes of a 4h rotation and falsely trip the crashloop guard (default 40.0).
 # watcher_max_turns: max agent turns per rotation (default 400).
 # watcher_effort: effort level for the agent (default 'high').
 # watcher_backend: backend provider (default 'claude').
@@ -503,13 +516,14 @@ watcher_rotation_escalations: 50
 watcher_rotation_hours: 4.0
 watcher_max_crashloop_restarts: 5
 watcher_crashloop_window_secs: 600
+watcher_empty_queue_poll_secs: 60.0
 # Cost-runaway guard: a clean rotation shorter than watcher_misconfigured_min_rotation_secs
 # seconds is classified as degenerate (empty queue, SKILL.md drift, misconfigured env).
 # After watcher_max_misconfigured_clean_exits such exits within watcher_crashloop_window_secs,
 # the supervisor trips pause_scheduler('watcher_misconfigured') and stops.
 watcher_misconfigured_min_rotation_secs: 120
 watcher_max_misconfigured_clean_exits: 5
-watcher_model: opus
+watcher_model: sonnet
 watcher_rotation_budget_usd: 40.0
 watcher_max_turns: 400
 watcher_effort: high

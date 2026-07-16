@@ -28,6 +28,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import (
     _WATCHER_ALLOWED_TOOLS,
+    _WATCHER_DISALLOWED_TOOLS,
     _WATCHER_ESCALATION_HEADERS,
     _WATCHER_MAX_BACKOFF_SECS,
     _WATCHER_TIMEOUT_GRACE_SECS,
@@ -65,10 +66,17 @@ class TestWatcherConfig:
         config = OrchestratorConfig(project_root=tmp_path)
         assert config.watcher_crashloop_window_secs == 600
 
+    def test_watcher_empty_queue_poll_secs_default(self, tmp_path: Path) -> None:
+        """Idle re-check cadence when the L1 queue has no actionable work."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.watcher_empty_queue_poll_secs == 60.0
+
     # Invocation knobs
     def test_watcher_model_default(self, tmp_path: Path) -> None:
+        """Sonnet top-level rotation model (task 2629): hard/investigation-class
+        items are delegated to an opus subagent instead (see SKILL.md)."""
         config = OrchestratorConfig(project_root=tmp_path)
-        assert config.watcher_model == 'opus'
+        assert config.watcher_model == 'sonnet'
 
     def test_watcher_rotation_budget_usd_default(self, tmp_path: Path) -> None:
         config = OrchestratorConfig(project_root=tmp_path)
@@ -2549,6 +2557,12 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
         h.config = h.config.model_copy(update={'watcher_misconfigured_min_rotation_secs': min_secs})
         h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
 
+        # task 2629: the empty-queue precheck only launches a rotation when an
+        # actionable L1 is pending — realistic here too, since a watcher
+        # outage is exactly when L1s pile up unhandled (_file_watcher_outage_l2's
+        # own summary reports the pending-L1 count).
+        _submit_sample_l1(queue)
+
         # Pre-file the outage L2
         h._file_watcher_outage_l2('watcher_crashloop')
         pending_before = [
@@ -2581,6 +2595,12 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
         min_secs = 30.0
         h.config = h.config.model_copy(update={'watcher_misconfigured_min_rotation_secs': min_secs})
         h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
+
+        # task 2629: the empty-queue precheck only launches a rotation when an
+        # actionable L1 is pending — realistic here too, since a watcher
+        # outage is exactly when L1s pile up unhandled (_file_watcher_outage_l2's
+        # own summary reports the pending-L1 count).
+        _submit_sample_l1(queue)
 
         # Pre-file the outage L2
         h._file_watcher_outage_l2('watcher_crashloop')
@@ -2622,4 +2642,277 @@ class TestWatcherAllowedTools:
             'mcp__escalation__promote_to_l2 must be in _WATCHER_ALLOWED_TOOLS '
             'so the autonomous watcher can promote L1→L2 escalations; '
             f'current list: {_WATCHER_ALLOWED_TOOLS}'
+        )
+
+    def test_task_in_allowed_tools(self) -> None:
+        """'Task' must be in _WATCHER_ALLOWED_TOOLS, and not in the disallowed list.
+
+        The sonnet top-level rotation (task 2629) delegates hard or
+        investigation-class items to an opus subagent via the Task tool
+        (SKILL.md "Delegating deep RCA to an opus subagent") instead of
+        running the whole rotation on opus. Task is not blocked by
+        bypassPermissions, so the delegation works today without this entry
+        — but a future tightening of the tool policy (e.g. an exhaustive
+        allowlist, or adding Task to _WATCHER_DISALLOWED_TOOLS) could
+        silently break this cost-optimization design with no test failing.
+        This assertion makes the dependency explicit and enforced.
+        """
+        assert 'Task' in _WATCHER_ALLOWED_TOOLS, (
+            "'Task' must be in _WATCHER_ALLOWED_TOOLS so the watcher rotation "
+            'can delegate deep RCA to an opus subagent (task 2629); '
+            f'current list: {_WATCHER_ALLOWED_TOOLS}'
+        )
+        assert 'Task' not in _WATCHER_DISALLOWED_TOOLS, (
+            "'Task' must not be in _WATCHER_DISALLOWED_TOOLS — that would "
+            'silently break the opus-subagent deep-RCA delegation (task 2629); '
+            f'current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2629 step-3: _watcher_has_actionable_l1 — empty-queue rotation precheck
+# ---------------------------------------------------------------------------
+
+def _submit_sample_l2(
+    queue: EscalationQueue,
+    task_id: str = 'task-cluster',
+    *,
+    members: list[str] | None = None,
+) -> str:
+    """Submit a minimal pending L2 escalation (cluster) and return its id."""
+    from escalation.models import Escalation
+    esc = Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role='escalation-watcher-auto',
+        severity='urgent',
+        category='infra_issue',
+        summary='sample L2 cluster for actionable-L1 precheck test',
+        level=2,
+        members=members or [],
+    )
+    queue.submit(esc)
+    return esc.id
+
+
+class TestWatcherHasActionableL1:
+    """Harness._watcher_has_actionable_l1() — pre-boot empty-queue precheck.
+
+    "Actionable L1" = at least one pending level-1 escalation whose id is
+    NOT already a member of a pending level-2 cluster.  Fails OPEN (returns
+    True) whenever the escalation queue is unset or unreadable — a precheck
+    bug must never silently drop L1 handling.
+    """
+
+    def test_empty_queue_returns_false(self, tmp_path: Path) -> None:
+        """No escalations at all — nothing actionable, skip the launch."""
+        h, _queue = _make_harness_with_queue(tmp_path)
+        assert h._watcher_has_actionable_l1() is False
+
+    def test_one_pending_l1_no_l2_returns_true(self, tmp_path: Path) -> None:
+        """A single pending L1 with no L2 clusters at all — actionable."""
+        h, queue = _make_harness_with_queue(tmp_path)
+        _submit_sample_l1(queue)
+        assert h._watcher_has_actionable_l1() is True
+
+    def test_queue_none_fails_open_true(self, tmp_path: Path) -> None:
+        """_escalation_queue is None (unset) — fail open, launch anyway."""
+        h, _queue = _make_harness_with_queue(tmp_path)
+        h._escalation_queue = None
+        assert h._watcher_has_actionable_l1() is True
+
+    def test_get_pending_raises_fails_open_true(self, tmp_path: Path) -> None:
+        """get_pending() raising — fail open, launch anyway."""
+        h, queue = _make_harness_with_queue(tmp_path)
+        with patch.object(queue, 'get_pending', side_effect=RuntimeError('boom')):
+            assert h._watcher_has_actionable_l1() is True
+
+    def test_only_l1_is_promoted_member_returns_false(self, tmp_path: Path) -> None:
+        """The only pending L1 is already a member of a pending L2 — not actionable.
+
+        Promoted member L1s remain status==pending at level 1 (SKILL.md), so a
+        naive level==1-and-pending check would relaunch every poll interval
+        while any L2 cluster has unresolved members.
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+        l1_id = _submit_sample_l1(queue, 'task-promoted')
+        _submit_sample_l2(queue, 'task-promoted-cluster', members=[l1_id])
+        assert h._watcher_has_actionable_l1() is False
+
+    def test_one_promoted_one_not_returns_true(self, tmp_path: Path) -> None:
+        """Two pending L1s, one promoted into an L2 and one not — actionable."""
+        h, queue = _make_harness_with_queue(tmp_path)
+        promoted_id = _submit_sample_l1(queue, 'task-promoted')
+        _submit_sample_l1(queue, 'task-unpromoted')
+        _submit_sample_l2(queue, 'task-promoted-cluster', members=[promoted_id])
+        assert h._watcher_has_actionable_l1() is True
+
+    def test_only_l0_returns_false(self, tmp_path: Path) -> None:
+        """Only a pending level-0 escalation — not actionable at L1.
+
+        L0->L1 promotion is owned by the separate _reap_orphan_l0_escalations
+        loop, so an L0-only queue must not trigger a rotation launch.
+        """
+        from escalation.models import Escalation
+        h, queue = _make_harness_with_queue(tmp_path)
+        esc = Escalation(
+            id=queue.make_id('task-l0'),
+            task_id='task-l0',
+            agent_role='test-agent',
+            severity='blocking',
+            category='infra_issue',
+            summary='sample L0 for actionable-L1 precheck test',
+            level=0,
+        )
+        queue.submit(esc)
+        assert h._watcher_has_actionable_l1() is False
+
+    def test_only_pending_l2_no_l1_returns_false(self, tmp_path: Path) -> None:
+        """Only a pending L2 cluster, no standalone pending L1 at all — not actionable.
+
+        Complements test_only_l0_returns_false: that test reaches the
+        `if not l1_ids: return False` guard via an L0-only queue. This test
+        reaches the same guard directly via a pure-L2 queue — the common
+        steady state this precheck exists to handle, where an L2 cluster has
+        unresolved members but the queue holds no pending level-1 escalation
+        of its own (e.g. its members were resolved individually and archived).
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+        _submit_sample_l2(
+            queue, 'task-l2-only-cluster', members=['task-already-resolved-1']
+        )
+        assert h._watcher_has_actionable_l1() is False
+
+
+# ---------------------------------------------------------------------------
+# task 2629 step-5: _watcher_supervisor_loop consults the empty-queue precheck
+# ---------------------------------------------------------------------------
+
+class TestWatcherSupervisorLoopEmptyQueueSkip:
+    """_watcher_supervisor_loop skips the rotation launch when the L1 queue
+    has no actionable work, and launches normally otherwise.
+    """
+
+    @pytest.mark.asyncio
+    async def test_skip_when_empty_queue(self, tmp_path: Path) -> None:
+        """Empty queue (no L1s at all) -> rotation is never launched;
+        the loop sleeps watcher_empty_queue_poll_secs and re-checks.
+        """
+        h, _queue = _make_loop_harness_with_queue(tmp_path)
+        sleep_durations: list[float] = []
+        rotation_spy = AsyncMock()
+        h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+            raise asyncio.CancelledError()
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        rotation_spy.assert_not_called()
+        assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (
+            f'Expected exactly one recorded sleep of watcher_empty_queue_poll_secs '
+            f'({h.config.watcher_empty_queue_poll_secs}); got {sleep_durations}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_skip_when_empty_queue_resolves_stale_outage_l2(self, tmp_path: Path) -> None:
+        """Empty L1 queue with a stale outage L2 open -> the skip path both
+        skips the rotation launch AND resolves the outage L2.
+
+        Reaching the empty-queue skip branch proves the supervisor loop is
+        alive and the queue is readable (the precheck fails open on a
+        None/erroring queue), which is exactly the 'watcher is up again'
+        signal the outage L2 represents -- so a stale L2 must not linger as
+        a false alarm just because the L1 queue happens to be drained.
+        """
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+
+        # Pre-file the outage L2; leave the L1 queue EMPTY (no _submit_sample_l1
+        # call) so _watcher_has_actionable_l1() returns False and the loop
+        # takes the empty-queue skip path.
+        h._file_watcher_outage_l2('watcher_crashloop')
+        pending_before = [
+            e for e in queue.get_pending()
+            if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+        ]
+        assert len(pending_before) == 1, 'Pre-condition: outage L2 must be filed before loop runs'
+
+        sleep_durations: list[float] = []
+        rotation_spy = AsyncMock()
+        h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+            raise asyncio.CancelledError()
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        rotation_spy.assert_not_called()
+        assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (
+            f'Expected exactly one recorded sleep of watcher_empty_queue_poll_secs '
+            f'({h.config.watcher_empty_queue_poll_secs}); got {sleep_durations}'
+        )
+
+        pending_after = [
+            e for e in queue.get_pending()
+            if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+        ]
+        assert len(pending_after) == 0, (
+            f'Expected the stale outage L2 to be resolved on the empty-queue skip path; '
+            f'still pending: {pending_after}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_launch_when_actionable_l1_present(self, tmp_path: Path) -> None:
+        """An actionable pending L1 -> the rotation IS launched normally
+        (precheck must not block real work from being picked up).
+        """
+        from shared.cli_invoke import AgentResult
+
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        _submit_sample_l1(queue)
+        min_secs = h.config.watcher_misconfigured_min_rotation_secs
+
+        rotation_calls = 0
+        sleep_durations: list[float] = []
+        timestamps = _build_monotonic_timestamps([min_secs + 1.0])
+        monotonic_sequence = iter(timestamps)
+
+        def fake_monotonic() -> float:
+            return next(monotonic_sequence)
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls > 1:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        async def recording_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', recording_sleep),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        assert rotation_calls >= 1, (
+            'Expected _run_watcher_rotation to be invoked when an actionable L1 is pending'
+        )
+        assert sleep_durations == [h.config.watcher_subprocess_restart_backoff_secs], (
+            f'Expected the healthy-clean restart-backoff sleep (proving the rotation '
+            f'actually ran, not the empty-queue skip path); got {sleep_durations}'
         )

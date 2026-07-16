@@ -312,6 +312,15 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     'Bash(git rev-parse:*)',
     'Bash(git branch:*)',
     'Bash(git ls-files:*)',
+    # Subagent delegation for deep RCA on hard/investigation-class items
+    # (task 2629): the sonnet top-level rotation spawns an opus subagent via
+    # the Task tool for read-only deep-dive investigation feeding
+    # promote_to_l2 (see SKILL.md "Delegating deep RCA to an opus subagent").
+    # The spawned subagent inherits this same allowed/disallowed-tools
+    # posture, so it cannot edit code or touch main regardless of its prompt.
+    # Covered by TestWatcherAllowedTools.test_task_in_allowed_tools — keep in
+    # lockstep with that test if this entry ever moves or is removed.
+    'Task',
     # Escalation MCP: read + autonomous resolve + L1→L2 promotion
     # (promote_to_l2 is needed by the consumer-per-level contract so the
     # watcher can escalate out-of-scope L1s directly to a human L2 stream)
@@ -7850,6 +7859,55 @@ Output JSON matching the schema. Every task must appear in the output.
             disallowed_tools=_WATCHER_DISALLOWED_TOOLS,
         )
 
+    def _watcher_has_actionable_l1(self) -> bool:
+        """Pre-boot precheck: does the L1 queue have any actionable work?
+
+        "Actionable" means at least one pending level-1 escalation whose id
+        is NOT already a member of a pending level-2 cluster.  Promoted
+        member L1s remain ``status=='pending'`` at level 1 (SKILL.md), so a
+        naive ``level == 1 and pending`` check would relaunch a rotation
+        every poll interval for as long as any L2 cluster has unresolved
+        members — a common steady state while a human is slow to resolve
+        L2s — defeating the entire cost optimisation this precheck exists
+        for.
+
+        Scope: only L1 work counts.  A queue containing only L0s, or only
+        pending L2s, is treated as non-actionable — L0->L1 promotion is
+        owned by the separate ``_reap_orphan_l0_escalations`` loop, so
+        skipping here does not starve that promotion path.
+
+        FAIL-OPEN: returns True (launch the rotation) whenever the
+        escalation queue is unset/None or ``get_pending()`` raises — a bug
+        in this precheck must never silently stop L1 escalations from being
+        handled (loud-over-silent-degradation norm).  Accessed via
+        ``getattr`` so bare-Harness tests that never set
+        ``_escalation_queue`` also fail open.
+        """
+        queue = getattr(self, '_escalation_queue', None)
+        if queue is None:
+            return True
+        try:
+            pending = queue.get_pending()
+        except Exception:
+            logger.warning(
+                'Escalation-watcher-auto: _watcher_has_actionable_l1 precheck '
+                'failed to read the escalation queue — failing open '
+                '(launching rotation anyway)',
+                exc_info=True,
+            )
+            return True
+
+        l1_ids = [esc.id for esc in pending if esc.level == 1]
+        if not l1_ids:
+            return False
+
+        promoted: set[str] = set()
+        for esc in pending:
+            if esc.level == 2:
+                promoted.update(esc.members or [])
+
+        return any(l1_id not in promoted for l1_id in l1_ids)
+
     async def _watcher_supervisor_loop(self) -> None:
         """Supervisor loop — restart watcher rotations until shutdown.
 
@@ -7866,6 +7924,34 @@ Output JSON matching the schema. Every task must appear in the output.
         consecutive_unclean: int = 0
         consecutive_degenerate_clean: int = 0  # task 1430: exponential floor on fast-clean exits
         while True:
+            # task 2629: pre-boot empty-queue precheck.  Skip the (expensive)
+            # rotation launch entirely when the L1 queue has no actionable
+            # work; fails open (see _watcher_has_actionable_l1) so a precheck
+            # bug can never silently stop real L1 handling.  Deliberately
+            # placed before `start = time.monotonic()` and does not touch the
+            # clean/unclean/degenerate counters, the guards, or
+            # _maybe_write_digest — this is a pure pre-boot bypass, not a
+            # rotation outcome.
+            if not self._watcher_has_actionable_l1():
+                poll = self.config.watcher_empty_queue_poll_secs
+                logger.debug(
+                    'Escalation-watcher-auto: L1 queue has no actionable work; '
+                    'skipping rotation launch (poll=%.1fs)', poll,
+                )
+                # task 2629 review fix: reaching this branch proves the
+                # supervisor loop is alive and the queue was readable (the
+                # precheck fails open on a None/erroring queue), which is
+                # exactly the "watcher is up again" signal a stale
+                # watcher-outage L2 is waiting on — resolve it here so it
+                # never lingers as a false alarm just because the L1 queue
+                # happens to be drained. Best-effort/no-op when none is open.
+                self._resolve_watcher_outage_l2()
+                try:
+                    await asyncio.sleep(poll)
+                except asyncio.CancelledError:
+                    raise  # clean shutdown
+                continue
+
             start = time.monotonic()
             try:
                 result = await self._run_watcher_rotation()
