@@ -21,6 +21,7 @@ from pydantic import BaseModel, ValidationError
 
 import shared.task_metadata as task_metadata_module
 from shared.task_metadata import (
+    KNOWN_ROLE_NAMES,
     BeforeDone,
     DoneProvenance,
     ExternalDep,
@@ -33,6 +34,7 @@ from shared.task_metadata import (
     apply_migrations,
     parse_metadata,
     register_metadata_submodel,
+    validate_model_overrides,
 )
 
 
@@ -580,6 +582,48 @@ class TestRoutingStateTransforms:
 
     def test_from_metadata_malformed_routing_dict_returns_default_never_raises(self):
         assert RoutingState.from_metadata({'routing': {'history': 'bad'}}) == RoutingState()
+
+
+class TestModelOverridesShapeAuthority:
+    """``validate_model_overrides`` / ``KNOWN_ROLE_NAMES`` — the shared shape
+    authority for ``metadata.model_overrides`` (PRD adaptive-model-routing
+    task ζ, PRD decision 9).
+
+    SHAPE only (known role names + string values). Model *string* validation
+    against an allowlist is the orchestrator resolver's fail-safe job at
+    resolve time, not this module's — fused-memory does not know the
+    orchestrator's ``routing.allowed_models``.
+    """
+
+    def test_well_formed_override_returns_none(self):
+        assert validate_model_overrides({'implementer': 'haiku'}) is None
+
+    def test_empty_dict_is_valid(self):
+        assert validate_model_overrides({}) is None
+
+    def test_unknown_role_raises_and_names_the_role(self):
+        with pytest.raises(ValueError, match='bogus_role'):
+            validate_model_overrides({'bogus_role': 'haiku'})
+
+    def test_non_string_value_raises(self):
+        with pytest.raises(ValueError):
+            validate_model_overrides({'implementer': 123})
+
+    @pytest.mark.parametrize('value', [['implementer', 'haiku'], 'implementer'])
+    def test_non_dict_value_raises(self, value):
+        with pytest.raises(ValueError):
+            validate_model_overrides(value)
+
+    def test_known_role_names_is_frozenset_with_expected_members(self):
+        assert isinstance(KNOWN_ROLE_NAMES, frozenset)
+        for role in (
+            'architect',
+            'implementer',
+            'reviewer_comprehensive',
+            'judge',
+            'simple_task',
+        ):
+            assert role in KNOWN_ROLE_NAMES
 
 
 class TestTaskMetadataFields:
