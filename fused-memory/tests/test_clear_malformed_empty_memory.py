@@ -270,3 +270,190 @@ class TestDeletePoint:
         points_selector = call_kwargs.get('points_selector')
         assert isinstance(points_selector, qmodels.PointIdsList)
         assert points_selector.points == ['028edb1f-299c-4755-9432-f5a9fde97677']
+
+
+# ===========================================================================
+# Tests: build_report
+# ===========================================================================
+
+class TestBuildReport:
+    """Tests for the pure function build_report(...) -> dict."""
+
+    def test_report_shape(self):
+        """Returned dict has exactly the six report keys."""
+        report = _mod.build_report(
+            memory_id='id1', collection='fused_dark_factory', classification='malformed',
+            dry_run=True, deleted=False, payload={},
+        )
+
+        assert set(report.keys()) == {
+            'memory_id', 'collection', 'classification', 'dry_run', 'deleted', 'payload',
+        }
+
+    def test_fields_passed_through_verbatim(self):
+        """Every field is passed through verbatim, not recomputed."""
+        payload = {'data': '', 'category': None, 'agent_id': None}
+
+        report = _mod.build_report(
+            memory_id='028edb1f-299c-4755-9432-f5a9fde97677', collection='fused_dark_factory',
+            classification='malformed', dry_run=False, deleted=True, payload=payload,
+        )
+
+        assert report['memory_id'] == '028edb1f-299c-4755-9432-f5a9fde97677'
+        assert report['collection'] == 'fused_dark_factory'
+        assert report['classification'] == 'malformed'
+        assert report['dry_run'] is False
+        assert report['deleted'] is True
+        assert report['payload'] == payload
+
+    def test_payload_none_for_absent_record(self):
+        """An absent record's payload (None) is preserved, not coerced to {}."""
+        report = _mod.build_report(
+            memory_id='absent-id', collection='fused_dark_factory', classification='absent',
+            dry_run=True, deleted=False, payload=None,
+        )
+
+        assert report['payload'] is None
+
+
+# ===========================================================================
+# Tests: resolve_exit_code
+# ===========================================================================
+
+class TestResolveExitCode:
+    """Tests for the pure function resolve_exit_code(report) -> int."""
+
+    def test_healthy_and_applied_returns_1(self):
+        """A healthy record with dry_run=False (an --apply run that refused
+        to delete) is the loud-refusal case -> exit 1."""
+        report = _mod.build_report(
+            memory_id='id1', collection='c', classification='healthy',
+            dry_run=False, deleted=False, payload={'data': 'real content'},
+        )
+
+        assert _mod.resolve_exit_code(report) == 1
+
+    def test_healthy_and_dry_run_returns_0(self):
+        """A healthy record under dry-run (no --apply) is just a report,
+        never a failure -> exit 0."""
+        report = _mod.build_report(
+            memory_id='id1', collection='c', classification='healthy',
+            dry_run=True, deleted=False, payload={'data': 'real content'},
+        )
+
+        assert _mod.resolve_exit_code(report) == 0
+
+    def test_malformed_returns_0_regardless_of_dry_run(self):
+        """A malformed record always exits 0, whether or not it was applied."""
+        for dry_run, deleted in ((True, False), (False, True)):
+            report = _mod.build_report(
+                memory_id='id1', collection='c', classification='malformed',
+                dry_run=dry_run, deleted=deleted, payload={},
+            )
+
+            assert _mod.resolve_exit_code(report) == 0
+
+    def test_absent_returns_0_regardless_of_dry_run(self):
+        """An absent record (idempotent success) always exits 0."""
+        for dry_run in (True, False):
+            report = _mod.build_report(
+                memory_id='id1', collection='c', classification='absent',
+                dry_run=dry_run, deleted=False, payload=None,
+            )
+
+            assert _mod.resolve_exit_code(report) == 0
+
+
+# ===========================================================================
+# Tests: run
+# ===========================================================================
+
+class TestRun:
+    """Tests for async run(args, qdrant_client, collection_name) -> dict."""
+
+    @pytest.mark.asyncio
+    async def test_dry_run_malformed_no_delete(self):
+        """(a) apply=False + malformed: report reflects the classification,
+        dry_run True, deleted False, and delete is never awaited."""
+        payload = {'data': '', 'category': None, 'agent_id': None}
+        client = _make_qdrant_mock([_make_record(payload)])
+        args = types.SimpleNamespace(memory_id='id1', apply=False)
+
+        report = await _mod.run(args, client, 'fused_dark_factory')
+
+        assert report['classification'] == 'malformed'
+        assert report['dry_run'] is True
+        assert report['deleted'] is False
+        client.delete.assert_not_awaited()
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_apply_malformed_deletes(self):
+        """(b) apply=True + malformed: delete is awaited once, report
+        reflects deleted=True, exit code 0."""
+        payload = {'data': '', 'category': None, 'agent_id': None}
+        client = _make_qdrant_mock([_make_record(payload)])
+        args = types.SimpleNamespace(memory_id='id1', apply=True)
+
+        report = await _mod.run(args, client, 'fused_dark_factory')
+
+        client.delete.assert_awaited_once()
+        assert report['deleted'] is True
+        assert report['classification'] == 'malformed'
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_apply_healthy_refuses_loudly(self, caplog):
+        """(c) apply=True + healthy: delete is NEVER awaited (fail-safe),
+        classification 'healthy', exit code 1 (loud refusal), and a WARNING
+        is logged."""
+        payload = {
+            'data': 'Task 1470 wired /audit into /review Phase-2 Architectural Coherence.',
+            'category': 'observations_and_summaries',
+            'agent_id': 'claude-task-1470-implementer',
+        }
+        client = _make_qdrant_mock([_make_record(payload)])
+        args = types.SimpleNamespace(memory_id='id1', apply=True)
+
+        with caplog.at_level('WARNING'):
+            report = await _mod.run(args, client, 'fused_dark_factory')
+
+        client.delete.assert_not_awaited()
+        assert report['classification'] == 'healthy'
+        assert report['deleted'] is False
+        assert _mod.resolve_exit_code(report) == 1
+        assert any(rec.levelname == 'WARNING' for rec in caplog.records), (
+            f'Expected a WARNING refusing the delete, got: {[r.message for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_apply_absent_idempotent_success(self):
+        """(d) apply=True + absent (retrieve -> []): no delete attempted,
+        classification 'absent', exit code 0 (idempotent success)."""
+        client = _make_qdrant_mock([])
+        args = types.SimpleNamespace(memory_id='already-gone', apply=True)
+
+        report = await _mod.run(args, client, 'fused_dark_factory')
+
+        client.delete.assert_not_awaited()
+        assert report['classification'] == 'absent'
+        assert report['deleted'] is False
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_dry_run_healthy_no_delete(self):
+        """(e) apply=False + healthy: no delete attempted, exit code 0."""
+        payload = {
+            'data': 'Task 1470 wired /audit into /review Phase-2 Architectural Coherence.',
+            'category': 'observations_and_summaries',
+            'agent_id': 'claude-task-1470-implementer',
+        }
+        client = _make_qdrant_mock([_make_record(payload)])
+        args = types.SimpleNamespace(memory_id='id1', apply=False)
+
+        report = await _mod.run(args, client, 'fused_dark_factory')
+
+        client.delete.assert_not_awaited()
+        assert report['classification'] == 'healthy'
+        assert report['deleted'] is False
+        assert _mod.resolve_exit_code(report) == 0
