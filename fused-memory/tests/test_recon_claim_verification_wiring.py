@@ -311,13 +311,18 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
 
     async def test_per_candidate_checks_run_concurrently(self, tmp_path):
         """Per-candidate claim-verification checks run CONCURRENTLY
-        (asyncio.gather), not serially awaited one at a time — proven by
-        timing a batch of candidates each behind an artificially slow
-        _maybe_flag_unverified_claims. Serial execution would take
-        N * SLEEP_SECS; concurrent execution takes roughly one SLEEP_SECS
-        regardless of N."""
+        (asyncio.gather), not serially awaited one at a time — proven via an
+        asyncio.Event gate (mirrors test_memory_service.py's
+        test_concurrent_execution) rather than wall-clock timing: each
+        check increments a shared counter then blocks until ALL n have
+        started. That is only reachable if all n are in flight at once. A
+        regression to a serial await-in-a-loop would leave the first call
+        blocked alone — its siblings never get a chance to start — until it
+        times out. Unlike a wall-clock threshold, this cannot flake under
+        CI/CPU contention (e.g. lint/type-check running concurrently in the
+        same verify pass): it resolves as soon as the event loop schedules
+        the n coroutines, with no dependency on real elapsed time."""
         import asyncio
-        import time
         from unittest.mock import patch
 
         from fused_memory.middleware.task_curator import (
@@ -330,7 +335,6 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
         config = _make_config(recon_claim_verification_enabled=True)
         curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
 
-        sleep_secs = 0.2
         n = 4
         candidates = [
             CandidateTask(title=f"T{i}", description=f"plain description {i}")
@@ -343,8 +347,19 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
             for c in candidates
         ]
 
-        async def slow_flag(candidate, probe=None):
-            await asyncio.sleep(sleep_secs)
+        all_started = asyncio.Event()
+        start_count = 0
+
+        async def concurrent_flag(candidate, probe=None):
+            nonlocal start_count
+            start_count += 1
+            if start_count == n:
+                all_started.set()
+            # No statement between the increment above and this await, so a
+            # serial caller can never interleave another invocation in to
+            # push start_count to n — it can only reach here alone and time
+            # out waiting for siblings that never get scheduled.
+            await asyncio.wait_for(all_started.wait(), timeout=1.0)
             return []
 
         llm_decisions = [
@@ -359,18 +374,14 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
             return llm_decisions
 
         with (
-            patch.object(curator, "_maybe_flag_unverified_claims", side_effect=slow_flag),
+            patch.object(curator, "_maybe_flag_unverified_claims", side_effect=concurrent_flag),
             patch.object(curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch),
         ):
-            started = time.monotonic()
             await curator.curate_batch_prepared(
                 prepared, project_id="p", project_root=str(tmp_path),
             )
-            elapsed = time.monotonic() - started
 
-        # Serial awaiting would take >= n * sleep_secs (0.8s here); concurrent
-        # fan-out via asyncio.gather takes roughly one sleep_secs regardless
-        # of n. A 2x-sleep_secs threshold leaves ample margin above the
-        # concurrent case while still clearly catching a regression to serial
-        # execution.
-        assert elapsed < sleep_secs * 2
+        # All n checks reached the gate — proves they were in flight
+        # concurrently, not serially awaited one at a time (which would
+        # have raised TimeoutError out of the gather above instead).
+        assert start_count == n
