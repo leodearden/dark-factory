@@ -1066,3 +1066,60 @@ class TestRow7TrainAmortizationOneFullBreadthVerify:
                 f'test command, not a combined/opaque command; got '
                 f'{executed[mc.prefix].test_command!r}'
             )
+
+
+# ---------------------------------------------------------------------------
+# Row 8: "rollback path" (λ, R4). ``merge_verify_breadth='scoped'`` (the
+# shipped default) keeps the merge-role plan for a source-only diff
+# BYTE-IDENTICAL to the pre-λ legacy shape — the opposite pole from row 1
+# (breadth='full' widens to the whole registry) and row 2 (role='task'
+# floors pytest, R3): NEITHER applies here, so the touched module's OWN
+# pytest stays SKIPPED, exactly as it always has. Producer-only (see the
+# module docstring's row->seam map — no consumer/merge-gate side for this
+# row).
+# ---------------------------------------------------------------------------
+
+
+# NOTE (RED, step-15): _row8_assert_legacy_scoped_shape (the row-8
+# legacy-golden reference) is intentionally NOT YET DEFINED here — the test
+# below references it and fails with a NameError until step-16 (GREEN)
+# defines it, mirroring TestRow2TaskRoleSignal's RED-via-_drive_producer
+# split (test_verify_scope_inversion_boundary.py step-3/step-4).
+
+
+class TestRow8ScopedBreadthMergePlanByteIdenticalLegacy:
+    """Row 8 (PRD boundary-test sketch): ``merge_verify_breadth='scoped'``
+    (the shipped default) keeps the merge-role plan byte-identical to the
+    pre-λ legacy shape (R4, the rollback path). Reuses the SAME row-1
+    golden diff (source-only under modA, sibling test under modB), this
+    time with ``breadth='scoped'`` — modB must never execute (that
+    widening is breadth='full'-gated, row-1 territory) and modA's own
+    pytest must stay SKIPPED (that floor is role='task'-gated, row-2
+    territory).
+    """
+
+    @pytest.mark.asyncio
+    async def test_row8_scoped_breadth_merge_plan_byte_identical_legacy(
+        self, tmp_path: Path,
+    ) -> None:
+        mod_a, _mod_b, config = _row1_golden_diff(tmp_path, breadth='scoped')
+
+        result, executed, fake = await _drive_producer(
+            tmp_path, config, [mod_a], task_files=[MODA_SOURCE_PATH], role='merge',
+            is_merge_verify=True,
+        )
+
+        assert result.passed, (
+            'a scoped-breadth merge verify of a source-only diff must pass '
+            '(pytest SKIPPED is a no-op leg, never a failure)'
+        )
+        assert set(executed) == {'moda'}, (
+            f'expected NO widening to the registered-but-untouched sibling '
+            f'modB (merge+full-only widening, row-1 territory, is gated '
+            f'off by breadth=scoped); got {set(executed)!r}'
+        )
+        assert fake.await_count == 1, (
+            f'expected exactly ONE run_verification call (modA only — no '
+            f'widening, no per-tool fan-out); got {fake.await_count} call(s)'
+        )
+        _row8_assert_legacy_scoped_shape(executed['moda'])
