@@ -616,8 +616,12 @@ above — **a starting point, not a verdict**.
 
 **Re-verify (re-run the probe yourself) instead of trusting the note** when either:
 - `triaged_at` is older than roughly 6 hours, or
-- the record changed since triage — `updated_at` is newer than `triaged_at` (e.g. the L2 cluster
-  gained a new member via `promote_to_l2` after the stamp was written).
+- the record changed since triage — `updated_at` is **not** `None` **and** is newer than
+  `triaged_at` (e.g. the L2 cluster gained a new member via `promote_to_l2` after the stamp was
+  written). `updated_at` defaults to `None` (never bumped) until the record's first real content
+  change, so a triaged record with no changes since still reads `updated_at = None` — treat that as
+  "not newer than `triaged_at`", never as an ordering comparison between `None` and a timestamp
+  string.
 
 A well-formed `triage_note` names a machine-checkable **predicate** (e.g. `` `task-604
 status==done` ``) and the **probe** used to check it (e.g. `` `probe: get_task 604 ->

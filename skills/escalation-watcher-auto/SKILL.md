@@ -250,7 +250,7 @@ On startup and after each watcher fire:
 2. Fetch pending L2s: `mcp__escalation__get_pending_escalations()` → filter `level == 2`, `status == "pending"`
 3. Build the **already-promoted set**: the union of all `members` lists from every pending L2
 4. Set `work_batch` = L1 candidates whose `id` is **not** in the already-promoted set
-5. Filter `work_batch` again — drop any item whose existing triage stamp is still fresh and covering (`triaged_at` set, < ~6h old, `updated_at` not newer than `triaged_at`, note still plausibly covers the record); see [Triage-ack freshness contract](#triage-ack-freshness-contract) below for the exact skip rule
+5. Filter `work_batch` again — drop any item whose existing triage stamp is still fresh and covering (`triaged_at` set, < ~6h old, `updated_at` not newer than `triaged_at` — treating `updated_at is None` as "not newer", never comparing `None` directly against a timestamp string — note still plausibly covers the record); see [Triage-ack freshness contract](#triage-ack-freshness-contract) below for the exact skip rule
 
 Handle only the filtered `work_batch` before (re)starting the wait. On first assessment of each surviving item, stamp a triage-ack annotation (below) so later drain cycles can skip it instead of re-deriving its disposition from scratch.
 
@@ -273,9 +273,9 @@ mcp__escalation__stamp_triage(
 1. The **PREDICATE** — a machine-checkable condition, e.g. `` `task-604 status==done` `` — not a conclusion like "resume will close it". A conclusion-only note is untrusted prose: exactly this anti-pattern on esc-2584 was empirically refuted twice, costing two churn cycles and five separate `resolve_issue` calls before the item was actually closed.
 2. The **PROBE** used to verify it — command + key output line, e.g. `` `probe: get_task 604 -> status=done` ``. This mirrors the [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) evidence convention (quote a live-probe `key=value` token verbatim) and the [`stranded_blocked`](#stranded_blocked) "re-verify the predicate still holds" pattern — `triage_note` generalizes both into one durable rotation-to-rotation handoff note.
 
-`triaged_at` (stamped automatically) is the **freshness anchor** — there is no separate `verified_at` field; treat them as identical. On each drain cycle (step 5 above):
+`triaged_at` (stamped automatically) is the **freshness anchor** — there is no separate `verified_at` field; treat them as identical. `updated_at` defaults to `None` (never bumped) until the record's first real content change (e.g. an L2 gaining a member via `promote_to_l2`), so a triaged record that hasn't changed since still reads `updated_at = None` — that is the common case, not an edge case. On each drain cycle (step 5 above):
 - **Skip** re-deriving any item whose `triaged_at` is fresh (< ~6h old) and whose `triage_note` predicate still plausibly covers the record's current state.
-- **Re-assess** — re-run the probe, don't trust the stale note — when `updated_at > triaged_at` (the record changed since you triaged it, e.g. an L2 cluster gained a new member via `promote_to_l2`) or the existing note is stale or conclusion-only.
+- **Re-assess** — re-run the probe, don't trust the stale note — when `updated_at` is not `None` **and** `updated_at > triaged_at` (the record changed since you triaged it, e.g. an L2 cluster gained a new member via `promote_to_l2`), or the existing note is stale or conclusion-only. Guard the comparison explicitly: treat `updated_at is None` as "not newer than `triaged_at`" rather than ordering `None` against a timestamp string (e.g. Python raises `TypeError` comparing `None > str`).
 
 `triaged_at`/`triaged_by`/`triage_note`/`updated_at` are all surfaced in both full and compact `get_pending_escalations` output, so this check costs no extra per-record round-trip.
 
