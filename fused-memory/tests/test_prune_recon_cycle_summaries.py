@@ -816,6 +816,28 @@ class TestRun:
         assert 'under-count' in captured.err.lower() or 'race' in captured.err.lower()
 
     @pytest.mark.asyncio
+    async def test_scroll_timeout_propagates_uncaught(self):
+        """A real Qdrant read-timeout now RAISES out of scroll_by_metadata
+        (task 2671 removed the old swallow-into-`[]` behaviour) instead of
+        returning an empty list -- this is the invariant the
+        possible_undercount_projects rename and the surrounding
+        docstrings/NOTE wording above hinge on. run() must let the
+        TimeoutError propagate uncaught rather than silently classifying the
+        pool as empty ("nothing to prune") or reaching the
+        scan_truncated/abort branch at all -- a raised TimeoutError never
+        produces a scan result to evaluate in the first place."""
+        memory = self._make_memory([])
+        memory.mem0.scroll_by_metadata = AsyncMock(
+            side_effect=TimeoutError('qdrant scroll timed out'),
+        )
+        args = self._args(apply=True, project_id='dark_factory')
+
+        with pytest.raises(TimeoutError):
+            await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        memory.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_scan_skips_ground_truth_when_scroll_below_limit(self):
         """Efficiency: when the scroll returns a non-empty result strictly
         below --scan-limit, the pool is already provably fully enumerated
