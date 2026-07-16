@@ -485,6 +485,74 @@ class TestStampTriageTool:
 
 
 # ---------------------------------------------------------------------------
+# TestGetPendingSurfacesTriageFields: triage fields surfaced in full + compact
+# ---------------------------------------------------------------------------
+
+
+class TestGetPendingSurfacesTriageFields:
+    """get_pending_escalations surfaces triaged_at/triaged_by/triage_note/updated_at.
+
+    Full mode already surfaces them via to_dict() once the model fields exist
+    (models.py). Compact mode requires _COMPACT_ESCALATION_FIELDS to be
+    widened to include them — that widening is the RED driver here.
+    """
+
+    def _seed_and_stamp(self, queue: EscalationQueue, esc_id: str = 'esc-t1-0001') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='t-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='pending L2 for triage-field surfacing test',
+            level=2,
+        )
+        queue.submit(esc)
+        queue.stamp_triage(
+            esc_id, triaged_by='orchestrator-escalation-watcher-auto',
+            triage_note='task-604 status==done | probe: get_task 604 -> status=done',
+        )
+        # A real L2 member append bumps updated_at — exercise that path too so
+        # both timestamp fields have faithful non-default values to assert on.
+        queue.add_members_to_l2(esc_id, ['esc-m-0001'])
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_full_mode_surfaces_triage_fields(self, tmp_path: Path):
+        """(a) FULL mode (compact omitted) returns the four triage fields faithfully."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_and_stamp(queue)
+
+        result = await _get_pending(server, level=2)
+
+        assert len(result) == 1, f"Expected 1 result, got {len(result)}: {result}"
+        row = result[0]
+        assert row['triaged_at'] is not None
+        assert row['triaged_by'] == 'orchestrator-escalation-watcher-auto'
+        assert row['triage_note'] == 'task-604 status==done | probe: get_task 604 -> status=done'
+        assert row['updated_at'] is not None
+
+    @pytest.mark.asyncio
+    async def test_compact_mode_includes_triage_fields(self, tmp_path: Path):
+        """(b) COMPACT mode includes triaged_at/triaged_by/triage_note/updated_at per row."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_and_stamp(queue)
+
+        result = await _get_pending(server, level=2, compact=True)
+
+        assert len(result) == 1, f"Expected 1 result, got {len(result)}: {result}"
+        row = result[0]
+        for key in ('triaged_at', 'triaged_by', 'triage_note', 'updated_at'):
+            assert key in row, f"Missing {key!r} in compact projection: {row}"
+        assert row['triaged_at'] is not None
+        assert row['triaged_by'] == 'orchestrator-escalation-watcher-auto'
+        assert row['triage_note'] == 'task-604 status==done | probe: get_task 604 -> status=done'
+        assert row['updated_at'] is not None
+
+
+# ---------------------------------------------------------------------------
 # TestL2DedupeBypass: born-at-L2 escalations bypass deduplication
 # ---------------------------------------------------------------------------
 
