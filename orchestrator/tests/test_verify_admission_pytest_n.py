@@ -20,11 +20,19 @@ supported a specific worker-count cap on this host.
 
 from __future__ import annotations
 
+import pytest
+
 from orchestrator.config import (
     RELOADABLE_FIELDS,
     OrchestratorConfig,
     apply_reload,
     diff_config,
+)
+from orchestrator.verify_cmd import (
+    ToolKind,
+    apply_pytest_numprocesses,
+    parse_config_command,
+    render,
 )
 
 
@@ -71,3 +79,42 @@ class TestVerifyAdmissionPytestNReloadDisposition:
         assert report['reloaded'] is True
         assert report['applied']['verify_admission_pytest_n'] == {'old': 'auto', 'new': '16'}
         assert live.verify_admission_pytest_n == '16'
+
+
+class TestApplyPytestNumprocesses:
+    """apply_pytest_numprocesses(cmd, n) appends a `-n <n>` pytest-xdist
+    worker-count flag. Mirrors test_verify_cmd.py::TestSerialPytest's shape.
+    """
+
+    def test_structured_single_invocation_appends_dash_n(self):
+        cmd = parse_config_command('uv run pytest tests/')
+        result = render(apply_pytest_numprocesses(cmd, '16'))
+        assert result == 'uv run pytest -n 16 tests/'
+
+    @pytest.mark.parametrize('n', ['auto', ''])
+    def test_noop_values_leave_cmd_byte_identical(self, n):
+        cmd = parse_config_command('uv run pytest tests/')
+        mutated = apply_pytest_numprocesses(cmd, n)
+        assert mutated == cmd
+        assert render(mutated) == render(cmd)
+
+    def test_rewrites_every_pytest_invocation_in_chained_command(self):
+        raw = (
+            'cd shared && uv run pytest tests/ && '
+            'cd ../orchestrator && uv run pytest tests/'
+        )
+        cmd = parse_config_command(raw)
+        assert cmd.tool is ToolKind.PYTEST
+        assert cmd.raw == raw
+
+        result = render(apply_pytest_numprocesses(cmd, '16'))
+        assert result.count('pytest') == 2
+        assert result.count('-n 16') == 2
+
+    def test_non_pytest_command_returned_unchanged(self):
+        cmd = parse_config_command('ruff check .')
+        assert apply_pytest_numprocesses(cmd, '16') == cmd
+
+    def test_noop_on_opaque(self):
+        cmd = parse_config_command('mypy src/')
+        assert apply_pytest_numprocesses(cmd, '16') == cmd
