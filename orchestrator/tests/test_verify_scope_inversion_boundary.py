@@ -1147,3 +1147,68 @@ class TestRow8ScopedBreadthMergePlanByteIdenticalLegacy:
             f'widening, no per-tool fan-out); got {fake.await_count} call(s)'
         )
         _row8_assert_legacy_scoped_shape(executed['moda'])
+
+
+# ---------------------------------------------------------------------------
+# Row 9: "fallback narrowing" (the wall-clock win, asserted structurally). A
+# diff touching an UNREGISTERED path (kappa's UNREGISTERED_PATH_DIFF shape)
+# against the REAL dark_factory root-level fleet lint/type/test chains
+# (_FLEET_*_COMMAND, test_verify_scope_kappa.py) must route through the
+# plan-driven FALLBACK branch scoped to ONE subproject — never a
+# per-fleet-subproject fan-out and never the whole-repo opaque chain
+# leaking other subprojects' names into the executed command. Producer-only
+# (see the module docstring's row->seam map).
+# ---------------------------------------------------------------------------
+
+
+# NOTE (RED, step-17): _row9_unregistered_scripts_diff (the row-9
+# fallback/unregistered-path fixture) is intentionally NOT YET DEFINED here
+# — the test below references it and fails with a NameError until step-18
+# (GREEN) defines it, mirroring TestRow2TaskRoleSignal's RED-via-
+# _drive_producer split and TestRow8ScopedBreadthMergePlanByteIdenticalLegacy's
+# RED-via-_row8_assert_legacy_scoped_shape split, above.
+
+
+class TestRow9FallbackNarrowingNeverWholeRepoChain:
+    """Row 9 (PRD boundary-test sketch): a diff touching only an
+    unregistered path (no ``ModuleConfig`` claims it) against the REAL
+    dark_factory root-level fleet lint/type/test chains must scope to
+    exactly ONE fallback ``ModuleConfig`` — never a per-fleet-subproject
+    fan-out (5 separate ``run_verification`` calls) and never the
+    unscoped opaque chain leaking every OTHER subproject's name into the
+    executed lint/type command (the wall-clock win: this is what makes a
+    task-verify of a single-file diff fast instead of running the entire
+    fleet's suite).
+    """
+
+    @pytest.mark.asyncio
+    async def test_row9_scripts_module_scoped_no_whole_repo_chain(
+        self, tmp_path: Path,
+    ) -> None:
+        config, task_files = _row9_unregistered_scripts_diff(tmp_path)
+
+        result, executed, fake = await _drive_producer(
+            tmp_path, config, [], task_files=task_files, role='task',
+        )
+
+        assert result.passed
+        assert fake.await_count == 1, (
+            f'expected exactly ONE scoped call, not a per-subproject '
+            f'fan-out or an extra global fallthrough; got '
+            f'{fake.await_count} call(s)'
+        )
+        assert set(executed) == {'__fallback__'}, (
+            f'expected exactly one scoped ModuleConfig routed through the '
+            f'plan-driven fallback branch, not a per-subproject fan-out or '
+            f'the unscoped global branch; got {set(executed)!r}'
+        )
+        fallback = executed['__fallback__']
+        for other in ('escalation', 'fused-memory', 'dashboard'):
+            assert other not in (fallback.lint_command or ''), (
+                f'whole-repo fleet chain leaked into the executed '
+                f'lint_command: {fallback.lint_command!r}'
+            )
+            assert other not in (fallback.type_check_command or ''), (
+                f'whole-repo fleet chain leaked into the executed '
+                f'type_check_command: {fallback.type_check_command!r}'
+            )
