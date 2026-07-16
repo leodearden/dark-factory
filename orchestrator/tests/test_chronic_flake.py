@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from importlib import resources as pkg_resources
 
-import pytest
 import yaml
 
 from orchestrator.config import OrchestratorConfig
