@@ -2064,7 +2064,9 @@ class Harness:
             task_summaries.append({
                 'id': str(t.get('id', '')),
                 'title': t.get('title', ''),
-                'description': t.get('description', ''),
+                # Fall back to details when description is empty so the
+                # tagger still has context to predict from.
+                'description': t.get('description') or t.get('details') or '',
             })
 
         schema = {
