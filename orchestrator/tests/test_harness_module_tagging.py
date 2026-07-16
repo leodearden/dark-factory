@@ -846,3 +846,44 @@ async def test_tag_skips_when_only_deterministic(harness):
         mock_invoke.assert_not_called()
 
     harness.scheduler.update_task.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# details fallback in the prompt when description is empty (task 2561
+# defect 3 prompt fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tag_prompt_uses_details_when_description_empty(harness):
+    """When a task's description is empty, the prompt must fall back to
+    its details field so the tagger still has context to predict from.
+
+    Fails now: task_summaries reads t.get('description', '') only, so
+    details is never surfaced in the prompt.
+    """
+    tasks = [
+        {
+            'id': '1', 'title': 'Task', 'description': '',
+            'details': 'SPECIAL_DETAILS_TOKEN',
+            'status': 'pending', 'metadata': {}, 'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+
+    agent_response = {'predictions': []}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
+        await harness._tag_task_modules()
+
+    prompt = mock_invoke.call_args.kwargs['prompt']
+    assert 'SPECIAL_DETAILS_TOKEN' in prompt, (
+        f'Expected details fallback text in the prompt when description is empty; got prompt={prompt!r}'
+    )
