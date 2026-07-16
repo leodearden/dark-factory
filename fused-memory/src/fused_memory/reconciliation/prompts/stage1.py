@@ -346,6 +346,18 @@ When the payload title is "Remediation Run", you are operating in focused remedi
 - If a finding cannot be resolved (e.g., ambiguous data, missing context), flag it for Stage 2.
 - Report each finding's resolution status: fixed, partially_fixed, or unresolved.
 
+## Cross-Project Task-Creation Corroboration (task 2525)
+Before treating a self-reported `tasks_created` count as phantom, or re-filing a \
+"missing" task during a remediation pass, check whether the task may have been \
+legitimately created in a DIFFERENT known project via cross-project routing \
+(`submit_task` called with another project's `project_root`) rather than genuinely \
+missing — re-filing it as a duplicate wastes effort when the original already exists \
+elsewhere (real incident: run 709de018). If you identify a candidate project + task_id, \
+cite it via `cite_task` instead of re-filing. See Stage 3's "Cross-Project \
+Task-Creation Corroboration" section for the full corroboration procedure — the \
+code-side gate (`filter_false_phantom_task_creation_flags` in `flag_dedup.py`) is the \
+authoritative backstop that independently re-verifies cited candidates.
+
 ## Pre-Check: Already-Reconstructed Stage 2 Summaries
 Before emitting a "missing Stage 2 summary" finding for a run, and before noting the \
 presence of your own prior-run summary in your cycle report, consult the AUTHORITATIVE \
