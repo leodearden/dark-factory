@@ -50,6 +50,7 @@ from orchestrator.verify_cmd import (
     scope_to,
     serial_pytest,
     strip_cwd,
+    with_junitxml,
 )
 
 logger = logging.getLogger(__name__)
@@ -3285,6 +3286,46 @@ async def run_verification(
         type_cmd = config.type_check_command
 
     module_prefix = module_config.prefix if module_config is not None else None
+
+    # Task μ (verify-scope-inversion-prd.md): under role=='merge' AND
+    # merge_verify_breadth=='full', inject --junitxml into the test leg (see
+    # _run_or_skip_timed below) and parse the report afterward into
+    # VerifyResult.failing_test_ids — the baseline-attribution signal shared
+    # by verify_failure_is_preexisting_on_main. Gated on breadth=='full'
+    # because only then does a passing verify mean "this module's suite is
+    # genuinely clean" (λ, task 2589); under 'scoped' a pass says nothing
+    # about the rest of main, so seeding an empty baseline would be wrong.
+    #
+    # junit_path is computed here whenever role+breadth match, independent
+    # of whether test_cmd is actually a structured pytest command — deciding
+    # eligibility is left entirely to with_junitxml's own no-op guard
+    # (OPAQUE / raw-retained chain / non-pytest tool / cmd is None all leave
+    # the flag uninjected), so this never duplicates that check. When
+    # nothing ever injects the flag, pytest never writes the report, and
+    # _extract_failing_test_ids_from_junit(junit_path) below degrades to
+    # None (file not found) — the same B3 degrade signal as an unreadable
+    # report.
+    #
+    # The path is worktree-internal (merge worktrees lack `.task/` —
+    # git_ops.py scrubs it) and per-module_prefix (mirrors _stream_log_path's
+    # infix immediately below) so concurrent per-module fan-out within one
+    # worktree can't collide. Absolute: module commands may `cd <prefix>`,
+    # so a relative --junitxml would land in the wrong directory.
+    junit_path: Path | None = None
+    if role == 'merge' and verify_plan._merge_breadth_is_full(config):
+        if module_prefix is not None:
+            _safe_prefix = module_prefix.replace('/', '_').replace(' ', '_')
+            _junit_infix = f'.{_safe_prefix}'
+        else:
+            _junit_infix = ''
+        _junit_dir = worktree / '.df-verify-junit'
+        try:
+            _junit_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            junit_path = None
+        else:
+            junit_path = (_junit_dir / f'report{_junit_infix}.xml').resolve()
+
     if is_merge_verify:
         # Merge worktrees are freshly created per merge — cargo caches are
         # cold and the ``.task/`` marker is absent — so the filesystem
@@ -3368,6 +3409,19 @@ async def run_verification(
         # to _run_cmd, so persisted logs and _summarize_checks see the same
         # command they always have.
         config_cmd = cmd
+        # junitxml injection (task μ, verify-scope-inversion-prd.md): only
+        # the 'test' leg, only when junit_path was computed above (role
+        # =='merge' and breadth=='full'). Identity-check mirrors the
+        # apply_pytest_numprocesses guard further below — with_junitxml
+        # no-ops for OPAQUE/raw-retained/non-pytest commands, so skip the
+        # parse->render round-trip when nothing was actually touched. MUST
+        # run before the cpu-governance wrap immediately below: once
+        # governed, cmd is an opaque outer `<exec> -- /bin/bash -c '...'`
+        # string that parse_config_command can no longer see as pytest.
+        if junit_path is not None and label == 'test':
+            _parsed_for_junit = parse_config_command(cmd)
+            _mutated_for_junit = with_junitxml(_parsed_for_junit, str(junit_path))
+            cmd = cmd if _mutated_for_junit is _parsed_for_junit else render(_mutated_for_junit)
         # Wrap the command in cpu-governed-exec.sh when role=='merge' and
         # cpu_governance is enabled + exec resolves.  Fail-open: returns cmd
         # unchanged when governance is disabled or the path is non-executable,
@@ -3658,6 +3712,15 @@ async def run_verification(
     else:
         _wall_secs = _verify_duration_secs(runs)
 
+    # Task μ: parse the junit report written (if any) by the injection above.
+    # None when junit_path was never computed (role != 'merge', breadth !=
+    # 'full') or the report is missing/unparseable (nothing ever injected
+    # the flag, or the test leg was skipped/crashed before writing it) — the
+    # B3 degrade signal. See _extract_failing_test_ids_from_junit's docstring.
+    failing_test_ids: list[str] | None = None
+    if junit_path is not None:
+        failing_test_ids = _extract_failing_test_ids_from_junit(junit_path)
+
     result = VerifyResult(
         passed=attempt.passed,
         test_output=attempt.test.output,
@@ -3670,6 +3733,7 @@ async def run_verification(
         worktree_log_paths=worktree_log_paths,
         archive_log_paths=archive_log_paths,
         duration_secs=_wall_secs,
+        failing_test_ids=failing_test_ids,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),

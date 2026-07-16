@@ -5,6 +5,7 @@ import contextlib
 import logging
 from dataclasses import asdict
 from pathlib import Path
+from typing import Literal
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -1992,7 +1993,9 @@ class TestRunVerificationJunitxmlInjection:
         '</testsuites>\n'
     )
 
-    def _make_config(self, tmp_path: Path, *, breadth: str = 'full') -> OrchestratorConfig:
+    def _make_config(
+        self, tmp_path: Path, *, breadth: Literal['scoped', 'full'] = 'full',
+    ) -> OrchestratorConfig:
         return OrchestratorConfig(project_root=tmp_path, merge_verify_breadth=breadth)
 
     def _module_config(self, test_command: str = 'pytest tests/') -> ModuleConfig:
