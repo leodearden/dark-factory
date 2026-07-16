@@ -335,69 +335,7 @@ class TestDiscoverOrchestrators:
 
         assert len(result) == 1
         assert result[0]['tasks'] == []
-        assert result[0]['worktrees'] == {}
         assert result[0]['summary'] == {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0}
-
-    async def test_worktree_keyed_by_task_id_not_dirname(self, tmp_path, fake_fetch_tasks, dummy_client):
-        """Worktree dir named 'task-7' is keyed by '7' (not 'task-7') in discover_orchestrators output."""
-        from unittest.mock import patch
-
-        from dashboard.config import DashboardConfig
-        from dashboard.data.orchestrator import discover_orchestrators
-
-        config = DashboardConfig(project_root=tmp_path)
-        fake_fetch_tasks(tmp_path, [
-            {'id': '7', 'title': 'Widget', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ])
-
-        wt_dir = tmp_path / '.worktrees' / 'task-7'
-        wt_dir.mkdir(parents=True)
-        task_dir = wt_dir / '.task'
-        task_dir.mkdir()
-        steps = [{'id': 'step-1', 'status': 'done'}, {'id': 'step-2', 'status': 'pending'}]
-        (task_dir / 'plan.json').write_text(json.dumps({'steps': steps}))
-
-        prd_path = str(tmp_path / 'prd.md')
-        mock_procs = [{'pid': 9000, 'prd': prd_path, 'config_path': None, 'running': True, 'started': 'Mar19'}]
-        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
-
-        assert len(result) == 1
-        worktrees = result[0]['worktrees']
-        assert 7 in worktrees
-        assert 'task-7' not in worktrees
-        assert worktrees[7]['phase'] == 'EXECUTE'
-
-    async def test_non_task_worktree_dirs_excluded(self, tmp_path, fake_fetch_tasks, dummy_client):
-        """Non-task directories (e.g. 'tmp-backup') are excluded; plain and 'task-' numeric dirs included."""
-        from unittest.mock import patch
-
-        from dashboard.config import DashboardConfig
-        from dashboard.data.orchestrator import discover_orchestrators
-
-        config = DashboardConfig(project_root=tmp_path)
-        fake_fetch_tasks(tmp_path, [
-            {'id': '3', 'title': 'T3', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
-            {'id': '5', 'title': 'T5', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
-        ])
-
-        worktrees_dir = tmp_path / '.worktrees'
-        worktrees_dir.mkdir()
-
-        for name in ('task-3', '5', 'tmp-backup'):
-            d = worktrees_dir / name
-            d.mkdir()
-
-        prd_path = str(tmp_path / 'prd.md')
-        mock_procs = [{'pid': 1111, 'prd': prd_path, 'config_path': None, 'running': True, 'started': 'Mar19'}]
-        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
-
-        worktrees = result[0]['worktrees']
-        assert 3 in worktrees
-        assert 5 in worktrees
-        assert 'tmp-backup' not in worktrees
-        assert 'task-3' not in worktrees
 
     async def test_single_process_produces_pids_list(self, tmp_path, fake_fetch_tasks, dummy_client):
         """Single running orchestrator produces entry with 'pids' list and no 'pid' key."""
@@ -446,7 +384,6 @@ class TestDiscoverOrchestrators:
         entry = result[0]
         assert entry['pids'] == [1234, 5678]
         assert len(entry['tasks']) == 1
-        assert 1 in entry['worktrees']
         assert entry['summary']['total'] == 1
 
     async def test_different_projects_produce_separate_entries(self, tmp_path, fake_fetch_tasks, dummy_client):
@@ -733,48 +670,6 @@ class TestDiscoverOrchestratorsPerProject:
         assert len(result) == 1
         assert set(result[0]['pids']) == {1000, 2000}
         assert len(result[0]['tasks']) == 1
-
-    async def test_worktrees_loaded_per_project(self, tmp_path, fake_fetch_tasks, dummy_client):
-        """Each orchestrator sees worktrees from its own project."""
-        from unittest.mock import patch
-
-        from dashboard.config import DashboardConfig
-        from dashboard.data.orchestrator import discover_orchestrators
-
-        config = DashboardConfig(project_root=tmp_path)
-
-        proj_a = tmp_path / 'proj_a'
-        proj_a.mkdir()
-        (proj_a / '.taskmaster').mkdir()
-        fake_fetch_tasks(proj_a, [
-            {'id': '3', 'title': 'A-task', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ])
-        wt_a = proj_a / '.worktrees' / '3' / '.task'
-        wt_a.mkdir(parents=True)
-        (wt_a / 'plan.json').write_text(json.dumps({'steps': [{'id': 's1', 'status': 'done'}]}))
-
-        proj_b = tmp_path / 'proj_b'
-        proj_b.mkdir()
-        (proj_b / '.taskmaster').mkdir()
-        fake_fetch_tasks(proj_b, [
-            {'id': '5', 'title': 'B-task', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ])
-        wt_b = proj_b / '.worktrees' / '5' / '.task'
-        wt_b.mkdir(parents=True)
-        (wt_b / 'plan.json').write_text(json.dumps({'steps': [{'id': 's1', 'status': 'pending'}]}))
-
-        mock_procs = [
-            {'pid': 1000, 'prd': str(proj_a / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
-            {'pid': 2000, 'prd': str(proj_b / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
-        ]
-        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
-            result = await discover_orchestrators(client=dummy_client, config=config)
-
-        by_root = {e['project_root']: e for e in result}
-        assert set(by_root[str(proj_a)]['worktrees'].keys()) == {3}
-        assert by_root[str(proj_a)]['worktrees'][3]['phase'] == 'DONE'
-        assert set(by_root[str(proj_b)]['worktrees'].keys()) == {5}
-        assert by_root[str(proj_b)]['worktrees'][5]['phase'] == 'EXECUTE'
 
     async def test_fallback_to_config_project_root(self, tmp_path, fake_fetch_tasks, dummy_client):
         """When PRD path has no .taskmaster/ ancestor, falls back to config project_root."""
