@@ -305,6 +305,16 @@ def _lifespan_block(records: list[tuple[Escalation, dict]], *, now: datetime) ->
       WARNING. ``p50_secs``/``p90_secs`` are ``None`` when no deltas were
       collected. No L0->L1 metric — see design_decisions (open question 7):
       the model has no machine-readable L0->L1 link.
+    - ``triage_segments`` (render-when-present, 2555 forward-compat):
+      ``{count, filed_to_triaged:{p50,p90}, triaged_to_resolved:{p50,p90}}``
+      over terminal-with-valid-times records whose *raw* dict carries a
+      parseable ``triaged_at`` (``triaged_at`` is not an ``Escalation``
+      dataclass field, so it is read from the retained raw dict, not
+      ``esc``). ``filed_to_triaged`` = ``triaged_at - timestamp``;
+      ``triaged_to_resolved`` = ``resolved_at - triaged_at``. Omitted
+      entirely (no key) when no record in the project carries a parseable
+      ``triaged_at`` — this is a render-when-present field, not a
+      zero-filled one.
     """
     by_id: dict[str, Escalation] = {esc.id: esc for esc, _raw in records}
 
@@ -312,6 +322,8 @@ def _lifespan_block(records: list[tuple[Escalation, dict]], *, now: datetime) ->
     samples: list[list] = []
     open_items: list[dict] = []
     promotion_deltas: list[float] = []
+    filed_to_triaged_deltas: list[float] = []
+    triaged_to_resolved_deltas: list[float] = []
 
     for esc, _raw in records:
         if esc.level == 2 and esc.members:
@@ -386,6 +398,19 @@ def _lifespan_block(records: list[tuple[Escalation, dict]], *, now: datetime) ->
         secs_by_level.setdefault(esc.level, []).append(secs)
         samples.append([resolved_at.date().isoformat(), tier, esc.level, secs])
 
+        triaged_at_raw = _raw.get('triaged_at')
+        if triaged_at_raw:
+            try:
+                triaged_at = parse_utc(triaged_at_raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    '_lifespan_block: unparseable triaged_at on terminal %s: %r',
+                    esc.id, triaged_at_raw,
+                )
+            else:
+                filed_to_triaged_deltas.append((triaged_at - filed_at).total_seconds())
+                triaged_to_resolved_deltas.append((resolved_at - triaged_at).total_seconds())
+
     percentiles_by_level = {
         str(level): {
             'p50': percentile(sorted(secs_list), 50),
@@ -401,12 +426,29 @@ def _lifespan_block(records: list[tuple[Escalation, dict]], *, now: datetime) ->
         'p90_secs': percentile(promotion_deltas, 90) if promotion_deltas else None,
     }
 
-    return {
+    result = {
         'percentiles_by_level': percentiles_by_level,
         'l1_to_l2_promotion': l1_to_l2_promotion,
         'samples': samples,
         'open_items': open_items,
     }
+
+    if filed_to_triaged_deltas:
+        filed_to_triaged_deltas.sort()
+        triaged_to_resolved_deltas.sort()
+        result['triage_segments'] = {
+            'count': len(filed_to_triaged_deltas),
+            'filed_to_triaged': {
+                'p50': percentile(filed_to_triaged_deltas, 50),
+                'p90': percentile(filed_to_triaged_deltas, 90),
+            },
+            'triaged_to_resolved': {
+                'p50': percentile(triaged_to_resolved_deltas, 50),
+                'p90': percentile(triaged_to_resolved_deltas, 90),
+            },
+        }
+
+    return result
 
 
 # ---------------------------------------------------------------------------
