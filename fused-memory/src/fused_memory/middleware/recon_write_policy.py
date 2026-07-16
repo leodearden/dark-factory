@@ -74,16 +74,42 @@ TERMINAL_CORRECTIVE_PATH = 'set_task_status_done_provenance_repair'
 # never reach this predicate.
 CLEARABLE_ANNOTATION_KEYS: frozenset[str] = frozenset({'possible_scope_mismatch'})
 
-# Task-content ``update_task`` kwargs that disqualify a write from the
-# terminal-annotation-clear exemption. Presence of any of these means the
-# caller is mutating task content, not merely clearing an advisory
-# annotation — a genuine freeze violation Gate 1 must still block.
-# ``status`` and ``metadata.done_provenance`` are deliberately excluded from
-# this list for the same reason noted on :data:`CLEARABLE_ANNOTATION_KEYS`:
-# the write-authority floor already rejects them unconditionally.
-_NON_METADATA_CONTENT_FIELDS: tuple[str, ...] = (
-    'title', 'description', 'details', 'prompt', 'priority', 'dependencies',
-)
+# Allowlist (robustness amendment, task 2684) of ``update_task`` kwargs that
+# NEVER disqualify the terminal-annotation-clear exemption. Deliberately an
+# allowlist of permitted kwargs, NOT a denylist of known content fields: a
+# denylist (title/description/details/prompt/priority/dependencies) has the
+# OPPOSITE default-safety posture from :data:`CLEARABLE_ANNOTATION_KEYS`'s
+# frozen-by-default allowlist — a *new* content-mutating ``update_task``
+# parameter added later (e.g. a hypothetical ``owner`` or ``subtasks`` field)
+# would silently pass through a denylist until someone remembered to add it
+# there, permitting a content mutation on a terminal task alongside a
+# sanctioned annotation clear. An allowlist fails CLOSED instead: an
+# unrecognized kwarg disqualifies the exemption until deliberately added
+# here, matching :data:`CLEARABLE_ANNOTATION_KEYS`'s posture so both checks
+# in :func:`is_terminal_annotation_clear` agree.
+#
+# This is a *kwarg-name* allowlist (is this top-level ``update_task``
+# parameter one the exemption may ignore?) — a different axis from
+# :data:`CLEARABLE_ANNOTATION_KEYS`, which is a *metadata-key* allowlist
+# (is this key inside the ``metadata`` dict one the exemption may clear?).
+# The two compose: both must hold for the exemption to apply.
+#
+# ``metadata``/``metadata_mode``/``append`` are specially inspected below
+# (not merely ignored). ``tag`` selects the tag-scoped row
+# (``WHERE tag = ? AND id = ?`` in ``sqlite_task_backend.update_task``) and
+# is never itself written — addressing, not content. ``status`` is included
+# for the same reason :data:`CLEARABLE_ANNOTATION_KEYS` never eligibility-
+# checks it: the write-authority floor unconditionally rejects a non-None
+# ``status`` for every caller, before any DB write is attempted, regardless
+# of this predicate's verdict — carrying forward the original design
+# decision rather than silently reversing it. ``agent_id`` never actually
+# reaches ``update_kwargs`` in practice (the ``task_interceptor.update_task``
+# call site captures it as a separate keyword-only parameter, out of
+# ``**kwargs``) — listed here only so a direct caller of this predicate is
+# not surprised.
+_ANNOTATION_CLEAR_ALLOWED_KWARGS: frozenset[str] = frozenset({
+    'metadata', 'metadata_mode', 'append', 'tag', 'status', 'agent_id',
+})
 
 # ---------------------------------------------------------------------------
 # Verdict
@@ -372,8 +398,11 @@ def is_terminal_annotation_clear(update_kwargs: dict) -> bool:
     ``is_annotation_clear`` bypass (task 2684) for a non-load-bearing
     annotation-only ``update_task`` write against a terminal task:
 
-    (a) No :data:`_NON_METADATA_CONTENT_FIELDS` key in *update_kwargs* has a
-        non-``None`` value — a content mutation disqualifies unconditionally.
+    (a) Every key in *update_kwargs* with a non-``None`` value is in
+        :data:`_ANNOTATION_CLEAR_ALLOWED_KWARGS` — an unrecognized kwarg
+        (any ``update_task`` parameter not on that allowlist, including a
+        content-mutating field added after this predicate was written)
+        disqualifies unconditionally: fail CLOSED, not open.
     (b) The effective metadata merge mode is ``'merge'`` — mirroring
         ``sqlite_task_backend._resolve_metadata_mode``'s precedence
         (``metadata_mode`` wins; else ``append`` True->additive/False->replace;
@@ -389,7 +418,10 @@ def is_terminal_annotation_clear(update_kwargs: dict) -> bool:
     A "clear" is a merge-overwrite (including to ``None``); this predicate
     has no notion of key deletion (metadata has no such primitive).
     """
-    if any(update_kwargs.get(field) is not None for field in _NON_METADATA_CONTENT_FIELDS):
+    if any(
+        key not in _ANNOTATION_CLEAR_ALLOWED_KWARGS and value is not None
+        for key, value in update_kwargs.items()
+    ):
         return False
 
     metadata_mode = update_kwargs.get('metadata_mode')

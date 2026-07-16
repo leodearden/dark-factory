@@ -482,6 +482,41 @@ class TestIsTerminalAnnotationClear:
             {'metadata': {'possible_scope_mismatch': None}, 'dependencies': [1, 2]},
         ) is False
 
+    # -- negative: unrecognized kwargs fail closed (robustness amendment) ---
+
+    def test_unrecognized_future_kwarg_is_false(self):
+        """A hypothetical `update_task` parameter that doesn't exist yet (and
+        so cannot be on any denylist) must still disqualify the exemption —
+        the allowlist (_ANNOTATION_CLEAR_ALLOWED_KWARGS) fails CLOSED for any
+        kwarg it doesn't recognize, unlike a denylist which would silently
+        let an unenumerated field through."""
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'owner': 'alice'},
+        ) is False
+
+    def test_unrecognized_kwarg_alone_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'some_new_field': 'x'},
+        ) is False
+
+    # -- positive: allowlisted non-content kwargs don't disqualify -----------
+
+    def test_tag_present_is_still_true(self):
+        """`tag` selects the tag-scoped row (addressing); it is never itself
+        written, so it is not a content mutation."""
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'tag': 'master'},
+        ) is True
+
+    def test_status_present_is_still_true(self):
+        """`status` is deliberately excluded from consideration here (same
+        rationale as CLEARABLE_ANNOTATION_KEYS): the write-authority floor
+        unconditionally rejects a non-None status for every caller before
+        any DB write, regardless of this predicate's verdict."""
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'status': 'done'},
+        ) is True
+
     # -- negative: non-allowlisted metadata keys -----------------------------
 
     def test_non_allowlisted_key_is_false(self):
