@@ -335,12 +335,21 @@ It takes **no path argument** — it always re-reads the process's own `ORCH_CON
 | Edit | Action |
 |---|---|
 | Per-role `models` / `budgets` / `max_turns` / `effort` / `timeouts` / `backends` | Reload |
+| `routing.*` (`allowed_models` / `ladder` / `per_model_daily_ceiling_usd` / `rules`) | Reload |
 | Steward grace (`steward_completion_timeout`, `steward_lifetime_budget`) | Reload |
 | Scheduler + starvation-watchdog tuning, loop-pass thresholds (`idle_poll_secs`, `orphan_l0_timeout_secs`, watcher-rotation params) | Reload |
 | `review.*` checkpoint knobs, `unblock_auto.*`, `verify_env` | Reload |
 | `git.offline_lane_*` leaf tunables (test threads, poll interval, red-advance count) | Reload |
 | `max_concurrent_tasks`, pool sizes / `verify_runners`, `escalation` bind host/port, `sandbox.backend`, `project_root`, merge-lane `git.*` structural fields (`branch_prefix`, `main_branch`, `persistent_merge_worktree`, …) | **Restart** — these are startup-baked (semaphores, pool sizes, bound sockets, module globals); reload reports them in `restart_required` without touching the running process |
 | Any code change (not just YAML) | **Restart** — reload only re-reads config, never code |
+
+`routing.*` is green-tier hot-reloadable like the other per-role knobs — its
+leaves are auto-covered by `RELOADABLE_FIELDS` through
+`config._submodel_leaf_paths` (task 2535 step-16 confirmed this), matching
+the existing per-role `models`/`budgets`/`max_turns`/`effort`/`backends`
+reload semantics. An operator can install/retune a policy rule or bump
+`allowed_models`/ceilings without a restart, then read `applied` /
+`restart_required` in the reload response as usual.
 
 When unsure, reload first — it's cheap and non-destructive (fail-closed on bad YAML, never half-applies), then check the response for anything in `restart_required` and restart only if something you actually need is on that list.
 
