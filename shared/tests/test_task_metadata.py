@@ -1124,6 +1124,23 @@ class TestParseMetadataFailurePolicy:
         dumped = model.model_dump()
         assert dumped['prd_path'] == blob['prd_path']
 
+    # Table-driven over the FULL _BLESSED_METADATA_KEYS frozenset (imported
+    # directly), rather than the hand-maintained partial sample above (which
+    # only covers 25 of the 34 entries). Every key gets its own parametrized
+    # case, so a typo'd or accidentally-unskipped entry fails immediately
+    # instead of silently reappearing as unknown_key census noise, and the
+    # test stays in lockstep as the allowlist grows -- no manual sample to
+    # update.
+    @pytest.mark.parametrize(
+        'blessed_key', sorted(task_metadata_module._BLESSED_METADATA_KEYS)
+    )
+    def test_every_blessed_metadata_key_individually_suppresses_unknown_key_warning(
+        self, blessed_key
+    ):
+        _, warnings = parse_metadata({blessed_key: 'v'}, direction='read')
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert blessed_key not in unknown_key_fields
+
     def test_deterministic_invariant_violation_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)
