@@ -4776,9 +4776,10 @@ async def _check_reopen_freshness(
 
     When the gate fires, the evidence commit's committer date and
     ``reopen_at`` are both normalised to aware UTC and compared. Evidence
-    dated before the reopen is STALE. Per task 2674 S2, an unparseable date
-    on either side currently returns None (fail-OPEN) — S10 flips this to
-    fail-closed (treat as stale).
+    dated before the reopen is STALE. Fail-CLOSED (task 2674 S10): an
+    unparseable date on either side (git failure / parse failure) is ALSO
+    treated as stale — a gate that cannot prove freshness must not certify
+    it, so the comparison never silently passes on indeterminate input.
 
     On stale, BEFORE the enforce/warn mode dispatch: a well-formed,
     non-recon-stage ``raw_done_provenance['stale_evidence_override']``
@@ -4818,7 +4819,7 @@ async def _check_reopen_freshness(
     evidence_dt = _parse_aware_utc(evidence_committed_at) if evidence_committed_at else None
     reopen_dt = _parse_aware_utc(reopen_at)
 
-    stale = evidence_dt is not None and reopen_dt is not None and evidence_dt < reopen_dt
+    stale = evidence_dt is None or reopen_dt is None or evidence_dt < reopen_dt
     if not stale:
         return None
 
