@@ -27,7 +27,7 @@ from pydantic import ValidationError
 from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.event_store import EventType
-from orchestrator.scheduler import Scheduler, TickContext
+from orchestrator.scheduler import Scheduler, SchedulerCallbacks, TickContext
 
 # ---------------------------------------------------------------------------
 # TestRunnerGrepKind (task 2580 — step-1 RED / step-2 GREEN)
@@ -475,6 +475,37 @@ class TestTickContextField:
         ctx2 = TickContext(tasks=[], status_map={}, tasks_by_id={})
         ctx1.delivered_check_cache['x'] = True
         assert ctx2.delivered_check_cache == {}
+
+    def test_delivered_check_cache_accepts_none(self):
+        """task 2583 (epsilon): the annotation widens to dict[str, bool] |
+        None so the kill switch (delivered_checks.enabled=False) can signal
+        'gate off' distinctly from 'sweep ran, found nothing checked' ({})."""
+        ctx = TickContext(
+            tasks=[], status_map={}, tasks_by_id={}, delivered_check_cache=None,
+        )
+        assert ctx.delivered_check_cache is None
+
+
+# ---------------------------------------------------------------------------
+# TestSchedulerCallbacksOnDeliveredCheckBlock (task 2583 — step-3 RED / step-4 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerCallbacksOnDeliveredCheckBlock:
+    """``SchedulerCallbacks`` must carry an ``on_delivered_check_block`` hook,
+    defaulting to None, mirroring ``on_external_dep_block`` — the structural
+    plumbing the grace-streak escalation (task 2583, epsilon) invokes."""
+
+    def test_defaults_to_none(self):
+        assert SchedulerCallbacks().on_delivered_check_block is None
+
+    def test_accepts_constructor_kwarg(self):
+        async def _fn(task_id, *, summary, detail, category):
+            pass
+
+        callbacks = SchedulerCallbacks(on_delivered_check_block=_fn)
+
+        assert callbacks.on_delivered_check_block is _fn
 
 
 # ---------------------------------------------------------------------------
