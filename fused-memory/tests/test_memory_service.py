@@ -8251,3 +8251,57 @@ class TestStoreFailureDiagnosticsHelper:
         assert 'cypher boom' in diag['error']
         assert diag['query_len'] == len('dup nodes q')
         assert diag['project_id'] == 'reify'
+
+    @pytest.mark.asyncio
+    async def test_search_raised_exception_populates_failure_diagnostics(self, service):
+        """Reproduce the exact observed signature end-to-end via MemoryService.search:
+        search() degrades on a graphiti query-execution failure while get_status
+        (the connectivity/liveness probe) stays connected — NOT connectivity loss
+        (ruling out prior tasks 382/98). graphiti.list_graphs/node_count succeed
+        while graphiti.search (a full hybrid Cypher+embedding+BM25 query) raises.
+
+        RED: search() does not populate failure_diagnostics yet.
+        """
+        from fused_memory.services.memory_service import SearchResults
+
+        service.graphiti.search = AsyncMock(side_effect=RuntimeError('cypher boom'))
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {'id': 'mem0-1', 'memory': 'some surviving fact', 'score': 0.8, 'metadata': {}},
+            ],
+        })
+        service.graphiti.list_graphs = AsyncMock(return_value=['reify'])
+        service.graphiti.node_count = AsyncMock(return_value=1)
+        service.mem0.list_projects = AsyncMock(return_value=[])
+        service.mem0.count = AsyncMock(return_value=0)
+
+        res = await service.search(
+            query='duplicate orchestrator Graphiti entity nodes', project_id='reify',
+        )
+
+        assert isinstance(res, SearchResults), f'Expected SearchResults, got {type(res)}'
+        assert res.degraded is True
+        assert res.failed_stores == ['graphiti']
+        assert any(r.content == 'some surviving fact' for r in res), (
+            f'Expected the mem0 result to still be present in res, got {list(res)!r}. '
+            'mem0 must keep returning even though graphiti degrades.'
+        )
+
+        diagnostics = getattr(res, 'failure_diagnostics', None)
+        assert diagnostics, (
+            f'Expected a non-empty failure_diagnostics list, got {diagnostics!r}. '
+            'RED: search() does not populate failure_diagnostics yet.'
+        )
+        graphiti_diag = next((d for d in diagnostics if d.get('store') == 'graphiti'), None)
+        assert graphiti_diag is not None, f'Expected a graphiti entry in {diagnostics!r}'
+        assert graphiti_diag['error_type'] == 'RuntimeError'
+        assert graphiti_diag['reason'] == 'exception'
+        assert graphiti_diag['store'] == 'graphiti'
+
+        # The exact reported asymmetry: search degrades while get_status stays
+        # connected — a query-execution failure, not a connectivity loss.
+        st = await service.get_status(project_id='reify')
+        assert st['graphiti']['connected'] is True, (
+            f"Expected get_status to report graphiti connected=True even though "
+            f"search degraded, got {st['graphiti']!r}."
+        )
