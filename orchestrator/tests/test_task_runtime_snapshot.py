@@ -91,7 +91,8 @@ def _tool_runtime_tasks(git_ops: GitOps, tmp_path: Path) -> tuple[dict[int, dict
     )
     server = create_server(EscalationQueue(tmp_path / 'esc'), harness=fixture)
     tool = asyncio.run(server.get_tool('get_task_runtime_state'))
-    result = tool.fn()
+    assert tool is not None
+    result = tool.fn()  # type: ignore[union-attr]
     return {t['task_id']: t for t in result['tasks']}, result['offline']
 
 
