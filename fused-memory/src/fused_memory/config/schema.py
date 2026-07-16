@@ -616,7 +616,11 @@ class ReconciliationConfig(BaseModel):
             "'task_status.done_evidence_stale_warn' WARNING and proceeds. "
             "'enforce': the write is rejected with a typed "
             "done_evidence_stale error. Task alpha ships warn; task gamma "
-            'flips the default to enforce after task beta lands.'
+            "flips the default to enforce after task beta lands. NOTE: a "
+            "present-but-invalid stale_evidence_override (malformed shape, "
+            "or supplied by a recon-stage caller) always rejects with "
+            "done_evidence_stale_override_invalid regardless of this "
+            'setting — that one rejection is not gated by warn/enforce.'
         ),
     )
 

@@ -4640,6 +4640,9 @@ async def _resolve_commit_committed_at(project_root: str, sha: str) -> str | Non
             stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
         except TimeoutError:
             proc.kill()
+            # Reap the killed child promptly rather than leaving it as a
+            # transient zombie until GC finalizes the Process object.
+            await proc.wait()
             return None
     except FileNotFoundError:
         return None
@@ -4780,6 +4783,18 @@ async def _check_reopen_freshness(
     unparseable date on either side (git failure / parse failure) is ALSO
     treated as stale — a gate that cannot prove freshness must not certify
     it, so the comparison never silently passes on indeterminate input.
+    This deliberately does not distinguish a transient git failure (binary
+    hiccup, timeout) from a genuinely pre-reopen commit — both fail closed
+    identically; see ``task_status.done_evidence_stale_unresolved_commit``
+    below for the observability seam that at least makes the two cases
+    distinguishable in logs ahead of the task-gamma enforce flip.
+
+    Whenever the evidence commit's committer date cannot be resolved at
+    all (``_resolve_commit_committed_at`` returns None), a
+    ``task_status.done_evidence_stale_unresolved_commit`` WARNING (stable
+    grep anchor) is logged unconditionally — in both modes, and whether or
+    not an override subsequently bypasses the gate — purely as a
+    diagnostic aid; it does not itself change the accept/reject outcome.
 
     On stale, BEFORE the enforce/warn mode dispatch: a well-formed,
     non-recon-stage ``raw_done_provenance['stale_evidence_override']``
@@ -4803,6 +4818,15 @@ async def _check_reopen_freshness(
     override is always a loud caller error, never a silent fall-through to
     the plain ``done_evidence_stale`` rejection or (worse) an accept. Only
     the no-override stale path proceeds to the enforce/warn mode dispatch.
+
+    Rollout-safety note: this makes the override-invalid rejection the
+    ONE case where 'warn' mode is not purely observational — every other
+    branch of 'warn' mode (no override, or a *valid* override) never
+    blocks a write. This is intentional (a malformed override is a caller
+    bug, not a staleness verdict the rollout mode should suppress — see
+    task 2674 design decisions), not an oversight; callers relying on
+    warn-mode being unconditionally non-blocking during the alpha rollout
+    must still handle ``done_evidence_stale_override_invalid``.
     """
     if not isinstance(resolved_provenance, dict):
         return None
@@ -4816,6 +4840,21 @@ async def _check_reopen_freshness(
         return None
 
     evidence_committed_at = await _resolve_commit_committed_at(project_root, evidence_commit)
+    if evidence_committed_at is None:
+        # Distinguishable from a genuine date-based staleness verdict: this
+        # fires whenever `git show` itself failed (binary missing, timeout,
+        # non-zero exit) rather than because the comparison found the
+        # evidence dated before reopen_at. The disposition is unchanged
+        # (still fail-closed — see the module docstring), but this gives
+        # operators a grep-stable way to tell "couldn't prove freshness
+        # because git errored" apart from "proved stale" ahead of the
+        # task-gamma enforce flip. Logged unconditionally (both modes),
+        # before the override/mode dispatch below.
+        logger.warning(
+            'task_status.done_evidence_stale_unresolved_commit task_id=%s '
+            'evidence_commit=%s reopen_at=%s agent_id=%s',
+            task_id, evidence_commit, reopen_at, agent_id,
+        )
     evidence_dt = _parse_aware_utc(evidence_committed_at) if evidence_committed_at else None
     reopen_dt = _parse_aware_utc(reopen_at)
 
