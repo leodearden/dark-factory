@@ -5727,6 +5727,16 @@ class TaskWorkflow:
 
         self.artifacts.update_base_commit(current_main)
 
+        # Re-derive any plan step whose status regressed to (or never
+        # advanced past) "pending" even though it's genuinely complete on
+        # this branch (task 2387) — before task 2386's
+        # _reconcile_done_step_commits and the loop's self.plan = read_plan()
+        # re-reads (see _execute_iterations), so a pending->done flip here is
+        # picked up as part of that same refresh. Best-effort/self-contained
+        # (never raises), so the return dict and event-label behavior below
+        # are unaffected.
+        await self._rederive_step_status_from_branch_state()
+
         # Capture is_first BEFORE incrementing the counter (0 == this is the
         # first rebase of a fresh per-dispatch WorkflowMetrics instance).
         is_first = self.metrics.inter_iteration_rebases == 0
