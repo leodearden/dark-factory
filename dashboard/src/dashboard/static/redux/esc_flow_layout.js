@@ -149,7 +149,12 @@ function aggregateFlow(flowDaily, { topNSources = 6 } = {}) {
 }
 
 // Turns an aggregateFlow() count model into pixel geometry: {nodes, ribbons,
-// width, height}. `dims` = {width, height, nodeWidth, nodePad}.
+// width, height, colX}. `dims` = {width, height, nodeWidth, nodePad}. `colX`
+// is the same per-column left-edge x array used to place every node in that
+// column (nodes[i].x === colX[nodes[i].col]) — exposed so a caller (e.g.
+// esc_flow_diagram.jsx's column headers) can align to the exact same
+// coordinates nodes/ribbons use, instead of re-deriving its own approximation
+// and silently drifting out of sync.
 //
 // nodes: one {col, id, label, count, x, y, w, h} per column entry, stacked
 // top-to-bottom within each column (vertically centered as a group) with
@@ -169,13 +174,16 @@ function layoutFlow(model, { width = 640, height = 260, nodeWidth = 14, nodePad 
   const columns = (model && model.columns) || [];
   const links = (model && model.links) || [];
 
-  const anyNodes = columns.some(col => col.length > 0);
-  if (!anyNodes) {
-    return { nodes: [], ribbons: [], width, height };
-  }
-
+  // Hoisted above the anyNodes early-return so `colX` is available on EVERY
+  // return path (including the degenerate all-zero-count case) — it depends
+  // only on width/nodeWidth/column count, never on the actual node counts.
   const numCols = columns.length;
   const colX = columns.map((_, i) => (numCols <= 1 ? 0 : (i * Math.max(width - nodeWidth, 0)) / (numCols - 1)));
+
+  const anyNodes = columns.some(col => col.length > 0);
+  if (!anyNodes) {
+    return { nodes: [], ribbons: [], width, height, colX };
+  }
 
   let scale = Infinity;
   for (const col of columns) {
@@ -247,7 +255,7 @@ function layoutFlow(model, { width = 640, height = 260, nodeWidth = 14, nodePad 
     return { col: link.col, from: link.from, to: link.to, count: link.count, w, d };
   });
 
-  return { nodes, ribbons, width, height };
+  return { nodes, ribbons, width, height, colX };
 }
 
 const API = { aggregateFlow, layoutFlow };

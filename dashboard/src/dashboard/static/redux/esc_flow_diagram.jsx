@@ -57,10 +57,15 @@ function LifecycleFlowDiagram({ flowDaily, width = 640, height = 260 }) {
 
   return (
     <svg viewBox={`0 0 ${geo.width} ${height}`} style={{ width: '100%', height, display: 'block' }}>
+      {/* geo.colX[i] is the SAME per-column x layoutFlow uses to place that
+          column's node rects (nodes[i].x === geo.colX[nodes[i].col]) — using
+          it here (rather than independently re-deriving an x from geo.width)
+          keeps headers pinned to their actual column geometry even if
+          nodeWidth/width/column count ever change. */}
       {_COLUMN_LABELS.map((label, i) => (
         <text
           key={label}
-          x={geo.width * (i / (_COLUMN_LABELS.length - 1))}
+          x={geo.colX[i]}
           y={10}
           fontSize="9"
           fill={C.PALETTE.fg3}
