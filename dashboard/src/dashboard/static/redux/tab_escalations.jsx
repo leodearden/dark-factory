@@ -11,6 +11,7 @@
 const { useState: uS, useEffect: uE } = React;
 const { ProjectGroup, taskId } = window.DF_SHELL;
 const DF = window.DF_DATA;
+const C = window.DF_CHARTS;
 
 // ── Local helpers (tabs.jsx-compatible copies; not exported from any namespace) ──
 
@@ -84,6 +85,30 @@ function sevClass(sev) {
   return 'esc-sev-low';
 }
 
+// ── EscalationStatStrip — four-tile summary (benign rate, 6h breaches,
+//    esc/done, churn), reading the ESCALATION_ANALYTICS payload already
+//    wired into DF_DATA by the analytics tab (no duplicated computation) ──
+
+function EscalationStatStrip({ analytics, projectFilter }) {
+  const a = analytics || DF.ESCALATION_ANALYTICS;
+  const projects = (a.per_project || []).filter(p => {
+    if (!projectFilter || projectFilter.length === 0) return true;
+    return projectFilter.includes(p.project);
+  });
+
+  // TODO(2660 step-4): replace placeholder tiles below with real windowed
+  // rollups over `projects` (workflow.flow_daily / lifespan.open_items /
+  // workflow.esc_per_done_daily / workflow.churn_daily).
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, marginBottom: 10 }}>
+      <C.StatTile label="tile 1" value="—" />
+      <C.StatTile label="tile 2" value="—" />
+      <C.StatTile label="tile 3" value="—" />
+      <C.StatTile label="tile 4" value="—" />
+    </div>
+  );
+}
+
 // ── EscalationsTab ──
 
 function EscalationsTab({ projectFilter }) {
@@ -154,6 +179,8 @@ function EscalationsTab({ projectFilter }) {
 
   return (
     <div style={{ position: 'relative' }}>
+      <EscalationStatStrip analytics={DF.ESCALATION_ANALYTICS} projectFilter={projectFilter} />
+
       {/* Controls header */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
         {/* Level filter chips */}
