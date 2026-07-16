@@ -893,6 +893,27 @@ class CuratorConfig(BaseModel):
         ),
     )
 
+    # Recon claim-verification backstop (task 2438): when True, specific
+    # code-level tokens a Stage 2 candidate attributes to a completed
+    # task/commit/ACTION (a metadata key, a stamp like foo=true, a named
+    # identifier) are verified against the live source tree + git history
+    # before the candidate is filed. Unlike recon_code_fix_premise_registry_path
+    # above, an unverified token is never dropped — it is only logged as an
+    # advisory recon_claim_verification.unverified WARNING for human review.
+    # False (default) disables the guard, keeping every existing caller
+    # byte-identical.
+    recon_claim_verification_enabled: bool = Field(
+        default=False,
+        description=(
+            "When True, the recon claim-verification backstop runs on filed "
+            "candidates: code-level tokens attributed to a completed "
+            "task/commit/ACTION are verified against the live tree + git "
+            "history, and unverified tokens are logged as "
+            "recon_claim_verification.unverified WARNINGs for human review. "
+            "False disables the guard."
+        ),
+    )
+
     # Operational-ask registry: path (absolute, or relative to server cwd) of a
     # YAML registry of recurring operational live-data/live-mutation asks —
     # deliverables that are already-built+unit-tested scripts whose remaining
