@@ -249,7 +249,7 @@ class TestStewardCostStoreConstructor:
     def test_cost_store_stored_when_provided(
         self, worktree, mock_config, mock_mcp, mock_briefing, mock_queue,
     ):
-        sentinel = object()
+        sentinel = MagicMock()
         steward = TaskSteward(
             task_id='42',
             task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
