@@ -742,6 +742,11 @@ class TaskSteward:
                 mcp_config=mcp_config,
                 effort=self.config.effort.triage,
                 backend=self.config.backends.triage,
+                cost_store=self.cost_store,
+                run_id=self.event_store.run_id if self.event_store else '',
+                task_id=self.task_id,
+                project_id=self.config.fused_memory.project_id,
+                role='triage',
             )
         except AllAccountsCappedException as e:
             # BD-1: the reason text is single-sourced from the SAME
