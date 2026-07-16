@@ -1875,7 +1875,7 @@ async def _run_post_merge_verify(
             )
             if detail:
                 reason = f'{reason}\n\n{detail}'
-            return MergeOutcome('blocked', reason=reason, failure_category=verify.category)
+            return MergeOutcome('blocked', reason=reason)
 
         # Main-health probe: classify whether this failure is pre-existing on
         # bare main HEAD rather than introduced by this merge.  Inserted after
