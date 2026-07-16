@@ -10,6 +10,7 @@ import pytest
 from _orch_helpers import assert_update_wire_mode
 from shared.cli_invoke import AllAccountsCappedException
 
+import orchestrator.harness as harness_module
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
@@ -504,3 +505,46 @@ async def test_tag_task_modules_routes_through_seed_modules(tmp_path):
     task_id, metadata_json = h.scheduler.update_task.call_args.args
     assert task_id == '1'
     assert json.loads(metadata_json)['files'] == ['src/config/schema.py']
+
+
+# ---------------------------------------------------------------------------
+# _extract_tagger_entries: StructuredOutput wrapper-peeling normalizer
+# (task 2561 defect 3 / acceptance c)
+# ---------------------------------------------------------------------------
+
+_EXTRACT_TAGGER_ENTRIES_CASES = [
+    pytest.param(
+        {'predictions': [{'id': '1', 'files': ['a.py']}]},
+        [{'id': '1', 'files': ['a.py']}],
+        id='new_flat_predictions',
+    ),
+    pytest.param(
+        {'tasks': [{'id': '1', 'files': ['a.py']}]},
+        [{'id': '1', 'files': ['a.py']}],
+        id='legacy_single_wrap_tasks',
+    ),
+    pytest.param(
+        {'tasks': {'tasks': [{'id': '1', 'files': ['a.py']}]}},
+        [{'id': '1', 'files': ['a.py']}],
+        id='legacy_double_wrap_tasks_tasks',
+    ),
+    pytest.param({}, [], id='empty_dict'),
+    pytest.param(None, [], id='none'),
+    pytest.param({'tasks': {}}, [], id='tasks_maps_to_empty_dict'),
+]
+
+
+@pytest.mark.parametrize('payload, expected', _EXTRACT_TAGGER_ENTRIES_CASES)
+def test_extract_tagger_entries(payload, expected):
+    """_extract_tagger_entries must peel known wrapper keys up to a bounded depth.
+
+    Accepts the new flat {"predictions": [...]} shape (post-rename), the
+    legacy single-wrap {"tasks": [...]}, and the legacy double-wrap
+    {"tasks": {"tasks": [...]}} produced when the StructuredOutput tool's
+    sole parameter collides with the schema's top-level key. Anything that
+    doesn't resolve to a list fails safe to [] (no tagging, no crash).
+
+    Fails now with AttributeError: orchestrator.harness has no
+    _extract_tagger_entries yet (added in step-4).
+    """
+    assert harness_module._extract_tagger_entries(payload) == expected
