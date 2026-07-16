@@ -601,6 +601,57 @@ def _degrade_or_reraise(exc: Exception, name: str) -> dict:
     return _graphiti_degraded_entity_result()
 
 
+def _store_failure_diagnostics(
+    store: SourceStore,
+    exc: BaseException | None,
+    *,
+    query: str,
+    project_id: str,
+    reason: str,
+) -> dict:
+    """Build a structured failure-diagnostics dict for a degraded search() store.
+
+    Called from search() for both root-cause variants a selected store can hit:
+    ``reason='exception'`` when the store's search task raised (any exception other
+    than the inner GraphitiBackend.search TimeoutError swallow — see search()'s
+    per-task except block), and ``reason='timeout'`` when the store's task was
+    still pending when the OUTER ``search_timeout_seconds`` asyncio.wait deadline
+    elapsed and was cancelled (there, *exc* is None — there is no exception object,
+    only the fact of the timeout).
+
+    This is the diagnosability fix for task 2653: search()'s prior degraded-path
+    WARNING carried only ``{'store': ..., 'error': str(e)}`` — no exception type, no
+    query shape, no rate-limit/quota classification — which left a recurring
+    degradation unattributable even though get_status/`/health` reported the store
+    as connected (a query-execution failure, not a connectivity loss). Returns a
+    plain dict (not raised, not logged) so callers can both log it and collect it
+    into SearchResults.failure_diagnostics without doing either twice.
+
+    Args:
+        store: Which store failed.
+        exc: The raised exception, or None for the outer-timeout variant (there,
+            error_type/error describe the timeout itself rather than a real
+            exception object).
+        query: The search query text — only its length is recorded (``query_len``),
+            not its content, matching the write-journal's existing
+            query[:200]-truncation-not-full-body convention.
+        project_id: The project scope the search ran under.
+        reason: ``'exception'`` or ``'timeout'`` — which degrade variant produced
+            this diagnostic.
+
+    Returns:
+        dict with keys: store, reason, error_type, error, query_len, project_id.
+    """
+    return {
+        'store': store.value,
+        'reason': reason,
+        'error_type': type(exc).__name__ if exc is not None else 'TimeoutError',
+        'error': (str(exc)[:500] if exc is not None else 'search_timeout'),
+        'query_len': len(query),
+        'project_id': project_id,
+    }
+
+
 class SearchResults(list):
     """list subclass returned by MemoryService.search carrying in-band degrade metadata.
 
@@ -611,20 +662,33 @@ class SearchResults(list):
     Attributes:
         degraded: True when one or more selected stores raised or timed out.
         failed_stores: List of store name strings (SourceStore.value) that failed.
+        failure_diagnostics: List of structured failure-diagnostic dicts (task 2653),
+            one per failed store — see _store_failure_diagnostics. Empty when
+            degraded is False.
 
     .. warning::
-        The `degraded` and `failed_stores` metadata do **not** survive list-returning
-        operations (slicing, sorted(), concatenation, list comprehensions).  Those
-        operations return a plain ``list``, silently dropping the degrade metadata.
-        Callers that need the metadata after a transform should read the attributes
-        *before* the transform, or pass the SearchResults object directly without
-        intermediate list operations.
+        The `degraded`, `failed_stores`, and `failure_diagnostics` metadata do
+        **not** survive list-returning operations (slicing, sorted(), concatenation,
+        list comprehensions).  Those operations return a plain ``list``, silently
+        dropping the degrade metadata. Callers that need the metadata after a
+        transform should read the attributes *before* the transform, or pass the
+        SearchResults object directly without intermediate list operations.
     """
 
-    def __init__(self, iterable=(), *, degraded: bool = False, failed_stores=None):
+    def __init__(
+        self,
+        iterable=(),
+        *,
+        degraded: bool = False,
+        failed_stores=None,
+        failure_diagnostics=None,
+    ):
         super().__init__(iterable)
         self.degraded = degraded
         self.failed_stores: list[str] = failed_stores if failed_stores is not None else []
+        self.failure_diagnostics: list[dict] = (
+            failure_diagnostics if failure_diagnostics is not None else []
+        )
 
 
 @dataclass
