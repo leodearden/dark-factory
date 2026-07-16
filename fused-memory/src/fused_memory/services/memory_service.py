@@ -2481,10 +2481,7 @@ class MemoryService:
                     diag = _store_failure_diagnostics(
                         store_list[i], e, query=query, project_id=project_id, reason='exception'
                     )
-                    logger.warning(
-                        'search.store_failed',
-                        extra={'store': store_list[i].value, 'error': str(e)},
-                    )
+                    logger.warning('search.store_failed', extra=diag)
                     failed_stores.append(store_list[i])
                     failure_diagnostics.append(diag)
 
