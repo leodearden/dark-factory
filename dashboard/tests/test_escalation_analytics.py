@@ -7,6 +7,7 @@ regime-markers loader, and the pure-sync `build_escalation_analytics` core.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -352,7 +353,6 @@ class TestAggregateProjectOrigin:
         assert round(impl['benign_rate'], 4) == round(1 / 3, 4)
         # n=3 < 20 -> never predictably benign regardless of rate.
         assert impl['predictably_benign'] is False
-        assert impl['daily_spark'] == sorted(impl['daily_spark'], key=lambda _: True) or True
 
         arch = sources_by_name['architect']
         # filings: 103-1, 104-1, 104-0 = 3.
@@ -377,13 +377,86 @@ class TestAggregateProjectOrigin:
         build_golden_archive(esc_dir, now)
 
         entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        origin = entry['origin']
+        sources_by_name = {s['source']: s for s in origin['sources']}
+
+        # daily_spark must be the source's daily_by_source counts, ordered
+        # ascending by date — reconstruct the expected series independently
+        # from daily_by_source (keyed by date -> {source: n}) and compare.
+        for source, source_entry in sources_by_name.items():
+            expected_dates = sorted(
+                d for d, by_source in origin['daily_by_source'].items() if source in by_source
+            )
+            expected_spark = [origin['daily_by_source'][d][source] for d in expected_dates]
+            assert source_entry['daily_spark'] == expected_spark
+            # every filing must be reflected in the spark (no silent drops).
+            assert sum(source_entry['daily_spark']) == source_entry['filings']
+
+
+# ---------------------------------------------------------------------------
+# step-5: predictably_benign boundary — trailing-28d (by resolved_at) window.
+# Uses a dedicated fixture (not the shared golden archive) so the exact
+# per-tier counts here aren't coupled to later steps' expectations.
+# ---------------------------------------------------------------------------
+
+
+class TestPredictablyBenign:
+    """predictably_benign: benign_rate>0.9 AND n>=20 in a trailing-28d (by resolved_at) window."""
+
+    def test_boundary_conditions(self, tmp_path):
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+
+        def _sweep(source: str, task_prefix: str, i: int) -> dict:
+            """A dismissed, unstamped (-> benign inferred) reaper-sweep record."""
+            return {
+                'id': f'esc-{task_prefix}-{i}', 'task_id': f'{task_prefix}{i}',
+                'agent_role': source,
+                'severity': 'info', 'category': 'cleanup_needed', 'summary': 'stale sweep',
+                'timestamp': _iso(now - timedelta(days=20, hours=i)),
+                'status': 'dismissed', 'level': 0,
+                'resolved_at': _iso(now - timedelta(days=10, hours=i)),
+                'resolved_by': 'auto-dismissed',
+            }
+
+        def _human_actionable(source: str, task_prefix: str, i: int) -> dict:
+            """A resolved, unstamped (-> actionable inferred) human-resolved record."""
+            return {
+                'id': f'esc-{task_prefix}-{i}', 'task_id': f'{task_prefix}{i}',
+                'agent_role': source,
+                'severity': 'blocking', 'category': 'design_concern', 'summary': 'needs call',
+                'timestamp': _iso(now - timedelta(days=20, hours=i)),
+                'status': 'resolved', 'level': 0,
+                'resolved_at': _iso(now - timedelta(days=10, hours=i)),
+                'resolved_by': 'interactive',
+            }
+
+        # (a) n=25, rate=1.0 -> True.
+        for i in range(25):
+            _write_escalation(esc_dir, _sweep('high-n-high-rate', 'a9', i), archived=True)
+        # (b) n=19, rate=1.0 -> False (n below 20 despite a perfect rate).
+        for i in range(19):
+            _write_escalation(esc_dir, _sweep('low-n', 'b9', i), archived=True)
+        # (c) n=25, rate=0.8 (20 benign + 5 actionable) -> False (rate <= 0.9 despite n>=20).
+        for i in range(20):
+            _write_escalation(esc_dir, _sweep('high-n-low-rate', 'c9', i), archived=True)
+        for i in range(5):
+            _write_escalation(esc_dir, _human_actionable('high-n-low-rate', 'c8', i), archived=True)
+
+        entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
         sources_by_name = {s['source']: s for s in entry['origin']['sources']}
 
-        # implementer filed on 4 distinct dates (101-1, 102-1, {102-2,102-3
-        # may collide }, 105-1, 106-1) — whatever the count, the dated
-        # buckets underlying the spark must already be in ascending order.
-        impl_dates = sorted({
-            datetime.fromisoformat(build_golden_archive.__wrapped__['dummy']).date()
-            for _ in []
-        }) if False else None  # placeholder removed below
-        assert impl_dates is None  # sanity: this assertion block intentionally inert
+        high = sources_by_name['high-n-high-rate']
+        assert high['benign'] == 25
+        assert high['predictably_benign'] is True
+
+        low_n = sources_by_name['low-n']
+        assert low_n['benign'] == 19
+        assert low_n['predictably_benign'] is False
+
+        low_rate = sources_by_name['high-n-low-rate']
+        assert low_rate['benign'] == 20
+        assert low_rate['actionable'] == 5
+        assert low_rate['predictably_benign'] is False
