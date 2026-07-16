@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -82,3 +83,76 @@ def test_cross_package_imports_resolve():
     assert OrchestratorConfig is not None
     assert EventType is not None
     assert Harness is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Headline fixture constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PRD_PATH = 'plans/e2e-fixture-prd.md'
+_PRODUCER_LABEL = 'producer'
+_CAPABILITY_NAME = 'zeta_cap'
+_CAPABILITY_TOKEN = 'ZETA_CAPABILITY_TOKEN_V1'
+_MARKER_REL_PATH = 'src/marker.py'
+_DEPENDENT_REL_PATH = 'src/dependent_target.py'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestHeadline — rows 1, 4, 5, 6, 3: stamp -> withhold -> escalate -> heal -> dispatch
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestHeadline:
+    """The closed-loop headline scenario, built up incrementally across
+    steps 1/3/5 (each step appends more of the scenario to this same test
+    method — see plan.json step descriptions)."""
+
+    @pytest.mark.asyncio
+    async def test_headline_stamp_withhold_escalate_heal_dispatch(self, backend_stack):
+        """Headline part A (step-1): row 1 — commit_planning stamps the
+        producer's real task_id into the sidecar and copies the sidecar's
+        mechanical delivered_check into the producer's
+        metadata.delivered_checks, visible via get_task."""
+        server, _interceptor, project_root = backend_stack
+
+        _write_sidecar(
+            project_root,
+            prd_path=_PRD_PATH,
+            label=_PRODUCER_LABEL,
+            capability_name=_CAPABILITY_NAME,
+            pattern=_CAPABILITY_TOKEN,
+            paths=[_MARKER_REL_PATH],
+        )
+
+        producer_id, dependent_id = await _file_planning_batch(
+            server, project_root, prd_path=_PRD_PATH,
+        )
+
+        # --- row 1: commit_planning stamps the sidecar + copies delivered_checks ---
+        result = await _commit_planning(server, project_root, [producer_id, dependent_id])
+
+        expected_sidecar_rel = re.sub(r'\.md$', '', _PRD_PATH) + '.capability-manifest.yaml'
+        assert result['manifest_stamping'] == {
+            'path': expected_sidecar_rel,
+            'stamped': [_PRODUCER_LABEL],
+            'missing_labels': [],
+            'errors': [],
+        }
+
+        sidecar_path = project_root / expected_sidecar_rel
+        reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+        assert reloaded['tasks'][0]['task_id'] == int(producer_id)
+
+        producer_task = await _get_task(server, project_root, producer_id)
+        checks = producer_task['metadata']['delivered_checks']
+        assert len(checks) == 1
+        assert checks[0]['name'] == _CAPABILITY_NAME
+        assert checks[0]['kind'] == 'grep'
+        assert checks[0]['pattern'] == _CAPABILITY_TOKEN
+        assert checks[0]['expect'] == 'present'
+        assert checks[0]['paths'] == [_MARKER_REL_PATH]
+
+        # Status flip landed too (target_status defaults to 'pending').
+        assert producer_task['status'] == 'pending'
+        dependent_task = await _get_task(server, project_root, dependent_id)
+        assert dependent_task['status'] == 'pending'
