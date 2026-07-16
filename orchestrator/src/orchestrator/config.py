@@ -2558,14 +2558,22 @@ class OrchestratorConfig(BaseSettings):
     )
 
     # Two LIVE uses: (1) per-role timeout FALLBACK — workflow._invoke reads
-    # `getattr(timeouts_cfg, role_key, self.config.invocation_timeout)`, so
-    # any role whose split role_key misses a TimeoutsConfig field (e.g.
-    # module_tagger/deep_reviewer) falls through to this scalar; (2) the
-    # working-regime ABSOLUTE CAP — the outer bound on the post-turn-1
-    # progress extension (see TimeoutsConfig.working_idle_secs), regardless
-    # of how much the transcript keeps advancing. Default 7200.0 matches
-    # defaults.yaml, which has shipped this value since before this scalar
-    # was repurposed as the absolute cap.
+    # `getattr(timeouts_cfg, role_key, self.config.invocation_timeout)` keyed
+    # on the role's FULL name (role_key = role.name; routing alpha, task
+    # 2531 retired the old split('_')[0] derivation), so this only engages
+    # for a role whose full name has no matching TimeoutsConfig field —
+    # every role _invoke currently routes (architect/implementer/debugger/
+    # judge/merger/reviewer_*/simple_task) has one, so today this is a
+    # defensive catch-all for a future role added without a submodel field,
+    # not a live fallback. module_tagger and deep_reviewer never reach this
+    # path at all — both are dispatched out-of-band (harness.py /
+    # review_checkpoint.py) via their own full-name config lookups, not
+    # through _invoke; (2) the working-regime ABSOLUTE CAP — the outer
+    # bound on the post-turn-1 progress extension (see
+    # TimeoutsConfig.working_idle_secs), regardless of how much the
+    # transcript keeps advancing. Default 7200.0 matches defaults.yaml,
+    # which has shipped this value since before this scalar was repurposed
+    # as the absolute cap.
     invocation_timeout: float = Field(default=7200.0)
 
     # Models, budgets, turns, timeouts per role
