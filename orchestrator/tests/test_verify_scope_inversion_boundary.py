@@ -357,3 +357,40 @@ class TestRow1SourceOnlySiblingBreakRejectedAtMergeGate:
             f'expected the failing modB test id to be cited in the block '
             f'reason; got {outcome.reason!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Row 2: "task-role signal" — the task-role pytest floor (λ, R3) never widens
+# beyond the owning module. Producer-only (no consumer/merge-gate side).
+# ---------------------------------------------------------------------------
+
+
+class TestRow2TaskRoleSignal:
+    """Row 2 (PRD boundary-test sketch): the SAME row-1 golden diff, but at
+    role='task' — ONLY the owning module modA executes (the task-role pytest
+    floor, R3); the registered sibling modB must NEVER run (R1-task: the
+    floor never widens beyond owning modules — only the knob-gated
+    merge+full gate row 1 pins does that widening).
+    """
+
+    @pytest.mark.asyncio
+    async def test_row2_same_diff_task_role_owning_module_only(self, tmp_path: Path) -> None:
+        mod_a, _mod_b, config = _row1_golden_diff(tmp_path, breadth='full')
+
+        result, executed, _fake = await _drive_producer(
+            tmp_path, config, [mod_a], task_files=[MODA_SOURCE_PATH], role='task',
+        )
+
+        assert result.passed
+        assert set(executed) == {'moda'}, (
+            f'expected ONLY the owning module to execute at role=task (the '
+            f'floor never widens beyond owning modules); got {set(executed)!r}'
+        )
+        assert executed['moda'].test_command == mod_a.test_command, (
+            f"expected the task-role floor to full-suite the owning module's "
+            f'pytest: {executed["moda"].test_command!r}'
+        )
+        assert 'modb' not in executed, (
+            'the registered sibling modB must never execute at role=task '
+            '(no cross-module widening from the task-role floor)'
+        )
