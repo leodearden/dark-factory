@@ -2797,6 +2797,77 @@ def test_report_includes_merge_idle_and_would_defer_columns(
         )
 
 
+def test_report_merge_idle_degrades_to_unknown_when_drain_check_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """_classify_unit_heartbeat's fail-soft branch (scripts/orchestrator-
+    watchdog.py): when the lazy drain_check reuse path raises for any reason
+    (here, drain_check.resolve_fleet_dir() itself blowing up), report() must
+    still complete rather than crash, render MERGE-IDLE='unknown' with
+    WOULD-DEFER='no' for the affected row (never silently drop the row,
+    never guess a verdict), and log a WARNING naming the swallowed
+    exception -- honoring the loud-over-silent-degradation norm.
+
+    Regression lock for the except-block in _classify_unit_heartbeat, which
+    the four real-heartbeat-file cases above (idle/busy/stale/absent) never
+    exercise -- a future refactor that turned the swallow into a crash, or
+    that dropped the WARNING, would otherwise pass CI.
+    """
+    wdog = _load_watchdog()
+    import drain_check
+
+    commit_epoch = 1_800_000_000
+    now = 2_000_000_000.0
+    unit = "orchestrator-foxtrot.service"
+    start_epoch = commit_epoch + 100  # fresh vs. commit -- irrelevant to this test
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{unit} loaded active running desc\n", stderr=""
+            )
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epoch}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(tmp_path / "absent_clock.json"))
+
+    def _boom():
+        raise OSError("simulated: fleet dir unreadable")
+
+    monkeypatch.setattr(drain_check, "resolve_fleet_dir", _boom)
+
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda msg: logged.append(msg))
+
+    exit_code = wdog.report()
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    line = next(entry for entry in captured.out.splitlines() if entry.startswith(unit))
+    tokens = line.split()
+    _verdict_tok, _deploy_age_tok, merge_tok, defer_tok = tokens[-4:]
+    assert merge_tok == "unknown", (
+        f"expected MERGE-IDLE='unknown' when drain_check raises, got {merge_tok!r} "
+        f"in line {line!r}"
+    )
+    assert defer_tok == "no", (
+        f"expected WOULD-DEFER='no' when MERGE-IDLE is unknown, got {defer_tok!r} "
+        f"in line {line!r}"
+    )
+    assert any(
+        "WARNING" in msg and "_classify_unit_heartbeat" in msg for msg in logged
+    ), f"expected a WARNING naming _classify_unit_heartbeat's swallowed exception, got {logged!r}"
+
+
 def test_report_extended_columns_stay_read_only(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
@@ -3211,6 +3282,51 @@ def _boundary_decode(maybe_bytes):
     return maybe_bytes
 
 
+_UNIT_SUITE_FAKE_SYSTEMCTL_PATH = REPO_ROOT / "scripts" / "tests" / "test_restart_all_orchestrators.py"
+
+
+def _fake_systemctl_functional_body(fake_systemctl_src: str) -> str:
+    """Strip the module-level shebang/docstring preamble, returning the fake
+    systemctl's actual behavior (from the first `import json` line onward).
+
+    The two copies' module docstrings are intentionally different -- each is
+    contextualized to its own test file -- so comparing from here down
+    isolates what actually matters for drift (the verbs/fields the fake
+    models) from that cosmetic difference.
+    """
+    marker = "\nimport json\n"
+    idx = fake_systemctl_src.index(marker)
+    return fake_systemctl_src[idx:]
+
+
+def test_boundary_fake_systemctl_matches_unit_suite_verbatim() -> None:
+    """DRIFT GUARD: _BOUNDARY_FAKE_SYSTEMCTL_SRC (this file's local
+    reimplementation, used by scenarios 2-6 above) must stay in lockstep
+    with scripts/tests/test_restart_all_orchestrators.py's
+    FAKE_SYSTEMCTL_SRC, which it deliberately reimplements rather than
+    imports across test directories (see the module comment above the
+    boundary-harness block). If the real restart-all-orchestrators.sh
+    starts querying a systemctl field neither fake models, or the unit
+    suite's fake gains support for it and this module's copy doesn't, this
+    test fails loudly instead of the two suites silently drifting apart.
+    """
+    unit_suite_src = _UNIT_SUITE_FAKE_SYSTEMCTL_PATH.read_text()
+    match = re.search(r"^FAKE_SYSTEMCTL_SRC = '''(.*?)'''$", unit_suite_src, re.S | re.M)
+    assert match, (
+        f"could not locate FAKE_SYSTEMCTL_SRC in {_UNIT_SUITE_FAKE_SYSTEMCTL_PATH} "
+        "-- has it been renamed or restructured?"
+    )
+    unit_suite_fake = match.group(1)
+
+    assert _fake_systemctl_functional_body(unit_suite_fake) == _fake_systemctl_functional_body(
+        _BOUNDARY_FAKE_SYSTEMCTL_SRC
+    ), (
+        "_BOUNDARY_FAKE_SYSTEMCTL_SRC has drifted from "
+        f"{_UNIT_SUITE_FAKE_SYSTEMCTL_PATH}'s FAKE_SYSTEMCTL_SRC -- update this "
+        "file's copy (or promote both to a shared fixture) to match."
+    )
+
+
 def test_boundary2_all_idle_restarts_and_stamps_clock(tmp_path: pathlib.Path) -> None:
     """Scenario 2 (I1/I2/I6) -- staleness past 8h, all idle: the REAL
     restart-all-orchestrators.sh --drain restarts every unit, verifies each
@@ -3319,7 +3435,14 @@ def test_boundary4_defers_busy_unit_while_others_proceed(tmp_path: pathlib.Path)
                 "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": "99999",
                 "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
             },
-            timeout=3,
+            # Wide margin over the couple of bash+python3 subprocess spawns
+            # needed to reach the assertion point below (SELF_UNIT/list-units,
+            # the idle unit's drain-check+baseline+restart, R's drain-check)
+            # so a loaded CI host can't push the idle unit's restart past the
+            # cutoff and flake the ordering assertion; FORCE_FIRE_AFTER_SECS
+            # is 99999s, so widening this can't accidentally let R's own
+            # restart land before the timeout fires.
+            timeout=8,
         )
 
     stdout = _boundary_decode(exc_info.value.stdout)
