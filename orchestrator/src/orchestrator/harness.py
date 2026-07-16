@@ -7850,6 +7850,55 @@ Output JSON matching the schema. Every task must appear in the output.
             disallowed_tools=_WATCHER_DISALLOWED_TOOLS,
         )
 
+    def _watcher_has_actionable_l1(self) -> bool:
+        """Pre-boot precheck: does the L1 queue have any actionable work?
+
+        "Actionable" means at least one pending level-1 escalation whose id
+        is NOT already a member of a pending level-2 cluster.  Promoted
+        member L1s remain ``status=='pending'`` at level 1 (SKILL.md), so a
+        naive ``level == 1 and pending`` check would relaunch a rotation
+        every poll interval for as long as any L2 cluster has unresolved
+        members — a common steady state while a human is slow to resolve
+        L2s — defeating the entire cost optimisation this precheck exists
+        for.
+
+        Scope: only L1 work counts.  A queue containing only L0s, or only
+        pending L2s, is treated as non-actionable — L0->L1 promotion is
+        owned by the separate ``_reap_orphan_l0_escalations`` loop, so
+        skipping here does not starve that promotion path.
+
+        FAIL-OPEN: returns True (launch the rotation) whenever the
+        escalation queue is unset/None or ``get_pending()`` raises — a bug
+        in this precheck must never silently stop L1 escalations from being
+        handled (loud-over-silent-degradation norm).  Accessed via
+        ``getattr`` so bare-Harness tests that never set
+        ``_escalation_queue`` also fail open.
+        """
+        queue = getattr(self, '_escalation_queue', None)
+        if queue is None:
+            return True
+        try:
+            pending = queue.get_pending()
+        except Exception:
+            logger.warning(
+                'Escalation-watcher-auto: _watcher_has_actionable_l1 precheck '
+                'failed to read the escalation queue — failing open '
+                '(launching rotation anyway)',
+                exc_info=True,
+            )
+            return True
+
+        l1_ids = [esc.id for esc in pending if esc.level == 1]
+        if not l1_ids:
+            return False
+
+        promoted: set[str] = set()
+        for esc in pending:
+            if esc.level == 2:
+                promoted.update(esc.members or [])
+
+        return any(l1_id not in promoted for l1_id in l1_ids)
+
     async def _watcher_supervisor_loop(self) -> None:
         """Supervisor loop — restart watcher rotations until shutdown.
 
