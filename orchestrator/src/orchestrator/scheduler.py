@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from shared.locking import (
     files_to_modules,
@@ -23,6 +23,7 @@ from shared.locking import (
 )
 from shared.mcp_envelope import parse_tool_result, resolver_failed
 from shared.psi import PsiSample, read_psi_sample
+from shared.task_claimant import has_live_claimant, is_stranded_blocked
 from shared.task_metadata import parse_metadata
 
 from orchestrator import git_ops
@@ -43,6 +44,13 @@ from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
+
+if TYPE_CHECKING:
+    # Task 2408 mechanism 2: the scheduler only ever calls read-only methods
+    # (get_by_task) on an injected EscalationQueue instance (harness.py wires
+    # the real one at startup) — no runtime import needed, avoiding a
+    # scheduler<->escalation module-load coupling.
+    from escalation.queue import EscalationQueue
 
 # task_skipped events for "effectively infinite" skip thresholds (>= this
 # value) are rate-limited to a geometric schedule so the event store is not
@@ -1221,6 +1229,7 @@ class Scheduler:
         'park_gc',
         'stale_sweep',
         'cooldown_gc',
+        'redispatch_stranded_blocked',
         'external_dep_policy',
         'delivered_check_gate',
         'stamp_milestone',
@@ -1278,6 +1287,15 @@ class Scheduler:
         self.event_store = event_store
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
+        # Task 2408 mechanism 2: attribute-injected by the Harness right
+        # after it constructs its EscalationQueue (harness.py, mirroring the
+        # review_checkpoint.escalation_queue injection one line above that
+        # site) — the Scheduler is built long before the queue exists, so
+        # constructor injection is impossible.  None (the default, and the
+        # value in every test that doesn't set it) is a fail-safe: the
+        # blocked-redispatch sweep (_phase_redispatch_stranded_blocked) can
+        # never verify "no open escalation" without it, so it never flips.
+        self.escalation_queue: EscalationQueue | None = None
         # --- Workflow-cancel grace stamp (task 2235, relocated from Harness) ---
         # Written by cancel_workflow/hard_cancel_workflow so a mid-run
         # reconcile sweep does not race a workflow's finally-block teardown
@@ -3847,10 +3865,30 @@ class Scheduler:
         the dispatch-cooldown signal for the task (or None), forwarded so the
         caller can pass it to post-dispatch bookkeeping without a second
         evaluation.
+
+        Task 2408 mechanism 1: also refuses dispatch when the task currently
+        carries a LIVE claimant (a fresh ``claimant_run_id``/``heartbeat_at``
+        pair — see ``shared.task_claimant.has_live_claimant``). A normal
+        freshly-pending task has a null claimant (claimant is stamped only at
+        dispatch, see ``TaskWorkflow``), so this is a no-op in the common
+        case and only fires as a safety net against dispatching into an
+        already-claimed worktree (reconcile/race/multi-host). Gated by
+        ``config.claimant_dispatch_gate_enabled``.
         """
         if task.get('status') != 'pending':
             return False, None
         if tid in self._dispatched:
+            return False, None
+        if self.config.claimant_dispatch_gate_enabled and has_live_claimant(
+            task,
+            self._wall_now(),
+            timedelta(seconds=self.config.claimant_liveness_ttl_secs),
+        ):
+            logger.info(
+                'Task %s dispatch refused: live claimant %r (task 2408 mechanism 1)',
+                tid,
+                task.get('claimant_run_id'),
+            )
             return False, None
         if self._deferred_watch_gated(task):
             return False, None
@@ -4656,6 +4694,127 @@ class Scheduler:
         continues.
         """
         self._gc_expired_cooldowns()
+        return _CONTINUE
+
+    async def _phase_redispatch_stranded_blocked(self, ctx: TickContext) -> object:
+        """Mechanism 2 (task 2408): sweep-redispatch genuinely-stranded
+        BLOCKED tasks back to ``pending``.
+
+        Complements mechanism 1 (the live-claimant dispatch refusal in
+        :meth:`_eligible_for_dispatch`): together, the scheduler never steps
+        into a live claim and always reclaims a dead one, both keyed off
+        the same ``claimant_liveness_ttl_secs`` signal.
+
+        A crash-strand and a deliberate park (a human ``/unblock`` session,
+        or a deterministic born-at-L2 gate) present IDENTICALLY at the
+        claimant layer — both null/stale — so this sweep applies additional
+        park-protection guards beyond ``is_stranded_blocked`` before
+        flipping (see ``shared.task_claimant.is_stranded_blocked``'s
+        docstring). The full gate set is: not actively dispatched, not a
+        deterministic task (DESIGN GAP carve-out — a deterministic blocked
+        task is either a born-at-L2 gate awaiting human ``resolve_issue``
+        or a deploy strand; both are owned exclusively by the deterministic
+        gate flow / deterministic-recon sweep, and this generic sweep would
+        race or duplicate that flow), not within its post-cancel grace
+        window (``workflow_cancel_recent`` — a workflow just
+        cancelled/parked it and its finally-block teardown may still be
+        writing state, mirrors harness Fix #1b gate 4), not within its
+        dispatch/requeue cooldown window, genuinely stranded
+        (claimant-liveness), deps resolved, and no open escalation (mirrors
+        Fix #1b gate 5 — protects a non-deterministic human ``/unblock``
+        park, whose null claimant is otherwise indistinguishable from a
+        crash-strand).
+
+        Fails safe (never flips) when the sweep is disabled via
+        ``config.stranded_blocked_redispatch_enabled``, or when
+        ``self.escalation_queue`` is ``None`` — without the queue this
+        method cannot verify "no open escalation" (the park-protection
+        guard for a non-deterministic human ``/unblock`` park), so it must
+        never flip.
+
+        **"deps resolved" is LOCAL deps only.** The ``_deps_satisfied`` call
+        below intentionally omits ``external_status_cache`` (leaving the
+        cross-project external-dep gate inactive, matching legacy
+        no-cache-supplied behaviour) instead of forwarding
+        ``ctx.external_cache``: this phase runs BEFORE
+        ``_phase_external_dep_policy`` in ``_TICK_PHASE_ORDER`` — the phase
+        that actually populates ``ctx.external_cache`` from a live
+        ``get_external_statuses`` call each tick — so ``ctx.external_cache``
+        is always still its empty per-tick default here. Forwarding it would
+        make every ``metadata.external_deps`` entry look permanently
+        unsatisfied, so a stranded blocked task with external deps would
+        never be swept, even long after those deps finish. Omitting it is
+        safe: flipping to ``pending`` does not dispatch, so the REAL
+        external-dep status is re-checked by ``_phase_external_dep_policy``
+        + ``_eligible_for_dispatch`` before the task is ever actually
+        assigned.
+
+        Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``.
+        Writes: none on ctx — a task flipped this tick is picked up on the
+        NEXT tick (the server row flips via ``set_task_status``, but this
+        tick's in-memory ``ctx.tasks`` still reads 'blocked'), avoiding a
+        current-tick candidate-set race. Also clears the stale
+        ``claimant_run_id``/``heartbeat_at`` via ``set_task_claimant``
+        (best-effort) immediately before the status flip, mirroring the
+        slot-release NULL-claimant convention at harness.py:5693-5696, so a
+        redispatched task is never left carrying a claimant that no longer
+        owns it. Always continues.
+        """
+        if not self.config.stranded_blocked_redispatch_enabled:
+            return _CONTINUE
+        if self.escalation_queue is None:
+            return _CONTINUE
+
+        now = self._wall_now()
+        ttl = timedelta(seconds=self.config.claimant_liveness_ttl_secs)
+
+        for task in ctx.tasks:
+            if task.get('status') != 'blocked':
+                continue
+            tid = str(task.get('id', ''))
+            if tid in self._dispatched:
+                continue
+            # DESIGN GAP carve-out (mirrors harness Fix #1b / task-1622):
+            # a deterministic blocked task is owned exclusively by the
+            # deterministic gate flow (born-at-L2 resolve_issue) or the
+            # deterministic-recon sweep (deploy strands) — redispatching it
+            # here would race/duplicate that flow.  Unconditional: this
+            # cheap metadata check runs before any of the pricier checks
+            # below, including the escalation-queue I/O.
+            if (task.get('metadata') or {}).get('task_kind') == 'deterministic':
+                continue
+            # A workflow just cancelled/parked this task; its finally-block
+            # teardown may still be writing state (mirrors Fix #1b gate 4).
+            if self.workflow_cancel_recent(tid):
+                continue
+            # Same dispatch/requeue cooldown deadline check
+            # _eligible_for_dispatch uses (monotonic clock).
+            cooldown_deadline = self._requeue_until.get(tid)
+            if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
+                continue
+            if not is_stranded_blocked(task, now, ttl):
+                continue
+            if not self._deps_satisfied(task, ctx.status_map, ctx.tasks_by_id):
+                continue
+            if self.escalation_queue.get_by_task(tid, status='pending'):
+                continue
+            logger.warning(
+                'Task %s: crash-stranded-blocked-redispatch — flipping blocked -> '
+                'pending (no live claimant, deps satisfied, no open escalation)',
+                tid,
+            )
+            # Clear the stale claimant BEFORE the status flip — mirrors the
+            # slot-release ordering at harness.py:5693-5696. The task is
+            # still 'blocked' here (not yet dispatch-contestable), so
+            # nothing should be racing in a fresh claimant stamp; clearing
+            # first means a concurrent orchestrator that dispatches into
+            # this task right after it goes 'pending' below can never have
+            # its fresh stamp clobbered by a late-landing clear.
+            # Best-effort — set_task_claimant already swallows its own
+            # errors, so this can never block the flip.
+            await self.set_task_claimant(tid, claimant_run_id=None, heartbeat_at=None)
+            await self.set_task_status(tid, 'pending')
+
         return _CONTINUE
 
     async def _phase_external_dep_policy(self, ctx: TickContext) -> object:
