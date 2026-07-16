@@ -1021,6 +1021,7 @@ def reap_stale_records(
     root: Path | str | None = None,
     *,
     now: datetime | None = None,
+    limit: int | None = None,
 ) -> list[ReapedSessionRecord]:
     """Sweep ``<root>/sessions/*/`` and remove stale session-record directories.
 
@@ -1041,8 +1042,19 @@ def reap_stale_records(
       NON_TERMINAL_HEARTBEAT_TTL -> reaped, reason='stale_pid'.
     - otherwise -> kept.
 
+    Directories are visited in ``sorted(iterdir())`` order (directory-name
+    order, not age order).
+
     *now* is injectable for deterministic tests; defaults to the real UTC
     clock.
+
+    *limit* is None (the default) for an unbounded full sweep -- today's
+    behavior, unchanged. A positive int stops the sweep once *limit*
+    directories have actually been removed, bounding both the rmtree work
+    and the O(N) directory scan cost of this call -- this is what lets an
+    opportunistic per-spawn caller stay cheap regardless of backlog size. A
+    directory whose removal is attempted and fails (logged, see below) does
+    NOT count against *limit*.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -1085,6 +1097,8 @@ def reap_stale_records(
                 logger.error('reap_stale_records: failed to remove %s', slug_dir, exc_info=True)
                 continue
             reaped.append(ReapedSessionRecord(path=slug_dir, session_slug=slug, reason=reason))
+            if limit is not None and len(reaped) >= limit:
+                break
 
     return reaped
 
