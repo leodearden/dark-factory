@@ -4709,10 +4709,20 @@ class Scheduler:
         claimant layer — both null/stale — so this sweep applies additional
         park-protection guards beyond ``is_stranded_blocked`` before
         flipping (see ``shared.task_claimant.is_stranded_blocked``'s
-        docstring). This CORE gate set is: not actively dispatched,
-        genuinely stranded (claimant-liveness), deps resolved, and no open
-        escalation. (The deterministic task_kind carve-out, cooldown, and
-        workflow_cancel_recent guards are layered on separately.)
+        docstring). The full gate set is: not actively dispatched, not a
+        deterministic task (DESIGN GAP carve-out — a deterministic blocked
+        task is either a born-at-L2 gate awaiting human ``resolve_issue``
+        or a deploy strand; both are owned exclusively by the deterministic
+        gate flow / deterministic-recon sweep, and this generic sweep would
+        race or duplicate that flow), not within its post-cancel grace
+        window (``workflow_cancel_recent`` — a workflow just
+        cancelled/parked it and its finally-block teardown may still be
+        writing state, mirrors harness Fix #1b gate 4), not within its
+        dispatch/requeue cooldown window, genuinely stranded
+        (claimant-liveness), deps resolved, and no open escalation (mirrors
+        Fix #1b gate 5 — protects a non-deterministic human ``/unblock``
+        park, whose null claimant is otherwise indistinguishable from a
+        crash-strand).
 
         Fails safe (never flips) when the sweep is disabled via
         ``config.stranded_blocked_redispatch_enabled``, or when
@@ -4740,6 +4750,24 @@ class Scheduler:
                 continue
             tid = str(task.get('id', ''))
             if tid in self._dispatched:
+                continue
+            # DESIGN GAP carve-out (mirrors harness Fix #1b / task-1622):
+            # a deterministic blocked task is owned exclusively by the
+            # deterministic gate flow (born-at-L2 resolve_issue) or the
+            # deterministic-recon sweep (deploy strands) — redispatching it
+            # here would race/duplicate that flow.  Unconditional: this
+            # cheap metadata check runs before any of the pricier checks
+            # below, including the escalation-queue I/O.
+            if (task.get('metadata') or {}).get('task_kind') == 'deterministic':
+                continue
+            # A workflow just cancelled/parked this task; its finally-block
+            # teardown may still be writing state (mirrors Fix #1b gate 4).
+            if self.workflow_cancel_recent(tid):
+                continue
+            # Same dispatch/requeue cooldown deadline check
+            # _eligible_for_dispatch uses (monotonic clock).
+            cooldown_deadline = self._requeue_until.get(tid)
+            if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
                 continue
             if not is_stranded_blocked(task, now, ttl):
                 continue
