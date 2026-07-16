@@ -13,7 +13,9 @@ from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
+from pydantic import ValidationError
 from shared.branch_names import canonical_queued_branch_name
+from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
@@ -127,6 +129,55 @@ def _require_matching_project_root(harness: Any, project_root: str) -> str | Non
             f'resolved {gops_root!s}).'
         )
     return None
+
+
+def _project_task_runtime_entry(s: Any) -> TaskRuntimeEntry:
+    """Project one duck-typed ``TaskRuntimeState``-shaped object into the
+    wire-checked ``TaskRuntimeEntry`` (used by ``get_task_runtime_state``).
+
+    ``phase``/``lane_state`` are machine-checked ``Literal`` vocabularies on
+    the wire (INV-1) but free-form ``str`` on the orchestrator source
+    (``orchestrator.task_runtime.TaskRuntimeState``, produced by that
+    module's ``_derive_phase``/``_LANE_STATE_MAP``). Both currently only
+    ever emit values inside today's vocab, but that is a cross-package
+    coupling, not an enforced invariant: if a future orchestrator change
+    ever emits a value outside it, this degrades ONLY that one task to an
+    honest per-task error entry (loud, but isolated) rather than letting a
+    single bad task's ``ValidationError`` take down the entire snapshot —
+    every other task must still render on the dashboard.
+    ``TaskRuntimeEntry.model_construct`` (bypasses validation) is used for
+    the fallback so a pathological double-fault (e.g. ``task_id`` itself
+    also being malformed) still cannot raise.
+    """
+    try:
+        return TaskRuntimeEntry(
+            task_id=s.task_id,
+            has_worktree=s.has_worktree,
+            loops=s.loops,
+            attempts=s.attempts,
+            started=s.started,
+            lane=s.lane,
+            phase=s.phase,
+            lane_state=s.lane_state,
+            error=getattr(s, 'error', None),
+        )
+    except ValidationError as exc:
+        logger.warning(
+            'get_task_runtime_state: task %r failed wire-contract validation, '
+            'degrading to an honest error entry: %s',
+            getattr(s, 'task_id', '<unknown>'), exc,
+        )
+        return TaskRuntimeEntry.model_construct(
+            task_id=s.task_id,
+            has_worktree=s.has_worktree,
+            loops=None,
+            attempts=None,
+            started=None,
+            lane=None,
+            phase=None,
+            lane_state=None,
+            error=f'wire-contract violation: {exc}'[:200],
+        )
 
 
 # C1 action enum for resolve_issue — five valid values, two disposition buckets.
@@ -1381,6 +1432,34 @@ def create_server(
         if harness is None:
             return {'wired': False, 'error': 'escalation server running standalone'}
         return harness.get_merge_halt_status()
+
+    @mcp.tool()
+    def get_task_runtime_state() -> dict[str, Any]:
+        """Live per-task runtime snapshot, projected to the shared wire contract.
+
+        Delegates to ``harness.task_runtime_snapshot()`` (task alpha, task
+        2634) and projects each duck-typed entry into
+        ``shared.task_runtime_state.TaskRuntimeEntry`` — read as attributes
+        (no static ``orchestrator`` import, matching ``merge_request``'s
+        reverse-dep discipline) so this works against both the real
+        ``orchestrator.task_runtime.TaskRuntimeState`` and a test stub alike.
+        A per-task artifact read failure is carried through unmodified
+        (``loops``/``attempts``/``phase``/``started`` stay ``None`` plus a
+        non-empty ``error`` — never coerced to a fabricated honest-looking
+        value). A task whose ``phase``/``lane_state`` falls outside the wire
+        model's ``Literal`` vocabulary (see ``_project_task_runtime_entry``)
+        degrades the same way — that one task reports an honest error entry
+        instead of a ``ValidationError`` failing the whole snapshot.
+        Standalone (no harness wired) returns the model's legible empty
+        envelope, never raises. This server always emits ``offline: False``;
+        the dashboard synthesizes ``True`` client-side when this server
+        itself is unreachable.
+        """
+        if harness is None:
+            return TaskRuntimeSnapshot().model_dump(mode='json')
+        states = harness.task_runtime_snapshot()
+        entries = [_project_task_runtime_entry(s) for s in states]
+        return TaskRuntimeSnapshot(offline=False, tasks=entries).model_dump(mode='json')
 
     @mcp.tool()
     def get_merge_queue() -> dict[str, Any]:
