@@ -2065,8 +2065,21 @@ class OrchestratorConfig(BaseSettings):
     # (sonnet) agent when the classifier matches a trivial doc/comment/
     # rename/typo task with at most a couple of files in scope.
     simple_task_enabled: bool = Field(default=True)
-    simple_task_budget_usd: float = Field(default=1.50)
-    simple_task_max_turns: int = Field(default=30)
+    # Deprecated (routing alpha, task 2531): superseded by budgets.simple_task
+    # / max_turns.simple_task, the real per-role resolution path _invoke uses.
+    # Formally honored, not dead: _honor_deprecated_simple_task_scalars below
+    # migrates a non-default value into the matching submodel field (only
+    # when that field is still at its own default) with a loud WARNING.
+    simple_task_budget_usd: float = Field(
+        default=1.50,
+        deprecated=True,
+        description='Deprecated — set budgets.simple_task instead.',
+    )
+    simple_task_max_turns: int = Field(
+        default=30,
+        deprecated=True,
+        description='Deprecated — set max_turns.simple_task instead.',
+    )
 
     # Auto-eval — when the optimistic path (B-skip or C-simple) blocks at
     # plan/execute/verify/review, automatically rerun the same task from the
@@ -2833,6 +2846,65 @@ class OrchestratorConfig(BaseSettings):
         return self
 
     @model_validator(mode='after')
+    def _honor_deprecated_simple_task_scalars(self) -> 'OrchestratorConfig':
+        """Formally honor the deprecated simple_task_budget_usd /
+        simple_task_max_turns scalars (routing alpha, task 2531) rather than
+        leave them dead: a non-default scalar migrates into the matching
+        submodel field (budgets.simple_task / max_turns.simple_task) — but
+        ONLY when that submodel field is still at its own default, so an
+        explicitly-configured submodel value always wins and the scalar is
+        then silently ignored (no migration, no warning). Every migration
+        logs a loud deprecation WARNING naming the replacement, honoring the
+        project's loud-over-silent-degradation norm — OrchestratorConfig
+        uses extra='ignore', so a removed field set in an existing
+        orchestrator.yaml would otherwise vanish with no signal at all.
+
+        Idempotent under apply_reload's post-apply
+        model_validate(model_dump()) round-trip: once migrated, the
+        submodel field is no longer at its default, so a second pass is a
+        no-op (the precedence check above skips migration and logs nothing).
+
+        Reads both scalars via ``self.__dict__`` rather than plain attribute
+        access — both fields are marked ``Field(deprecated=True)`` below, so
+        a normal ``self.simple_task_...`` read would itself fire pydantic's
+        deprecated-field access warning on every single config construction,
+        not just the ones where an operator actually set a non-default
+        value. ``__dict__`` holds the same validated raw value pydantic
+        already stored; this only bypasses the deprecated-access warning
+        wrapper, not validation.
+        """
+        budget_default = type(self).model_fields['simple_task_budget_usd'].default
+        raw_budget = self.__dict__['simple_task_budget_usd']
+        if (
+            raw_budget != budget_default
+            and self.budgets.simple_task == type(self.budgets).model_fields['simple_task'].default
+        ):
+            logger.warning(
+                'simple_task_budget_usd is deprecated and will be removed; '
+                'migrating its value (%s) into budgets.simple_task. Set '
+                'budgets.simple_task directly in orchestrator.yaml instead.',
+                raw_budget,
+            )
+            self.budgets.simple_task = raw_budget
+
+        max_turns_default = type(self).model_fields['simple_task_max_turns'].default
+        raw_max_turns = self.__dict__['simple_task_max_turns']
+        if (
+            raw_max_turns != max_turns_default
+            and self.max_turns.simple_task
+            == type(self.max_turns).model_fields['simple_task'].default
+        ):
+            logger.warning(
+                'simple_task_max_turns is deprecated and will be removed; '
+                'migrating its value (%s) into max_turns.simple_task. Set '
+                'max_turns.simple_task directly in orchestrator.yaml instead.',
+                raw_max_turns,
+            )
+            self.max_turns.simple_task = raw_max_turns
+
+        return self
+
+    @model_validator(mode='after')
     def _validate_models_in_allowlist(self) -> 'OrchestratorConfig':
         """Fail-fast: every claude-backend role's configured model string must
         be in routing.allowed_models (task beta,
@@ -3173,12 +3245,20 @@ def _iter_leaves(model: BaseModel):
     are yielded whole as atomic leaves compared by equality. PrivateAttrs
     (e.g. _module_configs) are never visited because they are not in
     model_fields.
+
+    Reads values via ``__dict__`` rather than plain ``getattr`` — a field
+    marked ``Field(deprecated=True)`` (e.g. simple_task_budget_usd) wraps
+    attribute access with a DeprecationWarning, and this generic diff sweep
+    reads every leaf on every call regardless of whether it is deprecated,
+    so a plain getattr would fire that warning on every diff_config() call.
+    ``__dict__`` holds the same validated value pydantic already stored;
+    this only bypasses the deprecated-access warning, not validation.
     """
     for name in type(model).model_fields:
-        value = getattr(model, name)
+        value = model.__dict__[name]
         if isinstance(value, BaseModel):
             for sub in type(value).model_fields:
-                yield f'{name}.{sub}', getattr(value, sub)
+                yield f'{name}.{sub}', value.__dict__[sub]
         else:
             yield name, value
 
