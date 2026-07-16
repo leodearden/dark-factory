@@ -72,8 +72,10 @@ class TestWatcherConfig:
 
     # Invocation knobs
     def test_watcher_model_default(self, tmp_path: Path) -> None:
+        """Sonnet top-level rotation model (task 2629): hard/investigation-class
+        items are delegated to an opus subagent instead (see SKILL.md)."""
         config = OrchestratorConfig(project_root=tmp_path)
-        assert config.watcher_model == 'opus'
+        assert config.watcher_model == 'sonnet'
 
     def test_watcher_rotation_budget_usd_default(self, tmp_path: Path) -> None:
         config = OrchestratorConfig(project_root=tmp_path)
