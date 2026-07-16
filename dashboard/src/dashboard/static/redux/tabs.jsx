@@ -2,6 +2,7 @@
 const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, HistBar: HB, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS } = window.DF_CHARTS;
 const { Glyph: GL, ProjectGroup, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
+const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
 const { useState: uS, useEffect: uE } = React;
 
 // shared open-state helper for furl/unfurl, persisted to localStorage by key
@@ -258,6 +259,9 @@ function OrchTab({ projectFilter, search }) {
                       <col style={{ width: 60 }} />
                       <col style={{ width: 60 }} />
                       <col style={{ width: 100 }} />
+                      <col style={{ width: 90 }} />
+                      <col style={{ width: 90 }} />
+                      <col style={{ width: 100 }} />
                       <col style={{ width: 200 }} />
                       <col style={{ width: 240 }} />
                       <col style={{ width: 90 }} />
@@ -266,11 +270,12 @@ function OrchTab({ projectFilter, search }) {
                       <th>ID</th><th>Title</th><th>Agent</th>
                       <th className="num">Loops</th><th className="num">Tries</th>
                       <th className="num">Age</th>
+                      <th>Lane</th><th>Phase</th><th>State</th>
                       <th>Deps</th><th>Locks</th>
-                      <th>State</th>
+                      <th>Status</th>
                     </tr></thead>
                     <tbody>
-                      {filtered.length === 0 && <tr><td colSpan={9} className="empty" style={{ padding: 20 }}>No {filter === 'all' ? '' : filter + ' '}tasks</td></tr>}
+                      {filtered.length === 0 && <tr><td colSpan={12} className="empty" style={{ padding: 20 }}>No {filter === 'all' ? '' : filter + ' '}tasks</td></tr>}
                       {filtered.map(t => {
                         const isDone = t.status === 'done';
                         const isPending = t.status === 'pending';
@@ -279,9 +284,12 @@ function OrchTab({ projectFilter, search }) {
                             <td className="mono" style={{ color: 'var(--fg-1)', whiteSpace: 'nowrap' }}>{window.DF_SHELL.taskId(t.id)}</td>
                             <td style={{ color: isDone ? 'var(--fg-2)' : 'var(--fg-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.title}>{t.title}</td>
                             <td className="mono" style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.agent || '—'}</td>
-                            <td className="num">{t.loops}</td>
-                            <td className="num">{t.attempts}</td>
-                            <td className="num" style={{ color: 'var(--fg-3)' }}>{isDone ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : isPending ? '—' : `${t.started}m`}</td>
+                            <td className="num">{rtCell(t.loops)}</td>
+                            <td className="num">{rtCell(t.attempts)}</td>
+                            <td className="num" style={{ color: 'var(--fg-3)' }}>{isDone ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : isPending ? '—' : rtAge(t.started)}</td>
+                            <td className="mono" style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rtCell(t.lane)}</td>
+                            <td style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rtCell(t.phase)}</td>
+                            <td style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rtCell(t.lane_state)}</td>
                             <td><DepsCell task={t} /></td>
                             <td><LocksCell task={t} /></td>
                             <td>
