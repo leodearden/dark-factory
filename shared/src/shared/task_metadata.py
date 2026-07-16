@@ -435,6 +435,12 @@ class TaskMetadata(BaseModel):
     # scheduler (PRD Open Q #4); ExternalDep is a parse/render convenience.
     external_deps: list[str] = Field(default_factory=list)
     files: list[str] = Field(default_factory=list)
+    # role_name -> model string (PRD adaptive-model-routing task ζ). A plain
+    # typed field mirroring external_deps: list[str] -- role-name/value
+    # shape validation is NOT duplicated here as a model_validator; it
+    # stays single-sourced in validate_model_overrides / the fused-memory
+    # submit_task/update_task guard that delegates to it (decision 9).
+    model_overrides: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode='after')
     def _deterministic_invariants(self) -> TaskMetadata:
