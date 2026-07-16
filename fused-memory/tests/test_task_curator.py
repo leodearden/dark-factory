@@ -5186,6 +5186,57 @@ class TestCuratorMaybeRouteDeterministic:
         assert decision.action == "route_deterministic"
         assert curator._check_cache(payload_hash) is None
 
+    async def test_execution_class_operational_routes_without_substring_match(self, tmp_path):
+        """(task 2687) A candidate tagged metadata.execution_class='operational'
+        routes to route_deterministic even though it matches none of the
+        registry's substring entries."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Restart fused-memory service to activate an echo-write suppression fix",
+            description="Nothing about pruning cycle summaries here.",
+            execution_class="operational",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is not None
+        assert decision.action == "route_deterministic"
+        assert decision.justification.startswith("operational-ask-registry:")
+
+    async def test_execution_class_code_tdd_does_not_route_without_substring_match(
+        self, tmp_path,
+    ):
+        """(task 2687) An equivalent candidate tagged execution_class='code_tdd'
+        does NOT route — unchanged pre-existing substring-only behavior."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Restart fused-memory service to activate an echo-write suppression fix",
+            description="Nothing about pruning cycle summaries here.",
+            execution_class="code_tdd",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # task-2085 step-9 RED: TestCuratorCurateRouteDeterministicIntegration

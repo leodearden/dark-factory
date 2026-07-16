@@ -416,6 +416,137 @@ class TestMatchCandidate:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# task-2687 step-3 RED: TestMatchCandidateExecutionClassAxis
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestMatchCandidateExecutionClassAxis:
+    """match_candidate() consults CandidateTask.execution_class (threaded from
+    metadata.execution_class) as an authoritative, wording-independent routing
+    axis, checked FIRST — before the _CODE_CHANGE_TITLE_SIGNALS guard and
+    before the title/description substring loop (task 2687).
+    """
+
+    def _make_entry(
+        self,
+        name: str = "test_entry",
+        title_subs: list | None = None,
+        desc_subs: list | None = None,
+        reason: str = "test reason",
+    ):
+        from fused_memory.middleware.operational_ask_registry import OperationalAskEntry
+        return OperationalAskEntry(
+            name=name,
+            reason=reason,
+            title_substrings=title_subs or ["merge_entities", "live"],
+            description_substrings=desc_subs or ["FalkorDB"],
+        )
+
+    def _make_candidate(
+        self,
+        title: str,
+        description: str = "",
+        details: str = "",
+        execution_class: str | None = None,
+    ):
+        return CandidateTask(
+            title=title, description=description, details=details,
+            execution_class=execution_class,
+        )
+
+    def test_operational_execution_class_routes_with_no_substring_match(self):
+        """A candidate tagged execution_class='operational' whose title/
+        description match no entry still routes."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entry = self._make_entry()
+        candidate = self._make_candidate(
+            title="Restart fused-memory service",
+            description="Nothing to do with any registry entry.",
+            execution_class="operational",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is not None
+        assert result.name == "execution_class_operational_or_decision"
+
+    def test_decision_execution_class_routes_with_no_substring_match(self):
+        """Same as above for execution_class='decision'."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entry = self._make_entry()
+        candidate = self._make_candidate(
+            title="Decide which config value to roll out",
+            description="Nothing to do with any registry entry.",
+            execution_class="decision",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is not None
+        assert result.name == "execution_class_operational_or_decision"
+
+    def test_operational_execution_class_bypasses_code_change_title_signal(self):
+        """(bypass proof — the task-2686 motivating case) A title containing a
+        code-change signal word ("fix") with execution_class='operational' and
+        no substring match STILL routes: an explicit recon-stage declaration is
+        authoritative over incidental title wording."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entry = self._make_entry()
+        candidate = self._make_candidate(
+            title=(
+                "Restart fused-memory service to activate task 2622's "
+                "echo-write suppression fix"
+            ),
+            description="Nothing to do with any registry entry.",
+            execution_class="operational",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is not None
+        assert result.name == "execution_class_operational_or_decision"
+
+    def test_code_tdd_execution_class_unchanged_behavior(self):
+        """execution_class='code_tdd' does not engage the axis — falls
+        through to the pre-existing substring-only behavior (None here, since
+        the fixture matches no entry)."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entry = self._make_entry()
+        candidate = self._make_candidate(
+            title="Totally unrelated title",
+            description="Totally unrelated description.",
+            execution_class="code_tdd",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is None
+
+    def test_none_execution_class_unchanged_behavior(self):
+        """execution_class=None (the default) does not engage the axis."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entry = self._make_entry()
+        candidate = self._make_candidate(
+            title="Totally unrelated title",
+            description="Totally unrelated description.",
+            execution_class=None,
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is None
+
+    def test_operational_execution_class_matches_with_empty_entries(self):
+        """Pure-function independence: the axis fires even when entries=[] —
+        it does not depend on any registry entry existing."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        candidate = self._make_candidate(
+            title="Restart fused-memory service",
+            description="Nothing to do with any registry entry.",
+            execution_class="operational",
+        )
+        result = match_candidate(candidate, [])
+        assert result is not None
+        assert result.name == "execution_class_operational_or_decision"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # step-5 RED: TestSeedOperationalAskRegistry
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -566,3 +697,26 @@ class TestSeedOperationalAskRegistry:
             f"Expected no match for a code-fix candidate naming merge_entities "
             f"+ live + FalkorDB, got {entry.name!r}"
         )
+
+    def test_task_2686_execution_class_operational_routes_despite_fix_wording(self):
+        """(task 2687 motivating case) task 2686's real title contains "fix"
+        and matches none of the shipped registry's substring entries, yet
+        execution_class='operational' must still route — the axis is
+        authoritative and wording-independent."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entries = self._load_entries()
+        title = "Restart fused-memory service to activate task 2622's echo-write suppression fix"
+
+        # Sanity: without the execution_class tag, this candidate matches
+        # none of the 4 seed entries (it contains "fix", and its wording is
+        # unrelated to any of them).
+        untagged = CandidateTask(title=title)
+        assert match_candidate(untagged, entries) is None, (
+            "expected the untagged task-2686 candidate to match nothing"
+        )
+
+        tagged = CandidateTask(title=title, execution_class="operational")
+        entry = match_candidate(tagged, entries)
+        assert entry is not None
+        assert entry.name == "execution_class_operational_or_decision"
