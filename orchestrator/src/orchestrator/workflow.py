@@ -5316,8 +5316,9 @@ class TaskWorkflow:
         re-pointed to the WIP tip sha via
         ``artifacts.update_step_status(id, 'done', wip_tip_sha)``. On a
         mismatch, an unresolvable original commit (empty file set — e.g.
-        GC'd), or no WIP run at HEAD at all, the step is left unchanged
-        (flagging it for review is layered on separately).
+        GC'd), or no WIP run at HEAD at all, the step is left unchanged and
+        :meth:`_escalate_unreconciled_done_step` files a non-blocking info
+        escalation flagging it for review instead.
 
         Best-effort and defensive, identical posture to
         :meth:`_detect_tip_wip_commits`: no-ops on any missing collaborator
@@ -5364,11 +5365,71 @@ class TaskWorkflow:
                 orphaned_files = await self.git_ops.get_commit_changed_files(commit)
                 if orphaned_files and wip_tip_sha and set(orphaned_files) <= wip_files:
                     self.artifacts.update_step_status(item['id'], 'done', wip_tip_sha)
+                else:
+                    # Mismatch, unresolvable original (empty file set — e.g.
+                    # GC'd), or no WIP run at HEAD at all: cannot safely
+                    # auto-reconcile. Flag for review and leave the commit
+                    # unchanged rather than guess.
+                    self._escalate_unreconciled_done_step(item['id'], commit, wip_tip_sha)
         except Exception:
             logger.warning(
                 'Done-step commit reconciliation failed; leaving plan commits unchanged',
                 exc_info=True,
             )
+
+    def _escalate_unreconciled_done_step(
+        self, step_id: str, stale_commit: str, wip_tip_sha: str | None,
+    ) -> None:
+        """Submit a non-blocking info escalation for a done step whose
+        recorded ``commit`` is orphaned but could not be safely
+        content-matched against the tip WIP safety-commit run (content
+        mismatch, an unresolvable/GC'd original commit, or no WIP run
+        sitting at HEAD at all).
+
+        Mirrors :meth:`_escalate_corruption`'s posture: informational only
+        (never gates progress), and the step's ``commit`` is deliberately
+        left unchanged so the documented manual `git show <wip-sha>`
+        verification workaround remains available. Guards a missing
+        ``escalation_queue`` with a log-and-continue, same as
+        ``_escalate_corruption``.
+        """
+        if not self.escalation_queue:
+            logger.warning(
+                "Task %s: done step %s's commit %s is orphaned and could not "
+                'be auto-reconciled against a WIP run (no escalation queue)',
+                self.task_id, step_id, stale_commit,
+            )
+            return
+
+        from escalation.models import Escalation
+
+        tip_desc = wip_tip_sha or '<none>'
+        esc = Escalation(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='orchestrator',
+            severity='info',
+            category='infra_issue',
+            summary=(
+                f"Done step {step_id}'s commit {stale_commit[:10]} is orphaned "
+                f'and could not be auto-reconciled against WIP tip {tip_desc}'
+            ),
+            detail=(
+                f'Step {step_id} recorded commit {stale_commit}, which is no '
+                'longer reachable from HEAD (likely rewritten/orphaned by an '
+                'inter-iteration or warm-lane rebase). Its content could not '
+                f'be verified against the tip WIP safety-commit run (tip sha '
+                f'{tip_desc}) — either the files did not match, the original '
+                'commit is unresolvable (possibly garbage-collected), or no '
+                'WIP safety-commit run sits at HEAD. Verify manually via '
+                f'`git show {stale_commit}` against the WIP commit(s) and '
+                "re-point the step's commit if appropriate."
+            ),
+            suggested_action='verify_wip_reconciliation',
+            worktree=str(self.worktree) if self.worktree else None,
+            workflow_state=self.state.value,
+        )
+        self.escalation_queue.submit(esc)
 
     async def _detect_tip_wip_commits(self) -> list[dict]:
         """Detect a contiguous run of WIP safety-commits sitting at HEAD.
