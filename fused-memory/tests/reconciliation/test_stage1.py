@@ -2663,6 +2663,7 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
         stage.memory.graphiti.get_all_valid_edges = AsyncMock(
             return_value={'entity-a': [stale_edge, healthy_edge]},
         )
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
         stage.taskmaster.get_statuses = AsyncMock(
             return_value={'142': 'done', '999': 'pending'},
         )
@@ -2685,6 +2686,7 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
             )
 
         stage.memory.update_edge.assert_awaited_once()
+        assert stage.memory.update_edge.await_args is not None
         update_call = stage.memory.update_edge.await_args
         assert update_call.args[0] == 'edge-stale', (
             f'Expected update_edge awaited for the stale edge uuid only, got {update_call!r}'
