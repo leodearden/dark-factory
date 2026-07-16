@@ -968,6 +968,80 @@ class TestBatchPlanPromotionGate:
         )
 
 
+class TestProposedResolutionPromotionGate:
+    """task 2447: _on_task_done permanently withholds promotion of a
+    proposed-resolution episode (per is_proposed_resolution_framing) — a
+    proposed/unchosen option must never auto-become fact. Unlike the
+    batch-plan gate (task 2033), this withhold is unconditional: it does not
+    depend on any sibling task's status.
+
+    Incident: episode 7882dcdc (sourced from task 2444's RESOLUTION OPTIONS
+    section) would otherwise be promoted the moment task 2444 goes done,
+    re-surfacing the wrong/unchosen option's edge into default search.
+    """
+
+    @pytest.fixture
+    def reconciler_with_registry(self, reconciler):
+        """Reconciler with a mocked planned_episode_registry (same pattern as
+        TestPlannedEpisodePromotion.reconciler_with_registry)."""
+        from unittest.mock import AsyncMock, MagicMock
+        mock_registry = MagicMock()
+        mock_registry.promote = AsyncMock()
+        reconciler.planned_episode_registry = mock_registry
+        return reconciler
+
+    @pytest.mark.asyncio
+    async def test_withhold_proposed_resolution_episode(
+        self, reconciler_with_registry, mock_memory_service, mock_taskmaster
+    ):
+        """A proposed-resolution episode is withheld from promotion when its
+        source task (2444) completes — the RESOLUTION-OPTIONS content must
+        never surface as fact."""
+        proposed_ep_uuid = 'proposed-resolution-ep-2444'
+        resolution_content = (
+            'RESOLUTION OPTIONS (architect call — pick one, land as a RED/GREEN pair): '
+            '(a) Move the VERIFYING->FINALIZING _note_transition to AFTER await '
+            'entry.verify_task ...'
+        )
+        planned_result = MemoryResult(
+            id='edge-planned-proposed-resolution',
+            content=(
+                'entry.verify_task is awaited before the registry transition to '
+                'FINALIZING occurs'
+            ),
+            category=None,
+            source_store=SourceStore.graphiti,
+            relevance_score=0.9,
+            provenance=[proposed_ep_uuid],
+            metadata={'planned': True},
+        )
+
+        call_results = [[], [planned_result]]
+        call_index = {'n': 0}
+
+        async def mock_search(**kwargs):
+            idx = call_index['n']
+            call_index['n'] += 1
+            return call_results[idx] if idx < len(call_results) else []
+
+        mock_memory_service.search = mock_search
+        mock_memory_service.get_episode_content = AsyncMock(return_value=resolution_content)
+
+        result = await reconciler_with_registry.reconcile_task(
+            task_id='2444', transition='done', project_id='test-project',
+            project_root='/tmp/test',
+            task_before={
+                'id': '2444', 'title': 'Fix VERIFYING->FINALIZING race', 'status': 'in-progress',
+            },
+        )
+
+        reconciler_with_registry.planned_episode_registry.promote.assert_not_called()
+        assert any(a.get('type') == 'planned_episodes_withheld' for a in result.get('actions', [])), (
+            f'Expected a planned_episodes_withheld action for a proposed-resolution '
+            f'episode, got actions={result.get("actions")!r}'
+        )
+
+
 # ── task-1136: route _on_task_blocked metadata write through TaskInterceptor ──
 
 
@@ -2177,6 +2251,33 @@ class TestShouldWithholdBatchPromotionAcceptsScope:
         result = await reconciler._should_withhold_batch_promotion('ep-uuid', scope, {})
 
         assert result is False
+
+
+class TestShouldWithholdProposedResolutionAcceptsScope:
+    """_should_withhold_batch_promotion (task 2447 extension) permanently
+    withholds a proposed-resolution episode from promotion — unconditionally,
+    with no taskmaster status fetch (unlike the batch-plan gate, task 2033,
+    which is conditional on sibling status).
+    """
+
+    @pytest.mark.asyncio
+    async def test_withholds_proposed_resolution_without_status_fetch(
+        self, reconciler, mock_memory_service, mock_taskmaster
+    ):
+        scope = ProjectScope(ProjectId('test-project'), ProjectRoot('/tmp/test'))
+        mock_memory_service.get_episode_content = AsyncMock(
+            return_value=(
+                'RESOLUTION OPTIONS (architect call — pick one, land as a RED/GREEN '
+                'pair): (a) Move the VERIFYING->FINALIZING _note_transition to AFTER '
+                'await entry.verify_task ...'
+            )
+        )
+        mock_taskmaster.get_statuses = AsyncMock(return_value={'1990': 'in-progress'})
+
+        result = await reconciler._should_withhold_batch_promotion('ep-uuid', scope, {})
+
+        assert result is True
+        mock_taskmaster.get_statuses.assert_not_awaited()
 
 
 # ── Pre-echo authoritative-resolution check (task 1984) ─────────────────────
