@@ -1107,6 +1107,60 @@ async def _prune_task_count_snapshots(
         enumeration_ok = False
         members = []
 
+    # Silent-empty enumeration guard (task 2655, 5th recorded recurrence).
+    # Mem0Backend.scroll_by_metadata swallows TimeoutError and returns []
+    # (mem0_client.py:392-407), while its sibling count_by_metadata lets
+    # timeouts propagate (mem0_client.py:296-339) -- so an empty,
+    # NON-exceptional scroll page is ambiguous: it could be a genuine empty
+    # pool, or a swallowed Qdrant read timeout that would otherwise let the
+    # caller's canonical write proceed without ever pruning the prior
+    # snapshot(s), growing the byte-identical duplicate pile. Cross-check
+    # via count_memories_by_metadata, which propagates timeouts: a raised
+    # cross-check, or a confirmed count > 0, is the swallowed-timeout
+    # fingerprint. Only runs on an empty scroll -- a non-empty page skips
+    # the extra count call entirely. Best-effort: never raises.
+    #
+    # Benign false-positive note (reviewer finding, amendment round): the
+    # fingerprint assumes scroll and count agree for committed records. If a
+    # task_count_snapshot was authored earlier in this SAME cycle by the
+    # still-live Stage-2 LLM path (see the duplicate-write note in run()) and
+    # Qdrant's scroll vs. count views momentarily disagree under eventual
+    # consistency, this guard can flip enumeration_ok to 0 against an
+    # otherwise healthy pool. That is an accepted, self-correcting trigger --
+    # it costs one skipped write, recovered next cycle -- so not every
+    # enumeration_ok == 0 log below is a confirmed Qdrant timeout.
+    if enumeration_ok and not members:
+        try:
+            snapshot_count = await memory_service.count_memories_by_metadata(
+                project_id=project_id,
+                filters={'kind': TASK_COUNT_SNAPSHOT_KIND},
+            )
+            enumeration_confirmed_empty = snapshot_count <= 0
+        except Exception:
+            logger.warning(
+                'reconciliation._prune_task_count_snapshots: '
+                'count_memories_by_metadata cross-check failed for project_id=%s '
+                'after an empty scroll; treating enumeration as not-ok rather '
+                'than a confirmed empty pool (possible swallowed Qdrant read '
+                'timeout, task 2655)',
+                project_id,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
+            enumeration_ok = False
+        else:
+            if not enumeration_confirmed_empty:
+                logger.warning(
+                    'reconciliation._prune_task_count_snapshots: '
+                    'get_memories_by_metadata scroll returned 0 task_count_snapshot '
+                    'records for project_id=%s but count_memories_by_metadata '
+                    'reports %d existing -- swallowed Qdrant read timeout '
+                    'fingerprint (task 2655); treating enumeration as not-ok '
+                    'rather than a genuine empty pool',
+                    project_id, snapshot_count,
+                    extra={'project_id': project_id, 'run_id': run_id},
+                )
+                enumeration_ok = False
+
     if len(members) >= scroll_limit:
         logger.warning(
             'reconciliation._prune_task_count_snapshots: enumerated %d of scroll_limit=%d '
@@ -1210,6 +1264,19 @@ async def _write_task_count_snapshot(
     escalation. Pinned by
     ``test_add_memory_failure_after_successful_prune_returns_none``.
 
+    Enumeration-failure write-gate (task 2655; supersedes task 2646's note
+    that the write proceeds regardless of the prune's enumeration outcome):
+    if :func:`_prune_task_count_snapshots` reports
+    ``SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY == 0`` — including the silent-
+    empty-scroll case caught by its count cross-check — this function logs a
+    structured WARNING and returns ``None`` BEFORE calling ``add_memory``.
+    Writing a fresh snapshot when the prior one(s) could not be confirmed
+    enumerated/pruned is exactly what grows the byte-identical duplicate
+    pile (the recurring incident this task exists to fix); skipping is
+    self-correcting, since the next healthy cycle enumerates and prunes all
+    accumulated duplicates before writing one. Pinned by
+    ``TestWriteTaskCountSnapshotEnumerationGate``.
+
     Counts are derived by self-fetching via ``taskmaster.get_tasks`` and
     filtering with :func:`filter_task_tree` — mirroring
     ``assemble_payload``'s own self-fetch fallback idiom — rather than
@@ -1244,11 +1311,16 @@ async def _write_task_count_snapshot(
             rather than direct indexing — see the "Conditional presence"
             note on
             ``task_count_snapshot_cadence.SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY``
-            (amendment round, task 2646 review).
+            (amendment round, task 2646 review). Also read back internally
+            (task 2655) immediately after the prune call to decide the
+            enumeration-failure write-gate below — a throwaway local dict is
+            used for this when the caller passes ``None``, so the gate reads
+            correctly even when the caller doesn't want the stats.
 
     Returns:
         ``True`` on a successful write; ``None`` when *taskmaster* is
-        ``None`` or any step of the fetch/filter/write fails.
+        ``None``, the prune could not confirm a clean enumeration (task
+        2655 write-gate), or any step of the fetch/filter/write fails.
     """
     if taskmaster is None:
         return None
@@ -1270,7 +1342,27 @@ async def _write_task_count_snapshot(
             highest_task_id=tree.max_task_id,
             as_of=as_of,
         )
-        await _prune_task_count_snapshots(memory_service, project_id, run_id, stats=stats)
+        # prune_stats is ALWAYS a real dict (never None) so the write-gate
+        # below can read SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY back
+        # regardless of whether the caller wanted the observability stats
+        # (task 2655). When the caller passed a real `stats` dict (e.g.
+        # run()'s report.stats), prune_stats IS that same object, so the
+        # four prune stats still surface there unchanged.
+        prune_stats = stats if stats is not None else {}
+        await _prune_task_count_snapshots(
+            memory_service, project_id, run_id, stats=prune_stats,
+        )
+        if prune_stats.get(SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY) == 0:
+            logger.warning(
+                'reconciliation._write_task_count_snapshot: '
+                'prune enumeration failed for project_id=%s run_id=%s; '
+                'skipping this cycle\'s snapshot write to avoid growing the '
+                'duplicate pile (task 2655) -- the next healthy cycle will '
+                'prune and write normally',
+                project_id, run_id,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
+            return None
         await memory_service.add_memory(
             content=content,
             category=TASK_COUNT_SNAPSHOT_CATEGORY,
@@ -1886,7 +1978,38 @@ class TaskKnowledgeSync(BaseStage):
                 self.memory, self.taskmaster, self.project_root, self.project_id,
                 run_id, run_window_start, stats=report.stats,
             )
-        if task_count_snapshot_written is None:
+        # Task 2655 step-6: if the prune couldn't enumerate (enumeration_ok
+        # == 0 -- the swallowed-Qdrant-timeout fingerprint), _write_task_
+        # count_snapshot already skipped its write above (step-4) rather than
+        # risk another duplicate. Don't fall back to verify in that case
+        # either: _verify_task_count_snapshot_written's scroll swallows
+        # timeouts the same way and would mis-read the empty page as a
+        # CONFIRMED miss (False), spuriously growing the harness's
+        # consecutive-stale-snapshot streak. Leave the stat key absent
+        # (inconclusive) instead. When the key is absent entirely (taskmaster
+        # None, or write-blocked project -- the prune never ran) or
+        # enumeration_ok == 1, behavior is unchanged: verify still runs.
+        #
+        # Accepted trade-off (reviewer finding, amendment round): a
+        # SUSTAINED enumeration failure (e.g. a Qdrant read timeout that
+        # persists across cycles) is now invisible to the harness's
+        # consecutive-stale-snapshot escalation -- every affected cycle skips
+        # both the write and the verify fallback, so 'task_count_snapshot_
+        # written' stays absent (never a CONFIRMED miss) and the streak never
+        # advances. The only signal is the per-cycle WARNING logged in
+        # _prune_task_count_snapshots / _write_task_count_snapshot. Before
+        # this change a sustained timeout still produced a fresh (duplicated)
+        # snapshot each cycle, so freshness was maintained at the cost of the
+        # duplicate pile this task exists to stop. A bounded backstop --
+        # escalate once consecutive enumeration_ok == 0 cycles cross a
+        # threshold, mirroring the harness's existing consecutive-miss streak
+        # -- would close this blind spot; it needs a harness-side consumer of
+        # the prune stats and is left as a possible follow-up rather than
+        # folded into this task.
+        if (
+            task_count_snapshot_written is None
+            and report.stats.get(SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY) != 0
+        ):
             task_count_snapshot_written = await _verify_task_count_snapshot_written(
                 self.memory, self.project_id, run_window_start,
             )

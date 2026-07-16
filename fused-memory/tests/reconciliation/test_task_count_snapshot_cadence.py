@@ -667,6 +667,11 @@ class TestPruneSnapshotStats:
     async def test_genuine_empty_enumeration_sets_enumeration_ok(self):
         memory_service = AsyncMock()
         memory_service.get_memories_by_metadata.return_value = []
+        # Task 2655: an empty scroll now triggers a count cross-check (see
+        # TestPruneSilentEmptyGuard below) -- a confirmed count of 0 is what
+        # makes this a genuine empty pool rather than the swallowed-timeout
+        # fingerprint (empty scroll + count > 0).
+        memory_service.count_memories_by_metadata.return_value = 0
         observed = {}
 
         result = await _prune_task_count_snapshots(
@@ -739,6 +744,130 @@ class TestPruneSnapshotStats:
 
 
 # ---------------------------------------------------------------------------
+# _prune_task_count_snapshots -- silent-empty-enumeration guard (task 2655)
+# ---------------------------------------------------------------------------
+
+
+class TestPruneSilentEmptyGuard:
+    """The incident fingerprint (task 2655, 5th recorded recurrence):
+    ``Mem0Backend.scroll_by_metadata`` catches ``TimeoutError`` and returns
+    ``[]`` (mem0_client.py:392-407), while its sibling ``count_by_metadata``
+    (mem0_client.py:296-339) lets timeouts propagate. So an empty,
+    NON-exceptional scroll page is ambiguous: a genuine empty pool and a
+    swallowed Qdrant read timeout look identical to
+    ``enumeration_ok``/``enumerated`` alone.
+
+    This class pins the fix: on an empty scroll, cross-check via
+    ``count_memories_by_metadata`` (project 2655's chosen cross-check
+    primitive, since it propagates timeouts). A raised cross-check, or a
+    confirmed count > 0, is the swallowed-timeout fingerprint and flips
+    ``enumeration_ok`` to False; only a confirmed count of 0 keeps
+    ``enumeration_ok`` True. The cross-check itself must never raise
+    (preserves the prune's best-effort, never-raises contract), and must
+    not run at all on a non-empty scroll (hot path unaffected).
+    """
+
+    @pytest.mark.asyncio
+    async def test_swallowed_timeout_fingerprint_sets_enumeration_not_ok(self):
+        """(a) Empty scroll but the count cross-check reports 3 existing
+        snapshots -- the swallowed-timeout fingerprint. Nothing was
+        enumerated, so nothing is deleted, but enumeration_ok must be
+        observably 0 rather than looking like a genuine empty pool."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+        memory_service.count_memories_by_metadata.return_value = 3
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 0
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 0,
+            'task_count_snapshot_pruned': 0,
+            'task_count_snapshot_prune_enumeration_ok': 0,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+        memory_service.delete_memory.assert_not_awaited()
+        memory_service.count_memories_by_metadata.assert_awaited_once()
+        _, kwargs = memory_service.count_memories_by_metadata.await_args
+        assert kwargs['project_id'] == 'reify'
+        assert kwargs['filters'] == {'kind': TASK_COUNT_SNAPSHOT_KIND}
+
+    @pytest.mark.asyncio
+    async def test_count_cross_check_raises_sets_enumeration_not_ok_never_raises(self):
+        """(b) Empty scroll and the count cross-check itself raises -- still
+        degrades to enumeration_ok=0 rather than propagating (never-raise
+        contract preserved even for the new cross-check)."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+        memory_service.count_memories_by_metadata.side_effect = RuntimeError('mem0 down')
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 0
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 0,
+            'task_count_snapshot_pruned': 0,
+            'task_count_snapshot_prune_enumeration_ok': 0,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_confirmed_zero_count_keeps_enumeration_ok(self):
+        """(c) Empty scroll AND the count cross-check confirms 0 -- a
+        genuine empty pool, not the swallowed-timeout fingerprint."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+        memory_service.count_memories_by_metadata.return_value = 0
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 0
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 0,
+            'task_count_snapshot_pruned': 0,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+        memory_service.count_memories_by_metadata.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_empty_scroll_never_invokes_count_cross_check(self):
+        """(d) Hot path unaffected: a non-empty scroll page must not pay for
+        the extra count cross-check call at all, and enumeration_ok stays
+        True as before."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'm1', 'created_at': '2026-07-01T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm2', 'created_at': '2026-07-02T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+        ]
+        memory_service.delete_memory.return_value = None
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 2
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 2,
+            'task_count_snapshot_pruned': 2,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+        memory_service.count_memories_by_metadata.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # _write_task_count_snapshot (stages/task_knowledge_sync.py) -- task 2325 step-5/6
 # ---------------------------------------------------------------------------
 
@@ -771,6 +900,11 @@ class TestWriteTaskCountSnapshot:
     async def test_success_writes_once_and_returns_true(self):
         memory_service = AsyncMock()
         memory_service.get_memories_by_metadata.return_value = []
+        # Task 2655: an empty scroll now triggers the prune's count
+        # cross-check (TestPruneSilentEmptyGuard); a confirmed count of 0
+        # is what makes this a genuine empty pool that the write-gate
+        # (TestWriteTaskCountSnapshot below) lets through.
+        memory_service.count_memories_by_metadata.return_value = 0
         memory_service.add_memory.return_value = {'memory_ids': ['m1']}
         taskmaster = self._taskmaster()
 
@@ -935,6 +1069,101 @@ class TestWriteTaskCountSnapshot:
             call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
         }
         assert deleted_ids == {'stale-1', 'stale-2'}
+        memory_service.add_memory.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# _write_task_count_snapshot -- enumeration-failure write-gate (task 2655)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteTaskCountSnapshotEnumerationGate:
+    """_write_task_count_snapshot skips the deterministic write (returns
+    None, never calls add_memory) when the prune reports
+    enumeration_ok=0 (task 2655).
+
+    Writing a fresh snapshot when the prior ones could not be
+    enumerated/pruned is exactly what grows the byte-identical duplicate
+    pile (the recurring incident this task exists to fix). Skipping is
+    self-correcting: the next healthy cycle enumerates and prunes all
+    accumulated duplicates, then writes one. Deliberately supersedes task
+    2646's pinned "write still proceeds on enumeration failure" behavior --
+    see TestRunSurfacesPruneObservability.
+    test_live_silent_enumeration_failure_surfaces_as_not_ok, updated
+    alongside this class.
+    """
+
+    def _taskmaster(self):
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {
+            'tasks': [
+                {'id': 1, 'status': 'pending'},
+                {'id': 2, 'status': 'in-progress'},
+                {'id': 3, 'status': 'done'},
+                {'id': 4, 'status': 'cancelled'},
+            ],
+        }
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_enumeration_raises_skips_write(self):
+        """(a) The prune's own scroll call raises outright -- the write
+        must be skipped (returns None, add_memory never called) rather
+        than proceeding to add a fresh snapshot on top of an unprunable
+        pile."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.side_effect = RuntimeError('mem0 down')
+        taskmaster = self._taskmaster()
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+        )
+
+        assert result is None
+        memory_service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_fingerprint_skips_write(self):
+        """(b) Empty scroll + count cross-check reports 2 existing
+        snapshots -- the swallowed-timeout fingerprint. The write must be
+        skipped so the cycle doesn't add another duplicate on top of the
+        un-enumerable pile."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+        memory_service.count_memories_by_metadata.return_value = 2
+        taskmaster = self._taskmaster()
+        observed = {}
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+            stats=observed,
+        )
+
+        assert result is None
+        memory_service.add_memory.assert_not_awaited()
+        assert observed[SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY] == 0
+
+    @pytest.mark.asyncio
+    async def test_healthy_enumeration_still_writes(self):
+        """(c) Positive guard: a normal non-empty scroll (enumeration_ok=1)
+        must still write -- the gate must not over-skip a healthy cycle."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {
+                'id': 'stale-1',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'kind': 'task_count_snapshot'},
+            },
+        ]
+        memory_service.delete_memory.return_value = None
+        memory_service.add_memory.return_value = {'memory_ids': ['fresh-1']}
+        taskmaster = self._taskmaster()
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+        )
+
+        assert result is True
         memory_service.add_memory.assert_awaited_once()
 
 
@@ -1452,10 +1681,12 @@ class TestRunSurfacesPruneObservability:
     @pytest.mark.asyncio
     async def test_live_silent_enumeration_failure_surfaces_as_not_ok(self, mock_deps):
         """Case (b), the incident fingerprint: enumeration RAISES inside the
-        real prune, yet the canonical add_memory write still proceeds.
-        report.stats must show enumeration_ok=0 / enumerated=0 -- runtime-
-        observably distinct from a genuine empty result -- rather than
-        silently looking like nothing was ever there to prune."""
+        real prune. report.stats must show enumeration_ok=0 / enumerated=0
+        -- runtime-observably distinct from a genuine empty result -- and
+        (task 2655) the canonical add_memory write must now be SKIPPED
+        rather than proceeding and adding another duplicate on top of an
+        unprunable pile. This supersedes task 2646's pinned
+        write-proceeds-on-enumeration-failure behavior."""
 
         def _get_memories_by_metadata(*, project_id, filters, **kwargs):
             if filters == {'kind': TASK_COUNT_SNAPSHOT_KIND}:
@@ -1483,4 +1714,120 @@ class TestRunSurfacesPruneObservability:
 
         assert report.stats['task_count_snapshot_prune_enumeration_ok'] == 0
         assert report.stats['task_count_snapshot_prune_enumerated'] == 0
-        mock_deps['memory_service'].add_memory.assert_awaited_once()
+        mock_deps['memory_service'].add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_timeout_fingerprint_skips_write_no_duplicate_added(self, mock_deps):
+        """Case (c), task 2655's core fix: the scroll comes back EMPTY
+        (no exception -- the swallowed-timeout shape) while the count
+        cross-check reports 2 existing snapshots. The real prune must
+        surface enumeration_ok=0, and the canonical write must be skipped
+        entirely -- no duplicate added on top of the un-enumerable pile."""
+
+        def _get_memories_by_metadata(*, project_id, filters, **kwargs):
+            if filters == {'kind': TASK_COUNT_SNAPSHOT_KIND}:
+                return []
+            return []
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            side_effect=_get_memories_by_metadata,
+        )
+        mock_deps['memory_service'].count_memories_by_metadata.return_value = 2
+
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('reify', '/tmp/test'),
+            **mock_deps,
+        )
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=self._fake_cli_result()),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='run-prune-live-timeout-fingerprint',
+            )
+
+        assert report.stats['task_count_snapshot_prune_enumeration_ok'] == 0
+        mock_deps['memory_service'].add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_timeout_fingerprint_skips_verify_fallback(self, mock_deps):
+        """Task 2655 step-5/6: when the prune reports enumeration_ok=0, run()
+        must NOT fall back to _verify_task_count_snapshot_written -- that
+        helper's own scroll swallows timeouts the same way and would
+        mis-read the empty page as a CONFIRMED miss (False), spuriously
+        growing the harness's consecutive-miss streak
+        (_maybe_escalate_stale_task_count_snapshot). report.stats must
+        instead leave 'task_count_snapshot_written' absent (inconclusive)."""
+
+        def _get_memories_by_metadata(*, project_id, filters, **kwargs):
+            if filters == {'kind': TASK_COUNT_SNAPSHOT_KIND}:
+                return []
+            return []
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            side_effect=_get_memories_by_metadata,
+        )
+        mock_deps['memory_service'].count_memories_by_metadata.return_value = 2
+
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('reify', '/tmp/test'),
+            **mock_deps,
+        )
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._verify_task_count_snapshot_written',
+                new=AsyncMock(),
+            ) as mock_verify,
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='run-prune-live-timeout-no-verify',
+            )
+
+        assert 'task_count_snapshot_written' not in report.stats
+        mock_verify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_taskmaster_none_still_falls_back_to_verify(self, mock_deps):
+        """Contrast case: when the prune never ran at all (no taskmaster,
+        so _write_task_count_snapshot early-returns before ever calling
+        _prune_task_count_snapshots), SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY
+        is absent from report.stats entirely (not 0) -- the new step-6
+        guard must read that as "unknown", not "confirmed failed", and
+        still fall back to verify exactly as before this task."""
+        mock_deps['taskmaster'] = None
+
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('reify', '/tmp/test'),
+            **mock_deps,
+        )
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._verify_task_count_snapshot_written',
+                new=AsyncMock(return_value=True),
+            ) as mock_verify,
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='run-no-taskmaster-verify-fallback',
+            )
+
+        mock_verify.assert_awaited_once()
+        assert report.stats['task_count_snapshot_written'] == 1
