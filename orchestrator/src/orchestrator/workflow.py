@@ -7019,7 +7019,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         This runs OUTSIDE the merge queue — the worker is free to process
         other merges while this task resolves its conflicts.
         """
-        assert self.worktree is not None
+        assert self.worktree is not None and self.artifacts is not None
         logger.info(
             f'Task {self.task_id}: merge conflicts detected, '
             f'resolving outside queue'
@@ -7034,10 +7034,35 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         # Rebase onto current main so MERGER works on up-to-date state
         await self.git_ops.rebase_onto_main(self.worktree)
+        # I-FRESH: never consume a stale verdict from a prior invocation on
+        # this same worktree (mirrors steward.py's pre-triage clear).
+        self.artifacts.clear_verdict('merger')
         merger_result = await self._invoke(MERGER, prompt, self.worktree)
 
-        if not merger_result.success or 'BLOCKED' in merger_result.output.upper():
-            reason = f'Merger could not resolve: {merger_result.output[:200]}'
+        # Read the merger's structured disposition instead of grepping its
+        # free-text output for "BLOCKED" (task 2483 / PRD task γ). Defensive
+        # extraction mirrors extract_triage_verdict's untrusted-shape
+        # contract: only a dict envelope with a dict 'verdict' carrying a
+        # bool 'blocked' is trusted; anything else is treated as absent.
+        envelope = self.artifacts.read_verdict('merger')
+        verdict = envelope.get('verdict') if isinstance(envelope, dict) else None
+        if not isinstance(verdict, dict) or not isinstance(verdict.get('blocked'), bool):
+            verdict = None
+
+        if not merger_result.success or verdict is None:
+            # Fail-safe (I-FAIL-SAFE): an invocation failure, an absent
+            # verdict, or a malformed one all block the merge — a merger
+            # that produces no trustworthy disposition must never proceed.
+            reason = (
+                f'Merger invocation failed: {merger_result.output[:200]}'
+                if not merger_result.success
+                else f'Merger emitted no/invalid disposition: {merger_result.output[:200]}'
+            )
+            self._write_merge_failure_review('merger_blocked', reason)
+            return await self._mark_blocked(reason, merge_phase=merge_phase)
+
+        if verdict['blocked']:
+            reason = verdict.get('reason') or f'Merger blocked: {merger_result.output[:200]}'
             self._write_merge_failure_review('merger_blocked', reason)
             return await self._mark_blocked(reason, merge_phase=merge_phase)
 

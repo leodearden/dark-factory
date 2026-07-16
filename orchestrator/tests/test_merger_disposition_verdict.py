@@ -29,10 +29,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _workflow_helpers import _make
+from shared.cli_invoke import AgentResult
 
 from orchestrator.mcp.verdict_tools import _envelope
 from orchestrator.workflow import WorkflowOutcome
-from shared.cli_invoke import AgentResult
 
 
 def _invoke_with_verdict(
