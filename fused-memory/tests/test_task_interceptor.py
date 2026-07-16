@@ -2935,6 +2935,72 @@ async def test_reopen_freshness_warn_mode_emits_census_line(
         await backend.close()
 
 
+@pytest.mark.asyncio
+async def test_reopen_freshness_valid_override_accepted_and_recorded(
+    tmp_path, event_buffer,
+):
+    """A valid ``stale_evidence_override`` bypasses the enforce-mode
+    rejection and is recorded VERBATIM into the persisted done_provenance
+    for Stage-2 audit -- fused-memory has no orchestrator-escalation
+    client, so no live cross-service lookup is attempted (PRD G3).
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    _init_git_repo(tmp_path)
+    stale_sha = _commit_on_main(tmp_path, 'stale_evidence.txt', '2020-01-01T00:00:00+00:00')
+
+    cfg = FusedMemoryConfig()
+    cfg.reconciliation.reject_stale_done_evidence = 'enforce'
+
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg)
+
+        stale_provenance = {'kind': 'found_on_main', 'commit': stale_sha, 'note': 'sibling'}
+
+        first_done = await interceptor.set_task_status(
+            '1', 'done', project_root, done_provenance=stale_provenance,
+        )
+        assert 'error' not in first_done, first_done
+
+        reopen_result = await interceptor.set_task_status(
+            '1', 'pending', project_root, reopen_reason='reverting: regression found',
+        )
+        assert 'error' not in reopen_result, reopen_result
+
+        override = {
+            'escalation_id': 'esc-prov-conflict-42',
+            'reason': 'reopen was wrong; work truly on main',
+        }
+        result = await interceptor.set_task_status(
+            '1',
+            'done',
+            project_root,
+            done_provenance={**stale_provenance, 'stale_evidence_override': override},
+            agent_id='claude-interactive',
+        )
+
+        assert 'error' not in result, result
+
+        # Independent fresh backend confirms the override-accepted write
+        # actually persisted (status flip) AND that the override itself was
+        # recorded verbatim onto the persisted done_provenance.
+        fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await fresh.start()
+        try:
+            task = await fresh.get_task('1', project_root=project_root)
+        finally:
+            await fresh.close()
+        assert task['status'] == 'done', task
+        assert task['metadata']['done_provenance']['stale_evidence_override'] == override
+    finally:
+        await backend.close()
+
+
 # ── Tests for done_provenance.kind discriminator (2026-04-27 hardening) ────
 
 
