@@ -1883,6 +1883,37 @@ def _run_write_decision(
         print(record.id)
 
 
+def _run_reap_decisions(project: str, escalations_dir: str) -> None:
+    """Run the ``reap-decisions`` verb (Fleet Cockpit C8: close-on-resolve driver).
+
+    Builds the production ``escalation_status`` closure for
+    reap_answered_decisions: a decision belonging to a DIFFERENT project is
+    left alone (returns None -- unresolved), since DecisionRecords are
+    fleet-global (``~/.claude/fleet/decisions/``) but escalations are
+    per-project (``<project_root>/data/escalations``); otherwise defers to
+    read_escalation_status against *escalations_dir*. Project-scoping this
+    way makes the (global decisions <-> per-project escalations) join
+    correct without fragile project_id -> path auto-discovery. Root
+    resolves via $CLAUDE_FLEET_ROOT, same as every other verb.
+
+    A watcher runs this once per Main Loop cycle (SKILL.md "Closing parked
+    decisions on resolve") so a decision it (or anyone -- /unblock, an L2
+    cascade, the human) files closes once its escalation is actually
+    resolved/dismissed. Prints one ``f'{id} {new_state}'`` line per closed
+    decision, mirroring `write-decision` printing the filed id.
+    """
+
+    def _status(decision: DecisionRecord) -> str | None:
+        if decision.project != project:
+            return None
+        if decision.escalation_id is None:
+            return None
+        return read_escalation_status(escalations_dir, decision.escalation_id)
+
+    for reaped in reap_answered_decisions(escalation_status=_status):
+        print(f'{reaped.id} {reaped.new_state}')
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='session_registry')
     sub = parser.add_subparsers(dest='verb', required=True)
@@ -1945,6 +1976,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help='escalation severity to weight this ask (info|blocking|critical|urgent)',
     )
 
+    reap_decisions_p = sub.add_parser(
+        'reap-decisions',
+        help='close OPEN decisions whose escalation has resolved/dismissed (Fleet Cockpit C8)',
+    )
+    reap_decisions_p.add_argument('--project', required=True)
+    reap_decisions_p.add_argument('--escalations-dir', required=True)
+
     return parser
 
 
@@ -1988,6 +2026,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.session_id,
                 args.severity,
             )
+        elif args.verb == 'reap-decisions':
+            _run_reap_decisions(args.project, args.escalations_dir)
     except Exception:
         logger.error('session_registry %s failed', args.verb, exc_info=True)
         return 0
