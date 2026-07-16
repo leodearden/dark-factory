@@ -62,7 +62,7 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 
 ## Shallow-by-default → Deepen-on-signal RCA
 
-RCA stays **shallow** until escalations carry signals of a common cause. Deepening costs context budget — this rotation runs on opus/high-effort under a $50/day ceiling, so a quiet queue must stay cheap.
+RCA stays **shallow** until escalations carry signals of a common cause. Deepening costs context budget — the top-level rotation now runs on sonnet/high-effort (task 2629), sized for cheap mechanical triage on a quiet queue, under a $50/day ceiling. When a signal below does call for deepening, delegate the deep dive itself to an opus subagent (see [Delegating deep RCA to an opus subagent](#delegating-deep-rca-to-an-opus-subagent)) rather than deepening in the top-level context.
 
 ### When to deepen
 
@@ -91,6 +91,14 @@ The auto-watcher's allowed tools strictly limit what you can access. Use these f
 | `mcp__fused-memory__search` | Semantic search for prior decisions, related tasks, conventions |
 
 **You do NOT have** `df`, `systemctl`, `docker`, `kill`, or any host-health tool — you form infra hypotheses from symptom patterns only.
+
+### Delegating deep RCA to an opus subagent
+
+The top-level rotation runs on sonnet (task 2629) to keep the common case — mechanical triage on a quiet queue — cheap. When a [deepen-on-signal](#when-to-deepen) trigger fires, or an escalation is otherwise hard or investigation-class, spawn an **opus** subagent via the `Task` tool to do the deep RCA rather than deepening in your own (sonnet) context. This keeps the top-level rotation cheap and orchestration-only while still getting opus-quality reasoning exactly where it's needed.
+
+- **Scope the subagent to read-only investigation only.** Its job is RCA and hypothesis formation feeding `promote_to_l2` — gathering evidence with the same [read-only investigation toolset](#read-only-investigation-toolset) above (`Read`/`Glob`/`Grep`, `git log`/`diff`/`show`/`status`, the fused-memory task/search reads) and returning a root-cause hypothesis, supporting evidence, and candidate options as its final message.
+- **The subagent inherits every Hard Constraint verbatim.** It must NOT make code edits (no `Edit`/`Write`), NOT touch the merge queue or infra, and NOT perform any main-ref recovery move — those stay forbidden and are promoted to L2 exactly as if you had investigated it yourself. State these constraints explicitly in the subagent's prompt; do not assume a subagent infers them.
+- **You still make the `promote_to_l2` call.** The subagent's findings come back as data, not as an action — you (the top-level rotation) fold them into `root_cause`/`evidence`/`options` and call `promote_to_l2` yourself. The subagent never calls escalation-mutating tools.
 
 ### Hypothesis formation
 
