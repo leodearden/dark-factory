@@ -457,3 +457,39 @@ class TestRun:
         assert report['classification'] == 'healthy'
         assert report['deleted'] is False
         assert _mod.resolve_exit_code(report) == 0
+
+
+# ===========================================================================
+# Tests: _build_parser
+# ===========================================================================
+
+class TestBuildParser:
+    """Tests for the CLI parser factory _build_parser()."""
+
+    def test_no_args_raises_system_exit(self):
+        """--memory-id is required -- parsing with no args raises SystemExit."""
+        parser = _mod._build_parser()
+
+        with pytest.raises(SystemExit):
+            parser.parse_args([])
+
+    def test_defaults_project_id_and_apply(self):
+        """Only --memory-id given: project_id defaults to 'dark_factory' and
+        apply defaults to False."""
+        parser = _mod._build_parser()
+
+        args = parser.parse_args(['--memory-id', 'X'])
+
+        assert args.memory_id == 'X'
+        assert args.project_id == 'dark_factory'
+        assert args.apply is False
+
+    def test_project_id_and_apply_overridable(self):
+        """--project-id and --apply both override their defaults."""
+        parser = _mod._build_parser()
+
+        args = parser.parse_args(['--memory-id', 'X', '--project-id', 'reify', '--apply'])
+
+        assert args.memory_id == 'X'
+        assert args.project_id == 'reify'
+        assert args.apply is True
