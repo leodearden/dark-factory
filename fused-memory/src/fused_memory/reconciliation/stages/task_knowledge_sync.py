@@ -1166,6 +1166,8 @@ async def _write_task_count_snapshot(
     project_id: str,
     run_id: str,
     run_window_start: datetime | None,
+    *,
+    stats: dict | None = None,
 ) -> bool | None:
     """Deterministically write this cycle's task_count_snapshot Mem0 record.
 
@@ -1228,6 +1230,11 @@ async def _write_task_count_snapshot(
             ``metadata.run_id`` and its ``causation_id``.
         run_window_start: Start of the current run window, or ``None`` when
             unknown — used only to derive the content's ``as_of`` date.
+        stats: Optional dict forwarded to ``_prune_task_count_snapshots`` to
+            populate with this cycle's prune runtime-observability counts
+            (task 2646). Populated only when the prune is actually reached —
+            left untouched if *taskmaster* is ``None`` or the fetch/filter
+            step fails before the prune call.
 
     Returns:
         ``True`` on a successful write; ``None`` when *taskmaster* is
@@ -1253,7 +1260,7 @@ async def _write_task_count_snapshot(
             highest_task_id=tree.max_task_id,
             as_of=as_of,
         )
-        await _prune_task_count_snapshots(memory_service, project_id, run_id)
+        await _prune_task_count_snapshots(memory_service, project_id, run_id, stats=stats)
         await memory_service.add_memory(
             content=content,
             category=TASK_COUNT_SNAPSHOT_CATEGORY,
