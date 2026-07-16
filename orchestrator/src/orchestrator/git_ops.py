@@ -216,6 +216,20 @@ class TrainStackResult:
 # The ``{tid}`` placeholder is interpolated via ``str.format`` with the
 # escaped task id; a ``\b`` (word boundary) at each side blocks substring
 # overlap so ``task/3399`` doesn't match a row that cites ``task/339``.
+#
+# Subject-only (task 2675 FIX 2): this pattern is written with ``^``
+# anchors as if applied to a single SUBJECT line, but git's ``--grep``
+# applies ``^``/``$`` per LINE across the whole commit message — a BODY
+# line that happens to start with a conventional-commit token, or with
+# ``Merge task/{tid} into ``, would otherwise false-cite.
+# ``find_task_citation_commit`` uses ``--grep`` only as a coarse
+# full-message PRE-filter (a sound superset) and then re-applies this
+# same pattern string, compiled as a Python ``re`` (no ``re.MULTILINE``,
+# so ``^`` anchors to the start of the string), to each candidate's
+# SUBJECT ONLY — body-only matches are therefore never treated as
+# citations. A caller-supplied ``pattern_template`` override must
+# therefore be valid as both a git ``--extended-regexp`` (ERE) pattern
+# *and* a Python ``re`` pattern.
 DEFAULT_COMMIT_CITATION_PATTERN: str = (
     r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
     r'(\(\b{tid}\b[):]|.*\btask/{tid}\b)'
@@ -5498,7 +5512,7 @@ class GitOps:
     async def find_task_citation_commit(
         self, tid: str, *, pattern_template: str | None = None,
     ) -> str | None:
-        """Search main's history for a commit whose subject cites *tid*.
+        """Search main's history for a commit whose SUBJECT cites *tid*.
 
         Used by the reconciler to gate the ``is_ancestor==True`` fast-path:
         ``is_ancestor`` returns True trivially for zero-commit branches
@@ -5506,18 +5520,50 @@ class GitOps:
         false-positives blocked/escalated tasks.  Requiring a positive
         citation on main rejects that degenerate case.
 
+        Matching is constrained to each candidate commit's SUBJECT line
+        only (task 2675 FIX 2): git's ``--grep`` applies ``^``/``$`` per
+        LINE across the whole commit message, so a BODY line that merely
+        happens to start with a conventional-commit token, or with
+        ``Merge task/{tid} into ``, would otherwise false-cite.  ``--grep``
+        is used only as a coarse, uncapped full-message PRE-filter (a
+        sound superset — any subject match is necessarily a message
+        match); each candidate's subject is then re-tested against the
+        same pattern, compiled as a Python ``re`` (see
+        ``DEFAULT_COMMIT_CITATION_PATTERN``'s doc comment). Candidates are
+        walked in git-log order (most-recent-first) and the first whose
+        SUBJECT matches wins, so a body-only false match on a newer
+        commit can never shadow an older genuine subject citation.
+
+        **Accepted tradeoff — uncapped walk**: dropping ``--max-count=1``
+        means git enumerates every commit the coarse ``--grep``
+        pre-filter matches (subject OR body), not just the most recent
+        one — a task referenced in many commit bodies makes git emit and
+        this method re-test all of them.  This is bounded by how many
+        commits actually mention the pattern (never the full history) and
+        is required for correctness (see above), so it is accepted as-is;
+        a caller on a hot path with a very chatty history could additionally
+        cap the walk (e.g. an extra ``--max-count=N`` under the assumption
+        a genuine subject citation appears within the N most recent
+        message-matches), but no such cap is applied here.
+
         Args:
             tid: Bare task id (no ``task/`` prefix); the prefix is added
                 by the default pattern where appropriate.
             pattern_template: Optional override for the citation pattern.
                 Defaults to ``DEFAULT_COMMIT_CITATION_PATTERN``.  Empty
                 string disables the check by returning None immediately
-                (caller opt-out for projects without citation conventions).
+                (caller opt-out for projects without citation
+                conventions).  Must be valid as both a git
+                ``--extended-regexp`` pattern and a Python ``re`` pattern
+                — an uncompilable override is treated as fail-safe
+                no-citation (logs a warning and returns None), mirroring
+                the prior git-error-means-None behavior.
 
         Returns:
-            The 40-char commit SHA of the most recent matching commit on
-            main, or None when no commit cites the task or the pattern is
-            disabled.
+            The 40-char commit SHA of the most recent commit on main
+            whose SUBJECT cites *tid*, or None when no commit's subject
+            cites the task, the pattern is disabled, or an override
+            pattern fails to compile as a Python ``re``.
         """
         template = (
             pattern_template
@@ -5526,20 +5572,36 @@ class GitOps:
         )
         if template == '':
             return None
-        pattern = template.format(tid=re.escape(tid))
+        pattern_str = template.format(tid=re.escape(tid))
+        try:
+            compiled = re.compile(pattern_str)
+        except re.error:
+            logger.warning(
+                'find_task_citation_commit: pattern_template is not a '
+                'valid Python re pattern (tid=%s); treating as '
+                'no-citation (fail-safe): %r',
+                tid, pattern_str,
+            )
+            return None
         rc, out, _ = await _run(
             [
                 'git', 'log', self.config.main_branch,
                 '--extended-regexp',
-                f'--grep={pattern}',
-                '--max-count=1',
-                '--format=%H',
+                f'--grep={pattern_str}',
+                '-z',
+                '--format=%H%x1f%s',
             ],
             cwd=self.project_root,
         )
         if rc != 0 or not out:
             return None
-        return out
+        for record in out.split('\0'):
+            if not record:
+                continue
+            sha, _, subject = record.partition('\x1f')
+            if compiled.search(subject):
+                return sha.strip()
+        return None
 
     async def rebase_onto_main(self, worktree: Path, onto: str | None = None) -> bool:
         """Rebase the task branch in *worktree* onto *onto* (default: main).
@@ -6123,36 +6185,77 @@ class GitOps:
         touched.  ``is_ancestor`` alone cannot see that the commit's own
         effect is gone from current HEAD.
 
-        Computes ``touched = git -c core.quotePath=false diff-tree
-        --no-commit-id --name-only -r -z <commit_sha>`` (plain diff-tree,
-        no ``-m``/``-c`` — this is the commit's own diff against its sole
-        parent for an ordinary commit, and is empty by git's own default
-        behavior for a merge commit; ``-z`` + ``core.quotePath=false``
-        together make the path list byte-faithful for any filename,
-        including non-ASCII or newline-containing ones — see the
-        path-quoting caveat on :meth:`branch_content_in_main`, which
-        shares this primitive's underlying pattern but not yet this
-        hardening) and, when non-empty, returns whether ``git diff
-        --quiet <commit_sha> <main> -- <touched...>`` reports no
-        difference — i.e. main HEAD still carries byte-identical content
-        for every path *commit_sha* touched.
+        Resolves *commit_sha*'s parents via ``git rev-list --parents -n 1
+        <commit_sha>`` and branches on parent count:
+
+        - **Merge commit** (2+ parents; task 2675 FIX 1′) — the old plain
+          ``diff-tree`` touched-set is empty by git's own default
+          behavior for merge commits, which used to make this primitive
+          return True *unconditionally* for every merge (the task-1175
+          "reverted merge" blind spot: a ``Merge task/1175 into main``
+          marker exists and the merge commit is an ancestor of main
+          forever, but a later commit on main removed the deliverable —
+          effect NOT present, yet the old code said True).  Instead this
+          diffs EVERY non-first parent's (each merged branch's) content
+          against current main, requiring ALL of them to still be present
+          (task 2675 amendment — octopus-merge safety, so a later revert
+          of a third-or-later parent's deliverable cannot silently read
+          as effect-present): for each ``other_parent`` in
+          ``parents[1:]``, ``merge_base = git merge-base <parents[0]>
+          <other_parent>`` (that parent's FORK POINT — stable regardless
+          of later main history; **CRITICAL**: this must be
+          ``merge-base(first_parent, other_parent)``, NOT
+          ``merge-base(main, other_parent)`` — because the merge commit
+          is itself an ancestor of main in the found_on_main scenario,
+          ``merge-base(main, other_parent)`` collapses to
+          ``other_parent`` and yields an empty, useless diff), then
+          ``touched = git -c core.quotePath=false diff --name-only -z
+          <merge_base> <other_parent>`` (the paths that parent introduced
+          since its fork point), and finally whether ``git diff --quiet
+          <other_parent> <main> -- <touched...>`` reports no difference —
+          i.e. main HEAD still carries that parent's content
+          byte-identical for every path it touched.  For an ordinary
+          two-parent merge this is exactly one iteration, byte-identical
+          to checking the second parent alone.
+
+        - **Non-merge commit** (root or single-parent) — UNCHANGED from
+          prior behavior (task 2500): ``touched = git -c
+          core.quotePath=false diff-tree --no-commit-id --name-only -r
+          -z <commit_sha>`` (the commit's own diff against its sole
+          parent) and, when non-empty, whether ``git diff --quiet
+          <commit_sha> <main> -- <touched...>`` reports no difference.
+
+        ``-z`` + ``core.quotePath=false`` together make every path list
+        byte-faithful for any filename, including non-ASCII or
+        newline-containing ones — see the path-quoting caveat on
+        :meth:`branch_content_in_main`, which shares this primitive's
+        underlying merge-base/diff/diff-quiet pattern but not yet this
+        hardening.
 
         Returns True (path-based revert detection inapplicable) when:
-        - ``touched`` is empty — a merge commit (plain diff-tree shows no
-          per-file diff for a merge by default) or a genuinely empty
-          commit.  This deliberately preserves prior mark-done behavior
-          for journal-hit (:class:`MergeProvenance` ``advanced_sha``) and
-          merge-marker (:meth:`find_merge_marker`) shas, which are always
-          merge commits — only the git-fallback branch-tip work-commit
-          case gets a real check.
+        - the commit is non-merge and its own touched-set is empty — a
+          genuinely empty ordinary commit.  This deliberately preserves
+          prior mark-done behavior for that case (task 2500).
 
         Returns False (fail-safe — never claim an effect is present on
         doubt) when:
-        - the ``diff-tree`` call errors (rc != 0);
-        - the ``diff --quiet`` call errors for a reason other than "paths
-          differ" (rc not in {0, 1}); or
-        - any touched path differs between *commit_sha* and main HEAD
-          (rc == 1) — produced by a post-hoc revert of those paths, but
+        - ``rev-list --parents`` errors or returns nothing (rc != 0, or
+          *commit_sha* is unresolvable);
+        - for a merge commit, the ``merge-base`` call errors/is empty for
+          ANY non-first parent, that parent's ``diff --name-only`` call
+          errors, or its touched-set is empty — an empty branch merge has
+          no deliverable to confirm on main, so this is fail-safe False
+          (unlike the non-merge empty-touched case above, which stays
+          True); the per-parent check short-circuits on the first
+          failing parent, so an octopus merge (3+ parents) requires
+          EVERY parent to pass;
+        - for a non-merge commit, the ``diff-tree`` call errors (rc !=
+          0);
+        - the final ``diff --quiet`` call errors for a reason other than
+          "paths differ" (rc not in {0, 1}); or
+        - any touched path differs (rc == 1) between the relevant commit
+          (*commit_sha* for non-merge, any non-first parent for merge) and
+          main HEAD — produced by a post-hoc revert of those paths, but
           equally by any OTHER later change to the same paths (e.g.
           another already-landed task's follow-up edit, or this task's
           own later commit on the same branch overlapping the same
@@ -6160,19 +6263,84 @@ class GitOps:
           accepted-risk note below.
 
         **Accepted risk — later evolution reads the same as a revert**:
-        because this primitive only compares *commit_sha*'s own touched
-        paths against current main HEAD, ordinary subsequent evolution of
-        those paths (not just a genuine revert) also returns False here.
-        This is a deliberate fail-safe trade-off, not a bug: the caller's
-        own recovery path on False is idempotent (re-open to pending /
-        withhold the flip — never a wrong terminal state), so the cost of
-        a false negative here is a re-check, whereas a false True would
-        wrongly cement a completion that never happened. Callers with a
-        same-branch multi-commit shape should anchor this check on the
-        branch's own tip rather than a possibly-stale intermediate commit
-        — see ``Harness._already_landed_dispatch_gate``'s citation-lineage
+        because this primitive only compares the relevant commit's own
+        touched paths against current main HEAD, ordinary subsequent
+        evolution of those paths (not just a genuine revert) also
+        returns False here.  This is a deliberate fail-safe trade-off,
+        not a bug: the caller's own recovery path on False is idempotent
+        (re-open to pending / withhold the flip — never a wrong terminal
+        state), so the cost of a false negative here is a re-check,
+        whereas a false True would wrongly cement a completion that
+        never happened. Callers with a same-branch multi-commit shape
+        should anchor this check on the branch's own tip rather than a
+        possibly-stale intermediate commit — see
+        ``Harness._already_landed_dispatch_gate``'s citation-lineage
         handling (task 2500).
+
+        **Accepted risk — conflict-resolved merges**: the merge-commit
+        branch above compares each non-first parent's OWN pre-merge
+        content against main, not the merge commit's own
+        conflict-resolution snapshot.  A merge that needed manual
+        conflict resolution can therefore read as effect-absent (False)
+        here even though the merge landed cleanly on main, because the
+        resolved content on main no longer matches that parent's
+        unresolved pre-merge blob for the conflicting paths.  Same
+        fail-safe trade-off as above: a false False costs the caller an
+        idempotent re-check, never a wrongly-cemented completion.
         """
+        rc, parents_out, _ = await _run(
+            ['git', 'rev-list', '--parents', '-n', '1', commit_sha],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not parents_out:
+            return False
+        parents = parents_out.split()[1:]
+
+        if len(parents) >= 2:
+            # Merge commit (task 2675 FIX 1′): check EVERY non-first
+            # parent's (each merged branch's) content — the paths it
+            # touched since its fork point — against current main HEAD.
+            # For an ordinary two-parent merge this is exactly one
+            # iteration (byte-identical to the original second-parent-only
+            # check); for an octopus merge (3+ parents) ALL parents must
+            # pass, else a later revert of a third-or-later parent's
+            # deliverable would silently read as effect-present (task 2675
+            # amendment — the octopus blind spot).  Touched paths MUST
+            # derive from merge-base(first_parent, other_parent), NOT
+            # merge-base(main, other_parent) — see the docstring above.
+            first_parent = parents[0]
+            for other_parent in parents[1:]:
+                rc, merge_base, _ = await _run(
+                    ['git', 'merge-base', first_parent, other_parent],
+                    cwd=self.project_root,
+                )
+                if rc != 0 or not merge_base:
+                    return False
+                rc, touched_out, _ = await _run(
+                    [
+                        'git', '-c', 'core.quotePath=false',
+                        'diff', '--name-only', '-z', merge_base, other_parent,
+                    ],
+                    cwd=self.project_root,
+                )
+                if rc != 0:
+                    return False
+                touched = [f for f in touched_out.split('\0') if f]
+                if not touched:
+                    # Empty branch merge — no deliverable to confirm; fail-safe.
+                    return False
+                rc, _, _ = await _run(
+                    [
+                        'git', 'diff', '--quiet', other_parent,
+                        self.config.main_branch, '--', *touched,
+                    ],
+                    cwd=self.project_root,
+                )
+                if rc != 0:
+                    return False
+            return True
+
+        # Non-merge (root or single-parent) commit: unchanged existing logic.
         rc, touched_out, _ = await _run(
             [
                 'git', '-c', 'core.quotePath=false',
