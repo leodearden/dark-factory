@@ -7,6 +7,7 @@ No live systemd runtime is needed — all subprocess.run calls are monkeypatched
 """
 
 import importlib.util
+import json
 import pathlib
 import re
 import subprocess
@@ -2689,6 +2690,109 @@ def test_report_deploy_age_unknown_when_clock_absent(
     captured = capsys.readouterr()
     unit_line = next(line for line in captured.out.splitlines() if line.startswith(unit))
     assert "unknown" in unit_line, f"expected DEPLOY-AGE 'unknown' in row: {unit_line!r}"
+
+
+def test_report_includes_merge_idle_and_would_defer_columns(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """report() gains MERGE-IDLE (idle/busy/stale/absent, matching
+    drain_check.classify exactly) and WOULD-DEFER (yes iff MERGE-IDLE is
+    'busy') columns, populated from real per-unit heartbeat files under a
+    tmp ORCH_FLEET_DIR. Fails today: report() has neither column yet.
+
+    All four units share the same start/commit relationship (fresh) so the
+    pre-existing VERDICT column can't be confused with the new MERGE-IDLE
+    values in this assertion; row values are extracted positionally
+    (the last four whitespace-separated tokens are VERDICT, DEPLOY-AGE,
+    MERGE-IDLE, WOULD-DEFER, in that order) so the START/NEWEST WATCHED
+    COMMIT timestamp columns' embedded spaces can't misalign a naive split.
+    """
+    wdog = _load_watchdog()
+
+    commit_epoch = 1_800_000_000
+    now = 2_000_000_000.0
+    # unit->(merge_idle, ts_epoch) heartbeat fixture, or None for "no file".
+    units = [
+        "orchestrator-alpha.service",  # idle: fresh + merge_idle=True
+        "orchestrator-bravo.service",  # busy: fresh + merge_idle=False
+        "orchestrator-charlie.service",  # stale: ts_epoch far outside the fresh window
+        "orchestrator-delta.service",  # absent: no heartbeat file at all
+    ]
+    start_epochs = {u: commit_epoch + 100 for u in units}  # all fresh vs. commit
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            stdout = "".join(f"{u} loaded active running desc\n" for u in units)
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            unit = cmd[3]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epochs[unit]}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    # Keep DEPLOY-AGE deterministically 'unknown' — irrelevant to this test.
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(tmp_path / "absent_clock.json"))
+
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    monkeypatch.setenv("ORCH_FLEET_DIR", str(fleet_dir))
+
+    def _write_heartbeat(unit: str, *, merge_idle: bool, ts_epoch: float) -> None:
+        (fleet_dir / f"{unit}.json").write_text(
+            json.dumps(
+                {
+                    "unit": unit,
+                    "merge_idle": merge_idle,
+                    "depth": 0,
+                    "queue_empty": merge_idle,
+                    "ts_epoch": ts_epoch,
+                }
+            )
+        )
+
+    _write_heartbeat(units[0], merge_idle=True, ts_epoch=now - 10)
+    _write_heartbeat(units[1], merge_idle=False, ts_epoch=now - 10)
+    _write_heartbeat(units[2], merge_idle=True, ts_epoch=now - 100_000)
+    # units[3] ("delta"/absent): deliberately no heartbeat file written.
+
+    wdog.report()
+
+    captured = capsys.readouterr()
+    header_line = next(line for line in captured.out.splitlines() if line.startswith("UNIT"))
+    assert "MERGE-IDLE" in header_line, f"expected MERGE-IDLE in header: {header_line!r}"
+    assert "WOULD-DEFER" in header_line, f"expected WOULD-DEFER in header: {header_line!r}"
+
+    expected_merge = {
+        units[0]: "idle",
+        units[1]: "busy",
+        units[2]: "stale",
+        units[3]: "absent",
+    }
+    expected_defer = {
+        units[0]: "no",
+        units[1]: "yes",
+        units[2]: "no",
+        units[3]: "no",
+    }
+    for unit in units:
+        line = next(entry for entry in captured.out.splitlines() if entry.startswith(unit))
+        tokens = line.split()
+        _verdict_tok, _deploy_age_tok, merge_tok, defer_tok = tokens[-4:]
+        assert merge_tok == expected_merge[unit], (
+            f"{unit}: expected MERGE-IDLE={expected_merge[unit]!r}, got {merge_tok!r} "
+            f"in line {line!r}"
+        )
+        assert defer_tok == expected_defer[unit], (
+            f"{unit}: expected WOULD-DEFER={expected_defer[unit]!r}, got {defer_tok!r} "
+            f"in line {line!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
