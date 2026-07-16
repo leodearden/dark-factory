@@ -57,12 +57,12 @@ class TestClosedVocabularyForbidsUnknownKeys:
 
     def test_unknown_match_key_raises(self):
         with pytest.raises(ValidationError) as exc_info:
-            RuleMatch(plan_vibes=3)
+            RuleMatch(plan_vibes=3)  # type: ignore[call-arg]
         assert 'plan_vibes' in str(exc_info.value)
 
     def test_unknown_set_key_raises(self):
         with pytest.raises(ValidationError) as exc_info:
-            RuleSet(vibe='good')
+            RuleSet(vibe='good')  # type: ignore[call-arg]
         assert 'vibe' in str(exc_info.value)
 
 

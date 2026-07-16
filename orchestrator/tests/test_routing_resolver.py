@@ -21,6 +21,7 @@ from __future__ import annotations
 import pytest
 
 from orchestrator.config import (
+    BackendsConfig,
     BudgetsConfig,
     EffortConfig,
     ModelsConfig,
@@ -626,4 +627,77 @@ class TestCeilingFallback:
         assert decision.model == 'opus'
         assert decision.source_layer == 'policy_rule'
         assert decision.rule_id == 'r'
+        assert decision.rejected == ()
+
+
+class TestFailSafeScopedToClaudeBackend:
+    """Invariants 2/6's fail-safe validation is scoped to claude-backend
+    roles ONLY -- mirrors config.py's ``_validate_models_in_allowlist``,
+    which never checks a non-claude-backend role's configured model string
+    against the claude-centric ``routing.allowed_models`` (see
+    test_routing.py's ``TestNonClaudeBackendScopeBoundary``).
+    ``routing.allowed_models``/``per_model_daily_ceiling_usd`` are
+    claude-specific concepts the harness-backend PRD's model space never
+    participates in -- a role running on a non-claude backend
+    (``backends.<role> != 'claude'``) must resolve its configured model
+    unconditionally at every layer, exactly as the pre-epsilon getattr-based
+    resolution did (that resolution never consulted an allowlist at all).
+
+    Regression: this was originally a byte-equivalence break caught by
+    test_invoke_role_config_resolution.py's
+    TestInvokeReviewerVariantOverrideStaysGreen (task 2531/alpha) --
+    ``models.reviewer='reviewer-sentinel-model'`` + ``backends.reviewer=
+    'gemini'`` fell all the way back to role_default because layer 3's
+    fail-safe check rejected the sentinel model against the (irrelevant,
+    claude-only) allowlist.
+    """
+
+    def test_non_claude_backend_config_model_not_in_allowlist_still_resolves(self):
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(reviewer='gemini-2.5-pro'),
+            backends=BackendsConfig(reviewer='gemini'),
+        )
+
+        decision = resolve_route(_inputs(role_name='reviewer_comprehensive'), cfg)
+
+        assert decision.model == 'gemini-2.5-pro'
+        assert decision.source_layer == 'config'
+        assert decision.rejected == ()
+
+    def test_non_claude_backend_policy_rule_model_not_in_allowlist_still_resolves(self):
+        rule = RoutingRule(
+            id='r', match=RuleMatch(role=['reviewer_comprehensive']),
+            set=RuleSet(model='gemini-3-flash'),
+        )
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(reviewer='gemini-2.5-pro'),
+            backends=BackendsConfig(reviewer='gemini'),
+            routing=RoutingConfig(rules=[rule]),
+        )
+
+        decision = resolve_route(_inputs(role_name='reviewer_comprehensive'), cfg)
+
+        assert decision.model == 'gemini-3-flash'
+        assert decision.source_layer == 'policy_rule'
+        assert decision.rejected == ()
+
+    def test_non_claude_backend_metadata_override_not_in_allowlist_still_resolves(self):
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(reviewer='gemini-2.5-pro'),
+            backends=BackendsConfig(reviewer='gemini'),
+        )
+        inputs = RouteInputs(
+            role_name='reviewer_comprehensive',
+            task_id='1',
+            task_metadata={'model_overrides': {'reviewer_comprehensive': 'gemini-3-pro'}},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(),
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'gemini-3-pro'
+        assert decision.source_layer == 'metadata_override'
         assert decision.rejected == ()

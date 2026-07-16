@@ -464,6 +464,13 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
     whatever the next-lower-precedence layer already validated -- and a
     namespaced ``"<layer>:<reason>"`` string is appended to ``rejected``.
     A dispatch is never blocked by a routing mis-config.
+
+    This validation is scoped to claude-backend roles only (``config.
+    backends`` keyed the same way as ``config.models`` -- the reviewer*
+    collapse applies identically), mirroring ``config.py``'s
+    ``_validate_models_in_allowlist``: a non-claude-backend role's model
+    string is the harness-backend PRD's axis and must never be rejected
+    against this claude-centric allowlist/ceiling.
     """
     model = inputs.role_defaults.model
     effort = inputs.role_defaults.effort
@@ -475,12 +482,28 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
 
     key = _config_key(inputs.role_name)
 
+    # Fail-safe validation (invariants 2/6) is scoped to claude-backend
+    # roles ONLY -- mirrors config.py's _validate_models_in_allowlist, which
+    # never checks a non-claude-backend role's configured model string
+    # against the claude-centric routing.allowed_models (same `key`, since
+    # ModelsConfig/BackendsConfig share role field names). routing.
+    # allowed_models/per_model_daily_ceiling_usd are claude-specific
+    # concepts the harness-backend PRD's model space never participates in
+    # -- a role running on a non-claude backend must resolve its configured
+    # model unconditionally at every layer below, exactly as the
+    # pre-epsilon getattr-based resolution did (it never consulted an
+    # allowlist at all).
+    claude_backend = getattr(config.backends, key, 'claude') == 'claude'
+
     # Layer 3: static per-role config. Only `model` is fail-safe validated
     # (invariants 2/6) -- effort/budget_usd/max_turns apply unconditionally,
     # they carry no allowlist/ceiling concept.
     if hasattr(config.models, key):
         candidate = getattr(config.models, key)
-        reason = _model_rejection_reason(candidate, config, inputs.spend_by_model)
+        reason = (
+            _model_rejection_reason(candidate, config, inputs.spend_by_model)
+            if claude_backend else None
+        )
         if reason is None:
             model = candidate
             source_layer = 'config'
@@ -506,7 +529,10 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
             else:
                 candidate = rule.set.model
             if candidate is not None:
-                reason = _model_rejection_reason(candidate, config, inputs.spend_by_model)
+                reason = (
+                    _model_rejection_reason(candidate, config, inputs.spend_by_model)
+                    if claude_backend else None
+                )
                 if reason is None:
                     model = candidate
                     source_layer = 'policy_rule'
@@ -524,7 +550,10 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
     overrides = inputs.task_metadata.get('model_overrides') if inputs.task_metadata else None
     override_model = overrides.get(inputs.role_name) if overrides else None
     if override_model is not None:
-        reason = _model_rejection_reason(override_model, config, inputs.spend_by_model)
+        reason = (
+            _model_rejection_reason(override_model, config, inputs.spend_by_model)
+            if claude_backend else None
+        )
         if reason is None:
             model = override_model
             source_layer = 'metadata_override'
