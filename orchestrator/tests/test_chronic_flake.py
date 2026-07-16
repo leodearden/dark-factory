@@ -93,3 +93,94 @@ class TestChronicFlakeConfigDefaults:
         assert config.chronic_flake.window == block['window']
         assert config.chronic_flake.rate_limit_days == block['rate_limit_days']
         assert config.chronic_flake.ledger_relpath == block['ledger_relpath']
+
+
+# ── Step-3 / Step-4: CHRONIC-FLAKY marker parsing ─────────────────────────────
+
+
+class TestMatchChronicFlakyMarker:
+    """``_match_chronic_flaky_marker``: line-anchored, mirroring
+    ``verify._match_clock_marker`` (reify esc-4791-52 / task 4998 discipline)
+    — an embedded/mid-line or log-prefixed occurrence must NOT match."""
+
+    def test_well_formed_marker_matches(self):
+        from orchestrator.chronic_flake import ChronicFlakeMarker, _match_chronic_flaky_marker
+        line = '=== CHRONIC-FLAKY test=test_pool_x.sh count=3 window=20 ==='
+        result = _match_chronic_flaky_marker(line)
+        assert result == ChronicFlakeMarker(test='test_pool_x.sh', count=3, window=20)
+
+    def test_leading_whitespace_still_matches(self):
+        """A marker with only leading WHITESPACE still matches (lstrip-anchored)."""
+        from orchestrator.chronic_flake import ChronicFlakeMarker, _match_chronic_flaky_marker
+        line = '   \t=== CHRONIC-FLAKY test=test_pool_x.sh count=3 window=20 ==='
+        result = _match_chronic_flaky_marker(line)
+        assert result == ChronicFlakeMarker(test='test_pool_x.sh', count=3, window=20)
+
+    def test_embedded_in_prose_does_not_match(self):
+        """Regression for reify esc-4791-52 / task 4998: a marker quoted
+        MID-LINE (assertion prose) must NOT match — same discipline as the
+        clock-stop parser fix."""
+        from orchestrator.chronic_flake import _match_chronic_flaky_marker
+        line = (
+            'PASS: C: stderr contains === CHRONIC-FLAKY test=test_pool_x.sh '
+            'count=3 window=20 === (hold)'
+        )
+        assert _match_chronic_flaky_marker(line) is None
+
+    def test_harness_prefixed_line_does_not_match(self):
+        """An arbitrary leading log/harness prefix is NOT tolerated either
+        (deliberate tightening, mirroring the clock-stop fix)."""
+        from orchestrator.chronic_flake import _match_chronic_flaky_marker
+        line = (
+            '[harness] 2026-06-26T12:00:00 === CHRONIC-FLAKY test=test_pool_x.sh '
+            'count=3 window=20 ==='
+        )
+        assert _match_chronic_flaky_marker(line) is None
+
+    def test_plain_log_line_returns_none(self):
+        from orchestrator.chronic_flake import _match_chronic_flaky_marker
+        assert _match_chronic_flaky_marker('running tests/infra/run_all.sh') is None
+
+    def test_empty_line_returns_none(self):
+        from orchestrator.chronic_flake import _match_chronic_flaky_marker
+        assert _match_chronic_flaky_marker('') is None
+
+    def test_malformed_count_returns_none(self):
+        from orchestrator.chronic_flake import _match_chronic_flaky_marker
+        line = '=== CHRONIC-FLAKY test=test_pool_x.sh count=abc window=20 ==='
+        assert _match_chronic_flaky_marker(line) is None
+
+    def test_malformed_window_returns_none(self):
+        from orchestrator.chronic_flake import _match_chronic_flaky_marker
+        line = '=== CHRONIC-FLAKY test=test_pool_x.sh count=3 window=abc ==='
+        assert _match_chronic_flaky_marker(line) is None
+
+
+class TestParseChronicFlakyMarkers:
+    """``parse_chronic_flaky_markers``: scans a multi-line blob and returns
+    every valid (line-anchored) marker, in order, ignoring non-matching
+    lines (embedded/prefixed occurrences, plain log lines)."""
+
+    def test_returns_every_valid_marker_in_order(self):
+        from orchestrator.chronic_flake import ChronicFlakeMarker, parse_chronic_flaky_markers
+        blob = '\n'.join([
+            'running tests/infra/run_all.sh',
+            '=== CHRONIC-FLAKY test=test_a.sh count=3 window=20 ===',
+            'PASS: C: stderr contains === CHRONIC-FLAKY test=test_x.sh count=9 '
+            'window=20 === (hold)',
+            '=== CHRONIC-FLAKY test=test_b.sh count=5 window=20 ===',
+            '',
+        ])
+        result = parse_chronic_flaky_markers(blob)
+        assert result == [
+            ChronicFlakeMarker(test='test_a.sh', count=3, window=20),
+            ChronicFlakeMarker(test='test_b.sh', count=5, window=20),
+        ]
+
+    def test_empty_output_returns_empty_list(self):
+        from orchestrator.chronic_flake import parse_chronic_flaky_markers
+        assert parse_chronic_flaky_markers('') == []
+
+    def test_no_markers_returns_empty_list(self):
+        from orchestrator.chronic_flake import parse_chronic_flaky_markers
+        assert parse_chronic_flaky_markers('all good\nnothing to see\n') == []
