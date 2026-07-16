@@ -875,6 +875,34 @@ def create_server(
             return {'error': f'Escalation {escalation_id} not found'}
         return esc.to_dict()
 
+    @mcp.tool()
+    def stamp_triage(
+        escalation_id: str,
+        triaged_by: str | None = None,
+        triage_note: str = '',
+    ) -> dict[str, Any]:
+        """Stamp a triage-ack ANNOTATION on a pending escalation.
+
+        This is deliberately NOT gated by the connection-capability level
+        check (contrast ``resolve_issue``): triage is metadata, not a state
+        transition, so a {0,1}-level-capped connection (e.g. the auto-watcher)
+        can annotate a pending L2 it is still forbidden to resolve. Gating
+        this tool would defeat its purpose — the auto-watcher must be able to
+        record that it assessed a pending L2 so future rotations skip
+        re-deriving the same disposition every rotation.
+
+        Delegates to ``queue.stamp_triage()``, which stamps pending records
+        only (root-only load; never resurrects an archived/resolved record).
+        Does not change ``status``, ``level``, or ``updated_at``.
+
+        Returns the updated record as a full dict on success, or
+        ``{'error': ...}`` when *escalation_id* is not found or not pending.
+        """
+        esc = queue.stamp_triage(escalation_id, triaged_by=triaged_by, triage_note=triage_note)
+        if esc is None:
+            return {'error': f'Escalation {escalation_id} not found or not pending'}
+        return esc.to_dict()
+
     # --- L2 promotion tool ---
 
     @mcp.tool()
