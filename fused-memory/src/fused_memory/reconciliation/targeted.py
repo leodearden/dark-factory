@@ -447,6 +447,7 @@ class TargetedReconciler:
 
             content = f"Task '{title}' completed."
             used_provenance = False
+            unverified_completion = False
             if not has_authoritative:
                 # Task 2049: prefer the landed-outcome done_provenance over the
                 # raw description — on a first done-transition `description` is
@@ -460,8 +461,23 @@ class TargetedReconciler:
                     content += f" {outcome}"
                     used_provenance = True
                 else:
+                    # Task 2622: with no authoritative resolution memory and no
+                    # verified done_provenance, the only available content is
+                    # the task's own UNVERIFIED description/details. Asserting
+                    # "completed" from that text is misleading whenever a
+                    # done-transition later proves premature/false (e.g. the
+                    # predates-own-deps architect close-out bug) — so this
+                    # fallback is reframed to report the transition without
+                    # claiming the deliverable is verified.
+                    unverified_completion = True
+                    content = (
+                        f"Task '{title}' transitioned to done; "
+                        "completion not yet verified."
+                    )
                     if description:
-                        content += f" {description}"
+                        content += (
+                            f" Intended deliverable per task description: {description}"
+                        )
                     details = task.get('details', '')
                     if isinstance(details, str) and details:
                         content += f"\nDetails: {_truncate_clean(details, 500)}"
@@ -475,6 +491,8 @@ class TargetedReconciler:
                 write_metadata['echo_suppressed_stale_description'] = True
             if used_provenance:
                 write_metadata['echo_used_provenance'] = True
+            if unverified_completion:
+                write_metadata['echo_unverified_completion'] = True
 
             written = await self._fenced_add_memory(
                 content=content,
