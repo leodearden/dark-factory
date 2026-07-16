@@ -1240,3 +1240,89 @@ class TestRow9FallbackNarrowingNeverWholeRepoChain:
                 f'whole-repo fleet chain leaked into the executed '
                 f'type_check_command: {fallback.type_check_command!r}'
             )
+
+
+# ---------------------------------------------------------------------------
+# Row 10: "plan authority, both roles" (κ, A1). The runs executed are
+# EXACTLY plan.runs, at EITHER role — run_scoped_verification never
+# re-derives or drifts from derive_verify_plan's decision — and
+# VerifyResult.plan reflects the EXECUTED plan, never a stale
+# independently-rederived diagnostic mirror. Producer-only (see the module
+# docstring's row->seam map). This is the FINAL row: once GREEN, the whole
+# 10-row module passes — the leaf signal that the inversion composes
+# end-to-end.
+# ---------------------------------------------------------------------------
+
+
+# NOTE (RED, step-19): _row10_mixed_diff and _row10_expected_command (the
+# row-10 mixed-diff fixture and plan-vs-executed comparison helper) are
+# intentionally NOT YET DEFINED here — the test below references them and
+# fails with a NameError until step-20 (GREEN) defines them, mirroring the
+# RED-via-not-yet-defined-helper split used by rows 8/9 above.
+
+
+class TestRow10PlanAuthorityBothRoles:
+    """Row 10 (PRD boundary-test sketch): the runs executed are exactly
+    ``plan.runs`` — A1 — at BOTH role='task' and role='merge'. A mixed diff
+    (a touched TEST file under modA, role-independent; a touched SOURCE-only
+    file under modB, which forks by role — FULL_SUITE pytest at role='task'
+    (R3), SKIPPED at role='merge' (R4, breadth='scoped')) exercises both a
+    role-independent and a role-forking module in one plan.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ['task', 'merge'])
+    async def test_row10_executed_commands_equal_plan_runs_both_roles(
+        self, tmp_path: Path, role: Literal['task', 'merge'],
+    ) -> None:
+        mod_a, mod_b, config, task_files = _row10_mixed_diff(tmp_path)
+        module_configs = [mod_a, mod_b]
+        existing_files = [f for f in task_files if (tmp_path / f).exists()]
+
+        result, executed, _fake = await _drive_producer(
+            tmp_path, config, module_configs, task_files=task_files, role=role,
+        )
+
+        assert result.passed
+
+        expected_plan = verify_plan.derive_verify_plan(
+            existing_files, module_configs, config,
+            _real_worktree_reader(tmp_path), role=role,
+        )
+
+        # A1: no module executes that the plan didn't include, and no
+        # module the plan included (with a real command) is left out.
+        plan_prefixes_with_cmd = {
+            run.module_prefix for run in expected_plan.runs if run.cmd is not None
+        }
+        assert set(executed) == plan_prefixes_with_cmd, (
+            f'expected the executed module set to equal the plan '
+            f'(role={role!r}); executed={set(executed)!r} '
+            f'plan={plan_prefixes_with_cmd!r}'
+        )
+
+        # A1: every executed command is EXACTLY what the plan's run for
+        # that (module, tool) prescribes — never a re-derived drift.
+        runs_by_module: dict[str, list[verify_plan.PlannedRun]] = {}
+        for run in expected_plan.runs:
+            runs_by_module.setdefault(run.module_prefix, []).append(run)
+
+        for mc in module_configs:
+            executed_mc = executed.get(mc.prefix)
+            for run in runs_by_module.get(mc.prefix, []):
+                attr = _mc_attr_for_run_or_none(run)
+                if attr is None:
+                    continue
+                expected_cmd = _row10_expected_command(mc, run)
+                actual_cmd = getattr(executed_mc, attr) if executed_mc is not None else None
+                assert actual_cmd == expected_cmd, (
+                    f'{mc.prefix}.{attr} (role={role!r}): executed '
+                    f'{actual_cmd!r} != plan-prescribed {expected_cmd!r} '
+                    f'(scope_kind={run.scope_kind!r})'
+                )
+
+        # A1: VerifyResult.plan is the plan that DROVE execution above, not
+        # an independently re-derived diagnostic mirror.
+        assert result.plan == expected_plan.to_dict(), (
+            f'VerifyResult.plan (role={role!r}) must reflect the EXECUTED plan'
+        )
