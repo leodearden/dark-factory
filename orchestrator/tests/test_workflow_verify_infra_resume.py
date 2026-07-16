@@ -24,6 +24,7 @@ from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyInfraError, VerifyResult
+from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
@@ -831,10 +832,16 @@ class TestClassifiedInfraTransientOutcome:
     """
 
     @pytest.mark.asyncio
-    async def test_classified_infra_result_clears_on_retry_no_attempt_no_debugger(self):
+    @pytest.mark.parametrize('category', sorted(INFRA_TRANSIENT_CATEGORIES))
+    async def test_classified_infra_result_clears_on_retry_no_attempt_no_debugger(self, category):
         """(a) TRANSIENT-CLEARS: infra-category result then a passing result → DONE,
 
-        zero verify attempts consumed, debugger never dispatched.
+        zero verify attempts consumed, debugger never dispatched. Parametrized
+        over every INFRA_TRANSIENT_CATEGORIES member (task 2591 amendment,
+        reviewer_comprehensive/test_coverage) so a future edit that narrows
+        the set-membership check (e.g. accidentally special-casing one
+        category) cannot silently keep passing with only the default
+        'semaphore_timeout' covered.
         """
         wf = _make(verify_infra_retry_max_attempts=3)
 
@@ -844,7 +851,7 @@ class TestClassifiedInfraTransientOutcome:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return _infra_category_result()
+                return _infra_category_result(category=category)
             return _passed_result()
 
         sleep_calls = []
@@ -869,17 +876,20 @@ class TestClassifiedInfraTransientOutcome:
         mock_invoke.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_classified_infra_result_persistent_exhausts_to_infra_hold(self):
+    @pytest.mark.parametrize('category', sorted(INFRA_TRANSIENT_CATEGORIES))
+    async def test_classified_infra_result_persistent_exhausts_to_infra_hold(self, category):
         """(b) PERSISTENT: infra-category result on every attempt → BLOCKED,
 
         _infra_hold_info stamped loud (category='infra_issue',
         escalate_to_human=True), zero verify attempts consumed, no debugger
         dispatch, and _mark_blocked never called from inside the loop.
+        Parametrized over every INFRA_TRANSIENT_CATEGORIES member (task 2591
+        amendment, reviewer_comprehensive/test_coverage).
         """
         wf = _make(verify_infra_retry_max_attempts=3)
 
         async def always_infra_category(*args, **kwargs):
-            return _infra_category_result()
+            return _infra_category_result(category=category)
 
         with (
             patch(
@@ -948,3 +958,146 @@ class TestClassifiedInfraTransientOutcome:
             f'got {wf.metrics.verify_attempts}'
         )
         mock_invoke.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_env_transient_outer_retry_stacks_with_internal_env_serial_retry(self):
+        """env_transient double-retry-layer interaction is intentional (task
+
+        2591 amendment, reviewer_comprehensive/test_coverage): a
+        category='env_transient' VerifyResult already reflects ONE internal
+        forced-serial ENV_SERIAL retry that run_scoped_verification performs
+        on its own (verify.py:3746) before ever returning to this wrapper.
+        run_scoped_verification is mocked wholesale in this unit test, so
+        that internal retry is invisible here — this test pins down that
+        the OUTER bounded retry in _run_scoped_verification_with_infra_retry
+        still fires on top of it, exactly as it does for the other three
+        INFRA_TRANSIENT_CATEGORIES members, rather than skipping env_transient
+        on the assumption "it already got a retry". Two independent retry
+        layers stacking is deliberate, not a double-counted bug.
+        """
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        call_count = 0
+
+        async def fake_run_scoped(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _infra_category_result(category='env_transient')
+            return _passed_result()
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification', side_effect=fake_run_scoped),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+            patch.object(wf, '_invoke', new=AsyncMock()) as mock_invoke,
+        ):
+            outcome = await wf._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert call_count == 2, (
+            f'expected the outer wrapper to retry once more on top of whatever '
+            f'internal env_serial retry already happened inside the mocked '
+            f'run_scoped_verification, got {call_count} calls'
+        )
+        assert wf.metrics.verify_attempts == 0
+        mock_invoke.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Task 2591 amendment (reviewer_comprehensive/test_coverage): the exhaustion
+# stamp's "whichever infra signal was seen LAST wins" logic (last_infra_exc
+# vs last_infra_result mutual-reset) was only covered for the homogeneous
+# cases (all raised VerifyInfraError, or all returned classified-infra
+# VerifyResult). These pin the two MIXED orderings within one bounded
+# 2-attempt window.
+# ---------------------------------------------------------------------------
+
+class TestMixedInfraExhaustionLastSeenWins:
+    """_run_scoped_verification_with_infra_retry's exhaustion stamp reflects
+
+    whichever infra signal — a raised VerifyInfraError or a RETURNED
+    classified-infra VerifyResult — was seen on the LAST attempt before the
+    bounded retry window closes, regardless of what came before it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_classified_then_raised_stamps_exception_reason(self):
+        """classified-infra on attempt 1, VerifyInfraError on attempt 2 (window
+
+        exhausted at max_attempts=2) → the stamped _infra_hold_info reflects
+        the LAST-seen kind (the raised exception's phase/errno), not the
+        earlier classified-infra category.
+        """
+        wf = _make(verify_infra_retry_max_attempts=2)
+
+        call_count = 0
+
+        async def fake_run_scoped(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _infra_category_result(category='disk_full')
+            raise VerifyInfraError(phase='test', errno=errno_module.ENOSPC)
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification', side_effect=fake_run_scoped),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+            patch.object(wf, '_invoke', new=AsyncMock()) as mock_invoke,
+        ):
+            outcome = await wf._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert call_count == 2
+        assert wf._infra_hold_info is not None
+        assert wf._infra_hold_info.get('phase') == 'test', (
+            f"expected the LAST-seen (raised exception) phase stamped, "
+            f"got: {wf._infra_hold_info!r}"
+        )
+        assert wf._infra_hold_info.get('errno') == errno_module.ENOSPC
+        assert 'phase=' in wf._infra_hold_info['reason']
+        assert 'category=' not in wf._infra_hold_info['reason'], (
+            f"expected the LAST-seen (raised exception) reason, not the earlier "
+            f"classified-infra category; got: {wf._infra_hold_info['reason']!r}"
+        )
+        mock_invoke.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_raised_then_classified_stamps_category_reason(self):
+        """VerifyInfraError on attempt 1, classified-infra on attempt 2 (window
+
+        exhausted at max_attempts=2) → the stamped _infra_hold_info reflects
+        the LAST-seen kind (the classified-infra category, phase/errno both
+        None), not the earlier raised exception's phase/errno.
+        """
+        wf = _make(verify_infra_retry_max_attempts=2)
+
+        call_count = 0
+
+        async def fake_run_scoped(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise VerifyInfraError(phase='test', errno=errno_module.ENOSPC)
+            return _infra_category_result(category='pytest_internalerror')
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification', side_effect=fake_run_scoped),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+            patch.object(wf, '_invoke', new=AsyncMock()) as mock_invoke,
+        ):
+            outcome = await wf._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert call_count == 2
+        assert wf._infra_hold_info is not None
+        assert wf._infra_hold_info.get('phase') is None, (
+            f"expected the LAST-seen (classified-infra) phase of None, "
+            f"got: {wf._infra_hold_info!r}"
+        )
+        assert wf._infra_hold_info.get('errno') is None
+        assert 'category=' in wf._infra_hold_info['reason']
+        assert "'pytest_internalerror'" in wf._infra_hold_info['reason'], (
+            f"expected the LAST-seen (classified-infra) category in the reason, "
+            f"got: {wf._infra_hold_info['reason']!r}"
+        )
+        mock_invoke.assert_not_awaited()

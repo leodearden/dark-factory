@@ -76,6 +76,7 @@ from orchestrator.merge_queue import (
     register_and_enqueue_merge_request,
 )
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -13615,11 +13616,16 @@ class TestRunPostMergeVerify:
             f'expected enospc_retries[task_id]=1, got: {enospc_retries}'
         )
 
-    async def test_classified_infra_transient_clears_on_retry(self) -> None:
+    @pytest.mark.parametrize('category', sorted(INFRA_TRANSIENT_CATEGORIES))
+    async def test_classified_infra_transient_clears_on_retry(self, category) -> None:
         """(task ν) RETRY-CLEARS: infra-category result then a pass → None (merge
 
         proceeds), run_scoped_verification called twice (one bounded retry
-        shared with the ENOSPC budget).
+        shared with the ENOSPC budget). Parametrized over every
+        INFRA_TRANSIENT_CATEGORIES member (task 2591 amendment,
+        reviewer_comprehensive/test_coverage) so a future edit that narrows
+        the set-membership check cannot silently keep passing with only the
+        default 'semaphore_timeout' covered.
         """
         from orchestrator.merge_queue import _run_post_merge_verify
 
@@ -13636,7 +13642,7 @@ class TestRunPostMergeVerify:
             patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
             patch(
                 'orchestrator.merge_queue.run_scoped_verification',
-                AsyncMock(side_effect=[_infra_category_verify_result(), passing]),
+                AsyncMock(side_effect=[_infra_category_verify_result(category=category), passing]),
             ) as mock_verify,
         ):
             result = await _run_post_merge_verify(
@@ -13650,12 +13656,15 @@ class TestRunPostMergeVerify:
             f'expected exactly one bounded infra retry (2 total calls), got {mock_verify.call_count}'
         )
 
-    async def test_classified_infra_transient_persistent_holds_loud_no_attempt(self) -> None:
+    @pytest.mark.parametrize('category', sorted(INFRA_TRANSIENT_CATEGORIES))
+    async def test_classified_infra_transient_persistent_holds_loud_no_attempt(self, category) -> None:
         """(task ν) PERSISTENT-HOLD: infra-category result on every dispatch →
 
         blocked with the TRANSIENT_INFRA_REASON_PREFIX (loud infra_issue hold,
         not the generic branch-blaming block); no timeout-counter bump (no
         merge verify attempt consumed) and no dry-run debugger spawn.
+        Parametrized over every INFRA_TRANSIENT_CATEGORIES member (task 2591
+        amendment, reviewer_comprehensive/test_coverage).
         """
         from orchestrator.merge_queue import _run_post_merge_verify
 
@@ -13665,7 +13674,7 @@ class TestRunPostMergeVerify:
         timeouts: dict[str, int] = {}
         enospc_retries: dict[str, int] = {}
 
-        infra_result = _infra_category_verify_result()
+        infra_result = _infra_category_verify_result(category=category)
 
         with (
             patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
@@ -13701,6 +13710,111 @@ class TestRunPostMergeVerify:
             f'gate never mis-tags it as a cross-member interaction candidate; '
             f'got: {result.failure_category!r}'
         )
+
+    async def test_env_transient_outer_retry_stacks_with_internal_env_serial_retry(self) -> None:
+        """env_transient double-retry-layer interaction is intentional (task
+
+        2591 amendment, reviewer_comprehensive/test_coverage): a
+        category='env_transient' VerifyResult already reflects ONE internal
+        forced-serial ENV_SERIAL retry that run_scoped_verification performs
+        on its own (verify.py:3746) before ever returning here.
+        run_scoped_verification is mocked wholesale in this unit test, so
+        that internal retry is invisible to it — this pins down that the
+        merge-side bounded retry (branch A) still fires on top of it, exactly
+        as for the other three INFRA_TRANSIENT_CATEGORIES members, rather
+        than skipping env_transient on the assumption "it already got a
+        retry". Two independent retry layers stacking is deliberate.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        enospc_retries: dict[str, int] = {}
+
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='',
+        )
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(side_effect=[
+                    _infra_category_verify_result(category='env_transient'), passing,
+                ]),
+            ) as mock_verify,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries=enospc_retries,
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is None, f'expected None (verify eventually passed), got: {result!r}'
+        assert mock_verify.call_count == 2, (
+            f'expected the merge-side wrapper to retry once more on top of whatever '
+            f'internal env_serial retry already happened inside the mocked '
+            f'run_scoped_verification, got {mock_verify.call_count} calls'
+        )
+
+    async def test_classified_infra_transient_zero_retry_after_shared_budget_exhausted(self) -> None:
+        """(task 2591 amendment, reviewer_comprehensive/robustness) The
+
+        classified-infra retry (branch A) shares the enospc_retries/
+        max_enospc budget with the ENOSPC retry (documented, intentional).
+        Consequence: if an earlier ENOSPC event in this task's merge
+        lifecycle already consumed the shared budget, a later classified-
+        infra failure gets ZERO in-place retry and blocks immediately on the
+        first dispatch — still a loud infra_issue hold
+        (TRANSIENT_INFRA_REASON_PREFIX), never branch-blaming, just with no
+        retry chance. Seeds enospc_retries[task_id]=max_enospc to simulate
+        the budget already being spent.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        timeouts: dict[str, int] = {}
+        # Simulate the shared enospc_retries/max_enospc budget already spent,
+        # e.g. by an earlier ENOSPC event in this task's merge lifecycle.
+        enospc_retries: dict[str, int] = {req.task_id: 1}
+
+        infra_result = _infra_category_verify_result()
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=infra_result),
+            ) as mock_verify,
+            patch(
+                'orchestrator.merge_queue._spawn_merge_verify_dry_run',
+            ) as mock_spawn_dry_run,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts=timeouts, enospc_retries=enospc_retries,
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'expected transient-infra reason even with the retry budget already '
+            f'spent, got: {result.reason!r}'
+        )
+        assert mock_verify.call_count == 1, (
+            f'expected NO in-place retry once the shared enospc_retries/max_enospc '
+            f'budget is exhausted (a regression risk from the shared-budget '
+            f'coupling), got {mock_verify.call_count} calls'
+        )
+        assert timeouts == {}, (
+            f'classified-infra outcome must not bump the timeout loop-breaker even '
+            f'when the retry budget is exhausted: {timeouts}'
+        )
+        mock_spawn_dry_run.assert_not_called()
 
     async def test_genuine_test_failure_not_treated_as_infra_transient(self) -> None:
         """(task ν) NARROWNESS: a genuine test_failure category is NOT retried
