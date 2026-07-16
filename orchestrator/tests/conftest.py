@@ -327,7 +327,8 @@ def _restore_sandbox_backend():
 
 @pytest.fixture(autouse=True)
 def _clear_probe_cache():
-    """Clear verify._PROBE_CACHE before and after every test.
+    """Clear verify._PROBE_CACHE (and its sibling _BASELINE_FAILING_IDS_CACHE)
+    before and after every test.
 
     ``verify_failure_is_preexisting_on_main`` stores results in the
     process-global ``_PROBE_CACHE`` dict keyed by
@@ -337,8 +338,15 @@ def _clear_probe_cache():
     short-circuits the probe path in the later test — causing it to skip
     worktree creation / cleanup and return the wrong result.
 
-    Clearing the cache before *and* after each test ensures:
-    - every test starts with an empty cache regardless of prior teardown;
+    ``_BASELINE_FAILING_IDS_CACHE`` (task μ, verify-scope-inversion-prd.md) is
+    the sibling per-main-SHA failing-test-id baseline cache keyed on
+    ``main_sha`` alone — the same cross-test-pollution hazard applies (an
+    earlier test's seeded/probed baseline for a reused MAIN_SHA would
+    silently serve a later test's ``main_baseline_failing_ids`` call from
+    cache instead of exercising its own probe/seed path).
+
+    Clearing the caches before *and* after each test ensures:
+    - every test starts with empty caches regardless of prior teardown;
     - this suite's pollution cannot escape to any later consumer.
 
     Production is unaffected: main_sha advances on every merge so real
@@ -348,13 +356,15 @@ def _clear_probe_cache():
     If ``orchestrator/src/orchestrator/verify.py`` gains additional
     module-level caches (e.g. a sibling result cache), add a matching
     ``.clear()`` call here so they are also reset between tests.  The
-    relevant globals are defined near ``_PROBE_CACHE`` (verify.py ~line 391)
-    and ``_PROBE_CACHE_TTL`` (~line 392).
+    relevant globals are defined near ``_PROBE_CACHE``/``_PROBE_CACHE_TTL``
+    and ``_BASELINE_FAILING_IDS_CACHE``.
     """
     from orchestrator import verify
     verify._PROBE_CACHE.clear()
+    verify._BASELINE_FAILING_IDS_CACHE.clear()
     yield
     verify._PROBE_CACHE.clear()
+    verify._BASELINE_FAILING_IDS_CACHE.clear()
 
 
 @pytest.fixture(autouse=True)

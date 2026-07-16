@@ -895,6 +895,121 @@ def is_wholly_preexisting(branch: Iterable[str], baseline: Iterable[str]) -> boo
     return not diff_new_failures(branch_set, baseline)
 
 
+# Process-wide cache for the per-main-SHA failing-test-id BASELINE (task μ,
+# verify-scope-inversion-prd.md, B2): distinct from _PROBE_CACHE above (that
+# one caches a bool — "is THIS specific failure preexisting"; this one caches
+# the FULL SET of ids already failing on a given main tip). Seeded for free
+# on every successful merge+full gate run (merge_queue.py's
+# _run_post_merge_verify pass path — see seed_main_baseline's docstring) so
+# steady-state lookups never pay for a probe; a probe only runs on a genuine
+# cold-start miss. Same TTL discipline as _PROBE_CACHE (mirrors its
+# docstring/shape) so a long-idle orchestrator doesn't pin a stale baseline
+# forever.
+# Key: main_sha; Value: (seeded_or_probed_at, failing_test_ids frozenset).
+_BASELINE_FAILING_IDS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
+
+
+def seed_main_baseline(main_sha: str, ids: Iterable[str]) -> None:
+    """Seed (or refresh) the per-main-SHA failing-id baseline cache for free.
+
+    Called from the PASS path of a merge+full gate run (merge_sha IS the
+    merged tree that is about to CAS-advance to become the next main tip —
+    see merge_queue.py's ``_run_post_merge_verify``), so in steady state
+    ``main_baseline_failing_ids`` below is always a cache hit and never pays
+    for a probe (B2).
+    """
+    _BASELINE_FAILING_IDS_CACHE[main_sha] = (time.monotonic(), frozenset(ids))
+
+
+async def main_baseline_failing_ids(
+    config: 'OrchestratorConfig',
+    module_configs: 'list[ModuleConfig]',
+    git_ops: object,
+    main_sha: str,
+) -> 'frozenset[str] | None':
+    """Return the set of test ids already failing on *main_sha*, cache-first.
+
+    Cache hit (seeded by a prior gate pass, or a prior probe of this same sha
+    within the TTL window): returned immediately — no probe, no worktree.
+
+    Cache miss: runs exactly ONE full-suite, merge-role probe of bare main,
+    reusing the same ``ephemeral_worktree(WorktreeKind.MAIN_PROBE, ...,
+    warm_seed=True)`` + ``run_scoped_verification`` lifecycle
+    :func:`verify_failure_is_preexisting_on_main` uses for its own probe —
+    a leaseless, local-only probe that NEVER routes through
+    :class:`~orchestrator.verify_runner.HostAllocator` or
+    :class:`~orchestrator.verify_runner.RemoteRunner` (see that function's
+    docstring for the full LEASE-SAFETY & HOST-AFFINITY rationale, which
+    applies identically here). The probe passes no ``task_files`` — full
+    suite, no scoping — so its id-set is apples-to-apples with a merge+full
+    branch verify's id-set.
+
+    A probe that doesn't yield a junit-derived id set
+    (``failing_test_ids is None`` — OPAQUE/non-pytest command, or the probe
+    itself errored) returns ``None`` (B3 degrade) and is deliberately **not**
+    cached, so the next caller retries rather than being stuck with a
+    falsely-empty baseline for the whole TTL window.
+
+    Does not alter deferred-probe scheduling/transport (G4, task 2564) — the
+    probe body reused here is exactly the one that function already owns.
+    """
+    from orchestrator.git_ops import EphemeralWorktreeError, WorktreeKind
+
+    if not main_sha:
+        return None
+
+    _now = time.monotonic()
+    _cached = _BASELINE_FAILING_IDS_CACHE.get(main_sha)
+    if _cached is not None:
+        _cached_at, _cached_ids = _cached
+        if _now - _cached_at < _PROBE_CACHE_TTL:
+            logger.debug(
+                'main_baseline_failing_ids: cache hit (main_sha=%.8s, %d id(s))',
+                main_sha, len(_cached_ids),
+            )
+            return _cached_ids
+
+    try:
+        async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
+            WorktreeKind.MAIN_PROBE, main_sha, warm_seed=True,
+        ) as tmp_path:
+            try:
+                probe_result = await run_scoped_verification(
+                    tmp_path, config, module_configs,
+                    task_files=None,
+                    max_retries=0,
+                    role='merge',
+                )
+            except Exception:
+                logger.debug(
+                    'main_baseline_failing_ids: probe verify raised', exc_info=True,
+                )
+                return None
+
+            if probe_result.failing_test_ids is None:
+                # OPAQUE / non-pytest / probe-side failure to collect a junit
+                # report — degrade (B3). Deliberately not cached: a transient
+                # probe hiccup shouldn't pin "no baseline" for the TTL window.
+                logger.debug(
+                    'main_baseline_failing_ids: probe collected no junit ids '
+                    '(main_sha=%.8s) — degrading to None (B3)', main_sha,
+                )
+                return None
+
+            ids = frozenset(probe_result.failing_test_ids)
+            seed_main_baseline(main_sha, ids)
+            return ids
+
+    except EphemeralWorktreeError as e:
+        logger.warning(
+            'main_baseline_failing_ids: %s — baseline probe disabled for this attempt', e,
+        )
+        return None
+    except Exception:
+        logger.debug('main_baseline_failing_ids: unexpected error', exc_info=True)
+        return None
+
+
 def _worst_category(categories: list[str]) -> str:
     """Return the highest-severity category from *categories*.
 
