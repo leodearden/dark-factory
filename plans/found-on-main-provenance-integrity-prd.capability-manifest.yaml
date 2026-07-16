@@ -1,128 +1,146 @@
-# Machine-readable twin of found-on-main-provenance-integrity-prd.capability-manifest.md
-# Schema: plans/capability-delivered-checks-prd.md §Contract; loader shared/src/shared/capability_manifest.py.
-# task_id values stamped by commit_planning (manifest stamper live as of 2026-07-16).
 prd: plans/found-on-main-provenance-integrity-prd.md
 schema_version: 1
 tasks:
-  - label: "γ"
-    task_id: null
-    title: "Enforce flip: reject_stale_done_evidence=enforce + e2e reopen-sticks test"
-    capabilities:
-      - name: "interceptor-freshness-gate-and-typed-error"
-        binding: "capability→producer — task-α upstream; chokepoint substrate grep:task_interceptor.py:988,4287"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "done_evidence_stale"
-          paths: ["fused-memory/src/fused_memory/"]
-          expect: present
-      - name: "gate-terminal-this-tick-and-conflict-l2"
-        binding: "capability→producer — task-β upstream; dedupe substrate grep:escalation/src/escalation/dedupe.py:117"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "provenance_conflict"
-          paths: ["orchestrator/src/orchestrator/"]
-          expect: present
-      - name: "enforce-default-on"
-        binding: "capability→producer — γ itself flips reject_stale_done_evidence default to enforce"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "config default value + e2e reopen-sticks behaviour judged by γ's boundary-test #1, not a grep"
-  - label: "ε"
-    task_id: null
-    title: "Call-site tightening: shared evidence helper; remove sha fallbacks; escalate-instead-of-stamp"
-    capabilities:
-      - name: "get-main-sha-fallback-removed"
-        binding: "rejection-mechanism — pattern present today at harness.py:7479; ε removes it"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "or await self\\.git_ops\\.get_main_sha\\(\\)"
-          paths: ["orchestrator/src/orchestrator/harness.py"]
-          expect: absent
-      - name: "coalesce-main-sha-fallback-removed"
-        binding: "rejection-mechanism — pattern present today at merge_queue.py:8980; ε removes it"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "resolve_branch_sha\\(branch\\) or main_sha"
-          paths: ["orchestrator/src/orchestrator/merge_queue.py"]
-          expect: absent
-      - name: "fix1-prime-and-anchored-regex-from-delta"
-        binding: "capability→producer — task-δ upstream; primitives grep:git_ops.py:6116,219"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "second-parent effect semantics + regex anchoring judged by δ's unit fixtures"
-      - name: "single-shared-evidence-helper"
-        binding: "INV-5 no-lockstep-duplication — one helper, five call sites"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "helper-extraction quality is a review judgment"
-  - label: "ζ"
-    task_id: null
-    title: "LandedOutbox consume-on-happy-path"
-    capabilities:
-      - name: "consume-exists-and-gets-wired"
-        binding: "capability→producer — grep:landed_outbox.py:117 def consume; ζ wires the happy path (task-2155 KNOWN LIMITATION)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "happy-path wiring vs crash-recovery-only is a call-graph judgment covered by ζ's integration test"
-  - label: "η"
-    task_id: null
-    title: "operational-verified provenance kind + submit-time operational suggestion"
-    capabilities:
-      - name: "operational-verified-kind-accepted"
-        binding: "capability→producer — validator extension point grep:task_interceptor.py:4276; deterministic-gate commitless precedent (task 2648)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "operational-verified"
-          paths: ["fused-memory/src/fused_memory/"]
-          expect: present
-      - name: "no-cross-service-escalation-lookup-assumed"
-        binding: "G3 constraint — fused-memory's only escalation client is its own 8103 recon queue (reconciliation/harness.py:1412-1428); escalation_id recorded-for-audit only"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "a deliberate absence-of-assumption, not a greppable artifact"
-  - label: "κ"
-    task_id: null
-    title: "Deploy gate: restart fused-memory (deterministic pure gate)"
-    capabilities:
-      - name: "deterministic-pure-gate-preset"
-        binding: "capability→producer (wired) — live precedent task 2648 (deterministic-gate provenance 2026-07-16)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "gate resolution is the human/watcher L2 flow; no code artifact"
-  - label: "θ"
-    task_id: null
-    title: "Soak: +7d delayed-milestone predicate re-running the provenance audit"
-    capabilities:
-      - name: "milestone-delayed-mode"
-        binding: "capability→producer (wired) — grep:shared/src/shared/task_metadata.py:229-239 Milestone.after_secs"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "after_secs"
-          paths: ["shared/src/shared/task_metadata.py"]
-          expect: present
-      - name: "predicate-wrapper-script"
-        binding: "capability→producer — task-ι upstream"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "check_found_on_main_spurious_rate"
-          paths: ["fused-memory/scripts/"]
-          expect: present
-      - name: "zero-new-spurious-premise"
-        binding: "G6 numeric — count-zero assertion post-deploy, not an accuracy bound; basis: ε/γ close every RCA-identified stamping path; audit script exists (exercised by task 2648)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the soak run itself is the check; recorded in θ's resolution"
+- label: γ
+  task_id: 2680
+  title: 'Enforce flip: reject_stale_done_evidence=enforce + e2e reopen-sticks test'
+  capabilities:
+  - name: interceptor-freshness-gate-and-typed-error
+    binding: capability→producer — task-α upstream; chokepoint substrate grep:task_interceptor.py:988,4287
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: done_evidence_stale
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: gate-terminal-this-tick-and-conflict-l2
+    binding: capability→producer — task-β upstream; dedupe substrate grep:escalation/src/escalation/dedupe.py:117
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: provenance_conflict
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: enforce-default-on
+    binding: capability→producer — γ itself flips reject_stale_done_evidence default
+      to enforce
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'config default value + e2e reopen-sticks behaviour judged by γ''s boundary-test
+        #1, not a grep'
+- label: ε
+  task_id: 2678
+  title: 'Call-site tightening: shared evidence helper; remove sha fallbacks; escalate-instead-of-stamp'
+  capabilities:
+  - name: get-main-sha-fallback-removed
+    binding: rejection-mechanism — pattern present today at harness.py:7479; ε removes
+      it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: or await self\.git_ops\.get_main_sha\(\)
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: absent
+  - name: coalesce-main-sha-fallback-removed
+    binding: rejection-mechanism — pattern present today at merge_queue.py:8980; ε
+      removes it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: resolve_branch_sha\(branch\) or main_sha
+      paths:
+      - orchestrator/src/orchestrator/merge_queue.py
+      expect: absent
+  - name: fix1-prime-and-anchored-regex-from-delta
+    binding: capability→producer — task-δ upstream; primitives grep:git_ops.py:6116,219
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: second-parent effect semantics + regex anchoring judged by δ's unit
+        fixtures
+  - name: single-shared-evidence-helper
+    binding: INV-5 no-lockstep-duplication — one helper, five call sites
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: helper-extraction quality is a review judgment
+- label: ζ
+  task_id: 2681
+  title: LandedOutbox consume-on-happy-path
+  capabilities:
+  - name: consume-exists-and-gets-wired
+    binding: capability→producer — grep:landed_outbox.py:117 def consume; ζ wires
+      the happy path (task-2155 KNOWN LIMITATION)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: happy-path wiring vs crash-recovery-only is a call-graph judgment covered
+        by ζ's integration test
+- label: η
+  task_id: 2679
+  title: operational-verified provenance kind + submit-time operational suggestion
+  capabilities:
+  - name: operational-verified-kind-accepted
+    binding: capability→producer — validator extension point grep:task_interceptor.py:4276;
+      deterministic-gate commitless precedent (task 2648)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: operational-verified
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: no-cross-service-escalation-lookup-assumed
+    binding: G3 constraint — fused-memory's only escalation client is its own 8103
+      recon queue (reconciliation/harness.py:1412-1428); escalation_id recorded-for-audit
+      only
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a deliberate absence-of-assumption, not a greppable artifact
+- label: κ
+  task_id: 2682
+  title: 'Deploy gate: restart fused-memory (deterministic pure gate)'
+  capabilities:
+  - name: deterministic-pure-gate-preset
+    binding: capability→producer (wired) — live precedent task 2648 (deterministic-gate
+      provenance 2026-07-16)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: gate resolution is the human/watcher L2 flow; no code artifact
+- label: θ
+  task_id: 2683
+  title: 'Soak: +7d delayed-milestone predicate re-running the provenance audit'
+  capabilities:
+  - name: milestone-delayed-mode
+    binding: capability→producer (wired) — grep:shared/src/shared/task_metadata.py:229-239
+      Milestone.after_secs
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: after_secs
+      paths:
+      - shared/src/shared/task_metadata.py
+      expect: present
+  - name: predicate-wrapper-script
+    binding: capability→producer — task-ι upstream
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: check_found_on_main_spurious_rate
+      paths:
+      - fused-memory/scripts/
+      expect: present
+  - name: zero-new-spurious-premise
+    binding: 'G6 numeric — count-zero assertion post-deploy, not an accuracy bound;
+      basis: ε/γ close every RCA-identified stamping path; audit script exists (exercised
+      by task 2648)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the soak run itself is the check; recorded in θ's resolution
