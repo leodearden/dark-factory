@@ -346,6 +346,22 @@ class StaleServiceRestartCoordinator:
         independent clock gate (``ORCH_RESTART_MIN_INTERVAL_SECS`` in
         scripts/orchestrator-watchdog.py), not this in-memory cap, as
         authoritative.
+    force_fire_after_secs:
+        Fleet-redeploy PRD task delta (fire-while-busy). Max MONOTONIC
+        seconds (``clock``) a pending restart may stay owed before
+        ``maybe_restart`` force-fires it — bypassing the ``agents_idle``
+        gate, the debounce, and the ``restart_precondition`` preference (but
+        NEVER the ``min_interval_secs`` wall-clock cap above, which is still
+        enforced unchanged on the force-fire path). Owed-age is measured
+        from ``_first_pending_monotonic`` (the non-resetting first-armed
+        timestamp), not from ``_last_request_monotonic`` (which resets on
+        every ``note_merge`` re-arm and so would never age under a
+        continuous merge stream). ``0.0`` (the default) DISABLES force-fire
+        entirely, preserving byte-identical behaviour for coordinators that
+        don't need it (fused-memory, dashboard). Used only by the
+        orchestrator's own self-redeploy coordinator, whose polite path
+        (``require_idle=True``) can otherwise starve indefinitely under
+        chronic fleet saturation.
     """
 
     def __init__(
@@ -369,6 +385,7 @@ class StaleServiceRestartCoordinator:
         wall_clock: Callable[[], float] = time.time,
         state_path: Path | None = None,
         stamp_clock_on_fire: bool = True,
+        force_fire_after_secs: float = 0.0,
     ) -> None:
         self._git_ops = git_ops
         self._event_store = event_store
@@ -416,6 +433,10 @@ class StaleServiceRestartCoordinator:
         # no persisted state). Seeded fail-open from state_path at construction:
         # a missing / corrupt / unreadable file must never raise here.
         self._last_fire_wall: float | None = self._load_last_fire_wall()
+        # Fire-while-busy force-fire threshold (fleet-redeploy PRD task
+        # delta). 0.0 disables — see the force_fire_after_secs docstring
+        # above.
+        self._force_fire_after_secs = force_fire_after_secs
 
         # State
         self._pending: bool = False
@@ -426,6 +447,15 @@ class StaleServiceRestartCoordinator:
         # Consecutive TRANSIENT executor failures since the last successful
         # fire (NOT reset by note_merge re-arming — see maybe_restart).
         self._consecutive_executor_failures: int = 0
+        # Monotonic timestamp of the FIRST note_merge that armed the current
+        # pending burst (False→True transition) — NOT reset by note_merge
+        # re-arming (mirrors _consecutive_executor_failures above), so it
+        # measures true owed-age under a continuous merge stream even though
+        # _last_request_monotonic keeps advancing. None while not pending;
+        # reset to None at every pending-clear site (permanent-fail,
+        # exhausted-transient, successful-fire) in maybe_restart, so
+        # pending=True iff _first_pending_monotonic is not None.
+        self._first_pending_monotonic: float | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -483,9 +513,15 @@ class StaleServiceRestartCoordinator:
         if not watched_changed:
             return False
 
-        # Arm / re-arm
+        # Arm / re-arm. Stamp _first_pending_monotonic ONLY on the False→True
+        # transition — it must NOT move on a re-arm (see its docstring in
+        # __init__), unlike _last_request_monotonic below, which is the
+        # debounce source and re-stamps on every note_merge.
+        now = self._clock()
+        if not self._pending:
+            self._first_pending_monotonic = now
         self._pending = True
-        self._last_request_monotonic = self._clock()
+        self._last_request_monotonic = now
         self._trigger_task_ids.append(task_id)
         self._trigger_merge_shas.append(head_sha)
         logger.info(
