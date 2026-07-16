@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from bisect import bisect_left
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -139,14 +140,14 @@ def _done_by_day(runs_db: Path) -> dict[str, int]:
 # ---------------------------------------------------------------------------
 
 
-def _load_escalation_records(escalations_dir: Path) -> tuple[list[tuple[Escalation, dict]], int]:
+def _load_escalation_records(escalations_dir: Path) -> tuple[list[Escalation], int]:
     """Walk *escalations_dir* (queue root + archive) parsing every escalation file.
 
-    Returns ``(records, parse_failures)``: each record pairs the parsed
-    :class:`~escalation.models.Escalation` with its *raw* dict. The raw dict
-    is retained so forward-compat fields dropped by ``Escalation.from_dict``'s
-    ``__dataclass_fields__`` filter (e.g. 2555's ``triaged_at``/``triaged_by``)
-    survive for later blocks (``triage_segments``) with no model change.
+    Returns ``(records, parse_failures)``. ``triaged_at``/``triaged_by`` (2555)
+    are first-class ``Escalation`` dataclass fields (``escalation.models``), so
+    ``Escalation.from_dict``'s ``__dataclass_fields__`` filter already
+    preserves them on the parsed record — no raw dict needs to be carried
+    alongside it for later blocks (``triage_segments``) to read.
 
     A file that is not valid JSON, or whose parsed JSON cannot construct an
     ``Escalation`` (missing required field, non-dict top level, etc.), is
@@ -154,17 +155,16 @@ def _load_escalation_records(escalations_dir: Path) -> tuple[list[tuple[Escalati
     dashboard is the loud surface for a corrupt archive file (skipped AND
     counted), not a silent drop or a 500.
     """
-    records: list[tuple[Escalation, dict]] = []
+    records: list[Escalation] = []
     parse_failures = 0
     for path in iter_all_escalation_paths(Path(escalations_dir)):
         try:
-            raw = json.loads(path.read_text())
-            esc = Escalation.from_dict(raw)
+            esc = Escalation.from_dict(json.loads(path.read_text()))
         except Exception as exc:
             logger.warning('_load_escalation_records: failed to parse %s: %s', path, exc)
             parse_failures += 1
             continue
-        records.append((esc, raw))
+        records.append(esc)
     return records, parse_failures
 
 
@@ -180,7 +180,7 @@ _PREDICTABLY_BENIGN_MIN_N = 20
 _PREDICTABLY_BENIGN_MIN_RATE = 0.9
 
 
-def _origin_block(records: list[tuple[Escalation, dict]], *, now: datetime) -> dict:
+def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
     """Per-source (``agent_role``) origin aggregates over *records*.
 
     ``sources[].filings`` counts every record for that source, regardless of
@@ -196,7 +196,11 @@ def _origin_block(records: list[tuple[Escalation, dict]], *, now: datetime) -> d
 
     ``daily_by_source`` maps ``date(timestamp) -> {source: filing_count}``;
     ``daily_spark`` is each source's ascending-by-date filing-count series
-    read back from that same map (sparkline shape).
+    read back from that same map (sparkline shape). The two are deliberately
+    redundant: ``daily_by_source`` is the cross-source-by-date shape (donut/
+    stacked-bar rendering) and ``daily_spark`` is the pre-extracted per-source
+    series (sparkline rendering) — both are provided so neither consumer has
+    to reconstruct one from the other.
     """
     window_cutoff = now - timedelta(days=_PREDICTABLY_BENIGN_WINDOW_DAYS)
 
@@ -209,7 +213,7 @@ def _origin_block(records: list[tuple[Escalation, dict]], *, now: datetime) -> d
     window_benign: dict[str, int] = {}
     daily_by_source: dict[str, dict[str, int]] = {}
 
-    for esc, _raw in records:
+    for esc in records:
         source = esc.agent_role
         filings[source] = filings.get(source, 0) + 1
 
@@ -348,7 +352,7 @@ def _downsample_stratified(samples: list[list], threshold: int) -> list[list]:
 
 
 def _lifespan_block(
-    records: list[tuple[Escalation, dict]],
+    records: list[Escalation],
     *,
     now: datetime,
     downsample_threshold: int = 10_000,
@@ -376,10 +380,9 @@ def _lifespan_block(
       the model has no machine-readable L0->L1 link.
     - ``triage_segments`` (render-when-present, 2555 forward-compat):
       ``{count, filed_to_triaged:{p50,p90}, triaged_to_resolved:{p50,p90}}``
-      over terminal-with-valid-times records whose *raw* dict carries a
-      parseable ``triaged_at`` (``triaged_at`` is not an ``Escalation``
-      dataclass field, so it is read from the retained raw dict, not
-      ``esc``). ``filed_to_triaged`` = ``triaged_at - timestamp``;
+      over terminal-with-valid-times records carrying a parseable
+      ``esc.triaged_at`` (a first-class ``Escalation`` dataclass field).
+      ``filed_to_triaged`` = ``triaged_at - timestamp``;
       ``triaged_to_resolved`` = ``resolved_at - triaged_at``. Omitted
       entirely (no key) when no record in the project carries a parseable
       ``triaged_at`` — this is a render-when-present field, not a
@@ -391,7 +394,7 @@ def _lifespan_block(
     (the pre-downsample count) — a loud marker, never silent truncation.
     Below/at threshold, ``samples`` is untouched and neither key appears.
     """
-    by_id: dict[str, Escalation] = {esc.id: esc for esc, _raw in records}
+    by_id: dict[str, Escalation] = {esc.id: esc for esc in records}
 
     secs_by_level: dict[int, list[float]] = {}
     samples: list[list] = []
@@ -400,7 +403,7 @@ def _lifespan_block(
     filed_to_triaged_deltas: list[float] = []
     triaged_to_resolved_deltas: list[float] = []
 
-    for esc, _raw in records:
+    for esc in records:
         if esc.level == 2 and esc.members:
             try:
                 l2_filed_at = parse_utc(esc.timestamp)
@@ -473,7 +476,7 @@ def _lifespan_block(
         secs_by_level.setdefault(esc.level, []).append(secs)
         samples.append([resolved_at.date().isoformat(), tier, esc.level, secs])
 
-        triaged_at_raw = _raw.get('triaged_at')
+        triaged_at_raw = esc.triaged_at
         if triaged_at_raw:
             try:
                 triaged_at = parse_utc(triaged_at_raw)
@@ -541,7 +544,7 @@ def _lifespan_block(
 _CHURN_LOOKBACK = timedelta(hours=24)
 
 
-def _workflow_block(records: list[tuple[Escalation, dict]], runs_db: Path) -> dict:
+def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
     """Workflow aggregates over *records*: tier/action mix, churn, throughput, flow cube.
 
     - ``tier_weekly``: ISO-week (``YYYY-Www``) -> ``{tier: count}``, over
@@ -561,14 +564,14 @@ def _workflow_block(records: list[tuple[Escalation, dict]], runs_db: Path) -> di
       ``resolved_at`` — so their counts reconcile per row 11).
     """
     by_task: dict[str, list[Escalation]] = {}
-    for esc, _raw in records:
+    for esc in records:
         by_task.setdefault(esc.task_id, []).append(esc)
 
     tier_weekly: dict[str, dict[str, int]] = {}
     action_mix: dict[str, int] = {}
     flow_cube: dict[tuple[str, str, int, str, str], int] = {}
 
-    for esc, _raw in records:
+    for esc in records:
         if esc.status not in ('resolved', 'dismissed'):
             continue
 
@@ -604,9 +607,30 @@ def _workflow_block(records: list[tuple[Escalation, dict]], runs_db: Path) -> di
         key = (resolved_at.date().isoformat(), esc.agent_role, esc.level, tier, cls)
         flow_cube[key] = flow_cube.get(key, 0) + 1
 
+    # Pre-parse + sort each task's terminal resolved_at once so the per-filing
+    # churn check below can bisect a [window_start, filed_at) range instead of
+    # rescanning (and re-parsing timestamps in) that task's full escalation
+    # history for every filing — O(log k + matches) rather than O(k) per
+    # filing, where k = escalations ever filed against that task_id. Without
+    # this, a task with a long re-filing history would make this block
+    # quadratic in k.
+    resolved_index: dict[str, tuple[list[datetime], list[str]]] = {}
+    for task_id, task_records in by_task.items():
+        pairs: list[tuple[datetime, str]] = []
+        for other in task_records:
+            if other.status not in ('resolved', 'dismissed'):
+                continue
+            try:
+                other_resolved_at = parse_utc(other.resolved_at)
+            except (TypeError, ValueError):
+                continue
+            pairs.append((other_resolved_at, other.id))
+        pairs.sort(key=lambda p: p[0])
+        resolved_index[task_id] = ([p[0] for p in pairs], [p[1] for p in pairs])
+
     churn_daily: dict[str, int] = {}
     filings_by_date: dict[str, int] = {}
-    for esc, _raw in records:
+    for esc in records:
         try:
             filed_at = parse_utc(esc.timestamp)
         except (TypeError, ValueError):
@@ -619,17 +643,10 @@ def _workflow_block(records: list[tuple[Escalation, dict]], runs_db: Path) -> di
         filings_by_date[date_key] = filings_by_date.get(date_key, 0) + 1
 
         window_start = filed_at - _CHURN_LOOKBACK
-        churned = False
-        for other in by_task.get(esc.task_id, []):
-            if other.id == esc.id or other.status not in ('resolved', 'dismissed'):
-                continue
-            try:
-                other_resolved_at = parse_utc(other.resolved_at)
-            except (TypeError, ValueError):
-                continue
-            if window_start <= other_resolved_at < filed_at:
-                churned = True
-                break
+        resolved_ats, resolved_ids = resolved_index.get(esc.task_id, ([], []))
+        lo = bisect_left(resolved_ats, window_start)
+        hi = bisect_left(resolved_ats, filed_at)
+        churned = any(resolved_ids[i] != esc.id for i in range(lo, hi))
         if churned:
             churn_daily[date_key] = churn_daily.get(date_key, 0) + 1
 
