@@ -4709,6 +4709,26 @@ def _done_evidence_stale_error(
     }
 
 
+def _done_evidence_stale_override_invalid_error(task_id: str, agent_id: str | None) -> dict:
+    """Structured error for a present-but-invalid ``stale_evidence_override``.
+
+    Mode-independent (returned in both enforce and warn) — an explicit
+    malformed override, or one supplied by a recon-stage caller, is always
+    a loud caller error, never a silent fall-through to the plain
+    :func:`_done_evidence_stale_error` rejection.
+    """
+    return {
+        'success': False,
+        'error': 'done_evidence_stale_override_invalid',
+        'task_id': task_id,
+        'agent_id': agent_id,
+        'hint': (
+            'stale_evidence_override requires a non-recon-stage caller and '
+            'non-empty escalation_id + reason fields'
+        ),
+    }
+
+
 def _valid_stale_evidence_override(override: object, is_recon_stage: bool) -> bool:
     """True iff ``override`` is a well-formed, non-recon-stage bypass assertion.
 
