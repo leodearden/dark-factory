@@ -2134,7 +2134,7 @@ PHANTOM_TASK_CREATION_FLAG_TYPES: frozenset[str] = frozenset({
 
 async def filter_false_phantom_task_creation_flags(
     taskmaster: Any,
-    known_projects: dict[str, str],
+    known_projects: dict[str, str] | None,
     flags: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Drop phantom-tasks_created findings corroborated by a cross-project task.
