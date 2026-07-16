@@ -2303,6 +2303,26 @@ class TestPreTriageUsageGateCleanup:
         # invoke_with_cap_retry sets account_name='' when no gate is provided
         assert mock_result.account_name == ''
 
+    async def test_forwards_cost_telemetry_kwargs(self, steward: TaskSteward):
+        """cost_store/run_id/task_id/project_id/role='triage' are forwarded to
+        invoke_with_cap_retry so its guarded save_invocation block fires
+        (task 2461). FAILS RED today: none of these kwargs are forwarded."""
+        steward.cost_store = MagicMock()
+        steward.event_store = MagicMock(run_id='run-abc')
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-triage')
+            await steward._pre_triage_suggestions(self._esc())
+
+        kwargs = mock_iwcr.call_args.kwargs
+        assert kwargs['cost_store'] is steward.cost_store
+        assert kwargs['role'] == 'triage'
+        assert kwargs['run_id'] == 'run-abc'
+        assert kwargs['task_id'] == '42'
+        assert kwargs['project_id'] == steward.config.fused_memory.project_id
+
 
 # ---------------------------------------------------------------------------
 # Pre-triage suggestions path — _handle_escalation integration + kwarg contract
