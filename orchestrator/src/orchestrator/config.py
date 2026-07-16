@@ -153,6 +153,7 @@ class ModelsConfig(BaseModel):
     module_tagger: str = Field(default='sonnet')
     deep_reviewer: str = Field(default='opus')
     judge: str = Field(default='sonnet')
+    simple_task: str = Field(default='sonnet')
 
 
 class BudgetsConfig(BaseModel):
@@ -168,6 +169,7 @@ class BudgetsConfig(BaseModel):
     module_tagger: float = Field(default=2.0)
     deep_reviewer: float = Field(default=15.0)
     judge: float = Field(default=0.50)
+    simple_task: float = Field(default=1.50)
 
 
 class TurnsConfig(BaseModel):
@@ -183,6 +185,7 @@ class TurnsConfig(BaseModel):
     module_tagger: int = Field(default=30)
     deep_reviewer: int = Field(default=100)
     judge: int = Field(default=15)
+    simple_task: int = Field(default=30)
 
 
 class EffortConfig(BaseModel):
@@ -198,6 +201,7 @@ class EffortConfig(BaseModel):
     module_tagger: str = Field(default='medium')
     deep_reviewer: str = Field(default='max')
     judge: str = Field(default='medium')
+    simple_task: str = Field(default='high')
 
 
 class TimeoutsConfig(BaseModel):
@@ -223,6 +227,12 @@ class TimeoutsConfig(BaseModel):
     module_tagger: float = Field(default=300.0)
     deep_reviewer: float = Field(default=2400.0)
     judge: float = Field(default=300.0)
+    # Dedicated per-role knob (deliberately decoupled from
+    # OrchestratorConfig.invocation_timeout — see that field's docstring):
+    # today simple_task's timeout comes from the getattr(timeouts_cfg,
+    # role_key, self.config.invocation_timeout) fallback, so at stock config
+    # (invocation_timeout=7200.0) this literal is byte-equivalent.
+    simple_task: float = Field(default=7200.0)
     startup_grace_secs: float = Field(
         default=120.0,
         description=(
@@ -268,6 +278,7 @@ class BackendsConfig(BaseModel):
     module_tagger: str = Field(default='claude')
     deep_reviewer: str = Field(default='claude')
     judge: str = Field(default='claude')
+    simple_task: str = Field(default='claude')
 
 
 class RoutingConfig(BaseModel):

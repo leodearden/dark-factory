@@ -173,6 +173,9 @@ timeouts:
   module_tagger: 300
   deep_reviewer: 2400
   judge: 300
+  # Dedicated per-role knob, deliberately decoupled from invocation_timeout
+  # above (see that field's comment) — byte-equivalent at stock config.
+  simple_task: 7200.0
   # Post-turn-1 no-progress idle bound (seconds) — the working-regime
   # watchdog kills only after no NEW assistant turn for
   # max(working_idle_secs, the per-role ceiling above).
@@ -190,6 +193,7 @@ models:
   module_tagger: "sonnet"
   deep_reviewer: "opus"
   judge: "sonnet"
+  simple_task: "sonnet"
 
 # Budget per invocation (USD)
 budgets:
@@ -203,6 +207,7 @@ budgets:
   module_tagger: 2.0
   deep_reviewer: 15.0
   judge: 0.50
+  simple_task: 1.50
 
 # Turn limits per invocation
 max_turns:
@@ -216,6 +221,7 @@ max_turns:
   module_tagger: 30
   deep_reviewer: 100
   judge: 15
+  simple_task: 30
 
 # Reasoning effort per role
 effort:
@@ -229,6 +235,7 @@ effort:
   module_tagger: "medium"
   deep_reviewer: "max"
   judge: "medium"
+  simple_task: "high"
 
 # Backend CLI per role (claude, codex, gemini, pi)
 backends:
@@ -242,6 +249,7 @@ backends:
   module_tagger: "claude"
   deep_reviewer: "claude"
   judge: "claude"
+  simple_task: "claude"
 
 # Review checkpoints
 review:
