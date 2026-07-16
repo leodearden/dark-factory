@@ -2572,6 +2572,7 @@ class TestStampTriage:
             esc.id, triaged_by='watcher', triage_note='predicate P | probe: cmd -> out',
         )
         assert first is not None
+        assert first.triaged_at is not None
         first_triaged_at = first.triaged_at
 
         time.sleep(0.01)  # ensure distinct timestamps
