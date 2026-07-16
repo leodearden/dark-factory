@@ -8,9 +8,11 @@ No live systemd runtime is needed — all subprocess.run calls are monkeypatched
 
 import importlib.util
 import json
+import os
 import pathlib
 import re
 import subprocess
+import time
 import types
 
 import pytest  # pyright: ignore[reportMissingImports]
@@ -3027,4 +3029,226 @@ def test_boundary1_staleness_inside_window_real_clock_file(
     assert any(
         "skip" in m and str(wdog.ORCH_RESTART_MIN_INTERVAL_SECS) in m for m in log_messages
     ), f"Expected a skip log line naming the fleet-deploy min-interval: {log_messages}"
+
+
+# ---------------------------------------------------------------------------
+# Boundary scenarios 2-6 (I1/I2/I3/I4/I6): drive the REAL
+# scripts/restart-all-orchestrators.sh --drain via subprocess, against a
+# local fake multi-unit `systemctl` on PATH + crafted heartbeats.
+#
+# Reimplements -- rather than imports across test directories, which isn't
+# clean -- the proven harnesses in tests/scripts/test_restart_all_
+# orchestrators.py (fake-binary-on-PATH + clock-stamp pattern) and
+# scripts/tests/test_restart_all_orchestrators.py (multi-unit fake systemctl
+# with per-unit state + the drain env-knob techniques: force-fire=0 for
+# force, unknown-grace=0 for absent, a bounded subprocess timeout for defer).
+# ---------------------------------------------------------------------------
+
+RESTART_ALL_SCRIPT = REPO_ROOT / "scripts" / "restart-all-orchestrators.sh"
+
+# Stateful fake `systemctl`: `list-units` reports every entry in
+# running_units; `show -p FIELDS UNIT` and `restart UNIT` operate on
+# state["units"][UNIT], keyed by a "scenario" ("fresh" advances MainPID/
+# ActiveState/ActiveEnterTimestampMonotonic on restart, simulating a verified
+# restart; "stale" -- the default -- never advances, simulating a restart
+# that never came back up fresh). Every call is recorded into state["calls"]
+# for assertions. Verbatim reimplementation of
+# scripts/tests/test_restart_all_orchestrators.py's FAKE_SYSTEMCTL_SRC.
+_BOUNDARY_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
+"""Fake multi-unit `systemctl` for ε's --drain boundary scenarios."""
+import json
+import os
+import sys
+
+STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
+
+
+def _load():
+    with open(STATE_PATH) as f:
+        return json.load(f)
+
+
+def _save(state):
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f)
+
+
+def main(argv):
+    args = [a for a in argv[1:] if a != "--user"]
+    if not args:
+        return 1
+    verb, rest = args[0], args[1:]
+
+    state = _load()
+    state.setdefault("calls", []).append(argv[1:])
+
+    if verb == "list-units":
+        for unit in state.get("running_units", []):
+            print(f"{unit} loaded active running Orchestrator")
+        _save(state)
+        return 0
+
+    if verb == "restart":
+        unit = rest[0] if rest else ""
+        units = state.setdefault("units", {})
+        ustate = units.setdefault(unit, {})
+        scenario = ustate.get("scenario", "stale")
+        if scenario == "fresh":
+            ustate["MainPID"] = ustate.get("MainPID", 1000) + 1
+            ustate["ActiveState"] = "active"
+            ustate["ActiveEnterTimestampMonotonic"] = (
+                ustate.get("ActiveEnterTimestampMonotonic", 0) + 5_000_000
+            )
+            ustate["ActiveEnterTimestamp"] = "restarted"
+        _save(state)
+        return 0
+
+    if verb == "show":
+        fields = None
+        unit = None
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok == "-p":
+                fields = rest[i + 1]
+                i += 2
+            elif tok.startswith("--property="):
+                fields = tok.split("=", 1)[1]
+                i += 1
+            elif tok.startswith("-"):
+                i += 1
+            else:
+                unit = tok
+                i += 1
+        ustate = state.get("units", {}).get(unit, {})
+        current = {
+            "MainPID": str(ustate.get("MainPID", 0)),
+            "ActiveState": ustate.get("ActiveState", "active"),
+            "ActiveEnterTimestamp": ustate.get("ActiveEnterTimestamp", "baseline"),
+            "ActiveEnterTimestampMonotonic": str(ustate.get("ActiveEnterTimestampMonotonic", 0)),
+        }
+        keys = fields.split(",") if fields else list(current.keys())
+        for k in keys:
+            print(f"{k}={current.get(k, '')}")
+        _save(state)
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+'''
+
+
+def _boundary_make_fake_systemctl(base_dir, *, running_units, units=None):
+    """Write a fake multi-unit `systemctl` into <base_dir>/bin/.
+
+    Returns (bin_dir, state_path). parents=True/exist_ok=True so callers may
+    pass a not-yet-created base_dir (e.g. a fresh sub-scenario directory).
+    """
+    bin_dir = base_dir / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    fake = bin_dir / "systemctl"
+    fake.write_text(_BOUNDARY_FAKE_SYSTEMCTL_SRC)
+    fake.chmod(0o755)
+
+    state_path = base_dir / "systemctl_state.json"
+    state_path.write_text(json.dumps({
+        "running_units": list(running_units),
+        "units": units or {},
+        "calls": [],
+    }))
+    return bin_dir, state_path
+
+
+def _boundary_write_heartbeat(fleet_dir, unit, **overrides):
+    """Write a heartbeat JSON matching fleet_heartbeat.py's on-disk contract."""
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "unit": unit,
+        "merge_idle": True,
+        "depth": 0,
+        "queue_empty": True,
+        "ts_epoch": time.time(),
+    }
+    payload.update(overrides)
+    (fleet_dir / f"{unit}.json").write_text(json.dumps(payload))
+
+
+def _boundary_run_drain_script(
+    bin_dir, state_path, fleet_dir, clock_file, *, env=None, timeout=20
+):
+    """Run the REAL restart-all-orchestrators.sh --drain with the fake
+    systemctl prepended onto PATH."""
+    full_env = dict(os.environ)
+    full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
+    full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
+    full_env["ORCH_FLEET_DIR"] = str(fleet_dir)
+    full_env["ORCH_FLEET_DEPLOY_CLOCK"] = str(clock_file)
+    if env:
+        full_env.update(env)
+    return subprocess.run(
+        ["bash", str(RESTART_ALL_SCRIPT), "--drain"],
+        env=full_env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _boundary_load_state(state_path):
+    return json.loads(state_path.read_text())
+
+
+def _boundary_decode(maybe_bytes):
+    """subprocess.run's TimeoutExpired attaches partial output as bytes even
+    when text=True was passed to the original call -- normalize."""
+    if maybe_bytes is None:
+        return ""
+    if isinstance(maybe_bytes, bytes):
+        return maybe_bytes.decode(errors="replace")
+    return maybe_bytes
+
+
+def test_boundary2_all_idle_restarts_and_stamps_clock(tmp_path: pathlib.Path) -> None:
+    """Scenario 2 (I1/I2/I6) -- staleness past 8h, all idle: the REAL
+    restart-all-orchestrators.sh --drain restarts every unit, verifies each
+    fresh, and stamps the shared fleet-deploy clock afterward.
+
+    Drives the actual bash script + drain_check.py end-to-end via subprocess
+    against a local fake multi-unit `systemctl` on PATH, with >=2 running
+    units, all heartbeats fresh + merge_idle=True (idle -> transparent, no
+    defer/force line). The clock file does not exist beforehand -- the
+    script's own stamp_fleet_deploy_clock is what creates it: a new
+    integration combo (drain-idle + verify + stamp together) beyond the
+    pre-existing per-contract suites, which test drain and stamping
+    separately.
+    """
+    fleet_dir = tmp_path / "fleet"
+    unit_a = "orchestrator-alpha.service"
+    unit_b = "orchestrator-bravo.service"
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path,
+        running_units=[unit_a, unit_b],
+        units={unit_a: {"scenario": "fresh"}, unit_b: {"scenario": "fresh"}},
+    )
+    _boundary_write_heartbeat(fleet_dir, unit_a, merge_idle=True, ts_epoch=time.time())
+    _boundary_write_heartbeat(fleet_dir, unit_b, merge_idle=True, ts_epoch=time.time())
+
+    clock_file = tmp_path / "clock.json"
+    assert not clock_file.exists()
+
+    result = _boundary_run_drain_script(
+        bin_dir, state_path, fleet_dir, clock_file,
+        env={"RESTART_VERIFY_TIMEOUT": "5"},
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    state = _boundary_load_state(state_path)
+    assert ["--user", "restart", unit_a] in state["calls"], state["calls"]
+    assert ["--user", "restart", unit_b] in state["calls"], state["calls"]
+    assert clock_file.exists(), "a fully-verified drain-aware restart must stamp the clock"
+    stamped = json.loads(clock_file.read_text())
+    assert isinstance(stamped["ts"], (int, float)), f"ts must be numeric; got {stamped!r}"
 
