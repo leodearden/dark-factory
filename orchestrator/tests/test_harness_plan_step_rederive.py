@@ -293,3 +293,70 @@ class TestRederiveStepStatusDefensive:
 
         assert result == []
         assert artifacts.read_plan()['steps'][0]['status'] == 'pending'
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED: observability log entry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRederiveStepStatusLogEntry:
+    async def test_rederive_emits_plan_step_rederive_log_entry(
+        self, config, git_ops, task_assignment,
+    ):
+        """Positive: a genuine re-derivation writes exactly one
+        plan_step_rederive iteration-log entry naming the re-derived id(s)."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'impl.py').write_text('implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_plan(artifacts, workflow, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+        ])
+        artifacts.append_iteration_log({
+            'agent': 'implementer', 'steps_completed': ['step-1'], 'commit': step_commit,
+        })
+
+        result = await workflow._rederive_step_status_from_branch_state()
+        assert result == ['step-1']
+
+        entries, _ = artifacts.read_iteration_log()
+        rederive_entries = [e for e in entries if e.get('event') == 'plan_step_rederive']
+        assert len(rederive_entries) == 1, (
+            f'Expected exactly one plan_step_rederive entry, got {rederive_entries}'
+        )
+        assert rederive_entries[0]['rederived_steps'] == ['step-1']
+
+    async def test_no_rederive_emits_no_log_entry(
+        self, config, git_ops, task_assignment,
+    ):
+        """Negative: reuses the no-work-guard setup (nothing re-derived) —
+        no plan_step_rederive entry must be written."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        workflow.plan = _write_plan(artifacts, workflow, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+        ])
+        artifacts.append_iteration_log({
+            'agent': 'implementer',
+            'steps_completed': ['step-1'],
+            'commit': 'orphan-sha',
+        })
+
+        result = await workflow._rederive_step_status_from_branch_state()
+        assert result == []
+
+        entries, _ = artifacts.read_iteration_log()
+        assert not any(e.get('event') == 'plan_step_rederive' for e in entries), (
+            f'No plan_step_rederive entry should be written when nothing was '
+            f're-derived; entries: {entries}'
+        )
