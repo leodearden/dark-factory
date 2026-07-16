@@ -1107,6 +1107,50 @@ async def _prune_task_count_snapshots(
         enumeration_ok = False
         members = []
 
+    # Silent-empty enumeration guard (task 2655, 5th recorded recurrence).
+    # Mem0Backend.scroll_by_metadata swallows TimeoutError and returns []
+    # (mem0_client.py:392-407), while its sibling count_by_metadata lets
+    # timeouts propagate (mem0_client.py:296-339) -- so an empty,
+    # NON-exceptional scroll page is ambiguous: it could be a genuine empty
+    # pool, or a swallowed Qdrant read timeout that would otherwise let the
+    # caller's canonical write proceed without ever pruning the prior
+    # snapshot(s), growing the byte-identical duplicate pile. Cross-check
+    # via count_memories_by_metadata, which propagates timeouts: a raised
+    # cross-check, or a confirmed count > 0, is the swallowed-timeout
+    # fingerprint. Only runs on an empty scroll -- a non-empty page skips
+    # the extra count call entirely. Best-effort: never raises.
+    if enumeration_ok and not members:
+        try:
+            snapshot_count = await memory_service.count_memories_by_metadata(
+                project_id=project_id,
+                filters={'kind': TASK_COUNT_SNAPSHOT_KIND},
+            )
+            enumeration_confirmed_empty = snapshot_count <= 0
+        except Exception:
+            logger.warning(
+                'reconciliation._prune_task_count_snapshots: '
+                'count_memories_by_metadata cross-check failed for project_id=%s '
+                'after an empty scroll; treating enumeration as not-ok rather '
+                'than a confirmed empty pool (possible swallowed Qdrant read '
+                'timeout, task 2655)',
+                project_id,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
+            enumeration_ok = False
+        else:
+            if not enumeration_confirmed_empty:
+                logger.warning(
+                    'reconciliation._prune_task_count_snapshots: '
+                    'get_memories_by_metadata scroll returned 0 task_count_snapshot '
+                    'records for project_id=%s but count_memories_by_metadata '
+                    'reports %d existing -- swallowed Qdrant read timeout '
+                    'fingerprint (task 2655); treating enumeration as not-ok '
+                    'rather than a genuine empty pool',
+                    project_id, snapshot_count,
+                    extra={'project_id': project_id, 'run_id': run_id},
+                )
+                enumeration_ok = False
+
     if len(members) >= scroll_limit:
         logger.warning(
             'reconciliation._prune_task_count_snapshots: enumerated %d of scroll_limit=%d '
