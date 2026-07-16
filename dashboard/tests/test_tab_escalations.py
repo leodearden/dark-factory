@@ -654,3 +654,76 @@ def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
         'add `{row.task_unresolved ? <unresolved note> : <task card>}` to handle '
         'escalations whose linked task could not be resolved.'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-1 test: EscalationStatStrip is declared, wired to DF_CHARTS/analytics,
+# and mounted at the top of EscalationsTab
+# ---------------------------------------------------------------------------
+
+
+def test_tab_escalations_strip_mounted_and_wired(tab_escalations_jsx_body: str) -> None:
+    """EscalationStatStrip must be declared, use DF_CHARTS, read the analytics
+    payload, render StatTiles, and mount at the top of EscalationsTab (above
+    the level-filter controls).
+
+    Asserts:
+    (1) file declares `function EscalationStatStrip(`.
+    (2) file declares `const C = window.DF_CHARTS` (charts primitives available).
+    (3) scoped to the EscalationStatStrip body: references ESCALATION_ANALYTICS
+        (reads the analytics payload) and renders <C.StatTile.
+    (4) scoped to the EscalationsTab body: renders <EscalationStatStrip, and
+        that render's index is BEFORE the "Level:" filter-chip controls — the
+        strip must sit at the top of the tab.
+    """
+    body = tab_escalations_jsx_body
+
+    # (1) Component declared
+    assert 'function EscalationStatStrip(' in body, (
+        'tab_escalations.jsx does not define `function EscalationStatStrip(` — '
+        'add the summary-strip component as a named function.'
+    )
+
+    # (2) Charts primitives available
+    assert re.search(r'const\s+C\s*=\s*window\.DF_CHARTS', body), (
+        'tab_escalations.jsx does not alias `const C = window.DF_CHARTS` — add it '
+        'near the top alongside the existing `const DF = window.DF_DATA;` so '
+        'EscalationStatStrip can render <C.StatTile.'
+    )
+
+    # (3) Scoped to the EscalationStatStrip body: reads the analytics payload,
+    # renders StatTile.
+    strip_fn = _extract_function_body(body, 'EscalationStatStrip')
+    assert strip_fn, (
+        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body — '
+        'add the component definition.'
+    )
+    assert 'ESCALATION_ANALYTICS' in strip_fn, (
+        'EscalationStatStrip does not reference ESCALATION_ANALYTICS — it should read '
+        'the analytics payload (e.g. `analytics || DF.ESCALATION_ANALYTICS`).'
+    )
+    assert '<C.StatTile' in strip_fn, (
+        'EscalationStatStrip does not render <C.StatTile — add the tile container.'
+    )
+
+    # (4) Scoped to the EscalationsTab body: strip mounts before the level-filter
+    # controls (top-of-tab placement).
+    tab_fn = _extract_function_body(body, 'EscalationsTab')
+    assert tab_fn, (
+        'tab_escalations.jsx does not define a `function EscalationsTab(` body.'
+    )
+    strip_idx = tab_fn.find('<EscalationStatStrip')
+    assert strip_idx != -1, (
+        'EscalationsTab does not render <EscalationStatStrip — mount it as the first '
+        'child of the returned JSX, above the controls header.'
+    )
+    level_idx = tab_fn.find('Level:')
+    assert level_idx != -1, (
+        'EscalationsTab does not render the "Level:" filter-chip label — cannot '
+        'verify strip placement relative to the controls header.'
+    )
+    assert strip_idx < level_idx, (
+        f'EscalationsTab renders <EscalationStatStrip AFTER the level-filter controls '
+        f'(index {strip_idx} vs {level_idx}) — the strip must sit at the TOP of the '
+        f'tab, above the controls header.'
+    )
