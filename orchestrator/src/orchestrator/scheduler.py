@@ -468,6 +468,53 @@ def _render_retry_cap_report(
     return '\n'.join(lines)
 
 
+def _build_delivered_check_escalation(
+    *,
+    task_id: str,
+    dep_id: str,
+    dep_status: str,
+    check: dict,
+    main_sha: str,
+) -> tuple[str, str]:
+    """Render the PRD Resolved-6 summary/detail pair for a delivered-check
+    grace-streak escalation (task 2583, epsilon).
+
+    ``check`` is the FAILED check's full descriptor, as authored in the
+    dep's ``metadata.delivered_checks`` — looked up by name at the call
+    site (:meth:`Scheduler._compute_delivered_check_cache`) rather than
+    passed in from delta's minimal ``_delivered_check_fail_detail`` shape,
+    so the escalation can name the pattern/script/args/paths/expect that
+    delta's dispatch-gate cache does not persist.
+
+    Pure rendering — no side effects, no scheduler state.
+    """
+    name = check.get('name')
+    kind = check.get('kind')
+    sha12 = main_sha[:12]
+    summary = (
+        f'DEP_CAPABILITY_NOT_DELIVERED: task {task_id} — dep {dep_id} '
+        f'{dep_status} but check {name!r} fails on main@{sha12}'
+    )
+    lines = [
+        f'Delivered check {name!r} (kind={kind}) failed against main@{sha12}.',
+        f'Dependency: task {dep_id} (status={dep_status}).',
+    ]
+    if kind == 'script':
+        lines.append(f'script: {check.get("script")}')
+        lines.append(f'args: {check.get("args", [])}')
+    else:
+        lines.append(f'pattern: {check.get("pattern")}')
+    lines.append(f'paths: {check.get("paths", [])}')
+    lines.append(f'expect: {check.get("expect")}')
+    lines.append('observed: FAILED')
+    lines.append(
+        f'Blocked dependents are NOT auto-re-pended — set task {task_id} back '
+        f'to pending after the capability lands on main.'
+    )
+    detail = '\n'.join(lines)
+    return summary, detail
+
+
 class McpSessionLike(Protocol):
     """Structural interface for MCP session objects.
 
