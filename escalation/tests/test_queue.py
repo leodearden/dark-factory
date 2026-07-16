@@ -2546,6 +2546,59 @@ class TestResolveCascade:
         assert result.resolution == 'Fixed; no members'
 
 
+class TestResolveResolutionClassExplicit:
+    """EscalationQueue.resolve() accepts an explicit resolution_class, validated before any write."""
+
+    def test_actionable_round_trips_to_queue_get_and_archive(self, tmp_path: Path):
+        """(a) resolve(..., resolution_class='actionable') -> queue.get() and the archived JSON both carry it."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', resolution_class='actionable')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.resolution_class == 'actionable'
+
+        archived_files = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archived_files) == 1
+        data = json.loads(archived_files[0].read_text())
+        assert data['resolution_class'] == 'actionable', (
+            f"Expected archived JSON resolution_class='actionable'; got {data.get('resolution_class')!r}"
+        )
+
+    def test_dismiss_with_benign_round_trips(self, tmp_path: Path):
+        """(b) resolve(..., dismiss=True, resolution_class='benign') round-trips 'benign'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', dismiss=True, resolution_class='benign')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.status == 'dismissed'
+        assert updated.resolution_class == 'benign'
+
+    def test_invalid_class_raises_value_error_naming_legal_values_nothing_persisted(self, tmp_path: Path):
+        """(c) resolve(..., resolution_class='meh') raises ValueError naming benign/actionable; record unchanged."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        with pytest.raises(ValueError) as exc_info:
+            queue.resolve('esc-1-1', 'text', resolution_class='meh')
+
+        msg = str(exc_info.value)
+        assert 'benign' in msg, f"ValueError must name 'benign'; got: {msg!r}"
+        assert 'actionable' in msg, f"ValueError must name 'actionable'; got: {msg!r}"
+
+        record = queue.get('esc-1-1')
+        assert record is not None
+        assert record.status == 'pending', f"Record must stay pending (nothing persisted); got {record.status!r}"
+        assert record.resolution_class is None, (
+            f"Record must remain unstamped (nothing persisted); got {record.resolution_class!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Step-1: Unit tests for the escalation_id_lock exported helper
 # ---------------------------------------------------------------------------
