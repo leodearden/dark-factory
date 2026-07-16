@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _orch_helpers import HermeticMcpSession
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.cost_store import CostStore
@@ -1048,6 +1049,7 @@ class TestHarnessCostCeiling:
             orch_daily_cost_ceiling_usd=1000.0,
         )
         harness = Harness(config)
+        harness.scheduler._mcp_session = HermeticMcpSession()
         harness.scheduler.finish_startup()
         mock_run_store = MagicMock(spec=RunStore)
         harness._run_store = mock_run_store
