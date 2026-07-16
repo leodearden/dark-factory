@@ -60,12 +60,14 @@ from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.proc_supervision import EscalationSpec
+from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import (
     Scheduler,
     SchedulerCallbacks,
     SetTaskStatusRejected,
+    StaleEvidenceRejection,
 )
 from orchestrator.service_restart import (
     FLEET_DEPLOY_CLOCK_RELPATH,
@@ -975,6 +977,16 @@ class Harness:
         self._escalation_queue: EscalationQueue | None = None
         self._escalation_events: dict[str, asyncio.Event] = {}
         self._escalation_task: asyncio.Task | None = None
+
+        # Shared done_evidence_stale sink (task 2677, INV-5: one instance,
+        # not N copies) — constructed here with escalation_queue=None since
+        # self._escalation_queue (above) is still None at this point; late-
+        # bound via the mutable public .escalation_queue attr once the real
+        # queue is created below (~run()). Injected by reference into the
+        # SpeculativeMergeWorker and threaded into the module-level
+        # reconcile_landed_* calls so every done-writer site shares one
+        # memo + one dedupe fingerprint namespace.
+        self._provenance_conflict_sink = ProvenanceConflictSink()
 
         # Ground-truth resolver seam (task 2243, W10-θ2) — lazily built (and
         # memoized) by _get_ground_truth() the first time a reconcile sweep
@@ -3343,6 +3355,7 @@ Output JSON matching the schema. Every task must appear in the output.
         statuses, err = await self.scheduler.get_statuses()
         reverted = 0
         marked_done = 0
+        stale_conflicts = 0
         log_prefix = 'Reconcile (mid-run)' if mid_run else 'Reconcile'
         if resolver_failed(statuses, err):
             if err is not None:
@@ -3414,12 +3427,23 @@ Output JSON matching the schema. Every task must appear in the output.
                 marked_done += 1
             elif outcome == 'reverted':
                 reverted += 1
+            elif outcome == 'stale_conflict':
+                # task 2677: an honest tally, not a false 'marked_done' —
+                # the done-write was refused by the found_on_main
+                # provenance-integrity gate (evidence predates reopen_at).
+                # _reconcile_one_stranded/_mark_in_progress_done already
+                # filed (or folded) the born-at-L2 provenance_conflict
+                # escalation; this task stays in-progress awaiting
+                # arbitration, so it is deliberately NOT added to the
+                # reverted+marked_done "changed" total below.
+                stale_conflicts += 1
 
-        if reverted or marked_done:
+        if reverted or marked_done or stale_conflicts:
             logger.info(
                 '%s: %d stranded task(s) reverted to pending; '
-                '%d marked done (branch already on main)',
-                log_prefix, reverted, marked_done,
+                '%d marked done (branch already on main); '
+                '%d held on provenance conflict (done_evidence_stale)',
+                log_prefix, reverted, marked_done, stale_conflicts,
             )
         return reverted + marked_done
 
@@ -3687,8 +3711,18 @@ Output JSON matching the schema. Every task must appear in the output.
                     else 'reconcile: branch deleted but merge marker found on main'
                 )
             reason = 'branch-already-on-main' if on_main else 'branch-deleted-marker-found'
-            await self._mark_in_progress_done(tid, report.branch_state.sha, note, reason)
-            return 'marked_done'
+            # task 2677: a prior sweep may have already had this exact
+            # (task_id, reopen_at) rejected as done_evidence_stale — the
+            # sink's in-memory memo makes that terminal-for-this-tick so we
+            # don't re-attempt the same doomed write every sweep cycle.
+            if self._provenance_conflict_sink.should_skip(
+                tid, reopen_at=metadata.get('reopen_at'),
+            ):
+                return 'stale_conflict'
+            marked = await self._mark_in_progress_done(
+                tid, report.branch_state.sha, note, reason,
+            )
+            return 'marked_done' if marked else 'stale_conflict'
 
         # Ground-truth revert decision (task 2243, W10-θ2): the _RECOVERY
         # table maps a stranded in-progress task with no live claimant and no
@@ -4097,7 +4131,7 @@ Output JSON matching the schema. Every task must appear in the output.
         sha: str | None,
         note: str,
         reason: str,
-    ) -> None:
+    ) -> bool:
         """Mark a stranded task done via ``scheduler.mark_done``.
 
         Thin wrapper around ``Scheduler.mark_done`` that owns the side-effect
@@ -4114,9 +4148,22 @@ Output JSON matching the schema. Every task must appear in the output.
             note: Free-text provenance note distinguishing the recovery
                 path (already-on-main vs deleted-but-marker-found).
             reason: Short slug used in cleanup-failure WARNING and the
-                success INFO log.
+                success INFO log; also the ``gate_source`` recorded on a
+                ``provenance_conflict`` escalation (task 2677).
 
-        Raises ``SetTaskStatusRejected`` on persistent persistence-layer
+        Returns:
+            ``True`` when the task was marked done (or the ``sha is None``
+            race-skip no-op occurred — nothing to mark, not a conflict).
+            ``False`` when ``scheduler.mark_done`` raised
+            ``StaleEvidenceRejection`` (task 2677): the write was refused by
+            the found_on_main provenance-integrity gate because the evidence
+            commit predates the task's ``reopen_at``. The task is NOT done —
+            callers must report an honest ``'stale_conflict'`` disposition
+            (never ``'marked_done'``) and must not release the warm lane.
+
+        Raises ``SetTaskStatusRejected`` (other than ``StaleEvidenceRejection``,
+        which is caught and converted to a ``False`` return + a born-at-L2
+        ``provenance_conflict`` escalation) on persistent persistence-layer
         rejection — caller decides whether to count strikes / escalate.
         """
         if sha is None:
@@ -4125,7 +4172,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 'skipping; next sweep will retry',
                 tid, reason,
             )
-            return
+            return True
         # For warm tasks the real worktree is the assigned pool lane.
         # _resolve_task_worktree falls back to the cold worktree_base/tid
         # convention when the pool is absent or has no assignment for tid.
@@ -4141,9 +4188,29 @@ Output JSON matching the schema. Every task must appear in the output.
                     ' (%s); continuing',
                     tid, reason, exc_info=True,
                 )
-        await self.scheduler.mark_done(
-            tid, kind='found_on_main', sha=sha, note=note,
-        )
+        try:
+            await self.scheduler.mark_done(
+                tid, kind='found_on_main', sha=sha, note=note,
+            )
+        except StaleEvidenceRejection as exc:
+            # The reopen-freshness gate refused: this evidence commit
+            # predates a later reopen_at, so completing the task now would
+            # phantom-complete a stale claim (task 2677). Route to the
+            # shared sink (dedupe-guarded born-at-L2) instead of the
+            # generic reconcile_persistent_rejection L1 escalation — this
+            # is NOT an unexpected persistence-layer contradiction, it is
+            # the provenance-integrity gate doing its job.
+            self._provenance_conflict_sink.record_from_rejection(
+                exc, gate_source=reason,
+            )
+            logger.warning(
+                'Reconcile: task %s done_evidence_stale — evidence %s '
+                '(%s) predates reopen_at %s; filed provenance_conflict '
+                'escalation instead of marking done (reason=%s)',
+                tid, exc.evidence_commit, exc.evidence_committed_at,
+                exc.reopen_at, reason,
+            )
+            return False
         # Diff 5c (T9 hardening): release warm lane after the done flip.
         # cleanup_worktree (above) frees the lane only when the in-memory
         # assignment map still has tid; opt into the on-disk plan.json
@@ -4156,6 +4223,7 @@ Output JSON matching the schema. Every task must appear in the output.
         logger.info(
             'Reconcile: marked task %s done (reason=%s)', tid, reason,
         )
+        return True
 
     def _escalate_reconcile_failure(
         self,
@@ -7201,6 +7269,14 @@ Output JSON matching the schema. Every task must appear in the output.
         self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-unbound]
         self._escalation_queue.set_notify_callback(self._on_escalation)
         self._escalation_queue.set_resolve_callback(self._on_escalation_resolved)
+
+        # Late-bind the shared provenance-conflict sink (task 2677) now that
+        # the real queue exists — self._provenance_conflict_sink was
+        # constructed with escalation_queue=None in __init__ (the queue
+        # doesn't exist yet at that point). Injected by reference into the
+        # SpeculativeMergeWorker, so the worker's copy of the attribute
+        # updates automatically.
+        self._provenance_conflict_sink.escalation_queue = self._escalation_queue
 
         # Wire escalation queue into review checkpoint so it can triage
         # escalations the deep reviewer emits against the synthetic review
