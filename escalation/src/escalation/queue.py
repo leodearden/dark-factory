@@ -817,11 +817,16 @@ class EscalationQueue:
         resurrect an archived record into the queue root — the same Defect-2
         class of bug that motivated task 1498's ``add_members_to_l2`` guard.
 
-        Sets ``triaged_at`` (now, UTC ISO), ``triaged_by`` (only when not
-        ``None`` — a ``None`` arg leaves any existing value untouched), and
-        ``triage_note``. Does NOT touch ``updated_at``: an annotation must not
-        masquerade as a content change (see ``add_members_to_l2`` for the one
-        mutation that does bump ``updated_at``).
+        Sets ``triaged_at`` (now, UTC ISO). ``triaged_by`` is overwritten only
+        when not ``None``, and ``triage_note`` is overwritten only when
+        non-empty — a ``None``/omitted arg leaves the existing value of each
+        field untouched. This symmetry is deliberate: a bare re-stamp (no new
+        ``triaged_by``/``triage_note`` supplied) is a harmless freshness bump
+        that refreshes ``triaged_at`` without silently wiping a
+        previously-recorded predicate/probe. Does NOT touch ``updated_at``:
+        an annotation must not masquerade as a content change (see
+        ``add_members_to_l2`` for the one mutation that does bump
+        ``updated_at``).
 
         Returns the updated ``Escalation``, or ``None`` when *escalation_id*
         is not found in the queue root, fails to parse, or is not pending
@@ -843,7 +848,8 @@ class EscalationQueue:
             esc.triaged_at = datetime.now(UTC).isoformat()
             if triaged_by is not None:
                 esc.triaged_by = triaged_by
-            esc.triage_note = triage_note
+            if triage_note:
+                esc.triage_note = triage_note
             self._rewrite(escalation_id, esc)
             logger.info('stamp_triage: stamped triage ack on %s', escalation_id)
             return esc

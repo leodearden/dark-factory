@@ -2559,6 +2559,66 @@ class TestStampTriage:
         assert archived is not None
         assert archived.triaged_at is None, 'Archived record must not gain a triage stamp'
 
+    def test_re_stamp_with_none_triaged_by_preserves_existing_value(self, tmp_path: Path):
+        """A re-stamp with triaged_by=None leaves the existing triaged_by
+        untouched, while triaged_at still advances — a bare re-stamp (no new
+        attribution supplied) is a harmless freshness bump, never a wipe."""
+        import time
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        first = queue.stamp_triage(
+            esc.id, triaged_by='watcher', triage_note='predicate P | probe: cmd -> out',
+        )
+        assert first is not None
+        first_triaged_at = first.triaged_at
+
+        time.sleep(0.01)  # ensure distinct timestamps
+        second = queue.stamp_triage(esc.id, triaged_by=None, triage_note='predicate P | probe: cmd -> out')
+
+        assert second is not None
+        assert second.triaged_by == 'watcher', (
+            f'Expected triaged_by to be preserved when re-stamped with None, got {second.triaged_by!r}'
+        )
+        assert second.triaged_at is not None
+        assert second.triaged_at > first_triaged_at, 'Expected triaged_at to advance even on a bare re-stamp'
+
+    def test_re_stamp_with_empty_triage_note_preserves_existing_note(self, tmp_path: Path):
+        """triage_note mirrors the triaged_by preserve-on-absent pattern: a
+        re-stamp with the default '' (omitted) leaves the existing note
+        untouched, so a bare freshness-bump re-stamp can never silently wipe
+        a previously-recorded predicate/probe."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='predicate P | probe: cmd -> out')
+
+        result = queue.stamp_triage(esc.id, triaged_by='watcher')  # triage_note omitted -> default ''
+
+        assert result is not None
+        assert result.triage_note == 'predicate P | probe: cmd -> out', (
+            f'Expected the prior note to be preserved on an empty re-stamp, got {result.triage_note!r}'
+        )
+
+    def test_re_stamp_with_new_triage_note_overwrites(self, tmp_path: Path):
+        """A non-empty triage_note DOES overwrite the prior note — this is the
+        normal re-assessment path (stamp-then-skip: re-derive and re-stamp
+        once staleness/change is detected)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='stale predicate | probe: old cmd -> old out')
+
+        result = queue.stamp_triage(
+            esc.id, triaged_by='watcher', triage_note='fresh predicate | probe: new cmd -> new out',
+        )
+
+        assert result is not None
+        assert result.triage_note == 'fresh predicate | probe: new cmd -> new out', (
+            f'Expected a non-empty re-stamp to overwrite the prior note, got {result.triage_note!r}'
+        )
+
 
 class TestUpdatedAtStamp:
     """updated_at is a last-substantive-change marker: bumped by add_members_to_l2's real
