@@ -732,3 +732,39 @@ def test_extract_tagger_entries(payload, expected):
     _extract_tagger_entries yet (added in step-4).
     """
     assert harness_module._extract_tagger_entries(payload) == expected
+
+
+# ---------------------------------------------------------------------------
+# Sentinel skip: a sentinel-but-no-files task must not re-enter the batch
+# (task 2561 acceptance a-skip)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tag_skips_task_with_sentinel(harness):
+    """A task carrying only files_tagged_at (no files) must be skipped.
+
+    Without this, a task the agent couldn't predict files for — which only
+    ever gets the sentinel, never a files list — would re-enter the
+    tagging batch on every cycle forever.
+
+    Fails now: the skip-check keys off truthy `files` only, so a
+    sentinel-but-no-files task still enters the batch and invokes the
+    agent.
+    """
+    tasks = [
+        {
+            'id': '1', 'title': 'Task', 'description': '',
+            'status': 'pending',
+            'metadata': {'files_tagged_at': '2026-07-16T00:00:00+00:00'},
+            'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock()) as mock_invoke:
+        await harness._tag_task_modules()
+        mock_invoke.assert_not_called()
+
+    harness.scheduler.update_task.assert_not_called()
