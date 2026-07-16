@@ -6,8 +6,10 @@ test_audit_found_on_main_provenance.py / test_audit_duplicate_tasks.py.
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
+import sys
 import types
 from pathlib import Path
 
@@ -23,8 +25,6 @@ def _load_module() -> types.ModuleType:
     @dataclass and other reflection-based decorators work correctly
     (they call sys.modules.get(cls.__module__)).
     """
-    import sys  # noqa: PLC0415
-
     mod_name = 'correct_found_on_main_backlog'
     spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
     if spec is None or spec.loader is None:
@@ -261,6 +261,15 @@ class FakeCorrectionsBackend:
       ``status_results[task_id]`` when configured, else a synthesized
       success DTO shaped like the real backend's ``SetTaskStatusResult``
       (no ``'success'`` key on success — mirrors the real wire shape).
+      Retained for API completeness and so tests can assert it is NEVER
+      called by the reopen path (which writes through the atomic
+      ``set_status_and_stamp_audit`` below instead — task 2667 amendment).
+    - ``set_status_and_stamp_audit`` calls are recorded (``audit_fields``
+      included, so tests can decode the persisted reopen_*/
+      x_provenance_audit payload in one shot); returns
+      ``status_and_stamp_audit_results[task_id]`` when configured, else the
+      same synthesized success DTO shape as ``set_task_status``; raises for
+      any task_id in ``fail_status_and_stamp_audit_for``.
     - ``get_task`` calls are recorded; returns ``get_task_results[task_id]``
       when configured, else ``{'status': 'pending'}`` — the common
       happy-path shape for a post-reopen re-read.
@@ -270,14 +279,19 @@ class FakeCorrectionsBackend:
         self,
         *,
         status_results: dict[str, dict] | None = None,
+        status_and_stamp_audit_results: dict[str, dict] | None = None,
         get_task_results: dict[str, dict] | None = None,
         fail_update_for: set[str] | None = None,
+        fail_status_and_stamp_audit_for: set[str] | None = None,
     ):
         self.status_results = status_results or {}
+        self.status_and_stamp_audit_results = status_and_stamp_audit_results or {}
         self.get_task_results = get_task_results or {}
         self.fail_update_for = fail_update_for or set()
+        self.fail_status_and_stamp_audit_for = fail_status_and_stamp_audit_for or set()
         self.update_calls: list[dict] = []
         self.status_calls: list[dict] = []
+        self.status_and_stamp_audit_calls: list[dict] = []
         self.get_task_calls: list[dict] = []
 
     async def update_task(self, task_id, project_root, metadata=None, tag=None, **kwargs):
@@ -295,6 +309,22 @@ class FakeCorrectionsBackend:
         })
         if task_id in self.status_results:
             return self.status_results[task_id]
+        return {
+            'message': f'Successfully updated 1 task(s) to "{status}"',
+            'tasks': [{'taskId': task_id, 'oldStatus': 'done', 'newStatus': status}],
+        }
+
+    async def set_status_and_stamp_audit(
+        self, task_id, status, project_root, tag=None, *, audit_fields,
+    ):
+        if task_id in self.fail_status_and_stamp_audit_for:
+            raise RuntimeError(f'simulated set_status_and_stamp_audit failure for {task_id}')
+        self.status_and_stamp_audit_calls.append({
+            'task_id': task_id, 'status': status, 'project_root': project_root,
+            'tag': tag, 'audit_fields': audit_fields,
+        })
+        if task_id in self.status_and_stamp_audit_results:
+            return self.status_and_stamp_audit_results[task_id]
         return {
             'message': f'Successfully updated 1 task(s) to "{status}"',
             'tasks': [{'taskId': task_id, 'oldStatus': 'done', 'newStatus': status}],
@@ -325,6 +355,7 @@ class TestApplyCorrectionsDryRun:
         backend = FakeCorrectionsBackend()
         summary = await apply_corrections(backend, '/proj', corrections, apply=False)
         assert backend.status_calls == []
+        assert backend.status_and_stamp_audit_calls == []
         assert backend.update_calls == []
         assert backend.get_task_calls == []
         assert summary['dry_run'] is True
@@ -396,16 +427,33 @@ class TestApplyCorrectionsReopenHappyPath:
             reasons=['declared file(s) missing from the ref HEAD: fused-memory/tests/x.py'],
             reopen_reason=REOPEN_DISPOSITIONS['1175'],
         )
-        # Defaults already shape the happy path: set_task_status returns a
-        # success DTO, get_task's post-write re-read reports 'pending'.
+        # Defaults already shape the happy path: set_status_and_stamp_audit
+        # returns a success DTO, get_task's post-write re-read reports
+        # 'pending'.
         backend = FakeCorrectionsBackend()
         summary = await apply_corrections(backend, '/proj', [correction], apply=True)
 
-        assert len(backend.status_calls) == 1
-        status_call = backend.status_calls[0]
-        assert status_call['task_id'] == '1175'
-        assert status_call['status'] == 'pending'
-        assert status_call['project_root'] == '/proj'
+        # The reopen is a SINGLE atomic status+audit write — never the
+        # plain set_task_status, and never a separate update_task call.
+        assert backend.status_calls == []
+        assert backend.update_calls == []
+
+        assert len(backend.status_and_stamp_audit_calls) == 1
+        call = backend.status_and_stamp_audit_calls[0]
+        assert call['task_id'] == '1175'
+        assert call['status'] == 'pending'
+        assert call['project_root'] == '/proj'
+
+        # Canonical reopen_* fields (the same audit-field convention
+        # TaskInterceptor stamps on every reopen) land in the SAME atomic
+        # write as this script's own x_provenance_audit correction record.
+        audit_fields = call['audit_fields']
+        assert audit_fields['reopen_reason'] == REOPEN_DISPOSITIONS['1175']
+        assert audit_fields['reopen_from'] == 'done'
+        assert audit_fields.get('reopen_at')
+        annotation = audit_fields['x_provenance_audit']
+        assert annotation['label'] == LABEL_REOPENED
+        assert annotation['reopen_reason'] == REOPEN_DISPOSITIONS['1175']
 
         assert len(backend.get_task_calls) == 1
         assert backend.get_task_calls[0]['task_id'] == '1175'
@@ -413,15 +461,6 @@ class TestApplyCorrectionsReopenHappyPath:
         assert summary['reopened'] == 1
         assert '1175' not in summary['reopen_failed']
         assert summary['errors'] == 0
-
-        # An audit-trail annotation is also written on a successful reopen.
-        assert len(backend.update_calls) == 1
-        call = backend.update_calls[0]
-        assert call['task_id'] == '1175'
-        payload = json.loads(call['metadata'])
-        annotation = payload['x_provenance_audit']
-        assert annotation['label'] == LABEL_REOPENED
-        assert annotation['reopen_reason'] == REOPEN_DISPOSITIONS['1175']
 
 
 # ===========================================================================
@@ -446,7 +485,7 @@ class TestApplyCorrectionsReopenNotPersisted:
             '9999', ACTION_ANNOTATE, label=LABEL_PRESUMED_BENIGN_HISTORICAL,
         )
         backend = FakeCorrectionsBackend(
-            status_results={
+            status_and_stamp_audit_results={
                 '1175': {
                     'success': False,
                     'error': 'status_write_not_persisted',
@@ -464,8 +503,9 @@ class TestApplyCorrectionsReopenNotPersisted:
         assert summary['errors'] >= 1
         assert summary['reopened'] == 0
 
-        # No audit-trail annotation is written for the not-persisted reopen
-        # itself — loud failure, not a paper trail implying success.
+        # No separate update_task call is ever made for a reopen (the
+        # atomic writer carries its own audit trail) — loud failure, not a
+        # paper trail implying success.
         assert all(call['task_id'] != '1175' for call in backend.update_calls)
 
         # The batch is NOT aborted: the following annotate correction still
@@ -474,9 +514,9 @@ class TestApplyCorrectionsReopenNotPersisted:
         assert any(call['task_id'] == '9999' for call in backend.update_calls)
 
     async def test_reread_still_shows_done_is_recorded_reopen_failed(self):
-        """set_task_status reports success, but the independent get_task
-        re-read still shows 'done' — the exact silent-non-persist shape
-        task 1175 suffered under prior reconciliation reopens."""
+        """set_status_and_stamp_audit reports success, but the independent
+        get_task re-read still shows 'done' — the exact silent-non-persist
+        shape task 1175 suffered under prior reconciliation reopens."""
         reopen_correction = _correction(
             '1175', ACTION_REOPEN, label=LABEL_REOPENED, ref='main',
             reopen_reason=REOPEN_DISPOSITIONS['1175'],
@@ -486,7 +526,7 @@ class TestApplyCorrectionsReopenNotPersisted:
         )
         summary = await apply_corrections(backend, '/proj', [reopen_correction], apply=True)
 
-        assert len(backend.status_calls) == 1
+        assert len(backend.status_and_stamp_audit_calls) == 1
         assert len(backend.get_task_calls) == 1
 
         assert '1175' in summary['reopen_failed']
@@ -531,6 +571,35 @@ class TestApplyCorrectionsErrorIsolation:
         assert any(call['task_id'] == '2222' for call in backend.update_calls)
         assert all(call['task_id'] != '1111' for call in backend.update_calls)
 
+    async def test_one_failing_atomic_reopen_write_does_not_abort_the_batch(self):
+        """The reopen write is now atomic (status + both audit trails in
+        ONE call — the split-write partial-failure gap no longer exists
+        structurally), but the call itself can still raise (e.g. a
+        transient backend/network error), and that must not abort the
+        batch either. A raise is caught by apply_corrections' generic
+        per-op except — distinct from the graceful not-persisted-DTO path,
+        which records reopen_failed explicitly (see
+        TestApplyCorrectionsReopenNotPersisted) — so this task is counted
+        under errors only, not reopen_failed."""
+        failing_reopen = _correction(
+            '1175', ACTION_REOPEN, label=LABEL_REOPENED,
+            reopen_reason=REOPEN_DISPOSITIONS['1175'],
+        )
+        ok_annotate = _correction(
+            '2222', ACTION_ANNOTATE, label=LABEL_PRESUMED_BENIGN_HISTORICAL,
+        )
+        backend = FakeCorrectionsBackend(fail_status_and_stamp_audit_for={'1175'})
+
+        summary = await apply_corrections(
+            backend, '/proj', [failing_reopen, ok_annotate], apply=True,
+        )
+
+        assert summary['errors'] >= 1
+        assert summary['reopened'] == 0
+        assert '1175' not in summary['reopen_failed']
+        assert summary['annotated'] == 1
+        assert any(call['task_id'] == '2222' for call in backend.update_calls)
+
 
 # ===========================================================================
 # Step-13/14: _apply_exit_code — pure summary -> process exit code helper
@@ -559,3 +628,231 @@ class TestApplyExitCode:
         # silent 0 exit (the exact task-1175 regression this script guards).
         summary = {'errors': 0, 'reopen_failed': ['1175'], 'annotated': 0, 'reopened': 0}
         assert _apply_exit_code(summary) != 0
+
+
+# ===========================================================================
+# Amendment (reviewer_comprehensive test_coverage_gap_cli_orchestration):
+# the deferred sibling import inside _run() — regression guard
+# ===========================================================================
+
+class TestSiblingAuditImportResolves:
+    """Regression guard for the deferred sibling import inside _run():
+    ``from audit_found_on_main_provenance import GitFacts, build_audit_report``.
+
+    That import is deferred to inside _run() specifically so the rest of
+    this test module can importlib-load correct_found_on_main_backlog.py
+    without the scripts/ directory on sys.path (see _load_module above) —
+    a documented fragility with no regression guard prior to this test. It
+    resolves at runtime only because scripts/ is sys.path[0] when this
+    script is invoked directly (`python scripts/correct_found_on_main_backlog.py`);
+    this test pins exactly that condition.
+    """
+
+    def test_sibling_module_exposes_build_audit_report_and_gitfacts(self, monkeypatch):
+        # Force a FRESH import — never satisfied from a sys.modules cache
+        # another test file may have already populated — so this genuinely
+        # exercises the sys.path resolution _run() depends on, not an
+        # incidental cache hit.
+        monkeypatch.delitem(sys.modules, 'audit_found_on_main_provenance', raising=False)
+        monkeypatch.syspath_prepend(str(SCRIPT_PATH.parent))
+
+        import importlib  # noqa: PLC0415
+        sibling = importlib.import_module('audit_found_on_main_provenance')
+
+        assert callable(sibling.build_audit_report)
+        assert callable(sibling.GitFacts)
+
+
+# ===========================================================================
+# Amendment (reviewer_comprehensive test_coverage_gap_cli_orchestration):
+# _run() end-to-end CLI wiring — config load, sibling import, backend
+# start/close, report build, dry-run vs --apply exit-code plumbing
+# ===========================================================================
+
+class _FakeGitFacts:
+    """Stand-in for audit_found_on_main_provenance.GitFacts — never
+    actually gathers git facts, since the fake build_audit_report below
+    ignores it entirely; only its constructor signature matters here."""
+
+    def __init__(self, project_root):
+        self.project_root = project_root
+
+
+def _install_fake_audit_module(monkeypatch, report):
+    """Pre-seed sys.modules['audit_found_on_main_provenance'] with a fake
+    module exposing build_audit_report/GitFacts, so _run()'s deferred
+    `from audit_found_on_main_provenance import ...` resolves from the
+    cache instead of a real sys.path-based file search — independent of
+    TestSiblingAuditImportResolves above, which tests that real resolution
+    directly."""
+
+    async def _fake_build_audit_report(tasks, git, ref='main'):
+        return report
+
+    fake_mod = types.ModuleType('audit_found_on_main_provenance')
+    fake_mod.build_audit_report = _fake_build_audit_report  # type: ignore[attr-defined]
+    fake_mod.GitFacts = _FakeGitFacts  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, 'audit_found_on_main_provenance', fake_mod)
+
+
+class _FakeRunBackend(FakeCorrectionsBackend):
+    """Extends FakeCorrectionsBackend (which already fakes update_task /
+    set_task_status / set_status_and_stamp_audit / get_task) with the
+    start/close/get_tasks surface _run() drives directly, for the
+    _run()-level CLI wiring tests below."""
+
+    def __init__(self, taskmaster_config=None, **kwargs):
+        super().__init__(**kwargs)
+        self.taskmaster_config = taskmaster_config
+        self.started = False
+        self.closed = False
+        self.get_tasks_calls: list[str] = []
+
+    async def start(self):
+        self.started = True
+
+    async def close(self):
+        self.closed = True
+
+    async def get_tasks(self, project_root):
+        self.get_tasks_calls.append(project_root)
+        return {'tasks': []}
+
+
+class _FakeTaskmasterConfig:
+    """Truthy sentinel standing in for a real TaskmasterConfig — _run()
+    only ever checks `config.taskmaster is None`, never inspects its
+    fields."""
+
+
+class _FakeFusedMemoryConfigWithTaskmaster:
+    """Fake FusedMemoryConfig() whose .taskmaster is configured (non-None),
+    so _run() proceeds past its early-return guard."""
+
+    def __init__(self, *args, **kwargs):
+        self.taskmaster = _FakeTaskmasterConfig()
+
+
+class _FakeFusedMemoryConfigWithoutTaskmaster:
+    """Fake FusedMemoryConfig() whose .taskmaster is unset — exercises
+    _run()'s early-return ('Task backend not configured') branch."""
+
+    def __init__(self, *args, **kwargs):
+        self.taskmaster = None
+
+
+@pytest.mark.asyncio
+class TestRunCliWiring:
+    """_run() end-to-end: config load, the sibling audit import, backend
+    start/close, report build, and the dry-run vs --apply exit-code
+    plumbing — the wiring path plan.json's step-14 left deliberately
+    untested (mirroring audit_found_on_main_provenance's own _run/main),
+    which the review amendment asks to cover."""
+
+    async def test_dry_run_wires_report_into_plan_and_exits_zero(self, monkeypatch):
+        report = _report([_detail('9999', 'misattributed', reasons=['z'])])
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        backend_holder: dict[str, _FakeRunBackend] = {}
+
+        def _make_backend(taskmaster_config):
+            backend_holder['backend'] = _FakeRunBackend(taskmaster_config)
+            return backend_holder['backend']
+
+        monkeypatch.setattr(
+            'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', _make_backend,
+        )
+
+        args = argparse.Namespace(project_root='/proj', config=None, ref='main', apply=False)
+        exit_code = await _mod._run(args)
+
+        assert exit_code == 0
+        backend = backend_holder['backend']
+        assert backend.started is True
+        assert backend.closed is True
+        assert backend.get_tasks_calls == ['/proj']
+        # Dry run: the wiring reaches plan_corrections/apply_corrections but
+        # performs zero writes.
+        assert backend.update_calls == []
+        assert backend.status_and_stamp_audit_calls == []
+
+    async def test_apply_wires_through_to_annotate_and_exits_zero(self, monkeypatch):
+        report = _report([_detail('9999', 'misattributed', reasons=['z'])])
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        backend_holder: dict[str, _FakeRunBackend] = {}
+
+        def _make_backend(taskmaster_config):
+            backend_holder['backend'] = _FakeRunBackend(taskmaster_config)
+            return backend_holder['backend']
+
+        monkeypatch.setattr(
+            'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', _make_backend,
+        )
+
+        args = argparse.Namespace(project_root='/proj', config=None, ref='main', apply=True)
+        exit_code = await _mod._run(args)
+
+        assert exit_code == 0
+        backend = backend_holder['backend']
+        assert len(backend.update_calls) == 1
+        assert backend.update_calls[0]['task_id'] == '9999'
+
+    async def test_missing_taskmaster_config_returns_1_without_creating_backend(
+        self, monkeypatch,
+    ):
+        report = _report([])
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithoutTaskmaster,
+        )
+        created: list[int] = []
+        monkeypatch.setattr(
+            'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend',
+            lambda *a, **kw: created.append(1),  # noqa: ARG005
+        )
+
+        args = argparse.Namespace(project_root='/proj', config=None, ref='main', apply=False)
+        exit_code = await _mod._run(args)
+
+        assert exit_code == 1
+        assert created == []
+
+    async def test_apply_with_reopen_failure_exits_non_zero(self, monkeypatch):
+        report = _report([_detail('1175', 'reverted', reasons=['x'])])
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+
+        def _make_backend(taskmaster_config):
+            return _FakeRunBackend(
+                taskmaster_config,
+                status_and_stamp_audit_results={
+                    '1175': {
+                        'success': False,
+                        'error': 'status_write_not_persisted',
+                        'task_id': '1175',
+                        'requested_status': 'pending',
+                        'actual_status': 'done',
+                    },
+                },
+                get_task_results={'1175': {'status': 'done'}},
+            )
+
+        monkeypatch.setattr(
+            'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', _make_backend,
+        )
+
+        args = argparse.Namespace(project_root='/proj', config=None, ref='main', apply=True)
+        exit_code = await _mod._run(args)
+
+        assert exit_code != 0
