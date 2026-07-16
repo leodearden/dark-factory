@@ -11,8 +11,11 @@ from pydantic import ValidationError
 
 from orchestrator.config import (
     RELOADABLE_FIELDS,
+    BackendsConfig,
+    BudgetsConfig,
     ConfigRequiredError,
     CpuPriorityConfig,
+    EffortConfig,
     JobserverConfig,
     ModelsConfig,
     ModuleConfig,
@@ -20,6 +23,7 @@ from orchestrator.config import (
     PriceEntry,
     SccacheConfig,
     TimeoutsConfig,
+    TurnsConfig,
     _deep_merge,
     _discover_module_configs,
     apply_reload,
@@ -1893,6 +1897,58 @@ class TestConfigReload:
             f'{path!r} requires a process restart to take effect and must NOT '
             f'be in RELOADABLE_FIELDS'
         )
+
+
+class TestSimpleTaskRoleConfigAddressability:
+    """Routing alpha (plans/adaptive-model-routing-prd.md): simple_task is a
+    full peer of every other AgentRole in the six per-role routing
+    submodels, not a name-derivation blind spot (workflow.py _invoke used to
+    key on role.name.split('_')[0], which yields 'simple' for simple_task
+    and matches no submodel field).
+
+    Byte-equivalence: these defaults reproduce simple_task's CURRENT
+    effective runtime -- roles.py SIMPLE_TASK's AgentRole dataclass defaults
+    (model='sonnet', budget=1.50, max_turns=30) plus _invoke's getattr
+    fallbacks (effort='high', timeout=invocation_timeout=7200.0,
+    backend='claude'). Retuning these values to something better suited to
+    a "simple" task is out of scope here (task lambda).
+    """
+
+    def test_submodel_field_defaults_reproduce_current_runtime(self):
+        assert ModelsConfig().simple_task == 'sonnet'
+        assert BudgetsConfig().simple_task == 1.50
+        assert TurnsConfig().simple_task == 30
+        assert EffortConfig().simple_task == 'high'
+        assert TimeoutsConfig().simple_task == 7200.0
+        assert BackendsConfig().simple_task == 'claude'
+
+    def test_defaults_yaml_agrees_with_submodel_defaults(self, monkeypatch, tmp_path):
+        """A config materialized from the packaged defaults.yaml (Layer 1, no
+        project override) resolves the same six simple_task values as the
+        bare submodel Field defaults -- keeps config.py and defaults.yaml in
+        lockstep."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        defaults = _load_package_defaults()
+        assert config.models.simple_task == defaults['models']['simple_task'] == 'sonnet'
+        assert config.budgets.simple_task == defaults['budgets']['simple_task'] == 1.50
+        assert config.max_turns.simple_task == defaults['max_turns']['simple_task'] == 30
+        assert config.effort.simple_task == defaults['effort']['simple_task'] == 'high'
+        assert config.timeouts.simple_task == defaults['timeouts']['simple_task'] == 7200.0
+        assert config.backends.simple_task == defaults['backends']['simple_task'] == 'claude'
+
+    def test_simple_task_leaves_are_reloadable(self):
+        """New submodel fields auto-join RELOADABLE_FIELDS via
+        _submodel_leaf_paths -- no RELOADABLE_FIELDS edit required."""
+        assert {
+            'models.simple_task',
+            'budgets.simple_task',
+            'max_turns.simple_task',
+            'effort.simple_task',
+            'timeouts.simple_task',
+            'backends.simple_task',
+        } <= RELOADABLE_FIELDS
 
 
 class TestDiffConfig:
