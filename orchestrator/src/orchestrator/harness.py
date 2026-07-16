@@ -2065,7 +2065,7 @@ class Harness:
         schema = {
             'type': 'object',
             'properties': {
-                'tasks': {
+                'predictions': {
                     'type': 'array',
                     'items': {
                         'type': 'object',
@@ -2081,7 +2081,7 @@ class Harness:
                     },
                 },
             },
-            'required': ['tasks'],
+            'required': ['predictions'],
         }
 
         prompt = f"""\
@@ -2099,7 +2099,13 @@ Directory paths are accepted when an entire directory will be touched.
 # Tasks to tag
 {json.dumps(task_summaries, indent=2)}
 
-Output JSON matching the schema. Every task must appear in the output.
+Output JSON matching the schema: a SINGLE top-level "predictions" array — do
+NOT nest it inside another "predictions" or "tasks" key. For example:
+
+{{"predictions":[{{"id":"12","files":["src/foo.py","tests/test_foo.py"]}},{{"id":"13","files":[]}}]}}
+
+Every task must appear in the output. If you cannot predict any files for a
+task, include it with an empty "files" list rather than omitting it.
 """
 
         try:
@@ -2135,17 +2141,24 @@ Output JSON matching the schema. Every task must appear in the output.
             logger.warning(f'Module tagger agent failed: {result.output[:200]}')
             return
 
-        # Parse the structured output
-        mapping = result.structured_output
-        if not mapping:
+        # Parse the structured output. _extract_tagger_entries peels known
+        # StructuredOutput wrapper keys ('predictions', legacy 'tasks') up to
+        # a bounded depth, so it accepts the current flat {"predictions": [...]}
+        # shape, the legacy single-wrap {"tasks": [...]}, and the legacy
+        # double-wrap {"tasks": {"tasks": [...]}} produced when the tool
+        # param name collided with the schema's old 'tasks' key (defect 3).
+        payload = result.structured_output
+        if not payload:
             try:
-                mapping = json.loads(result.output)
+                payload = json.loads(result.output)
             except (json.JSONDecodeError, TypeError):
                 logger.warning('Module tagger produced no parseable output')
                 return
 
+        entries = _extract_tagger_entries(payload)
+
         tagged_count = 0
-        for entry in mapping.get('tasks', []):
+        for entry in entries:
             task_id = str(entry.get('id', ''))
             files = entry.get('files', [])
             if task_id and files:
