@@ -170,6 +170,84 @@ class TestGetCycleSummaryPresenceTool:
             await store.close()
 
     @pytest.mark.asyncio
+    async def test_remediation_field_reflects_payload_marker(self, mock_config, tmp_path):
+        """The `remediation` field (task 2652) surfaces the ledger row's
+        payload_json `remediation` marker written by
+        ``summary_pool.write_cycle_summary``: True/False for an explicit
+        marker, None for a legacy row lacking the key entirely (payload
+        '{}') or for a never-written run_id — so Stage 3 can disambiguate a
+        Stage-2-only remediation run's expected missing Stage 1 summary from
+        a genuine Stage 1 write failure."""
+        service = MemoryService(mock_config)
+        store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await store.initialize()
+        service.set_recon_ledger(store)
+
+        rows = {
+            'run-remediation-true': '{"remediation": true}',
+            'run-remediation-false': '{"remediation": false}',
+            'run-legacy': '{}',
+        }
+        for run_id, payload_json in rows.items():
+            await store.upsert(
+                ReconLedgerRecord(
+                    project_id=_PROJECT_ID,
+                    record_kind='cycle_summary',
+                    task_id='',
+                    flag_type=_STAGE,
+                    run_id=run_id,
+                    payload_json=payload_json,
+                    state='active',
+                    created_at='2026-07-01T00:00:00+00:00',
+                )
+            )
+
+        try:
+            server = create_mcp_server(service)
+
+            true_result = await server._tool_manager.call_tool(
+                'get_cycle_summary_presence',
+                {'project_id': _PROJECT_ID, 'run_id': 'run-remediation-true', 'stage': _STAGE},
+            )
+            assert 'error' not in true_result, f'Unexpected error in result: {true_result!r}'
+            assert true_result.get('present') is True
+            assert true_result.get('remediation') is True, (
+                f'Expected remediation=True, got: {true_result!r}'
+            )
+
+            false_result = await server._tool_manager.call_tool(
+                'get_cycle_summary_presence',
+                {'project_id': _PROJECT_ID, 'run_id': 'run-remediation-false', 'stage': _STAGE},
+            )
+            assert 'error' not in false_result, f'Unexpected error in result: {false_result!r}'
+            assert false_result.get('present') is True
+            assert false_result.get('remediation') is False, (
+                f'Expected remediation=False, got: {false_result!r}'
+            )
+
+            legacy_result = await server._tool_manager.call_tool(
+                'get_cycle_summary_presence',
+                {'project_id': _PROJECT_ID, 'run_id': 'run-legacy', 'stage': _STAGE},
+            )
+            assert 'error' not in legacy_result, f'Unexpected error in result: {legacy_result!r}'
+            assert legacy_result.get('present') is True
+            assert legacy_result.get('remediation') is None, (
+                f'Expected remediation=None for a legacy row with no key, got: {legacy_result!r}'
+            )
+
+            absent_result = await server._tool_manager.call_tool(
+                'get_cycle_summary_presence',
+                {'project_id': _PROJECT_ID, 'run_id': 'never-written', 'stage': _STAGE},
+            )
+            assert 'error' not in absent_result, f'Unexpected error in result: {absent_result!r}'
+            assert absent_result.get('present') is False
+            assert absent_result.get('remediation') is None, (
+                f'Expected remediation=None for an absent row, got: {absent_result!r}'
+            )
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
     async def test_inconclusive_when_ledger_not_wired(self, mock_config):
         """A real MemoryService with NO recon_ledger wired reports a clean
         inconclusive dict (present=False, ledger_available=False) — NOT an
