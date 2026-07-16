@@ -170,6 +170,8 @@ from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import (
     VerifyResult,
     _derive_task_files_from_git,
+    cached_main_baseline_failing_ids,
+    diff_new_failures,
     run_scoped_verification,
     run_verification,
     seed_main_baseline,
@@ -1860,14 +1862,44 @@ async def _run_post_merge_verify(
             if main_health_outcome is not None:
                 return main_health_outcome
         detail = verify.failure_report()
-        reason = f'Post-merge verification failed: {verify.summary}'
-        # Append the failure category so the timeout-vs-real-failure
-        # distinction is visible in the surviving human-facing signal
-        # without requiring log spelunking.  Append-only (after the
-        # summary, before the detail block) keeps all existing
-        # prefix/substring reason assertions green.
-        if verify.category:
-            reason = f'{reason} [category: {verify.category}]'
+        # Task μ (verify-scope-inversion-prd.md): when this failure carries
+        # junit-derived failing_test_ids AND the current-main baseline is
+        # already cache-warm (seeded for free by a prior successful
+        # merge+full gate run — see seed_main_baseline/step-18 — or a prior
+        # cold-start probe), cite only the NEW failing ids (branch - baseline)
+        # instead of the generic category summary (B1). CACHE-ONLY: this
+        # never triggers a probe on the critical path (G4, task 2564) — a
+        # cold cache (not yet seeded) or failing_test_ids=None (OPAQUE/
+        # scoped/degraded) falls back to today's wording unchanged (B3). The
+        # wholly-preexisting case (new_ids empty) is routed to
+        # MAIN_HEALTH_RED separately, above, by _classify_main_health_red /
+        # _run_deferred_main_health_probe (both share the extended probe via
+        # step-16); this enrichment only fires for a genuinely non-empty
+        # new-ids set so it never contradicts that routing.
+        new_ids: frozenset[str] | None = None
+        if verify.failing_test_ids is not None:
+            try:
+                _current_main_sha = await git_ops.get_main_sha()  # type: ignore[union-attr]
+            except Exception:
+                _current_main_sha = ''
+            if _current_main_sha:
+                _cached_baseline = cached_main_baseline_failing_ids(_current_main_sha)
+                if _cached_baseline is not None:
+                    new_ids = diff_new_failures(verify.failing_test_ids, _cached_baseline)
+        if new_ids:
+            reason = (
+                f'Post-merge verification failed: {len(new_ids)} new failing '
+                f"test(s) not present on main: {', '.join(sorted(new_ids))}"
+            )
+        else:
+            reason = f'Post-merge verification failed: {verify.summary}'
+            # Append the failure category so the timeout-vs-real-failure
+            # distinction is visible in the surviving human-facing signal
+            # without requiring log spelunking.  Append-only (after the
+            # summary, before the detail block) keeps all existing
+            # prefix/substring reason assertions green.
+            if verify.category:
+                reason = f'{reason} [category: {verify.category}]'
         if detail:
             reason = f'{reason}\n\n{detail}'
         # Merge-skew attribution (task 2383 β, M2 of

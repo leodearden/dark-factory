@@ -1010,6 +1010,26 @@ async def main_baseline_failing_ids(
         return None
 
 
+def cached_main_baseline_failing_ids(main_sha: str) -> 'frozenset[str] | None':
+    """Cache-ONLY peek at the per-main-SHA failing-id baseline — never probes.
+
+    Pure, synchronous, side-effect-free: returns the cached id set for
+    *main_sha* when present and within :data:`_PROBE_CACHE_TTL`, else
+    ``None``.  Used by the synchronous branch-block reason enrichment in
+    ``merge_queue._run_post_merge_verify`` (task μ, verify-scope-inversion-
+    prd.md), which must NEVER trigger a probe on the critical path (G4, task
+    2564) — unlike :func:`main_baseline_failing_ids` (cache-first, THEN
+    probes on a miss), this helper only ever reads.
+    """
+    _cached = _BASELINE_FAILING_IDS_CACHE.get(main_sha)
+    if _cached is None:
+        return None
+    _cached_at, _cached_ids = _cached
+    if time.monotonic() - _cached_at >= _PROBE_CACHE_TTL:
+        return None
+    return _cached_ids
+
+
 def _worst_category(categories: list[str]) -> str:
     """Return the highest-severity category from *categories*.
 
