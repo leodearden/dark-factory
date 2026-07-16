@@ -2628,3 +2628,102 @@ class TestWatcherAllowedTools:
             'so the autonomous watcher can promote L1→L2 escalations; '
             f'current list: {_WATCHER_ALLOWED_TOOLS}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2629 step-3: _watcher_has_actionable_l1 — empty-queue rotation precheck
+# ---------------------------------------------------------------------------
+
+def _submit_sample_l2(
+    queue: EscalationQueue,
+    task_id: str = 'task-cluster',
+    *,
+    members: list[str] | None = None,
+) -> str:
+    """Submit a minimal pending L2 escalation (cluster) and return its id."""
+    from escalation.models import Escalation
+    esc = Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role='escalation-watcher-auto',
+        severity='urgent',
+        category='infra_issue',
+        summary='sample L2 cluster for actionable-L1 precheck test',
+        level=2,
+        members=members or [],
+    )
+    queue.submit(esc)
+    return esc.id
+
+
+class TestWatcherHasActionableL1:
+    """Harness._watcher_has_actionable_l1() — pre-boot empty-queue precheck.
+
+    "Actionable L1" = at least one pending level-1 escalation whose id is
+    NOT already a member of a pending level-2 cluster.  Fails OPEN (returns
+    True) whenever the escalation queue is unset or unreadable — a precheck
+    bug must never silently drop L1 handling.
+    """
+
+    def test_empty_queue_returns_false(self, tmp_path: Path) -> None:
+        """No escalations at all — nothing actionable, skip the launch."""
+        h, _queue = _make_harness_with_queue(tmp_path)
+        assert h._watcher_has_actionable_l1() is False
+
+    def test_one_pending_l1_no_l2_returns_true(self, tmp_path: Path) -> None:
+        """A single pending L1 with no L2 clusters at all — actionable."""
+        h, queue = _make_harness_with_queue(tmp_path)
+        _submit_sample_l1(queue)
+        assert h._watcher_has_actionable_l1() is True
+
+    def test_queue_none_fails_open_true(self, tmp_path: Path) -> None:
+        """_escalation_queue is None (unset) — fail open, launch anyway."""
+        h, _queue = _make_harness_with_queue(tmp_path)
+        h._escalation_queue = None
+        assert h._watcher_has_actionable_l1() is True
+
+    def test_get_pending_raises_fails_open_true(self, tmp_path: Path) -> None:
+        """get_pending() raising — fail open, launch anyway."""
+        h, queue = _make_harness_with_queue(tmp_path)
+        with patch.object(queue, 'get_pending', side_effect=RuntimeError('boom')):
+            assert h._watcher_has_actionable_l1() is True
+
+    def test_only_l1_is_promoted_member_returns_false(self, tmp_path: Path) -> None:
+        """The only pending L1 is already a member of a pending L2 — not actionable.
+
+        Promoted member L1s remain status==pending at level 1 (SKILL.md), so a
+        naive level==1-and-pending check would relaunch every poll interval
+        while any L2 cluster has unresolved members.
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+        l1_id = _submit_sample_l1(queue, 'task-promoted')
+        _submit_sample_l2(queue, 'task-promoted-cluster', members=[l1_id])
+        assert h._watcher_has_actionable_l1() is False
+
+    def test_one_promoted_one_not_returns_true(self, tmp_path: Path) -> None:
+        """Two pending L1s, one promoted into an L2 and one not — actionable."""
+        h, queue = _make_harness_with_queue(tmp_path)
+        promoted_id = _submit_sample_l1(queue, 'task-promoted')
+        _submit_sample_l1(queue, 'task-unpromoted')
+        _submit_sample_l2(queue, 'task-promoted-cluster', members=[promoted_id])
+        assert h._watcher_has_actionable_l1() is True
+
+    def test_only_l0_returns_false(self, tmp_path: Path) -> None:
+        """Only a pending level-0 escalation — not actionable at L1.
+
+        L0->L1 promotion is owned by the separate _reap_orphan_l0_escalations
+        loop, so an L0-only queue must not trigger a rotation launch.
+        """
+        from escalation.models import Escalation
+        h, queue = _make_harness_with_queue(tmp_path)
+        esc = Escalation(
+            id=queue.make_id('task-l0'),
+            task_id='task-l0',
+            agent_role='test-agent',
+            severity='blocking',
+            category='infra_issue',
+            summary='sample L0 for actionable-L1 precheck test',
+            level=0,
+        )
+        queue.submit(esc)
+        assert h._watcher_has_actionable_l1() is False
