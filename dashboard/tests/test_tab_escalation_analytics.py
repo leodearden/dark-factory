@@ -7,7 +7,10 @@ TestClient-driven route test against the real FastAPI app.
 
 from __future__ import annotations
 
+import json
 import re
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
@@ -93,3 +96,118 @@ def test_data_js_registers_escalation_analytics_endpoint(data_js_body: str) -> N
             f"ESCALATION_ANALYTICS seed missing key '{field_name}:' — "
             'add it to the window.DF_DATA ESCALATION_ANALYTICS initializer in data.js.'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-19: GET /api/v2/dashboard/escalation-analytics — real config + tmp archive.
+# Uses the module-level `client` fixture from conftest.py (function-scoped —
+# a fresh TestClient/lifespan per test) so each test can point app.state.config
+# at its own tmp project root, mirroring test_api_curator.py's _override_client
+# idiom without needing a local helper.
+# ---------------------------------------------------------------------------
+
+
+def _write_esc(esc_dir: Path, esc: dict) -> None:
+    """Write a minimal escalation dict as esc-*.json at the queue root.
+
+    iter_all_escalation_paths only globs 'esc-*.json' (not '*.json') at the
+    root tier (escalation.queue), so esc['id'] must start with 'esc-'.
+    """
+    esc_dir.mkdir(parents=True, exist_ok=True)
+    (esc_dir / f"{esc['id']}.json").write_text(json.dumps(esc))
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+def _make_config(tmp_path: Path, *, known_project_roots: list[Path] | None = None):
+    from dashboard.config import DashboardConfig
+
+    return DashboardConfig(project_root=tmp_path, known_project_roots=known_project_roots or [])
+
+
+class TestEscalationAnalyticsRoute:
+    """GET /api/v2/dashboard/escalation-analytics against the real app + a tmp archive."""
+
+    def test_returns_wrapped_contract_keys(self, client, tmp_path):
+        """200 + ESCALATION_ANALYTICS wrapping the four Seam-2 contract keys."""
+        from dashboard.app import _analytics_cache_clear
+
+        now = datetime(2026, 7, 16, 18, 0, 0, tzinfo=UTC)
+        esc_dir = tmp_path / 'data' / 'escalations'
+        _write_esc(esc_dir, {
+            'id': 'esc-t1-1', 'task_id': 't1', 'agent_role': 'implementer',
+            'severity': 'blocking', 'category': 'cleanup_needed', 'summary': 'x',
+            'timestamp': _iso(now - timedelta(days=1)),
+            'status': 'resolved', 'level': 0,
+            'resolved_at': _iso(now - timedelta(hours=1)),
+            'resolved_by': 'interactive',
+        })
+
+        client.app.state.config = _make_config(tmp_path)
+        _analytics_cache_clear()
+
+        resp = client.get('/api/v2/dashboard/escalation-analytics')
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert 'ESCALATION_ANALYTICS' in body, (
+            'route response missing the ESCALATION_ANALYTICS wrapper key — data.js '
+            "applyKey('ESCALATION_ANALYTICS', body['ESCALATION_ANALYTICS']) needs it, "
+            'matching the ESCALATIONS/CURATOR_STATE/SCHEDULER envelope precedent.'
+        )
+        analytics = body['ESCALATION_ANALYTICS']
+        assert set(analytics) == {'generated_at', 'parse_failures', 'regime_markers', 'per_project'}
+        assert isinstance(analytics['generated_at'], str) and analytics['generated_at']
+        assert analytics['parse_failures'] == 0
+        assert isinstance(analytics['regime_markers'], list)
+        assert len(analytics['per_project']) == 1
+        assert analytics['per_project'][0]['project'] == tmp_path.name
+
+    def test_primary_root_ordered_first(self, client, tmp_path):
+        """per_project lists the primary project_root before known_project_roots."""
+        from dashboard.app import _analytics_cache_clear
+
+        primary = tmp_path / 'primary'
+        secondary = tmp_path / 'secondary'
+        (primary / 'data' / 'escalations').mkdir(parents=True)
+        (secondary / 'data' / 'escalations').mkdir(parents=True)
+
+        client.app.state.config = _make_config(primary, known_project_roots=[secondary])
+        _analytics_cache_clear()
+
+        resp = client.get('/api/v2/dashboard/escalation-analytics')
+
+        assert resp.status_code == 200
+        per_project = resp.json()['ESCALATION_ANALYTICS']['per_project']
+        assert [p['project'] for p in per_project] == ['primary', 'secondary']
+
+    def test_malformed_regime_markers_never_500s(self, client, tmp_path, monkeypatch):
+        """Row 9 (endpoint level): a broken regime-markers file degrades loudly.
+
+        Mirrors load_regime_markers' own fail-soft contract (step-1) but pins it
+        through the real route: a corrupt markers file must never surface as a
+        500 — only a counted parse_failures increment.
+        """
+        import dashboard.data.escalation_analytics as escalation_analytics_module
+        from dashboard.app import _analytics_cache_clear
+
+        (tmp_path / 'data' / 'escalations').mkdir(parents=True)
+        client.app.state.config = _make_config(tmp_path)
+        _analytics_cache_clear()
+
+        resp1 = client.get('/api/v2/dashboard/escalation-analytics')
+        assert resp1.status_code == 200
+        assert resp1.json()['ESCALATION_ANALYTICS']['parse_failures'] == 0
+
+        bad_markers = tmp_path / 'bad-regime-markers.yaml'
+        bad_markers.write_text('date: [unclosed')
+        monkeypatch.setattr(
+            escalation_analytics_module, '_DEFAULT_REGIME_MARKERS_PATH', bad_markers,
+        )
+        _analytics_cache_clear()
+
+        resp2 = client.get('/api/v2/dashboard/escalation-analytics')
+        assert resp2.status_code == 200
+        assert resp2.json()['ESCALATION_ANALYTICS']['parse_failures'] >= 1
