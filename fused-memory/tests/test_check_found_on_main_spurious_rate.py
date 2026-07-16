@@ -326,6 +326,52 @@ class TestRunCliWiring:
         assert exit_code == 1
         assert created == []
 
+    async def test_malformed_since_raises_valueerror(self, monkeypatch):
+        # parse_since(args.since) runs before any backend/report work, so a
+        # bad --since surfaces as a ValueError straight out of _run() — it
+        # is main()'s job (tested below) to catch this and map it to the
+        # distinct usage-error exit code rather than 0/1.
+        _install_fake_audit_module(monkeypatch, _report([]))
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+
+        args = argparse.Namespace(
+            project_root='/proj', config=None, ref='main', since='not-a-date',
+        )
+
+        with pytest.raises(ValueError):
+            await _mod._run(args)
+
+
+# ===========================================================================
+# main() — malformed --since maps to a distinct usage-error exit code (2),
+# never the business-logic 0/1 (see module docstring "Contract").
+# ===========================================================================
+
+class TestMainMalformedSinceExitCode:
+    def test_malformed_since_exits_with_distinct_usage_code(self, monkeypatch, capsys):
+        _install_fake_audit_module(monkeypatch, _report([]))
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        monkeypatch.setattr(
+            sys, 'argv',
+            [
+                'check_found_on_main_spurious_rate.py',
+                '--since', 'not-a-date',
+                '--project-root', '/proj',
+            ],
+        )
+
+        exit_code = _mod.main()
+
+        assert exit_code == 2
+        captured = capsys.readouterr()
+        assert 'not-a-date' in captured.err
+
 
 # ===========================================================================
 # Regression guard for the deferred sibling import inside _run()

@@ -17,10 +17,18 @@ DeterministicRunner predicate convention):
 
   - Exit 0: zero found_on_main stamps updated after ``--since`` were
     flagged ``misattributed``/``deliverable_absent``.
-  - Exit 1: one or more were. A structured stdout summary is printed —
-    one line per offending task (task_id, cited commit sha, flag class) —
-    for human/log triage; the DeterministicRunner itself never parses it,
-    only the exit code.
+  - Exit 1: one or more were (a genuine check failure) — OR the task
+    backend is not configured (an infra/config problem). This predicate's
+    contract is intentionally coarse: non-zero-for-any-reason means "did
+    not pass" (fail loud/closed rather than silently degrade), with no
+    separate exit code distinguishing a check failure from an infra
+    failure. A structured stdout summary is printed for the check-failure
+    case — one line per offending task (task_id, cited commit sha, flag
+    class) — for human/log triage; the DeterministicRunner itself never
+    parses it, only the exit code.
+  - Exit 2: ``--since`` could not be parsed — a caller usage error, kept
+    on its own code so it is never mistaken for "offenders found" (1) by
+    a caller branching on exit code alone.
 
 Deliberately narrower than the audit's own ``_FLAGGED_VERDICTS``: this
 predicate's contract (PRD decomposition label ι) is specifically
@@ -73,8 +81,9 @@ def parse_since(value: str) -> datetime:
     rejects a bare ``Z``). A naive value (no offset) is treated as already
     UTC — the documented contract is "ISO-8601 UTC" — rather than silently
     guessing a different zone; an aware value is converted to UTC. Raises
-    ``ValueError`` on an unparseable string, which the CLI surfaces as a
-    usage error rather than a business-logic exit code.
+    ``ValueError`` on an unparseable string; ``main()`` catches this and
+    maps it to exit code 2 — a usage error, distinct from the 0/1
+    business-logic exit codes (see module docstring "Contract").
     """
     normalized = value.strip()
     if normalized.endswith('Z'):
@@ -184,6 +193,11 @@ async def _run(args: argparse.Namespace) -> int:
 
     config = FusedMemoryConfig()
     if config.taskmaster is None:
+        # Fail loud/closed: an unconfigured task backend is an infra
+        # problem, not a clean result, and this predicate's exit-code
+        # contract has no separate channel for infra vs. check-failure
+        # (see module docstring "Contract") — non-zero means "did not
+        # pass" either way, by design.
         logger.error('Task backend not configured in fused-memory config')
         return 1
 
@@ -236,7 +250,18 @@ def main() -> int:
         help='Git ref to audit commit lineage against (default: main)',
     )
     args = parser.parse_args()
-    return asyncio.run(_run(args))
+    try:
+        return asyncio.run(_run(args))
+    except ValueError as exc:
+        # A malformed --since (parsed inside _run(), before any backend or
+        # report work) is a caller usage error, not a business-logic check
+        # result — keep it on its own exit code (2) rather than letting it
+        # propagate as an uncaught traceback exiting 1, which would be
+        # indistinguishable from a genuine "offenders found" failure under
+        # this predicate's exit-code-only contract (see module docstring
+        # "Contract").
+        print(f'error: invalid --since {args.since!r}: {exc}', file=sys.stderr)
+        return 2
 
 
 if __name__ == '__main__':
