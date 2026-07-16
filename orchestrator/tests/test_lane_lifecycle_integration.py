@@ -1,12 +1,11 @@
-"""B+H integration gate (mechanisms 1+2) — two-way boundary suite B1-B6.
+"""B+H integration gate (mechanisms 1+2) — boundary suite B1-B5.
 
 PRD W11 omega (``plans/worktree-lane-lifecycle-prd.md``). TEST-ONLY gate: the
-six behaviors below (gamma acquire-writer, delta crash-recovery reader,
+behaviors below (gamma acquire-writer, delta crash-recovery reader,
 epsilon1 contamination structural prevention, epsilon2 clean-survival) are
-already merged. These tests drive the REAL writer (GitOps.acquire_warm_lane),
-the REAL reader (Harness._recover_crashed_tasks), and the REAL dashboard
-reader (dashboard.data.orchestrator.read_task_artifacts) over a real local
-git repo, proving they agree on the durable-record location/format/semantics
+already merged. These tests drive the REAL writer (GitOps.acquire_warm_lane)
+and the REAL reader (Harness._recover_crashed_tasks) over a real local git
+repo, proving they agree on the durable-record location/format/semantics
 through their production code paths — not the mocked-git unit tests already
 covered by test_crash_recovery.py::TestRecordDrivenRecovery.
 
@@ -17,7 +16,16 @@ Boundary suite:
     B4 — hostile `git add -A` stages ZERO task-meta (STRUCTURAL, load-bearing
          for task theta's later guard deletion)
     B5 — durable record + .task-meta survive `git clean -xfd` + `checkout -f`
-    B6 — dashboard reader resolves a relocated lane (new-then-old)
+
+B6 (dashboard reader resolves a relocated lane) was RETIRED by task
+gamma/2636 (``plans/dashboard-task-runtime-endpoint-prd.md``): that task
+deleted the dashboard's hand-rolled worktree reader
+(dashboard.data.orchestrator.read_task_artifacts) in favor of consuming
+per-task runtime state over MCP (get_task_runtime_state), by design severing
+the very format coupling B6 existed to prove. With no dashboard-side disk
+reader left, the two-way writer<->dashboard-reader boundary B6 checked no
+longer exists, so its two test classes and the dashboard-src sys.path
+plumbing were removed here alongside that deletion.
 
 Each test is expected GREEN once its fixture wiring converges: this task's
 impl steps exercise the existing seam rather than add production code.
@@ -29,7 +37,6 @@ verify.py's has_conftest full-suite fallback for merge-time verify.
 from __future__ import annotations
 
 import asyncio
-import json
 import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -48,31 +55,6 @@ from orchestrator.lane_lifecycle import (
 )
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool
-
-# B6 imports `dashboard.data.orchestrator` from inside the test bodies below
-# (deferred to avoid F401 — see module docstring). `orchestrator/tests/
-# conftest.py` puts orchestrator/shared/escalation `src/` dirs on sys.path
-# but deliberately not dashboard's, and the root conftest.py that *does* wire
-# up dashboard/src is never loaded here — verify.py (and pytest's own
-# confcutdir) roots the run at `orchestrator/`, above which pytest does not
-# ascend for conftest discovery. Rather than mutate sys.path at
-# module-import/collection time (which would leak dashboard/src onto the
-# import path for the rest of the pytest session — every other orchestrator
-# test module collected in the same run — risking module-name shadowing or
-# cross-test contamination), the `_dashboard_on_path` fixture below scopes
-# the insertion to just the two B6 tests that need it via
-# `monkeypatch.syspath_prepend`, which reverts automatically at fixture
-# teardown. This still avoids editing orchestrator/tests/conftest.py (which
-# would trip verify.py's has_conftest full-suite fallback per this task's
-# design decisions).
-_DASHBOARD_SRC = Path(__file__).parent.parent.parent / 'dashboard' / 'src'
-
-
-@pytest.fixture
-def _dashboard_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Put dashboard/src on sys.path for the duration of one B6 test only."""
-    monkeypatch.syspath_prepend(str(_DASHBOARD_SRC))
-
 
 # ── Module-local fixtures + helpers ─────────────────────────────────────
 
@@ -570,70 +552,3 @@ class TestB5SurvivesCleaning:
         assert rec.task_id == '42'
 
         assert (meta / 'plan.json').exists()
-        assert TaskArtifacts(lane, meta).read_plan()['steps']
-
-
-# ── B6 — dashboard reader (new-then-old) ────────────────────────────────
-
-
-@pytest.mark.asyncio
-class TestB6DashboardReaderNewPath:
-    """B6 (new path): dashboard's read_task_artifacts resolves an acquired
-    lane's relocated .task-meta sidecar (worktree_path.parent / '.task-meta'
-    / worktree_path.name), exercising the same meta_root_for path shape the
-    real writer (GitOps/TaskArtifacts) uses.
-    """
-
-    async def test_reads_relocated_task_meta(
-        self, ig_git_repo: Path, _dashboard_on_path: None,
-    ):
-        from dashboard.data.orchestrator import (  # pyright: ignore[reportMissingImports]
-            read_task_artifacts,
-        )
-
-        repo = ig_git_repo
-        await _add_warm_lane_scripts(repo)
-        harness = _build_harness(_make_orch_config(repo))
-        _wire_recovery_scheduler(harness)
-
-        base = harness.git_ops.worktree_base
-        lane = await _acquire_lane(harness.git_ops, '42', await _get_head(repo))
-        meta = TaskArtifacts.meta_root_for(base, lane.name)
-        ta = TaskArtifacts(lane, meta)
-        ta.init('42', 'B6 dash', 'd')
-        ta.write_plan(_make_plan(3, 5, '42'))
-        ta.append_iteration_log({'a': 1})
-        ta.append_iteration_log({'b': 2})
-
-        result = read_task_artifacts(lane)
-        assert result['phase'] == 'EXECUTE'
-        assert result['plan_progress'] == {'done': 3, 'total': 5}
-        assert result['iteration_count'] == 2
-        assert result['metadata']['task_id'] == '42'
-
-
-class TestB6DashboardReaderLegacyPath:
-    """B6 (old path, compat): read_task_artifacts still parses a legacy
-    `<worktree>/.task/` layout when no `.task-meta` sibling exists.
-    """
-
-    def test_reads_legacy_task_dir(self, tmp_path: Path, _dashboard_on_path: None):
-        from dashboard.data.orchestrator import (  # pyright: ignore[reportMissingImports]
-            read_task_artifacts,
-        )
-
-        base = tmp_path / '.worktrees'
-        legacy = base / '_legacy'
-        (legacy / '.task').mkdir(parents=True)
-        (legacy / '.task' / 'metadata.json').write_text(json.dumps({'task_id': 'legacy'}))
-        (legacy / '.task' / 'plan.json').write_text(json.dumps({
-            'steps': [
-                {'id': 'step-1', 'status': 'done'},
-                {'id': 'step-2', 'status': 'pending'},
-            ],
-        }))
-
-        result = read_task_artifacts(legacy)
-        assert result['plan_progress']['total'] > 0
-        assert result['metadata'] is not None
-        assert result['metadata']['task_id'] == 'legacy'
