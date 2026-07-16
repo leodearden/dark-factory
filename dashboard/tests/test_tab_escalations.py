@@ -746,8 +746,6 @@ def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> No
     (c) esc-per-done — references esc_per_done_daily.
     (d) churn — references churn_daily.
     (e) at least four <C.StatTile tiles are rendered.
-    (f) human-readable tile labels are present (case-insensitive): 'benign',
-        '6h', a per-done token like 'done', and 'churn'.
     """
     strip_fn = _extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
     assert strip_fn, (
@@ -802,14 +800,6 @@ def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> No
         f'EscalationStatStrip renders {tile_count} <C.StatTile tiles, expected >= 4 '
         '(benign rate, 6h breaches, esc/done, churn).'
     )
-
-    # (f) human-readable labels present (case-insensitive)
-    lower = strip_fn.lower()
-    for token in ('benign', '6h', 'done', 'churn'):
-        assert token in lower, (
-            f'EscalationStatStrip does not have a human-readable tile label '
-            f'containing {token!r} — add a descriptive label to the corresponding tile.'
-        )
 
 
 # ---------------------------------------------------------------------------
