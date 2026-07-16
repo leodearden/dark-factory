@@ -44,6 +44,10 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     ESCALATION_CATEGORY,
+    SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY,
+    SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY,
+    SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY,
+    SNAPSHOT_PRUNED_STAT_KEY,
     SNAPSHOT_WRITTEN_STAT_KEY,
     TASK_COUNT_SNAPSHOT_CATEGORY,
     TASK_COUNT_SNAPSHOT_KIND,
@@ -85,6 +89,18 @@ class TestConstants:
 
     def test_stat_key_value(self):
         assert SNAPSHOT_WRITTEN_STAT_KEY == 'task_count_snapshot_written'
+
+    def test_prune_enumerated_stat_key_value(self):
+        assert SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY == 'task_count_snapshot_prune_enumerated'
+
+    def test_pruned_stat_key_value(self):
+        assert SNAPSHOT_PRUNED_STAT_KEY == 'task_count_snapshot_pruned'
+
+    def test_prune_enumeration_ok_stat_key_value(self):
+        assert SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY == 'task_count_snapshot_prune_enumeration_ok'
+
+    def test_prune_truncated_stat_key_value(self):
+        assert SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY == 'task_count_snapshot_prune_truncated'
 
     def test_miss_threshold_value(self):
         assert TASK_COUNT_SNAPSHOT_MISS_THRESHOLD == 2
@@ -560,6 +576,169 @@ class TestPruneTaskCountSnapshots:
 
 
 # ---------------------------------------------------------------------------
+# _prune_task_count_snapshots -- optional stats dict (task 2646 step-1/2, step-3/4)
+# ---------------------------------------------------------------------------
+
+
+class TestPruneSnapshotStats:
+    """_prune_task_count_snapshots(..., stats=observed) populates observed
+    with the three runtime-observability counts (task 2646).
+
+    The crux this class exists to pin: a silent enumeration failure (the
+    incident fingerprint -- prune deletes nothing, canonical write still
+    proceeds) must be OBSERVABLY DISTINCT from a genuine empty result. A
+    single delete-count int cannot make this distinction; enumeration_ok
+    is the flag that does.
+    """
+
+    @pytest.mark.asyncio
+    async def test_full_success_populates_all_three_stats(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'm1', 'created_at': '2026-07-01T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm2', 'created_at': '2026-07-02T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm3', 'created_at': '2026-07-03T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+        ]
+        memory_service.delete_memory.return_value = None
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 3
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 3,
+            'task_count_snapshot_pruned': 3,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_partial_delete_failure_counts_only_successes(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'm1', 'created_at': '2026-07-01T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm2', 'created_at': '2026-07-02T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm3', 'created_at': '2026-07-03T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+        ]
+        memory_service.delete_memory.side_effect = [
+            {'status': 'deleted'}, RuntimeError('boom'), {'status': 'deleted'},
+        ]
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 2
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 3,
+            'task_count_snapshot_pruned': 2,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_enumeration_failure_is_observably_distinct_from_empty(self):
+        """The incident fingerprint: a silent enumeration failure must be
+        distinguishable from a genuine empty result. Both return 0/leave
+        enumerated=0/pruned=0, but only the failure case sets
+        enumeration_ok=0 -- a single delete-count int cannot make this
+        distinction."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.side_effect = RuntimeError('mem0 down')
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 0
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 0,
+            'task_count_snapshot_pruned': 0,
+            'task_count_snapshot_prune_enumeration_ok': 0,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_genuine_empty_enumeration_sets_enumeration_ok(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 0
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 0,
+            'task_count_snapshot_pruned': 0,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_scroll_cap_reached_sets_truncated_stat(self):
+        """Amendment round (reviewer finding): hitting the scroll_limit cap
+        means older stale snapshots may remain unpruned this cycle -- a
+        provably incomplete prune. Reported identically to a clean success
+        by enumerated/pruned/enumeration_ok alone (all look the same as a
+        real 2-record success); only the dedicated truncated stat makes a
+        capped page observably distinct from a complete one. Mirrors the
+        scroll_limit=N-with-N-records saturation idiom already used by
+        TestVerifyTaskCountSnapshotWritten."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'm1', 'created_at': '2026-07-01T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm2', 'created_at': '2026-07-02T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+        ]
+        memory_service.delete_memory.return_value = None
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', scroll_limit=2, stats=observed,
+        )
+
+        assert result == 2
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 2,
+            'task_count_snapshot_pruned': 2,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_unsaturated_page_leaves_truncated_stat_unset(self):
+        """A page below scroll_limit is exhaustive -- not a truncation --
+        even though it enumerates the same 2 records as the capped case
+        above."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'm1', 'created_at': '2026-07-01T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm2', 'created_at': '2026-07-02T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+        ]
+        memory_service.delete_memory.return_value = None
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', scroll_limit=3, stats=observed,
+        )
+
+        assert result == 2
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 2,
+            'task_count_snapshot_pruned': 2,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+
+
+# ---------------------------------------------------------------------------
 # _write_task_count_snapshot (stages/task_knowledge_sync.py) -- task 2325 step-5/6
 # ---------------------------------------------------------------------------
 
@@ -757,6 +936,80 @@ class TestWriteTaskCountSnapshot:
         }
         assert deleted_ids == {'stale-1', 'stale-2'}
         memory_service.add_memory.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# _write_task_count_snapshot -- threading the stats dict (task 2646 step-5/6)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteThreadsPruneStats:
+    """_write_task_count_snapshot(..., stats=observed) threads its stats dict
+    straight into _prune_task_count_snapshots, so the prune's runtime-
+    observability counts are populated only when the prune is actually
+    reached (task 2646).
+    """
+
+    def _taskmaster(self):
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {
+            'tasks': [
+                {'id': 1, 'status': 'pending'},
+                {'id': 2, 'status': 'in-progress'},
+                {'id': 3, 'status': 'done'},
+                {'id': 4, 'status': 'cancelled'},
+            ],
+        }
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_success_threads_prune_stats(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {
+                'id': 'stale-1',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'kind': 'task_count_snapshot'},
+            },
+            {
+                'id': 'stale-2',
+                'created_at': '2026-07-02T00:00:00+00:00',
+                'metadata': {'kind': 'task_count_snapshot'},
+            },
+        ]
+        memory_service.delete_memory.return_value = None
+        memory_service.add_memory.return_value = {'memory_ids': ['fresh-1']}
+        taskmaster = self._taskmaster()
+        observed = {}
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+            stats=observed,
+        )
+
+        assert result is True
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 2,
+            'task_count_snapshot_pruned': 2,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_taskmaster_leaves_stats_untouched(self):
+        """The taskmaster-None early-return precedes the prune entirely, so
+        stats must stay untouched (not even zeroed) -- the prune was never
+        attempted."""
+        memory_service = AsyncMock()
+        observed = {}
+
+        result = await _write_task_count_snapshot(
+            memory_service, None, '/tmp/test', 'reify', 'run-1', None,
+            stats=observed,
+        )
+
+        assert result is None
+        assert observed == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1099,3 +1352,135 @@ class TestRunDeterministicSnapshotWrite:
         assert report.stats['task_count_snapshot_written'] == 0
         mock_write.assert_not_awaited()
         mock_verify.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# TaskKnowledgeSync.run() wiring — live-cycle prune observability (task 2646
+# step-7/8)
+# ---------------------------------------------------------------------------
+
+
+class TestRunSurfacesPruneObservability:
+    """run() surfaces the REAL (unpatched) prune's enumerate/delete/
+    enumeration_ok counts in report.stats (task 2646).
+
+    Unlike TestRunDeterministicSnapshotWrite, this class does NOT patch
+    _write_task_count_snapshot -- it lets the real _write_task_count_snapshot
+    -> _prune_task_count_snapshots call chain run inside a live stage.run()
+    cycle. This is the only kind of test that would have caught the
+    incident this task exists to guard against: the prune enumerating
+    nothing at runtime while everything looked correct in code review
+    (the existing run()-level tests all patch the write out, so the real
+    prune never executes under test).
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 1
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.search.return_value = []
+        memory_service.add_memory.return_value = {'memory_ids': []}
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {'tasks': []}
+        return {
+            'memory_service': memory_service,
+            'taskmaster': taskmaster,
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def _fake_cli_result(self):
+        return MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1, tokens_used=0, cost_usd=0.0,
+            model='test-model', error=None,
+        )
+
+    @staticmethod
+    def _seed_snapshot_records(count):
+        return [
+            {
+                'id': f'snap-{i}',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'kind': TASK_COUNT_SNAPSHOT_KIND},
+            }
+            for i in range(count)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_live_prune_success_surfaces_actual_counts(self, mock_deps):
+        """Case (a): the real prune enumerates and deletes 2 seeded stale
+        snapshots; report.stats reflects the actual enumerated/deleted
+        counts and enumeration_ok=1."""
+        seeded = self._seed_snapshot_records(2)
+
+        def _get_memories_by_metadata(*, project_id, filters, **kwargs):
+            # Isolates the prune's counts from _sweep_stale_persistence_markers,
+            # which shares this same method with a different filter shape
+            # within a single run() cycle (design_decisions, task 2646 plan).
+            if filters == {'kind': TASK_COUNT_SNAPSHOT_KIND}:
+                return seeded
+            return []
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            side_effect=_get_memories_by_metadata,
+        )
+
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('reify', '/tmp/test'),
+            **mock_deps,
+        )
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=self._fake_cli_result()),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='run-prune-live-ok',
+            )
+
+        assert report.stats['task_count_snapshot_prune_enumerated'] == 2
+        assert report.stats['task_count_snapshot_pruned'] == 2
+        assert report.stats['task_count_snapshot_prune_enumeration_ok'] == 1
+        mock_deps['memory_service'].add_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_live_silent_enumeration_failure_surfaces_as_not_ok(self, mock_deps):
+        """Case (b), the incident fingerprint: enumeration RAISES inside the
+        real prune, yet the canonical add_memory write still proceeds.
+        report.stats must show enumeration_ok=0 / enumerated=0 -- runtime-
+        observably distinct from a genuine empty result -- rather than
+        silently looking like nothing was ever there to prune."""
+
+        def _get_memories_by_metadata(*, project_id, filters, **kwargs):
+            if filters == {'kind': TASK_COUNT_SNAPSHOT_KIND}:
+                raise RuntimeError('mem0 down')
+            return []
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            side_effect=_get_memories_by_metadata,
+        )
+
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('reify', '/tmp/test'),
+            **mock_deps,
+        )
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=self._fake_cli_result()),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='run-prune-live-fail',
+            )
+
+        assert report.stats['task_count_snapshot_prune_enumeration_ok'] == 0
+        assert report.stats['task_count_snapshot_prune_enumerated'] == 0
+        mock_deps['memory_service'].add_memory.assert_awaited_once()
