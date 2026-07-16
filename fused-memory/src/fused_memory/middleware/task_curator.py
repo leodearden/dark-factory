@@ -1124,6 +1124,15 @@ class TaskCurator:
         - The registry is empty.
         - No entry matches the candidate.
 
+        Note (task 2687): this includes candidates whose
+        ``metadata.execution_class`` is ``"operational"`` or ``"decision"``.
+        ``operational_ask_registry.match_candidate``'s execution_class axis
+        is authoritative and wording-independent *once it runs*, but it is
+        only reached after the registry-availability checks above already
+        passed — a missing/unconfigured/empty registry disables that axis
+        too and falls open to the architect, consistent with this method's
+        best-effort degradation philosophy.
+
         Never raises.
         """
         from fused_memory.middleware.operational_ask_registry import (

@@ -33,6 +33,16 @@ seeded signature (or whose title happens to contain "fix"/"bug"/etc.) falls
 through to the architect and re-churns the exact latency 2085 eliminated for
 the seeded cases.
 
+Caveat: the "unconditional" guarantee above describes ``match_candidate``'s
+own logic once it runs — it holds even when ``entries`` is empty. Its sole
+caller, ``TaskCurator._maybe_route_deterministic``, still short-circuits to
+``None`` *before* ever calling ``match_candidate`` when the registry path is
+unconfigured or the registry file failed to load (missing, unreadable,
+unparseable, or empty). In that state the execution_class axis does not fire
+either, and an operational/decision-tagged candidate falls through to the
+architect like everything else — a deliberate fail-open choice (see that
+method's docstring), not a gap in this axis.
+
 Usage::
 
     from fused_memory.middleware.operational_ask_registry import (
