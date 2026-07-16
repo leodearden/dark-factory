@@ -5534,6 +5534,18 @@ class GitOps:
         SUBJECT matches wins, so a body-only false match on a newer
         commit can never shadow an older genuine subject citation.
 
+        **Accepted tradeoff — uncapped walk**: dropping ``--max-count=1``
+        means git enumerates every commit the coarse ``--grep``
+        pre-filter matches (subject OR body), not just the most recent
+        one — a task referenced in many commit bodies makes git emit and
+        this method re-test all of them.  This is bounded by how many
+        commits actually mention the pattern (never the full history) and
+        is required for correctness (see above), so it is accepted as-is;
+        a caller on a hot path with a very chatty history could additionally
+        cap the walk (e.g. an extra ``--max-count=N`` under the assumption
+        a genuine subject citation appears within the N most recent
+        message-matches), but no such cap is applied here.
+
         Args:
             tid: Bare task id (no ``task/`` prefix); the prefix is added
                 by the default pattern where appropriate.
@@ -6184,21 +6196,27 @@ class GitOps:
           marker exists and the merge commit is an ancestor of main
           forever, but a later commit on main removed the deliverable —
           effect NOT present, yet the old code said True).  Instead this
-          diffs the SECOND parent's (the merged branch's) content against
-          current main: ``merge_base = git merge-base <parents[0]>
-          <parents[1]>`` (the branch's FORK POINT — stable regardless of
-          later main history; **CRITICAL**: this must be
-          ``merge-base(first_parent, second_parent)``, NOT
-          ``merge-base(main, second_parent)`` — because the merge commit
+          diffs EVERY non-first parent's (each merged branch's) content
+          against current main, requiring ALL of them to still be present
+          (task 2675 amendment — octopus-merge safety, so a later revert
+          of a third-or-later parent's deliverable cannot silently read
+          as effect-present): for each ``other_parent`` in
+          ``parents[1:]``, ``merge_base = git merge-base <parents[0]>
+          <other_parent>`` (that parent's FORK POINT — stable regardless
+          of later main history; **CRITICAL**: this must be
+          ``merge-base(first_parent, other_parent)``, NOT
+          ``merge-base(main, other_parent)`` — because the merge commit
           is itself an ancestor of main in the found_on_main scenario,
-          ``merge-base(main, second_parent)`` collapses to
-          ``second_parent`` and yields an empty, useless diff), then
+          ``merge-base(main, other_parent)`` collapses to
+          ``other_parent`` and yields an empty, useless diff), then
           ``touched = git -c core.quotePath=false diff --name-only -z
-          <merge_base> <second_parent>`` (the paths the branch introduced
+          <merge_base> <other_parent>`` (the paths that parent introduced
           since its fork point), and finally whether ``git diff --quiet
-          <second_parent> <main> -- <touched...>`` reports no difference
-          — i.e. main HEAD still carries the branch's content
-          byte-identical for every path it touched.
+          <other_parent> <main> -- <touched...>`` reports no difference —
+          i.e. main HEAD still carries that parent's content
+          byte-identical for every path it touched.  For an ordinary
+          two-parent merge this is exactly one iteration, byte-identical
+          to checking the second parent alone.
 
         - **Non-merge commit** (root or single-parent) — UNCHANGED from
           prior behavior (task 2500): ``touched = git -c
@@ -6223,17 +6241,20 @@ class GitOps:
         doubt) when:
         - ``rev-list --parents`` errors or returns nothing (rc != 0, or
           *commit_sha* is unresolvable);
-        - for a merge commit, the ``merge-base`` call errors/is empty,
-          the second parent's ``diff --name-only`` call errors, or its
-          touched-set is empty — an empty branch merge has no deliverable
-          to confirm on main, so this is fail-safe False (unlike the
-          non-merge empty-touched case above, which stays True);
+        - for a merge commit, the ``merge-base`` call errors/is empty for
+          ANY non-first parent, that parent's ``diff --name-only`` call
+          errors, or its touched-set is empty — an empty branch merge has
+          no deliverable to confirm on main, so this is fail-safe False
+          (unlike the non-merge empty-touched case above, which stays
+          True); the per-parent check short-circuits on the first
+          failing parent, so an octopus merge (3+ parents) requires
+          EVERY parent to pass;
         - for a non-merge commit, the ``diff-tree`` call errors (rc !=
           0);
         - the final ``diff --quiet`` call errors for a reason other than
           "paths differ" (rc not in {0, 1}); or
         - any touched path differs (rc == 1) between the relevant commit
-          (*commit_sha* for non-merge, the second parent for merge) and
+          (*commit_sha* for non-merge, any non-first parent for merge) and
           main HEAD — produced by a post-hoc revert of those paths, but
           equally by any OTHER later change to the same paths (e.g.
           another already-landed task's follow-up edit, or this task's
@@ -6257,15 +6278,15 @@ class GitOps:
         handling (task 2500).
 
         **Accepted risk — conflict-resolved merges**: the merge-commit
-        branch above compares the second parent's OWN pre-merge content
-        against main, not the merge commit's own conflict-resolution
-        snapshot.  A merge that needed manual conflict resolution can
-        therefore read as effect-absent (False) here even though the
-        merge landed cleanly on main, because the resolved content on
-        main no longer matches the second parent's unresolved pre-merge
-        blob for the conflicting paths.  Same fail-safe trade-off as
-        above: a false False costs the caller an idempotent re-check,
-        never a wrongly-cemented completion.
+        branch above compares each non-first parent's OWN pre-merge
+        content against main, not the merge commit's own
+        conflict-resolution snapshot.  A merge that needed manual
+        conflict resolution can therefore read as effect-absent (False)
+        here even though the merge landed cleanly on main, because the
+        resolved content on main no longer matches that parent's
+        unresolved pre-merge blob for the conflicting paths.  Same
+        fail-safe trade-off as above: a false False costs the caller an
+        idempotent re-check, never a wrongly-cemented completion.
         """
         rc, parents_out, _ = await _run(
             ['git', 'rev-list', '--parents', '-n', '1', commit_sha],
@@ -6276,39 +6297,48 @@ class GitOps:
         parents = parents_out.split()[1:]
 
         if len(parents) >= 2:
-            # Merge commit (task 2675 FIX 1′): check the SECOND parent's
-            # (branch) content — the paths it touched since its fork
-            # point — against current main HEAD.  Touched paths MUST
-            # derive from merge-base(first_parent, second_parent), NOT
-            # merge-base(main, second_parent) — see the docstring above.
-            first_parent, second_parent = parents[0], parents[1]
-            rc, merge_base, _ = await _run(
-                ['git', 'merge-base', first_parent, second_parent],
-                cwd=self.project_root,
-            )
-            if rc != 0 or not merge_base:
-                return False
-            rc, touched_out, _ = await _run(
-                [
-                    'git', '-c', 'core.quotePath=false',
-                    'diff', '--name-only', '-z', merge_base, second_parent,
-                ],
-                cwd=self.project_root,
-            )
-            if rc != 0:
-                return False
-            touched = [f for f in touched_out.split('\0') if f]
-            if not touched:
-                # Empty branch merge — no deliverable to confirm; fail-safe.
-                return False
-            rc, _, _ = await _run(
-                [
-                    'git', 'diff', '--quiet', second_parent,
-                    self.config.main_branch, '--', *touched,
-                ],
-                cwd=self.project_root,
-            )
-            return rc == 0
+            # Merge commit (task 2675 FIX 1′): check EVERY non-first
+            # parent's (each merged branch's) content — the paths it
+            # touched since its fork point — against current main HEAD.
+            # For an ordinary two-parent merge this is exactly one
+            # iteration (byte-identical to the original second-parent-only
+            # check); for an octopus merge (3+ parents) ALL parents must
+            # pass, else a later revert of a third-or-later parent's
+            # deliverable would silently read as effect-present (task 2675
+            # amendment — the octopus blind spot).  Touched paths MUST
+            # derive from merge-base(first_parent, other_parent), NOT
+            # merge-base(main, other_parent) — see the docstring above.
+            first_parent = parents[0]
+            for other_parent in parents[1:]:
+                rc, merge_base, _ = await _run(
+                    ['git', 'merge-base', first_parent, other_parent],
+                    cwd=self.project_root,
+                )
+                if rc != 0 or not merge_base:
+                    return False
+                rc, touched_out, _ = await _run(
+                    [
+                        'git', '-c', 'core.quotePath=false',
+                        'diff', '--name-only', '-z', merge_base, other_parent,
+                    ],
+                    cwd=self.project_root,
+                )
+                if rc != 0:
+                    return False
+                touched = [f for f in touched_out.split('\0') if f]
+                if not touched:
+                    # Empty branch merge — no deliverable to confirm; fail-safe.
+                    return False
+                rc, _, _ = await _run(
+                    [
+                        'git', 'diff', '--quiet', other_parent,
+                        self.config.main_branch, '--', *touched,
+                    ],
+                    cwd=self.project_root,
+                )
+                if rc != 0:
+                    return False
+            return True
 
         # Non-merge (root or single-parent) commit: unchanged existing logic.
         rc, touched_out, _ = await _run(

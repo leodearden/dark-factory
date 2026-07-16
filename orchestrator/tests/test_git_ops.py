@@ -4104,15 +4104,15 @@ class TestCommitEffectPresentInMain:
         (e.g. another task's overlapping follow-up edit) are
         indistinguishable here and both return False — see the
         "Accepted risk" note on the primitive's docstring.
-    (c) For a no-ff merge commit, the primitive checks the SECOND
-        PARENT's (branch) content — the paths it touched since its fork
-        point (``merge-base(parent1, parent2)``) — against current main
-        HEAD.  TRUE when that content is still present on main (the
-        merged feature is intact); FALSE when the branch introduced no
-        net content (empty touched set) or when main no longer carries
-        it (e.g. a later revert of the merge's deliverable — the
-        task-1175 "reverted merge" shape this replaces the old
-        unconditional-True empty-diff-tree no-op to catch).  See
+    (c) For a no-ff merge commit, the primitive checks EVERY non-first
+        parent's (each merged branch's) content — the paths it touched
+        since its fork point (``merge-base(parent1, other_parent)``) —
+        against current main HEAD.  TRUE when that content is still
+        present on main (the merged feature is intact); FALSE when a
+        branch introduced no net content (empty touched set) or when
+        main no longer carries it (e.g. a later revert of the merge's
+        deliverable — the task-1175 "reverted merge" shape this replaces
+        the old unconditional-True empty-diff-tree no-op to catch).  See
         ``test_true_for_merge_commit_when_branch_content_present_in_main``
         and ``test_false_for_merge_commit_when_branch_content_absent_from_main``.
     (d) FALSE (not a false-positive True) when a touched path contains
@@ -4121,6 +4121,15 @@ class TestCommitEffectPresentInMain:
         ``-z``/``core.quotePath=false`` rather than git's quoted
         ``--name-only`` rendering, which would otherwise fail to match as
         a pathspec and silently read as "no difference".
+    (e) FALSE for a merge commit whose branch nets ZERO content relative
+        to its own fork point (added-then-removed before the merge) — an
+        empty touched-set on a merge is fail-safe False, unlike the
+        non-merge empty-touched case (c above stays True). See
+        ``test_false_for_merge_commit_with_empty_branch_touched_set``.
+    (f) For an OCTOPUS merge (3+ parents), EVERY parent is checked, not
+        just the second — a later revert of a THIRD-or-later parent's
+        deliverable must also flip this to FALSE. See
+        ``test_false_for_octopus_merge_when_any_parent_content_absent_from_main``.
     """
 
     async def test_true_when_touched_paths_still_match_main(
@@ -4246,6 +4255,106 @@ class TestCommitEffectPresentInMain:
         )
         assert await git_ops.commit_effect_present_in_main(merge_sha) is False
 
+    async def test_false_for_merge_commit_with_empty_branch_touched_set(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A no-ff merge commit whose SECOND-PARENT branch nets ZERO
+        content relative to its own fork point (it added a file, then
+        removed that same file again before the merge) has an empty
+        touched-set.  Unlike the non-merge empty-touched case (which
+        stays True — task 2500), this is fail-safe False: there is no
+        branch deliverable for main to have kept or lost, so the merge's
+        "effect" cannot be confirmed present.
+        """
+        rc, _, err = await _run(['git', 'checkout', '-b', 'branch'], cwd=git_repo)
+        assert rc == 0, f'checkout branch failed: {err}'
+        (git_repo / 'temp.py').write_text('temp\n')
+        await _run(['git', 'add', 'temp.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'add temp'], cwd=git_repo)
+        assert rc == 0, f'add temp failed: {err}'
+        (git_repo / 'temp.py').unlink()
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'remove temp again'], cwd=git_repo)
+        assert rc == 0, f'remove temp failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'branch', '-m', 'Merge branch into main'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'merge failed: {err}'
+        rc, merge_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        merge_sha = merge_sha.strip()
+
+        assert await git_ops.commit_effect_present_in_main(merge_sha) is False
+
+    async def test_false_for_octopus_merge_when_any_parent_content_absent_from_main(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Octopus-merge safety (3+ parents): every merged parent must be
+        checked, not just the second.  This pins the closed blind spot
+        where only ``parents[0]``/``parents[1]`` were compared — a later
+        revert of a THIRD (or later) parent's deliverable used to be
+        invisible to this primitive.  Two sibling branches are merged
+        into main in a single octopus commit; branchA's file survives
+        untouched, but branchB's file (the THIRD parent's deliverable) is
+        later removed from main.
+        """
+        rc, _, err = await _run(['git', 'checkout', '-b', 'branchA'], cwd=git_repo)
+        assert rc == 0, f'checkout branchA failed: {err}'
+        (git_repo / 'fileA.py').write_text('a\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'add fileA'], cwd=git_repo)
+        assert rc == 0, f'add fileA failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        rc, _, err = await _run(['git', 'checkout', '-b', 'branchB'], cwd=git_repo)
+        assert rc == 0, f'checkout branchB failed: {err}'
+        (git_repo / 'fileB.py').write_text('b\n')
+        await _run(['git', 'add', 'fileB.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'add fileB'], cwd=git_repo)
+        assert rc == 0, f'add fileB failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'branchA', 'branchB', '-m', 'Octopus merge'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'octopus merge failed: {err}'
+        rc, merge_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        merge_sha = merge_sha.strip()
+
+        rc, parents_out, err = await _run(
+            ['git', 'rev-list', '--parents', '-n', '1', merge_sha], cwd=git_repo,
+        )
+        assert rc == 0, f'rev-list --parents failed: {err}'
+        assert len(parents_out.split()[1:]) == 3, (
+            f'expected a 3-parent octopus merge, got: {parents_out!r}'
+        )
+
+        # Both branches' content is intact — the octopus merge's effect is
+        # fully present.
+        assert await git_ops.commit_effect_present_in_main(merge_sha) is True
+
+        # A LATER commit removes fileB.py — branchB's (the THIRD parent's)
+        # deliverable — leaving fileA.py (the second parent's) untouched.
+        # A second-parent-only check would still see fileA.py intact and
+        # wrongly return True; every parent must be checked.
+        (git_repo / 'fileB.py').unlink()
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'revert fileB'], cwd=git_repo)
+        assert rc == 0, f'revert fileB failed: {err}'
+
+        assert await git_ops.is_ancestor(merge_sha, 'main') is True, (
+            'octopus merge commit must still be an ancestor of main'
+        )
+        assert await git_ops.commit_effect_present_in_main(merge_sha) is False
+
     async def test_detects_real_change_to_non_ascii_touched_path(
         self, git_ops: GitOps, git_repo: Path,
     ) -> None:
@@ -4300,6 +4409,10 @@ class TestFindTaskCitationCommit:
     merge subject, or a conventional-commit subject) must still return
     that commit's sha, both before and after the fix — pins no
     regression on the legitimate citation shapes.
+
+    Fail-safe guard (e): an override ``pattern_template`` that is not a
+    valid Python ``re`` pattern must return None and log a WARNING
+    rather than raise ``re.error``.
     """
 
     async def test_none_when_only_body_has_conventional_token_mentioning_task(
@@ -4393,6 +4506,26 @@ class TestFindTaskCitationCommit:
         commit_sha = commit_sha.strip()
 
         assert await git_ops.find_task_citation_commit('1175') == commit_sha
+
+    async def test_none_and_warns_for_uncompilable_pattern_template(
+        self, git_ops: GitOps, caplog,
+    ) -> None:
+        """An override ``pattern_template`` that fails to compile as a
+        Python ``re`` pattern is treated as fail-safe no-citation:
+        returns None and logs a WARNING, mirroring the prior
+        git-error-means-None behavior, rather than raising ``re.error``.
+        """
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.find_task_citation_commit(
+                '1175', pattern_template='^(unterminated',
+            )
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('pattern_template' in r.getMessage() for r in warnings), (
+            f'Expected a WARNING mentioning pattern_template for the '
+            f'uncompilable override. All warnings: {[r.getMessage() for r in warnings]}'
+        )
 
 
 @pytest.mark.asyncio
