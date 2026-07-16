@@ -1991,3 +1991,55 @@ async def test_force_fire_disabled_by_default_defers_forever_under_saturation() 
     assert result is False
     executor.assert_not_awaited()
     assert coord.is_pending is True
+
+
+@pytest.mark.asyncio
+async def test_force_fire_anchor_restamps_fresh_on_next_burst_after_fire() -> None:
+    """(g) Two-burst cycle: after a force-fire clears the owed-age anchor, a
+    subsequent note_merge re-stamps a FRESH anchor from its own re-arm time —
+    the next force-fire window starts over rather than immediately re-firing
+    off the (now-stale) prior owed-age.
+
+    Guards the practical guarantee that force-fire does not repeatedly fire
+    on every tick after the first burst: without a fresh anchor, the second
+    burst would inherit an owed-age already past the bound and force-fire on
+    the very next maybe_restart call.
+    """
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0, require_idle=True, debounce_secs=0.0
+    )
+
+    # First burst: arms at t=0, force-fires once owed-age reaches 4500.
+    await coord.note_merge('task-1', 'base', 'head')
+    assert coord._first_pending_monotonic == 0.0
+    current_time[0] = 4500.0
+    assert await coord.maybe_restart(agents_idle=False) is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False
+    assert coord._first_pending_monotonic is None
+
+    # Second burst arms later, at t=4600 — the anchor must re-stamp to this
+    # NEW arm time, not stay None nor jump back to the first burst's 0.0.
+    current_time[0] = 4600.0
+    await coord.note_merge('task-2', 'base2', 'head2')
+    assert coord._first_pending_monotonic == 4600.0
+
+    # Immediately after re-arming, owed-age is ~0 — must NOT force-fire off
+    # the first burst's already-expired window.
+    result = await coord.maybe_restart(agents_idle=False)
+    assert result is False
+    assert coord.is_pending is True
+    executor.assert_awaited_once()  # still only the first fire
+
+    # Just short of the FRESH anchor's own bound — still defers.
+    current_time[0] = 4600.0 + 4500.0 - 1.0
+    assert await coord.maybe_restart(agents_idle=False) is False
+    executor.assert_awaited_once()
+
+    # Only once owed-age from the fresh anchor itself reaches the bound does
+    # the second force-fire trigger.
+    current_time[0] = 4600.0 + 4500.0
+    assert await coord.maybe_restart(agents_idle=False) is True
+    assert executor.await_count == 2
+    assert coord.is_pending is False
+    assert coord._first_pending_monotonic is None
