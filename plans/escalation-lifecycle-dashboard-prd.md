@@ -64,9 +64,9 @@ every resolution can carry an explicit **`resolution_class`** stamp
   origin/lifespan/workflow aggregates per project root, `parse_failures`
   surfaced in-payload, regime markers loaded from a committed YAML file, and
   a new endpoint `/api/v2/dashboard/escalation-analytics`.
-- **δ/ε (frontend)** add the analytics tab (three panels + regime-marker
-  annotations) and the Escalations-tab StatTile strip, both reading the one
-  endpoint.
+- **δ/ε/ζ (frontend)** add the analytics tab (three panels + regime-marker
+  annotations), the Escalations-tab StatTile strip, and the hand-rolled
+  lifecycle flow diagram (mini-Sankey), all reading the one endpoint.
 - **β** wires the auto-watcher (and 2630's evidence-gated allowlisted closes)
   to pass `resolution_class` explicitly.
 - **η₀–η₃ (deterministic predicate tasks)** run
@@ -110,6 +110,27 @@ deploy task is needed; the perf checks anchor on the implementation tasks.
 9. **Read-only surface.** Consistent with the escalation-queues dashboard
    section decision (memory, 2026-05-27): no resolve/dismiss/promote
    affordances; interactive resolution stays with the escalation-watcher.
+10. **Display forms (resolved in the 2026-07-15/16 discussion):**
+    - *Origin*: StackedAreaChart of filings/day by source as primary, plus a
+      per-source trend **sparkline column** in the benign-rate table (an
+      individual source's regime change stays legible inside the stack).
+      Benign-rate table sorted by benign *count* (volume × rate — "who
+      wastes the most closes").
+    - *Lifespan*: **ECDF**, log-x, overlaid by resolver tier, with a
+      vertical marker at the 6h freshness contract — replaces the
+      histogram. Percentile StatTiles stay split by level; the curve
+      carries the tier split (no level×tier matrix).
+    - *Workflow*: tier absorption as a **100%-normalized** stacked area
+      with a small total-volume sparkline above it (normalization tells the
+      absorption story; the sparkline keeps shrinking load visible).
+    - *Workflow*: a hand-rolled **lifecycle flow diagram (mini-Sankey)** —
+      columns `origin → final level → resolver tier → benign/actionable`,
+      aggregated over the selected window; ribbons are bezier bands between
+      column rectangles. The one novel component in this PRD; own leaf (ζ).
+      Action mix stays a separate small donut (it is not the Sankey's
+      terminal column — class is, per the anchor principle).
+    - *Cut*: source×category heatmap — weakest space-per-insight; the
+      Sankey's origin ribbons carry most of that reading.
 
 ## Pre-conditions
 
@@ -199,11 +220,19 @@ contract):
   per_project: [{
     project: str,                   # subsection-per-root, primary first
     origin:   { daily_by_source, sources: [{source, filings, benign,
-                actionable, stamped_share, benign_rate, predictably_benign}] },
-    lifespan: { percentiles_by_level, histogram, l1_to_l2_promotion,
+                actionable, stamped_share, benign_rate, predictably_benign,
+                daily_spark: [int]}] },
+    lifespan: { percentiles_by_level, l1_to_l2_promotion,
+                samples: [[date, tier, level, secs], ...],  # resolved only;
+                          # frontend builds the ECDF + windows client-side.
+                          # Bounded: ~1.4k today; server-side downsample
+                          # (stratified by tier) once the archive passes ~10k.
                 open_items: [{id, task_id, level, age_secs, breach_6h}],
                 triage_segments? },   # present only once 2555 fields exist
-    workflow: { tier_weekly, action_mix, churn_daily, esc_per_done_daily },
+    workflow: { tier_weekly, action_mix, churn_daily, esc_per_done_daily,
+                flow_daily: [{date, source, level, tier, class, n}] },
+                          # sparse 4-dim daily cube; frontend sums over the
+                          # selected window to feed the mini-Sankey.
   }],
 }
 ```
@@ -257,6 +286,7 @@ pins them together).
 | 8 | perf script pass/fail/absent | live or mock endpoint | exit 0 under threshold; exit 1 over; exit 1 + message on connection-refused |
 | 9 | regime markers malformed | broken YAML committed to fixture | endpoint serves `regime_markers: []`, `parse_failures` incremented, no 500 |
 | 10 | 2555 forward-compat | fixture records with `triaged_at` | `triage_segments` present and correct; absent-field archives yield no key, no error |
+| 11 | flow cube consistency | golden mini-archive fixture | summing `flow_daily` over any window reproduces the same totals as `sources`/`tier_weekly` marginals; `lifespan.samples` count == resolved-record count |
 
 Frontend wiring is verified by Python source-assertion tests
 (`dashboard/tests/test_tab_*.py` convention — no JS runner in this project).
@@ -283,10 +313,21 @@ each leaf self-declares its execution path.
   route. Signal: boundary tests 6, 7, 9, 10 green; endpoint returns the
   contract payload against the real archive. Prereqs: α.
 - **δ — Analytics tab frontend** (dashboard static). Origin / Lifespan /
-  Workflow panels from existing chart primitives; regime-marker vertical
-  annotations; 7d/28d/all window toggle; stamped-vs-inferred split visible
-  on the benign views. Signal: new tab renders all three panels from the
-  live endpoint; source-assertion tests green. Prereqs: γ.
+  Workflow panels from existing chart primitives: stacked-area filings +
+  benign-rate table with sparkline column (Origin); tier-overlaid log-x
+  ECDF with 6h marker + percentile tiles + open-items list (Lifespan);
+  normalized tier-absorption area with volume sparkline + action-mix donut
+  + churn + esc-per-done (Workflow). Regime-marker verticals; 7d/28d/all
+  window toggle; stamped-vs-inferred split visible on the benign views.
+  Reserves the Workflow-panel slot where ζ's flow diagram mounts. Signal:
+  new tab renders all three panels from the live endpoint;
+  source-assertion tests green. Prereqs: γ.
+- **ζ — Lifecycle flow diagram (mini-Sankey)** (dashboard static). New
+  hand-rolled component: columns origin → final level → resolver tier →
+  benign/actionable; ribbon widths from summing `flow_daily` over the
+  selected window; no graph library. Signal: flow diagram renders in the
+  Workflow panel with ribbon widths matching the golden fixture's flow
+  sums; source-assertion tests green. Prereqs: γ, δ.
 - **ε — Escalations-tab StatTile strip** (dashboard static). Four tiles:
   benign-rate 7d (with stamped share), pending 6h-breach count, esc-per-done
   7d, churn-24h 7d. Signal: strip renders on the Escalations tab from the
@@ -314,6 +355,8 @@ each leaf self-declares its execution path.
 - **Reconciliation-queue (8103) analytics** — this PRD covers orchestrator
   escalation queues; the recon queue's lifecycle differs (sole-closer
   watcher) and can reuse the aggregator later if wanted.
+- **Source×category heatmap** — cut in the display discussion (weakest
+  space-per-insight; the flow diagram's origin ribbons cover most of it).
 - Retro-stamping historical records (proxy covers them; no rewrite sweep).
 
 ## Open questions (surfaced but not decided in this session)
