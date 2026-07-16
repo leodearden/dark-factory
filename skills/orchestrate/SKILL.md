@@ -374,6 +374,48 @@ See `CLAUDE.md`'s "Orchestrator Config Reload" section for the quick-reference t
 
 ---
 
+## Model Routing
+
+The orchestrator resolves `(model, effort, budget_usd, max_turns)` for every LLM invocation through a layered resolver (`routing.resolve_route`). See `CLAUDE.md`'s "Model Routing" section for the `routing.*` config block, the closed match/set vocabulary, and the layered precedence — this section covers the operator-facing CLI and how to read what was actually decided.
+
+### Probing model availability
+
+`orchestrator probe-models` exercises every configured pool account (`config.usage_cap.accounts`) × candidate model — default `config.routing.allowed_models` plus the fable candidate model (`claude-fable-5`) — with a cheap 1-turn invocation, and writes a deterministic, committable YAML availability artifact:
+
+```bash
+cd /home/leo/src/dark-factory
+uv run --project orchestrator orchestrator probe-models --config "$TARGET_CONFIG" \
+  [--models m1,m2] [--output PATH]
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--config` | required (or `ORCH_CONFIG_PATH`) | Same target-project rule as every other subcommand — selects `project_root` and the probed account/model config |
+| `--models` | `routing.allowed_models` + the fable candidate | Comma-separated override for the probed model set |
+| `--output` | `routing.DEFAULT_PROBE_ARTIFACT_PATH` (`config/model-availability.yaml`) | Where to write the rendered artifact |
+
+Per `(account, model)` pair, the artifact records one status (from `routing.classify_probe_outcome`, except `no_token`/`invoke_error` which the probe runner assigns directly around it):
+
+| Status | Meaning |
+|---|---|
+| `available` | invocation succeeded |
+| `unavailable` | model not found for this account |
+| `auth_error` | account auth failed |
+| `capped` | account is at or near its usage cap |
+| `no_token` | account's OAuth token env var is unresolvable — the model was never invoked for it |
+| `invoke_error` | the invocation call itself raised (network/subprocess) |
+| `error` | any other classified failure |
+
+This artifact is the input a future fable-admission gate consumes to decide whether `claude-fable-5` is safe to add to `routing.allowed_models` fleet-wide — running the probe does not itself admit it.
+
+### Reading routing decisions
+
+Today's per-invocation routing visibility: every resolved invocation emits a `routing_decision` event, and each task's `metadata.routing` carries the latest decision (`model`, `source_layer`, `rule_id`, `rejected` reasons) plus bounded history. There's no dedicated CLI query yet — `metadata.routing` is the practical read path, via `get_task`/`get_tasks` (see "Check Status" below).
+
+**Forthcoming:** a per-(model×role) rollup (done/blocked/cap-hit rates, $/done) in the digest and dashboard is not yet rendered — this section will be updated once that lands.
+
+---
+
 ## Check Status
 
 Identify the target project first (see [Critical: identify the target project FIRST](#critical-identify-the-target-project-first)), then query its status. The `status` subcommand also requires `--config` (or `ORCH_CONFIG_PATH`):
