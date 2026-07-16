@@ -11,7 +11,7 @@ You are running an autonomous, fully non-interactive level-1 escalation handler.
 
 - **NO terminal spawning.** Do not use `gnome-terminal`, `kitty`, `tmux`, `Bash(run_in_background)`, the `/spawn` skill, or any other form of background subprocess.
 - **NO interactive `/unblock` sessions.** Do not spawn Claude Code sessions or any interactive tool.
-- **Tier-1 admin actions ONLY.** You may call `mcp__fused-memory__update_task`, `mcp__fused-memory__add_dependency`, `mcp__escalation__resolve_issue`, and `mcp__escalation__promote_to_l2`. Nothing else mutates state.
+- **Tier-1 admin actions ONLY.** You may call `mcp__fused-memory__update_task`, `mcp__fused-memory__add_dependency`, `mcp__escalation__resolve_issue`, `mcp__escalation__promote_to_l2`, and `mcp__escalation__stamp_triage` (an ungated triage-ack **annotation**, not a state transition — see [Triage-ack freshness contract](#triage-ack-freshness-contract)). Nothing else mutates state.
 - **No code edits.** Do not use `Edit`, `Write`, or any tool that modifies source files.
 - **No merge-queue interaction.** Do not call merge-queue or git-merge tools. This skill never submits to the merge queue — no `merge_request` call exists anywhere in this flow and none may be added; if merge interaction is ever introduced, it must use the bounded submit→poll protocol (explicit `wait_secs`, `merge_status` polling — see `skills/escalation-watcher/SKILL.md` §"Merge Submissions — Bounded Submit, Then Poll").
 - **No infra commands.** Do not issue infrastructure commands (docker, systemctl, kill, etc.).
@@ -250,10 +250,34 @@ On startup and after each watcher fire:
 2. Fetch pending L2s: `mcp__escalation__get_pending_escalations()` → filter `level == 2`, `status == "pending"`
 3. Build the **already-promoted set**: the union of all `members` lists from every pending L2
 4. Set `work_batch` = L1 candidates whose `id` is **not** in the already-promoted set
+5. Filter `work_batch` again — drop any item whose existing triage stamp is still fresh and covering (`triaged_at` set, < ~6h old, `updated_at` not newer than `triaged_at` — treating `updated_at is None` as "not newer", never comparing `None` directly against a timestamp string — note still plausibly covers the record); see [Triage-ack freshness contract](#triage-ack-freshness-contract) below for the exact skip rule
 
-Handle only `work_batch` before (re)starting the wait.
+Handle only the filtered `work_batch` before (re)starting the wait. On first assessment of each surviving item, stamp a triage-ack annotation (below) so later drain cycles can skip it instead of re-deriving its disposition from scratch.
 
-**Why this filter matters:** Promoted member L1s remain `status == "pending"` at level 1 — the escalation model has no per-L1 "promoted" marker. Without the filter, every drain cycle re-encounters the same already-promoted L1s, re-runs shallow RCA on them, and re-calls `promote_to_l2` (which the server deduplicates, so no duplicate L2s are created). The real costs are: (1) `escalations_handled` is inflated, triggering premature rotation-limit exits; (2) RCA reads (git log/diff, get_tasks) are re-spent on already-triaged items, burning context budget unnecessarily.
+**Why this filter matters:** Promoted member L1s remain `status == "pending"` at level 1 — the escalation model has no per-L1 "promoted" marker. Without the filter, every drain cycle re-encounters the same already-promoted L1s, re-runs shallow RCA on them, and re-calls `promote_to_l2` (which the server deduplicates, so no duplicate L2s are created). The real costs are: (1) `escalations_handled` is inflated, triggering premature rotation-limit exits; (2) RCA reads (git log/diff, get_tasks) are re-spent on already-triaged items, burning context budget unnecessarily. The triage stamp (step 5) generalizes this same cost-avoidance to L1/L2 items that were already assessed but not promoted or resolved — the disposition itself (not just the promotion fact) is now remembered rotation-to-rotation.
+
+### Triage-ack freshness contract
+
+`mcp__escalation__stamp_triage(escalation_id, triage_note=...)` records that you assessed a pending L1/L2 without resolving or promoting it — a durable handoff note so the *next* rotation (fresh context, no memory of this one) doesn't re-run the same RCA:
+
+```python
+mcp__escalation__stamp_triage(
+  escalation_id="...",
+  triage_note="task-604 status==done | probe: get_task 604 -> status=done",
+)
+```
+
+`triaged_by` is server-attributed from your connection's `X-Escalation-Identity` header (non-spoofable, same contract as `resolved_by` — see [Hard Constraints](#hard-constraints--never-violate)); you do not need to pass it explicitly. Stamping is an **ungated annotation** — unlike `resolve_issue`, it is exempt from the `{0,1}` level cap, so you can stamp a pending L2 you are still forbidden to resolve. It changes neither `status` nor `level` nor `updated_at`.
+
+**`triage_note` MUST carry a verified predicate and the probe that verified it — never a bare conclusion:**
+1. The **PREDICATE** — a machine-checkable condition, e.g. `` `task-604 status==done` `` — not a conclusion like "resume will close it". A conclusion-only note is untrusted prose: exactly this anti-pattern on esc-2584 was empirically refuted twice, costing two churn cycles and five separate `resolve_issue` calls before the item was actually closed.
+2. The **PROBE** used to verify it — command + key output line, e.g. `` `probe: get_task 604 -> status=done` ``. This mirrors the [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) evidence convention (quote a live-probe `key=value` token verbatim) and the [`stranded_blocked`](#stranded_blocked) "re-verify the predicate still holds" pattern — `triage_note` generalizes both into one durable rotation-to-rotation handoff note.
+
+`triaged_at` (stamped automatically) is the **freshness anchor** — there is no separate `verified_at` field; treat them as identical. `updated_at` defaults to `None` (never bumped) until the record's first real content change (e.g. an L2 gaining a member via `promote_to_l2`), so a triaged record that hasn't changed since still reads `updated_at = None` — that is the common case, not an edge case. On each drain cycle (step 5 above):
+- **Skip** re-deriving any item whose `triaged_at` is fresh (< ~6h old) and whose `triage_note` predicate still plausibly covers the record's current state.
+- **Re-assess** — re-run the probe, don't trust the stale note — when `updated_at` is not `None` **and** `updated_at > triaged_at` (the record changed since you triaged it, e.g. an L2 cluster gained a new member via `promote_to_l2`), or the existing note is stale or conclusion-only. Guard the comparison explicitly: treat `updated_at is None` as "not newer than `triaged_at`" rather than ordering `None` against a timestamp string (e.g. Python raises `TypeError` comparing `None > str`).
+
+`triaged_at`/`triaged_by`/`triage_note`/`updated_at` are all surfaced in both full and compact `get_pending_escalations` output, so this check costs no extra per-record round-trip.
 
 ### Waiting for the next L1
 

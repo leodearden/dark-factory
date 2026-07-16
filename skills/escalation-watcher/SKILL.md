@@ -100,13 +100,14 @@ Check for all pending L2 escalations — **compact** to keep context small:
 mcp__escalation__get_pending_escalations(level=2, compact=True)
 ```
 
-`compact=True` returns only the triage fields (`id`, `task_id`, `category`, `severity`, `level`,
-`status`, `summary`, `suggested_action`, `timestamp`) and drops the heavy free-text/cluster fields
-(`detail`, `members`, `options`, `root_cause`, `train_state`, …). Triage from that; fetch the full
-record with `get_escalation(id)` **only** for the one item you're about to act on — and prefer doing
-that full read inside the handling sub-agent (see Context Conservation). During an AFK window the
-pending pile grows, and a full-dict drain every cycle is the dominant context sink — `compact=True`
-is what keeps a long-running session alive.
+`compact=True` returns the triage fields (`id`, `task_id`, `category`, `severity`, `level`,
+`status`, `summary`, `suggested_action`, `timestamp`) plus the triage-ack annotation fields
+(`triaged_at`, `triaged_by`, `triage_note`, `updated_at` — see "Reading a triage-ack annotation"
+below), and drops the heavy free-text/cluster fields (`detail`, `members`, `options`, `root_cause`,
+`train_state`, …). Triage from that; fetch the full record with `get_escalation(id)` **only** for
+the one item you're about to act on — and prefer doing that full read inside the handling sub-agent
+(see Context Conservation). During an AFK window the pending pile grows, and a full-dict drain every
+cycle is the dominant context sink — `compact=True` is what keeps a long-running session alive.
 
 **Drain-after-up — ordering matters.** Always (re)start the watcher and confirm its process is
 alive *before* you drain, never the other way round. A pre-start drain races inotify
@@ -517,6 +518,13 @@ demoted to a generated history view: the cockpit decision queue (C5b), fed by `w
 (see "Filing Parked Decisions to the Cockpit Registry" above), is now the primary return-triage
 surface for any of the above that left a decision open (i.e. every outcome except "Merged").
 
+**When a line is derived from a triage ack.** If a digest line above, or a `write-decision --text`
+registry entry (see "Filing Parked Decisions to the Cockpit Registry" above), draws on an existing
+`triage_note` rather than fresh investigation, carry forward the predicate and probe it names — not
+just its conclusion (see "Reading a triage-ack annotation" above). A conclusion-only line forces a
+returning human, or the next rotation, to re-derive the disposition from scratch instead of
+re-checking a named, machine-checkable predicate.
+
 ## Merge-failure disposition vocabulary (skew ⇒ port, don't debug)
 
 Merge-gate verify failures now carry a **disposition** — a classification of whose
@@ -595,6 +603,38 @@ Two mechanical caveats when building this prompt string:
   single-quoted `<prompt>` argument passed to `spawn-claude.sh`, and the spawn fails or truncates.
 
 Each call site below notes this briefly rather than repeating the full explanation.
+
+### Reading a triage-ack annotation
+
+A pending record — most often an L2 promoted from L1, but any pending item in principle — may
+carry a triage-ack annotation: `triaged_at`, `triaged_by`, `triage_note` (plus `updated_at`, the
+record's own last-substantive-change marker). This means an earlier rotation — almost always
+`escalation-watcher-auto`, since stamping is how that skill records "I assessed this without
+resolving or promoting it" — already looked at the item and left a handoff note so the next reader
+doesn't have to re-derive its disposition from scratch. Read it exactly like `suggested_action`
+above — **a starting point, not a verdict**.
+
+**Re-verify (re-run the probe yourself) instead of trusting the note** when either:
+- `triaged_at` is older than roughly 6 hours, or
+- the record changed since triage — `updated_at` is **not** `None` **and** is newer than
+  `triaged_at` (e.g. the L2 cluster gained a new member via `promote_to_l2` after the stamp was
+  written). `updated_at` defaults to `None` (never bumped) until the record's first real content
+  change, so a triaged record with no changes since still reads `updated_at = None` — treat that as
+  "not newer than `triaged_at`", never as an ordering comparison between `None` and a timestamp
+  string.
+
+A well-formed `triage_note` names a machine-checkable **predicate** (e.g. `` `task-604
+status==done` ``) and the **probe** used to check it (e.g. `` `probe: get_task 604 ->
+status=done` ``) — re-run that same probe before trusting the predicate still holds. A
+`triage_note` that states only a **conclusion**, with no predicate or probe behind it, is untrusted
+prose, not a substitute for investigation. This is exactly the esc-2584 failure mode: a
+conclusion-only recommendation ("resume will close it") was taken at face value, got refuted, and
+cost two churn cycles and five separate `resolve_issue` calls before the item was actually closed.
+
+`triaged_by` is server-attributed from the stamping connection's `X-Escalation-Identity` header and
+cannot be spoofed by the caller — the identical non-spoofable attribution contract this skill
+already documents for `resolved_by` (see "Recognizing the supervised auto-watcher's resolutions"
+below).
 
 ### `review_suggestions` (info)
 

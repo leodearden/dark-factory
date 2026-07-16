@@ -213,10 +213,13 @@ CATEGORIES = [
 # subset a long-running L2 watcher needs to decide whether to pull a full record.
 # The heavy fields (detail, members, options, root_cause, train_state,
 # workflow_state, worktree, dedupe_*) are dropped to keep the watcher's context
-# small as the pending pile grows during an AFK window.
+# small as the pending pile grows during an AFK window. The triage-ack fields
+# (triaged_at, triaged_by, triage_note, updated_at) are included so a compact
+# drain can decide stamp-then-skip without a per-record get_escalation round-trip.
 _COMPACT_ESCALATION_FIELDS = (
     'id', 'task_id', 'category', 'severity', 'level', 'status',
     'summary', 'suggested_action', 'timestamp',
+    'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
 )
 
 
@@ -873,6 +876,44 @@ def create_server(
         esc = queue.get(escalation_id)
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
+        return esc.to_dict()
+
+    @mcp.tool()
+    def stamp_triage(
+        escalation_id: str,
+        triaged_by: str | None = None,
+        triage_note: str = '',
+    ) -> dict[str, Any]:
+        """Stamp a triage-ack ANNOTATION on a pending escalation.
+
+        This is deliberately NOT gated by the connection-capability level
+        check (contrast ``resolve_issue``): triage is metadata, not a state
+        transition, so a {0,1}-level-capped connection (e.g. the auto-watcher)
+        can annotate a pending L2 it is still forbidden to resolve. Gating
+        this tool would defeat its purpose — the auto-watcher must be able to
+        record that it assessed a pending L2 so future rotations skip
+        re-deriving the same disposition every rotation.
+
+        Delegates to ``queue.stamp_triage()``, which stamps pending records
+        only (root-only load; never resurrects an archived/resolved record).
+        Does not change ``status``, ``level``, or ``updated_at``.
+
+        *triaged_by* attribution: when the connection sends an
+        X-Escalation-Identity header, that identity overrides the *triaged_by*
+        arg — mirroring ``resolve_issue``'s non-spoofable ``resolved_by``
+        override (server.py's identity gate). This is attribution ONLY, never
+        a deny path, so the tool stays ungated: reading the identity header
+        must never turn an annotation into a level denial.
+
+        Returns the updated record as a full dict on success, or
+        ``{'error': ...}`` when *escalation_id* is not found or not pending.
+        """
+        identity = get_http_headers().get(_IDENTITY_HEADER)
+        if identity is not None:
+            triaged_by = identity
+        esc = queue.stamp_triage(escalation_id, triaged_by=triaged_by, triage_note=triage_note)
+        if esc is None:
+            return {'error': f'Escalation {escalation_id} not found or not pending'}
         return esc.to_dict()
 
     # --- L2 promotion tool ---

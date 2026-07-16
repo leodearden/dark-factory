@@ -96,6 +96,19 @@ class Escalation:
     # unstamped — readers fall back to the effective_benign() proxy (see
     # escalation.classify).
     resolution_class: str | None = None
+    # Triage-ack annotation (NOT a resolution) — lets escalation-watcher-auto
+    # rotations skip re-deriving the disposition of a still-pending L1/L2 item
+    # every rotation. triaged_at/triaged_by/triage_note are stamped by
+    # queue.stamp_triage(); updated_at is a separate "changed since I triaged
+    # it" signal bumped elsewhere (e.g. add_members_to_l2 on real append).
+    # All four are optional with zero-migration defaults: legacy JSON files
+    # without these keys deserialise correctly via the from_dict
+    # __dataclass_fields__ filter below — the same pattern used for
+    # train_state/resolution_action/resolution_class above.
+    triaged_at: str | None = None
+    triaged_by: str | None = None  # server-attributed from X-Escalation-Identity when present
+    triage_note: str = ''  # freshness contract: verified predicate + probe (see watcher SKILLs)
+    updated_at: str | None = None  # last-substantive-change marker; None means never bumped
 
     def to_dict(self) -> dict:
         return asdict(self)

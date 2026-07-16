@@ -2475,6 +2475,208 @@ class TestAddMembersToL2:
         )
 
 
+class TestStampTriage:
+    """EscalationQueue.stamp_triage() stamps a triage-ack annotation on a pending record.
+
+    This is an ANNOTATION, not a resolution: it must work on a pending L2 that
+    the {0,1}-level-capped watcher connection is still forbidden to resolve.
+    """
+
+    def _make_pending(self, queue: EscalationQueue, task_id: str = 'task-1', level: int = 2) -> Escalation:
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='pending L2 for triage stamp test',
+            level=level,
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_stamps_pending_record(self, tmp_path: Path):
+        """(a) Stamping a pending record sets triaged_at/triaged_by/triage_note, keeps status/level."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        result = queue.stamp_triage(
+            esc.id, triaged_by='orchestrator-escalation-watcher-auto',
+            triage_note='task-604 status==done | probe: get_task 604 -> status=done',
+        )
+
+        assert result is not None
+        assert result.triaged_at is not None, 'Expected triaged_at to be stamped'
+        assert result.triaged_by == 'orchestrator-escalation-watcher-auto'
+        assert result.triage_note == 'task-604 status==done | probe: get_task 604 -> status=done'
+        assert result.status == 'pending', 'stamp_triage must not change status'
+        assert result.level == 2, 'stamp_triage must not change level'
+
+    def test_stamp_does_not_archive(self, tmp_path: Path):
+        """(a cont.) The file stays in the queue root (not moved to archive)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='note')
+
+        path = queue.queue_dir / f'{esc.id}.json'
+        assert path.exists(), 'Expected the record to remain in the queue root after stamping'
+
+    def test_stamp_is_durable_reload_shows_triage(self, tmp_path: Path):
+        """(a cont.) Reload via queue.get(id) shows the stamped triage fields."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='predicate P | probe: cmd -> out')
+
+        reloaded = queue.get(esc.id)
+        assert reloaded is not None
+        assert reloaded.triaged_by == 'watcher'
+        assert reloaded.triage_note == 'predicate P | probe: cmd -> out'
+        assert reloaded.triaged_at is not None
+
+    def test_returns_none_for_unknown_id(self, tmp_path: Path):
+        """(b) Returns None for a completely unknown id."""
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        result = queue.stamp_triage('esc-does-not-exist', triaged_by='watcher', triage_note='note')
+
+        assert result is None, f'Expected None for unknown id, got {result!r}'
+
+    def test_returns_none_for_archived_resolved_record(self, tmp_path: Path):
+        """(c) Returns None for a resolved+archived record; never resurrects it into the queue root."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.resolve(esc.id, 'Fixed')  # moves to archive
+
+        result = queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='note')
+
+        assert result is None, f'Expected None for archived record, got {result!r}'
+        path = queue.queue_dir / f'{esc.id}.json'
+        assert not path.exists(), 'stamp_triage must not resurrect the archived record into the queue root'
+
+        archived = queue.get(esc.id)  # falls back to archive
+        assert archived is not None
+        assert archived.triaged_at is None, 'Archived record must not gain a triage stamp'
+
+    def test_re_stamp_with_none_triaged_by_preserves_existing_value(self, tmp_path: Path):
+        """A re-stamp with triaged_by=None leaves the existing triaged_by
+        untouched, while triaged_at still advances — a bare re-stamp (no new
+        attribution supplied) is a harmless freshness bump, never a wipe."""
+        import time
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        first = queue.stamp_triage(
+            esc.id, triaged_by='watcher', triage_note='predicate P | probe: cmd -> out',
+        )
+        assert first is not None
+        assert first.triaged_at is not None
+        first_triaged_at = first.triaged_at
+
+        time.sleep(0.01)  # ensure distinct timestamps
+        second = queue.stamp_triage(esc.id, triaged_by=None, triage_note='predicate P | probe: cmd -> out')
+
+        assert second is not None
+        assert second.triaged_by == 'watcher', (
+            f'Expected triaged_by to be preserved when re-stamped with None, got {second.triaged_by!r}'
+        )
+        assert second.triaged_at is not None
+        assert second.triaged_at > first_triaged_at, 'Expected triaged_at to advance even on a bare re-stamp'
+
+    def test_re_stamp_with_empty_triage_note_preserves_existing_note(self, tmp_path: Path):
+        """triage_note mirrors the triaged_by preserve-on-absent pattern: a
+        re-stamp with the default '' (omitted) leaves the existing note
+        untouched, so a bare freshness-bump re-stamp can never silently wipe
+        a previously-recorded predicate/probe."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='predicate P | probe: cmd -> out')
+
+        result = queue.stamp_triage(esc.id, triaged_by='watcher')  # triage_note omitted -> default ''
+
+        assert result is not None
+        assert result.triage_note == 'predicate P | probe: cmd -> out', (
+            f'Expected the prior note to be preserved on an empty re-stamp, got {result.triage_note!r}'
+        )
+
+    def test_re_stamp_with_new_triage_note_overwrites(self, tmp_path: Path):
+        """A non-empty triage_note DOES overwrite the prior note — this is the
+        normal re-assessment path (stamp-then-skip: re-derive and re-stamp
+        once staleness/change is detected)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='stale predicate | probe: old cmd -> old out')
+
+        result = queue.stamp_triage(
+            esc.id, triaged_by='watcher', triage_note='fresh predicate | probe: new cmd -> new out',
+        )
+
+        assert result is not None
+        assert result.triage_note == 'fresh predicate | probe: new cmd -> new out', (
+            f'Expected a non-empty re-stamp to overwrite the prior note, got {result.triage_note!r}'
+        )
+
+
+class TestUpdatedAtStamp:
+    """updated_at is a last-substantive-change marker: bumped by add_members_to_l2's real
+    append path, left untouched by its no-op path, and never touched by stamp_triage
+    (an annotation must not masquerade as a content change)."""
+
+    def _make_l2(self, queue: EscalationQueue, task_id: str = 'task-1') -> Escalation:
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster for updated_at test',
+            level=2,
+            root_cause='Bad merge strategy',
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_add_members_to_l2_sets_updated_at_on_real_append(self, tmp_path: Path):
+        """(a) A genuinely-new member append stamps updated_at."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+        assert l2.updated_at is None
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-1'])
+
+        assert result is not None
+        assert result.updated_at is not None, 'Expected updated_at to be stamped on real append'
+
+    def test_add_members_to_l2_no_op_append_does_not_set_updated_at(self, tmp_path: Path):
+        """(b) Appending only already-present member ids is a no-op — updated_at stays None."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)  # already has 'esc-l1-0'
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-0'])
+
+        assert result is not None
+        assert result.updated_at is None, (
+            f'Expected updated_at to stay None on no-op append, got {result.updated_at!r}'
+        )
+
+    def test_stamp_triage_does_not_set_updated_at(self, tmp_path: Path):
+        """(c) stamp_triage is an annotation — it must not bump updated_at."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        result = queue.stamp_triage(l2.id, triaged_by='watcher', triage_note='note')
+
+        assert result is not None
+        assert result.updated_at is None, (
+            f'Expected updated_at to stay None after stamp_triage, got {result.updated_at!r}'
+        )
+
+
 class TestResolveCascade:
     """EscalationQueue.resolve() cascades resolution to member L1s when L2 has members."""
 
