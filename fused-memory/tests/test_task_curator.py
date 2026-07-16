@@ -198,6 +198,25 @@ class TestCandidateHash:
         assert a.payload_hash() != b.payload_hash()
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# task-2687 step-1 RED: TestCandidateTaskExecutionClass
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCandidateTaskExecutionClass:
+    """CandidateTask carries metadata.execution_class so the operational-ask
+    registry's match_candidate() can consult it as a routing axis (task 2687).
+    """
+
+    def test_execution_class_set_from_kwarg(self):
+        c = CandidateTask(title='x', execution_class='operational')
+        assert c.execution_class == 'operational'
+
+    def test_execution_class_defaults_to_none(self):
+        c = CandidateTask(title='x')
+        assert c.execution_class is None
+
+
 class TestHashShapeContract16:
     """Shape-contract regression guard for the two task_curator.py sha256 mirror sites
     that lack an existing 16-char length assertion.
