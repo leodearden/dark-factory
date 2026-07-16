@@ -504,6 +504,16 @@ class TargetedReconciler:
                 'source': _ECHO_SOURCE,
                 'task_id': task_id,
                 'transition': 'done',
+                # Task 2642: seed Stage 2's "Completion-Note Suppression
+                # Pre-Check" count gate (prompts/stage2.py) on every
+                # completion echo, so a task completed via
+                # TargetedReconciliation is recognized and Stage 2 skips
+                # writing its own redundant completion summary.
+                # _is_authoritative_resolution's source != _ECHO_SOURCE
+                # discriminator (above) keeps this self-stamp from making
+                # the echo authoritative to THIS reconciler's own pre-echo
+                # guard, preserving the task-1984 invariant.
+                _STAGE2_SUPPRESS_KEY: True,
             }
             if has_authoritative:
                 write_metadata['echo_suppressed_stale_description'] = True
