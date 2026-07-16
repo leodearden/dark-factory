@@ -36,9 +36,10 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE, SIMPLE_TASK
@@ -51,8 +52,12 @@ from orchestrator.config import (
     OrchestratorConfig,
     TimeoutsConfig,
     TurnsConfig,
+    load_config,
 )
+from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.harness import Harness
+from orchestrator.run_store import RunStore
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow
 
@@ -247,3 +252,98 @@ class TestInvokeReviewerVariantOverrideStaysGreen:
         assert call_kwargs.get('effort') == 'max'
         assert call_kwargs.get('timeout_seconds') == 555.0
         assert call_kwargs.get('backend') == 'gemini'
+
+
+# ---------------------------------------------------------------------------
+# Capstone -- PRD boundary test 4 (plans/adaptive-model-routing-prd.md):
+# setting models.simple_task via a REAL hot reload must both (a) land in the
+# reload's `applied` disposition -- not `restart_required` -- and (b) flip
+# the model the NEXT simple_task _invoke resolves. This is the end-to-end,
+# user-observable signal the whole task exists to deliver; it only passes
+# with step-2 (submodel field exists, so it round-trips through
+# RELOADABLE_FIELDS/YAML) and step-4 (full-name lookup, so _invoke actually
+# reads simple_task's own field) both in place.
+#
+# Mirrors test_config_reload_integration_gate.py's _make_reload_harness /
+# TestS2AllowlistedNextSpawn pattern (a real on-disk orchestrator.yaml read
+# via load_config() + Harness.reload_config(), never mocking load_config) --
+# duplicated module-locally per that file's documented
+# per-test-file-duplication convention (see this file's own top-of-module
+# docstring) -- but asserts at the invoke_with_cap_retry boundary (this
+# file's own established pattern, per _invoke_probe above) rather than a
+# StubInvoke.invoke_agent capture.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCapstoneHotReloadFlipsSimpleTaskModel:
+    """PRD boundary test 4: a real hot reload of models.simple_task applies
+    (not restart_required) and is observed by the next simple_task _invoke.
+    """
+
+    async def test_reload_models_simple_task_applies_and_flips_next_invoke(
+        self, tmp_path: Path, monkeypatch, git_repo, git_ops, task_assignment,
+    ) -> None:
+        config_path = tmp_path / 'orchestrator.yaml'
+        config_path.write_text(yaml.safe_dump({}))
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+
+        config = load_config()
+        assert config.models.simple_task == 'sonnet', (
+            'must start from the stock default so the reload below is an '
+            'observable change'
+        )
+
+        harness = Harness(config)
+        # Inject a mock RunStore (no persistence side effects) and a real
+        # EventStore pointing at a tmp DB -- same injection convention as
+        # test_config_reload_integration_gate.py::_make_reload_harness.
+        harness._run_store = MagicMock(spec=RunStore)
+        harness._run_id = 'run-test-0001'
+        harness.event_store = EventStore(tmp_path / 'events.db', 'run-test-0001')
+
+        # Edit the on-disk YAML: models.simple_task 'sonnet' -> 'haiku'.
+        data = yaml.safe_load(config_path.read_text()) or {}
+        data.setdefault('models', {})['simple_task'] = 'haiku'
+        config_path.write_text(yaml.safe_dump(data))
+
+        report = await harness.reload_config()
+
+        assert report['error'] is None
+        assert report['applied'].get('models.simple_task') == {
+            'old': 'sonnet', 'new': 'haiku',
+        }, (
+            f"Expected 'models.simple_task' in the applied disposition (not "
+            f"restart_required); got applied={report['applied']!r} "
+            f"restart_required={report['restart_required']!r}"
+        )
+        assert 'models.simple_task' not in report['restart_required']
+        assert harness.config.models.simple_task == 'haiku'
+
+        # workflow shares harness.config BY REFERENCE (I3 identity
+        # preservation) -- the reload mutated it in place, so the workflow
+        # observes 'haiku' on its NEXT _invoke with no extra wiring.
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=harness.config,
+            git_ops=git_ops,
+            scheduler=FakeScheduler(),  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=FakeMcp(),  # type: ignore[arg-type]
+        )
+        workflow.artifacts = None
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+
+        with patch(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            new_callable=AsyncMock,
+            return_value=AgentResult(success=True, output=''),
+        ) as mock_cap_retry:
+            await workflow._invoke(SIMPLE_TASK, 'p', wt_info.path)
+
+        assert mock_cap_retry.await_count == 1
+        assert mock_cap_retry.await_args.kwargs.get('model') == 'haiku', (
+            'the next simple_task _invoke after a hot reload must resolve '
+            'the freshly-reloaded models.simple_task value, not a stale one'
+        )
