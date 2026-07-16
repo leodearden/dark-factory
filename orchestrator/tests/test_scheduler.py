@@ -6921,6 +6921,84 @@ class TestMilestoneEligibilityGate:
         )
 
 
+class TestClaimantLivenessDispatchGate:
+    """Mechanism 1 (task 2408): Scheduler._eligible_for_dispatch refuses to
+    dispatch a pending task that currently has a LIVE claimant (fresh
+    heartbeat) — the acquire_next-level safety net against dispatching into
+    an already-claimed worktree (reconcile/race/multi-host).
+
+    Because _eligible_for_dispatch is the single gate shared by both the
+    scored-candidate path (_phase_build_candidates) and the pin-dispatch path
+    (_phase_select_pins), this one gate covers both automatically — no
+    separate pin-path test is needed.
+
+    Mirrors TestMilestoneEligibilityGate's injected wall_time_source pattern
+    (heartbeat_at is a wall-clock ISO timestamp, so staleness must be
+    evaluated against the injected wall clock, not the monotonic time_source).
+    """
+
+    FIXED_DT = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
+
+    def _pending_task_with_claimant(
+        self,
+        task_id: str,
+        claimant_run_id: str | None,
+        heartbeat_at: str | None,
+    ) -> dict:
+        return {
+            'id': task_id,
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {},
+            'claimant_run_id': claimant_run_id,
+            'heartbeat_at': heartbeat_at,
+        }
+
+    def test_live_claimant_refuses_dispatch(self):
+        heartbeat = (self.FIXED_DT - timedelta(minutes=1)).isoformat()  # fresh (ttl=300s default)
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
+
+        task = self._pending_task_with_claimant('5001', 'run-x/session-y/pid=1', heartbeat)
+        status_map: dict[str, str] = {}
+
+        assert scheduler._eligible_for_dispatch(task, '5001', status_map) == (False, None)
+
+    def test_no_claimant_is_eligible(self):
+        """A normal freshly-pending task (claimant_run_id=None) is unaffected
+        — the gate is a no-op for the common case."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
+
+        task = self._pending_task_with_claimant('5002', None, None)
+        status_map: dict[str, str] = {}
+
+        assert scheduler._eligible_for_dispatch(task, '5002', status_map) == (True, None)
+
+    def test_stale_claimant_heartbeat_is_eligible(self):
+        """Stale != live: a heartbeat older than the ttl does not refuse
+        dispatch (that is mechanism 2's job — the blocked-redispatch sweep —
+        not this gate)."""
+        heartbeat = (self.FIXED_DT - timedelta(seconds=301)).isoformat()  # stale (ttl=300s)
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
+
+        task = self._pending_task_with_claimant('5003', 'run-x/session-y/pid=1', heartbeat)
+        status_map: dict[str, str] = {}
+
+        assert scheduler._eligible_for_dispatch(task, '5003', status_map) == (True, None)
+
+    def test_kill_switch_disables_gate(self):
+        heartbeat = (self.FIXED_DT - timedelta(minutes=1)).isoformat()  # fresh
+        config = OrchestratorConfig(max_per_module=1, claimant_dispatch_gate_enabled=False)
+        scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
+
+        task = self._pending_task_with_claimant('5004', 'run-x/session-y/pid=1', heartbeat)
+        status_map: dict[str, str] = {}
+
+        assert scheduler._eligible_for_dispatch(task, '5004', status_map) == (True, None)
+
+
 class TestStampMilestoneDepsSatisfied:
     """Unit tests for the per-tick sweep
     Scheduler._stamp_milestone_deps_satisfied (task 2335 β step-5/6).
