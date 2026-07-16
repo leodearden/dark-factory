@@ -93,7 +93,13 @@ class TestOrchestratorConfigRoundTripsWithNewFields:
         cfg = OrchestratorConfig()
         assert cfg.routing.ladder == list(DEFAULT_LADDER)
         assert cfg.routing.per_model_daily_ceiling_usd == {}
-        assert cfg.routing.rules == []
+        # Step-10 ships one default policy rule via defaults.yaml (the
+        # byte-equivalent transcription of the pre-epsilon Rust heuristic) --
+        # this is no longer the bare RoutingConfig() pydantic default (see
+        # TestRoutingConfigDefaults.test_rules_defaults_empty for that), but
+        # OrchestratorConfig() still constructs and validates fine with it
+        # present, which is this test's actual point.
+        assert [r.id for r in cfg.routing.rules] == ['rust-large-plan-implementer']
 
     def test_orchestrator_config_with_rule_constructs_ok(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)

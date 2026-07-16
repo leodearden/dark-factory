@@ -186,6 +186,29 @@ timeouts:
   # max(working_idle_secs, the per-role ceiling above).
   working_idle_secs: 1800
 
+# Model routing policy (task epsilon, plans/adaptive-model-routing-prd.md).
+# allowed_models is deliberately NOT set here -- it stays sourced from
+# routing.DEFAULT_ALLOWED_MODELS (task beta's "allowlist home"), so that
+# schema and its default remain single-sourced. `ladder` orders models
+# weakest -> strongest for a policy rule's ladder-relative "+N" bumps
+# (RuleSet.model), clamped at the top.
+routing:
+  ladder: [haiku, sonnet, opus]
+  per_model_daily_ceiling_usd: {}
+  rules:
+    # Transcribes the pre-epsilon _select_model_for_role Rust heuristic
+    # byte-for-byte: implementer/debugger on a plan with >=3 'crates/'
+    # modules and >=12 steps upgrades to opus. One shared rule id covers
+    # both roles -- see test_routing_byte_equivalence.py.
+    - id: rust-large-plan-implementer
+      match:
+        role: [implementer, debugger]
+        plan_min_steps: 12
+        plan_min_modules: 3
+        module_prefix: "crates/"
+      set:
+        model: opus
+
 # Models per role
 models:
   architect: "opus"
