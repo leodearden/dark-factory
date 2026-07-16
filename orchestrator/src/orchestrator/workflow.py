@@ -5584,6 +5584,115 @@ class TaskWorkflow:
             )
             return []
 
+    async def _rederive_step_status_from_branch_state(self) -> list[str]:
+        """Re-derive stale-``pending`` plan steps to ``done`` from the
+        durable iteration log's ``steps_completed`` records (task 2387).
+
+        Unions every ``.task/iterations.jsonl`` entry's ``steps_completed``
+        into the set of step IDs genuinely completed on this branch, then
+        flips any plan.json step currently "pending" whose ID is in that set
+        to "done" — recording the post-rebase HEAD (not the log entry's own
+        ``commit``) as the step's commit. The log-reported commit is a
+        *pre-rebase* SHA: this method runs immediately after
+        ``rebase_preserving_task_commits`` has already rewritten the branch
+        onto the new base, so that SHA is virtually guaranteed to be
+        unreachable from the new HEAD. Recording it anyway would manufacture
+        exactly the "done step with an orphaned commit" condition
+        :meth:`_reconcile_done_step_commits` exists to repair — and that
+        repair only succeeds when the step's code happens to have been
+        folded into a WIP safety-commit sitting at HEAD; otherwise it falls
+        through to a non-blocking info escalation on every such rebase.
+        Recording ``head`` directly satisfies the reachable-commit invariant
+        up front instead of depending on that downstream heuristic.
+
+        GUARD: only reconciles when :meth:`_has_prior_implementation`
+        (called with the current branch HEAD, i.e. SHA-primary mode) reports
+        ``has_work=True`` — branch-SHA divergence from base AND at least one
+        genuine implementer/debugger log entry. This is the same
+        battle-tested false-DONE protection used elsewhere in this class; it
+        prevents re-deriving a step to "done" from an inherited/contaminated
+        ``iterations.jsonl`` on a branch that has no real commits beyond
+        base. Reuses ``status.entries`` from the guard call rather than
+        re-reading the iteration log.
+
+        **Granularity caveat**: the guard above is branch-level, not
+        per-step — it only asserts that *some* genuine work landed on this
+        branch, then trusts every step id named anywhere in the union of
+        ``steps_completed``. It does not verify that any individual step's
+        own commit is reachable or that its claimed files actually changed.
+        A log entry that over-claims (names a step in ``steps_completed``
+        whose own change was later reverted or failed) is still flipped to
+        "done" as long as the branch has real work elsewhere. This mirrors
+        the project's existing trust-the-durable-log design (see this
+        task's design_decisions) — per-step correctness depends entirely on
+        implementer log fidelity, not on independent per-step verification.
+
+        Emits a single ``event='plan_step_rederive'`` iteration-log entry
+        (naming every re-derived step id) when at least one step is
+        re-derived; emits nothing on a clean pass, so the common case does
+        not pollute the log other tests/tools scan.
+
+        Best-effort and defensive, identical posture to
+        :meth:`_detect_tip_wip_commits` / :meth:`_reconcile_done_step_commits`:
+        returns ``[]`` on any missing collaborator (``worktree``/``git_ops``/
+        ``artifacts``), unset ``base_commit``, or internal error — a false
+        negative here just reverts to today's (buggy) baseline rather than
+        sinking the iteration loop.
+
+        Returns the list of step IDs re-derived.
+        """
+        if self.worktree is None or self.git_ops is None or self.artifacts is None:
+            return []
+        base = self.artifacts.read_base_commit()
+        if not base:
+            return []
+        try:
+            head = await self._get_head_commit()
+            status = self._has_prior_implementation(wt_head=head)
+            if not status.has_work:
+                return []
+
+            completed_ids: set[str] = set()
+            for entry in status.entries:
+                completed_ids.update(entry.get('steps_completed') or [])
+
+            plan = self.artifacts.read_plan()
+            rederived: list[str] = []
+            for collection in ('prerequisites', 'steps'):
+                for item in plan.get(collection, []):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get('status') == 'pending' and item.get('id') in completed_ids:
+                        step_id = item['id']
+                        # Always record post-rebase HEAD, never the log's
+                        # pre-rebase commit — see the docstring above.
+                        self.artifacts.update_step_status(step_id, 'done', commit=head)
+                        rederived.append(step_id)
+
+            if rederived:
+                self.artifacts.append_iteration_log({
+                    'iteration': self.metrics.execute_iterations,
+                    'agent': 'orchestrator',
+                    'event': 'plan_step_rederive',
+                    'rederived_steps': rederived,
+                    'source': 'orchestrator',
+                    'summary': (
+                        f'Re-derived {len(rederived)} plan step(s) from branch '
+                        f'state after rebase: {rederived}'
+                    ),
+                })
+                logger.info(
+                    'Task %s: re-derived plan step status from branch state: %s',
+                    self.task_id, rederived,
+                )
+            return rederived
+        except Exception:
+            logger.warning(
+                'Plan step status re-derivation failed; leaving plan.json unchanged',
+                exc_info=True,
+            )
+            return []
+
     async def _inter_iteration_rebase(
         self, *, event_label: str = 'rebase',
     ) -> dict | None:
@@ -5635,6 +5744,16 @@ class TaskWorkflow:
             return None
 
         self.artifacts.update_base_commit(current_main)
+
+        # Re-derive any plan step whose status regressed to (or never
+        # advanced past) "pending" even though it's genuinely complete on
+        # this branch (task 2387) — before task 2386's
+        # _reconcile_done_step_commits and the loop's self.plan = read_plan()
+        # re-reads (see _execute_iterations), so a pending->done flip here is
+        # picked up as part of that same refresh. Best-effort/self-contained
+        # (never raises), so the return dict and event-label behavior below
+        # are unaffected.
+        await self._rederive_step_status_from_branch_state()
 
         # Capture is_first BEFORE incrementing the counter (0 == this is the
         # first rebase of a fresh per-dispatch WorkflowMetrics instance).
