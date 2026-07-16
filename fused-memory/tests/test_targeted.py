@@ -141,6 +141,51 @@ async def test_on_task_done_fast_path_write_stamps_stage2_suppress(reconciler, m
 
 
 @pytest.mark.asyncio
+async def test_on_task_done_deferred_write_does_not_persist_stage2_suppress(
+    reconciler, mock_memory_service, mock_event_buffer,
+):
+    """A deferred fast-path echo must not make stage2_suppress visible yet.
+
+    Task 2642 amendment (reviewer_comprehensive test_coverage): when a full
+    cycle is active, _fenced_add_memory parks the write in the event buffer
+    via defer_write instead of calling memory.add_memory -- so the
+    stage2_suppress tag never reaches the memory store's queryable index
+    this cycle. Stage 2's count_memories_by_metadata gate must therefore
+    correctly stay at 0 for this task until the deferred write is later
+    flushed; it must never be fooled by a write that only exists in the
+    buffer, locking in the fail-safe behavior noted in
+    test_on_task_done_fast_path_write_stamps_stage2_suppress above.
+    """
+    mock_event_buffer.is_full_recon_active = AsyncMock(return_value=True)
+    task_before = {
+        'id': '5192', 'title': 'Fix the thing', 'status': 'in-progress',
+        'description': 'Some description',
+    }
+    result = await reconciler.reconcile_task(
+        task_id='5192', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before=task_before,
+    )
+
+    # Nothing was persisted directly to the memory store -- the write was
+    # deferred to the event buffer instead, so no stage2_suppress-tagged
+    # memory exists yet for Stage 2's count gate to find.
+    assert mock_memory_service.add_memory.call_args_list == [], (
+        'Expected no direct add_memory calls while a full cycle is active -- '
+        'the fast-path write must be deferred, not persisted.'
+    )
+    assert any(a['type'] == 'knowledge_deferred_fast' for a in result.get('actions', []))
+
+    # The deferred write DOES carry stage2_suppress (it's the same
+    # write_metadata, merely parked) -- confirming the tag itself isn't
+    # lost, only not yet visible to the deterministic count gate.
+    defer_calls = mock_event_buffer.defer_write.call_args_list
+    assert len(defer_calls) >= 1
+    deferred_metadata = defer_calls[0].kwargs.get('metadata') or {}
+    assert deferred_metadata.get('stage2_suppress') is True
+    assert deferred_metadata.get('task_id') == '5192'
+
+
+@pytest.mark.asyncio
 async def test_on_task_done_passes_causation_id(reconciler, mock_memory_service):
     """All memory calls during targeted recon pass causation_id=run_id."""
     task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
