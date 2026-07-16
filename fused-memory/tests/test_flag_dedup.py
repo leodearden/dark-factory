@@ -2964,6 +2964,234 @@ class TestFilterFalseAbsenceFlags:
 
 
 # ---------------------------------------------------------------------------
+# task-2525 step-3: PHANTOM_TASK_CREATION_FLAG_TYPES +
+# filter_false_phantom_task_creation_flags (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterFalsePhantomTaskCreationFlags:
+    """RED tests for async filter_false_phantom_task_creation_flags(
+    taskmaster, known_projects, flags) (task-2525 step-3).
+
+    Drops a phantom-tasks_created finding ONLY when a cited task is
+    POSITIVELY confirmed present in a known project (corroborated => not
+    phantom). Keeps the finding on absent / inconclusive / unresolvable-
+    project citations — fail-safe: never suppress a genuine phantom on
+    uncertain data.
+
+    RED until step-4 adds PHANTOM_TASK_CREATION_FLAG_TYPES and
+    filter_false_phantom_task_creation_flags to flag_dedup.py.
+    """
+
+    @staticmethod
+    def _make_flag(cited_tasks=None, flag_type='phantom_tasks_created', **overrides):
+        flag = {
+            'task_id': None,
+            'flag_type': flag_type,
+            'category': 'task_memory_mismatch',
+            'description': 'Stage 2 reported tasks_created=1 but no corroborating task found',
+            'suggested_action': 'investigate',
+            'actionable': False,
+            'cited_tasks': cited_tasks if cited_tasks is not None else [],
+        }
+        flag.update(overrides)
+        return flag
+
+    @pytest.mark.asyncio
+    async def test_phantom_finding_dropped_when_cited_task_present_in_other_project(self):
+        """Case (a): cited task positively present in a NON-origin known project => DROPPED."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_phantom_task_creation_flags
+
+        taskmaster = AsyncMock()
+        present_task = {'id': '42', 'title': 'Foreign task', 'status': 'pending'}
+        taskmaster.get_task = AsyncMock(return_value=present_task)
+        known_projects = {'origin': '/origin', 'other': '/other'}
+
+        flag = self._make_flag(cited_tasks=[
+            {'project_id': 'other', 'task_id': '42', 'title': 'Foreign task'},
+        ])
+        result = await filter_false_phantom_task_creation_flags(taskmaster, known_projects, [flag])
+
+        assert result == [], (
+            'Phantom finding must be DROPPED when the cited task is positively present '
+            f'in a known cross-project; got {result!r}'
+        )
+        taskmaster.get_task.assert_called_once_with('42', '/other')
+
+    @pytest.mark.asyncio
+    async def test_phantom_finding_dropped_for_tasks_created_phantom_alias(self):
+        """The 'tasks_created_phantom' alias is also recognised (constant membership)."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_phantom_task_creation_flags
+
+        taskmaster = AsyncMock()
+        present_task = {'id': '42', 'title': 'Foreign task', 'status': 'pending'}
+        taskmaster.get_task = AsyncMock(return_value=present_task)
+        known_projects = {'origin': '/origin', 'other': '/other'}
+
+        flag = self._make_flag(
+            flag_type='tasks_created_phantom',
+            cited_tasks=[{'project_id': 'other', 'task_id': '42', 'title': 'Foreign task'}],
+        )
+        result = await filter_false_phantom_task_creation_flags(taskmaster, known_projects, [flag])
+
+        assert result == [], (
+            f"'tasks_created_phantom' alias must also be dropped on corroboration; got {result!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_phantom_finding_kept_when_cited_task_not_found(self):
+        """Case (b): cited task is not-found in its cited project => KEPT."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_phantom_task_creation_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={
+            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 42',
+            'error_type': 'TaskmasterError',
+        })
+        known_projects = {'origin': '/origin', 'other': '/other'}
+
+        flag = self._make_flag(cited_tasks=[
+            {'project_id': 'other', 'task_id': '42', 'title': 'Ghost task'},
+        ])
+        result = await filter_false_phantom_task_creation_flags(taskmaster, known_projects, [flag])
+
+        assert result == [flag], (
+            f'Phantom finding must be KEPT when the cited task is not-found; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_phantom_finding_kept_on_inconclusive_error(self):
+        """Case (c): inconclusive/generic get_task error => KEPT (fail-safe)."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_phantom_task_creation_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={
+            'error': 'Connection timeout', 'error_type': 'TimeoutError',
+        })
+        known_projects = {'origin': '/origin', 'other': '/other'}
+
+        flag = self._make_flag(cited_tasks=[
+            {'project_id': 'other', 'task_id': '42', 'title': 'Unclear task'},
+        ])
+        result = await filter_false_phantom_task_creation_flags(taskmaster, known_projects, [flag])
+
+        assert result == [flag], (
+            'Phantom finding must be KEPT on inconclusive get_task error (fail-safe); '
+            f'got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_phantom_flag_passes_through_with_zero_get_task_calls(self):
+        """Case (d): non-phantom flag_types pass through untouched; ZERO get_task calls issued."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_phantom_task_creation_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'title': 'x', 'status': 'pending'})
+        known_projects = {'origin': '/origin', 'other': '/other'}
+
+        flag = self._make_flag(
+            flag_type='task_memory_mismatch',
+            cited_tasks=[{'project_id': 'other', 'task_id': '42', 'title': 'Irrelevant'}],
+        )
+        result = await filter_false_phantom_task_creation_flags(taskmaster, known_projects, [flag])
+
+        assert result == [flag], 'Non-phantom flag must pass through unchanged'
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_noop_passthrough_when_taskmaster_falsy(self):
+        """Case (e): taskmaster falsy => no-op pass-through (returns list(flags))."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_phantom_task_creation_flags
+
+        known_projects = {'origin': '/origin', 'other': '/other'}
+        flag = self._make_flag(
+            cited_tasks=[{'project_id': 'other', 'task_id': '42', 'title': 't'}]
+        )
+
+        result = await filter_false_phantom_task_creation_flags(None, known_projects, [flag])
+
+        assert result == [flag], 'Must no-op pass through unchanged when taskmaster is falsy'
+
+    @pytest.mark.asyncio
+    async def test_noop_passthrough_when_known_projects_empty_or_none(self):
+        """Case (e): known_projects empty/None => no-op pass-through."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_phantom_task_creation_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'pending'})
+        flag = self._make_flag(
+            cited_tasks=[{'project_id': 'other', 'task_id': '42', 'title': 't'}]
+        )
+
+        result_empty = await filter_false_phantom_task_creation_flags(taskmaster, {}, [flag])
+        result_none = await filter_false_phantom_task_creation_flags(taskmaster, None, [flag])
+
+        assert result_empty == [flag], 'Must no-op pass through when known_projects == {}'
+        assert result_none == [flag], 'Must no-op pass through when known_projects is None'
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_cited_project_skips_lookup_and_keeps_finding(self):
+        """Case (f): cited_tasks entry's project_id absent from known_projects => skipped, KEPT."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_phantom_task_creation_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'id': '42', 'status': 'pending'})
+        known_projects = {'origin': '/origin'}  # 'other' is NOT known
+
+        flag = self._make_flag(cited_tasks=[
+            {'project_id': 'other', 'task_id': '42', 'title': 'Unresolvable'},
+        ])
+        result = await filter_false_phantom_task_creation_flags(taskmaster, known_projects, [flag])
+
+        assert result == [flag], (
+            'Finding with an unresolvable cited project must be KEPT (not corroborated); '
+            f'got {result!r}'
+        )
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_input_order_preserved(self):
+        """Case (g): input order of the returned list is preserved."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_phantom_task_creation_flags
+
+        present_task = {'id': '42', 'title': 'Foreign task', 'status': 'pending'}
+        not_found = {
+            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 99',
+            'error_type': 'TaskmasterError',
+        }
+
+        async def _mock_get_task(task_id, project_root, **_kw):
+            if str(task_id) == '42':
+                return present_task
+            return not_found
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_mock_get_task)
+        known_projects = {'origin': '/origin', 'other': '/other'}
+
+        flag_a = self._make_flag(
+            flag_type='task_memory_mismatch', cited_tasks=[], description='first, non-phantom',
+        )
+        flag_b = self._make_flag(  # dropped (corroborated)
+            cited_tasks=[{'project_id': 'other', 'task_id': '42', 'title': 'Foreign task'}],
+            description='second, dropped',
+        )
+        flag_c = self._make_flag(  # kept (not-found)
+            cited_tasks=[{'project_id': 'other', 'task_id': '99', 'title': 'Ghost'}],
+            description='third, kept',
+        )
+
+        result = await filter_false_phantom_task_creation_flags(
+            taskmaster, known_projects, [flag_a, flag_b, flag_c]
+        )
+
+        assert result == [flag_a, flag_c], (
+            f'Result must preserve input order with flag_b dropped; got {result!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task-1654 step-1 — RED: compute_content_fingerprint_signature tests
 # ---------------------------------------------------------------------------
 
