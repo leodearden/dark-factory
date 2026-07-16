@@ -1288,3 +1288,135 @@ class TestRunDeterministicSnapshotWrite:
         assert report.stats['task_count_snapshot_written'] == 0
         mock_write.assert_not_awaited()
         mock_verify.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# TaskKnowledgeSync.run() wiring — live-cycle prune observability (task 2646
+# step-7/8)
+# ---------------------------------------------------------------------------
+
+
+class TestRunSurfacesPruneObservability:
+    """run() surfaces the REAL (unpatched) prune's enumerate/delete/
+    enumeration_ok counts in report.stats (task 2646).
+
+    Unlike TestRunDeterministicSnapshotWrite, this class does NOT patch
+    _write_task_count_snapshot -- it lets the real _write_task_count_snapshot
+    -> _prune_task_count_snapshots call chain run inside a live stage.run()
+    cycle. This is the only kind of test that would have caught the
+    incident this task exists to guard against: the prune enumerating
+    nothing at runtime while everything looked correct in code review
+    (the existing run()-level tests all patch the write out, so the real
+    prune never executes under test).
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 1
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.search.return_value = []
+        memory_service.add_memory.return_value = {'memory_ids': []}
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {'tasks': []}
+        return {
+            'memory_service': memory_service,
+            'taskmaster': taskmaster,
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def _fake_cli_result(self):
+        return MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1, tokens_used=0, cost_usd=0.0,
+            model='test-model', error=None,
+        )
+
+    @staticmethod
+    def _seed_snapshot_records(count):
+        return [
+            {
+                'id': f'snap-{i}',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'kind': TASK_COUNT_SNAPSHOT_KIND},
+            }
+            for i in range(count)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_live_prune_success_surfaces_actual_counts(self, mock_deps):
+        """Case (a): the real prune enumerates and deletes 2 seeded stale
+        snapshots; report.stats reflects the actual enumerated/deleted
+        counts and enumeration_ok=1."""
+        seeded = self._seed_snapshot_records(2)
+
+        def _get_memories_by_metadata(*, project_id, filters, **kwargs):
+            # Isolates the prune's counts from _sweep_stale_persistence_markers,
+            # which shares this same method with a different filter shape
+            # within a single run() cycle (design_decisions, task 2646 plan).
+            if filters == {'kind': TASK_COUNT_SNAPSHOT_KIND}:
+                return seeded
+            return []
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            side_effect=_get_memories_by_metadata,
+        )
+
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('reify', '/tmp/test'),
+            **mock_deps,
+        )
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=self._fake_cli_result()),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='run-prune-live-ok',
+            )
+
+        assert report.stats['task_count_snapshot_prune_enumerated'] == 2
+        assert report.stats['task_count_snapshot_pruned'] == 2
+        assert report.stats['task_count_snapshot_prune_enumeration_ok'] == 1
+        mock_deps['memory_service'].add_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_live_silent_enumeration_failure_surfaces_as_not_ok(self, mock_deps):
+        """Case (b), the incident fingerprint: enumeration RAISES inside the
+        real prune, yet the canonical add_memory write still proceeds.
+        report.stats must show enumeration_ok=0 / enumerated=0 -- runtime-
+        observably distinct from a genuine empty result -- rather than
+        silently looking like nothing was ever there to prune."""
+
+        def _get_memories_by_metadata(*, project_id, filters, **kwargs):
+            if filters == {'kind': TASK_COUNT_SNAPSHOT_KIND}:
+                raise RuntimeError('mem0 down')
+            return []
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            side_effect=_get_memories_by_metadata,
+        )
+
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('reify', '/tmp/test'),
+            **mock_deps,
+        )
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=self._fake_cli_result()),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='run-prune-live-fail',
+            )
+
+        assert report.stats['task_count_snapshot_prune_enumeration_ok'] == 0
+        assert report.stats['task_count_snapshot_prune_enumerated'] == 0
+        mock_deps['memory_service'].add_memory.assert_awaited_once()
