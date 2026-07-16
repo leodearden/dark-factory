@@ -220,9 +220,10 @@ async def apply_corrections(
     dry run can never mutate anything, mirroring every other
     ``fused-memory/scripts/`` remediation tool's dry-run contract.
 
-    ``apply=True`` executes each correction with per-op isolation (added in
-    later steps of this module's build-out) so one failure never aborts the
-    batch.
+    ``apply=True`` executes each correction with per-op try/except
+    isolation (mirroring ``apply_audit_annotations``) so one failure is
+    logged loudly and counted under ``errors``, never silently swallowed
+    and never aborting the rest of the batch.
 
     Returns a summary dict:
       - ``dry_run``: ``not apply``, echoed back.
@@ -257,23 +258,30 @@ async def apply_corrections(
         return summary
 
     for correction in corrections:
-        if correction.action == ACTION_ANNOTATE:
-            await _apply_annotate(backend, project_root, correction, tag)
-            summary['annotated'] += 1
-        elif correction.action == ACTION_REOPEN:
-            reopened = await _apply_reopen(backend, project_root, correction, tag)
-            if reopened:
-                summary['reopened'] += 1
-            else:
-                # Loud, not silent: a reopen that did not verifiably
-                # persist is recorded as a failure and counted as an
-                # error, but the batch is NOT aborted — the next
-                # correction still gets a chance to apply.
-                summary['reopen_failed'].append(correction.task_id)
-                summary['errors'] += 1
-            # Per-op error isolation (try/except around each correction so
-            # one raised exception never aborts the batch) lands in a
-            # later step of this task's step sequence.
+        try:
+            if correction.action == ACTION_ANNOTATE:
+                await _apply_annotate(backend, project_root, correction, tag)
+                summary['annotated'] += 1
+            elif correction.action == ACTION_REOPEN:
+                reopened = await _apply_reopen(backend, project_root, correction, tag)
+                if reopened:
+                    summary['reopened'] += 1
+                else:
+                    # Loud, not silent: a reopen that did not verifiably
+                    # persist is recorded as a failure and counted as an
+                    # error, but the batch is NOT aborted — the next
+                    # correction still gets a chance to apply.
+                    summary['reopen_failed'].append(correction.task_id)
+                    summary['errors'] += 1
+        except Exception as exc:  # noqa: BLE001 - per-op isolation, mirrors
+            # apply_audit_annotations: one correction's backend failure
+            # must never abort the batch. Logged loudly, counted as an
+            # error, and the loop continues to the next correction.
+            logger.error(
+                'Failed to apply %s correction for task %s: %s',
+                correction.action, correction.task_id, exc,
+            )
+            summary['errors'] += 1
 
     return summary
 
