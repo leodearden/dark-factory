@@ -2035,6 +2035,16 @@ class OrchestratorConfig(BaseSettings):
     verify_admission_nice_merge: str = Field(default='')
     verify_admission_nice_task: str = Field(default='')
     verify_admission_nice_background: str = Field(default='')
+    # pytest-xdist worker count applied to the test leg for roles {task,
+    # background} only ('merge' is never `-n`-capped — it bypasses admission
+    # slot-counting and is latency-critical). Default 'auto' is the T6
+    # benchmark report's recommendation (plans/verify-oversubscription-
+    # benchmark-2026-07-14.md): a sustained, heavily-contended host precluded
+    # a clean-idle-window measurement supporting a specific cap, so the
+    # behavior-preserving value is kept — '' or 'auto' is a no-op (byte-
+    # identical to today's `-n auto` pyproject addopts); any other value is
+    # rendered as a literal `-n <value>` (see verify_cmd.apply_pytest_numprocesses).
+    verify_admission_pytest_n: str = Field(default='auto')
 
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
@@ -3215,15 +3225,17 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'git.offline_lane_test_threads',
         'git.offline_lane_poll_interval_secs',
         'git.offline_lane_red_advances_before_blocker',
-        # Verify admission control (task 2390 T2) — all six knobs are
-        # green-tier: an operator can retune slot counts / nice tiers /
-        # toggle the gate without a process restart.
+        # Verify admission control (task 2390 T2; task 2394 T6 adds the
+        # seventh, `_pytest_n`) — all seven knobs are green-tier: an operator
+        # can retune slot counts / nice tiers / the -n cap / toggle the gate
+        # without a process restart.
         'verify_admission_enabled',
         'verify_admission_task_slots',
         'verify_admission_slots_dir',
         'verify_admission_nice_merge',
         'verify_admission_nice_task',
         'verify_admission_nice_background',
+        'verify_admission_pytest_n',
         # Merge-role internal-fanout cap (task 2393, T5) — same knob family:
         # read fresh per run_scoped_verification call, so a live reload
         # lowers the merge fan-out without a restart.
