@@ -605,6 +605,191 @@ class TestDeriveVerifyPlanTaskRoleFloor:
 
 
 # ---------------------------------------------------------------------------
+# derive_verify_plan: merge role + merge_verify_breadth fork (λ, task 2589 step-5: RED)
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveVerifyPlanMergeBreadth:
+    """λ (task 2589), R1/R2/R4: the broad merge gate's breadth knob.
+
+    role='merge' + config.merge_verify_breadth='full' full-suites EVERY PASSED
+    module's EVERY configured command (pytest+ruff+pyright) — even a module the
+    diff never touches — closing the "only the touched modules are protected"
+    gap the task-role floor deliberately does not close (R1: the floor never
+    widens beyond owning modules; only the merge+full gate does). breadth=
+    'scoped' (the shipped default) keeps role='merge' byte-identical to the
+    legacy _derive_module_runs shape (R4 — the gate's rollback path).
+    """
+
+    # -- (a) role='merge' + breadth='full' ------------------------------------
+
+    def test_merge_full_breadth_full_suites_every_passed_module(self):
+        """(a) EVERY passed module full-suites each configured command, including
+        a module the diff never touches at all; a module missing a command gets
+        an explicit SKIPPED for that tool, never a fabricated run."""
+        mc_a = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+            type_check_command='uv run --directory orchestrator pyright src/',
+        )
+        mc_b = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+            # No type_check_command configured -> pyright must SKIP, never fabricate.
+        )
+        config = OrchestratorConfig(project_root=Path('/fake'), merge_verify_breadth='full')
+
+        plan = derive_verify_plan(
+            SOURCE_ONLY_DIFF, [mc_a, mc_b], config, fake_worktree_reader, role='merge',
+        )
+
+        # mc_a: touched by the diff -- still FULL_SUITE (never file-scoped) at
+        # this breadth, for all three tools.
+        pytest_a = _run_for(plan, 'orchestrator', 'pytest:')
+        assert pytest_a is not None
+        assert pytest_a.scope_kind is ScopeKind.FULL_SUITE
+        assert pytest_a.cmd == parse_config_command(mc_a.test_command)
+        assert 'merge' in pytest_a.reason.lower()
+        assert 'full' in pytest_a.reason.lower() or 'registered' in pytest_a.reason.lower()
+
+        lint_a = _run_for(plan, 'orchestrator', 'lint:')
+        assert lint_a is not None
+        assert lint_a.scope_kind is ScopeKind.FULL_SUITE
+        assert lint_a.cmd == parse_config_command(mc_a.lint_command)
+        assert 'merge' in lint_a.reason.lower()
+
+        pyright_a = _run_for(plan, 'orchestrator', 'pyright:')
+        assert pyright_a is not None
+        assert pyright_a.scope_kind is ScopeKind.FULL_SUITE
+        assert pyright_a.cmd == parse_config_command(mc_a.type_check_command)
+        assert 'merge' in pyright_a.reason.lower()
+
+        # mc_b: NOT touched by the diff at all -- still FULL_SUITE (R1: the
+        # broad merge gate covers every REGISTERED module passed to it, not
+        # just the modules the diff happens to touch).
+        pytest_b = _run_for(plan, 'shared', 'pytest:')
+        assert pytest_b is not None
+        assert pytest_b.scope_kind is ScopeKind.FULL_SUITE
+        assert pytest_b.cmd == parse_config_command(mc_b.test_command)
+
+        lint_b = _run_for(plan, 'shared', 'lint:')
+        assert lint_b is not None
+        assert lint_b.scope_kind is ScopeKind.FULL_SUITE
+        assert lint_b.cmd == parse_config_command(mc_b.lint_command)
+
+        # mc_b has no type_check_command configured -> explicit SKIPPED, never
+        # a fabricated pyright run.
+        pyright_b = _run_for(plan, 'shared', 'pyright:')
+        assert pyright_b is not None
+        assert pyright_b.scope_kind is ScopeKind.SKIPPED
+        assert pyright_b.cmd is None
+
+    # -- (b) role='merge' + breadth='scoped' (R4 rollback golden) ------------
+
+    def test_merge_scoped_breadth_source_only_matches_legacy_skipped(self):
+        """(b) source-only diff, breadth='scoped' (config=None) -> pytest SKIPPED,
+        byte-identical to the pre-λ legacy _derive_module_runs shape."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            SOURCE_ONLY_DIFF, [mc], None, fake_worktree_reader, role='merge',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.SKIPPED
+        assert run.cmd is None
+        assert run.reason == 'pytest: no collectable test files touched — nothing to run'
+
+    def test_merge_scoped_breadth_collectable_test_matches_legacy_file_scoped(self):
+        """(b) a real touched test file, breadth='scoped' -> pytest FILE_SCOPED,
+        byte-identical to the pre-λ legacy shape."""
+        mc = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+        )
+        plan = derive_verify_plan(
+            ['shared/tests/test_x.py'], [mc], None, fake_worktree_reader, role='merge',
+        )
+        run = _run_for(plan, 'shared', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.cmd is not None
+        assert 'shared/tests/test_x.py' in run.cmd.targets
+
+    def test_merge_scoped_breadth_structural_matches_legacy_pyright_widen_pytest_skip(self):
+        """(b) structural-only diff, breadth='scoped' -> pyright FULL_SUITE (D2,
+        role/breadth-independent) AND pytest SKIPPED (the floor never fires for
+        role='merge'), byte-identical to the pre-λ legacy shape."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --project orchestrator --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+            type_check_command=(
+                'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
+            ),
+        )
+        plan = derive_verify_plan(
+            STRUCTURAL_DIFF, [mc], None, fake_worktree_reader, role='merge',
+        )
+
+        pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
+        assert pyright_run is not None
+        assert pyright_run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.type_check_command is not None
+        assert pyright_run.cmd == parse_config_command(mc.type_check_command)
+
+        pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert pytest_run is not None
+        assert pytest_run.scope_kind is ScopeKind.SKIPPED
+
+    def test_merge_scoped_breadth_conftest_matches_legacy_full_suite(self):
+        """(b) conftest diff, breadth='scoped' -> pytest FULL_SUITE (D1,
+        role/breadth-independent), byte-identical to the pre-λ legacy shape."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command=(
+                'uv run --project orchestrator --directory orchestrator '
+                'pytest tests/ --tb=short -q'
+            ),
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            ROOT_CONFTEST_DIFF, [mc], None, fake_worktree_reader, role='merge',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.test_command is not None
+        assert run.cmd == parse_config_command(mc.test_command)
+        assert 'conftest' in run.reason.lower()
+
+    # -- (c) TRIVIAL short-circuit is breadth-independent (R2) ----------------
+
+    def test_docs_only_diff_stays_trivial_at_merge_full_breadth(self):
+        """(c) An all-INERT diff never fabricates FULL_SUITE runs even under
+        role='merge' + breadth='full' — the TRIVIAL short-circuit in
+        derive_verify_plan runs before the module-config branch is ever
+        reached, so it is unconditionally breadth-independent."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+        )
+        config = OrchestratorConfig(project_root=Path('/fake'), merge_verify_breadth='full')
+        plan = derive_verify_plan(
+            _ALL_INERT_DIFF, [mc], config, fake_worktree_reader, role='merge',
+        )
+        assert len(plan.runs) == 1
+        assert plan.runs[0].scope_kind is ScopeKind.TRIVIAL
+        assert plan.needs_pipeline_guard_check is True
+
+
+# ---------------------------------------------------------------------------
 # derive_verify_plan: fallback branch (step-9: RED)
 # ---------------------------------------------------------------------------
 
