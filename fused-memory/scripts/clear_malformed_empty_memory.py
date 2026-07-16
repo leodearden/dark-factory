@@ -65,7 +65,11 @@ Usage
 
 from __future__ import annotations
 
+import argparse
+import asyncio
+import json
 import logging
+import sys
 from typing import Any
 
 logger = logging.getLogger('clear_malformed_empty_memory')
@@ -250,3 +254,90 @@ async def run(args: Any, qdrant_client: Any, collection_name: str) -> dict:
         deleted=deleted,
         payload=payload,
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build this script's argparse parser.
+
+    Factored out of :func:`main` (mirrors sweep_orphan_flag_markers.py /
+    consolidate_namespace_families.py) so the CLI surface is testable
+    without any live I/O.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            'Retrieve, fingerprint-confirm, and (with --apply) delete a '
+            'malformed/empty Mem0 (Qdrant) memory record by id.'
+        ),
+    )
+    parser.add_argument(
+        '--memory-id', dest='memory_id', required=True,
+        help='Qdrant point id of the memory record to inspect/clear.',
+    )
+    parser.add_argument(
+        '--project-id', dest='project_id', default='dark_factory',
+        help='Project scope the memory belongs to (default: dark_factory).',
+    )
+    parser.add_argument(
+        '--apply', action='store_true', default=False,
+        help=(
+            'Commit the deletion -- ONLY if the retrieved payload matches '
+            'the malformed-empty fingerprint (default: dry-run only, '
+            'prints the payload + classification report and exits).'
+        ),
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to a fused-memory config file (sets CONFIG_PATH before loading).',
+    )
+    return parser
+
+
+def main() -> int:
+    """Parse CLI args, build a live MemoryService, and run the cleanup."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(name)s %(levelname)s %(message)s',
+    )
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    if args.config:
+        import os  # noqa: PLC0415
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    async def _run_live() -> dict:
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.models.scope import Scope  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        memory = MemoryService(config)
+        try:
+            await memory.initialize()
+            collection = Scope(project_id=args.project_id).mem0_collection_name(
+                memory.mem0.config.mem0.collection_prefix,
+            )
+            qdrant = await memory.mem0._get_async_qdrant()
+            return await run(args, qdrant, collection)
+        finally:
+            if hasattr(memory, 'close'):
+                await memory.close()
+
+    try:
+        report = asyncio.run(_run_live())
+    except Exception:
+        logger.exception('clear_malformed_empty_memory: fatal error during cleanup')
+        return 2
+
+    print(json.dumps(report, indent=2, default=str))
+    if not args.apply:
+        logger.info('Dry run -- nothing was modified. Use --apply to commit the deletion.')
+    return resolve_exit_code(report)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
