@@ -5594,13 +5594,26 @@ class TaskWorkflow:
         to "done" — recording the commit the log entry reported the step
         completed at (last-wins across entries naming the same step id).
 
+        GUARD: only reconciles when :meth:`_has_prior_implementation`
+        (called with the current branch HEAD, i.e. SHA-primary mode) reports
+        ``has_work=True`` — branch-SHA divergence from base AND at least one
+        genuine implementer/debugger log entry. This is the same
+        battle-tested false-DONE protection used elsewhere in this class; it
+        prevents re-deriving a step to "done" from an inherited/contaminated
+        ``iterations.jsonl`` on a branch that has no real commits beyond
+        base. Reuses ``status.entries`` from the guard call rather than
+        re-reading the iteration log.
+
         Returns the list of step IDs re-derived.
         """
-        entries, _ = self.artifacts.read_iteration_log()
+        head = await self._get_head_commit()
+        status = self._has_prior_implementation(wt_head=head)
+        if not status.has_work:
+            return []
 
         completed_ids: set[str] = set()
         commit_by_id: dict[str, str] = {}
-        for entry in entries:
+        for entry in status.entries:
             for step_id in entry.get('steps_completed') or []:
                 completed_ids.add(step_id)
                 entry_commit = entry.get('commit')
@@ -5616,7 +5629,7 @@ class TaskWorkflow:
                 if item.get('status') == 'pending' and item.get('id') in completed_ids:
                     step_id = item['id']
                     self.artifacts.update_step_status(
-                        step_id, 'done', commit=commit_by_id.get(step_id),
+                        step_id, 'done', commit=commit_by_id.get(step_id, head),
                     )
                     rederived.append(step_id)
         return rederived
