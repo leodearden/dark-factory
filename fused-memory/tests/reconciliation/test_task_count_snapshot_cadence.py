@@ -46,6 +46,7 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
     ESCALATION_CATEGORY,
     SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY,
     SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY,
+    SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY,
     SNAPSHOT_PRUNED_STAT_KEY,
     SNAPSHOT_WRITTEN_STAT_KEY,
     TASK_COUNT_SNAPSHOT_CATEGORY,
@@ -97,6 +98,9 @@ class TestConstants:
 
     def test_prune_enumeration_ok_stat_key_value(self):
         assert SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY == 'task_count_snapshot_prune_enumeration_ok'
+
+    def test_prune_truncated_stat_key_value(self):
+        assert SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY == 'task_count_snapshot_prune_truncated'
 
     def test_miss_threshold_value(self):
         assert TASK_COUNT_SNAPSHOT_MISS_THRESHOLD == 2
@@ -607,6 +611,7 @@ class TestPruneSnapshotStats:
             'task_count_snapshot_prune_enumerated': 3,
             'task_count_snapshot_pruned': 3,
             'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
         }
 
     @pytest.mark.asyncio
@@ -631,6 +636,7 @@ class TestPruneSnapshotStats:
             'task_count_snapshot_prune_enumerated': 3,
             'task_count_snapshot_pruned': 2,
             'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
         }
 
     @pytest.mark.asyncio
@@ -653,6 +659,7 @@ class TestPruneSnapshotStats:
             'task_count_snapshot_prune_enumerated': 0,
             'task_count_snapshot_pruned': 0,
             'task_count_snapshot_prune_enumeration_ok': 0,
+            'task_count_snapshot_prune_truncated': 0,
         }
         memory_service.delete_memory.assert_not_awaited()
 
@@ -671,8 +678,64 @@ class TestPruneSnapshotStats:
             'task_count_snapshot_prune_enumerated': 0,
             'task_count_snapshot_pruned': 0,
             'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
         }
         memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_scroll_cap_reached_sets_truncated_stat(self):
+        """Amendment round (reviewer finding): hitting the scroll_limit cap
+        means older stale snapshots may remain unpruned this cycle -- a
+        provably incomplete prune. Reported identically to a clean success
+        by enumerated/pruned/enumeration_ok alone (all look the same as a
+        real 2-record success); only the dedicated truncated stat makes a
+        capped page observably distinct from a complete one. Mirrors the
+        scroll_limit=N-with-N-records saturation idiom already used by
+        TestVerifyTaskCountSnapshotWritten."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'm1', 'created_at': '2026-07-01T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm2', 'created_at': '2026-07-02T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+        ]
+        memory_service.delete_memory.return_value = None
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', scroll_limit=2, stats=observed,
+        )
+
+        assert result == 2
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 2,
+            'task_count_snapshot_pruned': 2,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_unsaturated_page_leaves_truncated_stat_unset(self):
+        """A page below scroll_limit is exhaustive -- not a truncation --
+        even though it enumerates the same 2 records as the capped case
+        above."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'm1', 'created_at': '2026-07-01T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm2', 'created_at': '2026-07-02T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+        ]
+        memory_service.delete_memory.return_value = None
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', scroll_limit=3, stats=observed,
+        )
+
+        assert result == 2
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 2,
+            'task_count_snapshot_pruned': 2,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -929,6 +992,7 @@ class TestWriteThreadsPruneStats:
             'task_count_snapshot_prune_enumerated': 2,
             'task_count_snapshot_pruned': 2,
             'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
         }
 
     @pytest.mark.asyncio

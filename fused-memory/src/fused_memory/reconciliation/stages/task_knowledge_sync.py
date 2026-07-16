@@ -54,6 +54,7 @@ from fused_memory.reconciliation.summary_pool import (
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY,
     SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY,
+    SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY,
     SNAPSHOT_PRUNED_STAT_KEY,
     TASK_COUNT_SNAPSHOT_CATEGORY,
     TASK_COUNT_SNAPSHOT_KIND,
@@ -1080,7 +1081,9 @@ async def _prune_task_count_snapshots(
         stats: Optional dict to populate with this cycle's runtime-observability
             counts — see ``task_count_snapshot_cadence.SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY``
             / ``SNAPSHOT_PRUNED_STAT_KEY`` / ``SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY``
-            (task 2646). Left untouched when ``None`` (the default).
+            / ``SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY`` (task 2646; the last one
+            added in the amendment round). Left untouched when ``None`` (the
+            default).
 
     Returns:
         Number of memories successfully deleted (0 if nothing matched, or
@@ -1155,6 +1158,7 @@ async def _prune_task_count_snapshots(
         stats[SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY] = len(members)
         stats[SNAPSHOT_PRUNED_STAT_KEY] = success_count
         stats[SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY] = 1 if enumeration_ok else 0
+        stats[SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY] = 1 if len(members) >= scroll_limit else 0
 
     return success_count
 

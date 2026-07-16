@@ -79,6 +79,20 @@ enumerated, 0 pruned, ``enumeration_ok=1``) — a distinction a single
 delete-count int cannot make.
 """
 
+SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY: str = 'task_count_snapshot_prune_truncated'
+"""Key under Stage 2's ``report.stats``: ``1`` when ``_prune_task_count_snapshots``
+hit its ``scroll_limit`` cap (enumerated a full page of ``scroll_limit`` records),
+``0`` otherwise.
+
+Distinct from :data:`SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY`: enumeration_ok=1
+here too, since the ``get_memories_by_metadata`` call itself did not raise —
+but a full page means older stale snapshots may remain unpruned this cycle
+(see the scroll-cap saturation WARNING in ``_prune_task_count_snapshots``),
+so the prune provably did NOT delete every stale record. Without this flag a
+truncated/partial prune is reported identically to a clean, complete one
+(amendment round, task 2646 review).
+"""
+
 TASK_COUNT_SNAPSHOT_MISS_THRESHOLD: int = 2
 """Number of consecutive full-cycle misses before the harness escalates."""
 
