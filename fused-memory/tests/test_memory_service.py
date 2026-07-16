@@ -8206,3 +8206,48 @@ class TestSearchJournalSuccessFlagOnDegrade:
         assert call_kwargs.get('success') is True, (
             f"Expected success=True on clean search, got {call_kwargs.get('success')!r}."
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2653: search() query-execution degradation self-describing diagnostics
+#
+# step-1 (RED) / step-2 (GREEN): _store_failure_diagnostics pure helper +
+#   SearchResults.failure_diagnostics attribute
+# step-3 (RED) / step-4 (GREEN): wired into search()'s raised-exception path
+# step-5 (RED) / step-6 (GREEN): rate_limit_or_quota classification
+# step-7 (RED) / step-8 (GREEN): outer-timeout diagnostic variant
+# step-9 (RED) / step-10 (GREEN): structured search.store_failed warning
+# ---------------------------------------------------------------------------
+
+
+class TestStoreFailureDiagnosticsHelper:
+    """Module-level _store_failure_diagnostics pure helper (task 2653).
+
+    search()'s degraded path previously logged only {'store': ..., 'error':
+    str(e)} — no exception type, no query shape, no rate-limit/quota
+    classification — leaving a recurring degradation unattributable even
+    though get_status/`/health` reported the store connected (a
+    query-execution failure, not a connectivity loss). This helper builds
+    the structured diagnostic dict search() attaches to a degraded
+    SearchResults so the loud degrade is self-describing.
+
+    RED: the helper does not exist yet (ImportError).
+    """
+
+    def test_exception_variant_fields(self):
+        from fused_memory.services.memory_service import _store_failure_diagnostics
+
+        diag = _store_failure_diagnostics(
+            SourceStore.graphiti,
+            RuntimeError('cypher boom'),
+            query='dup nodes q',
+            project_id='reify',
+            reason='exception',
+        )
+
+        assert diag['store'] == 'graphiti'
+        assert diag['reason'] == 'exception'
+        assert diag['error_type'] == 'RuntimeError'
+        assert 'cypher boom' in diag['error']
+        assert diag['query_len'] == len('dup nodes q')
+        assert diag['project_id'] == 'reify'
