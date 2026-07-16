@@ -536,36 +536,65 @@ class StaleServiceRestartCoordinator:
     async def maybe_restart(self, *, agents_idle: bool) -> bool:
         """Fire the restart if all gate conditions are met.
 
-        Conditions: enabled AND pending AND agents_idle AND debounce elapsed
-        AND (no restart_precondition OR restart_precondition() is truthy).
+        Conditions: enabled AND pending AND (agents_idle AND debounce elapsed
+        AND (no restart_precondition OR restart_precondition() is truthy))
+        OR the force-fire escape (see below). In both cases the min_interval
+        wall-clock cap is still enforced afterward.
+
+        Force-fire escape (fleet-redeploy PRD task delta): once a pending
+        restart's owed-age (``clock() - _first_pending_monotonic``) reaches
+        ``force_fire_after_secs`` (disabled when ``0.0``), the agents_idle
+        gate, the debounce, and the restart_precondition preference are all
+        bypassed — but the min_interval cap below is NEVER bypassed. This
+        exists so the polite path (which requires ``agents_idle=True``, only
+        reachable from the run-loop's idle branch) cannot starve a pending
+        restart indefinitely under chronic fleet saturation.
 
         Returns True when the restart was fired; False otherwise (no side
         effects — caller may call again on the next idle tick).
         """
-        if not (
-            self._enabled
-            and self._pending
-            and (agents_idle or not self._require_idle)
-            and (self._clock() - self._last_request_monotonic >= self._debounce_secs)
-        ):
+        if not (self._enabled and self._pending):
             return False
 
-        if self._restart_precondition is not None:
-            try:
-                satisfied = self._restart_precondition()
-            except Exception:
-                logger.warning(
-                    f'{self._service_name} restart_precondition raised; deferring'
-                    ' (fail-safe) — pending stays set for the next idle tick.',
-                    exc_info=True,
-                )
+        now = self._clock()
+        force_fire = (
+            self._force_fire_after_secs > 0
+            and self._first_pending_monotonic is not None
+            and (now - self._first_pending_monotonic) >= self._force_fire_after_secs
+        )
+
+        if not force_fire:
+            if not (
+                (agents_idle or not self._require_idle)
+                and (now - self._last_request_monotonic >= self._debounce_secs)
+            ):
                 return False
-            if not satisfied:
-                logger.info(
-                    f'{self._service_name} restart deferred: restart_precondition'
-                    ' not satisfied (pending retained).',
-                )
-                return False
+
+            if self._restart_precondition is not None:
+                try:
+                    satisfied = self._restart_precondition()
+                except Exception:
+                    logger.warning(
+                        f'{self._service_name} restart_precondition raised; deferring'
+                        ' (fail-safe) — pending stays set for the next idle tick.',
+                        exc_info=True,
+                    )
+                    return False
+                if not satisfied:
+                    logger.info(
+                        f'{self._service_name} restart deferred: restart_precondition'
+                        ' not satisfied (pending retained).',
+                    )
+                    return False
+        else:
+            logger.warning(
+                f'{self._service_name} restart FORCE-FIRING: pending restart owed'
+                ' %.0fs (>= %.0fs bound) — bypassing agents_idle, the debounce, and'
+                ' the merge-drain preference; the min_interval clock is still'
+                ' honored.',
+                now - self._first_pending_monotonic,
+                self._force_fire_after_secs,
+            )
 
         # Restart-safe minimum-interval rate cap (wall-clock). Enforced AFTER
         # every other gate so it only ever gates an otherwise-ready fire. When
@@ -611,6 +640,7 @@ class StaleServiceRestartCoordinator:
             self._trigger_task_ids = []
             self._trigger_merge_shas = []
             self._consecutive_executor_failures = 0
+            self._first_pending_monotonic = None
             return False
         except Exception:
             # TRANSIENT: e.g. a momentary systemd-run registration hiccup
@@ -632,6 +662,7 @@ class StaleServiceRestartCoordinator:
                 self._trigger_task_ids = []
                 self._trigger_merge_shas = []
                 self._consecutive_executor_failures = 0
+                self._first_pending_monotonic = None
                 return False
             logger.warning(
                 f'{self._service_name} restart executor failed (transient, attempt'
@@ -671,6 +702,10 @@ class StaleServiceRestartCoordinator:
         # failures since the last successful fire, not a lifetime tally.
         # (note_merge re-arming does NOT reset it — only success/exhaustion do.)
         self._consecutive_executor_failures = 0
+        # Owed-age anchor: pending=True iff _first_pending_monotonic is not
+        # None (see __init__ docstring) — reset here so the next burst's
+        # force-fire window starts fresh from its own first arm.
+        self._first_pending_monotonic = None
 
         # Stamp the min-interval rate cap AFTER the fire succeeded. The
         # in-memory update is unconditional (retains within-process
