@@ -2050,6 +2050,36 @@ class TestSimpleTaskDeprecatedScalarHonoring:
             )
             diff_config(a, b)
 
+    def test_default_scalars_neither_migrate_nor_warn(
+        self, monkeypatch, tmp_path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Inverse of test_non_default_scalars_migrate_into_submodel_fields_with_warning:
+        when both deprecated scalars are left at their Field defaults, the
+        guard (raw != default AND submodel == default) must not fire -- no
+        migration, no WARNING. This keeps the deprecated scalars silent
+        unless an operator actually overrides them.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            config = OrchestratorConfig()
+
+        assert config.budgets.simple_task == 1.50, (
+            'A default-valued simple_task_budget_usd must not migrate into '
+            'budgets.simple_task.'
+        )
+        assert config.max_turns.simple_task == 30, (
+            'A default-valued simple_task_max_turns must not migrate into '
+            'max_turns.simple_task.'
+        )
+
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning_records == [], (
+            'Expected no orchestrator.config WARNING for a defaults-only '
+            f'OrchestratorConfig(); got: {[r.getMessage() for r in warning_records]}'
+        )
+
 
 class TestDiffConfig:
     """diff_config(live, fresh, allowlist) categorizes every differing leaf
