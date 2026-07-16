@@ -1792,7 +1792,8 @@ def _run_launching(env: Mapping[str, str]) -> str:
     write_record(record)
     with contextlib.suppress(Exception):
         mark_orphaned_sessions_exited()
-    reap_stale_records(limit=REAP_BATCH_LIMIT)
+    with contextlib.suppress(Exception):
+        reap_stale_records(limit=REAP_BATCH_LIMIT)
     return str(record_dir)
 
 
