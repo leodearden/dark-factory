@@ -4647,6 +4647,17 @@ async def _resolve_commit_committed_at(project_root: str, sha: str) -> str | Non
     except FileNotFoundError:
         return None
     except Exception:
+        # Loud fail-safe (silent-fallthrough gate, sig-b): an unexpected error
+        # in this best-effort committer-date probe must surface in the log
+        # rather than vanish. Behaviour is unchanged (still returns None); the
+        # WARN just makes the swallow observable, matching the "loud over
+        # silent" directive the gate enforces.
+        logger.warning(
+            '_resolve_commit_committed_at: unexpected error resolving committer '
+            'date for %s; returning None',
+            sha,
+            exc_info=True,
+        )
         return None
 
     if proc.returncode != 0:
