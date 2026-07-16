@@ -2599,6 +2599,82 @@ class TestResolveResolutionClassExplicit:
         )
 
 
+class TestResolveResolutionClassDefaults:
+    """EscalationQueue.resolve() defaults resolution_class per resolved_by when the caller passes none."""
+
+    def test_auto_dismissed_defaults_benign(self, tmp_path: Path):
+        """(a) resolved_by='auto-dismissed' stamps resolution_class='benign'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', resolved_by='auto-dismissed')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.resolution_class == 'benign'
+
+    def test_harness_orphan_reaper_defaults_benign(self, tmp_path: Path):
+        """(a) resolved_by='harness-orphan-reaper' stamps resolution_class='benign'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', resolved_by='harness-orphan-reaper')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.resolution_class == 'benign'
+
+    def test_orchestrator_starvation_watchdog_defaults_benign(self, tmp_path: Path):
+        """(a) resolved_by='orchestrator-starvation-watchdog' stamps resolution_class='benign'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', resolved_by='orchestrator-starvation-watchdog')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.resolution_class == 'benign'
+
+    def test_interactive_leaves_none(self, tmp_path: Path):
+        """(b) resolved_by='interactive' (human tier) leaves resolution_class None — no auto-benign for humans."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', resolved_by='interactive')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.resolution_class is None
+
+    def test_no_resolved_by_leaves_none(self, tmp_path: Path):
+        """(b) resolve() with no resolved_by at all leaves resolution_class None."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.resolution_class is None
+
+    def test_dismiss_all_pending_stamps_benign(self, tmp_path: Path):
+        """(c) dismiss_all_pending('aged out') archives each dismissed L0 with resolution_class='benign' (boundary row 5)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+        queue.submit(_make_escalation('esc-2-1', task_id='2'))
+
+        count = queue.dismiss_all_pending('aged out')
+
+        assert count == 2
+        for esc_id in ('esc-1-1', 'esc-2-1'):
+            updated = queue.get(esc_id)
+            assert updated is not None
+            assert updated.status == 'dismissed'
+            assert updated.resolution_class == 'benign', (
+                f"Expected {esc_id} resolution_class='benign' after age-out dismiss; got {updated.resolution_class!r}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Step-1: Unit tests for the escalation_id_lock exported helper
 # ---------------------------------------------------------------------------
