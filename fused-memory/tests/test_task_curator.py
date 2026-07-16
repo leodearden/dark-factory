@@ -215,6 +215,28 @@ class TestCandidateHash:
         b = CandidateTask(title='T', description='D', details='X', execution_class='operational')
         assert a.payload_hash() != b.payload_hash()
 
+    def test_execution_class_operational_vs_decision_differ(self):
+        """(task 2687) 'operational' and 'decision' are both non-code_tdd routing
+        values but must not collide with each other either — payload_hash must
+        distinguish every pairwise combination of execution_class values.
+        """
+        a = CandidateTask(title='T', description='D', details='X', execution_class='operational')
+        b = CandidateTask(title='T', description='D', details='X', execution_class='decision')
+        assert a.payload_hash() != b.payload_hash()
+
+    def test_execution_class_hash_idempotent(self):
+        """(task 2687) Hashing execution_class must not break idempotency: two
+        candidates that agree on execution_class (including both untagged/None)
+        still hash equal.
+        """
+        a1 = CandidateTask(title='T', description='D', details='X')
+        a2 = CandidateTask(title='T', description='D', details='X')
+        assert a1.payload_hash() == a2.payload_hash()
+
+        b1 = CandidateTask(title='T', description='D', details='X', execution_class='operational')
+        b2 = CandidateTask(title='T', description='D', details='X', execution_class='operational')
+        assert b1.payload_hash() == b2.payload_hash()
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # task-2687 step-1 RED: TestCandidateTaskExecutionClass
