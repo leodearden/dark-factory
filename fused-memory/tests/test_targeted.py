@@ -2842,6 +2842,55 @@ async def test_on_task_done_fails_open_when_metadata_query_raises(
 
 
 @pytest.mark.asyncio
+async def test_on_task_done_search_failure_does_not_abort_later_capture_steps(
+    reconciler, mock_memory_service, mock_taskmaster,
+):
+    """A search failure must not abort sparse-verification / dependent-check.
+
+    Task 2642 amendment (reviewer_comprehensive robustness_over_suppression):
+    the fast-path echo (step 0) durably stamps stage2_suppress=True BEFORE
+    this reconciler's own search (step 1). Stage 2's PRIMARY suppression
+    gate (prompts/stage2.py) treats that tag as "fully handled -- skip
+    search, completion note, AND missing_knowledge finding" for this task's
+    next Stage-2 cycle. Before this fix, an uncaught exception from
+    memory.search propagated straight out of _on_task_done, silently
+    skipping sparse-knowledge verification (step 2) and the
+    dependent-unblock check (step 3) -- so the marker would have vouched for
+    capture work that never actually ran. Fail open (treat as sparse) like
+    every other step in this method, so the run completes normally and the
+    rest of the capture pipeline still executes.
+    """
+    mock_memory_service.search = AsyncMock(side_effect=RuntimeError('qdrant down'))
+    mock_taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {'id': '1', 'status': 'done', 'dependencies': []},
+            {'id': '2', 'status': 'pending', 'title': 'Next task', 'dependencies': ['1']},
+        ]
+    })
+
+    result = await reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '1', 'title': 'Add tests', 'status': 'in-progress',
+            'description': 'Test suite',
+        },
+    )
+
+    # The run must fail open, not abort with an error, just because search raised.
+    assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+    # (a) fast-path completion echo (step 0) still landed.
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+    # (b) sparse-knowledge verification (step 2) still ran despite the search
+    #     failure -- fail-open treats unknown related-knowledge as sparse.
+    assert any(a['type'] == 'knowledge_captured' for a in result.get('actions', []))
+    # (c) dependent-unblock check (step 3) still ran.
+    unblocked = [a for a in result.get('actions', []) if a['type'] == 'dependent_unblocked']
+    assert len(unblocked) == 1
+    assert unblocked[0]['task_id'] == '2'
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     'memories, expected_suppressed',
     [

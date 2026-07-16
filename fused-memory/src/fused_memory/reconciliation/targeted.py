@@ -131,6 +131,23 @@ _STALE_ECHO_DELETE_LIMIT = 25
 # review pass found that allowlist was dead code — no writer anywhere in the
 # codebase ever stamped source='stage2_task_knowledge_sync', so the branch
 # could never fire in production (dead_trigger_correctness finding).
+#
+# Scope note (task 2642 amendment, reviewer_comprehensive
+# robustness_over_suppression): prompts/stage2.py has TWO checks keyed on
+# this same count gate — a narrow "Completion-Note Suppression Pre-Check"
+# (skip only the redundant completion note) and a broader PRIMARY gate ("For
+# each done task in the proactive sample... if count > 0, skip that done
+# task entirely: no search, no completion note, no missing_knowledge
+# finding"). _on_task_done's fast-path echo stamps stage2_suppress
+# unconditionally at step 0, so a task completed via TargetedReconciliation
+# is opted out of BOTH checks, not just the narrow one. This is accepted
+# because, by the time Stage 2 next evaluates the gate, _on_task_done's own
+# search/verification steps (1, 1.5, 2, 3 below) have already run — every
+# one of them fails open on its own exceptions (matching this step), so
+# reaching the end of _on_task_done is no longer contingent on any single
+# step succeeding, and the marker's implicit "this task's capture was
+# attempted" claim holds with the same fail-open guarantee as the rest of
+# this method.
 _STAGE2_SUPPRESS_KEY = 'stage2_suppress'
 
 
@@ -547,17 +564,38 @@ class TargetedReconciler:
             logger.warning(f'Fast-path write failed for task {task_id}: {e}')
 
         # 1. Search for existing knowledge about this task
-        related = await self.memory.search(
-            query=f'{title} {description}',
-            project_id=scope.project_id,
-            limit=5,
-            causation_id=run_id,
-        )
-        await self.journal.add_run_action(
-            run_id, 'read', 'search', 'search',
-            {'query': f'{title} {description}'[:200], 'results': len(related)},
-            causation_id=run_id,
-        )
+        #
+        # Task 2642 amendment (reviewer_comprehensive robustness_over_suppression):
+        # this step used to be the only uncaught one in _on_task_done — a
+        # search/journal hiccup here raised straight out of the method,
+        # skipping planned-episode promotion (1.5), sparse-knowledge
+        # verification (2), and the dependent-unblock check (3) entirely,
+        # even though step 0 above had already durably persisted a
+        # stage2_suppress-tagged completion echo. Stage 2's PRIMARY
+        # suppression gate (prompts/stage2.py's "For each done task in the
+        # proactive sample...") treats that tag as "fully handled — skip
+        # search, completion note, AND missing_knowledge finding", which is
+        # broader than just the redundant completion-note it was added for.
+        # Silently losing 1.5/2/3 here would make the marker over-promise
+        # relative to what this run actually captured. Fail open
+        # (related=[], i.e. treat knowledge as sparse) exactly like every
+        # sibling step in this method, so the rest of the capture pipeline
+        # still runs instead of aborting the whole reconcile.
+        try:
+            related = await self.memory.search(
+                query=f'{title} {description}',
+                project_id=scope.project_id,
+                limit=5,
+                causation_id=run_id,
+            )
+            await self.journal.add_run_action(
+                run_id, 'read', 'search', 'search',
+                {'query': f'{title} {description}'[:200], 'results': len(related)},
+                causation_id=run_id,
+            )
+        except Exception as e:
+            logger.warning(f'Knowledge search failed for task {task_id}: {e}; treating as sparse (fail-open)')
+            related = []
 
         # 1.5. Promote planned episodes related to this completed task.
         #      Now that the task is done, aspirational edges become factual —
