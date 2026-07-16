@@ -8206,3 +8206,231 @@ class TestSearchJournalSuccessFlagOnDegrade:
         assert call_kwargs.get('success') is True, (
             f"Expected success=True on clean search, got {call_kwargs.get('success')!r}."
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2653: search() query-execution degradation self-describing diagnostics
+#
+# step-1 (RED) / step-2 (GREEN): _store_failure_diagnostics pure helper +
+#   SearchResults.failure_diagnostics attribute
+# step-3 (RED) / step-4 (GREEN): wired into search()'s raised-exception path
+# step-5 (RED) / step-6 (GREEN): rate_limit_or_quota classification
+# step-7 (RED) / step-8 (GREEN): outer-timeout diagnostic variant
+# step-9 (RED) / step-10 (GREEN): structured search.store_failed warning
+# ---------------------------------------------------------------------------
+
+
+class TestStoreFailureDiagnosticsHelper:
+    """Module-level _store_failure_diagnostics pure helper (task 2653).
+
+    search()'s degraded path previously logged only {'store': ..., 'error':
+    str(e)} — no exception type, no query shape, no rate-limit/quota
+    classification — leaving a recurring degradation unattributable even
+    though get_status/`/health` reported the store connected (a
+    query-execution failure, not a connectivity loss). This helper builds
+    the structured diagnostic dict search() attaches to a degraded
+    SearchResults so the loud degrade is self-describing.
+
+    RED: the helper does not exist yet (ImportError).
+    """
+
+    def test_exception_variant_fields(self):
+        from fused_memory.services.memory_service import _store_failure_diagnostics
+
+        diag = _store_failure_diagnostics(
+            SourceStore.graphiti,
+            RuntimeError('cypher boom'),
+            query='dup nodes q',
+            project_id='reify',
+            reason='exception',
+        )
+
+        assert diag['store'] == 'graphiti'
+        assert diag['reason'] == 'exception'
+        assert diag['error_type'] == 'RuntimeError'
+        assert 'cypher boom' in diag['error']
+        assert diag['query_len'] == len('dup nodes q')
+        assert diag['project_id'] == 'reify'
+
+    @pytest.mark.asyncio
+    async def test_search_raised_exception_populates_failure_diagnostics(self, service):
+        """Reproduce the exact observed signature end-to-end via MemoryService.search:
+        search() degrades on a graphiti query-execution failure while get_status
+        (the connectivity/liveness probe) stays connected — NOT connectivity loss
+        (ruling out prior tasks 382/98). graphiti.list_graphs/node_count succeed
+        while graphiti.search (a full hybrid Cypher+embedding+BM25 query) raises.
+
+        RED: search() does not populate failure_diagnostics yet.
+        """
+        from fused_memory.services.memory_service import SearchResults
+
+        service.graphiti.search = AsyncMock(side_effect=RuntimeError('cypher boom'))
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {'id': 'mem0-1', 'memory': 'some surviving fact', 'score': 0.8, 'metadata': {}},
+            ],
+        })
+        service.graphiti.list_graphs = AsyncMock(return_value=['reify'])
+        service.graphiti.node_count = AsyncMock(return_value=1)
+        service.mem0.list_projects = AsyncMock(return_value=[])
+        service.mem0.count = AsyncMock(return_value=0)
+
+        res = await service.search(
+            query='duplicate orchestrator Graphiti entity nodes', project_id='reify',
+        )
+
+        assert isinstance(res, SearchResults), f'Expected SearchResults, got {type(res)}'
+        assert res.degraded is True
+        assert res.failed_stores == ['graphiti']
+        assert any(r.content == 'some surviving fact' for r in res), (
+            f'Expected the mem0 result to still be present in res, got {list(res)!r}. '
+            'mem0 must keep returning even though graphiti degrades.'
+        )
+
+        diagnostics = getattr(res, 'failure_diagnostics', None)
+        assert diagnostics, (
+            f'Expected a non-empty failure_diagnostics list, got {diagnostics!r}. '
+            'RED: search() does not populate failure_diagnostics yet.'
+        )
+        graphiti_diag = next((d for d in diagnostics if d.get('store') == 'graphiti'), None)
+        assert graphiti_diag is not None, f'Expected a graphiti entry in {diagnostics!r}'
+        assert graphiti_diag['error_type'] == 'RuntimeError'
+        assert graphiti_diag['reason'] == 'exception'
+        assert graphiti_diag['store'] == 'graphiti'
+
+        # The exact reported asymmetry: search degrades while get_status stays
+        # connected — a query-execution failure, not a connectivity loss.
+        st = await service.get_status(project_id='reify')
+        assert st['graphiti']['connected'] is True, (
+            f"Expected get_status to report graphiti connected=True even though "
+            f"search degraded, got {st['graphiti']!r}."
+        )
+
+    @pytest.mark.asyncio
+    async def test_search_rate_limit_error_classified_in_diagnostics(self, service):
+        """A rate-limit/quota error from graphiti.search is classified the same way
+        get_entity already classifies it (task 2448 parity): rate_limit_or_quota=True.
+
+        RED: _store_failure_diagnostics does not yet emit rate_limit_or_quota.
+        """
+        service.graphiti.search = AsyncMock(side_effect=_make_rate_limit_error())
+
+        res = await service.search(query='q', project_id='reify')
+
+        assert res.degraded is True
+        assert res.failed_stores == ['graphiti']
+        graphiti_diag = next(
+            (d for d in res.failure_diagnostics if d.get('store') == 'graphiti'), None
+        )
+        assert graphiti_diag is not None, (
+            f'Expected a graphiti entry in {res.failure_diagnostics!r}'
+        )
+        assert graphiti_diag['error_type'] == 'RateLimitError'
+        assert graphiti_diag.get('rate_limit_or_quota') is True, (
+            f"Expected rate_limit_or_quota=True, got {graphiti_diag!r}. "
+            "RED: _store_failure_diagnostics does not yet emit rate_limit_or_quota."
+        )
+
+    @pytest.mark.asyncio
+    async def test_search_outer_timeout_populates_failure_diagnostics(self, service):
+        """A store whose task is still pending when the OUTER search_timeout_seconds
+        deadline elapses (cancelled, not raised) must also get a failure_diagnostics
+        entry — the second root-cause variant search() can hit, distinct from a
+        store task raising an exception.
+
+        Deterministic and fast: the outer asyncio.wait times out at 0.01s and
+        cancels the pending task well before the 5s sleep would ever complete.
+
+        RED: timed-out stores currently produce no diagnostic entry.
+        """
+        service.config.queue.search_timeout_seconds = 0.01
+
+        async def _slow_graphiti_search(*args, **kwargs):
+            await asyncio.sleep(5)
+            return []
+
+        service.graphiti.search = AsyncMock(side_effect=_slow_graphiti_search)
+
+        res = await service.search(query='slow shape', project_id='reify')
+
+        assert res.degraded is True
+        assert 'graphiti' in res.failed_stores
+        graphiti_diag = next(
+            (d for d in res.failure_diagnostics if d.get('store') == 'graphiti'), None
+        )
+        assert graphiti_diag is not None, (
+            f'Expected a graphiti entry in {res.failure_diagnostics!r}. '
+            'RED: timed-out stores currently produce no diagnostic entry.'
+        )
+        assert graphiti_diag['reason'] == 'timeout'
+        assert graphiti_diag['error_type'] == 'TimeoutError'
+
+    @pytest.mark.asyncio
+    async def test_search_store_failed_warning_carries_structured_diagnostics(
+        self, service, caplog,
+    ):
+        """The 'search.store_failed' WARNING must carry the full structured
+        diagnostic dict as `extra` (server-log legibility), not just the old
+        {'store': ..., 'error': str(e)} pair.
+
+        RED: the current warning's extra only has {'store', 'error'} (no
+        error_type/query_len).
+        """
+        service.graphiti.search = AsyncMock(side_effect=RuntimeError('cypher boom'))
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.search(query='qshape', project_id='reify')
+
+        matching = [r for r in caplog.records if r.message == 'search.store_failed']
+        assert len(matching) == 1, (
+            f"Expected exactly 1 'search.store_failed' WARNING, got "
+            f'{len(matching)}: {[r.message for r in caplog.records]}'
+        )
+        record = matching[0]
+        assert record.error_type == 'RuntimeError', (
+            f'Expected the log record to expose error_type via extra, got '
+            f'{record.__dict__!r}'
+        )
+        assert record.store == 'graphiti'
+        assert record.query_len == len('qshape')
+
+    @pytest.mark.asyncio
+    async def test_search_mixed_timeout_and_exception_both_collected(self, service):
+        """A single search() call can hit BOTH root-cause variants at once: one
+        store's task is still pending when the outer deadline elapses (timeout)
+        while the other store's task completes with a raised exception. Both
+        diagnostic entries must be collected, correctly attributed to their own
+        store, and neither store may be double-counted between the pending-loop
+        (timed_out_stores) and the done-loop (per-task except block).
+        """
+        service.config.queue.search_timeout_seconds = 0.01
+
+        async def _slow_graphiti_search(*args, **kwargs):
+            await asyncio.sleep(5)
+            return []
+
+        service.graphiti.search = AsyncMock(side_effect=_slow_graphiti_search)
+        service.mem0.search = AsyncMock(side_effect=RuntimeError('mem0 boom'))
+
+        res = await service.search(
+            query='mixed shape', project_id='reify', stores=['graphiti', 'mem0'],
+        )
+
+        assert res.degraded is True
+        assert set(res.failed_stores) == {'graphiti', 'mem0'}
+        assert len(res.failure_diagnostics) == 2, (
+            'Expected exactly one diagnostic per failed store (no double-counting '
+            f'between the pending/done loops), got {res.failure_diagnostics!r}'
+        )
+        stores_seen = sorted(d['store'] for d in res.failure_diagnostics)
+        assert stores_seen == ['graphiti', 'mem0'], (
+            f'Expected one entry per store with no duplicates, got {stores_seen!r}'
+        )
+
+        graphiti_diag = next(d for d in res.failure_diagnostics if d['store'] == 'graphiti')
+        assert graphiti_diag['reason'] == 'timeout'
+        assert graphiti_diag['error_type'] == 'TimeoutError'
+
+        mem0_diag = next(d for d in res.failure_diagnostics if d['store'] == 'mem0')
+        assert mem0_diag['reason'] == 'exception'
+        assert mem0_diag['error_type'] == 'RuntimeError'

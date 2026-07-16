@@ -1273,6 +1273,9 @@ def create_mcp_server(
             if getattr(results, 'degraded', False):
                 response['degraded'] = True
                 response['failed_stores'] = getattr(results, 'failed_stores', [])
+                diagnostics = getattr(results, 'failure_diagnostics', [])
+                if diagnostics:
+                    response['failed_store_diagnostics'] = diagnostics
             await _log_read(
                 operation='search',
                 project_id=project_id,
