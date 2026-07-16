@@ -241,7 +241,10 @@ def build_golden_archive(esc_dir: Path, now: datetime) -> dict:
         'resolved_at': _iso(now - timedelta(days=7)),
         'resolved_by': 'interactive',  # tier=human; unstamped -> actionable inferred
         'resolution_action': 'fix_forward',
-        'triaged_at': _iso(now - timedelta(days=7, hours=-12)),  # row-10 field
+        # row-10 field: 18h after filing (timestamp=-8d), 6h before
+        # resolution (resolved_at=-7d) -> filed_to_triaged=64800s,
+        # triaged_to_resolved=21600s.
+        'triaged_at': _iso(now - timedelta(days=7, hours=6)),
         'triaged_by': 'escalation-watcher-auto',
     }
     # Churn pair: re-filings of task 102 relative to esc-102-1's resolved_at.
@@ -691,3 +694,64 @@ class TestAggregateProjectWorkflow:
         }
         assert all(row['n'] == 1 for row in workflow['flow_daily'])
         assert sum(row['n'] for row in workflow['flow_daily']) == len(entry['lifespan']['samples'])
+
+
+# ---------------------------------------------------------------------------
+# step-11: triage_segments — 2555 forward-compat (row 10)
+# ---------------------------------------------------------------------------
+
+
+def _percentile_2(vals: list[float], p: float) -> float:
+    """p50/p90 of an exactly-2-element list, mirroring stats_utils.percentile."""
+    lo, hi = sorted(vals)
+    frac = p / 100.0
+    return lo * (1 - frac) + hi * frac
+
+
+class TestTriageSegments:
+    """lifespan['triage_segments'] — render-when-present over triaged_at."""
+
+    def test_present_and_correct_over_golden_archive(self, tmp_path):
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+
+        entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        lifespan = entry['lifespan']
+
+        # Of the 5 terminal records, only esc-102-1 and esc-103-1 carry
+        # triaged_at; esc-101-1/104-1/105-1 don't -> excluded.
+        # esc-103-1: filed_to_triaged=1h, triaged_to_resolved=1h.
+        # esc-102-1: filed_to_triaged=18h, triaged_to_resolved=6h.
+        filed_to_triaged = [timedelta(hours=1).total_seconds(), timedelta(hours=18).total_seconds()]
+        triaged_to_resolved = [timedelta(hours=1).total_seconds(), timedelta(hours=6).total_seconds()]
+
+        assert 'triage_segments' in lifespan
+        segments = lifespan['triage_segments']
+        assert segments['count'] == 2
+        assert segments['filed_to_triaged']['p50'] == _percentile_2(filed_to_triaged, 50)
+        assert segments['filed_to_triaged']['p90'] == _percentile_2(filed_to_triaged, 90)
+        assert segments['triaged_to_resolved']['p50'] == _percentile_2(triaged_to_resolved, 50)
+        assert segments['triaged_to_resolved']['p90'] == _percentile_2(triaged_to_resolved, 90)
+
+    def test_absent_when_no_record_has_triaged_at(self, tmp_path):
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+
+        esc = {
+            'id': 'esc-300-1', 'task_id': '300', 'agent_role': 'implementer',
+            'severity': 'blocking', 'category': 'cleanup_needed', 'summary': 'no triage stamp',
+            'timestamp': _iso(now - timedelta(days=2)),
+            'status': 'resolved', 'level': 0,
+            'resolved_at': _iso(now - timedelta(days=1)),
+            'resolved_by': 'interactive',
+        }
+        _write_escalation(esc_dir, esc, archived=True)
+
+        entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+
+        assert 'triage_segments' not in entry['lifespan']
