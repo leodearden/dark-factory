@@ -497,6 +497,7 @@ class EscalationQueue:
                         resolution,
                         dismiss=dismiss,
                         resolved_by=cascade_resolved_by,
+                        resolution_class=esc.resolution_class,
                     )
                 except Exception as e:
                     logger.warning(
