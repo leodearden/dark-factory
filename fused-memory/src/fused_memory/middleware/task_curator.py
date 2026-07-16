@@ -32,7 +32,7 @@ import json
 import logging
 import time
 import uuid as uuid_mod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.middleware.curator_escalator import CuratorEscalator
+    from fused_memory.middleware.recon_claim_verification_guard import AttributedClaim
 
 logger = logging.getLogger(__name__)
 
@@ -996,6 +997,65 @@ class TaskCurator:
         )
         return decision
 
+    async def _maybe_flag_unverified_claims(
+        self, candidate: CandidateTask, probe: Callable[[str], bool] | None = None,
+    ) -> list[AttributedClaim]:
+        """Return any of *candidate*'s attributed code-level claims that are unverified.
+
+        Advisory backstop for the task-2433 fabrication incident (see
+        ``recon_claim_verification_guard``'s module docstring): extracts specific
+        code-level tokens *candidate* attributes to a completed task/commit/ACTION
+        (e.g. "task 2372 added metadata.done_provenance_invalidated=true") and
+        verifies each against the live source tree + git history via *probe*
+        (built from ``self._cwd`` via ``make_source_and_history_probe`` when not
+        injected — tests inject a fake probe to stay git-free).
+
+        Unlike :meth:`_maybe_premise_refuted_drop`, this hook NEVER drops the
+        candidate or returns/mutates a :class:`CuratorDecision` — it only surfaces
+        unverified claims via a grep-stable ``recon_claim_verification.unverified``
+        WARNING (one per unverified claim, naming the token + attribution +
+        candidate title) for human review, and returns the list of unverified
+        claims so a caller may inspect them further.
+
+        Returns ``[]`` (fail-open) when:
+        - ``self._config.curator.recon_claim_verification_enabled`` is ``False``
+          (the default — every existing caller is unaffected).
+        - ``self._cwd`` is ``None`` — the source root cannot be resolved, so no
+          claim can be verified (one WARNING logged).
+        - *candidate*'s title/description/details carry no attributed claims at all.
+        - Every attributed claim's token verifies present (self-correcting).
+
+        Never raises.
+        """
+        if not self._config.curator.recon_claim_verification_enabled:
+            return []
+
+        if self._cwd is None:
+            logger.warning(
+                'task_curator: recon_claim_verification_enabled is True but '
+                'TaskCurator was constructed without cwd — cannot resolve a source '
+                'root to verify attributed claims against; guard disabled for '
+                'this call',
+            )
+            return []
+
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            make_source_and_history_probe,
+            unverified_claims_in_text,
+        )
+
+        if probe is None:
+            probe = make_source_and_history_probe(self._cwd)
+
+        text = f'{candidate.title}\n{candidate.description}\n{candidate.details}'
+        unverified = unverified_claims_in_text(text, probe)
+        for claim in unverified:
+            logger.warning(
+                'recon_claim_verification.unverified token=%s attribution=%s candidate=%r',
+                claim.token, claim.attribution, candidate.title,
+            )
+        return unverified
+
     async def _maybe_route_deterministic(
         self, candidate: CandidateTask, payload_hash: str,
     ) -> CuratorDecision | None:
@@ -1118,6 +1178,15 @@ class TaskCurator:
         premise_decision = await self._maybe_premise_refuted_drop(candidate, payload_hash)
         if premise_decision is not None:
             return premise_decision
+
+        # Recon claim-verification advisory backstop (task 2438) — flags (never
+        # drops) any code-level claim the candidate attributes to a completed
+        # task/commit/ACTION whose token verifies absent from both the live
+        # source tree and git history. Purely observational: the return value
+        # is not used for control flow here — surfacing is via the
+        # recon_claim_verification.unverified WARNING census logged inside
+        # _maybe_flag_unverified_claims itself.
+        await self._maybe_flag_unverified_claims(candidate)
 
         # Pre-LLM exact-match short-circuit comes FIRST. The payload_hash
         # idempotency cache below can only return drop/combine safely — a
@@ -1429,6 +1498,17 @@ class TaskCurator:
                 non_premise_unique.append(i)
         unique_indices = non_premise_unique
         # ── End premise-verification check ──────────────────────────────────────
+
+        # ── Recon claim-verification advisory backstop (task 2438) ─────────────
+        # For each still-live candidate, flag (never drop) any code-level claim
+        # it attributes to a completed task/commit/ACTION whose token verifies
+        # absent from both the live source tree and git history. Purely
+        # observational — the return value is not used for control flow here;
+        # surfacing is via the recon_claim_verification.unverified WARNING
+        # census logged inside _maybe_flag_unverified_claims itself.
+        for i in unique_indices:
+            await self._maybe_flag_unverified_claims(candidates[i])
+        # ── End claim-verification backstop ─────────────────────────────────────
 
         # ── Decision cache check ───────────────────────────────────────────────
         # Consult the idempotency cache for each unique (non-blocklist) candidate
