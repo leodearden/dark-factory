@@ -7932,11 +7932,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # coarse approximation — the only non-config resolution layer
         # distinguishable today is the Rust-heuristic model upgrade above;
         # task ε (RoutingDecision) replaces this with the real source layer.
+        # rule_id is derived from role.name (not hardcoded to "implementer")
+        # because _select_model_for_role applies this same heuristic to both
+        # the implementer and debugger roles — hardcoding would mislabel the
+        # debugger's upgrades with an implementer-specific rule id.
         source_layer = 'config'
         rule_id: str | None = None
         if model != base_model and role.name in ('implementer', 'debugger'):
             source_layer = 'policy_rule'
-            rule_id = 'rust-large-plan-implementer'
+            rule_id = f'rust-large-plan-{role.name}'
 
         # Determine sandbox modules based on role (role.sandboxed is a
         # property of the role object — see roles.py's AgentRole/W9-η).
@@ -8174,15 +8178,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
     ) -> None:
         """Persist the resolved routing decision for this invocation (PRD γ).
 
-        Best-effort and non-blocking end-to-end, mirroring the fire-and-forget
-        ``save_invocation`` pattern above and the "routing telemetry must
-        never block or crash a caller" philosophy of
-        ``RoutingState.from_metadata``: building the decision record itself
-        is wrapped in try/except (a MagicMock-configured role in many existing
-        ``_invoke`` unit tests fails ``RoutingDecisionMirror``'s strict str/
-        float/int field validation — that must never break the invocation
-        under test), the ``routing_decision`` event is guarded on
-        ``self.event_store``, and the ``metadata.routing`` mirror via
+        Best-effort (never raises) but awaited synchronously inside
+        ``_invoke``'s critical path — it is not fire-and-forget in the
+        ``asyncio.create_task`` sense, so a slow/hanging scheduler write here
+        does add latency to every invocation. What it guarantees is failure
+        isolation, mirroring the "routing telemetry must never block or
+        crash a caller" philosophy of ``RoutingState.from_metadata``:
+        building the decision record itself is wrapped in try/except (a
+        MagicMock-configured role in many existing ``_invoke`` unit tests
+        fails ``RoutingDecisionMirror``'s strict str/float/int field
+        validation — that must never break the invocation under test), the
+        ``routing_decision`` event is guarded on ``self.event_store``, and
+        the ``metadata.routing`` mirror via
         ``scheduler.update_task(metadata_mode='merge')`` is guarded on
         ``self.scheduler`` and wrapped in its own try/except.  The in-memory
         ``self.task['metadata']['routing']`` update always runs — regardless
@@ -8215,23 +8222,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return
 
         if self.event_store:
+            # Derived from `decision` (rather than hand-duplicating each
+            # field) so the event payload and the metadata.routing mirror
+            # below can never drift as fields are added in task ε — both
+            # are two serializations of the one `decision` record, plus the
+            # event-only `inputs_digest`.
             self.event_store.emit(
                 EventType.routing_decision,
                 task_id=self.task_id,
                 role=role.name,
-                data={
-                    'model': model,
-                    'effort': effort,
-                    'budget_usd': budget_usd,
-                    'max_turns': max_turns,
-                    'source_layer': source_layer,
-                    'rule_id': rule_id,
-                    'rejected': [],
-                    'routing_tier': state.routing_tier,
-                    'inputs_digest': digest,
-                },
+                data={**decision.model_dump(), 'inputs_digest': digest},
             )
 
+        # Per-invocation write cost (task 2533 review): this adds one
+        # merge-mode metadata upsert per invocation, alongside the
+        # cost_store.save_invocation write _invoke already makes
+        # unconditionally — not a new class of write, and the payload is
+        # small and bounded (history capped at _ROUTING_HISTORY_MAX=5).
+        # Coalescing to "only write on decision change" was considered and
+        # rejected: the PRD goal is to persist WHICH decision was made per
+        # invocation, including repeated identical decisions, and
+        # test_successive_invocations_accumulate_history locks in that every
+        # invocation's decision lands in history.
         new_state = state.with_decision(decision)
         if self.scheduler:
             try:
