@@ -98,6 +98,178 @@ _DEPENDENT_REL_PATH = 'src/dependent_target.py'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Rig helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _run_git(project_root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ['git', '-C', str(project_root), *args],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def _init_git_repo(root: Path) -> Path:
+    """Initialize a real git repo at *root* on branch main with an initial
+    commit that already tracks the marker file the headline's grep check
+    targets.
+
+    The marker file is committed with PLACEHOLDER content (no capability
+    token yet) so the pathspec exists on ``main`` from the start — this
+    keeps the grep check's initial "capability absent" state a clean
+    no-match (``git grep`` rc=1 -> FAILED) rather than a pathspec-not-found
+    error (rc>=2 -> ERRORED), matching PRD row 4 (withhold), not row 7
+    (runner error).
+    """
+    subprocess.run(
+        ['git', 'init', '-b', 'main', str(root)],
+        check=True, capture_output=True, text=True,
+    )
+    _run_git(root, 'config', 'user.email', 'e2e-test@example.com')
+    _run_git(root, 'config', 'user.name', 'E2E Test')
+    marker = root / _MARKER_REL_PATH
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('# marker file -- capability token lands here later\n', encoding='utf-8')
+    _run_git(root, 'add', _MARKER_REL_PATH)
+    _run_git(root, 'commit', '-m', 'initial commit')
+    return root
+
+
+@pytest_asyncio.fixture
+async def backend_stack(tmp_path):
+    """Real fused-memory backend stack (SqliteTaskBackend + TaskInterceptor +
+    TicketStore + EventBuffer + create_mcp_server — the real_task_stack
+    pattern from test_task_tools.py) rooted at a real temp git repo, so
+    submit_task/commit_planning/get_task and the orchestrator scheduler's
+    git-backed delivered-check runner all agree on one project_root.
+    """
+    project_root = _init_git_repo(tmp_path)
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(project_root)))
+    await backend.start()
+    event_buffer = EventBuffer(
+        db_path=project_root / 'real_stack_eb.db', buffer_size_threshold=100,
+    )
+    await event_buffer.initialize()
+    ticket_store = TicketStore(project_root / 'real_stack_tickets.db')
+    await ticket_store.initialize()
+    interceptor = TaskInterceptor(backend, None, event_buffer, ticket_store=ticket_store)
+    server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
+    try:
+        yield server, interceptor, project_root
+    finally:
+        await ticket_store.close()
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
+        await event_buffer.close()
+        await backend.close()
+
+
+def _write_sidecar(
+    project_root: Path,
+    *,
+    prd_path: str,
+    label: str,
+    capability_name: str,
+    pattern: str,
+    paths: list[str],
+) -> Path:
+    """Write a capability-manifest sidecar (α schema) with ONE grep-kind
+    capability for *label*, derived strictly the same way
+    ``stamp_capability_manifests`` derives it: ``re.sub(r'\\.md$', '', prd_path)
+    + '.capability-manifest.yaml'``."""
+    sidecar_rel = re.sub(r'\.md$', '', prd_path) + '.capability-manifest.yaml'
+    sidecar_path = project_root / sidecar_rel
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    doc = {
+        'prd': prd_path,
+        'schema_version': 1,
+        'tasks': [
+            {
+                'label': label,
+                'task_id': None,
+                'title': f'Producer {label}',
+                'capabilities': [
+                    {
+                        'name': capability_name,
+                        'binding': 'grep for the capability token',
+                        'verdict': 'PASS',
+                        'delivered_check': {
+                            'kind': 'grep',
+                            'pattern': pattern,
+                            'expect': 'present',
+                            'paths': paths,
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+    sidecar_path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding='utf-8')
+    return sidecar_path
+
+
+async def _call(server, name: str, **arguments) -> dict:
+    """Call an MCP tool via the product's own ToolManager surface (mirrors
+    test_task_tools.py's ``server._tool_manager.call_tool(...)`` pattern)."""
+    return await server._tool_manager.call_tool(name, arguments)
+
+
+async def _file_planning_batch(
+    server, project_root: Path, *, prd_path: str | None,
+) -> tuple[str, str]:
+    """File a producer+dependent planning batch (both ``planning_mode=True``).
+
+    The producer carries ``metadata.prd_path``/``metadata.prd_task_label``
+    (matching the sidecar written by ``_write_sidecar``) when *prd_path* is
+    given; passing ``None`` files a legacy batch with no PRD metadata at all
+    (PRD row 2). The dependent depends on the producer via submit_task's
+    ``dependencies`` kwarg. Returns ``(producer_id, dependent_id)``.
+    """
+    producer_metadata: dict = {'files': [_MARKER_REL_PATH]}
+    if prd_path is not None:
+        producer_metadata['prd_path'] = prd_path
+        producer_metadata['prd_task_label'] = _PRODUCER_LABEL
+
+    submit_producer = await _call(
+        server, 'submit_task',
+        project_root=str(project_root),
+        title='Producer task',
+        planning_mode=True,
+        metadata=producer_metadata,
+    )
+    assert submit_producer['status'] == 'deferred', f'got {submit_producer!r}'
+    producer_id = submit_producer['task_id']
+
+    submit_dependent = await _call(
+        server, 'submit_task',
+        project_root=str(project_root),
+        title='Dependent task',
+        planning_mode=True,
+        dependencies=producer_id,
+        metadata={'files': [_DEPENDENT_REL_PATH]},
+    )
+    assert submit_dependent['status'] == 'deferred', f'got {submit_dependent!r}'
+    dependent_id = submit_dependent['task_id']
+
+    return producer_id, dependent_id
+
+
+async def _commit_planning(server, project_root: Path, ids: list[str]) -> dict:
+    return await _call(
+        server, 'commit_planning',
+        project_root=str(project_root),
+        task_ids=','.join(ids),
+    )
+
+
+async def _get_task(server, project_root: Path, task_id: str) -> dict:
+    return await _call(server, 'get_task', id=task_id, project_root=str(project_root))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TestHeadline — rows 1, 4, 5, 6, 3: stamp -> withhold -> escalate -> heal -> dispatch
 # ─────────────────────────────────────────────────────────────────────────────
 
