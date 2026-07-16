@@ -1748,3 +1748,67 @@ async def test_stamp_clock_on_fire_default_true_still_persists(tmp_path: Path) -
     assert state_path.exists()
     persisted = json.loads(state_path.read_text(encoding='utf-8'))
     assert persisted['ts'] == 55_555.0
+
+
+# ---------------------------------------------------------------------------
+# Force-fire escape fields (task 2398, fleet-redeploy δ): the
+# force_fire_after_secs constructor param + the non-resetting
+# _first_pending_monotonic owed-age anchor. maybe_restart force-fire BEHAVIOR
+# is covered separately below — these tests cover only field storage and the
+# note_merge lifecycle.
+# ---------------------------------------------------------------------------
+
+
+def test_force_fire_after_secs_stored_on_coordinator() -> None:
+    """(a) Constructor accepts force_fire_after_secs and stores it verbatim.
+
+    Default is 0.0 (force-fire disabled — byte-identical for fused-memory
+    and dashboard, which never pass this kwarg).
+    """
+    coord, _, _, _ = _make_coordinator_with_mutable_clock([])
+    assert coord._force_fire_after_secs == 0.0
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(return_value=([], None))
+    coord2 = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=MagicMock(),
+        watch_prefixes=['orchestrator/src/'],
+        restart_executor=AsyncMock(),
+        clock=lambda: 0.0,
+        force_fire_after_secs=4500.0,
+    )
+    assert coord2._force_fire_after_secs == 4500.0
+
+
+@pytest.mark.asyncio
+async def test_first_pending_monotonic_lifecycle_on_note_merge() -> None:
+    """(b) _first_pending_monotonic: None before any merge; stamped on the
+    False→True pending transition; UNCHANGED across a re-arm while pending.
+
+    This is the non-resetting owed-age anchor that measures true "how long
+    has this restart been owed" even under a continuous merge stream that
+    keeps re-arming _last_request_monotonic (which DOES reset every
+    note_merge — see test_note_merge_arms_pending_on_fused_memory_src_file
+    and friends above).
+    """
+    coord, current_time, _, _ = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'], debounce_secs=0.0
+    )
+    assert coord._first_pending_monotonic is None
+
+    current_time[0] = 1000.0
+    await coord.note_merge('task-1', 'base', 'head')
+    assert coord.is_pending is True
+    assert coord._first_pending_monotonic == 1000.0
+    assert coord._last_request_monotonic == 1000.0
+
+    # Re-arm while still pending: _last_request_monotonic advances, but
+    # _first_pending_monotonic must stay pinned to the FIRST transition.
+    current_time[0] = 1500.0
+    await coord.note_merge('task-2', 'base2', 'head2')
+    assert coord.is_pending is True
+    assert coord._first_pending_monotonic == 1000.0, (
+        '_first_pending_monotonic must NOT reset on a note_merge re-arm'
+    )
+    assert coord._last_request_monotonic == 1500.0
