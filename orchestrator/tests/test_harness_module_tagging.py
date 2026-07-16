@@ -508,6 +508,121 @@ async def test_tag_task_modules_routes_through_seed_modules(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# StructuredOutput schema rename 'tasks'->'predictions' + double-wrap
+# acceptance (task 2561 defect 3 / acceptance c)
+# ---------------------------------------------------------------------------
+
+_ONE_UNTAGGED_TASK = [
+    {
+        'id': '1',
+        'title': 'Task',
+        'description': 'desc',
+        'status': 'pending',
+        'metadata': {},
+        'dependencies': [],
+    },
+]
+
+
+@pytest.mark.asyncio
+async def test_output_schema_uses_predictions_root(harness):
+    """The output_schema's top-level key must be 'predictions', not 'tasks'.
+
+    The StructuredOutput tool's sole parameter is named after the schema's
+    top-level key; when that key is 'tasks' — the same heavily-repeated
+    domain noun used throughout the prompt — the model double-wraps its
+    answer as {"tasks": {"tasks": [...]}} (9/11 mined sessions). Renaming
+    the key removes the param-name/schema-key/domain-noun collision.
+
+    Fails now: schema is still keyed 'tasks'.
+    """
+    harness.scheduler.get_tasks = AsyncMock(return_value=_ONE_UNTAGGED_TASK)
+    harness.scheduler.update_task = AsyncMock()
+
+    agent_response = {'predictions': [{'id': '1', 'files': ['a.py']}]}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
+        await harness._tag_task_modules()
+
+    schema = mock_invoke.call_args.kwargs['output_schema']
+    assert 'predictions' in schema['properties'], (
+        f"Expected 'predictions' key in schema['properties']; got {schema['properties']!r}"
+    )
+    assert 'tasks' not in schema['properties'], (
+        f"schema['properties'] must not retain the colliding 'tasks' key; got {schema['properties']!r}"
+    )
+    assert schema['required'] == ['predictions'], (
+        f"Expected schema['required'] == ['predictions']; got {schema['required']!r}"
+    )
+
+    prompt = mock_invoke.call_args.kwargs['prompt']
+    assert 'predictions' in prompt, "Expected the literal token 'predictions' in the tagger prompt"
+
+
+@pytest.mark.asyncio
+async def test_tag_accepts_legacy_double_wrap(harness):
+    """The parser must still accept the legacy double-wrap {"tasks": {"tasks": [...]}}.
+
+    A defensive normalizer (_extract_tagger_entries) tolerates old-format
+    stragglers during rollout, even after the schema key is renamed.
+
+    Fails now: the parser does `mapping.get('tasks', [])`, which on this
+    double-wrap returns the inner dict {'tasks': [...]}, not a list.
+    """
+    harness.scheduler.get_tasks = AsyncMock(return_value=_ONE_UNTAGGED_TASK)
+    harness.scheduler.update_task = AsyncMock()
+
+    agent_response = {'tasks': {'tasks': [{'id': '1', 'files': ['a.py']}]}}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await harness._tag_task_modules()
+
+    harness.scheduler.update_task.assert_awaited_once()
+    task_id, metadata_json = harness.scheduler.update_task.call_args.args
+    assert task_id == '1'
+    assert json.loads(metadata_json)['files'] == ['a.py']
+
+
+@pytest.mark.asyncio
+async def test_tag_accepts_new_flat_predictions(harness):
+    """The parser must accept the new flat {"predictions": [...]} shape.
+
+    Fails now: the parser does `mapping.get('tasks', [])`, which finds
+    nothing under the new 'predictions' key and silently tags 0 tasks.
+    """
+    harness.scheduler.get_tasks = AsyncMock(return_value=_ONE_UNTAGGED_TASK)
+    harness.scheduler.update_task = AsyncMock()
+
+    agent_response = {'predictions': [{'id': '1', 'files': ['a.py']}]}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await harness._tag_task_modules()
+
+    harness.scheduler.update_task.assert_awaited_once()
+    task_id, metadata_json = harness.scheduler.update_task.call_args.args
+    assert task_id == '1'
+    assert json.loads(metadata_json)['files'] == ['a.py']
+
+
+# ---------------------------------------------------------------------------
 # _extract_tagger_entries: StructuredOutput wrapper-peeling normalizer
 # (task 2561 defect 3 / acceptance c)
 # ---------------------------------------------------------------------------
