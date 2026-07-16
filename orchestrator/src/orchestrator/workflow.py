@@ -5584,6 +5584,43 @@ class TaskWorkflow:
             )
             return []
 
+    async def _rederive_step_status_from_branch_state(self) -> list[str]:
+        """Re-derive stale-``pending`` plan steps to ``done`` from the
+        durable iteration log's ``steps_completed`` records (task 2387).
+
+        Unions every ``.task/iterations.jsonl`` entry's ``steps_completed``
+        into the set of step IDs genuinely completed on this branch, then
+        flips any plan.json step currently "pending" whose ID is in that set
+        to "done" — recording the commit the log entry reported the step
+        completed at (last-wins across entries naming the same step id).
+
+        Returns the list of step IDs re-derived.
+        """
+        entries, _ = self.artifacts.read_iteration_log()
+
+        completed_ids: set[str] = set()
+        commit_by_id: dict[str, str] = {}
+        for entry in entries:
+            for step_id in entry.get('steps_completed') or []:
+                completed_ids.add(step_id)
+                entry_commit = entry.get('commit')
+                if entry_commit:
+                    commit_by_id[step_id] = entry_commit
+
+        plan = self.artifacts.read_plan()
+        rederived: list[str] = []
+        for collection in ('prerequisites', 'steps'):
+            for item in plan.get(collection, []):
+                if not isinstance(item, dict):
+                    continue
+                if item.get('status') == 'pending' and item.get('id') in completed_ids:
+                    step_id = item['id']
+                    self.artifacts.update_step_status(
+                        step_id, 'done', commit=commit_by_id.get(step_id),
+                    )
+                    rederived.append(step_id)
+        return rederived
+
     async def _inter_iteration_rebase(
         self, *, event_label: str = 'rebase',
     ) -> dict | None:
