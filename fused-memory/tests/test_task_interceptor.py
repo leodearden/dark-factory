@@ -2516,6 +2516,90 @@ async def test_done_provenance_included_in_event_payload(
     assert payload['done_provenance']['commit'] == sha
 
 
+# ── Tests for atomic audit-write routing (task 2649) ────────────────────
+#
+# An audit-carrying status change (terminal-exit reopen, or a done
+# transition with resolved provenance) must route through the SINGLE
+# atomic tm.set_status_and_stamp_audit call — never the old two-commit
+# stamp_audit_metadata + set_task_status pattern. A plain, non-audit
+# transition must still use plain set_task_status and never touch the
+# atomic writer.
+
+
+@pytest.mark.asyncio
+async def test_reopen_routes_through_atomic_audit_write(taskmaster, reconciler, event_buffer):
+    """Terminal-exit reopen routes through the single atomic
+    set_status_and_stamp_audit call, carrying reopen_reason/reopen_from/
+    reopen_at as audit_fields — NOT a separate stamp_audit_metadata call
+    followed by plain set_task_status."""
+    taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+    taskmaster.set_status_and_stamp_audit = AsyncMock(return_value={
+        'message': 'Successfully updated 1 task(s) to "pending"',
+        'tasks': [{'taskId': '1', 'oldStatus': 'done', 'newStatus': 'pending'}],
+    })
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'pending', '/project', reopen_reason='resume',
+    )
+
+    assert 'error' not in result, result
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    audit_fields = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
+    assert audit_fields['reopen_reason'] == 'resume'
+    assert audit_fields['reopen_from'] == 'done'
+    assert 'reopen_at' in audit_fields
+    taskmaster.stamp_audit_metadata.assert_not_called()
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_routes_through_atomic_audit_write(
+    taskmaster, reconciler, event_buffer, tmp_path,
+):
+    """A done transition with resolved provenance routes through the single
+    atomic set_status_and_stamp_audit call, carrying done_provenance as an
+    audit_field — NOT a separate stamp_audit_metadata call."""
+    sha = _init_git_repo(tmp_path)
+    taskmaster.set_status_and_stamp_audit = AsyncMock(return_value={
+        'message': 'Successfully updated 1 task(s) to "done"',
+        'tasks': [{'taskId': '1', 'oldStatus': 'pending', 'newStatus': 'done'}],
+    })
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={'kind': 'merged', 'commit': sha},
+    )
+
+    assert 'error' not in result, result
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    audit_fields = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
+    assert audit_fields['done_provenance']['kind'] == 'merged'
+    assert audit_fields['done_provenance']['commit'] == sha
+    taskmaster.stamp_audit_metadata.assert_not_called()
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_plain_transition_does_not_use_atomic_audit_write(
+    taskmaster, reconciler, event_buffer,
+):
+    """A transition with no reopen_reason/done_provenance still calls plain
+    set_task_status — NOT the atomic audit writer (task 2649)."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'in-progress', 'title': 'T'},
+    )
+    taskmaster.set_status_and_stamp_audit = AsyncMock(return_value={'success': True})
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'blocked', '/project')
+
+    assert 'error' not in result, result
+    taskmaster.set_task_status.assert_called_once()
+    taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+
 # ── Tests for done_provenance.kind discriminator (2026-04-27 hardening) ────
 
 
