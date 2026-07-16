@@ -2,6 +2,7 @@
 
 import logging
 import os
+import warnings
 from importlib import resources as pkg_resources
 from pathlib import Path
 
@@ -2019,6 +2020,107 @@ class TestSimpleTaskDeprecatedScalarHonoring:
         assert config.budgets.simple_task == 5.55, (
             'An explicitly-set budgets.simple_task must win over the '
             'deprecated simple_task_budget_usd scalar.'
+        )
+
+    def test_no_deprecation_warning_on_construction_or_diff(self, monkeypatch, tmp_path):
+        """Locks the __dict__-vs-getattr choice in
+        _honor_deprecated_simple_task_scalars and _iter_leaves: a future
+        refactor back to plain getattr on either path would fire pydantic's
+        deprecated-field-access DeprecationWarning on EVERY
+        OrchestratorConfig construction / diff_config call, not just the
+        rare ones where an operator actually sets a deprecated scalar. This
+        test exercises both paths -- construction (including the migration
+        branch) and diff_config -- and asserts none of the warnings raised
+        is pydantic's deprecated-field-access warning.
+
+        Warnings are captured (record=True + simplefilter('always')), not
+        promoted to errors, then filtered down to pydantic's specific
+        marker for this mechanism: category DeprecationWarning with the
+        fixed message 'deprecated' -- the exact (and only) message pydantic
+        emits for a bool ``Field(deprecated=True)`` access, which is what
+        both simple_task_budget_usd and simple_task_max_turns use (pydantic
+        does not embed the field name in the message, so matching can't be
+        done on field name text). This narrows the regression signal to
+        the exact mechanism under test, so an incidental, unrelated
+        DeprecationWarning from pydantic internals or a transitive library
+        during construction cannot fail this test the way a blanket
+        simplefilter('error', DeprecationWarning) would.
+
+        Note: the migration's ``logger.warning(...)`` calls are Python
+        ``logging``, orthogonal to the ``warnings`` module, so they never
+        appear in the captured list regardless.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+
+            a = OrchestratorConfig()
+            b = OrchestratorConfig(
+                simple_task_budget_usd=3.33,
+                simple_task_max_turns=7,
+            )
+            diff_config(a, b)
+
+        deprecated_field_access_warnings = [
+            w for w in caught
+            if issubclass(w.category, DeprecationWarning) and str(w.message) == 'deprecated'
+        ]
+        assert deprecated_field_access_warnings == [], (
+            'Expected no pydantic deprecated-field-access warning (a getattr '
+            'regression in _honor_deprecated_simple_task_scalars or '
+            '_iter_leaves reading simple_task_budget_usd / '
+            'simple_task_max_turns) during OrchestratorConfig construction '
+            f'or diff_config; got: {[str(w.message) for w in deprecated_field_access_warnings]}'
+        )
+
+    def test_default_scalars_neither_migrate_nor_warn(
+        self, monkeypatch, tmp_path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Inverse of test_non_default_scalars_migrate_into_submodel_fields_with_warning:
+        when both deprecated scalars are left at their Field defaults, the
+        guard (raw != default AND submodel == default) must not fire -- no
+        migration, no WARNING. This keeps the deprecated scalars silent
+        unless an operator actually overrides them.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            config = OrchestratorConfig()
+
+        assert config.budgets.simple_task == 1.50, (
+            'A default-valued simple_task_budget_usd must not migrate into '
+            'budgets.simple_task.'
+        )
+        assert config.max_turns.simple_task == 30, (
+            'A default-valued simple_task_max_turns must not migrate into '
+            'max_turns.simple_task.'
+        )
+
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning_records == [], (
+            'Expected no orchestrator.config WARNING for a defaults-only '
+            f'OrchestratorConfig(); got: {[r.getMessage() for r in warning_records]}'
+        )
+
+    def test_explicit_max_turns_submodel_wins_over_deprecated_scalar(self, monkeypatch, tmp_path):
+        """Symmetric with test_explicit_submodel_value_wins_over_deprecated_scalar
+        (the budgets variant): an explicitly-set max_turns.simple_task takes
+        precedence -- the deprecated scalar is ignored (no migration) when
+        the submodel field is no longer at its default."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+        config = OrchestratorConfig(
+            simple_task_max_turns=7,
+            max_turns=TurnsConfig(simple_task=99),
+        )
+
+        assert config.max_turns.simple_task == 99, (
+            'An explicitly-set max_turns.simple_task must win over the '
+            'deprecated simple_task_max_turns scalar.'
         )
 
 
