@@ -3114,6 +3114,131 @@ async def test_on_task_done_completion_journal_has_echo_used_provenance(
     )
 
 
+# ---------------------------------------------------------------------------
+# Unverified-completion reframe (task 2622)
+#
+# The branch-3 fallback (no authoritative memory, no usable done_provenance)
+# previously asserted "Task 'X' completed. <description>" -- but the ONLY
+# content backing that claim is the task's own unverified description, which
+# is sometimes a pre-fix bug statement and sometimes proves stale when a
+# done-transition later turns out premature/false. This truth-table pins all
+# three fast-path branches so the reframe cannot regress the two OTHER
+# branches, which remain backed by real evidence (an authoritative resolution
+# memory, or verified done_provenance) and are intentionally left asserting
+# "completed".
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'memories_return, get_task_return, expect',
+    [
+        pytest.param(
+            [],
+            {'id': '361', 'metadata': {}},
+            {
+                'content_startswith': (
+                    "Task 'Autopilot task' transitioned to done; "
+                    "completion not yet verified."
+                ),
+                'content_contains': [
+                    'Intended deliverable per task description: '
+                    'STALE pre-fix bug statement',
+                ],
+                'content_not_contains': ['completed'],
+                'metadata_true': ['echo_unverified_completion'],
+                'metadata_absent': [
+                    'echo_used_provenance', 'echo_suppressed_stale_description',
+                ],
+            },
+            id='unverified_description',
+        ),
+        pytest.param(
+            [],
+            {
+                'id': '361',
+                'metadata': {
+                    'done_provenance': {
+                        'note': 'Added retry logic', 'commit': 'abc123',
+                    },
+                },
+            },
+            {
+                'content_equals': (
+                    "Task 'Autopilot task' completed. "
+                    "Added retry logic (commit abc123)"
+                ),
+                'metadata_true': ['echo_used_provenance'],
+                'metadata_absent': ['echo_unverified_completion'],
+            },
+            id='verified_provenance',
+        ),
+        pytest.param(
+            [{'metadata': {'task_id': '361', 'supersedes': 'x'}}],
+            {'id': '361', 'metadata': {}},
+            {
+                'content_equals': "Task 'Autopilot task' completed.",
+                'metadata_true': ['echo_suppressed_stale_description'],
+                'metadata_absent': ['echo_unverified_completion'],
+            },
+            id='has_authoritative',
+        ),
+    ],
+)
+async def test_on_task_done_unverified_completion_reframe(
+    reconciler, mock_memory_service, mock_taskmaster, memories_return, get_task_return, expect,
+):
+    """Truth-table pinning all three _on_task_done fast-path echo branches
+    (targeted.py:409-500) after the task 2622 reframe: (1) no usable
+    done_provenance and no authoritative memory -- the branch-3 fallback must
+    no longer assert "completed" from the unverified description, instead
+    reframing to "transitioned to done; completion not yet verified" plus an
+    `echo_unverified_completion` flag; (2) verified done_provenance (branch 2,
+    task 2049) is UNCHANGED -- still asserts "completed" with the landed
+    outcome; (3) an authoritative resolution memory (branch 1, task 1984) is
+    UNCHANGED -- still the title-only "completed." echo. Params 2 and 3 pin
+    the boundary so the reframe cannot over-apply the new flag to the
+    verified/authoritative branches.
+    """
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=memories_return)
+    mock_taskmaster.get_task = AsyncMock(return_value=get_task_return)
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'description': 'STALE pre-fix bug statement',
+        },
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content') or ''
+    metadata = first_call.kwargs.get('metadata') or {}
+
+    if 'content_equals' in expect:
+        assert content == expect['content_equals'], (
+            f"Expected exact content {expect['content_equals']!r}, got: {content!r}"
+        )
+    if 'content_startswith' in expect:
+        assert content.startswith(expect['content_startswith']), (
+            f"Expected content to start with {expect['content_startswith']!r}, got: {content!r}"
+        )
+    for substr in expect.get('content_contains', []):
+        assert substr in content, f'Expected {substr!r} in content, got: {content!r}'
+    for substr in expect.get('content_not_contains', []):
+        assert substr not in content, f'Expected {substr!r} NOT in content, got: {content!r}'
+
+    for key in expect.get('metadata_true', []):
+        assert metadata.get(key) is True, f'Expected metadata[{key!r}] is True, got: {metadata}'
+    for key in expect.get('metadata_absent', []):
+        assert key not in metadata, f'Expected {key!r} absent from metadata, got: {metadata}'
+
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     'get_task_kwargs',
