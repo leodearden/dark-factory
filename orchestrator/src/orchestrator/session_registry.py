@@ -967,6 +967,15 @@ TERMINAL_TTL = timedelta(hours=24)
 """How long a terminal (EXITED/FAILED_TO_START) record survives after its
 last write before the reaper reclaims it, regardless of launcher_pid."""
 
+REAP_BATCH_LIMIT = 100
+"""Per-call cap on how many stale record dirs a single OPPORTUNISTIC
+(spawn-path) reap removes -- see reap_stale_records' `limit` param. Caps a
+single spawn's synchronous prune cost regardless of how large the on-disk
+backlog has grown, at the cost of draining a large backlog over several
+spawns rather than in one call. The CLI `reap` verb (_run_reap) stays
+unbounded (limit=None) so an operator can still drain the entire backlog in
+a single invocation."""
+
 NON_TERMINAL_HEARTBEAT_TTL = timedelta(hours=1)
 """How long a non-terminal record survives with a dead launcher_pid and no
 fresh write (heartbeat) before the reaper reclaims it. A live launcher_pid
@@ -1729,13 +1738,16 @@ def _run_launching(env: Mapping[str, str]) -> str:
     """Build + write a LAUNCHING record from CLAUDE_SPAWN_* env; return its dir.
 
     Also opportunistically drives the liveness sweep
-    (``mark_orphaned_sessions_exited``): ``reap_stale_records``/this sweep
-    have no periodic production driver of their own (CLI-only), so every
-    spawn is what drains prior orphaned (unclean-death) records to
-    ``exited`` -- the backlog is bounded by spawn rate and self-limits as it
-    drains. Wrapped in a fail-soft guard: a sweep fault must never raise
-    here and must never write to stdout, or it would corrupt the printed
-    record dir spawn-claude.sh captures into ``SESSION_RECORD_DIR``.
+    (``mark_orphaned_sessions_exited``) AND a bounded prune
+    (``reap_stale_records(limit=REAP_BATCH_LIMIT)``): neither sweep has a
+    periodic production driver of its own (CLI-only), so every spawn is
+    what drains prior orphaned (unclean-death) records to ``exited`` AND
+    reclaims terminal/stale record dirs from disk -- the backlog is bounded
+    by spawn rate and self-limits as it drains, over successive spawns for
+    the bounded prune. Wrapped in a fail-soft guard: a sweep fault must
+    never raise here and must never write to stdout, or it would corrupt
+    the printed record dir spawn-claude.sh captures into
+    ``SESSION_RECORD_DIR``.
 
     Cost model (reviewer-flagged): the sweep is O(N) in the number of
     session directories -- one ``iterdir`` + one ``record.json`` parse per
@@ -1748,6 +1760,9 @@ def _run_launching(env: Mapping[str, str]) -> str:
     the right place to revisit if spawn latency ever becomes a problem is a
     dedicated periodic timer (systemd/cron) rather than this synchronous
     call -- out of this task's module scope (would touch harness/systemd).
+    The bounded prune (``limit=REAP_BATCH_LIMIT``) caps its own scan/rmtree
+    cost per call regardless of backlog size; the CLI ``reap`` verb
+    (``_run_reap``) remains the operator's unbounded full-drain path.
     """
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
     prompt = env.get('CLAUDE_SPAWN_PROMPT', '') or ''
@@ -1777,6 +1792,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
     write_record(record)
     with contextlib.suppress(Exception):
         mark_orphaned_sessions_exited()
+    reap_stale_records(limit=REAP_BATCH_LIMIT)
     return str(record_dir)
 
 
