@@ -5,7 +5,11 @@ effective-benign predicate, and the per-path benign default helper
 
 from __future__ import annotations
 
-from escalation.classify import classify_resolver_tier, effective_benign
+from escalation.classify import (
+    classify_resolver_tier,
+    default_resolution_class_for_resolver,
+    effective_benign,
+)
 from escalation.models import Escalation
 
 
@@ -132,3 +136,51 @@ class TestEffectiveBenign:
         """Pending record (resolution_class=None, status='pending') -> (None, 'excluded')."""
         record = _make_escalation(status='pending', resolution_class=None)
         assert effective_benign(record) == (None, 'excluded')
+
+
+class TestDefaultResolutionClassForResolver:
+    """default_resolution_class_for_resolver(resolved_by): 'benign' iff reaper-sweep tier, else None."""
+
+    def test_auto_dismissed_defaults_benign(self):
+        """resolved_by='auto-dismissed' defaults to 'benign'."""
+        assert default_resolution_class_for_resolver('auto-dismissed') == 'benign'
+
+    def test_harness_orphan_reaper_defaults_benign(self):
+        """resolved_by='harness-orphan-reaper' defaults to 'benign'."""
+        assert default_resolution_class_for_resolver('harness-orphan-reaper') == 'benign'
+
+    def test_orchestrator_starvation_watchdog_defaults_benign(self):
+        """resolved_by='orchestrator-starvation-watchdog' defaults to 'benign'."""
+        assert default_resolution_class_for_resolver('orchestrator-starvation-watchdog') == 'benign'
+
+    def test_harness_escalation_revalidation_sweep_defaults_benign(self):
+        """resolved_by='harness-escalation-revalidation-sweep' defaults to 'benign'."""
+        assert default_resolution_class_for_resolver('harness-escalation-revalidation-sweep') == 'benign'
+
+    def test_interactive_defaults_none(self):
+        """resolved_by='interactive' (human tier) defaults to None — no auto-benign for humans."""
+        assert default_resolution_class_for_resolver('interactive') is None
+
+    def test_escalation_watcher_defaults_none(self):
+        """resolved_by='escalation-watcher' (human tier) defaults to None."""
+        assert default_resolution_class_for_resolver('escalation-watcher') is None
+
+    def test_escalation_watcher_auto_defaults_none(self):
+        """resolved_by='escalation-watcher-auto' (auto-watcher tier) defaults to None — β wires it explicitly."""
+        assert default_resolution_class_for_resolver('escalation-watcher-auto') is None
+
+    def test_steward_defaults_none(self):
+        """resolved_by='claude-task-2656-steward' (steward tier) defaults to None."""
+        assert default_resolution_class_for_resolver('claude-task-2656-steward') is None
+
+    def test_l2_cascade_defaults_none(self):
+        """resolved_by='l2-cascade:esc-1-1' (cascade tier) defaults to None — cascade inherits the parent's class instead."""
+        assert default_resolution_class_for_resolver('l2-cascade:esc-1-1') is None
+
+    def test_none_defaults_none(self):
+        """resolved_by=None (unknown tier) defaults to None."""
+        assert default_resolution_class_for_resolver(None) is None
+
+    def test_random_role_defaults_none(self):
+        """resolved_by='random-role' (other-auto tier) defaults to None."""
+        assert default_resolution_class_for_resolver('random-role') is None
