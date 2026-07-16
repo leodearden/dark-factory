@@ -2614,6 +2614,92 @@ async def test_plain_transition_does_not_use_atomic_audit_write(
     taskmaster.set_status_and_stamp_audit.assert_not_called()
 
 
+# ── Tests for false-success propagation guard on a non-persisted write
+#    (task 2649 step-10; review remediation: reviewer_comprehensive /
+#    robustness_false_success_propagation) ───────────────────────────────
+#
+# The backend read-back verify (steps 3/4) makes set_task_status AND
+# set_status_and_stamp_audit return an explicit {'success': False,
+# 'error': 'status_write_not_persisted', ...} dict instead of a fabricated
+# success when the status column did not actually change. The interceptor
+# must short-circuit on that error BEFORE emitting task_status_changed and
+# BEFORE firing targeted reconciliation -- neither side effect may fire for
+# a transition that never actually happened.
+
+
+@pytest.mark.asyncio
+async def test_status_write_not_persisted_short_circuits_plain_writer(
+    interceptor, taskmaster, reconciler, event_buffer,
+):
+    """Plain tm.set_task_status reporting status_write_not_persisted must
+    propagate verbatim -- no event buffered, no reconciliation fired."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'in-progress', 'title': 'T'},
+    )
+    taskmaster.set_task_status = AsyncMock(return_value={
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '1',
+        'requested_status': 'blocked',
+        'actual_status': 'in-progress',
+    })
+
+    result = await interceptor.set_task_status('1', 'blocked', '/project')
+
+    assert result.get('success') is False
+    assert result.get('error') == 'status_write_not_persisted'
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 0
+    # Let any erroneously-spawned background reconciliation task run.
+    await asyncio.sleep(0)
+    reconciler.reconcile_task.assert_not_called()
+    assert 'reconciliation' not in result
+
+
+@pytest.mark.asyncio
+async def test_status_write_not_persisted_short_circuits_atomic_writer(
+    taskmaster, reconciler, event_buffer, tmp_path,
+):
+    """Same short-circuit for the atomic set_status_and_stamp_audit writer,
+    reached via a verified done_provenance (kind='merged') on a done
+    transition -- no event buffered, no reconciliation fired.
+
+    Uses a real git repo (not a placeholder SHA) because kind='merged'
+    provenance resolution shells out to ``git rev-parse``/``merge-base``
+    against project_root -- a fake commit against a nonexistent
+    project_root would fail done_provenance validation itself, never
+    reaching the atomic writer this test targets.
+    """
+    sha = _init_git_repo(tmp_path)
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'in-progress', 'title': 'T'},
+    )
+    taskmaster.set_status_and_stamp_audit = AsyncMock(return_value={
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '1',
+        'requested_status': 'done',
+        'actual_status': 'in-progress',
+    })
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    project_root = str(tmp_path)
+    project_id = resolve_project_id(project_root)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', project_root,
+        done_provenance={'kind': 'merged', 'commit': sha},
+    )
+
+    assert result.get('success') is False
+    assert result.get('error') == 'status_write_not_persisted'
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    stats = await event_buffer.get_buffer_stats(project_id)
+    assert stats['size'] == 0
+    await asyncio.sleep(0)
+    reconciler.reconcile_task.assert_not_called()
+    assert 'reconciliation' not in result
+
+
 # ── Regression guard: composed atomic-reopen contract, end-to-end (task 2649,
 #    requirement #5) ─────────────────────────────────────────────────────
 #
