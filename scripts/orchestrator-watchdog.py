@@ -135,6 +135,17 @@ FLEET_DEPLOY_CLOCK_PATH = os.environ.get(
 # ticks land inside an already-logged bucket and stay silent.
 SKIP_LOG_INTERVAL_SECS = 1800
 
+# Freshness window for report()'s MERGE-IDLE column (_classify_unit_heartbeat
+# below), mirroring restart-all-orchestrators.sh's ORCH_DRAIN_FRESH_WINDOW_SECS
+# default so the report's classification matches the drain gate exactly. A
+# missing/malformed value falls back to the default — mirrors
+# STALENESS_GRACE_SECS's try/except pattern above: a typo'd env var must not
+# crash the oneshot watchdog (or report()).
+try:
+    DRAIN_FRESH_WINDOW_SECS = int(os.environ["ORCH_DRAIN_FRESH_WINDOW_SECS"])
+except (KeyError, ValueError):
+    DRAIN_FRESH_WINDOW_SECS = 120
+
 
 def log(msg: str) -> None:
     """Write *msg* to the systemd journal tagged as ``orchestrator-watchdog``."""
@@ -708,6 +719,42 @@ def _format_epoch(epoch: int | None) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(epoch))
 
 
+def _classify_unit_heartbeat(unit: str, now: float) -> str:
+    """Classify *unit*'s merge-idle heartbeat for report()'s MERGE-IDLE column.
+
+    Reuses scripts/drain_check.py's classify()/_read_heartbeat()/
+    heartbeat_path()/resolve_fleet_dir() (task 2397, γ) via a lazy import, so
+    this column predicts restart-all-orchestrators.sh's drain gate exactly
+    rather than risking a reimplementation drifting from it. report() (doctor
+    mode) is the ONLY caller — the liveness/staleness timer path (main() /
+    staleness_pass()) never imports drain_check at all.
+
+    Fail-soft: any exception (drain_check missing/unimportable, an unreadable
+    fleet dir, or anything else) is swallowed and degrades this single column
+    to 'unknown' rather than breaking report() as a whole.
+
+    Inserts this module's own directory onto sys.path (guarded — a no-op if
+    already present, e.g. via tests/scripts/conftest.py under test) so
+    ``import drain_check`` resolves regardless of how this script was
+    invoked.
+    """
+    try:
+        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import drain_check  # noqa: PLC0415
+
+        fleet_dir = drain_check.resolve_fleet_dir()
+        path = drain_check.heartbeat_path(fleet_dir, unit)
+        heartbeat = drain_check._read_heartbeat(path)
+        return drain_check.classify(heartbeat, now, DRAIN_FRESH_WINDOW_SECS)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"_classify_unit_heartbeat({unit!r}): swallowed {exc!r}; returning 'unknown'"
+        )
+        return "unknown"
+
+
 def report() -> int:
     """Print a per-unit staleness table for the running fleet; return 1 iff any unit is stale.
 
@@ -736,7 +783,18 @@ def report() -> int:
     fleet-deploy clock read via _read_last_fleet_deploy_epoch, task 2396 β)
     rendered as hours-to-one-decimal and repeated on every row, like the
     existing NEWEST WATCHED COMMIT column; 'unknown' when the clock is
-    absent/unreadable. Read-only: this never writes the clock file (I8).
+    absent/unreadable.
+
+    MERGE-IDLE is each unit's per-unit merge-idle heartbeat verdict
+    (idle/busy/stale/absent/unknown), classified by _classify_unit_heartbeat
+    via a lazy reuse of scripts/drain_check.py (task 2397 γ) so it predicts
+    restart-all-orchestrators.sh's drain gate exactly. WOULD-DEFER is 'yes'
+    iff MERGE-IDLE is 'busy' — the only verdict the drain gate actually
+    defers on; idle proceeds immediately and stale/absent proceed after the
+    gate's short unknown-grace.
+
+    Read-only: report() never writes the fleet-deploy clock file and issues
+    zero mutating systemctl calls (I8).
     """
     commit_epoch = _newest_watched_commit_epoch()
     units = _enumerate_running_units()
@@ -755,7 +813,7 @@ def report() -> int:
     )
     print(
         f"{'UNIT':<50} {'START':<24} {'NEWEST WATCHED COMMIT':<24} {'VERDICT':<10} "
-        "DEPLOY-AGE"
+        f"{'DEPLOY-AGE':<12} {'MERGE-IDLE':<12} WOULD-DEFER"
     )
 
     any_stale = False
@@ -769,9 +827,11 @@ def report() -> int:
             any_stale = True
         else:
             verdict = "fresh"
+        merge_verdict = _classify_unit_heartbeat(unit, now)
+        would_defer = "yes" if merge_verdict == "busy" else "no"
         print(
             f"{unit:<50} {start_str:<24} {commit_str:<24} {verdict:<10} "
-            f"{deploy_age_str}"
+            f"{deploy_age_str:<12} {merge_verdict:<12} {would_defer}"
         )
 
     return 1 if any_stale else 0
