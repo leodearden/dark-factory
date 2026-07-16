@@ -1745,6 +1745,20 @@ class TestCiteRun:
         ]
 
     @pytest.mark.asyncio
+    async def test_happy_path_projects_in_get_findings_for_run(self):
+        """task-2595 step-5: the raw Stage-2 channel (get_findings_for_run)
+        must also project cited_runs, not just get_assembled_report."""
+        state, run_id, finding_id, _ = self._state_and_finding(count_result=3)
+
+        await state.cite_run(run_id, finding_id, self._VALID_CITED_RUN_ID)
+
+        results = state.get_findings_for_run(run_id)
+        by_id = {r['finding_id']: r for r in results}
+        assert by_id[finding_id]['cited_runs'] == [
+            {'run_id': self._VALID_CITED_RUN_ID, 'match_count': 3}
+        ]
+
+    @pytest.mark.asyncio
     async def test_run_not_found_when_count_is_zero(self):
         """count_result=0 → {error:'run_not_found', error_type:'ReconReportRunNotFound'}."""
         state, run_id, finding_id, _ = self._state_and_finding(count_result=0)
