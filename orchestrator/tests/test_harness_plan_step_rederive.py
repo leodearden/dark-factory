@@ -112,16 +112,24 @@ def _make_workflow(
     return workflow, artifacts
 
 
-def _write_plan(artifacts: TaskArtifacts, workflow: TaskWorkflow, steps: list[dict]) -> dict:
+def _write_plan(
+    artifacts: TaskArtifacts,
+    workflow: TaskWorkflow,
+    steps: list[dict],
+    prerequisites: list[dict] | None = None,
+) -> dict:
     """Persist a plan with the given step dicts and stamp provenance,
     returning the re-read plan so ``workflow.plan`` mirrors what's on disk —
     required because ``update_step_status`` reads/writes plan.json directly,
-    independent of any in-memory ``workflow.plan`` the caller also sets."""
+    independent of any in-memory ``workflow.plan`` the caller also sets.
+
+    ``prerequisites`` defaults to ``[]`` — most callers only care about the
+    'steps' collection; pass it explicitly to also seed 'prerequisites'."""
     plan = {
         'task_id': '42',
         'title': 'X',
         'analysis': 'A',
-        'prerequisites': [],
+        'prerequisites': prerequisites or [],
         'steps': steps,
     }
     artifacts.write_plan(plan)
@@ -171,6 +179,60 @@ class TestRederiveStepStatusHappyPath:
         assert step_1['commit'], 'Expected a non-null commit recorded on the re-derived step'
         assert step_2['status'] == 'pending', (
             'step-2 was never in steps_completed and must stay pending'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Reviewer amendment: prerequisite re-derivation. The implementation walks
+# both ('prerequisites', 'steps') collections; every other test in this file
+# only populates 'steps', so a regression that dropped the 'prerequisites'
+# iteration would pass the suite undetected. Pin it directly.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRederiveStepStatusPrerequisite:
+    async def test_pending_prerequisite_completed_in_log_is_rederived_to_done(
+        self, config, git_ops, task_assignment,
+    ):
+        """A *prerequisite* recorded 'pending' in plan.json but marked
+        complete in the durable iteration log is re-derived to 'done', the
+        same as a step — while an unrelated pending step (not in
+        steps_completed) stays untouched."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'impl.py').write_text('implementation\n')
+        prereq_commit = await git_ops.commit(wt, 'feat: GREEN — prereq-1')
+        assert prereq_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_plan(
+            artifacts, workflow,
+            steps=[{'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None}],
+            prerequisites=[
+                {'id': 'prereq-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+            ],
+        )
+        artifacts.append_iteration_log({
+            'agent': 'implementer',
+            'steps_completed': ['prereq-1'],
+            'commit': prereq_commit,
+        })
+
+        result = await workflow._rederive_step_status_from_branch_state()
+
+        assert result == ['prereq-1']
+        plan = artifacts.read_plan()
+        prereq = next(p for p in plan['prerequisites'] if p['id'] == 'prereq-1')
+        step = next(s for s in plan['steps'] if s['id'] == 'step-1')
+        assert prereq['status'] == 'done'
+        assert prereq['commit'], (
+            'Expected a non-null commit recorded on the re-derived prerequisite'
+        )
+        assert step['status'] == 'pending', (
+            'step-1 was never in steps_completed and must stay pending'
         )
 
 
@@ -374,7 +436,14 @@ class TestInterIterationRebaseRederivesStepStatus:
     ):
         """A real inter-iteration rebase must re-derive a stale-pending step
         (already completed per the durable iteration log, with a genuine
-        branch commit) to 'done'."""
+        branch commit) to 'done' — with its recorded commit reachable from
+        the post-rebase HEAD. The rebase rewrites the branch's commits onto
+        the new base, so the *pre-rebase* SHA the log reported (``step_commit``
+        below) is expected to become unreachable; the re-derivation must
+        record the post-rebase HEAD instead of that stale SHA (see
+        ``_rederive_step_status_from_branch_state``'s docstring) — otherwise
+        this would silently recreate the orphaned-commit condition task
+        2386's ``_reconcile_done_step_commits`` exists to repair."""
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
         workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
@@ -401,8 +470,16 @@ class TestInterIterationRebaseRederivesStepStatus:
 
         assert result is not None, 'Rebase should have happened (main advanced).'
         plan = artifacts.read_plan()
-        assert plan['steps'][0]['status'] == 'done', (
+        step_1 = plan['steps'][0]
+        assert step_1['status'] == 'done', (
             'Expected step-1 re-derived to done by the wired-in re-derivation'
+        )
+        post_rebase_head = await workflow._get_head_commit()
+        assert await git_ops.is_ancestor(step_1['commit'], post_rebase_head), (
+            f"Re-derived step's recorded commit {step_1['commit']!r} must be "
+            f'reachable from the post-rebase HEAD {post_rebase_head!r} — '
+            'recording the rewritten pre-rebase log commit instead would be '
+            'orphaned and unreachable here'
         )
 
     async def test_no_rebase_when_main_unchanged_leaves_step_pending(
