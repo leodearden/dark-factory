@@ -3141,8 +3141,8 @@ async def test_on_task_done_completion_journal_has_echo_used_provenance(
                     "completion not yet verified."
                 ),
                 'content_contains': [
-                    'Intended deliverable per task description: '
-                    'STALE pre-fix bug statement',
+                    'Task description (unverified, may be the original '
+                    'problem statement): STALE pre-fix bug statement',
                 ],
                 'content_not_contains': ['completed'],
                 'metadata_true': ['echo_unverified_completion'],

@@ -475,8 +475,16 @@ class TargetedReconciler:
                         "completion not yet verified."
                     )
                     if description:
+                        # Task 2622 amendment: don't label this a "deliverable" --
+                        # per the task-2049 note above, on a first done-transition
+                        # `description` is usually the pre-fix bug/problem
+                        # statement, not what was delivered. Calling it the
+                        # "intended deliverable" would re-assert an
+                        # interpretation this fallback exists precisely because
+                        # it can't verify.
                         content += (
-                            f" Intended deliverable per task description: {description}"
+                            " Task description (unverified, may be the original "
+                            f"problem statement): {description}"
                         )
                     details = task.get('details', '')
                     if isinstance(details, str) and details:
