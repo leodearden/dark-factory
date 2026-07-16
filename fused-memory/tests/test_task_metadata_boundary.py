@@ -450,3 +450,83 @@ async def test_update_task_kind_deterministic_on_normal_task_rejected_post_merge
 
     task2 = await warn_backend.get_task(dto2['id'], project_root=warn_root)
     assert task2['metadata'] == {'files': ['a.py'], 'task_kind': 'deterministic'}
+
+
+# ── Row 7 — capstone: census code= token + vocabulary reconciliation ─
+
+
+@pytest.mark.asyncio
+async def test_census_code_token_and_vocabulary_reconciliation_end_to_end(
+    make_backend, tmp_path, caplog,
+):
+    """Capstone regression guard for the near-empty enforcement census (task 2330).
+
+    Drives the REAL write-boundary validator (``_validate_metadata_on_write``
+    — the exact seam ``add_task``/``update_task`` call internally) with three
+    blobs, confirming the task's user-observable signal end-to-end:
+
+    (a) a blob with legacy TOP-LEVEL infra-resume counters emits ZERO
+        ``task_metadata.schema_warning`` census lines — the v1->v2
+        migration lifts them into ``retry_ledger`` at parse-time;
+    (b) a blob of Tier-A blessed conventional keys emits ZERO census lines
+        — the ``_BLESSED_METADATA_KEYS`` allowlist suppresses them;
+    (c) a blob with a genuine unknown key still emits exactly one census
+        line, and that line now carries the ``code=unknown_key`` token —
+        WORK ITEM 1's discriminator flowing through the real backend, with
+        genuine drift still surfacing.
+
+    This is the regression guard for
+    ``grep 'task_metadata.schema_warning' | grep -v code=unknown_key``
+    being near-empty in the live journal.
+    """
+    backend = await make_backend(enforce=False)
+    root = str(tmp_path / 'capstone')
+    dto = await backend.add_task(project_root=root, title='t')
+    tid = int(dto['id'])
+
+    # (a) legacy top-level infra-resume counters -- suppressed by the
+    # v1->v2 migration at parse-time.
+    legacy_counters = json.dumps({
+        'consecutive_infra_resume_failures': 3,
+        'last_infra_resume_iteration_count': 7,
+    })
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        caplog.clear()
+        await backend._validate_metadata_on_write(
+            legacy_counters, project_root=root, tag='master', task_id=tid,
+        )
+    assert _schema_warning_messages(caplog) == [], (
+        'Expected zero census lines for legacy top-level infra-resume counters '
+        '(the v1->v2 migration should lift them into retry_ledger at parse-time)'
+    )
+
+    # (b) a representative spread of Tier-A blessed conventional keys --
+    # suppressed by the _BLESSED_METADATA_KEYS allowlist.
+    blessed_blob = json.dumps({
+        'source': 'x',
+        'modules': ['a'],
+        'complexity': 'simple',
+        'prd_path': 'plans/x.md',
+        'gate_escalated_at': '2026-01-01T00:00:00+00:00',
+    })
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        caplog.clear()
+        await backend._validate_metadata_on_write(
+            blessed_blob, project_root=root, tag='master', task_id=tid,
+        )
+    assert _schema_warning_messages(caplog) == [], (
+        'Expected zero census lines for a Tier-A blessed conventional-key blob'
+    )
+
+    # (c) a genuine unknown key -- still surfaces, and now carries the new
+    # code=unknown_key discriminator token.
+    unknown_blob = json.dumps({'mystery_zzz': 'control'})
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        caplog.clear()
+        await backend._validate_metadata_on_write(
+            unknown_blob, project_root=root, tag='master', task_id=tid,
+        )
+    census = _schema_warning_messages(caplog)
+    assert len(census) == 1, f'Expected exactly one census line; got {census}'
+    assert 'code=unknown_key' in census[0], f'Expected code=unknown_key token; got: {census[0]!r}'
+    assert 'mystery_zzz' in census[0]
