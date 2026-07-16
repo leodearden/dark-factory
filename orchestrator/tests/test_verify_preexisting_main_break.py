@@ -617,3 +617,68 @@ class TestVerifyFailureProbeWarmSeed:
             f'expected the verdict to be unchanged by a seed fault '
             f'(fail-soft to cold); got {result!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — step-11 (task μ, verify-scope-inversion-prd.md): pure baseline-diff
+#          helpers, diff_new_failures / is_wholly_preexisting — the decision
+#          core of B1.  Unlike the rest of this file these are plain
+#          synchronous unit tests: no worktree, no GitOps, no async — the
+#          helpers are pure set operations over failing-test-id iterables.
+# ---------------------------------------------------------------------------
+
+
+class TestBaselineDiffHelpers:
+    """diff_new_failures(branch, baseline) is set difference (branch - baseline);
+    is_wholly_preexisting(branch, baseline) is True iff branch is non-empty and
+    every id in branch also appears in baseline."""
+
+    def test_diff_new_failures_is_set_difference(self) -> None:
+        from orchestrator.verify import diff_new_failures
+
+        assert diff_new_failures(['x::1', 'y::2'], ['x::1']) == frozenset({'y::2'})
+
+    def test_diff_new_failures_row4_shape(self) -> None:
+        """row-4: branch={X,Y}, baseline={X} -> new={Y} (mixed: one new id, one preexisting)."""
+        from orchestrator.verify import diff_new_failures
+
+        assert diff_new_failures({'X', 'Y'}, {'X'}) == frozenset({'Y'})
+
+    def test_diff_new_failures_row5_shape(self) -> None:
+        """row-5: branch={X}, baseline={X,Z} -> new=set() (branch wholly covered by baseline)."""
+        from orchestrator.verify import diff_new_failures
+
+        assert diff_new_failures({'X'}, {'X', 'Z'}) == frozenset()
+
+    def test_diff_new_failures_empty_branch_is_empty(self) -> None:
+        from orchestrator.verify import diff_new_failures
+
+        assert diff_new_failures([], ['X']) == frozenset()
+
+    def test_is_wholly_preexisting_true_for_row5_shape(self) -> None:
+        """row-5: branch subset-of baseline and branch non-empty -> True."""
+        from orchestrator.verify import is_wholly_preexisting
+
+        assert is_wholly_preexisting({'X'}, {'X', 'Z'}) is True
+
+    def test_is_wholly_preexisting_true_when_baseline_exactly_matches(self) -> None:
+        from orchestrator.verify import is_wholly_preexisting
+
+        assert is_wholly_preexisting({'X'}, {'X'}) is True
+
+    def test_is_wholly_preexisting_false_for_row4_shape(self) -> None:
+        """row-4: branch has a new id (Y) absent from baseline -> False."""
+        from orchestrator.verify import is_wholly_preexisting
+
+        assert is_wholly_preexisting({'X', 'Y'}, {'X'}) is False
+
+    def test_is_wholly_preexisting_false_when_branch_has_any_id_absent_from_baseline(self) -> None:
+        from orchestrator.verify import is_wholly_preexisting
+
+        assert is_wholly_preexisting({'a::1', 'b::2'}, {'a::1'}) is False
+
+    def test_is_wholly_preexisting_false_for_empty_branch(self) -> None:
+        """An empty branch (no failures at all) is trivially False -- nothing to attribute."""
+        from orchestrator.verify import is_wholly_preexisting
+
+        assert is_wholly_preexisting([], ['X', 'Y']) is False
