@@ -189,3 +189,52 @@ async def test_b6_online_but_task_absent_gets_honest_zero_contrast(dummy_client,
     assert row['loops'] == 0
     assert row['attempts'] == 0
     assert row['started'] == 0
+
+
+# ---------------------------------------------------------------------------
+# B7 — Hand reader gone
+# ---------------------------------------------------------------------------
+
+
+_RETIRED_HAND_READER_SYMBOLS = ('_scan_worktrees', '_extract_task_id', 'read_task_artifacts')
+
+
+def test_b7_hand_reader_symbols_absent_from_dashboard_orchestrator_module():
+    """The retired hand reader's symbols are gone from dashboard.data.orchestrator
+    (module-attribute check) -- per-task runtime state is now served entirely
+    by the escalation get_task_runtime_state MCP tool (see that module's
+    RETIRED docstring note, plans/dashboard-task-runtime-endpoint-prd.md).
+    """
+    for name in _RETIRED_HAND_READER_SYMBOLS:
+        assert not hasattr(dash_orch, name), (
+            f'{name} should be retired from dashboard.data.orchestrator -- '
+            'see plans/dashboard-task-runtime-endpoint-prd.md'
+        )
+
+
+def test_b7_hand_reader_defs_absent_from_dashboard_src_source_scan():
+    """No `def _scan_worktrees` / `def _extract_task_id` / `def read_task_artifacts`
+    exists anywhere under dashboard/src.
+
+    Anchored on the `def <name>` DEFINITION (not a bare substring) so this
+    does not false-positive on dashboard/data/orchestrator.py's RETIRED
+    docstring note (which legitimately names these symbols in prose) or any
+    future retirement note referencing them. Scoped strictly to dashboard/src
+    so orchestrator/src/orchestrator/task_runtime.py's own unrelated
+    `_extract_task_id` (a worktree-dirname parser, unrelated to the retired
+    hand reader) is not caught either.
+    """
+    src_root = Path(__file__).resolve().parent.parent / 'src'
+    assert src_root.is_dir(), f'expected dashboard/src at {src_root}'
+    def_patterns = tuple(f'def {name}' for name in _RETIRED_HAND_READER_SYMBOLS)
+    hits = [
+        (path, pattern)
+        for path in src_root.rglob('*.py')
+        for pattern in def_patterns
+        if pattern in path.read_text()
+    ]
+    assert hits == [], (
+        f'found retired hand-reader definitions in dashboard/src: {hits!r} -- '
+        'the hand reader is retired in favor of get_task_runtime_state '
+        '(plans/dashboard-task-runtime-endpoint-prd.md)'
+    )
