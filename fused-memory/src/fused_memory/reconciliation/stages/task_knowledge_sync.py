@@ -1086,6 +1086,7 @@ async def _prune_task_count_snapshots(
         Number of memories successfully deleted (0 if nothing matched, or
         on enumeration failure).
     """
+    enumeration_ok = True
     try:
         members = await memory_service.get_memories_by_metadata(
             project_id=project_id,
@@ -1099,7 +1100,8 @@ async def _prune_task_count_snapshots(
             project_id,
             extra={'project_id': project_id, 'run_id': run_id},
         )
-        return 0
+        enumeration_ok = False
+        members = []
 
     if len(members) >= scroll_limit:
         logger.warning(
@@ -1111,49 +1113,48 @@ async def _prune_task_count_snapshots(
         )
 
     ids = [member['id'] for member in members if member.get('id')]
-    if not ids:
-        return 0
-
-    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
-    # Pass 1 (inside gather_collect): re-raises structured-cancellation
-    # signals — this preserves the structured-cancellation contract and
-    # prevents this delete pass from silently converting a shutdown
-    # signal into an under-counted deletion tally.
-    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
-    results = await gather_collect(
-        memory_service.delete_memory(
-            memory_id=mid,
-            store='mem0',
-            project_id=project_id,
-            causation_id=run_id,
-            _source=_TASK_COUNT_SNAPSHOT_PRUNE_SOURCE,
-        )
-        for mid in ids
-    )
 
     success_count = 0
-    for mid, result in zip(ids, results, strict=True):
-        if isinstance(result, Exception):
-            logger.warning(
-                'reconciliation._prune_task_count_snapshots: delete failed for memory_id=%s; not counted',
-                mid,
-                extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
+    if ids:
+        # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+        # Pass 1 (inside gather_collect): re-raises structured-cancellation
+        # signals — this preserves the structured-cancellation contract and
+        # prevents this delete pass from silently converting a shutdown
+        # signal into an under-counted deletion tally.
+        # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+        results = await gather_collect(
+            memory_service.delete_memory(
+                memory_id=mid,
+                store='mem0',
+                project_id=project_id,
+                causation_id=run_id,
+                _source=_TASK_COUNT_SNAPSHOT_PRUNE_SOURCE,
             )
-        else:
-            success_count += 1
-
-    if success_count:
-        logger.info(
-            'reconciliation._prune_task_count_snapshots: pruned %d stale task_count_snapshot '
-            'record(s) for project_id=%s prior to canonical write',
-            success_count, project_id,
-            extra={'project_id': project_id, 'run_id': run_id},
+            for mid in ids
         )
+
+        for mid, result in zip(ids, results, strict=True):
+            if isinstance(result, Exception):
+                logger.warning(
+                    'reconciliation._prune_task_count_snapshots: delete failed for memory_id=%s; not counted',
+                    mid,
+                    extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
+                )
+            else:
+                success_count += 1
+
+        if success_count:
+            logger.info(
+                'reconciliation._prune_task_count_snapshots: pruned %d stale task_count_snapshot '
+                'record(s) for project_id=%s prior to canonical write',
+                success_count, project_id,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
 
     if stats is not None:
         stats[SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY] = len(members)
         stats[SNAPSHOT_PRUNED_STAT_KEY] = success_count
-        stats[SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY] = 1
+        stats[SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY] = 1 if enumeration_ok else 0
 
     return success_count
 
