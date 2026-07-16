@@ -138,17 +138,27 @@ function EscalationStatStrip({ analytics, projectFilter }) {
 
   // (a) benign rate — workflow.flow_daily is the only per-day benign/
   // actionable series in the payload; sum n by class across every filtered
-  // project's WINDOWED rows (cross-project rollup).
+  // project's WINDOWED rows (cross-project rollup), also building a
+  // per-date map (summed across projects) for the trend sparkline.
   let benignN = 0, actionableN = 0;
+  const benignByDate = {}; // date -> { benign, actionable }
   for (const p of projects) {
     const flowDaily = sliceRowsByWindow((p.workflow || {}).flow_daily || [], cutoff);
     for (const row of flowDaily) {
-      if (row.class === 'benign') benignN += row.n;
-      else if (row.class === 'actionable') actionableN += row.n;
+      const bucket = benignByDate[row.date] || (benignByDate[row.date] = { benign: 0, actionable: 0 });
+      if (row.class === 'benign') { benignN += row.n; bucket.benign += row.n; }
+      else if (row.class === 'actionable') { actionableN += row.n; bucket.actionable += row.n; }
     }
   }
   const benignDenom = benignN + actionableN;
   const benignRate = benignDenom > 0 ? benignN / benignDenom : null;
+  // Per-day benign rate; 0 (not omitted) when a windowed date had no
+  // classified rows at all, so the sparkline stays aligned to the window.
+  const benignSpark = Object.keys(benignByDate).sort().map(d => {
+    const { benign, actionable } = benignByDate[d];
+    const denom = benign + actionable;
+    return denom > 0 ? benign / denom : 0;
+  });
 
   // Stamped-share hint — NO per-day provenance series exists in the payload,
   // so this is an ALL-TIME aggregate from origin.sources[], weighted by each
@@ -174,26 +184,45 @@ function EscalationStatStrip({ analytics, projectFilter }) {
 
   // (c) esc-per-done — aggregate ratio sum(filings)/sum(done) over the
   // WINDOWED rows, NOT a mean of daily ratios (undefined/biased on
-  // low-volume or done==0 days).
+  // low-volume or done==0 days). Also builds a per-date map (summed across
+  // projects — dates can repeat across per_project entries) for the trend
+  // sparkline; re-derived from filings/done rather than the payload's
+  // per-project row.ratio, since that field isn't valid post-rollup.
   let filingsSum = 0, doneSum = 0;
+  const epdByDate = {}; // date -> { filings, done }
   for (const p of projects) {
     const epd = sliceRowsByWindow((p.workflow || {}).esc_per_done_daily || [], cutoff);
     for (const row of epd) {
       filingsSum += row.filings || 0;
       doneSum += row.done || 0;
+      const bucket = epdByDate[row.date] || (epdByDate[row.date] = { filings: 0, done: 0 });
+      bucket.filings += row.filings || 0;
+      bucket.done += row.done || 0;
     }
   }
   const escPerDone = doneSum > 0 ? filingsSum / doneSum : null;
+  // Null ratio (done == 0 that day) is OMITTED rather than plotted as a
+  // misleading zero — same precedent as tab_escalation_analytics.jsx.
+  const epdSpark = Object.keys(epdByDate).sort()
+    .map(d => epdByDate[d])
+    .filter(b => b.done > 0)
+    .map(b => b.filings / b.done);
 
   // (d) churn-24h rate — sum(WINDOWED churn_daily)/sum(WINDOWED
   // esc_per_done_daily filings); both are keyed by filed-date
-  // (date(timestamp)), so they reconcile.
+  // (date(timestamp)), so they reconcile. Also builds a per-date map (summed
+  // across projects) for the trend sparkline.
   let churnSum = 0;
+  const churnByDate = {};
   for (const p of projects) {
     const churnDaily = sliceDailyByWindow((p.workflow || {}).churn_daily || {}, cutoff);
-    for (const n of Object.values(churnDaily)) churnSum += n;
+    for (const [d, n] of Object.entries(churnDaily)) {
+      churnSum += n;
+      churnByDate[d] = (churnByDate[d] || 0) + n;
+    }
   }
   const churnRate = filingsSum > 0 ? churnSum / filingsSum : null;
+  const churnSpark = Object.keys(churnByDate).sort().map(d => churnByDate[d]);
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, marginBottom: 10 }}>
@@ -201,6 +230,8 @@ function EscalationStatStrip({ analytics, projectFilter }) {
         label="benign rate"
         value={benignRate != null ? `${Math.round(benignRate * 100)}%` : '—'}
         hint={stampedPct != null ? `${stampedPct}% stamped` : undefined}
+        spark={benignSpark}
+        sparkColor={C.PALETTE.ok}
       />
       <C.StatTile
         label="6h breaches"
@@ -210,10 +241,14 @@ function EscalationStatStrip({ analytics, projectFilter }) {
       <C.StatTile
         label="esc / done"
         value={escPerDone != null ? escPerDone.toFixed(2) : '—'}
+        spark={epdSpark}
+        sparkColor={C.PALETTE.accent}
       />
       <C.StatTile
         label="churn 24h"
         value={churnRate != null ? `${Math.round(churnRate * 100)}%` : '—'}
+        spark={churnSpark}
+        sparkColor={C.PALETTE.bad}
       />
     </div>
   );
