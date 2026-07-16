@@ -3302,6 +3302,19 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # config's models/unblock_auto leaves fails closed with a
     # {reloaded: False, error: 'hybrid-invariant: ...'} + rollback — no
     # new reload code needed.
+    #
+    # Audited for task epsilon (resolve_route, same PRD): ladder,
+    # per_model_daily_ceiling_usd and rules — the three leaves resolve_route
+    # adds to RoutingConfig — are auto-covered by this same whole-submodel
+    # group with no RELOADABLE_FIELDS edit. The list-valued `rules` leaf in
+    # particular is safe as an _iter_leaves atomic comparison: RoutingRule
+    # (and its RuleMatch/RuleSet fields) are plain pydantic BaseModels, whose
+    # structural __eq__ makes list[RoutingRule] equality — and therefore
+    # diff_config's `live_val != fresh_val` — behave element-wise as
+    # expected, with extra='forbid' on RuleMatch/RuleSet still enforced by
+    # apply_reload's post-apply model_validate. See
+    # test_routing_reload.py (boundary test 11) for the reload-applies +
+    # fail-closed-on-unknown-key coverage.
     _submodel_leaf_paths('routing', RoutingConfig),
     {
         # Steward grace
