@@ -2078,6 +2078,43 @@ def confirm_task_absent(get_task_result: object) -> bool:
     return error_type in {'TaskmasterError', 'TaskNotFoundError'} and _NOT_FOUND_PHRASE in error.lower()
 
 
+#: Keys whose presence on a get_task result dict identifies it as an actual
+#: task record (as opposed to e.g. an unrelated empty dict).  Mirrors the
+#: shape of both the MCP-wrapper task envelope and the raw sqlite backend row.
+_TASK_IDENTITY_KEYS: frozenset[str] = frozenset({'id', 'task_id', 'title', 'status'})
+
+
+def confirm_task_present(get_task_result: object) -> bool:
+    """Fail-safe classifier: True ONLY when get_task POSITIVELY confirms presence.
+
+    Positive-present inverse of :func:`confirm_task_absent`: returns True iff
+    the result is a plain task-record dict — no ``'error'`` / ``'error_type'``
+    key — that carries at least one task-identity key (``id``, ``task_id``,
+    ``title``, or ``status``) as evidence the record is an actual task rather
+    than an unrelated empty dict.
+
+    All other inputs — a not-found error dict, a generic/inconclusive error
+    dict, ``None``, an empty dict, or a non-dict value — return False
+    (fail-safe: an uncertain or absent result must never be treated as
+    corroboration that a task exists).
+
+    Args:
+        get_task_result: The raw value returned by taskmaster.get_task() (or
+            mcp__fused-memory__get_task).  Expected to be either a task dict
+            (present) or an error dict (absent / inconclusive).
+
+    Returns:
+        True if and only if the result is a dict without ``'error'`` /
+        ``'error_type'`` keys and with at least one task-identity key
+        present. False in all other cases.
+    """
+    if not isinstance(get_task_result, dict):
+        return False
+    if 'error' in get_task_result or 'error_type' in get_task_result:
+        return False
+    return any(key in get_task_result for key in _TASK_IDENTITY_KEYS)
+
+
 # --------------------------------------------------------------------------- #
 # Already-tracked systemic-pattern guard (task-2416)
 # --------------------------------------------------------------------------- #
