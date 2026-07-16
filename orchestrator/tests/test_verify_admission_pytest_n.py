@@ -20,20 +20,56 @@ supported a specific worker-count cap on this host.
 
 from __future__ import annotations
 
+import shlex
+from typing import Any
+from unittest.mock import patch
+
 import pytest
 
 from orchestrator.config import (
     RELOADABLE_FIELDS,
+    ModuleConfig,
     OrchestratorConfig,
     apply_reload,
     diff_config,
 )
+from orchestrator.verify import run_verification
 from orchestrator.verify_cmd import (
     ToolKind,
     apply_pytest_numprocesses,
     parse_config_command,
     render,
 )
+
+# Module-local wiring-test fixtures (not conftest.py — a conftest.py edit
+# trips verify.py's has_conftest; mirrors test_verify_admission_wiring.py's
+# stated rationale). Deliberately duplicated rather than imported from that
+# module: each admission test file is self-contained.
+_TEST_CMD = 'pytest tests/'
+_LINT_CMD = 'ruff'
+_TYPE_CMD = 'pyright'
+
+
+def _leg_for_cmd(cmd: str) -> str:
+    if _TEST_CMD in cmd:
+        return 'test'
+    if _LINT_CMD in cmd:
+        return 'lint'
+    if _TYPE_CMD in cmd:
+        return 'type'
+    return cmd
+
+
+def _module_config(**overrides: Any) -> ModuleConfig:
+    kwargs: dict[str, Any] = dict(
+        prefix='pkg',
+        test_command=_TEST_CMD,
+        lint_command=_LINT_CMD,
+        type_check_command=_TYPE_CMD,
+        concurrent_verify=False,
+    )
+    kwargs.update(overrides)
+    return ModuleConfig(**kwargs)
 
 
 class TestVerifyAdmissionPytestNConfigDefault:
@@ -118,3 +154,139 @@ class TestApplyPytestNumprocesses:
     def test_noop_on_opaque(self):
         cmd = parse_config_command('mypy src/')
         assert apply_pytest_numprocesses(cmd, '16') == cmd
+
+
+class TestPytestNWiring:
+    """Wiring into ``_run_or_skip_timed``: the test-leg-only, role-gated
+    (task/background, not merge) `-n` rewrite, injected before the
+    nice-prefix wrap. Mirrors test_verify_admission_wiring.py's spy/
+    _leg_for_cmd/_module_config pattern.
+    """
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ['task', 'background'])
+    async def test_task_and_background_roles_get_dash_n_injected(self, tmp_path, role):
+        captured_cmds: list[str] = []
+
+        async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+            verify_admission_pytest_n='16',
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(),
+                role=role,
+                attempt_id=None,
+            )
+
+        test_cmd = next(c for c in captured_cmds if _leg_for_cmd(c) == 'test')
+        assert '-n 16' in test_cmd, f'expected -n 16 injected for role={role!r}; got {test_cmd!r}'
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_merge_role_excluded_from_dash_n_injection(self, tmp_path):
+        captured_cmds: list[str] = []
+
+        async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+            verify_admission_pytest_n='16',
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(),
+                role='merge',
+                attempt_id=None,
+            )
+
+        test_cmd = next(c for c in captured_cmds if _leg_for_cmd(c) == 'test')
+        assert '-n 16' not in test_cmd, (
+            f"merge's test leg must never be -n-capped (bypasses admission "
+            f'slot-counting, latency-critical); got {test_cmd!r}'
+        )
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_auto_value_injects_nothing(self, tmp_path):
+        captured_cmds: list[str] = []
+
+        async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+            verify_admission_pytest_n='auto',
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(),
+                role='task',
+                attempt_id=None,
+            )
+
+        assert captured_cmds[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(_TEST_CMD), (
+            "verify_admission_pytest_n='auto' must inject no -n rewrite — the "
+            'test leg must be byte-identical to pre-T6 (nice-wrap only)'
+        )
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_admission_disabled_injects_nothing(self, tmp_path):
+        captured_cmds: list[str] = []
+
+        async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_enabled=False,
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+            verify_admission_pytest_n='16',
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(),
+                role='task',
+                attempt_id=None,
+            )
+
+        assert captured_cmds[0] == _TEST_CMD, (
+            'disabled admission must never inject -n (or nice/bash-c wrap) the test leg'
+        )
