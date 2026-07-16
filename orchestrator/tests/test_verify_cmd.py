@@ -27,6 +27,7 @@ from orchestrator.verify_cmd import (
     scope_to,
     serial_pytest,
     strip_cwd,
+    with_junitxml,
 )
 
 
@@ -672,6 +673,61 @@ class TestGovernCpu:
         result = render(govern_cpu(cmd, self._EXEC))
         expected = f'{shlex.quote(self._EXEC)} --role merge -- /bin/bash -c {shlex.quote(raw)}'
         assert result == expected
+
+
+class TestWithJunitxml:
+    """with_junitxml(cmd, junit_path) appends a `--junitxml <path>` flag to a
+    structured pytest command's base_flags (task μ, verify-scope-inversion-prd.md).
+
+    Deliberately narrower than apply_pytest_numprocesses/serial_pytest: there
+    is NO raw-chain regex-rewrite branch — a raw-retained pytest chain (a
+    recognised-but-unstructurable `&&`-chain) is returned byte-identical
+    rather than rewritten, and OPAQUE/non-pytest commands no-op (P1). This
+    means a merge-role test_command that happens to be a multi-segment chain
+    degrades gracefully to no junit collection for that run (B3) rather than
+    risking a mis-scoped regex injection into an unstructured shell string.
+    """
+
+    def test_structured_single_invocation_appends_junitxml_flag(self):
+        cmd = parse_config_command('pytest tests/x.py')
+        result = render(with_junitxml(cmd, '/abs/attempt/junit.xml'))
+        assert result == 'pytest --junitxml /abs/attempt/junit.xml tests/x.py'
+
+    def test_base_flags_end_with_junitxml_pair(self):
+        cmd = parse_config_command('pytest tests/x.py')
+        mutated = with_junitxml(cmd, '/abs/attempt/junit.xml')
+        assert mutated.base_flags[-2:] == ('--junitxml', '/abs/attempt/junit.xml')
+        assert mutated.raw is None
+
+    def test_raw_retained_chain_returned_unchanged(self):
+        """A recognised-but-unstructurable pytest chain (raw is not None) is
+        NEVER regex-rewritten — the sole deliberate divergence from
+        apply_pytest_numprocesses/serial_pytest, which DO rewrite every
+        invocation in such a chain. Byte-identical no-op here instead.
+        """
+        raw = (
+            'cd shared && uv run pytest tests/ && '
+            'cd ../orchestrator && uv run pytest tests/'
+        )
+        cmd = parse_config_command(raw)
+        assert cmd.tool is ToolKind.PYTEST
+        assert cmd.raw == raw
+
+        result = with_junitxml(cmd, '/abs/attempt/junit.xml')
+        assert result == cmd
+        assert render(result) == raw
+
+    def test_non_pytest_command_returned_unchanged(self):
+        cmd = parse_config_command('ruff check .')
+        assert with_junitxml(cmd, '/abs/attempt/junit.xml') == cmd
+
+    def test_pyright_command_returned_unchanged(self):
+        cmd = parse_config_command('pyright')
+        assert with_junitxml(cmd, '/abs/attempt/junit.xml') == cmd
+
+    def test_noop_on_opaque(self):
+        cmd = parse_config_command('mypy src/')
+        assert with_junitxml(cmd, '/abs/attempt/junit.xml') == cmd
 
 
 class TestRenderInvariantAsserts:
