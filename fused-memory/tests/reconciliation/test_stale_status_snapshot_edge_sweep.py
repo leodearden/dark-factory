@@ -29,6 +29,7 @@ from __future__ import annotations
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     extract_snapshot_edge_task_ids,
     flatten_dedup_edges,
+    select_stale_status_snapshot_edges,
 )
 
 
@@ -137,3 +138,94 @@ class TestFlattenDedupEdges:
         assert result[0]['uuid'] == 'edge-1'
         assert result[0]['fact'] == 'Task 142 is an active pending task'
         assert result[0]['name'] == 'orchestrator'
+
+
+# --------------------------------------------------------------------------- #
+# select_stale_status_snapshot_edges
+# --------------------------------------------------------------------------- #
+
+
+class TestSelectStaleStatusSnapshotEdges:
+    """select_stale_status_snapshot_edges(edges, statuses) is the pure decision
+    core: an edge is selected (stale) iff any task id it asserts as
+    active/pending/in-progress now has a positively-terminal (done/cancelled)
+    status. Unknown/missing/still-active statuses never select an edge
+    (invalidate-only-on-positively-terminal fail-safe).
+    """
+
+    def test_individual_edge_selected_when_referenced_task_done(self):
+        """'Task 142 ...' with statuses={'142': 'done'} -> selected."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+
+        result = select_stale_status_snapshot_edges([edge], {'142': 'done'})
+
+        assert result == [edge]
+
+    def test_individual_edge_not_selected_when_still_active(self):
+        """'Task 142 ...' with statuses={'142': 'in-progress'} -> not selected."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+
+        result = select_stale_status_snapshot_edges([edge], {'142': 'in-progress'})
+
+        assert result == []
+
+    def test_individual_edge_selected_when_referenced_task_cancelled(self):
+        """'Task 142 ...' with statuses={'142': 'cancelled'} -> selected."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+
+        result = select_stale_status_snapshot_edges([edge], {'142': 'cancelled'})
+
+        assert result == [edge]
+
+    def test_aggregate_edge_selected_when_one_member_terminal(self):
+        """Aggregate edge referencing [142, 148]; 142 done, 148 still pending ->
+        the whole edge is selected stale on the single terminal member."""
+        edge = {
+            'uuid': 'edge-agg',
+            'fact': 'The active pending tasks are [142, 148]',
+            'name': '',
+        }
+
+        result = select_stale_status_snapshot_edges(
+            [edge], {'142': 'done', '148': 'pending'},
+        )
+
+        assert result == [edge]
+
+    def test_count_only_edge_never_selected(self):
+        """A count-only edge (no extractable ids) is never selected regardless
+        of the statuses map contents."""
+        edge = {'uuid': 'edge-count', 'fact': 'There are 8 tasks in progress', 'name': ''}
+
+        result = select_stale_status_snapshot_edges(
+            [edge], {'142': 'done', '999': 'cancelled'},
+        )
+
+        assert result == []
+
+    def test_referenced_id_absent_from_statuses_not_selected(self):
+        """The referenced id is missing from the statuses map entirely ->
+        fail-safe: not selected (an unknown census gap never invalidates)."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+
+        result = select_stale_status_snapshot_edges([edge], {})
+
+        assert result == []
+
+    def test_referenced_id_unknown_status_not_selected(self):
+        """The referenced id resolves to the 'unknown' status sentinel ->
+        fail-safe: not selected."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+
+        result = select_stale_status_snapshot_edges([edge], {'142': 'unknown'})
+
+        assert result == []
+
+    def test_returned_entries_carry_edge_uuid(self):
+        """Selected entries are the original edge dicts, carrying their uuid."""
+        edge = {'uuid': 'edge-carries-uuid', 'fact': 'Task 142 is an active pending task', 'name': ''}
+
+        result = select_stale_status_snapshot_edges([edge], {'142': 'done'})
+
+        assert len(result) == 1
+        assert result[0]['uuid'] == 'edge-carries-uuid'
