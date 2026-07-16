@@ -42,6 +42,7 @@ When in doubt about whether a prompt is self-contained, prefer leaving it untouc
 - **`prompt`** (required) — the string passed as the first positional argument to `claude`. May be a slash command (e.g. `/unblock 123`) or natural language. **First resolve it per [Resolving the prompt for a fresh context](#resolving-the-prompt-for-a-fresh-context) above** — a contextual prompt typed in an interactive session must be rewritten to stand alone *before* it becomes this argument. The caller is responsible for ensuring the final string contains no unescaped single quotes; if it must, escape each one as `'\''` (close-single, escaped-single, open-single — the standard Bourne idiom). Example: `it'\''s fine` becomes a valid payload.
 - **`cwd`** (required) — directory to `cd` into before invoking `claude`. Usually the project root. Must be an absolute path that exists on the host.
 - **`skip_permissions`** (default `true`) — when `true`, passes `--dangerously-skip-permissions` so the spawned session runs without permission prompts. Set `false` when the spawned session should prompt for permissions normally (e.g. interactive exploration where the human wants oversight).
+- **`model`** (optional) — the model the spawned session runs. Pass it as the **`CLAUDE_SPAWN_MODEL` environment variable** on the `spawn-claude.sh` invocation (it's an env var, not a positional, so the four-arg calling contract below is unchanged). The script forwards it verbatim to `claude --model <value>`, so it accepts anything that flag does: a latest-model **alias** (`opus`, `sonnet`, `haiku`, `fable`) or a full **model id** (e.g. `claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5-20251001`, `claude-fable-5`). Omit it to inherit the spawner's default model. Example: spawn a cheap triage session with `CLAUDE_SPAWN_MODEL=haiku`, or a heavy one with `CLAUDE_SPAWN_MODEL=opus`. (For arbitrary *other* claude flags there's a raw passthrough, `CLAUDE_SPAWN_CLAUDE_ARGS`, applied after `--model`; prefer `CLAUDE_SPAWN_MODEL` for the common case of just picking a model.)
 - **`terminal_title`** (the target convention for programmatic callers; optional for ad-hoc interactive use) — passed via `--title` to emulators that support it (`gnome-terminal`, `konsole`, `xterm`; `kitty` ignores it harmlessly). Distinguishes multiple spawned sessions in the window manager, and is load-bearing for Leo-on-return and the (future) attention-manifest to identify sessions at a glance without opening each window. Follow the convention `<role>:<project>#<task-id> <short-slug>` — `<role>` is the spawned skill/command (`unblock`, `review`, `prd`, ...), `<project>` is the project_id, `#<task-id>` is included when the spawn is task-scoped (omit it for project-level spawns), and `<short-slug>` is a few hyphenated words summarizing the work. Examples: `unblock:df#2085 routing-mechanism`, `prd:df attention-rail`. Programmatic callers (e.g. escalation-watcher) should pass a convention-shaped title going forward — this is the convention new and updated call sites follow, not yet a property every existing caller satisfies. Only a genuinely ad-hoc interactive spawn may omit a title entirely.
 
 ## Invocation
@@ -51,6 +52,15 @@ The skill ships with a helper script — `$DARK_FACTORY_ROOT/skills/spawn/spawn-
 ```
 Bash(
   command="$DARK_FACTORY_ROOT/skills/spawn/spawn-claude.sh <cwd> <skip_perms> '<title>' '<prompt>'",
+  run_in_background=true
+)
+```
+
+To pin the spawned session's model, prefix the command with `CLAUDE_SPAWN_MODEL=<alias-or-id>` (see the `model` argument above) — nothing else changes:
+
+```
+Bash(
+  command="CLAUDE_SPAWN_MODEL=haiku $DARK_FACTORY_ROOT/skills/spawn/spawn-claude.sh <cwd> <skip_perms> '<title>' '<prompt>'",
   run_in_background=true
 )
 ```

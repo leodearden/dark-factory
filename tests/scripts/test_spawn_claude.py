@@ -1232,6 +1232,132 @@ def test_spawn_fail_soft_skips_result_handback_when_registry_faults(
 
 
 # ===========================================================================
+# Model selection: CLAUDE_SPAWN_MODEL forwards to `claude --model <value>`
+# ===========================================================================
+# The trivial, first-class way to pin the spawned session's model: an env var
+# baked into the payload string alongside $flags, so it reaches claude even
+# under daemon-owned emulators that don't inherit the caller's environment.
+# Unset = no --model on the argv (inherit the spawner's default), keeping every
+# existing caller byte-identical.
+
+
+def _write_fake_claude_capturing_argv(
+    bin_dir: pathlib.Path, capture_file: pathlib.Path
+) -> None:
+    """Write a fake ``claude`` that captures its full argv (NUL-delimited) to
+    *capture_file*, then exits 0.
+
+    NUL-delimited rather than newline-delimited on purpose: the prompt is a
+    single argv element that may itself contain newlines (the result-handback
+    trailer spawn-claude.sh appends is multi-line), so a NUL separator keeps
+    argv boundaries unambiguous. Read back with ``_read_argv`` below.
+
+    Lets a test inspect the exact flag list spawn-claude.sh assembled into
+    ``$inner`` -- e.g. whether a ``--model <value>`` pair was spliced in, and
+    that the prompt still survives as the final argument.
+    """
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\0" "$@" > {capture_file!s}\n'
+        "exit 0\n"
+    )
+    p.chmod(0o755)
+
+
+def _read_argv(capture_file: pathlib.Path) -> list[str]:
+    """Read a NUL-delimited argv capture (see _write_fake_claude_capturing_argv),
+    dropping the trailing empty element left by the final NUL terminator.
+    """
+    raw = capture_file.read_bytes().decode()
+    parts = raw.split("\0")
+    if parts and parts[-1] == "":
+        parts.pop()
+    return parts
+
+
+def test_spawn_model_env_adds_model_flag(tmp_path: pathlib.Path) -> None:
+    """CLAUDE_SPAWN_MODEL=<value> must splice ``--model <value>`` into the
+    claude invocation, ahead of the prompt.
+
+    Uses skip_perms="false" (the default baked into _run_spawn) so $flags is
+    otherwise empty and the argv is exactly ``--model <value> <prompt>``.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_argv.txt"
+    _write_fake_claude_capturing_argv(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_MODEL"] = "claude-fable-5"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    argv = _read_argv(capture_file)
+    assert "--model" in argv, f"expected --model in the claude argv, got: {argv!r}"
+    assert argv[argv.index("--model") + 1] == "claude-fable-5", (
+        f"expected the model value to follow --model, got: {argv!r}"
+    )
+    # The prompt (plus the result-handback trailer) must still be the final
+    # argument, unaffected by the flag.
+    assert argv[-1].startswith("test prompt"), (
+        f"expected the prompt to remain the final argv entry, got: {argv!r}"
+    )
+
+
+def test_spawn_no_model_env_omits_model_flag(tmp_path: pathlib.Path) -> None:
+    """With CLAUDE_SPAWN_MODEL unset, no ``--model`` may appear on the argv --
+    the spawned session inherits the spawner's default model (existing-caller
+    behavior is byte-identical).
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_argv.txt"
+    _write_fake_claude_capturing_argv(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    env.pop("CLAUDE_SPAWN_MODEL", None)
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    argv = _read_argv(capture_file)
+    assert "--model" not in argv, (
+        f"expected NO --model on the argv when CLAUDE_SPAWN_MODEL is unset, "
+        f"got: {argv!r}"
+    )
+    # The prompt (plus its result-handback trailer) is the ONLY argv entry.
+    assert len(argv) == 1 and argv[0].startswith("test prompt"), (
+        f"expected the prompt as the only argv entry, got: {argv!r}"
+    )
+
+
+def test_spawn_model_env_precedes_raw_claude_args(tmp_path: pathlib.Path) -> None:
+    """A raw ``--model`` in CLAUDE_SPAWN_CLAUDE_ARGS is spliced AFTER the
+    dedicated CLAUDE_SPAWN_MODEL one, so it is the last ``--model`` on the argv
+    -- and claude uses the last ``--model`` it sees, letting the escape hatch
+    override the dedicated var when a caller sets both.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_argv.txt"
+    _write_fake_claude_capturing_argv(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_MODEL"] = "haiku"
+    env["CLAUDE_SPAWN_CLAUDE_ARGS"] = "--model opus"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    argv = _read_argv(capture_file)
+    model_idxs = [i for i, tok in enumerate(argv) if tok == "--model"]
+    assert len(model_idxs) == 2, f"expected two --model flags, got: {argv!r}"
+    # Dedicated var first, raw passthrough (the winner) last.
+    assert argv[model_idxs[0] + 1] == "haiku", f"got: {argv!r}"
+    assert argv[model_idxs[1] + 1] == "opus", f"got: {argv!r}"
+    assert model_idxs[0] < model_idxs[1], f"got: {argv!r}"
+
+
+# ===========================================================================
 # task-2291 step-7: Fleet Cockpit C1 spawn env exports (child/parent identity)
 # ===========================================================================
 # CLAUDE_SPAWN_SESSION_ID/CLAUDE_SPAWN_PARENT_ID let the spawned child (and
