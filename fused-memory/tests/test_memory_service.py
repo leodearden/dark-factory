@@ -8305,3 +8305,28 @@ class TestStoreFailureDiagnosticsHelper:
             f"Expected get_status to report graphiti connected=True even though "
             f"search degraded, got {st['graphiti']!r}."
         )
+
+    @pytest.mark.asyncio
+    async def test_search_rate_limit_error_classified_in_diagnostics(self, service):
+        """A rate-limit/quota error from graphiti.search is classified the same way
+        get_entity already classifies it (task 2448 parity): rate_limit_or_quota=True.
+
+        RED: _store_failure_diagnostics does not yet emit rate_limit_or_quota.
+        """
+        service.graphiti.search = AsyncMock(side_effect=_make_rate_limit_error())
+
+        res = await service.search(query='q', project_id='reify')
+
+        assert res.degraded is True
+        assert res.failed_stores == ['graphiti']
+        graphiti_diag = next(
+            (d for d in res.failure_diagnostics if d.get('store') == 'graphiti'), None
+        )
+        assert graphiti_diag is not None, (
+            f'Expected a graphiti entry in {res.failure_diagnostics!r}'
+        )
+        assert graphiti_diag['error_type'] == 'RateLimitError'
+        assert graphiti_diag.get('rate_limit_or_quota') is True, (
+            f"Expected rate_limit_or_quota=True, got {graphiti_diag!r}. "
+            "RED: _store_failure_diagnostics does not yet emit rate_limit_or_quota."
+        )
