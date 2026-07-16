@@ -331,6 +331,7 @@ class TestGetPendingCompact:
     _COMPACT_KEYS = {
         'id', 'task_id', 'category', 'severity', 'level', 'status',
         'summary', 'suggested_action', 'timestamp',
+        'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
     }
     # Heavy fields that compact mode must omit.
     _HEAVY_KEYS = {

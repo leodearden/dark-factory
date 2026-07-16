@@ -213,10 +213,13 @@ CATEGORIES = [
 # subset a long-running L2 watcher needs to decide whether to pull a full record.
 # The heavy fields (detail, members, options, root_cause, train_state,
 # workflow_state, worktree, dedupe_*) are dropped to keep the watcher's context
-# small as the pending pile grows during an AFK window.
+# small as the pending pile grows during an AFK window. The triage-ack fields
+# (triaged_at, triaged_by, triage_note, updated_at) are included so a compact
+# drain can decide stamp-then-skip without a per-record get_escalation round-trip.
 _COMPACT_ESCALATION_FIELDS = (
     'id', 'task_id', 'category', 'severity', 'level', 'status',
     'summary', 'suggested_action', 'timestamp',
+    'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
 )
 
 
