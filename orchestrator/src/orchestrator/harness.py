@@ -7938,6 +7938,14 @@ Output JSON matching the schema. Every task must appear in the output.
                     'Escalation-watcher-auto: L1 queue has no actionable work; '
                     'skipping rotation launch (poll=%.1fs)', poll,
                 )
+                # task 2629 review fix: reaching this branch proves the
+                # supervisor loop is alive and the queue was readable (the
+                # precheck fails open on a None/erroring queue), which is
+                # exactly the "watcher is up again" signal a stale
+                # watcher-outage L2 is waiting on — resolve it here so it
+                # never lingers as a false alarm just because the L1 queue
+                # happens to be drained. Best-effort/no-op when none is open.
+                self._resolve_watcher_outage_l2()
                 try:
                     await asyncio.sleep(poll)
                 except asyncio.CancelledError:
