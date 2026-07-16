@@ -67,6 +67,20 @@ def _make_task_artifacts(worktree_base: Path, name: str, task_id: str) -> TaskAr
     return ta
 
 
+def _warm_config(**overrides) -> GitConfig:
+    """Build a GitConfig with the warm-lane pool enabled (mirrors
+    test_lane_lifecycle_gitops.py's _warm_config)."""
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        warm_lane_pool=True,
+        **overrides,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers — _derive_phase / _map_lane_state / TaskRuntimeState shape
 # ---------------------------------------------------------------------------
@@ -167,3 +181,65 @@ class TestNonPooled:
         assert entry.has_worktree is True
         assert entry.started == expected_started
         assert entry.error is None
+
+
+# ---------------------------------------------------------------------------
+# Pooled layout (scenarios B1/B3/B4) — durable .lane-state records drive
+# task<->lane, task<->lane_state; artifacts still read via the shared
+# .task-meta/<lane> root.
+# ---------------------------------------------------------------------------
+
+
+class TestPooled:
+    def test_pooled_layout(self, git_repo: Path):
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        assert git_ops.pool_in_use()
+        worktree_base = git_ops.worktree_base
+        lifecycle = git_ops._lane_lifecycle
+
+        # _lane-3 -> task 42, ASSIGNED (B1): 3 iteration lines + 1 review
+        # PASS + a plan.json.
+        lifecycle.note_assigned('_lane-3', task_id='42')
+        ta42 = _make_task_artifacts(worktree_base, '_lane-3', '42')
+        ta42.write_plan({'steps': [{'id': 's1', 'status': 'done'}]})
+        ta42.append_iteration_log({'note': 'iter-1'})
+        ta42.append_iteration_log({'note': 'iter-2'})
+        ta42.append_iteration_log({'note': 'iter-3'})
+        ta42.write_review('reviewer-a', {'verdict': 'PASS', 'issues': []})
+
+        # _lane-5 -> task 43, ASSIGNED then QUARANTINED (B3).
+        lifecycle.note_assigned('_lane-5', task_id='43')
+        lifecycle.transition('_lane-5', LaneState.QUARANTINED)
+
+        # _lane-7 -> task 44, ASSIGNED with an EMPTY iterations.jsonl (B4:
+        # honest zero, not a read failure).
+        lifecycle.note_assigned('_lane-7', task_id='44')
+        _make_task_artifacts(worktree_base, '_lane-7', '44')
+        empty_log = TaskArtifacts.meta_root_for(worktree_base, '_lane-7') / 'iterations.jsonl'
+        empty_log.write_text('')
+
+        # A task-less lane record (RELEASED clears task_id) must produce NO
+        # entry at all.
+        lifecycle.note_assigned('_lane-9', task_id='99')
+        lifecycle.transition('_lane-9', LaneState.RELEASED)
+
+        result = build_task_runtime_snapshot(git_ops=git_ops)
+
+        by_task = {r.task_id: r for r in result}
+        assert set(by_task) == {42, 43, 44}, (
+            f'expected exactly tasks {{42, 43, 44}} (task-less lane record '
+            f'excluded); got {sorted(by_task)!r}'
+        )
+
+        entry_42 = by_task[42]
+        assert entry_42.loops == 3
+        assert entry_42.attempts == 1
+        assert entry_42.lane == '_lane-3'
+        assert entry_42.lane_state == 'assigned'
+
+        entry_43 = by_task[43]
+        assert entry_43.lane_state == 'quarantined'
+
+        entry_44 = by_task[44]
+        assert entry_44.loops == 0
+        assert entry_44.error is None
