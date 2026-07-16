@@ -3416,3 +3416,103 @@ async def test_on_task_blocked_non_reopen_does_not_delete_echo(
 
     hints_actions = [a for a in result.get('actions', []) if a['type'] == 'hints_attached']
     assert len(hints_actions) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_task_blocked_reopen_preserves_non_echo_memories(
+    reconciler, mock_memory_service,
+):
+    """Reopen-from-done must delete ONLY this reconciler's own completion
+    echoes. A non-echo, task_id-tagged memory (e.g. flag_dedup.py's
+    stage1_flag_marker) picked up by the same {'task_id'} scroll must never
+    be deleted -- _is_authoritative_resolution's over-suppression concern
+    (task 1984) applies equally here: only source==_ECHO_SOURCE AND
+    transition=='done' identifies a completion echo. Hint attachment must
+    still proceed normally alongside the (no-op) sweep."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+        {
+            'id': 'hint-1',
+            'created_at': '2026-07-16T00:14:06',
+            'metadata': {
+                'source': 'stage1_flag_marker',
+                'task_id': '2531',
+            },
+        },
+    ])
+    mock_memory_service.search = AsyncMock(return_value=[
+        MemoryResult(id='1', content='relevant info', source_store=SourceStore.mem0, entities=['EntityA']),
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='2531', transition='blocked', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '2531', 'title': 'T', 'status': 'done'},
+    )
+
+    mock_memory_service.get_memories_by_metadata.assert_awaited_once()
+    mock_memory_service.delete_memory.assert_not_awaited()
+
+    deleted_actions = [a for a in result.get('actions', []) if a['type'] == 'stale_echo_deleted']
+    assert len(deleted_actions) == 0
+
+    hints_actions = [a for a in result.get('actions', []) if a['type'] == 'hints_attached']
+    assert len(hints_actions) == 1
+
+
+@pytest.mark.asyncio
+async def test_reopen_then_redone_cites_fresh_provenance(
+    reconciler, mock_memory_service, mock_taskmaster,
+):
+    """End-to-end regression for task 2531 / task 2433: reopen-from-done
+    deletes the stale pre-reopen echo, and the SUBSEQUENT redone
+    transition's completion echo cites the FRESH live done_provenance --
+    proving the redone echo is never shadowed by (or itself confused with)
+    the deleted pre-reopen echo, and that it reads live provenance via the
+    existing _fetch_done_provenance mechanism (task 2647) rather than any
+    stale cached value."""
+    # Phase 1: reopen-from-done deletes the stale echo (task 2531's repro:
+    # a found_on_main misattribution had cited task 2512's commit b929f444).
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+        {
+            'id': 'echo-stale',
+            'created_at': '2026-07-16T00:14:06',
+            'metadata': {
+                'source': 'targeted_reconciliation',
+                'task_id': '2531',
+                'transition': 'done',
+            },
+        },
+    ])
+
+    await reconciler.reconcile_task(
+        task_id='2531', transition='blocked', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '2531', 'title': 'T', 'status': 'done'},
+    )
+
+    mock_memory_service.delete_memory.assert_awaited_once()
+    assert mock_memory_service.delete_memory.await_args.kwargs.get('memory_id') == 'echo-stale'
+
+    # Phase 2: redone. The stale echo is gone (no memories returned), and
+    # the live task now carries the FRESH done_provenance from the redone
+    # transition.
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        'id': '2531', 'title': 'T', 'status': 'done',
+        'metadata': {
+            'done_provenance': {'kind': 'found_on_main', 'commit': 'FRESHc0ffee'},
+        },
+    })
+
+    await reconciler.reconcile_task(
+        task_id='2531', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '2531', 'title': 'T', 'status': 'in-progress'},
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content') or ''
+    assert 'FRESHc0ffee' in content, f'Expected the fresh commit in the redone echo, got: {content!r}'
+    assert 'b929f444' not in content, f'Stale pre-reopen commit must not appear, got: {content!r}'
+
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert metadata.get('echo_used_provenance') is True
