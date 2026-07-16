@@ -10,6 +10,7 @@ boundary test B10.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -264,3 +265,60 @@ class TestRunWarmLaneSoftGuard:
 
         assert rc == 127
         assert _read_call_log(git_repo) == []
+
+
+@pytest.mark.asyncio
+class TestWarmLaneSoftPressureDefer:
+    """Unit tests for GitOps._warm_lane_soft_pressure_defer() (step-5)."""
+
+    async def test_soft_pressure_rc3_returns_true(self, git_repo: Path):
+        await _add_disk_guard_scripts(git_repo)
+        _write_check_exits(git_repo, [3])
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        result = await git_ops._warm_lane_soft_pressure_defer('A')
+
+        assert result is True, 'rc=3 (soft pressure) must defer (True)'
+
+    @pytest.mark.parametrize('stub_rc', [0, 75, 127, 2, 9])
+    async def test_non_soft_pressure_rc_returns_false(
+        self, git_repo: Path, stub_rc: int,
+    ):
+        """Fail-open: healthy(0)/hard(75)/absent(127)/usage(2)/unknown(9) never defer."""
+        await _add_disk_guard_scripts(git_repo)
+        _write_check_exits(git_repo, [stub_rc])
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        result = await git_ops._warm_lane_soft_pressure_defer('A')
+
+        assert result is False, f'rc={stub_rc} must never defer (fail-open)'
+
+    async def test_absent_script_returns_false(self, git_repo: Path):
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        result = await git_ops._warm_lane_soft_pressure_defer('A')
+
+        assert result is False, 'Absent guard script must fail-open (False)'
+
+    async def test_defer_emits_structured_warning_journal_line(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """B10: the user-observable θ defer signal — a WARNING naming the
+        branch, mentioning 'soft' and 'deferring'."""
+        await _add_disk_guard_scripts(git_repo)
+        _write_check_exits(git_repo, [3])
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops._warm_lane_soft_pressure_defer('mybranch')
+
+        assert result is True
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'mybranch' in t and 'soft' in t.lower() and 'deferring' in t.lower()
+            for t in warning_texts
+        ), f'Expected a soft-floor defer WARNING naming the branch; got: {warning_texts}'
