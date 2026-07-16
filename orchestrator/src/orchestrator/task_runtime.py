@@ -118,13 +118,31 @@ def _read_task_entry(
 
     Shared by both the pooled and non-pooled enumeration branches so B4
     honest-zero and phase parity hold identically for both layouts.
+
+    INV-2 (structured-facts-at-failure): a per-task artifact READ FAILURE
+    (e.g. corrupt ``plan.json``/review JSON raising) is marked — ``error``
+    carries a diagnostic string and ``loops``/``attempts``/``phase``/
+    ``started`` are all ``None``, never a fabricated ``0``/``'PLAN'``.
+    Honest-empty artifacts (``[]``/``{}``) are not a failure and continue to
+    yield ``loops=0``/``phase='PLAN'`` with ``error=None``. ``lane``/
+    ``lane_state``/``has_worktree`` are resolved by the caller from the lane
+    record / worktree dir (not the artifact read) and stay populated
+    regardless of whether the read below succeeds.
     """
     artifacts = TaskArtifacts(worktree, meta_root)
-    entries, _corrupted = artifacts.read_iteration_log()
-    loops = len(entries)
-    attempts = len(artifacts.read_reviews())
-    phase = _derive_phase(artifacts.read_plan())
-    started = artifacts.read_created_at()
+    try:
+        entries, _corrupted = artifacts.read_iteration_log()
+        loops = len(entries)
+        attempts = len(artifacts.read_reviews())
+        phase = _derive_phase(artifacts.read_plan())
+        started = artifacts.read_created_at()
+        error = None
+    except Exception as exc:
+        logger.warning(
+            'task_runtime: artifact read failed for task %s: %r', task_id, exc,
+        )
+        loops = attempts = phase = started = None
+        error = f'{type(exc).__name__}: {exc}'[:200]
     return TaskRuntimeState(
         task_id=task_id,
         has_worktree=has_worktree,
@@ -134,7 +152,7 @@ def _read_task_entry(
         lane=lane,
         phase=phase,
         lane_state=lane_state,
-        error=None,
+        error=error,
     )
 
 
