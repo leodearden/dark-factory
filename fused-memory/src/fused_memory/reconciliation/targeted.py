@@ -100,11 +100,10 @@ _AUTHORITATIVE_PRECHECK_LIMIT = 25
 _STALE_ECHO_DELETE_LIMIT = 25
 
 # Metadata key recognized as an authoritative resolution/superseding marker
-# by _is_authoritative_resolution, in addition to a truthy `supersedes`
-# marker.  This is Stage 2's real, task_id-scoped "Completion-Note
-# Suppression Pre-Check (stage2_suppress guard)" write side
-# (prompts/stage2.py) — documented there as "the only writer of the
-# `stage2_suppress` key" — which stamps
+# by _is_authoritative_resolution (when not self-echoed — see below), in
+# addition to a truthy `supersedes` marker.  This is Stage 2's real,
+# task_id-scoped "Completion-Note Suppression Pre-Check (stage2_suppress
+# guard)" write side (prompts/stage2.py), which stamps
 # metadata={'stage2_suppress': True, 'task_id': str(task_id)} on its
 # protective completion-note guard writes. Because it carries task_id, it
 # intersects _on_task_done's deterministic {'task_id': task_id} pre-check
@@ -115,6 +114,17 @@ _STALE_ECHO_DELETE_LIMIT = 25
 # metadata={stage2_suppress: True, ...}), not deterministic code — so this
 # trigger is inherently best-effort, not compiler/test-enforced, and can
 # drift if the prompt wording changes without a matching update here.
+#
+# Second writer (task 2642): _on_task_done's own fast-path completion echo
+# ALSO stamps this key unconditionally (source=_ECHO_SOURCE), so Stage 2's
+# count_memories_by_metadata({'task_id': ..., 'stage2_suppress': True}) gate
+# recognizes a targeted-reconciliation completion record and skips its own
+# redundant completion-summary write. _is_authoritative_resolution still
+# requires `source != _ECHO_SOURCE` for the stage2_suppress branch, so a
+# targeted self-echo carrying this key satisfies Stage 2's external count
+# gate WITHOUT becoming authoritative to _on_task_done's own pre-echo guard
+# — preserving the task-1984 "a task's own earlier echoes never trigger
+# suppression" invariant.
 #
 # Replaces an earlier revision's `_AUTHORITATIVE_SOURCES =
 # frozenset({'stage2_task_knowledge_sync'})` source-allowlist: a task 1984
@@ -1361,10 +1371,13 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
 
     - a truthy ``supersedes`` marker — the established superseding-memory
       convention (harness.py:849); or
-    - a truthy ``_STAGE2_SUPPRESS_KEY`` (``stage2_suppress``) marker — Stage 2's
-      real, task_id-scoped "Completion-Note Suppression Pre-Check (stage2_suppress
-      guard)" write side (prompts/stage2.py), documented there as "the only
-      writer of the ``stage2_suppress`` key".
+    - a truthy ``_STAGE2_SUPPRESS_KEY`` (``stage2_suppress``) marker whose
+      ``source`` is NOT this reconciler's own echo (``source != _ECHO_SOURCE``)
+      — Stage 2's real, task_id-scoped "Completion-Note Suppression Pre-Check
+      (stage2_suppress guard)" write side (prompts/stage2.py) is one writer of
+      this key; TargetedReconciliation's own fast-path completion echo
+      (``_on_task_done``) is now a second (task 2642) — see the source
+      discriminator below for why only the former counts as authoritative.
 
     Neither check treats "any other source" as authoritative. Several real
     task_id-tagged writers are lifecycle / flag markers rather than
@@ -1383,12 +1396,26 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     ``stage2_suppress``) are deliberately NOT authoritative, so a task's own
     earlier echoes never trigger suppression or oscillation — see
     _on_task_done's pre-echo guard (task 1984).
+
+    Source discriminator (task 2642): TargetedReconciliation's fast-path
+    completion echo now ALSO stamps ``stage2_suppress=True`` on every write,
+    so that Stage 2's ``count_memories_by_metadata(..., {'task_id': ...,
+    'stage2_suppress': True})`` gate recognizes a targeted completion record
+    and skips writing its own redundant completion summary. Without a source
+    check, that would make a task's own prior echo authoritative to THIS
+    pre-check too — silently regressing the task-1984 invariant above on a
+    re-done transition. So the ``stage2_suppress`` branch requires
+    ``source != _ECHO_SOURCE``: Stage 2's real guard writes (which carry
+    ``stage2_suppress`` without ``source=_ECHO_SOURCE``) stay authoritative,
+    while a targeted self-echo carrying ``stage2_suppress`` stays
+    non-authoritative to this pre-check — even though it still satisfies
+    Stage 2's separate, external count gate.
     """
     if not isinstance(metadata, dict):
         return False
     if metadata.get('supersedes'):
         return True
-    return bool(metadata.get(_STAGE2_SUPPRESS_KEY))
+    return bool(metadata.get(_STAGE2_SUPPRESS_KEY)) and metadata.get('source') != _ECHO_SOURCE
 
 
 def _truncate_clean(text: str, limit: int) -> str:
