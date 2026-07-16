@@ -114,6 +114,7 @@ __all__ = [
     'TerminalExitRejection',
     'DoneGateRejection',
     'ProvenanceValidationRejection',
+    'StaleEvidenceRejection',
     'ExternalResolverError',
     'extract_rejection',
     'extract_structured_rejection',
@@ -217,6 +218,50 @@ class ProvenanceValidationRejection(SetTaskStatusRejected):
                 f'{error_code} — {raw}'
             ),
         )
+
+
+class StaleEvidenceRejection(SetTaskStatusRejected):
+    """Reopen-freshness gate refused: the done-claim evidence predates a reopen.
+
+    Raised when fused-memory returns ``error == 'done_evidence_stale'`` —
+    the found_on_main provenance-integrity gate (task 2674's
+    ``_check_reopen_freshness``) detected the writer's evidence commit
+    predates the task's most recent ``reopen_at`` stamp. Carries the
+    structured fields verbatim (task 2677, PRD
+    found-on-main-provenance-integrity §Contract) so callers — the
+    orchestrator's provenance-conflict sink — can file a born-at-L2
+    escalation without re-parsing the raw rejection string.
+
+    ``done_evidence_stale_override_invalid`` (a malformed
+    ``stale_evidence_override``) deliberately stays on the generic
+    ``SetTaskStatusRejected`` fallback: the orchestrator's automated
+    done-writers never supply an override, so they never encounter it.
+    """
+
+    def __init__(
+        self,
+        task_id: str,
+        evidence_commit: str,
+        evidence_committed_at: str,
+        reopen_at: str,
+        agent_id: str,
+        raw: str,
+    ):
+        self.evidence_commit = evidence_commit
+        self.evidence_committed_at = evidence_committed_at
+        self.reopen_at = reopen_at
+        self.agent_id = agent_id
+        super().__init__(
+            task_id=task_id,
+            error_code='done_evidence_stale',
+            raw=raw,
+            message=(
+                f'set_task_status({task_id!r}, "done") refused: '
+                f'done_evidence_stale — evidence {evidence_commit!r} '
+                f'({evidence_committed_at}) predates reopen_at {reopen_at!r}'
+            ),
+        )
+
 
 class ExternalResolverError(RuntimeError):
     """Synthesised error: ``get_external_statuses`` returned an unusable result.
@@ -2177,6 +2222,20 @@ class Scheduler:
                     raise ProvenanceValidationRejection(
                         task_id=task_id,
                         error_code=error_code,
+                        raw=rejection,
+                    )
+                if error_code == 'done_evidence_stale':
+                    raise StaleEvidenceRejection(
+                        task_id=task_id,
+                        evidence_commit=str(structured.get('evidence_commit', ''))
+                        if isinstance(structured, dict) else '',
+                        evidence_committed_at=str(
+                            structured.get('evidence_committed_at', '')
+                        ) if isinstance(structured, dict) else '',
+                        reopen_at=str(structured.get('reopen_at', ''))
+                        if isinstance(structured, dict) else '',
+                        agent_id=str(structured.get('agent_id', ''))
+                        if isinstance(structured, dict) else '',
                         raw=rejection,
                     )
                 # Any other non-transient rejection: raise the family base
