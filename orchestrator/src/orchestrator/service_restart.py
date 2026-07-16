@@ -557,10 +557,11 @@ class StaleServiceRestartCoordinator:
             return False
 
         now = self._clock()
+        first_pending = self._first_pending_monotonic
         force_fire = (
             self._force_fire_after_secs > 0
-            and self._first_pending_monotonic is not None
-            and (now - self._first_pending_monotonic) >= self._force_fire_after_secs
+            and first_pending is not None
+            and (now - first_pending) >= self._force_fire_after_secs
         )
 
         if not force_fire:
@@ -587,12 +588,17 @@ class StaleServiceRestartCoordinator:
                     )
                     return False
         else:
+            # force_fire is only True when the `and` chain above proved
+            # first_pending is not None; re-assert so the type checker
+            # narrows it here too (its own narrowing doesn't survive past
+            # the boolean expression that produced `force_fire`).
+            assert first_pending is not None
             logger.warning(
                 f'{self._service_name} restart FORCE-FIRING: pending restart owed'
                 ' %.0fs (>= %.0fs bound) — bypassing agents_idle, the debounce, and'
                 ' the merge-drain preference; the min_interval clock is still'
                 ' honored.',
-                now - self._first_pending_monotonic,
+                now - first_pending,
                 self._force_fire_after_secs,
             )
 
