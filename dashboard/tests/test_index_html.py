@@ -487,19 +487,71 @@ def test_prd_grouping_js_loads_before_tab_tasks(index_html_body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: runtime_format.js must load BEFORE tabs.jsx and
+# tab_tasks.jsx (task 2637)
+# ---------------------------------------------------------------------------
+
+_RUNTIME_FORMAT_PREFIX = '/static/redux/runtime_format.js'
+
+
+def test_runtime_format_js_loads_before_tabs(index_html_body: str) -> None:
+    """runtime_format.js must load as a classic synchronous script BEFORE
+    tabs.jsx.
+
+    tabs.jsx's OrchTab destructures {rtCell, rtAge} from window.DF_RUNTIME_FMT
+    at top-level execution time — if runtime_format.js loaded after (or not at
+    all), that destructure would silently produce undefined, and OrchTab would
+    throw the moment it tries to call rtCell/rtAge.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _RUNTIME_FORMAT_PREFIX,
+        _TABS_PREFIX,
+        before_label='runtime_format.js',
+        after_label='tabs.jsx',
+        consumer_note=(
+            'tabs.jsx (OrchTab) destructures window.DF_RUNTIME_FMT at top '
+            'level; runtime_format.js must define it first.'
+        ),
+    )
+
+
+def test_runtime_format_js_loads_before_tab_tasks(index_html_body: str) -> None:
+    """runtime_format.js must load as a classic synchronous script BEFORE
+    tab_tasks.jsx.
+
+    tab_tasks.jsx's TaskDetail destructures {rtCell} from window.DF_RUNTIME_FMT
+    at top-level execution time — if runtime_format.js loaded after (or not at
+    all), that destructure would silently produce undefined, and TaskDetail
+    would throw the moment it tries to call rtCell.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _RUNTIME_FORMAT_PREFIX,
+        _TAB_TASKS_PREFIX,
+        before_label='runtime_format.js',
+        after_label='tab_tasks.jsx',
+        consumer_note=(
+            'tab_tasks.jsx (TaskDetail) destructures window.DF_RUNTIME_FMT at '
+            'top level; runtime_format.js must define it first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: all /static/redux/* cache-busters share one bumped version
 # ---------------------------------------------------------------------------
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 29,
-    and graph_layout.js / prd_grouping.js must both be among the versioned
-    assets.
+    """All /static/redux/*?v= cache-busters must share a single version >= 30,
+    and graph_layout.js / prd_grouping.js / runtime_format.js must all be
+    among the versioned assets.
 
     Mirrors the existing single-shared-version guards in test_tab_escalations.py,
-    test_tab_scheduler.py, and test_scheduler_page.py, raising the floor to 29 to
-    prove the uniform bump landed alongside task 2530's PRD-grouping changes to
-    prd_grouping.js, tab_tasks.jsx, and styles.css.
+    test_tab_scheduler.py, and test_scheduler_page.py, raising the floor to 30 to
+    prove the uniform bump landed alongside task 2637's runtime_format.js
+    addition and its tabs.jsx/tab_tasks.jsx wiring.
     """
     versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
     assert len(versions) == 1, (
@@ -507,9 +559,9 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'bump all of them uniformly to the same value.'
     )
     v = int(next(iter(versions)))
-    assert v >= 29, (
-        f'index.html cache-buster version is {v}, expected >= 29 (proves the '
-        'uniform bump from 28 alongside task 2530\'s PRD-grouping changes).'
+    assert v >= 30, (
+        f'index.html cache-buster version is {v}, expected >= 30 (proves the '
+        'uniform bump from 29 alongside task 2637\'s runtime_format.js addition).'
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
@@ -517,5 +569,9 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
     )
     assert re.search(r'/static/redux/prd_grouping\.js\?v=\d+', index_html_body), (
         'prd_grouping.js is not present among the versioned /static/redux/* '
+        'assets in index.html.'
+    )
+    assert re.search(r'/static/redux/runtime_format\.js\?v=\d+', index_html_body), (
+        'runtime_format.js is not present among the versioned /static/redux/* '
         'assets in index.html.'
     )
