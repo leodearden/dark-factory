@@ -1132,7 +1132,7 @@ class TestMergeVerifyBreadthConfig:
 
     def test_invalid_value_rejected(self):
         with pytest.raises(ValidationError):
-            OrchestratorConfig(merge_verify_breadth='branch')
+            OrchestratorConfig(merge_verify_breadth='branch')  # type: ignore[arg-type]
 
     def test_defaults_yaml_carries_scoped(self, monkeypatch, tmp_path):
         """The shipped defaults.yaml explicitly carries merge_verify_breadth:

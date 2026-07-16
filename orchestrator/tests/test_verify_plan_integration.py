@@ -503,9 +503,16 @@ class TestPlanGoldenStructural:
     """Scenario 5 — GOLDEN D2: a Protocol-bearing source file widens pyright
 
     to the unscoped FULL_SUITE command (never file-scoped — cross-file
-    Protocol conformance can't be checked from one file) and skips pytest,
-    in BOTH the module-config path and the fallback path (the latent gap
+    Protocol conformance can't be checked from one file) in BOTH the
+    module-config path and the fallback path (the latent gap
     _build_fallback_config never closed).
+
+    pytest: the module-config path now full-suites pytest too, via the
+    task-role pytest floor (λ, task 2589 R3) — a structural-only diff counts
+    as source, non-test .py, so the default role='task' floors it to
+    FULL_SUITE instead of the pre-λ SKIPPED. The fallback path is NOT
+    covered by the floor (module-config-branch only — no owning-module
+    suite to floor to) and keeps the legacy SKIPPED shape.
 
     RED until step-8 builds this class's own reader (_structural_worktree_reader)
     seeded with STRUCTURAL_DIFF[0]'s Protocol-bearing content — STRUCTURAL is
@@ -532,7 +539,9 @@ class TestPlanGoldenStructural:
 
         pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
         assert pytest_run is not None
-        assert pytest_run.scope_kind is ScopeKind.SKIPPED
+        assert pytest_run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.test_command is not None
+        assert pytest_run.cmd == parse_config_command(mc.test_command)
 
     def test_structural_file_full_suites_pyright_fallback_path(self):
         config = OrchestratorConfig(project_root=Path('/fake'), test_command='pytest')

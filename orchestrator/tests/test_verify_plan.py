@@ -650,6 +650,7 @@ class TestDeriveVerifyPlanMergeBreadth:
         pytest_a = _run_for(plan, 'orchestrator', 'pytest:')
         assert pytest_a is not None
         assert pytest_a.scope_kind is ScopeKind.FULL_SUITE
+        assert mc_a.test_command is not None
         assert pytest_a.cmd == parse_config_command(mc_a.test_command)
         assert 'merge' in pytest_a.reason.lower()
         assert 'full' in pytest_a.reason.lower() or 'registered' in pytest_a.reason.lower()
@@ -657,12 +658,14 @@ class TestDeriveVerifyPlanMergeBreadth:
         lint_a = _run_for(plan, 'orchestrator', 'lint:')
         assert lint_a is not None
         assert lint_a.scope_kind is ScopeKind.FULL_SUITE
+        assert mc_a.lint_command is not None
         assert lint_a.cmd == parse_config_command(mc_a.lint_command)
         assert 'merge' in lint_a.reason.lower()
 
         pyright_a = _run_for(plan, 'orchestrator', 'pyright:')
         assert pyright_a is not None
         assert pyright_a.scope_kind is ScopeKind.FULL_SUITE
+        assert mc_a.type_check_command is not None
         assert pyright_a.cmd == parse_config_command(mc_a.type_check_command)
         assert 'merge' in pyright_a.reason.lower()
 
@@ -672,11 +675,13 @@ class TestDeriveVerifyPlanMergeBreadth:
         pytest_b = _run_for(plan, 'shared', 'pytest:')
         assert pytest_b is not None
         assert pytest_b.scope_kind is ScopeKind.FULL_SUITE
+        assert mc_b.test_command is not None
         assert pytest_b.cmd == parse_config_command(mc_b.test_command)
 
         lint_b = _run_for(plan, 'shared', 'lint:')
         assert lint_b is not None
         assert lint_b.scope_kind is ScopeKind.FULL_SUITE
+        assert mc_b.lint_command is not None
         assert lint_b.cmd == parse_config_command(mc_b.lint_command)
 
         # mc_b has no type_check_command configured -> explicit SKIPPED, never
