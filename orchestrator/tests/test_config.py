@@ -2022,6 +2022,34 @@ class TestSimpleTaskDeprecatedScalarHonoring:
             'deprecated simple_task_budget_usd scalar.'
         )
 
+    def test_no_deprecation_warning_on_construction_or_diff(self, monkeypatch, tmp_path):
+        """Locks the __dict__-vs-getattr choice in
+        _honor_deprecated_simple_task_scalars and _iter_leaves: a future
+        refactor back to plain getattr on either path would fire pydantic's
+        deprecated-field-access DeprecationWarning on EVERY
+        OrchestratorConfig construction / diff_config call, not just the
+        rare ones where an operator actually sets a deprecated scalar. This
+        test exercises both paths -- construction (including the migration
+        branch) and diff_config -- inside one shared filter and asserts
+        neither raises.
+
+        Note: the migration's ``logger.warning(...)`` calls are Python
+        ``logging``, orthogonal to the ``warnings`` module, so they never
+        trip this filter.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', DeprecationWarning)
+
+            a = OrchestratorConfig()
+            b = OrchestratorConfig(
+                simple_task_budget_usd=3.33,
+                simple_task_max_turns=7,
+            )
+            diff_config(a, b)
+
 
 class TestDiffConfig:
     """diff_config(live, fresh, allowlist) categorizes every differing leaf
