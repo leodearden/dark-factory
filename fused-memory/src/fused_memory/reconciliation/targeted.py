@@ -511,6 +511,7 @@ class TargetedReconciler:
                     'deferred': not written,
                     'echo_suppressed': has_authoritative,
                     'echo_used_provenance': used_provenance,
+                    'echo_unverified_completion': unverified_completion,
                 },
                 causation_id=run_id,
             )
