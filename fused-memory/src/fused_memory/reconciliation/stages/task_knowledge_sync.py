@@ -1968,7 +1968,21 @@ class TaskKnowledgeSync(BaseStage):
                 self.memory, self.taskmaster, self.project_root, self.project_id,
                 run_id, run_window_start, stats=report.stats,
             )
-        if task_count_snapshot_written is None:
+        # Task 2655 step-6: if the prune couldn't enumerate (enumeration_ok
+        # == 0 -- the swallowed-Qdrant-timeout fingerprint), _write_task_
+        # count_snapshot already skipped its write above (step-4) rather than
+        # risk another duplicate. Don't fall back to verify in that case
+        # either: _verify_task_count_snapshot_written's scroll swallows
+        # timeouts the same way and would mis-read the empty page as a
+        # CONFIRMED miss (False), spuriously growing the harness's
+        # consecutive-stale-snapshot streak. Leave the stat key absent
+        # (inconclusive) instead. When the key is absent entirely (taskmaster
+        # None, or write-blocked project -- the prune never ran) or
+        # enumeration_ok == 1, behavior is unchanged: verify still runs.
+        if (
+            task_count_snapshot_written is None
+            and report.stats.get(SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY) != 0
+        ):
             task_count_snapshot_written = await _verify_task_count_snapshot_written(
                 self.memory, self.project_id, run_window_start,
             )
