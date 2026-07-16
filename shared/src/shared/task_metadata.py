@@ -30,6 +30,8 @@ __all__ = [
     'MemoryHints',
     'Milestone',
     'RetryLedger',
+    'RoutingDecisionMirror',
+    'RoutingState',
     'SchemaWarning',
     'TaskMetadata',
     'apply_migrations',
@@ -409,6 +411,11 @@ def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
 # time (rather than lazily) guarantees the 'milestone' slice is validated
 # and typed before any of parse_metadata's many callers across packages run.
 register_metadata_submodel('milestone', Milestone)
+
+# routing (PRD γ, task 2533): registered the same way so 'routing' lands in
+# known_fields (no unknown_key census warning) and every parse_metadata
+# caller gets a validated, typed RoutingState slice.
+register_metadata_submodel('routing', RoutingState)
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:
