@@ -801,3 +801,90 @@ def test_tab_analytics_origin_panel(tab_analytics_jsx_body: str) -> None:
         'No `.sort(` call in OriginPanel references `.benign` nearby — rows must be '
         'sorted by benign COUNT (volume × rate), not alphabetically or by filings.'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-13 test: Lifespan panel
+# ---------------------------------------------------------------------------
+
+
+def test_tab_analytics_lifespan_panel(tab_analytics_jsx_body: str) -> None:
+    """The Lifespan panel (percentile tiles + tier-overlaid ECDF + open items).
+
+    Asserts, scoped to the Lifespan panel's own function body:
+    (a) `StatTile` percentiles keyed by level, from `percentiles_by_level`.
+    (b) A client-side ECDF built from `lifespan.samples`, fed to a
+        `LineChart` with one series per resolver tier.
+    (c) A log-x treatment (`Math.log`) with a vertical 6h (`21600`) freshness
+        marker.
+    (d) An open-items list sorted DESC by `age_secs`, with `breach_6h`
+        highlighting.
+    (e) A render-when-present `triage_segments` block, guarded by
+        `lifespan.triage_segments &&`.
+    """
+    body = tab_analytics_jsx_body
+
+    assert 'function LifespanPanel(' in body, (
+        'tab_escalation_analytics.jsx does not define `function LifespanPanel(` — '
+        'add the Lifespan panel component.'
+    )
+    lifespan_body = _extract_function_body(body, 'LifespanPanel')
+    assert lifespan_body, 'Could not locate the LifespanPanel( function body.'
+
+    # (a) StatTile percentiles keyed by level from percentiles_by_level.
+    assert 'percentiles_by_level' in lifespan_body, (
+        'LifespanPanel does not reference `percentiles_by_level` — the percentile '
+        'StatTiles must be built from lifespan.percentiles_by_level.'
+    )
+    assert '<C.StatTile' in lifespan_body, (
+        'LifespanPanel does not render <C.StatTile — add percentile tiles per level.'
+    )
+
+    # (b) ECDF from samples, overlaid by resolver tier, on a LineChart.
+    assert 'samples' in lifespan_body, (
+        'LifespanPanel does not reference `samples` — the ECDF must be built from '
+        'lifespan.samples.'
+    )
+    assert '<C.LineChart' in lifespan_body, (
+        'LifespanPanel does not render <C.LineChart — the ECDF must use the '
+        'LineChart primitive.'
+    )
+    assert 'tier' in lifespan_body, (
+        'LifespanPanel does not reference `tier` — the ECDF must be overlaid with '
+        'one series per resolver tier.'
+    )
+
+    # (c) log-x treatment + vertical 6h freshness marker.
+    assert 'Math.log' in lifespan_body, (
+        'LifespanPanel does not reference `Math.log` — the ECDF threshold grid must '
+        'be log-spaced (log-x axis).'
+    )
+    assert '21600' in lifespan_body, (
+        'LifespanPanel does not reference `21600` (6h in seconds) — add a vertical '
+        '6h freshness marker over the ECDF.'
+    )
+
+    # (d) Open-items list sorted DESC by age_secs, breach_6h highlighting.
+    assert 'open_items' in lifespan_body, (
+        'LifespanPanel does not reference `open_items` — add the open-items list.'
+    )
+    sort_positions = [m.start() for m in re.finditer(r'\.sort\(', lifespan_body)]
+    assert sort_positions, (
+        'LifespanPanel does not call `.sort(` — open_items must be sorted DESC by '
+        'age_secs.'
+    )
+    assert any('age_secs' in lifespan_body[i : i + 120] for i in sort_positions), (
+        'No `.sort(` call in LifespanPanel references `age_secs` nearby — open '
+        'items must be ranked by pending age.'
+    )
+    assert 'breach_6h' in lifespan_body, (
+        'LifespanPanel does not reference `breach_6h` — highlight open items that '
+        'have breached the 6h freshness threshold.'
+    )
+
+    # (e) render-when-present triage_segments block (2555 forward-compat).
+    assert re.search(r'lifespan\.triage_segments\s*&&', lifespan_body), (
+        'LifespanPanel does not guard a block with `lifespan.triage_segments &&` — '
+        'the filed→triaged→resolved segment block must render only when present, '
+        'not be zero-filled.'
+    )
