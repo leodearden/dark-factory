@@ -1720,6 +1720,115 @@ class SqliteTaskBackend:
             }],
         }
 
+    async def set_status_and_stamp_audit(
+        self,
+        task_id: str,
+        status: str,
+        project_root: str,
+        tag: str | None = None,
+        *,
+        audit_fields: dict,
+        claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
+        heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
+    ) -> SetTaskStatusResult:
+        """Atomically update ``status`` AND merge ``audit_fields`` into metadata.
+
+        The sole atomic status+audit writer (task 2649). Calling
+        ``stamp_audit_metadata`` followed by ``set_task_status`` — the
+        pre-2649 pattern — commits the audit stamp (``reopen_reason``/
+        ``reopen_from``/``reopen_at`` or ``done_provenance``) and the status
+        column as TWO separate transactions, leaving a window where an
+        observer (or a lost/rolled-back second commit) sees the audit half
+        applied but the status column unchanged. This method merges the
+        audit fields into metadata (via ``_merge_metadata(mode='merge')`` —
+        preserving every sibling key, exactly like ``stamp_audit_metadata``)
+        AND updates the status column in a SINGLE ``UPDATE`` inside ONE
+        ``_txn`` — both commit or both roll back.
+
+        Reuses the same claimant tri-state handling and IntegrityError ->
+        DuplicateCandidateKeyError collision mapping as :meth:`set_task_status`.
+
+        Deliberately NOT declared on :class:`TaskBackendProtocol` — mirrors
+        :meth:`stamp_audit_metadata`, kept off the 12-method contract so
+        other callers do not treat it as sanctioned public surface.
+        """
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        tid = _parse_task_id(task_id)
+        if status not in _VALID_STATUSES:
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR',
+                f'Invalid status {status!r}. Must be one of '
+                f'{sorted(s.value for s in _VALID_STATUSES)}.',
+            )
+        async with self._write_lock(project_root), self._txn(project_root) as conn:
+            cursor = await conn.execute(
+                'SELECT status, metadata, candidate_key FROM tasks WHERE tag = ? AND id = ?',
+                (tag, tid),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    f'No tasks found for ID(s): {task_id}',
+                )
+            old_status = row['status']
+            row_candidate_key = row['candidate_key']
+            new_metadata = _merge_metadata(
+                row['metadata'], json.dumps(audit_fields),
+                mode='merge',
+                project_root=project_root, tag=tag, task_id=tid,
+            )
+
+            set_columns = ['status = ?', 'metadata = ?', 'updated_at = ?']
+            set_values: list[Any] = [status, new_metadata, _now()]
+            if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
+                if self._claimant_columns_cache.get(project_root, False):
+                    if claimant_run_id is not _UNSET:
+                        set_columns.append('claimant_run_id = ?')
+                        set_values.append(claimant_run_id)
+                    if heartbeat_at is not _UNSET:
+                        set_columns.append('heartbeat_at = ?')
+                        set_values.append(heartbeat_at)
+                else:
+                    logger.warning(
+                        'set_status_and_stamp_audit: claimant_run_id/heartbeat_at '
+                        'columns absent (pre-migration connection) — writing '
+                        'status+metadata only for task_id=%s project_root=%s',
+                        task_id, project_root,
+                    )
+
+            set_values.extend([tag, tid])
+            try:
+                await conn.execute(
+                    f'UPDATE tasks SET {", ".join(set_columns)} '
+                    'WHERE tag = ? AND id = ?',
+                    set_values,
+                )
+            except sqlite3.IntegrityError as exc:
+                if row_candidate_key is None or 'candidate_key' not in str(exc):
+                    raise
+                survivor_cursor = await conn.execute(
+                    "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                    "AND status != 'cancelled' ORDER BY id LIMIT 1",
+                    (tag, row_candidate_key),
+                )
+                survivor = await survivor_cursor.fetchone()
+                raise DuplicateCandidateKeyError(
+                    existing_id=survivor['id'] if survivor is not None else None,
+                    existing_status=survivor['status'] if survivor is not None else None,
+                    tag=tag,
+                    candidate_key=row_candidate_key,
+                ) from exc
+        return {
+            'message': f'Successfully updated 1 task(s) to "{status}"',
+            'tasks': [{
+                'taskId': task_id,
+                'oldStatus': old_status,
+                'newStatus': status,
+            }],
+        }
+
     async def set_task_claimant(
         self,
         task_id: str,
