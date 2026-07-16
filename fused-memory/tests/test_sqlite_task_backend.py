@@ -1094,6 +1094,52 @@ def test_stamp_audit_metadata_is_privileged_non_protocol_seam():
     )
 
 
+# ── set_status_and_stamp_audit: atomic status+audit writer (task 2649) ──
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['found_on_main', 'merged'])
+async def test_set_status_and_stamp_audit_persists_status_and_metadata_atomically(
+    backend, project_root, kind,
+):
+    """The new atomic writer updates the status column AND merges audit
+    fields into metadata in a single call, preserving pre-existing
+    done_provenance (either kind) and an untouched sibling metadata key —
+    the fix for the two-commit partial-write window (task 2649)."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({'memory_hints': {'entities': ['A'], 'queries': ['q1']}}),
+    )
+    await backend.set_task_status('1', 'done', project_root=project_root)
+    await backend.stamp_audit_metadata(
+        '1', project_root,
+        {'done_provenance': {'kind': kind, 'commit': 'abc123'}},
+    )
+
+    result = await backend.set_status_and_stamp_audit(  # type: ignore[attr-defined]
+        '1', 'pending', project_root=project_root,
+        audit_fields={
+            'reopen_reason': 'regression found',
+            'reopen_from': 'done',
+            'reopen_at': '2026-07-09T00:00:00+00:00',
+        },
+    )
+
+    assert result['tasks'] == [{
+        'taskId': '1',
+        'oldStatus': 'done',
+        'newStatus': 'pending',
+    }]
+
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['status'] == 'pending'
+    assert task['metadata']['reopen_reason'] == 'regression found'
+    assert task['metadata']['reopen_from'] == 'done'
+    assert task['metadata']['reopen_at'] == '2026-07-09T00:00:00+00:00'
+    assert task['metadata']['done_provenance'] == {'kind': kind, 'commit': 'abc123'}
+    assert task['metadata']['memory_hints'] == {'entities': ['A'], 'queries': ['q1']}
+
+
 # ── _merge_metadata: new additive-merge semantics ─────────────────
 
 
