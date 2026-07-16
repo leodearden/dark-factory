@@ -172,3 +172,38 @@ class TestRederiveStepStatusHappyPath:
         assert step_2['status'] == 'pending', (
             'step-2 was never in steps_completed and must stay pending'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED: contamination / no-work guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRederiveStepStatusNoWorkGuard:
+    async def test_orphan_log_on_unadvanced_branch_is_not_rederived(
+        self, config, git_ops, task_assignment,
+    ):
+        """An inherited/contaminated iterations.jsonl entry claiming step-1
+        completed must NOT be trusted when the branch HEAD has not actually
+        diverged from base (no real commit was made) — the SHA-primary
+        `_has_prior_implementation` guard must reject it."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        workflow.plan = _write_plan(artifacts, workflow, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+        ])
+        artifacts.append_iteration_log({
+            'agent': 'implementer',
+            'steps_completed': ['step-1'],
+            'commit': 'orphan-sha',
+        })
+
+        result = await workflow._rederive_step_status_from_branch_state()
+
+        assert result == []
+        plan = artifacts.read_plan()
+        assert plan['steps'][0]['status'] == 'pending'
