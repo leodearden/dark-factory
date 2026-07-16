@@ -441,6 +441,119 @@ class TestWriteCycleSummaryLedgerWrite:
         assert result is False
 
 
+class TestWriteCycleSummaryRemediationFlag:
+    """``write_cycle_summary``'s optional ``remediation`` flag (task 2652)
+    stamps the authoritative ledger row's ``payload_json`` and the
+    best-effort Mem0 mirror ``metadata``, so
+    ``MemoryService.get_cycle_summary_presence`` can later disambiguate a
+    Stage-2-only remediation run's expected missing Stage 1 cycle_summary
+    from a genuine Stage 1 write failure (see ``prompts/stage3.py``'s
+    Stage-2-only remediation run exception).
+
+    Default ``remediation=False`` stamps an explicit ``False`` (not an
+    absent key) into both the payload and the mirror metadata — the
+    anti-inversion case below — so only rows written before this change lack
+    the key entirely (parsed as ``None`` by ``get_cycle_summary_presence``).
+    """
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        s = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    def _report(self, **overrides) -> StageReport:
+        defaults: dict[str, Any] = dict(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
+            items_flagged=[{'description': 'a'}],
+            stats={},
+            llm_calls=1,
+            tokens_used=10,
+        )
+        defaults.update(overrides)
+        return StageReport(**defaults)
+
+    @pytest.mark.asyncio
+    async def test_remediation_true_stamps_ledger_payload_and_mirror_metadata(self, ledger_store):
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        memory_service.add_system_record = AsyncMock(
+            return_value=SimpleNamespace(memory_ids=['m1']),
+        )
+
+        result = await write_cycle_summary(
+            memory_service,
+            'dark_factory',
+            self._report(),
+            'run-remediation-true',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+            remediation=True,
+        )
+
+        assert result is True
+
+        record = await ledger_store.get_by_identity(
+            'dark_factory',
+            'cycle_summary',
+            flag_type='task_knowledge_sync',
+            run_id='run-remediation-true',
+        )
+        assert record is not None
+        payload = json.loads(record.payload_json)
+        assert payload['remediation'] is True
+
+        memory_service.add_system_record.assert_awaited_once()
+        metadata = memory_service.add_system_record.call_args.kwargs.get('metadata') or {}
+        assert metadata.get('remediation') is True
+
+    @pytest.mark.asyncio
+    async def test_remediation_default_false_stamps_ledger_payload_and_mirror_metadata(
+        self, ledger_store,
+    ):
+        """Anti-inversion: the default call (no ``remediation`` kwarg) yields
+        payload ``remediation=False`` and mirror metadata
+        ``['remediation'] is False`` — an explicit marker, not an absent
+        key."""
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        memory_service.add_system_record = AsyncMock(
+            return_value=SimpleNamespace(memory_ids=['m1']),
+        )
+
+        result = await write_cycle_summary(
+            memory_service,
+            'dark_factory',
+            self._report(),
+            'run-remediation-false',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+        )
+
+        assert result is True
+
+        record = await ledger_store.get_by_identity(
+            'dark_factory',
+            'cycle_summary',
+            flag_type='task_knowledge_sync',
+            run_id='run-remediation-false',
+        )
+        assert record is not None
+        payload = json.loads(record.payload_json)
+        assert payload['remediation'] is False
+
+        memory_service.add_system_record.assert_awaited_once()
+        metadata = memory_service.add_system_record.call_args.kwargs.get('metadata') or {}
+        assert metadata.get('remediation') is False
+
+
 class TestWriteCycleSummaryMirrorAndTrim:
     """write_cycle_summary's best-effort Mem0 mirror (``add_system_record``)
     and pool-cap trim (``enforce_summary_pool_cap``) — task 2229 W5-λ step-03.

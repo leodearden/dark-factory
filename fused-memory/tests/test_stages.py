@@ -10638,6 +10638,105 @@ class TestTaskKnowledgeSyncDeterministicCycleSummaryWrite:
         assert payload['items_flagged_count'] == 0
 
     @pytest.mark.asyncio
+    async def test_remediation_mode_stamps_stage2_summary_remediation_true_stage1_absent(
+        self, mock_deps, ledger_store, mock_config,
+    ):
+        """End-to-end disambiguation (task 2652): a Stage-2-only remediation
+        pass (``TaskKnowledgeSync.run()`` with ``remediation_mode=True``)
+        writes a Stage 2 (``task_knowledge_sync``) cycle_summary row stamped
+        ``remediation=True``, while Stage 1 (``memory_consolidator``)
+        legitimately never ran for this ``run_id`` (it early-returns before
+        its own write on a remediation pass — see
+        ``memory_consolidator.py``). ``get_cycle_summary_presence`` must
+        report present=True/remediation=True for Stage 2 and present=False
+        for Stage 1 — the exact shape Stage 3's Stage-2-only remediation run
+        exception must special-case rather than flag as a genuine bug."""
+        from fused_memory.services.memory_service import MemoryService
+
+        run_id = 'run-d1-remediation-disambiguation'
+        remediation_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 12, 1, 0, tzinfo=UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
+        stage.remediation_mode = True
+        watermark = Watermark(project_id='reify')
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=remediation_report)):
+            await stage.run(events=[], watermark=watermark, prior_reports=[], run_id=run_id)
+
+        presence_service = MemoryService(mock_config)
+        presence_service.set_recon_ledger(ledger_store)
+
+        stage2_presence = await presence_service.get_cycle_summary_presence(
+            project_id='reify', run_id=run_id, stage='task_knowledge_sync',
+        )
+        assert stage2_presence.get('present') is True
+        assert stage2_presence.get('remediation') is True, (
+            f'Expected Stage 2 remediation=True, got: {stage2_presence!r}'
+        )
+
+        stage1_presence = await presence_service.get_cycle_summary_presence(
+            project_id='reify', run_id=run_id, stage='memory_consolidator',
+        )
+        assert stage1_presence.get('present') is False, (
+            'Stage 1 legitimately never ran in a Stage-2-only remediation '
+            f'pass — no memory_consolidator row should exist, got: {stage1_presence!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_full_cycle_stamps_stage2_summary_remediation_false(
+        self, mock_deps, ledger_store, mock_config,
+    ):
+        """Anti-inversion: a full-cycle run (``remediation_mode=False``, the
+        default) writes the Stage 2 cycle_summary row with
+        ``remediation=False`` — not True and not absent — so a genuinely
+        missing Stage 1 summary alongside it is still flagged as a real bug
+        by Stage 3, not suppressed."""
+        from fused_memory.services.memory_service import MemoryService
+
+        run_id = 'run-d1-full-cycle-remediation-false'
+        full_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=2,
+            tokens_used=500,
+        )
+
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
+        assert stage.remediation_mode is False
+        watermark = Watermark(project_id='reify')
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=full_report)):
+            await stage.run(events=[], watermark=watermark, prior_reports=[], run_id=run_id)
+
+        presence_service = MemoryService(mock_config)
+        presence_service.set_recon_ledger(ledger_store)
+
+        stage2_presence = await presence_service.get_cycle_summary_presence(
+            project_id='reify', run_id=run_id, stage='task_knowledge_sync',
+        )
+        assert stage2_presence.get('present') is True
+        assert stage2_presence.get('remediation') is False, (
+            f'Expected Stage 2 remediation=False for a full cycle, got: {stage2_presence!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_run_sets_cycle_summary_ledger_written_stat(self, mock_deps):
         report = await self._run_stage(mock_deps, 'run-d1-stat')
 

@@ -1813,6 +1813,12 @@ class TaskKnowledgeSync(BaseStage):
         # that pool is itself best-effort and bounded, not a durable audit
         # trail either. See test_remediation_pass_overwrites_full_cycle_ledger_payload
         # (tests/test_stages.py) for the behavior this confirms.
+        # remediation=self.remediation_mode (task 2652): lets Stage 3
+        # distinguish a Stage-2-only remediation run's expected missing
+        # Stage 1 (memory_consolidator) cycle_summary — Stage 1 early-returns
+        # before its own write on a remediation pass, by design — from a
+        # genuine Stage 1 write failure on a full cycle. See
+        # prompts/stage3.py's Stage-2-only remediation run exception.
         ledger_written = await write_cycle_summary(
             self.memory,
             self.project_id,
@@ -1822,6 +1828,7 @@ class TaskKnowledgeSync(BaseStage):
             recon_pool=_STAGE2_CYCLE_SUMMARY_RECON_POOL,
             trim_source=_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
             cap=STAGE2_CYCLE_SUMMARY_POOL_CAP,
+            remediation=self.remediation_mode,
         )
         # Named "..._ledger_written", not "..._written" (reviewer finding
         # observability, task 2229 amendment pass round 2): this reflects
