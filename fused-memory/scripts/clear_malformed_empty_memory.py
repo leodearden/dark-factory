@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Clear a malformed/empty Mem0 (Qdrant) memory record by id (task 2691).
+
+Background
+----------
+A malformed/empty Mem0 record (category=observations_and_summaries claimed by
+the recon MCP surface, but with a null-payload category, null agent_id, and
+no extractable content -- e.g. 028edb1f-299c-4755-9432-f5a9fde97677) recurs
+unresolved across reconciliation cycles. The recon MCP surface (cite_memory)
+exposes only a metadata fingerprint, not the raw Qdrant payload, so deletion
+cannot be confirmed-safe from within the pipeline.
+
+This script reaches the raw Qdrant transport directly via
+``MemoryService.mem0._get_async_qdrant()`` (the same admin path
+``consolidate_namespace_families.run`` uses), retrieves the point by id
+(``AsyncQdrantClient.retrieve``), CONFIRMS the malformed fingerprint with a
+pure fail-safe predicate (empty content AND null category AND null agent_id
+-- ALL three, see ``is_malformed_empty_payload``), and only then, under
+``--apply``, deletes it via a direct Qdrant point delete (``client.delete``
+with ``PointIdsList``).
+
+It deliberately does NOT use Mem0's ``AsyncMemory.delete()`` /
+``MemoryService.delete_memory`` -- a null-payload record breaks Mem0's delete
+path (it reads ``existing.payload['data']`` to build a history entry ->
+``KeyError``; the exact task-86 null-payload failure mode).
+
+Safety
+------
+Dry-run is the default: the printed JSON report (raw payload + classification)
+IS the investigation. ``--apply`` against a record that does NOT match the
+malformed fingerprint (a 'healthy' record) is refused LOUDLY (WARNING +
+non-zero exit) -- honoring the loud-over-silent-degradation norm, so a
+mistyped ``--memory-id`` can never delete a real memory. An absent record
+(already deleted) is idempotent success (exit 0), so the recurring finding
+self-heals once this tool is run against an already-cleared id.
+
+The tool is parameterized (``--memory-id``/``--project-id``, id NOT
+hardcoded) so the recurring malformed-empty-record class (precedent tasks
+86/54/61/98) is handled by re-running against a different id. Collection
+resolves to ``fused_dark_factory`` via ``Scope('dark_factory')
+.mem0_collection_name('fused')`` (``collection_prefix`` default ``'fused'``).
+
+Scope: this script + its test suite are MOCK-unit only (AsyncMock Qdrant
+client, MagicMock points) -- no live Qdrant. The live
+``--apply --memory-id 028edb1f-...`` run against live Qdrant is the
+operational close-out (needs live Qdrant + OPENAI env), documented here --
+mirroring every precedent cleanup script (mock-unit only; operator runs
+``--apply``).
+
+Usage
+-----
+  # Dry run (default): print the raw payload + classification, touch nothing.
+  python scripts/clear_malformed_empty_memory.py \\
+      --memory-id 028edb1f-299c-4755-9432-f5a9fde97677
+
+  # Commit the deletion (only proceeds if the record matches the malformed
+  # fingerprint; refuses loudly otherwise).
+  python scripts/clear_malformed_empty_memory.py \\
+      --memory-id 028edb1f-299c-4755-9432-f5a9fde97677 --apply
+
+  # Override the target project (default: dark_factory).
+  python scripts/clear_malformed_empty_memory.py \\
+      --memory-id <id> --project-id reify --apply
+"""
+
+from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger('clear_malformed_empty_memory')
+
+
+# ---------------------------------------------------------------------------
+# Pure core
+# ---------------------------------------------------------------------------
+
+# Payload keys tried in order when extracting a Mem0 memory's text content
+# from its raw Qdrant payload dict. Reused verbatim from
+# audit_duplicate_memories.py's _CONTENT_KEYS so 'empty content' is judged
+# identically to how the dedup sweep judges it ('data' is the canonical
+# Qdrant scroll-payload content key for infer=False writes).
+_CONTENT_KEYS: tuple[str, ...] = ('data', 'memory', 'content')
+
+
+def extract_content(payload: dict) -> str:
+    """Return the first non-empty string among payload['data'], ['memory'],
+    ['content'], trying _CONTENT_KEYS in order.
+
+    Returns '' when no key is present or every present value is empty/not a
+    string -- mirrors audit_duplicate_memories.fetch_procedural_memories's
+    content-extraction fallback exactly.
+    """
+    for key in _CONTENT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ''
+
+
+def is_malformed_empty_payload(payload: dict) -> bool:
+    """True iff *payload* matches the malformed-empty fingerprint: empty
+    extracted content AND category is None AND agent_id is None -- ALL
+    three conditions required.
+
+    Requiring all three means a healthy record (non-empty content, or a set
+    category, or a set agent_id) can NEVER match, so this predicate
+    structurally cannot authorize deleting a real memory.
+    """
+    return (
+        extract_content(payload) == ''
+        and payload.get('category') is None
+        and payload.get('agent_id') is None
+    )
+
+
+def classify_payload(payload: dict | None) -> str:
+    """Classify a retrieved Qdrant payload (or None) for the report/gate.
+
+    Returns:
+        'absent' if *payload* is None (record not found by retrieve);
+        'malformed' if *payload* matches is_malformed_empty_payload;
+        'healthy' otherwise.
+    """
+    if payload is None:
+        return 'absent'
+    if is_malformed_empty_payload(payload):
+        return 'malformed'
+    return 'healthy'
