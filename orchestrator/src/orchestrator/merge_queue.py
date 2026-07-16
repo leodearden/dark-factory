@@ -177,7 +177,10 @@ from orchestrator.verify import (
     seed_main_baseline,
     verify_failure_is_preexisting_on_main,
 )
-from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES
+from orchestrator.verify_categories import (
+    INFRA_TRANSIENT_CATEGORIES,
+    PREEXISTING_BREAK_SKIP_CATEGORIES,
+)
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
     HostAllocator,
@@ -1757,6 +1760,25 @@ async def _run_post_merge_verify(
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
                 )
+        # Classified infra-transient retry (task ν, verify-scope-inversion-prd.md):
+        # a failing VerifyResult whose category is policy-table infra-transient
+        # (CategoryPolicy.is_infra_transient — semaphore timeout, disk_full-by-
+        # category, pytest INTERNALERROR, env_transient) but was NOT ENOSPC-
+        # string-matched above.  Mirrors the ENOSPC branch's shape and shares its
+        # enospc_retries/max_enospc budget (no new config knob); no worktree
+        # prune since this is not disk-specific.
+        elif not verify.passed and (verify.category or '') in INFRA_TRANSIENT_CATEGORIES:
+            prior_infra = enospc_retries.get(req.task_id, 0)
+            if prior_infra < max_enospc:
+                enospc_retries[req.task_id] = prior_infra + 1
+                logger.warning(
+                    'Task %s: post-merge verify classified infra-transient '
+                    '(category=%s); retrying verify once',
+                    req.task_id, verify.category,
+                )
+                verify = await pool.dispatch(
+                    merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
+                )
 
     # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
     # called with the FINAL VerifyResult (after any ENOSPC retry) so the
@@ -1833,6 +1855,27 @@ async def _run_post_merge_verify(
             if detail:
                 reason = f'{reason}\n\n{detail}'
             return MergeOutcome('blocked', reason=reason)
+
+        # Persistent classified infra-transient outcome after the bounded
+        # retry above → transient infra hold (task ν, verify-scope-inversion-
+        # prd.md).  Mirrors the persistent-ENOSPC branch immediately above but
+        # for policy-table infra categories that were not ENOSPC-string-
+        # matched.  Placed before the main-health probe / μ new-ids
+        # attribution / skew disposition / timeout loop-breaker / dry-run
+        # spawn / generic block below so this outcome consumes no merge
+        # verify attempt and routes through the same loud infra_issue L1
+        # consumer (workflow.py:6690) as the ENOSPC branch — no steward, no
+        # branch-blaming.
+        if (verify.category or '') in INFRA_TRANSIENT_CATEGORIES:
+            detail = verify.failure_report()
+            reason = (
+                f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge verify '
+                f'classified infra-transient (category={verify.category!r}) '
+                f'and did not clear after retry. {verify.summary}'
+            )
+            if detail:
+                reason = f'{reason}\n\n{detail}'
+            return MergeOutcome('blocked', reason=reason, failure_category=verify.category)
 
         # Main-health probe: classify whether this failure is pre-existing on
         # bare main HEAD rather than introduced by this merge.  Inserted after
