@@ -8330,3 +8330,37 @@ class TestStoreFailureDiagnosticsHelper:
             f"Expected rate_limit_or_quota=True, got {graphiti_diag!r}. "
             "RED: _store_failure_diagnostics does not yet emit rate_limit_or_quota."
         )
+
+    @pytest.mark.asyncio
+    async def test_search_outer_timeout_populates_failure_diagnostics(self, service):
+        """A store whose task is still pending when the OUTER search_timeout_seconds
+        deadline elapses (cancelled, not raised) must also get a failure_diagnostics
+        entry — the second root-cause variant search() can hit, distinct from a
+        store task raising an exception.
+
+        Deterministic and fast: the outer asyncio.wait times out at 0.01s and
+        cancels the pending task well before the 5s sleep would ever complete.
+
+        RED: timed-out stores currently produce no diagnostic entry.
+        """
+        service.config.queue.search_timeout_seconds = 0.01
+
+        async def _slow_graphiti_search(*args, **kwargs):
+            await asyncio.sleep(5)
+            return []
+
+        service.graphiti.search = AsyncMock(side_effect=_slow_graphiti_search)
+
+        res = await service.search(query='slow shape', project_id='reify')
+
+        assert res.degraded is True
+        assert 'graphiti' in res.failed_stores
+        graphiti_diag = next(
+            (d for d in res.failure_diagnostics if d.get('store') == 'graphiti'), None
+        )
+        assert graphiti_diag is not None, (
+            f'Expected a graphiti entry in {res.failure_diagnostics!r}. '
+            'RED: timed-out stores currently produce no diagnostic entry.'
+        )
+        assert graphiti_diag['reason'] == 'timeout'
+        assert graphiti_diag['error_type'] == 'TimeoutError'
