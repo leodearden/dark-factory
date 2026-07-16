@@ -1836,12 +1836,13 @@ class TestCiteRun:
 class TestCiteToolsViaFastMCP:
     """Verify the four cite_* tools are registered and wired correctly in FastMCP."""
 
-    def _make(self, task_interceptor=None, known_projects=None):
+    def _make(self, task_interceptor=None, known_projects=None, count_result=None):
         from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
 
         t = [0.0]
         fake_ms = _FakeMemoryService(
-            entity_nodes=[{'uuid': 'aaaaaaaa-1111-1111-1111-111111111111', 'name': 'Foo'}]
+            entity_nodes=[{'uuid': 'aaaaaaaa-1111-1111-1111-111111111111', 'name': 'Foo'}],
+            count_result=count_result,
         )
         state = ReconReportState(
             ttl_seconds=300,
@@ -1984,6 +1985,80 @@ class TestCiteToolsViaFastMCP:
         report = state.get_assembled_report('r1', 'reconciler')
         assert report is not None
         assert [i['finding_id'] for i in report['flagged_items']] == [fid1]
+
+    # -- task-2595 step-3: cite_run via FastMCP — RED until step-4 registers
+    #    the cite_run tool wrapper -----------------------------------------
+
+    _CITE_RUN_VALID_UUID = '30e7dce2-42a7-437d-abe5-a2316faad40a'
+
+    async def _start_and_add_finding(self, mcp):
+        tm = mcp._tool_manager
+        await tm.call_tool('start_report', {
+            'run_id': 'r1', 'stage': 'test_stage', 'project_id': 'dark_factory',
+        })
+        r = await tm.call_tool('add_finding', {
+            'run_id': 'r1',
+            'severity': 'low',
+            'category': 'cat',
+            'description': 'd',
+            'suggested_action': 'a',
+            'task_id': '1',
+            'flag_type': 'f',
+        })
+        return tm, r['finding_id']
+
+    def test_cite_run_registered(self):
+        """cite_run must be registered in the FastMCP tool manager."""
+        _, mcp = self._make()
+        tools = set(mcp._tool_manager._tools.keys())
+        assert 'cite_run' in tools
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_cite_run_happy_path_via_call_tool(self):
+        """Full lifecycle through the MCP boundary: happy path returns
+        {'run_id', 'match_count'}."""
+        state, mcp = self._make(count_result=3)
+        tm, finding_id = await self._start_and_add_finding(mcp)
+
+        cite_r = await tm.call_tool('cite_run', {
+            'run_id': 'r1',
+            'finding_id': finding_id,
+            'cited_run_id': self._CITE_RUN_VALID_UUID,
+        })
+        assert cite_r.get('run_id') == self._CITE_RUN_VALID_UUID
+        assert cite_r.get('match_count') == 3
+
+        report = state.get_assembled_report('r1', 'test_stage')
+        assert report is not None
+        assert len(report['flagged_items'][0]['cited_runs']) == 1
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_cite_run_not_found_via_call_tool(self):
+        """count_result=0 surfaces the run_not_found error dict through the MCP boundary."""
+        _, mcp = self._make(count_result=0)
+        tm, finding_id = await self._start_and_add_finding(mcp)
+
+        cite_r = await tm.call_tool('cite_run', {
+            'run_id': 'r1',
+            'finding_id': finding_id,
+            'cited_run_id': self._CITE_RUN_VALID_UUID,
+        })
+        assert cite_r.get('error') == 'run_not_found'
+        assert cite_r.get('error_type') == 'ReconReportRunNotFound'
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_cite_run_invalid_uuid_shape_via_call_tool(self):
+        """A malformed cited_run_id surfaces invalid_uuid_shape through the MCP boundary."""
+        _, mcp = self._make(count_result=3)
+        tm, finding_id = await self._start_and_add_finding(mcp)
+
+        cite_r = await tm.call_tool('cite_run', {
+            'run_id': 'r1',
+            'finding_id': finding_id,
+            'cited_run_id': 'not-a-uuid',
+        })
+        assert cite_r.get('error') == 'invalid_uuid_shape'
+        assert cite_r.get('error_type') == 'ReconReportInvalidUuid'
 
 
 # ---------------------------------------------------------------------------
