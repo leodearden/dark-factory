@@ -142,3 +142,31 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
         ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(segment))
 
     return ids
+
+
+# --------------------------------------------------------------------------- #
+# flatten_dedup_edges
+# --------------------------------------------------------------------------- #
+
+
+def flatten_dedup_edges(grouped: dict[str, list[dict]]) -> list[dict]:
+    """Flatten get_all_valid_edges' dict[entity_uuid, list[EdgeDict]] shape.
+
+    ``GraphitiBackend.get_all_valid_edges``'s undirected MATCH pattern
+    double-attributes each directed edge under both its source and target
+    entity UUID. This flattens the grouping and dedups by ``edge['uuid']``,
+    keeping the first-seen occurrence, so each edge is considered exactly
+    once by the rest of the sweep.
+
+    Pure: no I/O, no side effects.
+    """
+    seen: set[str] = set()
+    result: list[dict] = []
+    for edges in grouped.values():
+        for edge in edges:
+            uuid = edge['uuid']
+            if uuid in seen:
+                continue
+            seen.add(uuid)
+            result.append(edge)
+    return result
