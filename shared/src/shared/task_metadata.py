@@ -259,6 +259,49 @@ class Milestone(BaseModel):
         return self
 
 
+class RoutingDecisionMirror(BaseModel):
+    """One resolved routing decision for a single LLM invocation (PRD γ).
+
+    Mirrors the fields of ``orchestrator.routing.RoutingDecision`` (task ε)
+    so that dataclass can be swapped in as this model's source with no
+    schema change (PRD invariant 7). ``extra='allow'`` so any of ε's
+    additional fields survive round-trip before this model is updated to
+    know about them by name.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    role: str
+    model: str
+    effort: str
+    budget_usd: float
+    max_turns: int
+    source_layer: str
+    rule_id: str | None = None
+    rejected: list[str] = Field(default_factory=list)
+    routing_tier: int = 0
+    decided_at: str | None = None
+
+
+class RoutingState(BaseModel):
+    """``metadata.routing`` — the LATEST routing decision + bounded history (PRD γ).
+
+    ``latest`` mirrors the most recent per-invocation routing resolution;
+    ``history`` retains a bounded window of the most recent decisions (see
+    ``with_decision``, added alongside this model's registration).
+    ``routing_tier``/``simple_saturated`` are counter/flag storage stamped
+    by later tasks (μ/ν) — this task only provides the typed slice, so
+    their defaults (0 / False) are inert until then.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    latest: RoutingDecisionMirror | None = None
+    history: list[RoutingDecisionMirror] = Field(default_factory=list)
+    routing_tier: int = 0
+    simple_saturated: bool = False
+
+
 class TaskMetadata(BaseModel):
     """The versioned ``metadata`` JSON blob carried on every task (PRD §5).
 
