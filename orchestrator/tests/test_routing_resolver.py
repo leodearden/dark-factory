@@ -32,6 +32,7 @@ from orchestrator.config import (
     TurnsConfig,
 )
 from orchestrator.routing import (
+    DEFAULT_ALLOWED_MODELS,
     PlanShape,
     RoleDefaults,
     RouteInputs,
@@ -479,3 +480,150 @@ class TestFirstMatchWins:
         )
         assert decision.model == 'opus'
         assert decision.rule_id == 'first'
+
+
+# ---------------------------------------------------------------------------
+# step-7: fail-safe validation + ladder + ceiling (RED until step-8's impl)
+#
+# All three mechanics share one shape: a layer's PROPOSED model is validated
+# (allowlist membership, ladder membership for '+N', ceiling headroom)
+# before it is committed; on failure the layer is skipped (resolution keeps
+# whatever the next-lower-precedence layer already validated), a namespaced
+# "<layer>:<reason>" string is appended to `rejected`, and -- critically --
+# a policy rule's `rule_id` is still recorded on MATCH, independent of
+# whether its `set.model` went on to apply (see RoutingDecision's
+# docstring) -- so a rejected policy-rule model bump still surfaces its
+# rule_id for telemetry.
+# ---------------------------------------------------------------------------
+
+
+class TestFailSafeMetadataOverrideNotInAllowlist:
+    """(a) invariant 2 / boundary test 2: an override model absent from
+    routing.allowed_models is rejected, not raised -- resolution falls
+    through to the next-lower layer (here: config, since no rules are
+    configured)."""
+
+    def test_invalid_override_falls_through_to_config(self):
+        cfg = OrchestratorConfig(models=ModelsConfig(implementer='sonnet'))
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={'model_overrides': {'implementer': 'gpt-9'}},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='haiku'),
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'sonnet'
+        assert decision.source_layer == 'config'
+        assert 'metadata_override:model-not-in-allowlist' in decision.rejected
+
+
+class TestLadderRelativeBump:
+    """(b) invariant 5: RuleSet.model == '+N' bumps the incoming (pre-rule)
+    model N ladder steps, clamped at the ladder top; a model absent from
+    `routing.ladder` cannot be bumped from -- that layer's model set is
+    skipped (rule_id is still recorded -- the rule DID match)."""
+
+    def test_bump_one_step(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='+1'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(rules=[rule]),
+        )
+
+        decision = resolve_route(_inputs(role_name='implementer'), cfg)
+
+        assert decision.model == 'opus'
+        assert decision.source_layer == 'policy_rule'
+        assert decision.rule_id == 'r'
+        assert decision.rejected == ()
+
+    def test_bump_clamps_at_ladder_top(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='+1'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='opus'),
+            routing=RoutingConfig(rules=[rule]),
+        )
+
+        decision = resolve_route(_inputs(role_name='implementer'), cfg)
+
+        assert decision.model == 'opus'
+        assert decision.source_layer == 'policy_rule'
+        assert decision.rule_id == 'r'
+        assert decision.rejected == ()
+
+    def test_model_absent_from_ladder_cannot_be_bumped(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='+1'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='claude-fable-5'),
+            routing=RoutingConfig(
+                allowed_models=[*DEFAULT_ALLOWED_MODELS, 'claude-fable-5'],
+                rules=[rule],
+            ),
+        )
+
+        decision = resolve_route(_inputs(role_name='implementer'), cfg)
+
+        assert decision.model == 'claude-fable-5'
+        assert decision.source_layer == 'config'
+        assert decision.rule_id == 'r'
+        assert 'policy_rule:model-not-in-ladder' in decision.rejected
+
+
+class TestCeilingFallback:
+    """(c) invariant 6 / boundary test 7: a model whose trailing-24h spend
+    has exhausted its configured `per_model_daily_ceiling_usd` is rejected
+    exactly like an allowlist failure -- resolution falls back one layer,
+    dispatch proceeds with the fallback model."""
+
+    def test_exhausted_ceiling_falls_back_one_layer(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='opus'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(rules=[rule], per_model_daily_ceiling_usd={'opus': 50.0}),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='haiku'),
+            spend_by_model={'opus': 60.0},
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'sonnet'
+        assert decision.source_layer == 'config'
+        assert decision.rule_id == 'r'
+        assert 'policy_rule:model-ceiling-exhausted' in decision.rejected
+
+    def test_ceiling_not_exhausted_applies_normally(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='opus'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(rules=[rule], per_model_daily_ceiling_usd={'opus': 50.0}),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='haiku'),
+            spend_by_model={'opus': 10.0},
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'opus'
+        assert decision.source_layer == 'policy_rule'
+        assert decision.rule_id == 'r'
+        assert decision.rejected == ()
