@@ -110,6 +110,16 @@ def is_malformed_empty_payload(payload: dict) -> bool:
     Requiring all three means a healthy record (non-empty content, or a set
     category, or a set agent_id) can NEVER match, so this predicate
     structurally cannot authorize deleting a real memory.
+
+    Note: 'empty content' is judged only over the recognized _CONTENT_KEYS
+    ('data', 'memory', 'content') -- this predicate assumes the standard
+    Mem0 payload shape. A record that stored its text under some other key
+    while also having category=None and agent_id=None would be
+    misclassified as malformed. In practice this risk is very low (real
+    observations_and_summaries records always carry a category, and the
+    operator supplies an exact --memory-id); re-verify this assumption
+    before repointing this tool at records from a different write
+    pipeline.
     """
     return (
         extract_content(payload) == ''
