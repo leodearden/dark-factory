@@ -20,6 +20,7 @@ Clock discipline: the only permitted clock read is via
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import date
 from pathlib import Path
 
@@ -84,3 +85,43 @@ def load_regime_markers(path: Path | None = None) -> tuple[list[dict], int]:
             'tasks': item.get('tasks') or [],
         })
     return markers, 0
+
+
+# ---------------------------------------------------------------------------
+# runs.db done-per-day (esc_per_done_daily substrate)
+# ---------------------------------------------------------------------------
+
+
+def _done_by_day(runs_db: Path) -> dict[str, int]:
+    """Return ``{date: count}`` of ``outcome='done'`` task_results rows.
+
+    Bucketed by ``date(completed_at)``. Sync, read-only (``mode=ro`` URI),
+    fail-open — mirrors ``orchestrator.digest._query_events_ro``'s discipline
+    applied to ``runs.db`` instead of an events DB: a missing DB logs at
+    DEBUG and returns ``{}``; any other failure logs at WARNING and returns
+    ``{}``. Never raises.
+    """
+    runs_db = Path(runs_db)
+    try:
+        if not runs_db.exists():
+            logger.debug('_done_by_day: DB not found (fail-open): %s', runs_db)
+            return {}
+        db_uri = runs_db.resolve().as_uri() + '?mode=ro'
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT date(completed_at), COUNT(*) FROM task_results "
+                "WHERE outcome = 'done' AND completed_at IS NOT NULL AND completed_at != '' "
+                "GROUP BY date(completed_at)"
+            ).fetchall()
+            return {row[0]: row[1] for row in rows if row[0] is not None}
+        finally:
+            conn.close()
+    except Exception:
+        # TOCTOU guard: re-detect a since-vanished DB as missing (DEBUG)
+        # rather than an unexpected failure (WARNING).
+        if not runs_db.exists():
+            logger.debug('_done_by_day: DB not found (fail-open): %s', runs_db)
+            return {}
+        logger.warning('_done_by_day: query failed for %s', runs_db, exc_info=True)
+        return {}
