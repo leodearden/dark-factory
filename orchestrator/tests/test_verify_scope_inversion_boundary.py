@@ -142,6 +142,30 @@ MODB_SIBLING_TEST_CONTENT: str = (
 # modB — shaped like a real junit-derived id (VerifyResult.failing_test_ids).
 MODB_FAILING_TEST_ID: str = 'modb/tests/test_sibling.py::test_sibling_contract'
 
+# Row 3's docs-only diff — no `.py`/`.rs` extension, so it can never satisfy
+# verify_plan._has_source_files; the ScopeKind.TRIVIAL short-circuit fires
+# ahead of both the module-config and fallback branches, independent of role
+# or merge_verify_breadth (R2).
+DOCS_ONLY_PATH: str = 'skills/foo.md'
+DOCS_ONLY_CONTENT: str = '# foo\n'
+
+
+def _write_docs_only_diff(root: Path) -> list[str]:
+    """Write row 3's docs-only diff (a single ``.md`` file) under *root* and
+    return its ``task_files`` list.
+
+    Used for the PRODUCER side (*root* is *tmp_path*, the worktree
+    ``run_scoped_verification`` reads directly). The CONSUMER-side parity
+    check does NOT call this — ``_drive_merge_gate`` writes
+    ``task_files_content`` into the MERGE worktree itself (see its
+    docstring's footgun paragraph), so the consumer side passes
+    ``DOCS_ONLY_PATH``/``DOCS_ONLY_CONTENT`` directly instead.
+    """
+    full = root / DOCS_ONLY_PATH
+    full.parent.mkdir(parents=True, exist_ok=True)
+    full.write_text(DOCS_ONLY_CONTENT)
+    return [DOCS_ONLY_PATH]
+
 
 def _row1_golden_diff(
     tmp_path: Path, *, breadth: Literal['scoped', 'full'] = 'full',
