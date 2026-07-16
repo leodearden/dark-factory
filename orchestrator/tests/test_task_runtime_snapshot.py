@@ -186,3 +186,32 @@ class TestB3Quarantined:
         entry = by_task[43]
         assert entry['lane_state'] == 'quarantined'
         assert entry['lane'] == '_lane-5'
+
+
+# ---------------------------------------------------------------------------
+# B4 — Honest zero
+# ---------------------------------------------------------------------------
+
+
+class TestB4HonestZero:
+    def test_empty_iteration_log_is_honest_zero_not_missing(self, git_repo: Path, tmp_path: Path):
+        """A genuinely-not-iterated task (empty iterations.jsonl, no read
+        failure) reports an honest integer 0 end-to-end — never a missing/
+        None/dropped entry (the structured-facts boundary).
+        """
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        worktree_base = git_ops.worktree_base
+        lifecycle = git_ops._lane_lifecycle
+        lifecycle.note_assigned('_lane-7', task_id='44')
+        _make_task_artifacts(worktree_base, '_lane-7', '44')
+        empty_log = TaskArtifacts.meta_root_for(worktree_base, '_lane-7') / 'iterations.jsonl'
+        empty_log.write_text('')
+
+        by_task, offline = _tool_runtime_tasks(git_ops, tmp_path)
+
+        assert offline is False
+        entry = by_task[44]
+        assert entry['loops'] == 0
+        assert entry['loops'] is not None
+        assert entry['attempts'] == 0
+        assert entry['error'] is None
