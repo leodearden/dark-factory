@@ -208,6 +208,71 @@ class TestMergeFinalizedEventType:
         assert rows[0][4] == 'done'
 
 
+class TestRoutingDecisionEventType:
+    """EventType.routing_decision must exist and round-trip (PRD γ, task 2533)."""
+
+    def test_routing_decision_member_exists_and_name_equals_value(self) -> None:
+        """routing_decision must exist with value == name (project convention)."""
+        assert EventType.routing_decision == 'routing_decision'
+        assert EventType.routing_decision.value == EventType.routing_decision.name
+
+    def test_routing_decision_round_trip(self, tmp_path: Path) -> None:
+        """Emitting routing_decision writes one row whose data round-trips key fields."""
+        db_path = tmp_path / 'rd_test.db'
+        store = EventStore(db_path, 'run-rd')
+        store.emit(
+            EventType.routing_decision,
+            task_id='42',
+            role='implementer',
+            data={
+                'model': 'sonnet',
+                'effort': 'high',
+                'budget_usd': 10.0,
+                'max_turns': 80,
+                'source_layer': 'config',
+                'rule_id': None,
+                'rejected': [],
+                'routing_tier': 0,
+                'inputs_digest': 'deadbeefcafef00d',
+            },
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, role, "
+            "json_extract(data, '$.source_layer') AS source_layer, "
+            "json_extract(data, '$.model') AS model "
+            "FROM events WHERE event_type = 'routing_decision'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'routing_decision'
+        assert rows[0][1] == '42'
+        assert rows[0][2] == 'implementer'
+        assert rows[0][3] == 'config'
+        assert rows[0][4] == 'sonnet'
+
+    def test_fetch_events_by_type_surfaces_routing_decision_rows(self, tmp_path: Path) -> None:
+        """fetch_events_by_type is the events-query surfacing signal (PRD contract invariant 7)."""
+        db_path = tmp_path / 'rd_fetch.db'
+        store = EventStore(db_path, 'run-rd-fetch')
+        store.emit(
+            EventType.routing_decision,
+            task_id='99',
+            role='debugger',
+            data={'model': 'opus', 'source_layer': 'policy_rule', 'rule_id': 'rust-large-plan-implementer'},
+        )
+
+        fetched = store.fetch_events_by_type(EventType.routing_decision)
+        assert len(fetched) == 1
+        assert fetched[0]['task_id'] == '99'
+        assert fetched[0]['role'] == 'debugger'
+        assert fetched[0]['data']['model'] == 'opus'
+        assert fetched[0]['data']['source_layer'] == 'policy_rule'
+        assert fetched[0]['data']['rule_id'] == 'rust-large-plan-implementer'
+
+
 class TestSchedulerOverrideEventTypes:
     """Assert the five priority-override event types exist on EventType.
 
