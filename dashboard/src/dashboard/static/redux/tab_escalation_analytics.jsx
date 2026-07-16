@@ -8,7 +8,7 @@
  * Export:     window.DF_TABS.EscalationAnalyticsTab  (additive mutation of
  *             the object created by tabs.jsx; app.jsx destructures it last)
  */
-const { useState: uS, useEffect: uE, useMemo } = React;
+const { useState: uS, useEffect: uE } = React;
 const DF = window.DF_DATA;
 const { ProjectGroup, Segmented, fmtUptime, fmtDateTime, taskId } = window.DF_SHELL;
 const C = window.DF_CHARTS;
@@ -298,6 +298,17 @@ const _TIER_COLORS = {
   'other-auto': C.PALETTE.bad,
 };
 
+// Any resolver tier the backend emits that isn't in the whitelist above
+// (e.g. a future addition to escalation.classify.classify_resolver_tier, or
+// a parse anomaly) folds into 'other-auto' rather than being dropped.
+// LifespanPanel's ECDF and WorkflowPanel's 100%-normalized stack both
+// iterate _RESOLVER_TIERS only — an un-folded unknown tier would silently
+// vanish from the ECDF, and would make the normalized stack's bands sum to
+// less than 1.0 for any week that touched it.
+function resolverTierKey(tier) {
+  return _RESOLVER_TIERS.includes(tier) ? tier : 'other-auto';
+}
+
 function LifespanPanel({ lifespan, win, generatedAt }) {
   const levels = Object.keys(lifespan.percentiles_by_level || {}).sort();
   // lifespan.samples rows are [date, tier, level, secs] — date is date(resolved_at).
@@ -323,7 +334,7 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
 
   const secsByTier = {};
   for (const row of samples) {
-    const tier = row[1], secs = row[3];
+    const tier = resolverTierKey(row[1]), secs = row[3];
     (secsByTier[tier] = secsByTier[tier] || []).push(secs);
   }
   const series = _RESOLVER_TIERS
@@ -427,13 +438,28 @@ function WorkflowPanel({ workflow, win, generatedAt, regimeMarkers }) {
   const weeks = Object.keys(tierWeekly).sort();
   const weekTotals = weeks.map(w => Object.values(tierWeekly[w] || {}).reduce((s, n) => s + n, 0));
 
+  // Fold any tier outside the known whitelist into 'other-auto' BEFORE
+  // building the per-week stacks below — weekTotals (the normalization
+  // denominator, just above) already counts every tier the backend sent,
+  // whitelisted or not, so an un-folded unknown tier would have no band of
+  // its own and the stack would visibly fall short of the 100% line.
+  const foldedWeekly = {};
+  for (const w of weeks) {
+    const folded = {};
+    for (const [t, n] of Object.entries(tierWeekly[w] || {})) {
+      const key = resolverTierKey(t);
+      folded[key] = (folded[key] || 0) + n;
+    }
+    foldedWeekly[w] = folded;
+  }
+
   // 100%-normalized: every tier is stacked every week (even at 0) so each
   // week's band heights always sum to exactly 1.0 — StackedAreaChart
   // auto-scales its y-axis to the max stacked total, which is then 1.0.
   const stacks = _RESOLVER_TIERS.map(t => ({
     key: t,
     color: _TIER_COLORS[t] || C.PALETTE.fg3,
-    values: weeks.map((w, wi) => (weekTotals[wi] > 0 ? ((tierWeekly[w] || {})[t] || 0) / weekTotals[wi] : 0)),
+    values: weeks.map((w, wi) => (weekTotals[wi] > 0 ? ((foldedWeekly[w] || {})[t] || 0) / weekTotals[wi] : 0)),
   }));
 
   const actionEntries = Object.entries(workflow.action_mix || {}).sort((a, b) => b[1] - a[1]);
