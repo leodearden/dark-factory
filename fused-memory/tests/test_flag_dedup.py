@@ -3190,6 +3190,122 @@ class TestFilterFalsePhantomTaskCreationFlags:
             f'Result must preserve input order with flag_b dropped; got {result!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_phantom_finding_kept_when_cited_id_collides_but_title_differs(self):
+        """Id-collision guard (task-2525 amendment).
+
+        Task ids are per-project sequential integers, so a resolved task
+        POSITIVELY PRESENT at the cited id in the cited project — but with a
+        DIFFERENT title — is routinely an unrelated task that merely happens
+        to occupy that id, not the task Stage 2 claims it created. A bare id
+        match must NOT corroborate; the finding must be KEPT (fail-safe).
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_false_phantom_task_creation_flags
+
+        taskmaster = AsyncMock()
+        # A real, unrelated task happens to have id '42' in the 'other' project.
+        unrelated_task = {'id': '42', 'title': 'Totally unrelated task', 'status': 'pending'}
+        taskmaster.get_task = AsyncMock(return_value=unrelated_task)
+        known_projects = {'origin': '/origin', 'other': '/other'}
+
+        flag = self._make_flag(cited_tasks=[
+            {'project_id': 'other', 'task_id': '42', 'title': 'The task Stage 2 claims it created'},
+        ])
+        result = await filter_false_phantom_task_creation_flags(taskmaster, known_projects, [flag])
+
+        assert result == [flag], (
+            'Phantom finding must be KEPT when the resolved task at the cited id has a '
+            f'non-matching title (id collision, not corroboration); got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_phantom_finding_dropped_when_title_matches_modulo_case_and_whitespace(self):
+        """Title comparison tolerates case/whitespace differences.
+
+        Mirrors _normalize_content_description's casefold + whitespace-collapse,
+        so a genuinely-matching cited task is still corroborated and dropped
+        even when the two title strings differ only in case or spacing.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_false_phantom_task_creation_flags
+
+        taskmaster = AsyncMock()
+        present_task = {'id': '42', 'title': '  Foreign   Task  ', 'status': 'pending'}
+        taskmaster.get_task = AsyncMock(return_value=present_task)
+        known_projects = {'origin': '/origin', 'other': '/other'}
+
+        flag = self._make_flag(cited_tasks=[
+            {'project_id': 'other', 'task_id': '42', 'title': 'foreign task'},
+        ])
+        result = await filter_false_phantom_task_creation_flags(taskmaster, known_projects, [flag])
+
+        assert result == [], (
+            f'Phantom finding must be DROPPED when titles match modulo case/whitespace; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_phantom_finding_kept_when_cited_title_missing(self):
+        """A cited_tasks entry missing 'title' cannot be identity-corroborated.
+
+        Even though the resolved record is positively present, an absent
+        cited title means there is nothing to compare against, so the finding
+        must be KEPT (fail-safe) rather than corroborated on id alone.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_false_phantom_task_creation_flags
+
+        taskmaster = AsyncMock()
+        present_task = {'id': '42', 'title': 'Foreign task', 'status': 'pending'}
+        taskmaster.get_task = AsyncMock(return_value=present_task)
+        known_projects = {'origin': '/origin', 'other': '/other'}
+
+        flag = self._make_flag(cited_tasks=[
+            {'project_id': 'other', 'task_id': '42'},  # no 'title' key
+        ])
+        result = await filter_false_phantom_task_creation_flags(taskmaster, known_projects, [flag])
+
+        assert result == [flag], (
+            f'Phantom finding must be KEPT when the cited task has no title to compare; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_drop_log_line_reports_corroborating_project_and_task_id(self, caplog):
+        """Observability (task-2525 amendment).
+
+        The drop log must carry the specific corroborating (project_id,
+        task_id) pair, not the finding's top-level task_id — which is always
+        None for this flag family by construction (_make_flag defaults
+        task_id=None; the whole point of cited_tasks is to carry the identity
+        a phantom finding otherwise lacks).
+        """
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import filter_false_phantom_task_creation_flags
+
+        taskmaster = AsyncMock()
+        present_task = {'id': '42', 'title': 'Foreign task', 'status': 'pending'}
+        taskmaster.get_task = AsyncMock(return_value=present_task)
+        known_projects = {'origin': '/origin', 'other': '/other'}
+
+        flag = self._make_flag(cited_tasks=[
+            {'project_id': 'other', 'task_id': '42', 'title': 'Foreign task'},
+        ])
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await filter_false_phantom_task_creation_flags(taskmaster, known_projects, [flag])
+
+        assert result == []
+
+        assert any(
+            'corroborating_project_id=other' in record.message
+            and 'corroborating_task_id=42' in record.message
+            for record in caplog.records
+        ), (
+            'Expected a drop log line reporting the corroborating (project_id, task_id) pair, '
+            f'got: {[r.message for r in caplog.records]}'
+        )
+        assert not any('task_id=None' in record.message for record in caplog.records), (
+            "Drop log must not report the finding's null top-level task_id; got: "
+            f'{[r.message for r in caplog.records]}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task-1654 step-1 — RED: compute_content_fingerprint_signature tests

@@ -1983,6 +1983,15 @@ async def filter_false_absence_flags(
         Returns the raw get_task result on success, or a normalised
         ``{'error': ..., 'error_type': ...}`` dict on any exception so that
         ``confirm_task_absent`` can classify both paths identically.
+
+        NOTE: this is structurally the same helper as
+        ``filter_false_phantom_task_creation_flags._safe_get_task``
+        (exception -> ``{'error', 'error_type'}`` normalisation). Keep the
+        two in sync if the normalised-exception shape ever changes — they
+        exist as separate closures (rather than one shared helper) only
+        because each closes over a different fixed positional argument
+        (the single ``project_root`` here vs. a per-call ``project_root``
+        there).
         """
         try:
             return await taskmaster.get_task(task_id, project_root)
@@ -2115,6 +2124,53 @@ def confirm_task_present(get_task_result: object) -> bool:
     return any(key in get_task_result for key in _TASK_IDENTITY_KEYS)
 
 
+def _cited_task_corroborated(cited: dict[str, Any], get_task_result: object) -> bool:
+    """True iff *get_task_result* positively corroborates the *cited* candidate.
+
+    ``confirm_task_present`` alone only proves that SOME task exists at the
+    looked-up id — it says nothing about WHICH task.  Task ids are per-project
+    sequential integers, so a cross-project ``get_task(task_id, root)`` lookup
+    routinely lands on an unrelated task that merely happens to share the
+    cited id in the resolved project (id collision is the norm, not the
+    exception).  Treating any id match as corroboration would silently drop
+    genuine phantom findings whenever a coincidental foreign task happens to
+    occupy the cited id (task-2525 amendment).
+
+    This helper additionally requires the resolved record's ``title`` to
+    match the cited candidate's ``title`` — both normalised via
+    :func:`_normalize_content_description` (casefold + whitespace-collapse)
+    to tolerate incidental case/spacing differences — before treating the
+    lookup as positive corroboration of the SAME task the finding cited.
+
+    Fails safe (returns False = not corroborated) when:
+    - :func:`confirm_task_present` returns False for *get_task_result*.
+    - Either the cited or resolved title is missing, blank, or non-string.
+    - The normalised titles differ.
+
+    Args:
+        cited: One ``cited_tasks`` entry ``{'project_id', 'task_id', 'title'}``
+            from the finding.
+        get_task_result: The raw (or normalised-exception) value returned by
+            ``taskmaster.get_task()`` for ``cited``.
+
+    Returns:
+        True only when the record is positively present AND its title
+        matches the cited candidate's title.
+    """
+    if not confirm_task_present(get_task_result):
+        return False
+    # confirm_task_present already proved get_task_result is a dict.
+    result_title = get_task_result.get('title')  # type: ignore[union-attr]
+    cited_title = cited.get('title')
+    if not isinstance(cited_title, str) or not isinstance(result_title, str):
+        return False
+    normalized_cited = _normalize_content_description(cited_title)
+    normalized_result = _normalize_content_description(result_title)
+    if not normalized_cited or not normalized_result:
+        return False
+    return normalized_cited == normalized_result
+
+
 # --------------------------------------------------------------------------- #
 # Phantom task-creation guard (task-2525)
 # --------------------------------------------------------------------------- #
@@ -2142,12 +2198,17 @@ async def filter_false_phantom_task_creation_flags(
     For each flag whose ``flag_type`` is in :data:`PHANTOM_TASK_CREATION_FLAG_TYPES`,
     resolves every ``cited_tasks`` entry's ``project_id`` to a root via
     ``known_projects`` and calls ``taskmaster.get_task(task_id, root)`` for each
-    resolvable entry, concurrently. DROPS the flag iff :func:`confirm_task_present`
-    returns True for ANY resolved cited task (the "phantom" premise is positively
-    disproven — the task actually exists in a known project). Keeps the flag
-    otherwise: absent, inconclusive, or unresolvable-project citations all fail
-    safe, mirroring :func:`confirm_task_absent`'s fail-safe posture applied in the
-    corroboration direction — never suppress a genuine phantom on uncertain data.
+    resolvable entry, concurrently. DROPS the flag iff :func:`_cited_task_corroborated`
+    returns True for ANY resolved cited task — i.e. the resolved record is
+    positively present AND its title matches the cited candidate's title (the
+    "phantom" premise is positively disproven — the SAME task the finding cited
+    actually exists in a known project). A bare id match with a non-matching (or
+    unavailable) title is NOT corroboration: task ids are per-project sequential
+    integers, so an id match alone is routinely a coincidence with an unrelated
+    task in the resolved project. Keeps the flag otherwise: absent, inconclusive,
+    title-mismatched, or unresolvable-project citations all fail safe, mirroring
+    :func:`confirm_task_absent`'s fail-safe posture applied in the corroboration
+    direction — never suppress a genuine phantom on uncertain data.
 
     A ``cited_tasks`` entry is unresolvable (and therefore skipped, issuing no
     get_task call) when its ``project_id`` is missing from ``known_projects``,
@@ -2160,7 +2221,12 @@ async def filter_false_phantom_task_creation_flags(
     falsy (e.g. stage running without cross-project routing configured).
 
     Structured drop observations are logged via
-    ``logger.info('reconciliation.false_phantom_task_creation_flag_dropped', ...)``.
+    ``logger.info('reconciliation.false_phantom_task_creation_flag_dropped', ...)``,
+    including the specific corroborating ``(project_id, task_id)`` pair — not the
+    finding's top-level ``task_id``, which is always ``None`` for this flag family
+    (the whole point of ``cited_tasks`` is to carry the identity a phantom finding
+    otherwise lacks) — so operators can trace exactly which cross-project task
+    drove each drop.
 
     Args:
         taskmaster: Object with an async ``get_task(task_id, project_root)``
@@ -2181,7 +2247,16 @@ async def filter_false_phantom_task_creation_flags(
 
         Returns the raw get_task result on success, or a normalised
         ``{'error': ..., 'error_type': ...}`` dict on any exception so that
-        ``confirm_task_present`` can classify both paths identically.
+        ``confirm_task_present`` / ``_cited_task_corroborated`` can classify
+        both paths identically.
+
+        NOTE: this is structurally the same helper as
+        ``filter_false_absence_flags._safe_get_task`` (exception ->
+        ``{'error', 'error_type'}`` normalisation). Keep the two in sync if
+        the normalised-exception shape ever changes — they exist as separate
+        closures (rather than one shared helper) only because each closes
+        over a different fixed positional argument (``project_root`` here vs.
+        the absence gate's single ``project_root``).
         """
         try:
             return await taskmaster.get_task(task_id, project_root)
@@ -2192,6 +2267,7 @@ async def filter_false_phantom_task_creation_flags(
     # Multiple cited_tasks entries (possibly across different flags) run
     # concurrently in a single flat asyncio.gather batch.
     lookup_flag_indices: list[int] = []  # flat lookup index -> owning flag index
+    lookup_cited: list[dict[str, Any]] = []  # flat lookup index -> owning cited_tasks entry
     lookup_coros = []
 
     for i, flag in enumerate(flags):
@@ -2211,6 +2287,7 @@ async def filter_false_phantom_task_creation_flags(
             if not root:
                 continue  # unresolvable project -> not corroborated -> skip lookup
             lookup_flag_indices.append(i)
+            lookup_cited.append(cited)
             lookup_coros.append(_safe_get_task(cited_task_id, root))
 
     if not lookup_coros:
@@ -2218,20 +2295,29 @@ async def filter_false_phantom_task_creation_flags(
 
     lookup_results: list[Any] = await asyncio.gather(*lookup_coros)
 
-    corroborated_flag_indices: set[int] = set()
-    for flag_idx, result in zip(lookup_flag_indices, lookup_results, strict=True):
-        if confirm_task_present(result):
-            corroborated_flag_indices.add(flag_idx)
+    # Map each corroborated flag index to the specific (project_id, task_id)
+    # cited-task that corroborated it, for structured drop logging below.
+    # First corroborating cite wins if a finding cites more than one task.
+    corroborating_cite: dict[int, tuple[Any, Any]] = {}
+    for flag_idx, cited, result in zip(
+        lookup_flag_indices, lookup_cited, lookup_results, strict=True
+    ):
+        if flag_idx in corroborating_cite:
+            continue
+        if _cited_task_corroborated(cited, result):
+            corroborating_cite[flag_idx] = (cited.get('project_id'), cited.get('task_id'))
 
     kept: list[dict[str, Any]] = []
     for i, flag in enumerate(flags):
-        if i in corroborated_flag_indices:
+        if i in corroborating_cite:
+            corroborating_project_id, corroborating_task_id = corroborating_cite[i]
             logger.info(
                 'reconciliation.false_phantom_task_creation_flag_dropped '
-                'flag_type=%s task_id=%s',
-                flag.get('flag_type'), flag.get('task_id'),
+                'flag_type=%s corroborating_project_id=%s corroborating_task_id=%s',
+                flag.get('flag_type'), corroborating_project_id, corroborating_task_id,
             )
-            # drop: a cited task is positively present in a known project
+            # drop: a cited task is positively present (id + title match) in a
+            # known project
             continue
         kept.append(flag)
 
