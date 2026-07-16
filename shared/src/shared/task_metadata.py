@@ -283,12 +283,16 @@ class RoutingDecisionMirror(BaseModel):
     decided_at: str | None = None
 
 
+# Bounded history length for RoutingState.with_decision (PRD Open-Q 3).
+_ROUTING_HISTORY_MAX = 5
+
+
 class RoutingState(BaseModel):
     """``metadata.routing`` — the LATEST routing decision + bounded history (PRD γ).
 
     ``latest`` mirrors the most recent per-invocation routing resolution;
-    ``history`` retains a bounded window of the most recent decisions (see
-    ``with_decision``, added alongside this model's registration).
+    ``history`` retains up to :data:`_ROUTING_HISTORY_MAX` of the most
+    recent decisions (oldest dropped first — see :meth:`with_decision`).
     ``routing_tier``/``simple_saturated`` are counter/flag storage stamped
     by later tasks (μ/ν) — this task only provides the typed slice, so
     their defaults (0 / False) are inert until then.
@@ -300,6 +304,47 @@ class RoutingState(BaseModel):
     history: list[RoutingDecisionMirror] = Field(default_factory=list)
     routing_tier: int = 0
     simple_saturated: bool = False
+
+    def with_decision(
+        self,
+        decision: RoutingDecisionMirror,
+        *,
+        history_max: int = _ROUTING_HISTORY_MAX,
+    ) -> RoutingState:
+        """Return a new RoutingState with ``decision`` as latest, appended to history.
+
+        Bounds ``history`` to the newest ``history_max`` entries (oldest
+        dropped first, order preserved). ``routing_tier``, ``simple_saturated``,
+        and any ``extra`` fields are preserved unchanged (``model_copy`` update
+        semantics) — this is a pure, unit-testable transform with no implicit
+        trimming of unrelated state.
+        """
+        return self.model_copy(
+            update={
+                'latest': decision,
+                'history': [*self.history, decision][-history_max:],
+            }
+        )
+
+    @classmethod
+    def from_metadata(cls, metadata: dict | None) -> RoutingState:
+        """Safely reconstruct a :class:`RoutingState` from ``metadata['routing']``.
+
+        Mirrors ``orchestrator.workflow._build_retry_ledger``'s tolerance: a
+        missing/None ``metadata``, a missing/non-dict ``routing`` key, or a
+        dict that fails validation all degrade to a fresh default
+        ``RoutingState()`` rather than raising — routing telemetry must
+        never block or crash a caller.
+        """
+        if not isinstance(metadata, dict):
+            return cls()
+        raw = metadata.get('routing')
+        if not isinstance(raw, dict):
+            return cls()
+        try:
+            return cls(**raw)
+        except (ValidationError, TypeError):
+            return cls()
 
 
 class TaskMetadata(BaseModel):
