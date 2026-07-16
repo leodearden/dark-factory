@@ -360,3 +360,75 @@ class TestRederiveStepStatusLogEntry:
             f'No plan_step_rederive entry should be written when nothing was '
             f're-derived; entries: {entries}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-9 RED: wiring into the real _inter_iteration_rebase path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInterIterationRebaseRederivesStepStatus:
+    async def test_rebase_rederives_pending_step_to_done(
+        self, config, git_ops, task_assignment,
+    ):
+        """A real inter-iteration rebase must re-derive a stale-pending step
+        (already completed per the durable iteration log, with a genuine
+        branch commit) to 'done'."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'impl.py').write_text('implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_plan(artifacts, workflow, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+        ])
+        artifacts.append_iteration_log({
+            'agent': 'implementer', 'steps_completed': ['step-1'], 'commit': step_commit,
+        })
+
+        # Advance main so the rebase actually runs.
+        repo = config.project_root
+        (repo / 'sibling.txt').write_text('sibling fix\n')
+        await _run(['git', 'add', 'sibling.txt'], cwd=repo)
+        await _run(['git', 'commit', '-m', 'sibling fix'], cwd=repo)
+
+        result = await workflow._inter_iteration_rebase()
+
+        assert result is not None, 'Rebase should have happened (main advanced).'
+        plan = artifacts.read_plan()
+        assert plan['steps'][0]['status'] == 'done', (
+            'Expected step-1 re-derived to done by the wired-in re-derivation'
+        )
+
+    async def test_no_rebase_when_main_unchanged_leaves_step_pending(
+        self, config, git_ops, task_assignment,
+    ):
+        """When main has not advanced, _inter_iteration_rebase returns None
+        and the re-derivation path is never reached — step-1 stays pending
+        even though it would be re-derivable in principle."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'impl.py').write_text('implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_plan(artifacts, workflow, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+        ])
+        artifacts.append_iteration_log({
+            'agent': 'implementer', 'steps_completed': ['step-1'], 'commit': step_commit,
+        })
+
+        result = await workflow._inter_iteration_rebase()
+
+        assert result is None
+        plan = artifacts.read_plan()
+        assert plan['steps'][0]['status'] == 'pending'
