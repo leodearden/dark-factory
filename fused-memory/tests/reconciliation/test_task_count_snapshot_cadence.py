@@ -876,6 +876,79 @@ class TestWriteTaskCountSnapshot:
 
 
 # ---------------------------------------------------------------------------
+# _write_task_count_snapshot -- threading the stats dict (task 2646 step-5/6)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteThreadsPruneStats:
+    """_write_task_count_snapshot(..., stats=observed) threads its stats dict
+    straight into _prune_task_count_snapshots, so the prune's runtime-
+    observability counts are populated only when the prune is actually
+    reached (task 2646).
+    """
+
+    def _taskmaster(self):
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {
+            'tasks': [
+                {'id': 1, 'status': 'pending'},
+                {'id': 2, 'status': 'in-progress'},
+                {'id': 3, 'status': 'done'},
+                {'id': 4, 'status': 'cancelled'},
+            ],
+        }
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_success_threads_prune_stats(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {
+                'id': 'stale-1',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'kind': 'task_count_snapshot'},
+            },
+            {
+                'id': 'stale-2',
+                'created_at': '2026-07-02T00:00:00+00:00',
+                'metadata': {'kind': 'task_count_snapshot'},
+            },
+        ]
+        memory_service.delete_memory.return_value = None
+        memory_service.add_memory.return_value = {'memory_ids': ['fresh-1']}
+        taskmaster = self._taskmaster()
+        observed = {}
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+            stats=observed,
+        )
+
+        assert result is True
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 2,
+            'task_count_snapshot_pruned': 2,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_taskmaster_leaves_stats_untouched(self):
+        """The taskmaster-None early-return precedes the prune entirely, so
+        stats must stay untouched (not even zeroed) -- the prune was never
+        attempted."""
+        memory_service = AsyncMock()
+        observed = {}
+
+        result = await _write_task_count_snapshot(
+            memory_service, None, '/tmp/test', 'reify', 'run-1', None,
+            stats=observed,
+        )
+
+        assert result is None
+        assert observed == {}
+
+
+# ---------------------------------------------------------------------------
 # TaskKnowledgeSync.run() wiring — report.stats['task_count_snapshot_written']
 # ---------------------------------------------------------------------------
 
