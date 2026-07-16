@@ -168,3 +168,88 @@ def _row1_golden_diff(
     modb_full.write_text(MODB_SIBLING_TEST_CONTENT)
 
     return mod_a, mod_b, config
+
+
+# ---------------------------------------------------------------------------
+# Row 1: "the hole, closed" — source-only sibling break rejected at the
+# merge gate. Builds the shared row-1 harness (instrumented fake
+# run_verification + the _run_post_merge_verify consumer driver), reused
+# unmodified by rows 4 and 5.
+# ---------------------------------------------------------------------------
+
+# A dedicated, row-scoped main SHA constant (never reused verbatim from
+# test_merge_queue_main_health.MAIN_SHA) so this module's _BASELINE_FAILING_
+# IDS_CACHE / _PROBE_CACHE keys can never collide with that module's under
+# parallel (-n auto --dist loadgroup) execution across separate files.
+ROW1_MAIN_SHA: str = 'r1main0000000000000000000000000000000000'
+
+
+class TestRow1SourceOnlySiblingBreakRejectedAtMergeGate:
+    """Row 1 (PRD boundary-test sketch): a source-only diff under modA that
+    breaks modB's sibling suite must be REJECTED at the merge gate under
+    merge+full breadth — the exact hole verify-scope-asymmetry (confusion-
+    codebook docs/legibility/confusion-codebook.yaml:75, 16 sightings)
+    documents: a scoped merge gate would never even look at modB, landing a
+    red main. See the module docstring's "Golden diff (row 1)" section for
+    why this diff is CONSTRUCTED rather than mined.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.exercise_merge_verify
+    async def test_row1_source_only_sibling_break_rejected_at_merge_gate(
+        self, tmp_path: Path,
+    ) -> None:
+        mod_a, mod_b, config = _row1_golden_diff(tmp_path, breadth='full')
+
+        # -- PRODUCER side: merge+full widens execution to the untouched,
+        # registry-only sibling modB, which is where the golden diff's break
+        # actually lives (mirrors test_verify_scope_lambda's merge+full
+        # expansion golden, but this row goes on to also drive the consumer
+        # side below against the SAME fake failure).
+        producer_fake = _fake_run_verification_by_module(
+            {mod_b.prefix: (False, [MODB_FAILING_TEST_ID])},
+        )
+        with patch.object(verify, 'run_verification', new=producer_fake):
+            producer_result = await run_scoped_verification(
+                tmp_path, config, [mod_a], task_files=[MODA_SOURCE_PATH],
+                role='merge', is_merge_verify=True,
+            )
+        executed = {mc.prefix: mc for mc in _executed_module_configs(producer_fake)}
+        assert set(executed) == {'moda', 'modb'}, (
+            f'expected merge+full to widen execution to the untouched sibling '
+            f'modB; got {set(executed)!r}'
+        )
+        assert executed['modb'].test_command == mod_b.test_command, (
+            f"expected modB to run its verbatim FULL_SUITE test command; "
+            f'got {executed["modb"].test_command!r}'
+        )
+        assert not producer_result.passed, (
+            'the aggregate producer-side result must reflect modB failing'
+        )
+
+        # -- CONSUMER side: drive the REAL merge gate. Main is clean (empty
+        # seeded baseline), so modB's failure is a NEW id, never
+        # MAIN_HEALTH_RED — the branch must be blocked citing it by name.
+        seed_main_baseline(ROW1_MAIN_SHA, frozenset())
+        outcome = await _drive_merge_gate(
+            tmp_path,
+            task_id='row1-9101',
+            module_configs_registry={'moda': mod_a, 'modb': mod_b},
+            touched_module_configs=[mod_a],
+            task_files=[MODA_SOURCE_PATH],
+            main_sha=ROW1_MAIN_SHA,
+            run_verification_fake=_fake_run_verification_by_module(
+                {mod_b.prefix: (False, [MODB_FAILING_TEST_ID])},
+            ),
+        )
+
+        assert outcome is not None, 'expected a blocked MergeOutcome, got the verify-passed sentinel'
+        assert outcome.status == 'blocked', f'expected blocked; got {outcome.status!r}'
+        assert not outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'a NEW sibling-test break (against an empty main baseline) must '
+            f'never route MAIN_HEALTH_RED; got {outcome.reason!r}'
+        )
+        assert MODB_FAILING_TEST_ID in outcome.reason, (
+            f'expected the failing modB test id to be cited in the block '
+            f'reason; got {outcome.reason!r}'
+        )
