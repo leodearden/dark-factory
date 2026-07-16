@@ -414,8 +414,15 @@ _XDIST_WORKER_CRASH_RE = re.compile(
 # retry (task 2496). Kept to a single entry today — the PGID-liveness race in
 # test_verify_merge_cancel_end_to_end — to minimize the accepted fail-safe
 # tradeoff documented on _is_bare_xdist_worker_crash below.
+#
+# Patterns are anchored on the full repo-relative node-id path (not just the
+# bare filename) since pytest is invoked with cwd=config.project_root and the
+# orchestrator verifies multiple projects — a bare ``test_cli.py::...`` match
+# would also discount a same-named test living anywhere else, including in an
+# unrelated project's own test suite. Future entries should follow the same
+# repo-path-anchored convention.
 _KNOWN_LOAD_FLAKE_NODEID_RES: tuple[re.Pattern[str], ...] = (
-    re.compile(r'(?:^|/)test_cli\.py::test_verify_merge_cancel_end_to_end\b'),
+    re.compile(r'(?:^|/)orchestrator/tests/test_cli\.py::test_verify_merge_cancel_end_to_end\b'),
 )
 
 
