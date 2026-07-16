@@ -1027,6 +1027,22 @@ class TaskWorkflow:
         # is the durable source-of-truth dedup for non-consecutive repeats.
         self._last_routed_suggestion_hash: str | None = None
 
+        # Dedup guard for _reconcile_done_step_commits' flag-for-review
+        # branch (task 2386 amendment). That method runs on every
+        # _execute_iterations loop iteration, and an unreconcilable orphaned
+        # done-step commit (content mismatch / unresolvable original / no
+        # WIP run at HEAD) is deliberately left unchanged rather than
+        # guessed — so without this guard the identical condition would
+        # re-fire _escalate_unreconciled_done_step and file a fresh info
+        # Escalation every iteration up to max_execute_iterations, flooding
+        # the queue with duplicates for one underlying anomaly. Keyed by
+        # (step_id, stale_commit) rather than step_id alone so a genuinely
+        # *new* orphaning event (the commit changes again) still escalates.
+        # Never reset — including across _execute_iterations re-entry from
+        # _replan/_amend — so the guard holds for this workflow instance's
+        # whole lifetime.
+        self._unreconciled_done_step_escalations: set[tuple[str, str]] = set()
+
         # One-shot guard for the architect plan-tightening retry.  Set
         # True on first _try_narrow_plan call regardless of outcome so
         # the workflow never loops the narrowing pass on the same task.
@@ -4844,6 +4860,16 @@ class TaskWorkflow:
             if corrupted:
                 self._escalate_corruption(corrupted)
 
+            # Reconcile any done step's commit orphaned by a rebase (this
+            # dispatch's inter-iteration rebase above, or a prior
+            # dispatch's warm-lane/requeue rebase) before the WIP detector
+            # runs — the re-read picks up any reconciled commit_sha so
+            # _detect_tip_wip_commits' own done-step dedup correctly
+            # excludes it instead of re-surfacing it as unattributed
+            # pending work (task 2386).
+            await self._reconcile_done_step_commits()
+            self.plan = self.artifacts.read_plan()
+
             wip_notice = await self._detect_tip_wip_commits()
 
             # Snapshot completed steps before invocation
@@ -5289,6 +5315,170 @@ class TaskWorkflow:
             return None
 
         return verdict
+
+    async def _reconcile_done_step_commits(self) -> None:
+        """Re-point a done step's ``commit`` when a rebase orphaned it.
+
+        ``_inter_iteration_rebase`` (below) squashes uncommitted work into a
+        WIP safety-commit and then rewrites the branch onto a new base; the
+        warm-lane-reclaim / requeue-rebase paths in ``git_ops.py`` do the
+        same. Either can leave an already-``done`` plan step's recorded
+        ``commit`` unreachable from the new HEAD even though its code now
+        lives in the WIP squash commit — and because
+        :meth:`_detect_tip_wip_commits` DEDUPS done-step commits out of its
+        notice, that stale ``commit`` is otherwise invisible to the harness
+        (task 2386).
+
+        For every done step/prerequisite in ``self.plan`` whose recorded
+        ``commit`` is no longer reachable from HEAD
+        (``not is_ancestor(commit, head)``), this locates the contiguous run
+        of WIP safety-commits sitting at HEAD (the same walk-and-stop over
+        ``get_commit_subjects`` + :func:`is_wip_safety_commit` that
+        :meth:`_detect_tip_wip_commits` performs) and matches by filename
+        set the orphaned commit's own changed-file set
+        (:meth:`GitOps.get_commit_changed_files`) against the WIP run's
+        union changed-file set. On a match — the orphaned commit's files are
+        non-empty and a subset of the WIP run's files — the step is
+        re-pointed to the WIP tip sha via
+        ``artifacts.update_step_status(id, 'done', wip_tip_sha)``. On a
+        mismatch, an unresolvable original commit (empty file set — e.g.
+        GC'd), or no WIP run at HEAD at all, the step is left unchanged and
+        :meth:`_escalate_unreconciled_done_step` files a non-blocking info
+        escalation flagging it for review instead — deduped per
+        ``(step_id, stale_commit)`` via
+        ``self._unreconciled_done_step_escalations`` so a still-stuck orphan
+        doesn't re-escalate on every ``_execute_iterations`` loop iteration
+        (see that attribute's docstring in ``__init__``).
+
+        **Heuristic, not a content diff**: the match above is a
+        *filename-set* subset check only — it never compares file contents
+        or blob shas. A WIP commit that happens to touch a superset of the
+        orphaned step's filenames but with unrelated content would still
+        count as a match and get silently re-pointed. This is accepted
+        given the best-effort posture (the fallback on any doubt is an
+        escalation, never silence) — :meth:`GitOps.branch_content_in_main`
+        shows the byte-level ``git diff --quiet`` pattern this could
+        upgrade to if the filename heuristic ever proves too loose in
+        practice.
+
+        Best-effort and defensive, identical posture to
+        :meth:`_detect_tip_wip_commits`: no-ops on any missing collaborator
+        (``worktree``/``git_ops``/``artifacts``), unset ``base_commit``, or
+        git error — a false negative here just reverts to today's baseline
+        (the documented manual `git show <wip-sha>` verification), never
+        sinks the iteration loop.
+
+        Callers should re-read ``self.plan = self.artifacts.read_plan()``
+        immediately after this so a reconciled commit is picked up before
+        ``_detect_tip_wip_commits`` runs (see ``_execute_iterations``) — that
+        ordering lets the detector's own done-step dedup correctly exclude
+        the now-reconciled sha instead of re-surfacing it as unattributed
+        pending work.
+        """
+        if self.worktree is None or self.git_ops is None or self.artifacts is None:
+            return
+        base = self.artifacts.read_base_commit()
+        if not base:
+            return
+        try:
+            head = await self._get_head_commit()
+            commits = await self.git_ops.get_commit_subjects(self.worktree, base)
+            wip_run: list[tuple[str, str]] = []
+            for sha, subject in commits:
+                if not is_wip_safety_commit(subject):
+                    break
+                wip_run.append((sha, subject))
+            wip_tip_sha = wip_run[0][0] if wip_run else None
+            wip_files: set[str] = set()
+            for wip_sha, _subject in wip_run:
+                wip_files.update(await self.git_ops.get_commit_changed_files(wip_sha))
+
+            done_items = [
+                item
+                for col in ('prerequisites', 'steps')
+                for item in self.plan.get(col, [])
+                if isinstance(item, dict) and item.get('status') == 'done' and item.get('commit')
+            ]
+            for item in done_items:
+                commit = item['commit']
+                if await self.git_ops.is_ancestor(commit, head):
+                    continue  # still reachable — nothing to reconcile
+                orphaned_files = await self.git_ops.get_commit_changed_files(commit)
+                if orphaned_files and wip_tip_sha and set(orphaned_files) <= wip_files:
+                    self.artifacts.update_step_status(item['id'], 'done', wip_tip_sha)
+                else:
+                    # Mismatch, unresolvable original (empty file set — e.g.
+                    # GC'd), or no WIP run at HEAD at all: cannot safely
+                    # auto-reconcile. Flag for review and leave the commit
+                    # unchanged rather than guess. Deduped by
+                    # _unreconciled_done_step_escalations so a still-stuck
+                    # orphan doesn't re-file an info escalation on every
+                    # _execute_iterations loop iteration.
+                    escalation_key = (item['id'], commit)
+                    if escalation_key not in self._unreconciled_done_step_escalations:
+                        self._unreconciled_done_step_escalations.add(escalation_key)
+                        self._escalate_unreconciled_done_step(item['id'], commit, wip_tip_sha)
+        except Exception:
+            logger.warning(
+                'Done-step commit reconciliation failed; leaving plan commits unchanged',
+                exc_info=True,
+            )
+
+    def _escalate_unreconciled_done_step(
+        self, step_id: str, stale_commit: str, wip_tip_sha: str | None,
+    ) -> None:
+        """Submit a non-blocking info escalation for a done step whose
+        recorded ``commit`` is orphaned but could not be safely
+        filename-matched against the tip WIP safety-commit run (filename-set
+        mismatch, an unresolvable/GC'd original commit, or no WIP run
+        sitting at HEAD at all).
+
+        Mirrors :meth:`_escalate_corruption`'s posture: informational only
+        (never gates progress), and the step's ``commit`` is deliberately
+        left unchanged so the documented manual `git show <wip-sha>`
+        verification workaround remains available. Guards a missing
+        ``escalation_queue`` with a log-and-continue, same as
+        ``_escalate_corruption``.
+        """
+        if not self.escalation_queue:
+            logger.warning(
+                "Task %s: done step %s's commit %s is orphaned and could not "
+                'be auto-reconciled against a WIP run (no escalation queue)',
+                self.task_id, step_id, stale_commit,
+            )
+            return
+
+        from escalation.models import Escalation
+
+        tip_desc = wip_tip_sha or '<none>'
+        esc = Escalation(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='orchestrator',
+            severity='info',
+            category='infra_issue',
+            summary=(
+                f"Done step {step_id}'s commit {stale_commit[:10]} is orphaned "
+                f'and could not be auto-reconciled against WIP tip {tip_desc}'
+            ),
+            detail=(
+                f'Step {step_id} recorded commit {stale_commit}, which is no '
+                'longer reachable from HEAD (likely rewritten/orphaned by an '
+                "inter-iteration or warm-lane rebase). Its filenames could "
+                f'not be matched against the tip WIP safety-commit run (tip '
+                f'sha {tip_desc}) — either the changed-file sets did not '
+                'match (this is a filename check only, not a byte-content '
+                'diff), the original commit is unresolvable (possibly '
+                'garbage-collected), or no WIP safety-commit run sits at '
+                f'HEAD. Verify manually via `git show {stale_commit}` '
+                "against the WIP commit(s) and re-point the step's commit "
+                'if appropriate.'
+            ),
+            suggested_action='verify_wip_reconciliation',
+            worktree=str(self.worktree) if self.worktree else None,
+            workflow_state=self.state.value,
+        )
+        self.escalation_queue.submit(esc)
 
     async def _detect_tip_wip_commits(self) -> list[dict]:
         """Detect a contiguous run of WIP safety-commits sitting at HEAD.
