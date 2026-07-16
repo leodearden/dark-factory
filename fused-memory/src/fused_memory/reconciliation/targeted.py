@@ -650,12 +650,22 @@ class TargetedReconciler:
     ) -> list[str]:
         """Delete this reconciler's own completion-echo memories for *task_id*.
 
-        Task 2433: reopening a task out of a terminal 'done' status does not
-        clear a prior ``metadata.done_provenance`` (task_interceptor.py:963-967),
-        and the completion echo `_on_task_done` wrote for the earlier
+        Task 2433 (repro: task 2531): a first done-transition's completion
+        echo can cite a WRONG outcome (task 2531's repro was a
+        found_on_main misattribution pointing at a sibling task's commit).
+        Reopening the task out of a terminal 'done' status does not clear
+        the prior ``metadata.done_provenance`` (task_interceptor.py:963-967
+        — ``update_task`` unconditionally rejects any
+        ``metadata.done_provenance`` write, and the reopen path itself only
+        ever *adds* ``reopen_*`` audit fields, never clears provenance), and
+        the completion echo `_on_task_done` wrote for that earlier
         done-transition is never otherwise removed — so it lingers in Mem0
         search citing whatever (possibly stale or wrong) outcome that
         transition captured, even after a later redone echo is written.
+        This complements task 2647's `_fetch_done_provenance`, which already
+        makes the redone echo itself read the live provenance rather than a
+        cached value — that fix alone left the OLD echo behind; this sweep
+        removes it.
 
         Matches ONLY memories whose metadata carries both
         ``source == _ECHO_SOURCE`` and ``transition == 'done'`` — i.e.
@@ -700,11 +710,16 @@ class TargetedReconciler:
         # Task 2433: on reopen-from-done (the PRE-transition status captured
         # in task_before was 'done'), delete the stale completion echo the
         # earlier done-transition wrote (see _delete_stale_completion_echoes
-        # docstring). Gated to genuine reopen-from-done transitions only —
-        # an ordinary pending/in-progress->blocked transition has no prior
+        # docstring — task 2531 repro, complements task 2647's live-refetch
+        # fix). Gated to genuine reopen-from-done transitions only — an
+        # ordinary pending/in-progress->blocked transition has no prior
         # completion echo to clean up, so it skips the extra Mem0 scroll
-        # entirely. Isolated in its own try/except so a Mem0 hiccup here
-        # never breaks hint attachment below.
+        # entirely. This sweep runs ONLY here (and via _on_task_deferred,
+        # which delegates to this handler) — i.e. only on the reopen-side
+        # 'blocked'/'deferred' transitions, NEVER on the 'done' transition
+        # itself — so a freshly-written redone completion echo is never at
+        # risk of sweeping itself. Isolated in its own try/except so a Mem0
+        # hiccup here never breaks hint attachment below.
         if task.get('status') == 'done':
             try:
                 deleted_ids = await self._delete_stale_completion_echoes(task_id, scope, run_id)
