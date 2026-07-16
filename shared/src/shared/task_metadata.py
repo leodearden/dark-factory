@@ -152,12 +152,14 @@ class DoneProvenance(BaseModel):
         'deterministic-deploy-scheduled',
         'deterministic-gate',
         'deterministic-milestone',
+        'operational-verified',
     ]
     commit: str | None = None
     note: str | None = None
     pid: int | None = None
     unit: str | None = None
     active_enter_timestamp: str | None = None
+    escalation_id: str | None = None
 
     @model_validator(mode='after')
     def _check_conditional_requirements(self) -> DoneProvenance:
@@ -165,6 +167,15 @@ class DoneProvenance(BaseModel):
             raise ValueError(f'DoneProvenance: commit is required when kind={self.kind!r}.')
         if self.kind == 'found_on_main' and self.note is None:
             raise ValueError("DoneProvenance: note is required when kind='found_on_main'.")
+        if self.kind == 'operational-verified':
+            if self.escalation_id is None:
+                raise ValueError(
+                    "DoneProvenance: escalation_id is required when kind='operational-verified'."
+                )
+            if self.note is None:
+                raise ValueError(
+                    "DoneProvenance: note is required when kind='operational-verified'."
+                )
         return self
 
 
