@@ -199,5 +199,65 @@ def plan_corrections(report: dict[str, Any]) -> list[Correction]:
     return corrections
 
 
-# NOTE: apply_corrections (steps 3-12) and the CLI entry point (main/_run,
-# step 14) land in later commits of this same task's step sequence.
+# ---------------------------------------------------------------------------
+# Apply layer
+# ---------------------------------------------------------------------------
+
+async def apply_corrections(
+    backend: Any,
+    project_root: str,
+    corrections: list[Correction],
+    *,
+    apply: bool,
+    tag: str | None = None,
+) -> dict[str, Any]:
+    """Apply (or dry-run report) every planned *corrections* against *backend*.
+
+    ``apply=False`` (the default, safe posture) performs ZERO backend
+    calls — every reopen/annotate is purely reported under ``planned`` so a
+    dry run can never mutate anything, mirroring every other
+    ``fused-memory/scripts/`` remediation tool's dry-run contract.
+
+    ``apply=True`` executes each correction with per-op isolation (added in
+    later steps of this module's build-out) so one failure never aborts the
+    batch.
+
+    Returns a summary dict:
+      - ``dry_run``: ``not apply``, echoed back.
+      - ``planned``: ``[{'task_id', 'action', 'label'}, ...]`` — the full
+        intended-action list, always populated (dry-run or apply alike).
+      - ``reopened`` / ``annotated`` / ``errors``: running counters — all 0
+        in dry-run, since nothing was actually attempted.
+      - ``reopen_failed``: task ids whose reopen request did not persist
+        (the task-1175-class silent-write-failure regression guard) —
+        empty in dry-run.
+      - ``needs_human_review``: task ids of every ``annotate`` correction,
+        computed straight from the input plan — independent of
+        apply/dry-run or of whether the write itself later succeeds.
+    """
+    planned = [
+        {'task_id': c.task_id, 'action': c.action, 'label': c.label}
+        for c in corrections
+    ]
+    needs_human_review = [c.task_id for c in corrections if c.action == ACTION_ANNOTATE]
+
+    summary: dict[str, Any] = {
+        'dry_run': not apply,
+        'planned': planned,
+        'reopened': 0,
+        'annotated': 0,
+        'errors': 0,
+        'reopen_failed': [],
+        'needs_human_review': needs_human_review,
+    }
+
+    if not apply:
+        return summary
+
+    # Execution (reopen/annotate branches, per-op isolation) lands in later
+    # steps of this task's step sequence.
+    return summary
+
+
+# NOTE: the CLI entry point (main/_run, step 14) lands in a later commit of
+# this same task's step sequence.
