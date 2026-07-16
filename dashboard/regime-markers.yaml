@@ -1,0 +1,22 @@
+# Regime markers for the escalation-analytics dashboard (Seam 2,
+# plans/escalation-lifecycle-dashboard-prd.md).
+#
+# Hand-curated: add an entry whenever a behaviour-reshaping change lands so
+# the analytics charts can render a vertical annotation marking the
+# before/after boundary. Each entry is a mapping with:
+#   date:  YYYY-MM-DD (the change's landing date)
+#   label: short human-readable description
+#   tasks: list of task ids that implemented the change
+#
+# Loaded by dashboard.data.escalation_analytics.load_regime_markers(), which
+# fails soft (never raises) on a missing or malformed file.
+
+- date: 2026-07-15
+  label: "Starvation threshold raised to 72h"
+  tasks: [2631]
+- date: 2026-07-15
+  label: "Auto-watcher benign closes"
+  tasks: [2630]
+- date: 2026-07-15
+  label: "Verify-scope flip"
+  tasks: [2593]
