@@ -5290,6 +5290,86 @@ class TaskWorkflow:
 
         return verdict
 
+    async def _reconcile_done_step_commits(self) -> None:
+        """Re-point a done step's ``commit`` when a rebase orphaned it.
+
+        ``_inter_iteration_rebase`` (below) squashes uncommitted work into a
+        WIP safety-commit and then rewrites the branch onto a new base; the
+        warm-lane-reclaim / requeue-rebase paths in ``git_ops.py`` do the
+        same. Either can leave an already-``done`` plan step's recorded
+        ``commit`` unreachable from the new HEAD even though its code now
+        lives in the WIP squash commit — and because
+        :meth:`_detect_tip_wip_commits` DEDUPS done-step commits out of its
+        notice, that stale ``commit`` is otherwise invisible to the harness
+        (task 2386).
+
+        For every done step/prerequisite in ``self.plan`` whose recorded
+        ``commit`` is no longer reachable from HEAD
+        (``not is_ancestor(commit, head)``), this locates the contiguous run
+        of WIP safety-commits sitting at HEAD (the same walk-and-stop over
+        ``get_commit_subjects`` + :func:`is_wip_safety_commit` that
+        :meth:`_detect_tip_wip_commits` performs) and content-matches the
+        orphaned commit's own changed-file set
+        (:meth:`GitOps.get_commit_changed_files`) against the WIP run's
+        union changed-file set. On a match — the orphaned commit's files are
+        non-empty and a subset of the WIP run's files — the step is
+        re-pointed to the WIP tip sha via
+        ``artifacts.update_step_status(id, 'done', wip_tip_sha)``. On a
+        mismatch, an unresolvable original commit (empty file set — e.g.
+        GC'd), or no WIP run at HEAD at all, the step is left unchanged
+        (flagging it for review is layered on separately).
+
+        Best-effort and defensive, identical posture to
+        :meth:`_detect_tip_wip_commits`: no-ops on any missing collaborator
+        (``worktree``/``git_ops``/``artifacts``), unset ``base_commit``, or
+        git error — a false negative here just reverts to today's baseline
+        (the documented manual `git show <wip-sha>` verification), never
+        sinks the iteration loop.
+
+        Callers should re-read ``self.plan = self.artifacts.read_plan()``
+        immediately after this so a reconciled commit is picked up before
+        ``_detect_tip_wip_commits`` runs (see ``_execute_iterations``) — that
+        ordering lets the detector's own done-step dedup correctly exclude
+        the now-reconciled sha instead of re-surfacing it as unattributed
+        pending work.
+        """
+        if self.worktree is None or self.git_ops is None or self.artifacts is None:
+            return
+        base = self.artifacts.read_base_commit()
+        if not base:
+            return
+        try:
+            head = await self._get_head_commit()
+            commits = await self.git_ops.get_commit_subjects(self.worktree, base)
+            wip_run: list[tuple[str, str]] = []
+            for sha, subject in commits:
+                if not is_wip_safety_commit(subject):
+                    break
+                wip_run.append((sha, subject))
+            wip_tip_sha = wip_run[0][0] if wip_run else None
+            wip_files: set[str] = set()
+            for wip_sha, _subject in wip_run:
+                wip_files.update(await self.git_ops.get_commit_changed_files(wip_sha))
+
+            done_items = [
+                item
+                for col in ('prerequisites', 'steps')
+                for item in self.plan.get(col, [])
+                if isinstance(item, dict) and item.get('status') == 'done' and item.get('commit')
+            ]
+            for item in done_items:
+                commit = item['commit']
+                if await self.git_ops.is_ancestor(commit, head):
+                    continue  # still reachable — nothing to reconcile
+                orphaned_files = await self.git_ops.get_commit_changed_files(commit)
+                if orphaned_files and wip_tip_sha and set(orphaned_files) <= wip_files:
+                    self.artifacts.update_step_status(item['id'], 'done', wip_tip_sha)
+        except Exception:
+            logger.warning(
+                'Done-step commit reconciliation failed; leaving plan commits unchanged',
+                exc_info=True,
+            )
+
     async def _detect_tip_wip_commits(self) -> list[dict]:
         """Detect a contiguous run of WIP safety-commits sitting at HEAD.
 

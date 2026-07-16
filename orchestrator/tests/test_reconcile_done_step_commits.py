@@ -49,6 +49,13 @@ async def _init_repo(repo: Path) -> None:
     await _run(['git', 'init', '-b', 'main'], cwd=repo)
     await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
     await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    # Mirror this repo's root .gitignore `.task/` entry (see
+    # GitOps.commit's / GitOps.has_uncommitted_work's docstrings): without
+    # this, `git add -A` in git_ops.commit() would stage .task/metadata.json
+    # into the test's real commits, and the reconcile tests' `git reset
+    # --hard <base>` (simulating a rebase orphaning a commit) would then
+    # wipe .task/ along with it — silently breaking read_base_commit().
+    (repo / '.gitignore').write_text('.task/\n')
     (repo / 'lib.py').write_text('x = 1\n')
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'Initial'], cwd=repo)
@@ -100,7 +107,9 @@ class TestGetCommitChangedFiles:
 
         result = await git_ops.get_commit_changed_files(root_sha)
 
-        assert result == ['lib.py']
+        # The root commit ("Initial") introduces both the fixture's
+        # .gitignore and lib.py — see _init_repo.
+        assert sorted(result) == ['.gitignore', 'lib.py']
 
     async def test_nonexistent_sha_returns_empty_list(self, git_repo, git_ops):
         """A garbage/nonexistent SHA returns [] defensively, never raises."""
