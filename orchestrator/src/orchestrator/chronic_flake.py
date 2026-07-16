@@ -37,9 +37,11 @@ wrap it in a second try/except as belt-and-suspenders.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -104,3 +106,89 @@ def parse_chronic_flaky_markers(output: str) -> list[ChronicFlakeMarker]:
         if marker is not None:
             markers.append(marker)
     return markers
+
+
+# ---------------------------------------------------------------------------
+# Flaky ledger read + chronic-test computation (step-5/step-6)
+# ---------------------------------------------------------------------------
+
+
+def read_flaky_ledger(path: str | Path) -> list[dict]:
+    """Best-effort read of reify's ``flaky-ledger.jsonl`` (task 5142):
+    one ``{ts, test, role, flaky_count_window}`` JSON object per line.
+
+    Tolerant by design — this is evidence-gathering for a non-blocking
+    filing decision, never a correctness-critical parse: blank lines,
+    malformed JSON, and well-formed-but-non-dict rows are logged and
+    skipped rather than raising. A missing ledger file (reify:5142 not yet
+    landed, or no flakes recorded yet) returns ``[]``.
+    """
+    ledger_path = Path(path)
+    if not ledger_path.exists():
+        return []
+    entries: list[dict] = []
+    for line in ledger_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            logger.warning('Skipping malformed flaky-ledger line: %s', line[:120])
+            continue
+        if not isinstance(row, dict):
+            logger.warning('Skipping non-dict flaky-ledger line: %s', line[:120])
+            continue
+        entries.append(row)
+    return entries
+
+
+@dataclass
+class ChronicFlakeEvidence:
+    """Evidence bundle for a test computed as chronic from the last
+    ``window`` flaky-ledger entries — feeds
+    :func:`build_chronic_flake_fix_task_arguments`'s description."""
+
+    test: str
+    count: int
+    window: int
+    dates: list[str]
+    roles: list[str]
+    entries: list[dict]
+
+
+def compute_chronic_flakes(
+    entries: list[dict], threshold: int, window: int
+) -> list[ChronicFlakeEvidence]:
+    """Group the last *window* ledger *entries* by ``test`` and flag every
+    test occurring ``>= threshold`` times as chronic.
+
+    Entries are assumed chronologically ordered (oldest first, as appended
+    by reify's ``run_all.sh``), so "the last `window` entries" is a plain
+    tail slice. Sub-threshold tests are excluded. Returns ``[]`` for empty
+    *entries* or when nothing meets *threshold*.
+    """
+    if not entries:
+        return []
+    considered = entries[-window:] if window > 0 else []
+    by_test: dict[str, list[dict]] = {}
+    for entry in considered:
+        if not isinstance(entry, dict):
+            continue
+        test = entry.get('test')
+        if not test:
+            continue
+        by_test.setdefault(test, []).append(entry)
+    evidence = []
+    for test, matches in by_test.items():
+        count = len(matches)
+        if count < threshold:
+            continue
+        dates = [str(match.get('ts', '')) for match in matches]
+        roles = sorted({str(match['role']) for match in matches if match.get('role')})
+        evidence.append(
+            ChronicFlakeEvidence(
+                test=test, count=count, window=window, dates=dates, roles=roles, entries=matches
+            )
+        )
+    return evidence
