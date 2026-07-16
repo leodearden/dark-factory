@@ -34,6 +34,10 @@ from fused_memory.middleware.lock_charter_guard import (
     lock_charter_error,
 )
 from fused_memory.middleware.model_overrides_guard import model_overrides_error
+from fused_memory.middleware.operational_suggestion_guard import (
+    operational_suggestion_finding,
+    operational_suggestion_warning,
+)
 from fused_memory.middleware.premise_lint_guard import premise_lint_error
 from fused_memory.middleware.routing_intent_guard import (
     routing_intent_enforced,
@@ -3408,6 +3412,20 @@ def create_mcp_server(
                 return routing_intent_reject(_routing_finding)
             _routing_warning = routing_intent_warning(_routing_finding)
 
+        # Operational-suggestion guard (task 2679, part 2) — WARN-ONLY, no
+        # enforce/reject path: a task_kind='normal' submission whose text
+        # carries IMPLICIT operational phrasing (restart/redeploy/reload/
+        # confirm/deploy/systemctl) with no code deliverable is flagged with
+        # a non-blocking suggestion. Never coerces task_kind or
+        # execution_class — see operational_suggestion_guard.py's module
+        # docstring.
+        _op_finding = operational_suggestion_finding(
+            title, description, details, task_kind=task_kind, metadata=metadata,
+        )
+        _op_warning: dict[str, Any] | None = None
+        if _op_finding is not None:
+            _op_warning = operational_suggestion_warning(_op_finding)
+
         result = await task_interceptor.submit_task(
             project_root=project_root,
             prompt=prompt,
@@ -3424,6 +3442,15 @@ def create_mcp_server(
         )
         if _routing_warning is not None and isinstance(result, dict):
             result.update(_routing_warning)
+        # Only attach the advisory when the submission actually succeeded —
+        # a rejected/errored result (top-level 'error') should not also
+        # carry a suggestion that applies to an accepted task (task 2679
+        # amendment pass, reviewer_comprehensive robustness finding).
+        # Mirrors this file's existing "act only on success" convention
+        # (see get_tasks above: `isinstance(result, dict) and 'error' not
+        # in result`).
+        if _op_warning is not None and isinstance(result, dict) and 'error' not in result:
+            result.update(_op_warning)
         return result
 
     @mcp.tool()

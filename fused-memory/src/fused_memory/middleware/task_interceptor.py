@@ -890,6 +890,7 @@ class TaskInterceptor:
                         done_provenance,
                         project_root,
                         tag,
+                        is_recon_stage=is_recon_stage_write,
                     )
                 return {'success': True, 'no_op': True, 'task_id': task_id}
 
@@ -990,6 +991,7 @@ class TaskInterceptor:
                     done_provenance,
                     project_root,
                     require=self._require_done_provenance(),
+                    is_recon_stage=is_recon_stage_write,
                 )
                 if validation_err is not None:
                     return validation_err
@@ -4336,22 +4338,26 @@ async def _validate_done_provenance(
     project_root: str,
     *,
     require: bool,
+    is_recon_stage: bool = False,
 ) -> tuple[dict | None, dict | None]:
     """Validate + resolve done_provenance for set_task_status(done).
 
     Schema:
         {
             "kind": "merged" | "found_on_main" | "deterministic-deploy"
-                    | "deterministic-deploy-scheduled",       # required
+                    | "deterministic-deploy-scheduled" | "operational-verified",
+                                                 # required
             "commit": <sha-or-ref>,              # required for "merged"/"found_on_main"
-            "note":   <free text>,               # required if kind="found_on_main";
-                                                 # optional for "deterministic-deploy"
-                                                 # and "deterministic-deploy-scheduled"
+            "note":   <free text>,               # required if kind="found_on_main" or
+                                                 # kind="operational-verified"; optional
+                                                 # for "deterministic-deploy" and
+                                                 # "deterministic-deploy-scheduled"
             "pid":    <int>,                     # deterministic-deploy: new MainPID
             "unit":   <str>,                     # deterministic-deploy(-scheduled): target unit name
             "active_enter_timestamp": <str>,     # deterministic-deploy: new AET string
             "transient_unit": <str>,             # deterministic-deploy-scheduled: scheduled restart unit
             "fire_delay_secs": <int>,            # deterministic-deploy-scheduled: --on-active delay
+            "escalation_id": <str>,              # required for "operational-verified"
         }
 
     - ``kind="merged"``: the work landed on main via a merge commit. ``commit``
@@ -4380,6 +4386,16 @@ async def _validate_done_provenance(
       ``transient_unit`` (str) is the scheduled restart unit's name, and
       ``fire_delay_secs`` (int) is its ``--on-active`` delay; ``note`` may
       carry a human-readable annotation (e.g. the crash-resume path).
+    - ``kind="operational-verified"``: the task was a no-code operational ask
+      (e.g. a restart/redeploy/confirm) closed out via a resolved escalation
+      rather than a code merge or a DeterministicRunner action. No ``commit``
+      is required or expected — commitless, like the ``deterministic-*``
+      kinds, and therefore exempt from the alpha reopen-freshness gate.
+      ``escalation_id`` (str) — the resolving escalation id, recorded
+      VERBATIM for Stage-2 audit with no live cross-service lookup — and
+      ``note`` are both required. Accepted only from non-recon-stage callers
+      (``is_recon_stage=True`` is rejected): a recon stage must not
+      self-authorize an operational close.
 
     Returns ``(error_payload, resolved_provenance)``. Error payload is a
     structured dict suitable for returning to the MCP caller; when it is
@@ -4393,6 +4409,11 @@ async def _validate_done_provenance(
     (wrong type, unknown kind, unresolvable commit, branch-only SHA) always
     errors regardless of ``require`` — we never want to record corrupt
     provenance on the task.
+
+    ``is_recon_stage`` mirrors ``_apply_status_transition``'s
+    ``is_recon_stage_write`` classification (``agent_id.startswith(
+    'recon-stage-')``); it is currently consulted only by the
+    ``kind="operational-verified"`` branch above.
     """
     if raw is None or raw == {}:
         if require:
@@ -4419,6 +4440,7 @@ async def _validate_done_provenance(
     kind = raw.get('kind')
     commit_input = raw.get('commit')
     note = raw.get('note')
+    escalation_id = raw.get('escalation_id')
 
     if kind is not None and not isinstance(kind, str):
         return _done_provenance_error(task_id, 'kind must be a string'), None
@@ -4426,10 +4448,13 @@ async def _validate_done_provenance(
         return _done_provenance_error(task_id, 'commit must be a string'), None
     if note is not None and not isinstance(note, str):
         return _done_provenance_error(task_id, 'note must be a string'), None
+    if escalation_id is not None and not isinstance(escalation_id, str):
+        return _done_provenance_error(task_id, 'escalation_id must be a string'), None
 
     kind = (kind or '').strip() or None
     commit_input = (commit_input or '').strip() or None
     note = (note or '').strip() or None
+    escalation_id = (escalation_id or '').strip() or None
 
     if kind is None:
         return _done_provenance_error(
@@ -4475,6 +4500,26 @@ async def _validate_done_provenance(
             'done_provenance with kind="found_on_main" requires note=<text> '
             'citing the impl-providing task or commit.',
         ), None
+    if kind == 'operational-verified':
+        if is_recon_stage:
+            return _done_provenance_error(
+                task_id,
+                'done_provenance with kind="operational-verified" cannot be '
+                'recorded by a recon-stage caller — a recon stage may not '
+                'self-authorize an operational close.',
+            ), None
+        if escalation_id is None:
+            return _done_provenance_error(
+                task_id,
+                'done_provenance with kind="operational-verified" requires '
+                'escalation_id=<resolving escalation id>.',
+            ), None
+        if note is None:
+            return _done_provenance_error(
+                task_id,
+                'done_provenance with kind="operational-verified" requires '
+                'note=<text> describing the operational action taken.',
+            ), None
 
     resolved: dict = {'kind': kind}
     if commit_input is not None:
@@ -4500,6 +4545,8 @@ async def _validate_done_provenance(
             ), None
     if note is not None:
         resolved['note'] = note
+    if kind == 'operational-verified':
+        resolved['escalation_id'] = escalation_id
 
     if kind in ('deterministic-deploy', 'deterministic-deploy-scheduled'):
         # Preserve the evidence captured by DeterministicRunner after a
@@ -4947,6 +4994,8 @@ async def _repair_done_provenance_same_status(
     done_provenance: dict,
     project_root: str,
     tag: str | None,
+    *,
+    is_recon_stage: bool = False,
 ) -> dict:
     """Sanctioned done->done repair path for a legacy ``done_provenance`` blob.
 
@@ -4972,12 +5021,18 @@ async def _repair_done_provenance_same_status(
     to be non-empty (``_apply_status_transition``'s same-status guard checks
     this); a caller with no supplied provenance should use the plain no-op
     instead.
+
+    ``is_recon_stage`` forwards the caller's recon-stage classification into
+    :func:`_validate_done_provenance` so a recon-stage caller cannot use this
+    sanctioned repair seam to record ``kind="operational-verified"`` either
+    (closing the loophole a fresh-transition-only rejection would leave open).
     """
     validation_err, resolved = await _validate_done_provenance(
         task_id,
         done_provenance,
         project_root,
         require=False,
+        is_recon_stage=is_recon_stage,
     )
     if validation_err is not None:
         return validation_err
