@@ -561,6 +561,30 @@ def apply_pytest_numprocesses(cmd: VerifyCmd, n: str) -> VerifyCmd:
     return replace(cmd, base_flags=(*cmd.base_flags, '-n', n))
 
 
+def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
+    """Return *cmd* with a ``--junitxml <junit_path>`` flag appended to ``base_flags``.
+
+    Task μ (verify-scope-inversion-prd.md): structured field edit, never a
+    regex, mirroring ``apply_pytest_numprocesses``'s structured branch. A
+    no-op (returns *cmd* unchanged) unless ``cmd.tool is ToolKind.PYTEST and
+    cmd.raw is None`` — covers OPAQUE and every other tool (P1), and,
+    deliberately UNLIKE ``apply_pytest_numprocesses``/``serial_pytest``, also
+    covers a raw-retained pytest chain (``cmd.raw is not None``): there is no
+    regex-rewrite branch here, so a recognised-but-unstructurable
+    ``&&``-chained pytest command is left byte-identical rather than
+    rewritten. Callers degrade gracefully (no junit collected for that run —
+    B3) rather than risk a mis-scoped injection into an unstructured shell
+    string.
+
+    *junit_path* should be an absolute path: the rendered command may run
+    with a shifted cwd (a structured command's own ``cd <cwd_rel> &&``), so a
+    relative ``--junitxml`` value would land in the wrong directory.
+    """
+    if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None:
+        return cmd
+    return replace(cmd, base_flags=(*cmd.base_flags, '--junitxml', junit_path))
+
+
 def govern_cpu(cmd: VerifyCmd, exec_path: str | None) -> VerifyCmd:
     """Return *cmd* with a cpu-governed-exec wrapper appended to ``wrappers``.
 

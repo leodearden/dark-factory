@@ -3,7 +3,9 @@
 import asyncio
 import contextlib
 import logging
+from dataclasses import asdict
 from pathlib import Path
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -1821,6 +1823,291 @@ class TestApplyCargoScopeRoutesThroughVerifyCmd:
         )
 
 
+class TestExtractFailingTestIdsFromJunit:
+    """``_extract_failing_test_ids_from_junit(path)`` parses a pytest junitxml
+    report into a sorted, de-duplicated list of stable ``classname::name`` ids
+    for failing/errored ``<testcase>``s only (task μ,
+    verify-scope-inversion-prd.md — the STRUCTURED baseline-attribution
+    signal; distinct from the stdout-regex ``_extract_failing_test_ids``
+    above, which stays untouched).  ``None`` signals "no junit collected /
+    unparseable" (B3 degrade); ``[]`` signals "junit collected, zero
+    failing".
+
+    RED today: the helper does not exist yet.
+    """
+
+    _JUNIT_XML = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuites>\n'
+        '<testsuite name="pytest" errors="1" failures="1" skipped="1" tests="4" time="0.123">\n'
+        '<testcase classname="tests.test_sample" name="test_pass" time="0.001" />\n'
+        '<testcase classname="tests.test_sample" name="test_fail" time="0.002">\n'
+        '<failure message="assert False">AssertionError: assert False</failure>\n'
+        '</testcase>\n'
+        '<testcase classname="tests.test_sample" name="test_error" time="0.001">\n'
+        '<error message="fixture broke">Exception: boom</error>\n'
+        '</testcase>\n'
+        '<testcase classname="tests.test_sample" name="test_skip" time="0.0">\n'
+        '<skipped message="skip reason" type="pytest.skip" />\n'
+        '</testcase>\n'
+        '</testsuite>\n'
+        '</testsuites>\n'
+    )
+
+    def test_returns_sorted_deduped_ids_for_failures_and_errors_only(self, tmp_path: Path):
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(self._JUNIT_XML)
+
+        ids = verify._extract_failing_test_ids_from_junit(junit_path)
+
+        assert ids == ['tests.test_sample::test_error', 'tests.test_sample::test_fail'], (
+            f'expected only the failing+errored cases, sorted+deduped; got {ids!r}'
+        )
+
+    def test_all_passing_junit_returns_empty_list(self, tmp_path: Path):
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest" tests="1">'
+            '<testcase classname="tests.test_sample" name="test_pass" time="0.001" />'
+            '</testsuite></testsuites>\n'
+        )
+
+        assert verify._extract_failing_test_ids_from_junit(junit_path) == [], (
+            'an all-passing junit report must return [] (collected, zero failing), not None'
+        )
+
+    def test_nonexistent_path_returns_none(self, tmp_path: Path):
+        assert verify._extract_failing_test_ids_from_junit(tmp_path / 'missing.xml') is None, (
+            'a nonexistent junit path must degrade to None, never raise'
+        )
+
+    def test_malformed_xml_returns_none(self, tmp_path: Path):
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text('not valid xml <<<')
+
+        assert verify._extract_failing_test_ids_from_junit(junit_path) is None, (
+            'unparseable xml must degrade to None (B3), never raise'
+        )
+
+    def test_empty_file_returns_none(self, tmp_path: Path):
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text('')
+
+        assert verify._extract_failing_test_ids_from_junit(junit_path) is None
+
+    def test_duplicate_ids_across_testsuites_are_deduplicated(self, tmp_path: Path):
+        """Two <testsuite> blocks sharing the same failing id collapse to one entry."""
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites>'
+            '<testsuite name="pytest"><testcase classname="tests.test_sample" name="test_fail">'
+            '<failure message="x">boom</failure></testcase></testsuite>'
+            '<testsuite name="pytest-rerun"><testcase classname="tests.test_sample" name="test_fail">'
+            '<failure message="x">boom</failure></testcase></testsuite>'
+            '</testsuites>\n'
+        )
+
+        assert verify._extract_failing_test_ids_from_junit(junit_path) == [
+            'tests.test_sample::test_fail',
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Task μ (verify-scope-inversion-prd.md) step-05: VerifyResult.failing_test_ids
+# — a plain JSON-native `list[str] | None` (mirrors the `contention` (task
+# 2306 α) and `plan` (task 2126 step-13) precedents in test_verify_runner.py's
+# TestVerifyResultContention/TestVerifyResultPlan), so it round-trips
+# losslessly through the generic codec (asdict / VerifyResult(**d)) with no
+# special-casing. None = "no junit collected" (B3 degrade signal); a `[]`
+# means "junit collected, zero failing" (see _extract_failing_test_ids_from_junit
+# above). verify_runner.py's wire codec (result_to_dict/result_to_json) is out
+# of this task's file scope, so this exercises the underlying generic
+# asdict/**d codec directly rather than going through that wrapper.
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyResultFailingTestIds:
+    """VerifyResult carries an optional `failing_test_ids` list that survives
+    the generic asdict/**d codec (RED today: the field does not exist yet).
+    """
+
+    def _make_result(self, **overrides: Any) -> VerifyResult:
+        defaults: dict[str, Any] = dict(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='all good',
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_default_failing_test_ids_is_none(self):
+        vr = self._make_result()
+        assert vr.failing_test_ids is None
+
+    def test_failing_test_ids_round_trips_via_asdict_codec(self):
+        vr = self._make_result(failing_test_ids=['a::b'])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.failing_test_ids == ['a::b']
+        assert restored == vr
+
+    def test_empty_failing_test_ids_is_preserved_not_coerced_to_none(self):
+        vr = self._make_result(failing_test_ids=[])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.failing_test_ids == []
+        assert restored.failing_test_ids is not None
+
+
+# ---------------------------------------------------------------------------
+# Task μ (verify-scope-inversion-prd.md) step-07: run_verification injects
+# --junitxml into the test leg and parses the report into
+# VerifyResult.failing_test_ids — but ONLY for role=='merge',
+# merge_verify_breadth=='full', and a structured (non-OPAQUE, non-raw-chain)
+# pytest test_command. Every other combination leaves failing_test_ids at
+# its None default (B3 degrade): no injection happens, so no junit report
+# is ever written, so parsing (when attempted) finds nothing.
+#
+# RED today: run_verification neither injects nor parses.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunVerificationJunitxmlInjection:
+    """Integration tests for the merge+full junitxml injection/parse wiring."""
+
+    _FAILING_JUNIT_XML = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuites>\n'
+        '<testsuite name="pytest" errors="0" failures="1" tests="1">\n'
+        '<testcase classname="tests.test_sample" name="test_fail" time="0.001">\n'
+        '<failure message="assert False">AssertionError</failure>\n'
+        '</testcase>\n'
+        '</testsuite>\n'
+        '</testsuites>\n'
+    )
+
+    def _make_config(
+        self, tmp_path: Path, *, breadth: Literal['scoped', 'full'] = 'full',
+    ) -> OrchestratorConfig:
+        return OrchestratorConfig(project_root=tmp_path, merge_verify_breadth=breadth)
+
+    def _module_config(self, test_command: str = 'pytest tests/') -> ModuleConfig:
+        return ModuleConfig(
+            prefix='pkg',
+            test_command=test_command,
+            lint_command=None,
+            type_check_command=None,
+        )
+
+    def _fake_run_cmd_writing_junit(self):
+        """Fake _run_cmd: when the (possibly-injected) cmd carries --junitxml,
+        write a one-failure report at the injected path and fail the run —
+        mimicking real pytest's --junitxml-writing behaviour."""
+        captured: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured.append(cmd)
+            if '--junitxml' in cmd:
+                parts = cmd.split()
+                junit_path = Path(parts[parts.index('--junitxml') + 1])
+                junit_path.parent.mkdir(parents=True, exist_ok=True)
+                junit_path.write_text(self._FAILING_JUNIT_XML)
+                return 1, 'FAILED tests/test_sample.py::test_fail', False
+            return 0, 'ok', False
+
+        return fake_run_cmd, captured
+
+    async def test_merge_full_structured_pytest_injects_and_parses_failing_ids(self, tmp_path: Path):
+        config = self._make_config(tmp_path, breadth='full')
+        module_config = self._module_config()
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+            )
+
+        test_cmds = [c for c in captured if 'pytest' in c]
+        assert test_cmds, f'expected a pytest invocation; got {captured}'
+        assert '--junitxml' in test_cmds[0], (
+            f'expected --junitxml injected into merge+full structured pytest cmd; got {test_cmds[0]!r}'
+        )
+        assert result.failing_test_ids == ['tests.test_sample::test_fail'], (
+            f'expected failing_test_ids parsed from the injected junit report; got {result.failing_test_ids!r}'
+        )
+
+    async def test_task_role_does_not_inject_or_collect(self, tmp_path: Path):
+        """role='task' (default) never injects junitxml, even under breadth='full'."""
+        config = self._make_config(tmp_path, breadth='full')
+        module_config = self._module_config()
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='task',
+            )
+
+        assert all('--junitxml' not in c for c in captured), (
+            f'role=task must never inject junitxml; got {captured}'
+        )
+        assert result.failing_test_ids is None
+
+    async def test_scoped_breadth_does_not_inject_or_collect(self, tmp_path: Path):
+        """merge_verify_breadth='scoped' (the default) — merge role but no injection."""
+        config = self._make_config(tmp_path, breadth='scoped')
+        module_config = self._module_config()
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+            )
+
+        assert all('--junitxml' not in c for c in captured), (
+            f'breadth=scoped must never inject junitxml; got {captured}'
+        )
+        assert result.failing_test_ids is None
+
+    async def test_opaque_test_command_degrades_to_none(self, tmp_path: Path):
+        """An OPAQUE (unparseable) test_command under merge+full: no injection, no crash."""
+        config = self._make_config(tmp_path, breadth='full')
+        module_config = self._module_config(test_command='pytest tests/ "unterminated')
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+            )
+
+        assert all('--junitxml' not in c for c in captured), (
+            f'OPAQUE test_command must never be regex-injected; got {captured}'
+        )
+        assert result.failing_test_ids is None
+
+    async def test_non_pytest_structured_command_degrades_to_none(self, tmp_path: Path):
+        """A structured but non-pytest (cargo test) command under merge+full: no junit collected."""
+        config = self._make_config(tmp_path, breadth='full')
+        module_config = self._module_config(test_command='cargo test --workspace')
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+            )
+
+        assert all('--junitxml' not in c for c in captured), (
+            f'non-pytest command must never receive --junitxml; got {captured}'
+        )
+        assert result.failing_test_ids is None
+
+
 class TestExtractCauseHint:
     """Tests for the ``_extract_cause_hint(output: str) -> str`` helper.
 
@@ -2945,6 +3232,72 @@ class TestVerifyResultCategoryAndPaths:
         # cargo_cli_error has higher priority than test_failure
         assert agg.category == 'cargo_cli_error', (
             f'Expected cargo_cli_error (higher priority), got {agg.category!r}'
+        )
+
+    # (f) _aggregate_results unions failing_test_ids across children (task μ,
+    # verify-scope-inversion-prd.md step-09). RED: _aggregate_results drops
+    # the field (defaults None) today.
+    def test_aggregate_results_all_none_failing_test_ids_stays_none(self):
+        """Every child with failing_test_ids=None (the default) aggregates to None."""
+        r1 = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        r2 = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+
+        agg = _aggregate_results([r1, r2])
+
+        assert agg.failing_test_ids is None
+
+    def test_aggregate_results_unions_and_sorts_failing_test_ids(self):
+        """A None/non-empty mix unions the non-None children's ids, sorted+deduped.
+
+        None contributes nothing but does not suppress a sibling's collected
+        ids — the aggregate is non-None once ANY child is non-None.
+        """
+        r_none = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        r_x = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['x::1'],
+        )
+        r_y = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['y::2'],
+        )
+
+        agg = _aggregate_results([r_none, r_x, r_y])
+
+        assert agg.failing_test_ids == ['x::1', 'y::2'], (
+            f'expected the sorted union of non-None children; got {agg.failing_test_ids!r}'
+        )
+
+    def test_aggregate_results_dedupes_failing_test_ids_across_children(self):
+        """The same failing id reported by two children collapses to one entry."""
+        r1 = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['dup::1', 'a::1'],
+        )
+        r2 = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['dup::1', 'b::1'],
+        )
+
+        agg = _aggregate_results([r1, r2])
+
+        assert agg.failing_test_ids == ['a::1', 'b::1', 'dup::1'], (
+            f'expected sorted+deduped union; got {agg.failing_test_ids!r}'
+        )
+
+    def test_aggregate_results_empty_list_child_is_non_none_contribution(self):
+        """A child with failing_test_ids=[] (collected, zero failing) still makes
+        the aggregate non-None — distinct from a child that never collected (None)."""
+        r_empty = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', failing_test_ids=[],
+        )
+        r_none = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+
+        agg = _aggregate_results([r_empty, r_none])
+
+        assert agg.failing_test_ids == [], (
+            f'expected [] (collected, zero failing), not None; got {agg.failing_test_ids!r}'
         )
 
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -63,11 +63,13 @@ def _make_config(
     tmp_path: Path,
     *,
     escalate_preexisting: bool = True,
+    merge_verify_breadth: Literal['scoped', 'full'] = 'scoped',
 ) -> OrchestratorConfig:
     return OrchestratorConfig(
         project_root=tmp_path,
         max_concurrent_tasks=1,
         escalate_preexisting_main_break=escalate_preexisting,
+        merge_verify_breadth=merge_verify_breadth,
         git=GitConfig(
             main_branch='main',
             branch_prefix='task/',
@@ -1018,4 +1020,302 @@ class TestSyncPathAndSentinelPreservation:
         assert spawned == set(), (
             f'[{label}] Expected no main-health probe task to be spawned '
             f'even though handles were provided; got {spawned}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-17 (task μ, verify-scope-inversion-prd.md): _run_post_merge_verify
+# seeds the per-main-SHA failing-test-id baseline for free on the PASS path
+# (B2) — see verify.seed_main_baseline / verify._BASELINE_FAILING_IDS_CACHE.
+# ---------------------------------------------------------------------------
+
+
+class TestPostMergeVerifySeedsBaseline:
+    """A successful merge+full gate run seeds
+    verify._BASELINE_FAILING_IDS_CACHE[merge_sha] for free, so the very next
+    gate's baseline lookup (main_baseline_failing_ids) is a cache hit and
+    never pays for a probe. Seeding must NOT happen when there is no junit-
+    derived id set (scoped/degraded) or no merge_sha to key on."""
+
+    def test_passing_merge_full_verify_seeds_baseline(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        passing_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='all checks passed', failing_test_ids=[],
+        )
+
+        async def _run() -> MergeOutcome | None:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                new=AsyncMock(return_value=passing_result),
+            ):
+                return await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha='abcsha',
+                )
+
+        outcome = asyncio.run(_run())
+        assert outcome is None, f'Expected the verify-passed sentinel (None); got {outcome!r}'
+
+        from orchestrator.verify import _BASELINE_FAILING_IDS_CACHE
+        assert 'abcsha' in _BASELINE_FAILING_IDS_CACHE, (
+            f'Expected the baseline cache to be seeded for merge_sha=abcsha; '
+            f'keys={list(_BASELINE_FAILING_IDS_CACHE)!r}'
+        )
+        _, seeded_ids = _BASELINE_FAILING_IDS_CACHE['abcsha']
+        assert seeded_ids == frozenset(), (
+            f'Expected the seeded ids to be the empty frozenset (all pass); got {seeded_ids!r}'
+        )
+
+    def test_passing_verify_with_no_failing_test_ids_does_not_seed(self, tmp_path: Path) -> None:
+        """A pass under 'scoped' breadth (or any other degrade path) never
+        collects junit ids -- failing_test_ids stays None -- and must NOT
+        seed the baseline: an empty seed there would be WRONG (scoped
+        passing doesn't mean main-at-large is clean, just that the touched
+        subset passed)."""
+        config = _make_config(tmp_path, merge_verify_breadth='scoped')
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        passing_result_no_ids = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='all checks passed', failing_test_ids=None,
+        )
+
+        async def _run() -> MergeOutcome | None:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                new=AsyncMock(return_value=passing_result_no_ids),
+            ):
+                return await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha='scopedsha',
+                )
+
+        outcome = asyncio.run(_run())
+        assert outcome is None
+
+        from orchestrator.verify import _BASELINE_FAILING_IDS_CACHE
+        assert 'scopedsha' not in _BASELINE_FAILING_IDS_CACHE, (
+            f'Must NOT seed when failing_test_ids is None; keys='
+            f'{list(_BASELINE_FAILING_IDS_CACHE)!r}'
+        )
+
+    def test_passing_verify_with_empty_merge_sha_does_not_seed(self, tmp_path: Path) -> None:
+        """merge_sha='' (module-level/train callers that pass no merge_sha)
+        must not attempt to seed -- there is no future main tip to key on."""
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        passing_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='all checks passed', failing_test_ids=[],
+        )
+
+        from orchestrator.verify import _BASELINE_FAILING_IDS_CACHE
+
+        async def _run() -> MergeOutcome | None:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                new=AsyncMock(return_value=passing_result),
+            ):
+                return await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha='',
+                )
+
+        before_keys = set(_BASELINE_FAILING_IDS_CACHE)
+        outcome = asyncio.run(_run())
+        assert outcome is None
+        after_keys = set(_BASELINE_FAILING_IDS_CACHE)
+        assert after_keys == before_keys, (
+            f'Empty merge_sha must not seed anything; before={before_keys!r} '
+            f'after={after_keys!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-19 (task μ, verify-scope-inversion-prd.md): end-to-end baseline
+# attribution over _run_post_merge_verify's BLOCK path (SYNC mode —
+# main_health_probe_handles=None, the default — matches every other test in
+# this file). Row numbering follows the PRD's failing-id-diff truth table.
+# ---------------------------------------------------------------------------
+
+
+class TestBaselineAttributionOverBlockPath:
+    """row 5 (wholly preexisting -> MAIN_HEALTH_RED, no probe on repeat);
+    row 4 (mixed -> branch block citing only the new id); B3 (failing_test_ids
+    is None -> today's category-level reason, no crash)."""
+
+    def test_row5_wholly_preexisting_routes_main_health_red_with_no_probe(
+        self, tmp_path: Path,
+    ) -> None:
+        """baseline={X}, branch fails with only {X} -> MAIN_HEALTH_RED
+        (branch not charged). A second failing merge against the same main
+        SHA must reuse the cache: the probe machinery (ephemeral_worktree)
+        must never be invoked for either merge."""
+        from orchestrator.verify import seed_main_baseline
+
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        git_ops = _make_git_ops(tmp_path)
+
+        probe_calls: list[tuple] = []
+
+        def _track_and_explode(*args, **kwargs):
+            probe_calls.append((args, kwargs))
+            raise AssertionError('probe machinery must not run — baseline cache is warm')
+        git_ops.ephemeral_worktree = MagicMock(side_effect=_track_and_explode)
+
+        seed_main_baseline(MAIN_SHA, frozenset({'X'}))
+
+        branch_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['X'],
+        )
+
+        async def _one_merge(task_id: str) -> MergeOutcome | None:
+            merge_wt = tmp_path / f'merge-wt-{task_id}'
+            merge_wt.mkdir()
+            req = _make_req(task_id, tmp_path / f'task-wt-{task_id}', config)
+            (tmp_path / f'task-wt-{task_id}').mkdir()
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                new=AsyncMock(return_value=branch_result),
+            ):
+                return await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+                )
+
+        outcome1 = asyncio.run(_one_merge('201'))
+        assert outcome1 is not None
+        assert outcome1.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'branch wholly covered by baseline must route MAIN_HEALTH_RED; '
+            f'got {outcome1.reason!r}'
+        )
+
+        # Second failing merge against the SAME (unchanged) main SHA.
+        outcome2 = asyncio.run(_one_merge('202'))
+        assert outcome2 is not None
+        assert outcome2.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'second merge against unchanged main must also route MAIN_HEALTH_RED; '
+            f'got {outcome2.reason!r}'
+        )
+
+        assert probe_calls == [], (
+            f'expected the baseline-probe machinery to never run across both '
+            f'merges (cache pre-seeded); got {len(probe_calls)} call(s): {probe_calls!r}'
+        )
+
+    def test_row4_mixed_failure_cites_only_new_id(self, tmp_path: Path) -> None:
+        """baseline={X}, branch fails with {X,Y} -> the outcome is a branch
+        block whose reason cites only Y (the new id) and NOT X; the
+        wholly-preexisting (MAIN_HEALTH_RED) route must NOT be taken."""
+        from orchestrator.verify import seed_main_baseline
+
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        seed_main_baseline(MAIN_SHA, frozenset({'X'}))
+
+        branch_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['X', 'Y'],
+        )
+
+        async def _run() -> MergeOutcome | None:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                new=AsyncMock(return_value=branch_result),
+            ):
+                return await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+                )
+
+        outcome = asyncio.run(_run())
+        assert outcome is not None
+        assert not outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'mixed failure (one new id) must NOT route MAIN_HEALTH_RED; got {outcome.reason!r}'
+        )
+        assert 'Y' in outcome.reason, f'expected the new id Y to be cited; got {outcome.reason!r}'
+        assert 'X' not in outcome.reason, (
+            f'the preexisting id X must NOT be cited in the branch-block reason; '
+            f'got {outcome.reason!r}'
+        )
+
+    def test_b3_failing_test_ids_none_uses_legacy_reason(self, tmp_path: Path) -> None:
+        """failing_test_ids=None (scoped/degraded/OPAQUE) -> today's
+        category-level reason, unchanged, no crash -- even with a warm
+        baseline cache sitting there for an unrelated sha comparison."""
+        from orchestrator.verify import seed_main_baseline
+
+        config = _make_config(tmp_path, merge_verify_breadth='scoped')
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        # Warm cache present regardless -- must be irrelevant to the B3 path.
+        seed_main_baseline(MAIN_SHA, frozenset({'X'}))
+
+        branch_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='generic task failure', category='test_failure',
+            cause_hint='AssertionError somewhere', failing_test_ids=None,
+        )
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=branch_result),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(return_value=(False, '')),
+                ),
+            ):
+                return await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+                )
+
+        outcome = asyncio.run(_run())
+        assert outcome is not None
+        assert outcome.reason.startswith('Post-merge verification failed: generic task failure'), (
+            f'expected the legacy category-level reason unchanged; got {outcome.reason!r}'
+        )
+        assert '[category: test_failure]' in outcome.reason, (
+            f'expected the category suffix preserved; got {outcome.reason!r}'
         )

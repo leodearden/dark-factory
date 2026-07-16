@@ -12,7 +12,8 @@ import shlex
 import shutil
 import time
 import uuid
-from collections.abc import Callable
+import xml.etree.ElementTree as ET
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,6 +50,7 @@ from orchestrator.verify_cmd import (
     scope_to,
     serial_pytest,
     strip_cwd,
+    with_junitxml,
 )
 
 logger = logging.getLogger(__name__)
@@ -575,6 +577,61 @@ def _extract_failing_test_ids(test_output: str) -> list[str]:
     return ordered
 
 
+def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
+    """Parse a pytest junitxml report at *path* into failing/errored test ids.
+
+    Task μ (verify-scope-inversion-prd.md): the STRUCTURED counterpart to
+    :func:`_extract_failing_test_ids` above (which regexes pytest stdout) —
+    this is the baseline-attribution signal, parsed via stdlib
+    ``xml.etree.ElementTree`` rather than a regex. The SAME parser feeds both
+    the per-main-SHA baseline probe and a branch's merge-gate result, so diff
+    consistency — not exact pytest-node-id fidelity — is what matters (see
+    ``diff_new_failures``/``is_wholly_preexisting``).
+
+    A ``<testcase>`` counts as failing iff it has a ``<failure>`` or
+    ``<error>`` child (a ``<skipped>`` child does not count). Its id is
+    ``f'{classname}::{name}'``; when ``classname`` is absent, falls back to
+    ``f'{file}::{name}'`` (the ``file`` attribute some junit writers emit),
+    then to the bare ``name`` when neither is present. ``<testcase>``
+    elements are found via ``root.iter('testcase')`` so both the modern
+    ``<testsuites><testsuite>...`` wrapping and a bare ``<testsuite>`` root
+    are handled uniformly, and multiple ``<testsuite>`` blocks are all
+    covered.
+
+    Returns:
+        - ``None`` when *path* does not exist, or the file is empty/malformed
+          (``ET.ParseError``) — "no junit collected", the B3 degrade signal
+          callers fall back on.
+        - ``[]`` when the report parses but no testcase is failing/errored
+          ("junit collected, zero failing" — main/branch genuinely clean).
+        - Otherwise a sorted, de-duplicated list of failing/errored ids.
+
+    Never raises: any unexpected parse-time exception is treated the same as
+    ``ET.ParseError`` (fail-soft to ``None``).
+    """
+    try:
+        tree = ET.parse(path)
+    except (OSError, ET.ParseError):
+        return None
+    root = tree.getroot()
+    if root is None:
+        return None
+
+    ids: set[str] = set()
+    for testcase in root.iter('testcase'):
+        if testcase.find('failure') is None and testcase.find('error') is None:
+            continue
+        name = testcase.get('name', '')
+        classname = testcase.get('classname')
+        if classname:
+            test_id = f'{classname}::{name}'
+        else:
+            file_attr = testcase.get('file')
+            test_id = f'{file_attr}::{name}' if file_attr else name
+        ids.add(test_id)
+    return sorted(ids)
+
+
 def _extract_cause_hint(output: str) -> str:
     """Extract a one-line failure hint from command output.
 
@@ -800,6 +857,177 @@ def _failure_anchored_excerpt(output: str, *, cap: int = 3000, window: int = 10)
 # Key: (main_sha, category, normalised_cause_hint); Value: (probe_time, is_preexisting).
 _PROBE_CACHE: dict[tuple[str, str, str], tuple[float, bool]] = {}
 _PROBE_CACHE_TTL: float = 300.0  # 5 minutes; main_sha changes on every hotfix merge
+
+
+# ---------------------------------------------------------------------------
+# Task μ (verify-scope-inversion-prd.md) — per-main-SHA baseline attribution:
+# pure failing-test-id diff helpers.  Both operate on plain iterables of test
+# ids (typically VerifyResult.failing_test_ids) and are entirely side-effect
+# free — no cache, no I/O.  They are the decision core of B1 ("a broad gate
+# blocks a branch only for failing test ids NOT already red on main"); the
+# surrounding cache/probe machinery (_BASELINE_FAILING_IDS_CACHE and friends,
+# added alongside verify_failure_is_preexisting_on_main) feeds them a
+# *baseline* set collected from a real main-tip probe.
+# ---------------------------------------------------------------------------
+
+
+def diff_new_failures(branch: Iterable[str], baseline: Iterable[str]) -> frozenset[str]:
+    """Return the ids present in *branch* but absent from *baseline*.
+
+    Plain set difference (``frozenset(branch) - frozenset(baseline)``), just
+    named/typed for the baseline-attribution call sites.  Pure; no I/O, no
+    caching, no ordering guarantee beyond frozenset's own (callers that need
+    a stable order should ``sorted()`` the result).
+    """
+    return frozenset(branch) - frozenset(baseline)
+
+
+def is_wholly_preexisting(branch: Iterable[str], baseline: Iterable[str]) -> bool:
+    """True iff *branch* is non-empty and every id in it already appears in *baseline*.
+
+    An empty *branch* (no failing ids at all) returns False — "wholly
+    preexisting" is meaningless with nothing to attribute; a passing verify
+    is the caller's concern, not this classifier's.
+    """
+    branch_set = frozenset(branch)
+    if not branch_set:
+        return False
+    return not diff_new_failures(branch_set, baseline)
+
+
+# Process-wide cache for the per-main-SHA failing-test-id BASELINE (task μ,
+# verify-scope-inversion-prd.md, B2): distinct from _PROBE_CACHE above (that
+# one caches a bool — "is THIS specific failure preexisting"; this one caches
+# the FULL SET of ids already failing on a given main tip). Seeded for free
+# on every successful merge+full gate run (merge_queue.py's
+# _run_post_merge_verify pass path — see seed_main_baseline's docstring) so
+# steady-state lookups never pay for a probe; a probe only runs on a genuine
+# cold-start miss. Same TTL discipline as _PROBE_CACHE (mirrors its
+# docstring/shape) so a long-idle orchestrator doesn't pin a stale baseline
+# forever.
+# Key: main_sha; Value: (seeded_or_probed_at, failing_test_ids frozenset).
+_BASELINE_FAILING_IDS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
+
+
+def seed_main_baseline(main_sha: str, ids: Iterable[str]) -> None:
+    """Seed (or refresh) the per-main-SHA failing-id baseline cache for free.
+
+    Called from the PASS path of a merge+full gate run (merge_sha IS the
+    merged tree that is about to CAS-advance to become the next main tip —
+    see merge_queue.py's ``_run_post_merge_verify``), so in steady state
+    ``main_baseline_failing_ids`` below is always a cache hit and never pays
+    for a probe (B2).
+    """
+    _BASELINE_FAILING_IDS_CACHE[main_sha] = (time.monotonic(), frozenset(ids))
+
+
+async def main_baseline_failing_ids(
+    config: 'OrchestratorConfig',
+    module_configs: 'list[ModuleConfig]',
+    git_ops: object,
+    main_sha: str,
+) -> 'frozenset[str] | None':
+    """Return the set of test ids already failing on *main_sha*, cache-first.
+
+    Cache hit (seeded by a prior gate pass, or a prior probe of this same sha
+    within the TTL window): returned immediately — no probe, no worktree.
+
+    Cache miss: runs exactly ONE full-suite, merge-role probe of bare main,
+    reusing the same ``ephemeral_worktree(WorktreeKind.MAIN_PROBE, ...,
+    warm_seed=True)`` + ``run_scoped_verification`` lifecycle
+    :func:`verify_failure_is_preexisting_on_main` uses for its own probe —
+    a leaseless, local-only probe that NEVER routes through
+    :class:`~orchestrator.verify_runner.HostAllocator` or
+    :class:`~orchestrator.verify_runner.RemoteRunner` (see that function's
+    docstring for the full LEASE-SAFETY & HOST-AFFINITY rationale, which
+    applies identically here). The probe passes no ``task_files`` — full
+    suite, no scoping — so its id-set is apples-to-apples with a merge+full
+    branch verify's id-set.
+
+    A probe that doesn't yield a junit-derived id set
+    (``failing_test_ids is None`` — OPAQUE/non-pytest command, or the probe
+    itself errored) returns ``None`` (B3 degrade) and is deliberately **not**
+    cached, so the next caller retries rather than being stuck with a
+    falsely-empty baseline for the whole TTL window.
+
+    Does not alter deferred-probe scheduling/transport (G4, task 2564) — the
+    probe body reused here is exactly the one that function already owns.
+    """
+    from orchestrator.git_ops import EphemeralWorktreeError, WorktreeKind
+
+    if not main_sha:
+        return None
+
+    _now = time.monotonic()
+    _cached = _BASELINE_FAILING_IDS_CACHE.get(main_sha)
+    if _cached is not None:
+        _cached_at, _cached_ids = _cached
+        if _now - _cached_at < _PROBE_CACHE_TTL:
+            logger.debug(
+                'main_baseline_failing_ids: cache hit (main_sha=%.8s, %d id(s))',
+                main_sha, len(_cached_ids),
+            )
+            return _cached_ids
+
+    try:
+        async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
+            WorktreeKind.MAIN_PROBE, main_sha, warm_seed=True,
+        ) as tmp_path:
+            try:
+                probe_result = await run_scoped_verification(
+                    tmp_path, config, module_configs,
+                    task_files=None,
+                    max_retries=0,
+                    role='merge',
+                )
+            except Exception:
+                logger.debug(
+                    'main_baseline_failing_ids: probe verify raised', exc_info=True,
+                )
+                return None
+
+            if probe_result.failing_test_ids is None:
+                # OPAQUE / non-pytest / probe-side failure to collect a junit
+                # report — degrade (B3). Deliberately not cached: a transient
+                # probe hiccup shouldn't pin "no baseline" for the TTL window.
+                logger.debug(
+                    'main_baseline_failing_ids: probe collected no junit ids '
+                    '(main_sha=%.8s) — degrading to None (B3)', main_sha,
+                )
+                return None
+
+            ids = frozenset(probe_result.failing_test_ids)
+            seed_main_baseline(main_sha, ids)
+            return ids
+
+    except EphemeralWorktreeError as e:
+        logger.warning(
+            'main_baseline_failing_ids: %s — baseline probe disabled for this attempt', e,
+        )
+        return None
+    except Exception:
+        logger.debug('main_baseline_failing_ids: unexpected error', exc_info=True)
+        return None
+
+
+def cached_main_baseline_failing_ids(main_sha: str) -> 'frozenset[str] | None':
+    """Cache-ONLY peek at the per-main-SHA failing-id baseline — never probes.
+
+    Pure, synchronous, side-effect-free: returns the cached id set for
+    *main_sha* when present and within :data:`_PROBE_CACHE_TTL`, else
+    ``None``.  Used by the synchronous branch-block reason enrichment in
+    ``merge_queue._run_post_merge_verify`` (task μ, verify-scope-inversion-
+    prd.md), which must NEVER trigger a probe on the critical path (G4, task
+    2564) — unlike :func:`main_baseline_failing_ids` (cache-first, THEN
+    probes on a miss), this helper only ever reads.
+    """
+    _cached = _BASELINE_FAILING_IDS_CACHE.get(main_sha)
+    if _cached is None:
+        return None
+    _cached_at, _cached_ids = _cached
+    if time.monotonic() - _cached_at >= _PROBE_CACHE_TTL:
+        return None
+    return _cached_ids
 
 
 def _worst_category(categories: list[str]) -> str:
@@ -2286,6 +2514,20 @@ class VerifyResult:
     # derive_verify_plan's docstring ("Fidelity" paragraph) for what its raw,
     # unreconciled return value alone still omits.
     plan: dict | None = None
+    # Machine-readable failing/errored pytest node ids, parsed from a
+    # structured merge-role run's junitxml report (task μ,
+    # verify-scope-inversion-prd.md — the baseline-attribution signal;
+    # see _extract_failing_test_ids_from_junit and with_junitxml in
+    # verify_cmd.py). Deliberately a plain JSON-native `list[str] | None`
+    # (mirrors `contention`/`plan` immediately above), so it round-trips
+    # losslessly through the generic codec (asdict / VerifyResult(**d)).
+    #
+    # None = "no junit collected" — role != 'merge', breadth != 'full', an
+    # OPAQUE/raw-retained test command, or an unreadable/malformed junit
+    # report — the B3 degrade signal callers fall back on. `[]` = "junit
+    # collected, zero failing" (main/branch genuinely clean under this
+    # run) and must NOT be conflated with None.
+    failing_test_ids: list[str] | None = None
     # Wall-clock verify cost.  For a single-module run: max(test, lint, type)
     # when the three commands ran concurrently (asyncio.gather), or their sum
     # when run serially.  For a multi-module run: max across child
@@ -3215,6 +3457,46 @@ async def run_verification(
         type_cmd = config.type_check_command
 
     module_prefix = module_config.prefix if module_config is not None else None
+
+    # Task μ (verify-scope-inversion-prd.md): under role=='merge' AND
+    # merge_verify_breadth=='full', inject --junitxml into the test leg (see
+    # _run_or_skip_timed below) and parse the report afterward into
+    # VerifyResult.failing_test_ids — the baseline-attribution signal shared
+    # by verify_failure_is_preexisting_on_main. Gated on breadth=='full'
+    # because only then does a passing verify mean "this module's suite is
+    # genuinely clean" (λ, task 2589); under 'scoped' a pass says nothing
+    # about the rest of main, so seeding an empty baseline would be wrong.
+    #
+    # junit_path is computed here whenever role+breadth match, independent
+    # of whether test_cmd is actually a structured pytest command — deciding
+    # eligibility is left entirely to with_junitxml's own no-op guard
+    # (OPAQUE / raw-retained chain / non-pytest tool / cmd is None all leave
+    # the flag uninjected), so this never duplicates that check. When
+    # nothing ever injects the flag, pytest never writes the report, and
+    # _extract_failing_test_ids_from_junit(junit_path) below degrades to
+    # None (file not found) — the same B3 degrade signal as an unreadable
+    # report.
+    #
+    # The path is worktree-internal (merge worktrees lack `.task/` —
+    # git_ops.py scrubs it) and per-module_prefix (mirrors _stream_log_path's
+    # infix immediately below) so concurrent per-module fan-out within one
+    # worktree can't collide. Absolute: module commands may `cd <prefix>`,
+    # so a relative --junitxml would land in the wrong directory.
+    junit_path: Path | None = None
+    if role == 'merge' and verify_plan._merge_breadth_is_full(config):
+        if module_prefix is not None:
+            _safe_prefix = module_prefix.replace('/', '_').replace(' ', '_')
+            _junit_infix = f'.{_safe_prefix}'
+        else:
+            _junit_infix = ''
+        _junit_dir = worktree / '.df-verify-junit'
+        try:
+            _junit_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            junit_path = None
+        else:
+            junit_path = (_junit_dir / f'report{_junit_infix}.xml').resolve()
+
     if is_merge_verify:
         # Merge worktrees are freshly created per merge — cargo caches are
         # cold and the ``.task/`` marker is absent — so the filesystem
@@ -3298,6 +3580,19 @@ async def run_verification(
         # to _run_cmd, so persisted logs and _summarize_checks see the same
         # command they always have.
         config_cmd = cmd
+        # junitxml injection (task μ, verify-scope-inversion-prd.md): only
+        # the 'test' leg, only when junit_path was computed above (role
+        # =='merge' and breadth=='full'). Identity-check mirrors the
+        # apply_pytest_numprocesses guard further below — with_junitxml
+        # no-ops for OPAQUE/raw-retained/non-pytest commands, so skip the
+        # parse->render round-trip when nothing was actually touched. MUST
+        # run before the cpu-governance wrap immediately below: once
+        # governed, cmd is an opaque outer `<exec> -- /bin/bash -c '...'`
+        # string that parse_config_command can no longer see as pytest.
+        if junit_path is not None and label == 'test':
+            _parsed_for_junit = parse_config_command(cmd)
+            _mutated_for_junit = with_junitxml(_parsed_for_junit, str(junit_path))
+            cmd = cmd if _mutated_for_junit is _parsed_for_junit else render(_mutated_for_junit)
         # Wrap the command in cpu-governed-exec.sh when role=='merge' and
         # cpu_governance is enabled + exec resolves.  Fail-open: returns cmd
         # unchanged when governance is disabled or the path is non-executable,
@@ -3588,6 +3883,15 @@ async def run_verification(
     else:
         _wall_secs = _verify_duration_secs(runs)
 
+    # Task μ: parse the junit report written (if any) by the injection above.
+    # None when junit_path was never computed (role != 'merge', breadth !=
+    # 'full') or the report is missing/unparseable (nothing ever injected
+    # the flag, or the test leg was skipped/crashed before writing it) — the
+    # B3 degrade signal. See _extract_failing_test_ids_from_junit's docstring.
+    failing_test_ids: list[str] | None = None
+    if junit_path is not None:
+        failing_test_ids = _extract_failing_test_ids_from_junit(junit_path)
+
     result = VerifyResult(
         passed=attempt.passed,
         test_output=attempt.test.output,
@@ -3600,6 +3904,7 @@ async def run_verification(
         worktree_log_paths=worktree_log_paths,
         archive_log_paths=archive_log_paths,
         duration_secs=_wall_secs,
+        failing_test_ids=failing_test_ids,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -3684,6 +3989,19 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         worktree_log_paths.extend(r.worktree_log_paths)
         archive_log_paths.extend(r.archive_log_paths)
 
+    # Task μ: aggregate failing_test_ids — None iff EVERY child's is None
+    # (nothing collected anywhere: no merge+full module in this run, or
+    # every junit report was unreadable), else the sorted, de-duped union of
+    # every non-None child list. A None child contributes nothing but does
+    # NOT suppress a sibling's collected ids, and a child that collected an
+    # empty list ([] — "clean") still makes the aggregate non-None, distinct
+    # from a child that never collected at all (None) — see
+    # VerifyResult.failing_test_ids's docstring.
+    _child_failing_ids = [r.failing_test_ids for r in results if r.failing_test_ids is not None]
+    failing_test_ids = (
+        sorted({fid for ids in _child_failing_ids for fid in ids}) if _child_failing_ids else None
+    )
+
     return VerifyResult(
         passed=passed,
         test_output=test_output,
@@ -3699,6 +4017,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # so the slowest module dominates the total elapsed time.  Single-module
         # tasks hit the len==1 fast path above and carry the exact value.
         duration_secs=max((r.duration_secs for r in results), default=0.0),
+        failing_test_ids=failing_test_ids,
     )
 
 
@@ -4741,6 +5060,43 @@ async def verify_failure_is_preexisting_on_main(
             return False, ''
         if not main_sha:
             return False, ''
+
+        # Task μ (verify-scope-inversion-prd.md): when the failing result
+        # carries junit-derived failing_test_ids (merge+full breadth — see
+        # run_verification), decide via a per-main-SHA failing-test-id
+        # baseline diff instead of the (category, cause_hint) signature
+        # comparison below (B1). A baseline of None (B3 degrade — OPAQUE/
+        # non-pytest command, or the baseline probe itself failed) falls
+        # through to the existing signature-comparison path unchanged, and
+        # failing_test_ids=None (today's callers, e.g. task-verify at
+        # workflow.py) always takes that legacy path too.
+        #
+        # Cost note (reviewer_comprehensive finding 2, task 2590): on a cold
+        # cache, main_baseline_failing_ids below pays for a FULL-SUITE
+        # merge-role probe (task_files=None) rather than the cheaper scoped
+        # role='task' probe further down this function — this applies to
+        # every caller that reaches here with a non-None failing_test_ids,
+        # sync (train/merge_gates/solo-reverify, via _classify_main_health_red)
+        # and deferred alike. This is confirmed acceptable, not an oversight:
+        # (1) it is opt-in — failing_test_ids is only ever non-None under
+        # merge_verify_breadth='full' (default remains 'scoped', so every
+        # caller that hasn't opted in pays exactly zero extra cost, byte-
+        # identical to pre-μ behaviour); (2) it is required for correctness
+        # — a full-suite branch id-set is only meaningfully diffable against
+        # an equally full-suite baseline id-set, a scoped signature
+        # comparison would not be apples-to-apples here; and (3) steady-state
+        # cost is amortized to a cache read by the pass-path seeding (B2,
+        # see seed_main_baseline) — a cold probe only happens on the first
+        # gate run against a given main tip, or after a TTL expiry / restart.
+        if failing_result.failing_test_ids is not None:
+            baseline = await main_baseline_failing_ids(
+                config, module_configs, git_ops, main_sha,
+            )
+            if baseline is not None:
+                branch_ids = frozenset(failing_result.failing_test_ids)
+                wholly = is_wholly_preexisting(branch_ids, baseline)
+                return wholly, (main_sha if wholly else '')
+            # baseline is None (B3) — fall through to the legacy probe below.
 
         # Check the process-wide probe cache before paying the worktree-add cost.
         _norm_hint = _normalize(failing_result.cause_hint)
