@@ -1,10 +1,19 @@
-"""Attributed-claim extraction/verification for Stage 2 recon task-filing (task 2438).
+"""Attributed-claim extraction/verification for curator candidates (task 2438).
 
 Provides a pure, deterministic pre-check that extracts specific code-level
-claims a Stage 2 recon candidate attributes to a completed task/commit/
-ACTION (a metadata key, a stamp like ``foo=true``, or a named identifier)
-so they can be verified against the live source tree + git history before
-they are embedded in a filed task's description as fact.
+claims a candidate attributes to a completed task/commit/ACTION (a metadata
+key, a stamp like ``foo=true``, or a named identifier) so they can be
+verified against the live source tree + git history before they are
+embedded in a filed task's description as fact.
+
+Motivated by a Stage 2 reconciliation incident, but wired (via
+``TaskCurator._maybe_flag_unverified_claims``) into the curator's general
+``curate`` / ``curate_batch_prepared`` entry points — when
+``CuratorConfig.recon_claim_verification_enabled`` is set, it runs over
+EVERY candidate the curator sees, not just Stage-2-recon-filed ones; there
+is no candidate-origin field to narrow it further (``CandidateTask``'s
+closest field, ``spawn_context``, distinguishes review/steward-triage/
+planning/manual, not stage2-recon vs. other origins).
 
 Motivating incident: Stage 2 reconciliation filed task 2433 asserting, as
 verified fact, that "task 2372 added an ACTION #5 stamp
@@ -201,6 +210,51 @@ def unverified_claims_in_text(
 # error and fails open (see probe() below).
 _GIT_PROBE_TIMEOUT_SECS = 10.0
 
+# Pathspecs excluded from BOTH the tree grep and the history pickaxe, so a
+# match confined to tests/docs/prompts never counts as "present". Without
+# this, a token this very module's own tests/docstrings/prompt guardrail use
+# as an EXAMPLE (e.g. the task-2433 incident's `done_provenance_invalidated`)
+# would verify "present" the moment those example-carrying files merge —
+# silently defeating detection of a genuine future re-fabrication of the
+# same token. `glob` magic is required for `**` to cross directory
+# boundaries (plain pathspec globs do not span `/`).
+_EXCLUDED_PATHSPECS: tuple[str, ...] = (
+    ':(exclude,glob)**/tests/**',
+    ':(exclude,glob)**/docs/**',
+    ':(exclude,glob)**/prompts/**',
+)
+
+
+def _resolve_git_toplevel(repo_root: Path) -> Path:
+    """Resolve *repo_root* to its git working-tree top level, if possible.
+
+    ``git grep`` (unlike ``git log --all``) scopes matches to the invocation
+    cwd's subtree, not the whole repository — so if *repo_root* is itself a
+    package subdirectory rather than the repo root, the two probes below
+    would search inconsistent scopes (grep: subtree only; log: everything).
+    Probing from the resolved top level keeps both calls' scope consistent
+    regardless of what *repo_root* points at.
+
+    Falls back to *repo_root* unchanged on any resolution failure — the
+    subsequent grep/log calls already fail open on a git error, so an
+    unresolvable root just degrades to the prior cwd-scoped behaviour rather
+    than raising. Never raises.
+    """
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=repo_root,
+            timeout=_GIT_PROBE_TIMEOUT_SECS,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return repo_root
+    if result.returncode != 0:
+        return repo_root
+    toplevel = result.stdout.strip()
+    return Path(toplevel) if toplevel else repo_root
+
 
 def make_source_and_history_probe(repo_root: Path) -> Callable[[str], bool]:
     """Build a ``probe(token) -> bool`` backed by *repo_root*'s live tree + git history.
@@ -212,18 +266,27 @@ def make_source_and_history_probe(repo_root: Path) -> Callable[[str], bool]:
     avoids false-flagging a token that was legitimately REMOVED from the
     tree but still exists in history (e.g. "task N removed X").
 
+    Both the tree grep and the history pickaxe are rooted at *repo_root*'s
+    resolved git top level (see :func:`_resolve_git_toplevel`) and exclude
+    ``tests/``, ``docs/``, and ``prompts/`` paths (see
+    :data:`_EXCLUDED_PATHSPECS`) — a match confined to those paths (e.g. this
+    guard's own example tokens in its tests/docstrings) never counts as
+    "present".
+
     Fails OPEN (returns ``True``, i.e. "assume present") on ANY git error —
     a non-zero/non-"no match" exit code, a timeout, or the git binary being
     unavailable — so an infrastructure hiccup (or *repo_root* not being a
     git repository at all) can never itself produce a false "fabrication"
     flag. Never raises.
     """
+    resolved_root = _resolve_git_toplevel(repo_root)
 
     def probe(token: str) -> bool:
         try:
             grep_result = subprocess.run(
-                ['git', 'grep', '--quiet', '--fixed-strings', '--', token],
-                cwd=repo_root,
+                ['git', 'grep', '--quiet', '--fixed-strings', '--',
+                 token, *_EXCLUDED_PATHSPECS],
+                cwd=resolved_root,
                 timeout=_GIT_PROBE_TIMEOUT_SECS,
                 capture_output=True,
                 text=True,
@@ -251,8 +314,9 @@ def make_source_and_history_probe(repo_root: Path) -> Callable[[str], bool]:
 
         try:
             log_result = subprocess.run(
-                ['git', 'log', '--all', f'-S{token}', '--oneline', '-1'],
-                cwd=repo_root,
+                ['git', 'log', '--all', f'-S{token}', '--oneline', '-1',
+                 '--', *_EXCLUDED_PATHSPECS],
+                cwd=resolved_root,
                 timeout=_GIT_PROBE_TIMEOUT_SECS,
                 capture_output=True,
                 text=True,

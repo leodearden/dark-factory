@@ -330,3 +330,162 @@ class TestMakeSourceAndHistoryProbe:
         probe = make_source_and_history_probe(not_a_repo)
 
         assert probe("ANY_TOKEN_AT_ALL") is True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Amendment: TestMakeSourceAndHistoryProbePathExclusion
+#
+# Regression tests for the reviewer's efficacy finding: `git grep` (no
+# pathspec) searches the WHOLE tracked tree, which now includes this task's
+# own artifacts (e.g. `done_provenance_invalidated` used as an example in
+# this module's docstring, both test files, stage2.py's prompt guardrail,
+# and docs/legibility/confusion-codebook.yaml). Without excluding
+# tests/docs/prompts paths, a token that merges into ONLY those paths would
+# verify "present" and the guard would never again flag a genuine
+# re-fabrication of that identical token — silently defeating the exact
+# incident (task 2433) this guard exists to catch.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestMakeSourceAndHistoryProbePathExclusion:
+    """tests/, docs/, and prompts/ paths are excluded from both the tree grep
+    and the history pickaxe, so a match confined to them never counts as
+    "present"."""
+
+    def test_token_only_in_excluded_paths_returns_false(self, tmp_path):
+        """(a) A token that exists ONLY under tests/, docs/, and prompts/
+        paths verifies ABSENT."""
+        _require_git()
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            make_source_and_history_probe,
+        )
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _run_git(["init", "-b", "main"], cwd=repo)
+        _run_git(["config", "user.email", "test@test.com"], cwd=repo)
+        _run_git(["config", "user.name", "Test"], cwd=repo)
+
+        (repo / "tests").mkdir()
+        (repo / "docs").mkdir()
+        (repo / "prompts").mkdir()
+        (repo / "tests" / "foo_test.py").write_text(
+            "EXAMPLE_ONLY_TOKEN = 1\n", encoding="utf-8",
+        )
+        (repo / "docs" / "notes.md").write_text(
+            "EXAMPLE_ONLY_TOKEN appears here too\n", encoding="utf-8",
+        )
+        (repo / "prompts" / "guardrail.py").write_text(
+            "# mentions EXAMPLE_ONLY_TOKEN as an example\n", encoding="utf-8",
+        )
+        _run_git(["add", "-A"], cwd=repo)
+        _run_git(["commit", "-m", "add example-only mentions"], cwd=repo)
+
+        probe = make_source_and_history_probe(repo)
+
+        assert probe("EXAMPLE_ONLY_TOKEN") is False
+
+    def test_token_in_real_source_path_still_returns_true(self, tmp_path):
+        """(b) Control: a token present in a NON-excluded source path is
+        still detected — the exclusion is scoped, not a blanket disable."""
+        _require_git()
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            make_source_and_history_probe,
+        )
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _run_git(["init", "-b", "main"], cwd=repo)
+        _run_git(["config", "user.email", "test@test.com"], cwd=repo)
+        _run_git(["config", "user.name", "Test"], cwd=repo)
+
+        (repo / "src").mkdir()
+        (repo / "src" / "real.py").write_text("REAL_SOURCE_TOKEN = 1\n", encoding="utf-8")
+        _run_git(["add", "-A"], cwd=repo)
+        _run_git(["commit", "-m", "add real source"], cwd=repo)
+
+        probe = make_source_and_history_probe(repo)
+
+        assert probe("REAL_SOURCE_TOKEN") is True
+
+    def test_incident_token_confined_to_excluded_paths_still_flagged(self, tmp_path):
+        """(c) Directly regresses the task-2433 incident scenario the review
+        comment identified: even once `done_provenance_invalidated` merges
+        into this guard's own tests/docstrings/prompt guardrail (all
+        excluded paths), a genuinely fabricated re-use of the identical
+        token in a NEW candidate must still be flagged."""
+        _require_git()
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            make_source_and_history_probe,
+        )
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _run_git(["init", "-b", "main"], cwd=repo)
+        _run_git(["config", "user.email", "test@test.com"], cwd=repo)
+        _run_git(["config", "user.name", "Test"], cwd=repo)
+
+        (repo / "tests").mkdir()
+        (repo / "tests" / "test_guard.py").write_text(
+            "# example: metadata.done_provenance_invalidated=true\n", encoding="utf-8",
+        )
+        _run_git(["add", "-A"], cwd=repo)
+        _run_git(["commit", "-m", "add example token in tests"], cwd=repo)
+
+        probe = make_source_and_history_probe(repo)
+
+        assert probe("done_provenance_invalidated") is False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Amendment: TestMakeSourceAndHistoryProbeRepoRootResolution
+#
+# Regression test for the reviewer's correctness/consistency finding: `git
+# grep` (no pathspec) scopes to repo_root's subtree while `git log --all`
+# scopes to the whole repo regardless of cwd — so a repo_root that is a
+# package subdirectory (rather than the repo top level) made the two probes
+# search inconsistent scopes.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestMakeSourceAndHistoryProbeRepoRootResolution:
+    """make_source_and_history_probe resolves repo_root to its git top level
+    once, up front, so both calls search the same scope regardless of which
+    subdirectory repo_root points at."""
+
+    def test_staged_uncommitted_token_outside_subdir_root_is_still_found(self, tmp_path):
+        """A token that is STAGED (tracked via `git add`, so it is visible to
+        `git grep`'s default working-tree search) but NOT YET committed (so
+        the history pickaxe alone cannot rescue it), and lives OUTSIDE the
+        subdirectory passed as repo_root, must still be found once grep is
+        rooted at the resolved repo top level rather than the subdirectory.
+
+        Staging (rather than leaving the file fully untracked) isolates the
+        cwd-scope bug this test targets from `git grep`'s separate, unrelated
+        default of not searching untracked files at all."""
+        _require_git()
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            make_source_and_history_probe,
+        )
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _run_git(["init", "-b", "main"], cwd=repo)
+        _run_git(["config", "user.email", "test@test.com"], cwd=repo)
+        _run_git(["config", "user.name", "Test"], cwd=repo)
+
+        pkg = repo / "pkg"
+        pkg.mkdir()
+        (pkg / "placeholder.py").write_text("PLACEHOLDER = 1\n", encoding="utf-8")
+        _run_git(["add", "-A"], cwd=repo)
+        _run_git(["commit", "-m", "init pkg"], cwd=repo)
+
+        # Staged but NOT committed — outside pkg/, at the repo root. The
+        # history pickaxe alone cannot see this (never committed); only a
+        # tree grep rooted at the true top level can.
+        (repo / "outside_pkg.py").write_text("SUBDIR_SCOPE_TOKEN = 1\n", encoding="utf-8")
+        _run_git(["add", "outside_pkg.py"], cwd=repo)
+
+        probe = make_source_and_history_probe(pkg)
+
+        assert probe("SUBDIR_SCOPE_TOKEN") is True
