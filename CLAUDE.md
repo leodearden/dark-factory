@@ -369,6 +369,52 @@ kind" above. The delayed anchor waits on the same local +
 `metadata.external_deps` dependency gate described in "Cross-project task
 dependencies" above.
 
+### Per-task model pin (`metadata.model_overrides`)
+
+Set `metadata.model_overrides` on a task to pin specific agent roles to a
+specific model for that task only — the highest-precedence layer in the
+orchestrator's route resolver (see "Model Routing" below).
+
+**Shape:** an object mapping full role name → model string:
+
+```
+{
+  "implementer": "opus",
+  "reviewer": "haiku"
+}
+```
+
+**Validation split** — submit-time SHAPE guard vs. resolve-time model
+STRING check, because fused-memory does not know the orchestrator's
+allowlist:
+- `submit_task`/`update_task` shape-validate at write time via
+  `shared.task_metadata.validate_model_overrides` against
+  `KNOWN_ROLE_NAMES` — an unknown role name, or a non-string/empty-string
+  model value, raises `ValidationError` and the write is rejected. The
+  fused-memory `model_overrides_guard` mirrors this at both `submit_task`
+  and `update_task`.
+- The orchestrator resolver separately validates the model *string*
+  against `routing.allowed_models` (and any configured per-model ceiling)
+  at resolve time, fail-safe — see "Model Routing" below.
+
+**Fail-safe semantics:** a well-formed override naming a model outside
+`routing.allowed_models` (or past its configured daily ceiling) is skipped
+at resolve time, recorded in `RoutingDecision.rejected`, WARN-logged, and
+never blocks dispatch — the override is the resolver's highest-precedence
+layer (`metadata_override`) and sets `model` only (never
+effort/budget_usd/max_turns).
+
+**Role-name caveat:** keys must be the full dispatch role name from
+`orchestrator.agents.roles.ROLES` (e.g. `implementer`,
+`reviewer_comprehensive`), not a collapsed config key. `reviewer`,
+`triage`, and `module_tagger` are accepted by the shape guard (
+`KNOWN_ROLE_NAMES` is a superset covering both `ROLES` and `ModelsConfig`'s
+collapsed keys) but are accepted-but-**inert** as override keys — the
+resolver's layer-1 reader keys strictly on the literal `role_name` it was
+invoked with, never the collapsed config key, so an override authored
+under one of these three collapsed keys silently never matches at resolve
+time.
+
 ### Task metadata vocabulary & census
 
 `parse_metadata` (`shared/src/shared/task_metadata.py`) validates every
