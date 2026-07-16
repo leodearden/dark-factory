@@ -33,11 +33,14 @@ Usage::
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 __all__ = [
     "AttributedClaim",
     "extract_attributed_claims",
+    "unverified_claims_in_text",
+    "verify_attributed_claims",
 ]
 
 
@@ -148,3 +151,39 @@ def extract_attributed_claims(text: str) -> list[AttributedClaim]:
         )
 
     return claims
+
+
+def verify_attributed_claims(
+    claims: list[AttributedClaim], probe: Callable[[str], bool],
+) -> list[AttributedClaim]:
+    """Return the subset of *claims* whose token *probe* reports ABSENT.
+
+    ``probe(token) -> bool`` is the injectable verification seam: it should
+    return ``True`` when the token is present somewhere relevant (e.g. the
+    live source tree or git history) and ``False`` when it is absent. Only
+    tokens the probe reports absent are returned — a claim whose token the
+    probe confirms present is filtered out (self-correcting: a legitimate
+    reference like ``get_statuses`` verifies clean regardless of how loosely
+    it was extracted).
+
+    Pure orchestration over the injected *probe* — no I/O of its own. Never
+    raises on its own; a *probe* that raises propagates to the caller.
+    """
+    return [claim for claim in claims if not probe(claim.token)]
+
+
+def unverified_claims_in_text(
+    text: str, probe: Callable[[str], bool],
+) -> list[AttributedClaim]:
+    """Extract attributed claims from *text* and return the unverified subset.
+
+    Composes :func:`extract_attributed_claims` and
+    :func:`verify_attributed_claims` — mirrors
+    ``recon_code_fix_premise_guard.premise_refuted_entry``'s
+    detect-then-verify composition shape. Short-circuits to ``[]`` (without
+    calling *probe*) when *text* carries no attributed claims at all.
+    """
+    claims = extract_attributed_claims(text)
+    if not claims:
+        return []
+    return verify_attributed_claims(claims, probe)
