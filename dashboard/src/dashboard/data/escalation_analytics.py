@@ -283,7 +283,76 @@ def _origin_block(records: list[tuple[Escalation, dict]], *, now: datetime) -> d
 _BREACH_SECONDS = 6 * 3600
 
 
-def _lifespan_block(records: list[tuple[Escalation, dict]], *, now: datetime) -> dict:
+def _downsample_stratified(samples: list[list], threshold: int) -> list[list]:
+    """Deterministically downsample *samples* to at most *threshold* rows.
+
+    Stratified by tier (``samples[i][1]``): each tier gets a quota
+    proportional to its share of the total, allocated by the largest-
+    remainder method (capped at the tier's own size) so quotas sum to
+    exactly ``threshold`` whenever enough cross-tier slack exists — which it
+    always does here, since *threshold* < ``len(samples)`` is the caller's
+    precondition. Ties in the remainder distribution break deterministically
+    on tier name (no RNG). Within each tier, rows are sorted by date
+    (``samples[i][0]``) and the quota is picked via a fixed, evenly-spaced
+    stride, so the selected rows stay in ascending date order. The returned
+    list is grouped by tier (sorted tier name), date-ascending within tier.
+
+    Callers must only invoke this when ``len(samples) > threshold`` — the
+    precondition is asserted, not silently handled.
+    """
+    total = len(samples)
+    assert total > threshold, '_downsample_stratified requires len(samples) > threshold'
+
+    by_tier: dict[str, list[list]] = {}
+    for row in samples:
+        by_tier.setdefault(row[1], []).append(row)
+    for rows in by_tier.values():
+        rows.sort(key=lambda r: r[0])
+
+    exact_quota = {tier: len(rows) * threshold / total for tier, rows in by_tier.items()}
+    quota = {tier: min(int(exact_quota[tier]), len(rows)) for tier, rows in by_tier.items()}
+    remaining = threshold - sum(quota.values())
+
+    # Largest-remainder distribution of the leftover units: round-robin over
+    # tiers in descending-fractional-part order (tie-broken by tier name) so
+    # `remaining` can exceed the tier count without under-allocating.
+    # Terminates because remaining < total-sum(quota) (cross-tier slack)
+    # always holds when threshold < total; the guard is defensive only.
+    priority = sorted(by_tier, key=lambda t: (-(exact_quota[t] - int(exact_quota[t])), t))
+    idx = 0
+    guard = 0
+    while remaining > 0 and guard <= total:
+        tier = priority[idx % len(priority)]
+        if quota[tier] < len(by_tier[tier]):
+            quota[tier] += 1
+            remaining -= 1
+        idx += 1
+        guard += 1
+
+    downsampled: list[list] = []
+    for tier in sorted(by_tier):
+        rows = by_tier[tier]
+        q = quota[tier]
+        if q <= 0:
+            continue
+        n = len(rows)
+        if q >= n:
+            downsampled.extend(rows)
+            continue
+        # Evenly-spaced index selection: int(i * n / q) is strictly
+        # increasing for i in range(q) whenever q < n, so this always picks
+        # q distinct, ascending (date-ordered, since rows are pre-sorted)
+        # indices — no RNG, fully reproducible.
+        downsampled.extend(rows[int(i * n / q)] for i in range(q))
+    return downsampled
+
+
+def _lifespan_block(
+    records: list[tuple[Escalation, dict]],
+    *,
+    now: datetime,
+    downsample_threshold: int = 10_000,
+) -> dict:
     """Lifespan aggregates over *records*: percentiles, samples, open items, promotion.
 
     - ``percentiles_by_level``: per-``level`` (stringified) p50/p90 of
@@ -315,6 +384,12 @@ def _lifespan_block(records: list[tuple[Escalation, dict]], *, now: datetime) ->
       entirely (no key) when no record in the project carries a parseable
       ``triaged_at`` — this is a render-when-present field, not a
       zero-filled one.
+
+    When ``len(samples) > downsample_threshold``, ``samples`` is
+    deterministically downsampled (see :func:`_downsample_stratified`) and
+    the result carries ``samples_downsampled=True`` plus ``samples_total``
+    (the pre-downsample count) — a loud marker, never silent truncation.
+    Below/at threshold, ``samples`` is untouched and neither key appears.
     """
     by_id: dict[str, Escalation] = {esc.id: esc for esc, _raw in records}
 
@@ -426,12 +501,20 @@ def _lifespan_block(records: list[tuple[Escalation, dict]], *, now: datetime) ->
         'p90_secs': percentile(promotion_deltas, 90) if promotion_deltas else None,
     }
 
+    samples_total = len(samples)
+    downsampled = samples_total > downsample_threshold
+    if downsampled:
+        samples = _downsample_stratified(samples, downsample_threshold)
+
     result = {
         'percentiles_by_level': percentiles_by_level,
         'l1_to_l2_promotion': l1_to_l2_promotion,
         'samples': samples,
         'open_items': open_items,
     }
+    if downsampled:
+        result['samples_downsampled'] = True
+        result['samples_total'] = samples_total
 
     if filed_to_triaged_deltas:
         filed_to_triaged_deltas.sort()
@@ -588,6 +671,7 @@ def _aggregate_project(
     runs_db: Path,
     *,
     now: datetime,
+    downsample_threshold: int = 10_000,
 ) -> tuple[dict, int]:
     """Aggregate one project's escalation archive into a Seam-2 payload entry.
 
@@ -597,7 +681,7 @@ def _aggregate_project(
     entry = {
         'project': project,
         'origin': _origin_block(records, now=now),
-        'lifespan': _lifespan_block(records, now=now),
+        'lifespan': _lifespan_block(records, now=now, downsample_threshold=downsample_threshold),
         'workflow': _workflow_block(records, Path(runs_db)),
     }
     return entry, parse_failures
@@ -613,6 +697,7 @@ def build_escalation_analytics(
     *,
     now: datetime | None = None,
     regime_markers_path: Path | None = None,
+    downsample_threshold: int = 10_000,
 ) -> dict:
     """Build the full Seam-2 escalation-analytics payload across *project_dirs*.
 
@@ -626,6 +711,9 @@ def build_escalation_analytics(
     across all project dirs) AND the regime-markers load's
     ``parse_failures_delta`` into a single loud count (INV-4) — there is
     only one ``parse_failures`` field in the payload.
+
+    ``downsample_threshold`` bounds each project's ``lifespan.samples`` —
+    see :func:`_lifespan_block` and :func:`_downsample_stratified`.
     """
     resolved_now = resolve_now(now)
 
@@ -634,6 +722,7 @@ def build_escalation_analytics(
     for project, escalations_dir, runs_db in project_dirs:
         entry, project_parse_failures = _aggregate_project(
             project, escalations_dir, runs_db, now=resolved_now,
+            downsample_threshold=downsample_threshold,
         )
         parse_failures += project_parse_failures
         per_project.append(entry)
