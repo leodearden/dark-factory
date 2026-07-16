@@ -7866,7 +7866,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         timeouts_cfg = self.config.timeouts
         backends_cfg = self.config.backends
 
-        role_key = role.name.split('_')[0]
+        # Full-name lookup is deliberate (routing alpha, task 2531) — do NOT
+        # re-derive a split('_')[0] prefix here. Every routing submodel now
+        # carries a field per full role name (including underscore-named
+        # roles like simple_task), so role.name itself is the addressable
+        # key; a split-derivation would silently miss those fields again
+        # (as it did for simple_task -> 'simple', which matched nothing).
+        # This aligns _invoke with the two out-of-band dispatch sites that
+        # already resolved config by full role name: module_tagger
+        # (harness.py's self.config.models.module_tagger) and deep_reviewer
+        # (review_checkpoint.py's getattr(self.config.models, 'deep_reviewer', ...)).
+        role_key = role.name
 
         model = getattr(models, role_key, role.default_model)
         model = self._select_model_for_role(role, model)
