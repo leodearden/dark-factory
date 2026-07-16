@@ -8393,3 +8393,44 @@ class TestStoreFailureDiagnosticsHelper:
         )
         assert record.store == 'graphiti'
         assert record.query_len == len('qshape')
+
+    @pytest.mark.asyncio
+    async def test_search_mixed_timeout_and_exception_both_collected(self, service):
+        """A single search() call can hit BOTH root-cause variants at once: one
+        store's task is still pending when the outer deadline elapses (timeout)
+        while the other store's task completes with a raised exception. Both
+        diagnostic entries must be collected, correctly attributed to their own
+        store, and neither store may be double-counted between the pending-loop
+        (timed_out_stores) and the done-loop (per-task except block).
+        """
+        service.config.queue.search_timeout_seconds = 0.01
+
+        async def _slow_graphiti_search(*args, **kwargs):
+            await asyncio.sleep(5)
+            return []
+
+        service.graphiti.search = AsyncMock(side_effect=_slow_graphiti_search)
+        service.mem0.search = AsyncMock(side_effect=RuntimeError('mem0 boom'))
+
+        res = await service.search(
+            query='mixed shape', project_id='reify', stores=['graphiti', 'mem0'],
+        )
+
+        assert res.degraded is True
+        assert set(res.failed_stores) == {'graphiti', 'mem0'}
+        assert len(res.failure_diagnostics) == 2, (
+            'Expected exactly one diagnostic per failed store (no double-counting '
+            f'between the pending/done loops), got {res.failure_diagnostics!r}'
+        )
+        stores_seen = sorted(d['store'] for d in res.failure_diagnostics)
+        assert stores_seen == ['graphiti', 'mem0'], (
+            f'Expected one entry per store with no duplicates, got {stores_seen!r}'
+        )
+
+        graphiti_diag = next(d for d in res.failure_diagnostics if d['store'] == 'graphiti')
+        assert graphiti_diag['reason'] == 'timeout'
+        assert graphiti_diag['error_type'] == 'TimeoutError'
+
+        mem0_diag = next(d for d in res.failure_diagnostics if d['store'] == 'mem0')
+        assert mem0_diag['reason'] == 'exception'
+        assert mem0_diag['error_type'] == 'RuntimeError'
