@@ -204,6 +204,36 @@ if task_result.get('project_id') != expected_project_id:
                 description='get_task returned task from project ..., expected ...')
 ```
 
+## Cross-Project Task-Creation Corroboration (IMPORTANT — task 2525)
+
+Stage 2 self-reports a `tasks_created` count. Do NOT conclude that count is phantom \
+(no corroborating task) from ONLY the origin project's own task-id sequence (e.g. \
+`highest_task_id` unchanged, `get_task(next_id)` not found there) — Stage 2 may have \
+legitimately created the task in a DIFFERENT known project via documented cross-project \
+routing (`submit_task` called with another project's `project_root`). An origin-only \
+check cannot see that. Real incident: run 709de018 — the task genuinely existed in \
+another project, and the false phantom conclusion drove a wasteful duplicate re-file.
+
+Before flagging a self-reported `tasks_created` count phantom:
+1. Look for any signal identifying a candidate OTHER project + task_id for the created \
+task — e.g. a `cross_project_routing` finding from this or a prior cycle, or a task \
+referenced in the Stage 1/Stage 2 reports above.
+2. If you can determine another project's `project_root`, verify with \
+`get_task(id=<task_id>, project_root=<that project's root>)`. If the task is found \
+there, do NOT flag it phantom — cite it instead via \
+`mcp__recon-report__cite_task(run_id=<from Reconciliation Context>, \
+finding_id=<finding_id>, project_id=<the project it was found in>, task_id=<task_id>)`.
+3. If you still conclude the count is phantom, emit the finding with \
+`flag_type='phantom_tasks_created'`, `category='task_memory_mismatch'`, and cite via \
+`cite_task` every candidate `(project_id, task_id)` pair you considered — even ones you \
+could not independently verify yourself. **This citation step is required, not \
+optional**: the code-side gate (`filter_false_phantom_task_creation_flags` in \
+`flag_dedup.py`) independently re-verifies every cited candidate via `get_task` against \
+the harness's own known-projects registry — after your report is assembled — and drops \
+the finding on positive corroboration. It is the authoritative backstop, but it can only \
+re-check what you cite, so cite every candidate you considered rather than only the ones \
+you managed to confirm yourself.
+
 ## Report Channel — recon_report MCP Tools (PRD γ §9)
 {get_recon_report_tool_guidance()}
 

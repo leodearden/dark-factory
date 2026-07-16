@@ -10366,6 +10366,133 @@ class TestIntegrityCheckBlockedSnapshotWiring:
         )
 
 
+class TestIntegrityCheckPhantomTaskCreationWiring:
+    """IntegrityCheck.run() must apply filter_false_phantom_task_creation_flags
+    and surface report.stats['phantom_task_creation_findings_dropped'] (task-2525
+    step-5).
+
+    Mirrors TestIntegrityCheckBlockedSnapshotWiring's mock_deps fixture and
+    patch.object(BaseStage, 'run', ...) pattern — the new gate is wired into
+    the same IntegrityCheck.run() override, immediately after the existing
+    filter_blocked_snapshot_findings block.
+
+    RED until step-6 wires filter_false_phantom_task_creation_flags into
+    run() and sets the stat.
+    """
+
+    @pytest.fixture
+    def config(self):
+        return ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+
+    @pytest.fixture
+    def mock_deps(self, config):
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('origin', '/tmp/test'),
+        }
+
+    @pytest.mark.asyncio
+    async def test_phantom_finding_dropped_when_cross_project_task_present(self, mock_deps):
+        """Phantom tasks_created finding citing a task present in a NON-origin
+        known project is DROPPED and the stat is set to 1.
+
+        RED: run() does not yet apply the filter or set the stat.
+        """
+        mock_deps['taskmaster'].get_task = AsyncMock(
+            return_value={'id': '42', 'title': 'Foreign task', 'status': 'pending'}
+        )
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.known_projects = {'origin': '/tmp/test', 'other': '/other'}
+        stage.filtered_task_tree = None
+
+        phantom_flag = {
+            'task_id': None,
+            'flag_type': 'phantom_tasks_created',
+            'category': 'task_memory_mismatch',
+            'description': 'Stage 2 reported tasks_created=1 but no corroborating task found',
+            'suggested_action': 'investigate',
+            'actionable': False,
+            'cited_tasks': [
+                {'project_id': 'other', 'task_id': '42', 'title': 'Foreign task'},
+            ],
+        }
+
+        base_report = StageReport(
+            stage=StageId.integrity_check,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[phantom_flag],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='origin'),
+                prior_reports=[],
+                run_id='run-2525',
+            )
+
+        assert phantom_flag not in report.items_flagged, (
+            'Phantom tasks_created finding corroborated by a cross-project task must be '
+            f'DROPPED; got items_flagged={report.items_flagged!r}'
+        )
+        assert report.stats.get('phantom_task_creation_findings_dropped') == 1, (
+            "run() must set report.stats['phantom_task_creation_findings_dropped'] = 1; "
+            f"got stats={report.stats!r}. RED: stat not yet surfaced."
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_phantom_findings_leaves_items_unchanged(self, mock_deps):
+        """A report with no phantom findings leaves items_flagged unchanged;
+        phantom_task_creation_findings_dropped == 0.
+
+        RED: run() does not yet set the stat.
+        """
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.known_projects = {'origin': '/tmp/test', 'other': '/other'}
+        stage.filtered_task_tree = None
+
+        benign_flag = {
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'category': 'missing_deliverable',
+            'description': 'task 42 has no design doc',
+            'suggested_action': 'Add a design doc',
+            'actionable': True,
+        }
+
+        base_report = StageReport(
+            stage=StageId.integrity_check,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[benign_flag],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='origin'),
+                prior_reports=[],
+                run_id='run-2525',
+            )
+
+        assert report.items_flagged == [benign_flag], (
+            'Non-phantom finding must survive unchanged; '
+            f'got items_flagged={report.items_flagged!r}'
+        )
+        assert report.stats.get('phantom_task_creation_findings_dropped') == 0, (
+            "run() must set report.stats['phantom_task_creation_findings_dropped'] = 0 "
+            "when no flags are dropped; "
+            f"got stats={report.stats!r}"
+        )
+        mock_deps['taskmaster'].get_task.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # step-1 (RED) / step-2 (GREEN): _repair_stage2_summary_stage_metadata core
 # ---------------------------------------------------------------------------
