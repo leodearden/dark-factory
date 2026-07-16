@@ -192,3 +192,71 @@ def compute_chronic_flakes(
             )
         )
     return evidence
+
+
+# ---------------------------------------------------------------------------
+# De-flake fix-task argument builder (step-7/step-8)
+# ---------------------------------------------------------------------------
+
+# Fixed root-cause guidance, always appended to the filed task's
+# description. Deliberately steers AWAY from the laziest "fix": widening a
+# sleep/timeout, which just makes the flake rarer and harder to reproduce
+# later. Condition-polling (wait for the actual state the test needs) and
+# structural asserts (assert on the state itself, not on prose/log output)
+# are the durable fix per the infra-test-wallclock-deflake toolkit.
+_ROOT_CAUSE_INSTRUCTION = (
+    'ROOT-CAUSE this, do not paper over it: replace wall-clock sleeps with '
+    'condition-polling (wait for the actual state the test depends on) and '
+    'prefer structural asserts (assert on state, not on log/prose output) '
+    'per the infra-test-wallclock-deflake toolkit. NEVER "fix" this with a '
+    'blind timeout bump — that only makes the flake rarer and harder to '
+    'reproduce, it does not remove it.'
+)
+
+
+def build_chronic_flake_fix_task_arguments(
+    evidence: ChronicFlakeEvidence, project_root: str | Path
+) -> dict:
+    """Build the ``submit_task`` argument block for an auto-filed De-flake
+    fix task (task 2358).
+
+    Modeled on :func:`~orchestrator.workflow.build_offline_lane_fix_task_arguments`
+    (title/description/priority/project_root/metadata shape). Unlike the
+    offline-lane red-fix task, this fires on a test that is CURRENTLY
+    GREEN overall (retry-once absorbed the flake) — so it is filed at
+    ``priority='medium'``, non-blocking, purely to make the flake debt
+    visible and owned.
+    """
+    dates_str = ', '.join(evidence.dates) if evidence.dates else '(none recorded)'
+    roles_str = ', '.join(evidence.roles) if evidence.roles else '(none recorded)'
+    title = f'De-flake {evidence.test}: chronic pool flake (auto-filed)'
+    description = (
+        f'The chronic-flake auto-file detector observed {evidence.test} flaky '
+        f'{evidence.count} time(s) within the last {evidence.window} '
+        f'flaky-ledger-recorded run(s) — at or above the configured chronic '
+        f'threshold.\n\n'
+        f'Evidence (from data/verify-logs/flaky-ledger.jsonl):\n'
+        f'  test:    {evidence.test}\n'
+        f'  count:   {evidence.count}\n'
+        f'  window:  {evidence.window}\n'
+        f'  dates:   {dates_str}\n'
+        f'  role(s): {roles_str}\n\n'
+        f'{_ROOT_CAUSE_INSTRUCTION}\n\n'
+        f'This task was auto-filed by the chronic-flake detector (task 2358) '
+        f'after a verify completed. The gate stayed green — retry-once '
+        f'already absorbed the failure — so this is non-blocking, visible '
+        f'flake debt, not an incident.'
+    )
+    return {
+        'title': title,
+        'description': description,
+        'priority': 'medium',
+        'project_root': str(project_root),
+        'metadata': {
+            'spawn_context': 'chronic_flake_auto_file',
+            'chronic_flake_test': evidence.test,
+            'chronic_flake_count': evidence.count,
+            'chronic_flake_window': evidence.window,
+            'roles': evidence.roles,
+        },
+    }
