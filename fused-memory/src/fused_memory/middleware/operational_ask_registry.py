@@ -19,6 +19,20 @@ therefore checks the candidate's title against ``_CODE_CHANGE_TITLE_SIGNALS``
 first and unconditionally refuses to match when one is present, so such
 asks still reach the architect.
 
+Detection axis (task 2687): a candidate whose ``metadata.execution_class``
+is ``"operational"`` or ``"decision"`` (see
+``fused_memory.reconciliation.recon_self_model.EXECUTION_CLASSES``) is
+routed to the deterministic PURE-GATE unconditionally — regardless of title/
+description wording, regardless of the seeded substring entries, and
+regardless of the ``_CODE_CHANGE_TITLE_SIGNALS`` guard above. This is checked
+FIRST in ``match_candidate``, before anything else: an explicit recon-stage
+execution_class declaration is authoritative, so it deliberately bypasses the
+code-change-title-signal guard built for the substring-only entries. Without
+this axis, an operational/decision-tagged ask whose wording doesn't match a
+seeded signature (or whose title happens to contain "fix"/"bug"/etc.) falls
+through to the architect and re-churns the exact latency 2085 eliminated for
+the seeded cases.
+
 Usage::
 
     from fused_memory.middleware.operational_ask_registry import (
@@ -180,6 +194,37 @@ def load_operational_registry(path: Path | None) -> list[OperationalAskEntry]:
 # over recall.
 _CODE_CHANGE_TITLE_SIGNALS: tuple[str, ...] = ("fix", "bug", "crash", "implement")
 
+# Execution-class values that route unconditionally to the deterministic
+# PURE-GATE regardless of title/description wording (task 2687). Mirrors
+# fused_memory.reconciliation.recon_self_model.EXECUTION_CLASSES =
+# ('code_tdd', 'operational', 'decision'), but is spelled out explicitly
+# rather than derived by subtracting 'code_tdd' from that tuple: an explicit
+# set is drift-safe if a future execution class is ever added there that is
+# still code-oriented, since subtraction would silently start routing it too.
+# 'code_tdd' is intentionally excluded — a code_tdd-tagged candidate must
+# still reach the TDD architect.
+_ROUTE_EXECUTION_CLASSES: frozenset[str] = frozenset({"operational", "decision"})
+
+# Synthetic registry entry returned by the execution_class axis in
+# match_candidate(). A real OperationalAskEntry instance so
+# TaskCurator._maybe_route_deterministic's entry.name / entry.reason
+# justification-and-log contract needs no changes: the justification it
+# builds still starts with "operational-ask-registry:", so the existing
+# dispatch/stamping tests continue to pass unmodified. The title/description
+# substrings are inert placeholders — this entry is returned directly by the
+# axis and never reached via the substring-matching loop below.
+_EXECUTION_CLASS_ENTRY = OperationalAskEntry(
+    name="execution_class_operational_or_decision",
+    reason=(
+        "candidate.execution_class is 'operational' or 'decision' — an "
+        "explicit, authoritative recon-stage declaration that this ask is "
+        "not a code change, so it routes to the deterministic PURE-GATE "
+        "regardless of title/description wording (task 2687)"
+    ),
+    title_substrings=["<execution-class-axis>"],
+    description_substrings=["<execution-class-axis>"],
+)
+
 
 def match_candidate(
     candidate: CandidateTask,
@@ -187,7 +232,19 @@ def match_candidate(
 ) -> OperationalAskEntry | None:
     """Return the first matching registry entry for *candidate*, or ``None``.
 
-    Matching is case-insensitive string search:
+    Checked FIRST, before anything else: if ``candidate.execution_class``
+    (case-insensitively) is ``"operational"`` or ``"decision"``, this
+    unconditionally returns the synthetic ``_EXECUTION_CLASS_ENTRY`` —
+    regardless of *entries*, the ``_CODE_CHANGE_TITLE_SIGNALS`` guard, or any
+    title/description substring (task 2687). An explicit recon-stage
+    execution_class declaration is authoritative and wording-independent:
+    unlike the substring-based entries below, it deliberately bypasses the
+    code-change-title-signal guard so a mis-worded but explicitly-tagged
+    operational/decision ask (e.g. a title containing "fix") still routes.
+    ``execution_class`` of ``"code_tdd"`` or ``None`` does not engage this
+    axis and falls through to the substring-only behavior below unchanged.
+
+    Absent that axis, matching is case-insensitive string search:
     - ALL strings in ``entry.title_substrings`` must appear in
       ``candidate.title``.
     - AT LEAST ONE string in ``entry.description_substrings`` must appear in
@@ -206,6 +263,10 @@ def match_candidate(
 
     Pure string operations — no regex, no async, no I/O.
     """
+    execution_class = (candidate.execution_class or "").strip().lower()
+    if execution_class in _ROUTE_EXECUTION_CLASSES:
+        return _EXECUTION_CLASS_ENTRY
+
     title_lower = (candidate.title or "").lower()
 
     if any(signal in title_lower for signal in _CODE_CHANGE_TITLE_SIGNALS):

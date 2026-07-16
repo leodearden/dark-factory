@@ -20,6 +20,18 @@
 #   description_substrings: list[str]  — AT LEAST ONE must appear in
 #                           candidate description+details (case-insensitive)
 #
+# Detection axis (task 2687): a candidate whose metadata.execution_class is
+# "operational" or "decision" routes to the deterministic PURE-GATE
+# UNCONDITIONALLY — regardless of these substring entries, regardless of
+# title/description wording, and regardless of the "fix"/"bug"/"crash"/
+# "implement" safety net described below. operational_ask_registry.py's
+# match_candidate() checks this axis FIRST: an explicit recon-stage
+# execution_class declaration is authoritative and wording-independent, so
+# e.g. a title containing "fix" does not suppress the route when the
+# candidate is explicitly tagged execution_class='operational' (motivating
+# case: task 2686). execution_class='code_tdd' or unset candidates are
+# unaffected by this axis and fall through to the substring entries below.
+#
 # Guidance for operators adding new entries:
 #   - Use a tight title anchor: prefer the specific script/tool/namespace name
 #     (e.g. "prune_recon_cycle_summaries", "merge_entities") over generic
