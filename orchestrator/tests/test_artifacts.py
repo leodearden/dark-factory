@@ -2,6 +2,7 @@
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -54,6 +55,26 @@ class TestInit:
 
     def test_base_commit_absent_when_not_provided(self, artifacts: TaskArtifacts):
         assert artifacts.read_base_commit() is None
+
+
+class TestReadCreatedAt:
+    def test_returns_created_at_after_init(self, artifacts: TaskArtifacts):
+        created_at = artifacts.read_created_at()
+        assert created_at is not None
+        # Must be an ISO-8601 (UTC) datetime string.
+        datetime.fromisoformat(created_at)
+
+    def test_returns_none_when_metadata_absent(self, worktree: Path):
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        assert ta.read_created_at() is None
+
+    def test_returns_none_when_created_at_key_missing(self, worktree: Path):
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.root.mkdir(parents=True, exist_ok=True)
+        (ta.root / 'metadata.json').write_text(json.dumps({'task_id': 'x'}))
+        assert ta.read_created_at() is None
 
 
 class TestPlan:
