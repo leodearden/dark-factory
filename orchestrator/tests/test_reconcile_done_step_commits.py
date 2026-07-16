@@ -455,3 +455,79 @@ class TestReconcileDoneStepCommits:
         await workflow._reconcile_done_step_commits()  # must not raise
 
         assert artifacts.read_plan()['steps'][0]['commit'] == step_commit
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED: _execute_iterations wires the reconciler in before the WIP
+# detector, with a self.plan re-read in between
+# ---------------------------------------------------------------------------
+#
+# Mirrors test_harness_wip_step_detection.py's
+# TestExecuteIterationsForwardsWipNotice: real git worktree, heavy
+# collaborators mocked, _invoke stubbed to mark the one pending step done so
+# the loop exits after a single iteration.
+
+
+@pytest.mark.asyncio
+class TestExecuteIterationsReconcilesDoneSteps:
+    async def test_done_step_commit_reconciled_before_prompt_is_built(
+        self, config, git_ops, task_assignment,
+    ):
+        """A done step's orphaned commit must be reconciled to the tip WIP
+        sha INSIDE _execute_iterations's loop, before build_implementer_prompt
+        is called — and the reconciled value must be re-read into self.plan
+        (proving _reconcile_done_step_commits actually ran and its result was
+        picked up, not just left sitting unread on disk)."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        # step-1's original implementation commit, later orphaned.
+        (wt / 'feature.py').write_text('original implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1 implementation')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        plan = {
+            'task_id': '42',
+            'title': 'X',
+            'analysis': 'A',
+            'prerequisites': [],
+            'steps': [
+                {'id': 'step-1', 'type': 'impl', 'status': 'done', 'commit': step_commit},
+                {'id': 'step-2', 'type': 'impl', 'status': 'pending', 'commit': None},
+            ],
+        }
+        artifacts.write_plan(plan)
+        artifacts.stamp_plan_provenance(workflow.session_id)
+        workflow.plan = artifacts.read_plan()
+
+        # Orphan step_commit, then re-land its exact file as a WIP
+        # safety-commit at HEAD (mirrors _inter_iteration_rebase's
+        # squash-then-rebase sequence).
+        await _run(['git', 'reset', '--hard', wt_info.base_commit], cwd=wt)
+        (wt / 'feature.py').write_text('original implementation\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before inter-iteration rebase')
+        assert wip_sha, 'Setup: expected a real WIP commit at HEAD'
+
+        def _mark_step2_done_side_effect(*args, **kwargs):
+            artifacts.update_step_status('step-2', 'done', 'impl-commit-sha')
+            return AgentResult(success=True, output='')
+
+        workflow.briefing.build_implementer_prompt = AsyncMock(return_value='impl')
+        workflow._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
+        workflow._get_head_commit = AsyncMock(return_value='head-sha')  # type: ignore[method-assign]
+        workflow._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_mark_step2_done_side_effect,
+        )
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        final_plan = artifacts.read_plan()
+        step_1 = next(s for s in final_plan['steps'] if s['id'] == 'step-1')
+        assert step_1['commit'] == wip_sha, (
+            f'Expected step-1 commit reconciled to WIP tip {wip_sha} inside '
+            f"_execute_iterations's loop, got {step_1['commit']}"
+        )
+        assert step_1['status'] == 'done'
