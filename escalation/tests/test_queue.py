@@ -2475,6 +2475,91 @@ class TestAddMembersToL2:
         )
 
 
+class TestStampTriage:
+    """EscalationQueue.stamp_triage() stamps a triage-ack annotation on a pending record.
+
+    This is an ANNOTATION, not a resolution: it must work on a pending L2 that
+    the {0,1}-level-capped watcher connection is still forbidden to resolve.
+    """
+
+    def _make_pending(self, queue: EscalationQueue, task_id: str = 'task-1', level: int = 2) -> Escalation:
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='pending L2 for triage stamp test',
+            level=level,
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_stamps_pending_record(self, tmp_path: Path):
+        """(a) Stamping a pending record sets triaged_at/triaged_by/triage_note, keeps status/level."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        result = queue.stamp_triage(
+            esc.id, triaged_by='orchestrator-escalation-watcher-auto',
+            triage_note='task-604 status==done | probe: get_task 604 -> status=done',
+        )
+
+        assert result is not None
+        assert result.triaged_at is not None, 'Expected triaged_at to be stamped'
+        assert result.triaged_by == 'orchestrator-escalation-watcher-auto'
+        assert result.triage_note == 'task-604 status==done | probe: get_task 604 -> status=done'
+        assert result.status == 'pending', 'stamp_triage must not change status'
+        assert result.level == 2, 'stamp_triage must not change level'
+
+    def test_stamp_does_not_archive(self, tmp_path: Path):
+        """(a cont.) The file stays in the queue root (not moved to archive)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='note')
+
+        path = queue.queue_dir / f'{esc.id}.json'
+        assert path.exists(), 'Expected the record to remain in the queue root after stamping'
+
+    def test_stamp_is_durable_reload_shows_triage(self, tmp_path: Path):
+        """(a cont.) Reload via queue.get(id) shows the stamped triage fields."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='predicate P | probe: cmd -> out')
+
+        reloaded = queue.get(esc.id)
+        assert reloaded is not None
+        assert reloaded.triaged_by == 'watcher'
+        assert reloaded.triage_note == 'predicate P | probe: cmd -> out'
+        assert reloaded.triaged_at is not None
+
+    def test_returns_none_for_unknown_id(self, tmp_path: Path):
+        """(b) Returns None for a completely unknown id."""
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        result = queue.stamp_triage('esc-does-not-exist', triaged_by='watcher', triage_note='note')
+
+        assert result is None, f'Expected None for unknown id, got {result!r}'
+
+    def test_returns_none_for_archived_resolved_record(self, tmp_path: Path):
+        """(c) Returns None for a resolved+archived record; never resurrects it into the queue root."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.resolve(esc.id, 'Fixed')  # moves to archive
+
+        result = queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='note')
+
+        assert result is None, f'Expected None for archived record, got {result!r}'
+        path = queue.queue_dir / f'{esc.id}.json'
+        assert not path.exists(), 'stamp_triage must not resurrect the archived record into the queue root'
+
+        archived = queue.get(esc.id)  # falls back to archive
+        assert archived is not None
+        assert archived.triaged_at is None, 'Archived record must not gain a triage stamp'
+
+
 class TestResolveCascade:
     """EscalationQueue.resolve() cascades resolution to member L1s when L2 has members."""
 
