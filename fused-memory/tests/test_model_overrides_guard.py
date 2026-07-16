@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from fused_memory.middleware.model_overrides_guard import model_overrides_error
 
 # ---------------------------------------------------------------------------
@@ -111,3 +113,28 @@ class TestModelOverridesErrorRejection:
         )
         assert result is not None
         assert result.get('error_type') == 'ValidationError'
+
+    @pytest.mark.parametrize('value', [0, False])
+    def test_falsy_scalar_model_overrides_rejects(self, value):
+        """A falsy-but-wrong-typed scalar (0, False) is NOT silently treated as
+        absent -- the presence gate keys on the dict key existing, not on
+        truthiness, so these reach validate_model_overrides and are rejected
+        as non-dict."""
+        result = model_overrides_error({'model_overrides': value})
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+
+# ---------------------------------------------------------------------------
+# Presence-gate edge cases: explicit null / explicit {} vs. key absent
+# ---------------------------------------------------------------------------
+
+
+class TestModelOverridesErrorPresenceGate:
+    """The presence gate keys on dict-key existence, not truthiness (see
+    ``model_overrides_error``'s docstring). Only a missing key, an explicit
+    ``None``, or an explicit ``{}`` bypass validation."""
+
+    def test_explicit_null_model_overrides_accepts(self):
+        """metadata.model_overrides=None (explicit null) -> accept."""
+        assert model_overrides_error({'model_overrides': None}) is None

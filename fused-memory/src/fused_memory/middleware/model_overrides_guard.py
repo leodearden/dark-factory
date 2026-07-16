@@ -17,8 +17,17 @@ outside the allowlist is skipped and recorded in
 never blocked by a routing mis-config).
 
 Presence-gated like ``deterministic_task_guard._validate_milestone``: an
-absent or empty ``model_overrides`` is valid, so every existing caller that
-never sets it is unaffected.
+absent, ``None``, or empty-dict ``model_overrides`` is valid, so every
+existing caller that never sets it is unaffected.
+
+CAVEAT — a role key accepted by this shape guard is not automatically
+*effective*: ``shared.task_metadata.KNOWN_ROLE_NAMES`` also includes a
+few collapsed ``ModelsConfig`` keys ('reviewer', 'triage', 'module_tagger')
+that the orchestrator resolver never matches against (it keys strictly on
+the full dispatch ``role_name``, e.g. 'reviewer_comprehensive'). An
+override pinned under one of those collapsed keys passes here but is
+silently inert at resolve time — see the ``KNOWN_ROLE_NAMES`` docstring in
+``shared/task_metadata.py`` for the full explanation.
 """
 
 from __future__ import annotations
@@ -83,14 +92,25 @@ def model_overrides_error(metadata: str | dict[str, Any] | None) -> dict[str, An
     Returns a structured error dict (``{'error': ..., 'error_type':
     'ValidationError', 'hint': ...}``) when ``model_overrides`` is present
     and malformed (unknown role name, non-string value, or a non-dict
-    value), or ``None`` when it is absent, empty, or well-formed.
+    value), or ``None`` when it is absent, ``None``, an empty dict, or
+    well-formed.
+
+    Gated on *presence*, not truthiness: only a missing key, an explicit
+    ``None``, or an explicit ``{}`` are treated as "nothing to validate".
+    A wrong-typed-but-falsy scalar (e.g. ``0`` or ``False``) is NOT treated
+    as absent -- it reaches ``validate_model_overrides`` below and is
+    rejected as a non-dict, same as any other malformed value.
 
     Args:
         metadata: Task metadata (dict, JSON string, or None).
     """
-    model_overrides = _parse_metadata(metadata).get('model_overrides')
-    if not model_overrides:
-        # Absent, None, or empty -- nothing to validate (presence-gated).
+    parsed = _parse_metadata(metadata)
+    if 'model_overrides' not in parsed:
+        # Key not present at all -- nothing to validate.
+        return None
+    model_overrides = parsed['model_overrides']
+    if model_overrides is None or model_overrides == {}:
+        # Explicit null or explicit empty dict -- benign "no overrides".
         return None
     try:
         validate_model_overrides(model_overrides)
