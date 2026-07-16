@@ -14,6 +14,7 @@ from typing import Any
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from shared.branch_names import canonical_queued_branch_name
+from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
@@ -1381,6 +1382,43 @@ def create_server(
         if harness is None:
             return {'wired': False, 'error': 'escalation server running standalone'}
         return harness.get_merge_halt_status()
+
+    @mcp.tool()
+    def get_task_runtime_state() -> dict[str, Any]:
+        """Live per-task runtime snapshot, projected to the shared wire contract.
+
+        Delegates to ``harness.task_runtime_snapshot()`` (task alpha, task
+        2634) and projects each duck-typed entry into
+        ``shared.task_runtime_state.TaskRuntimeEntry`` — read as attributes
+        (no static ``orchestrator`` import, matching ``merge_request``'s
+        reverse-dep discipline) so this works against both the real
+        ``orchestrator.task_runtime.TaskRuntimeState`` and a test stub alike.
+        A per-task artifact read failure is carried through unmodified
+        (``loops``/``attempts``/``phase``/``started`` stay ``None`` plus a
+        non-empty ``error`` — never coerced to a fabricated honest-looking
+        value). Standalone (no harness wired) returns the model's legible
+        empty envelope, never raises. This server always emits
+        ``offline: False``; the dashboard synthesizes ``True`` client-side
+        when this server itself is unreachable.
+        """
+        if harness is None:
+            return TaskRuntimeSnapshot().model_dump(mode='json')
+        states = harness.task_runtime_snapshot()
+        entries = [
+            TaskRuntimeEntry(
+                task_id=s.task_id,
+                has_worktree=s.has_worktree,
+                loops=s.loops,
+                attempts=s.attempts,
+                started=s.started,
+                lane=s.lane,
+                phase=s.phase,
+                lane_state=s.lane_state,
+                error=getattr(s, 'error', None),
+            )
+            for s in states
+        ]
+        return TaskRuntimeSnapshot(offline=False, tasks=entries).model_dump(mode='json')
 
     @mcp.tool()
     def get_merge_queue() -> dict[str, Any]:
