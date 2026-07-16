@@ -197,6 +197,24 @@ class TestCandidateHash:
         b = CandidateTask(title='T', spawned_from='43')
         assert a.payload_hash() != b.payload_hash()
 
+    def test_execution_class_affects_hash(self):
+        """(task 2687) match_candidate routes on execution_class FIRST and
+        unconditionally, so two otherwise-identical candidates differing only in
+        execution_class must NOT collide — otherwise the first-processed
+        candidate's cached routing decision (e.g. a deterministic pure-gate) is
+        wrongly returned for the second (e.g. a code_tdd change), silently
+        skipping the architect.
+        """
+        a = CandidateTask(title='T', description='D', details='X', execution_class='operational')
+        b = CandidateTask(title='T', description='D', details='X', execution_class='code_tdd')
+        assert a.payload_hash() != b.payload_hash()
+
+    def test_execution_class_none_vs_set_differ(self):
+        """(task 2687) An untagged candidate must not collide with a tagged one."""
+        a = CandidateTask(title='T', description='D', details='X')
+        b = CandidateTask(title='T', description='D', details='X', execution_class='operational')
+        assert a.payload_hash() != b.payload_hash()
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # task-2687 step-1 RED: TestCandidateTaskExecutionClass

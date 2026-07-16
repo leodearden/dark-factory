@@ -231,6 +231,15 @@ class CandidateTask:
         h.update('\n'.join(sorted(self.files_to_modify)).encode())
         h.update(b'\x00')
         h.update((self.spawned_from or '').encode())
+        h.update(b'\x00')
+        # execution_class routes match_candidate FIRST and unconditionally
+        # (task 2687), so it must be hashed too — otherwise two candidates that
+        # differ ONLY in execution_class collide and the first-processed one's
+        # cached routing decision (e.g. a deterministic pure-gate) is wrongly
+        # returned for the second (e.g. a code_tdd change), silently skipping
+        # the architect. This is the dangerous false-positive the module
+        # docstring warns against.
+        h.update((self.execution_class or '').encode())
         # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
         # Any change to length or algorithm must be mirrored there and at the other
         # task_curator.py mirror sites (_intra_batch_key, _normalize_key).
