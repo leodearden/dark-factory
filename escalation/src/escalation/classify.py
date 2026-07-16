@@ -19,6 +19,8 @@ same resolver membership or benign/actionable logic independently.
 
 from __future__ import annotations
 
+from escalation.models import Escalation
+
 # Resolver→tier classification table (plans/escalation-lifecycle-dashboard-prd.md
 # Contract Seam 1). Exact-membership frozensets for the tiers whose
 # resolved_by values are fixed literals; 'cascade' and 'steward' are matched
@@ -61,3 +63,24 @@ def classify_resolver_tier(resolved_by: str | None) -> str:
     if resolved_by in _REAPER_SWEEP_RESOLVERS:
         return 'reaper-sweep'
     return 'other-auto'
+
+
+def effective_benign(record: Escalation) -> tuple[str | None, str]:
+    """Return the (class, provenance) pair for *record* — stamp-first, proxy-fallback.
+
+    - Stamped (``record.resolution_class`` is not None) -> the stamp itself,
+      provenance ``'stamped'``. This covers both a direct explicit stamp and a
+      cascade-inherited stamp (the member's ``resolution_class`` field is
+      physically set either way).
+    - Unstamped and ``status == 'dismissed'`` -> ``('benign', 'inferred')``.
+    - Unstamped and ``status == 'resolved'`` -> ``('actionable', 'inferred')``.
+    - Otherwise (``status == 'pending'``) -> ``(None, 'excluded')`` — an open
+      escalation has no resolution to classify yet.
+    """
+    if record.resolution_class is not None:
+        return record.resolution_class, 'stamped'
+    if record.status == 'dismissed':
+        return 'benign', 'inferred'
+    if record.status == 'resolved':
+        return 'actionable', 'inferred'
+    return None, 'excluded'
