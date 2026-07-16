@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -36,7 +37,7 @@ from shared.cli_invoke import (
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
 from shared.task_claimant import compose_claimant_run_id
-from shared.task_metadata import RetryLedger
+from shared.task_metadata import RetryLedger, RoutingDecisionMirror, RoutingState
 from shared.task_statuses import TaskStatus
 
 from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
@@ -843,6 +844,34 @@ def _iteration_entry_is_work(entry: dict) -> bool:
     if agent == 'judge':
         return entry.get('event') == 'early_exit' and bool(entry.get('substantive_work'))
     return False
+
+
+def _routing_inputs_digest(
+    role: AgentRole,
+    task_id: str,
+    plan: dict,
+    modules: list[str],
+    routing_tier: int,
+) -> str:
+    """Stable sha256[:16] digest of the salient routing-resolution inputs (PRD γ).
+
+    Pure and deterministic: the same (role, task, plan shape, modules,
+    routing_tier) always yields the same digest, so telemetry consumers can
+    compare/dedupe resolutions without needing the full payload.  Digests the
+    plan's *step count* (not its full contents) and the modules list — cheap,
+    stable proxies for "what was being resolved" that avoid hashing large or
+    volatile plan bodies.
+    """
+    payload = {
+        'role': role.name,
+        'task_id': str(task_id),
+        'plan_step_count': len(plan.get('steps', [])),
+        'module_count': len(modules),
+        'modules': sorted(modules),
+        'routing_tier': routing_tier,
+    }
+    basis = json.dumps(payload, sort_keys=True).encode('utf-8')
+    return hashlib.sha256(basis).hexdigest()[:16]
 
 
 class TaskWorkflow:
@@ -7879,6 +7908,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         role_key = role.name
 
         model = getattr(models, role_key, role.default_model)
+        # Captured before _select_model_for_role's Rust-heuristic upgrade so
+        # the routing-decision telemetry below can detect whether that rule
+        # fired (PRD adaptive-model-routing, task γ / task 2533).
+        base_model = model
         model = self._select_model_for_role(role, model)
         budget = getattr(budgets, role_key, role.default_budget)
         max_turns_val = getattr(turns, role_key, role.default_max_turns)
@@ -7894,6 +7927,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             effort_val = effort_cfg.reviewer
             timeout_val = timeouts_cfg.reviewer
             backend_val = backends_cfg.reviewer
+
+        # Adaptive-model-routing telemetry (PRD γ, task 2533): pre-ε this is a
+        # coarse approximation — the only non-config resolution layer
+        # distinguishable today is the Rust-heuristic model upgrade above;
+        # task ε (RoutingDecision) replaces this with the real source layer.
+        source_layer = 'config'
+        rule_id: str | None = None
+        if model != base_model and role.name in ('implementer', 'debugger'):
+            source_layer = 'policy_rule'
+            rule_id = 'rust-large-plan-implementer'
 
         # Determine sandbox modules based on role (role.sandboxed is a
         # property of the role object — see roles.py's AgentRole/W9-η).
@@ -8084,6 +8127,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 },
             )
 
+        await self._record_routing_decision(
+            role,
+            model=model,
+            effort=effort_val,
+            budget_usd=budget,
+            max_turns=max_turns_val,
+            source_layer=source_layer,
+            rule_id=rule_id,
+        )
+
         if self.cost_store:
             try:
                 await self.cost_store.save_invocation(
@@ -8107,6 +8160,97 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 logger.warning('Failed to save invocation cost', exc_info=True)
 
         return result
+
+    async def _record_routing_decision(
+        self,
+        role: AgentRole,
+        *,
+        model: str,
+        effort: str,
+        budget_usd: float,
+        max_turns: int,
+        source_layer: str,
+        rule_id: str | None,
+    ) -> None:
+        """Persist the resolved routing decision for this invocation (PRD γ).
+
+        Best-effort and non-blocking end-to-end, mirroring the fire-and-forget
+        ``save_invocation`` pattern above and the "routing telemetry must
+        never block or crash a caller" philosophy of
+        ``RoutingState.from_metadata``: building the decision record itself
+        is wrapped in try/except (a MagicMock-configured role in many existing
+        ``_invoke`` unit tests fails ``RoutingDecisionMirror``'s strict str/
+        float/int field validation — that must never break the invocation
+        under test), the ``routing_decision`` event is guarded on
+        ``self.event_store``, and the ``metadata.routing`` mirror via
+        ``scheduler.update_task(metadata_mode='merge')`` is guarded on
+        ``self.scheduler`` and wrapped in its own try/except.  The in-memory
+        ``self.task['metadata']['routing']`` update always runs — regardless
+        of the scheduler write's outcome — so successive ``_invoke`` calls
+        within the same dispatch accumulate history without needing a
+        round-trip read.
+        """
+        try:
+            state = RoutingState.from_metadata(self.task.get('metadata'))
+            digest = _routing_inputs_digest(
+                role, self.task_id, self.plan, self.modules, state.routing_tier,
+            )
+            decision = RoutingDecisionMirror(
+                role=role.name,
+                model=model,
+                effort=effort,
+                budget_usd=budget_usd,
+                max_turns=max_turns,
+                source_layer=source_layer,
+                rule_id=rule_id,
+                rejected=[],
+                routing_tier=state.routing_tier,
+                decided_at=datetime.now(UTC).isoformat(),
+            )
+        except Exception:
+            logger.warning(
+                'Task %s: failed to build routing decision record (role=%s)',
+                self.task_id, role.name, exc_info=True,
+            )
+            return
+
+        if self.event_store:
+            self.event_store.emit(
+                EventType.routing_decision,
+                task_id=self.task_id,
+                role=role.name,
+                data={
+                    'model': model,
+                    'effort': effort,
+                    'budget_usd': budget_usd,
+                    'max_turns': max_turns,
+                    'source_layer': source_layer,
+                    'rule_id': rule_id,
+                    'rejected': [],
+                    'routing_tier': state.routing_tier,
+                    'inputs_digest': digest,
+                },
+            )
+
+        new_state = state.with_decision(decision)
+        if self.scheduler:
+            try:
+                await self.scheduler.update_task(
+                    self.task_id,
+                    {'routing': new_state.model_dump()},
+                    # SchedulerFacade's Protocol (scheduler.py) predates
+                    # metadata_mode and only declares `append`; the concrete
+                    # Scheduler.update_task (and the harness reblock_guard
+                    # call site) already support it. Out of task 2533's scope
+                    # to widen the Protocol itself — see escalate_info.
+                    metadata_mode='merge',  # type: ignore[reportCallIssue]
+                )
+            except Exception:
+                logger.warning(
+                    'Task %s: failed to mirror routing decision onto metadata',
+                    self.task_id, exc_info=True,
+                )
+        self.task.setdefault('metadata', {})['routing'] = new_state.model_dump()
 
     def _check_escalations(self):
         """Check for pending escalations for this task."""
