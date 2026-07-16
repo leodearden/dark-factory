@@ -46,6 +46,18 @@ class EventType(StrEnum):
 
     # Agent invocations
     invocation_end = 'invocation_end'
+    # Adaptive model routing (plans/adaptive-model-routing-prd.md, task γ) —
+    # emitted once per LLM invocation by TaskWorkflow._invoke, immediately
+    # after invocation_end.  Payload: the resolved model/effort/budget_usd/
+    # max_turns, source_layer (which layer decided — e.g. 'config' or
+    # 'policy_rule'), rule_id (the specific rule that fired, if any),
+    # rejected (list of alternatives considered and turned down),
+    # routing_tier (the current adaptive-retry tier counter), and
+    # inputs_digest (a stable hash of the salient resolution inputs).  Pre-ε
+    # this records a coarse approximation of source_layer/rule_id (only the
+    # existing Rust-heuristic model upgrade is distinguishable from plain
+    # config lookup); task ε swaps in the full RoutingDecision.
+    routing_decision = 'routing_decision'
 
     # Workflow phases
     phase_enter = 'phase_enter'
