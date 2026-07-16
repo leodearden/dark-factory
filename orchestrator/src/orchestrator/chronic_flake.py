@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -264,3 +263,70 @@ def build_chronic_flake_fix_task_arguments(
             'roles': evidence.roles,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# FilingLedger: persistent per-test rate-limit store (step-9/step-10)
+# ---------------------------------------------------------------------------
+
+
+class FilingLedger:
+    """Persistent JSON store of the last auto-filed timestamp per test
+    (``{test: last_filed_iso}``), backing the per-test rate limit that keeps
+    :func:`maybe_file_chronic_flake_tasks` from re-filing the same chronic
+    flake on every verify run.
+
+    Loaded eagerly at construction time (mirrors
+    :class:`~orchestrator.landed_outbox.LandedOutbox`'s warm-at-construction
+    cache) via ``shared.safe_io.load_json_or_warn`` — fail-open: a missing
+    file (first run) or a corrupt file (disk/process failure) both yield an
+    empty ledger rather than raising, since losing rate-limit history only
+    risks filing a little sooner than ideal, never a correctness bug.
+
+    ``now`` is always caller-injected (never ``datetime.now()`` internally)
+    so callers/tests can drive rate-limit-elapsed scenarios deterministically.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self._path = Path(path)
+        self._data: dict[str, str] = self.load()
+
+    def load(self) -> dict[str, str]:
+        """(Re)load the on-disk ledger; best-effort — a missing or corrupt
+        file yields ``{}`` rather than raising."""
+        data, ok = load_json_or_warn(self._path, default={}, on_corrupt='warn')
+        if not ok or not isinstance(data, dict):
+            return {}
+        return {
+            test: last_filed_iso
+            for test, last_filed_iso in data.items()
+            if isinstance(test, str) and isinstance(last_filed_iso, str)
+        }
+
+    def should_file(self, test: str, now: datetime, days: int) -> bool:
+        """True if *test* has never been filed, or its last filing was at
+        least *days* days before *now*."""
+        last_filed_iso = self._data.get(test)
+        if last_filed_iso is None:
+            return True
+        try:
+            last_filed = datetime.fromisoformat(last_filed_iso)
+        except ValueError:
+            # Hand-edited/schema-drifted entry — fail-open (treat as unfiled).
+            return True
+        return now - last_filed >= timedelta(days=days)
+
+    def record(self, test: str, now: datetime) -> None:
+        """Record *test* as filed at *now* (in-memory only — call
+        :meth:`save` to persist)."""
+        self._data[test] = now.isoformat()
+
+    def save(self) -> None:
+        """Best-effort persist the in-memory ledger to disk (mkdir parents)."""
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(self._data))
+        except OSError as exc:
+            logger.warning(
+                'chronic_flake: failed to save filing ledger at %s: %s', self._path, exc,
+            )
