@@ -1025,7 +1025,6 @@ Handle this escalation, then call `resolve_issue` with a summary.
         risk_label = proposal.get('risk_label', '')
         files_referenced = proposal.get('files_referenced') or []
         created_at = proposal.get('timestamp') or proposal.get('investigated_at') or ''
-        files_str = ', '.join(files_referenced)
 
         last_blocked_at = (task.get('metadata') or {}).get('last_blocked_at')
         if created_at and last_blocked_at:
@@ -1036,6 +1035,13 @@ Handle this escalation, then call `resolve_issue` with a summary.
             else:
                 if is_stale:
                     return ''
+
+        # Coerce defensively: files_referenced is persisted, untyped data, so
+        # a stray non-string element must never crash the prompt build — the
+        # same fail-open spirit as the timestamp comparison above. Deferred
+        # until after the staleness early-return so a stale/omitted proposal
+        # skips the work entirely.
+        files_str = ', '.join(str(f) for f in files_referenced)
 
         return f"""\
 ## Prior Block-Time Investigation

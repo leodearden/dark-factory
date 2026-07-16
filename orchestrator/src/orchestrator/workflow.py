@@ -3137,6 +3137,13 @@ class TaskWorkflow:
             # truthy existing_plan, so bool(existing_plan) is False ONLY for
             # a truly-fresh no-plan dispatch, keeping C-A1 anti-anchoring
             # intact for first dispatch.
+            # bool(...), not `is not None`, is the correct discriminator:
+            # existing_plan is self.artifacts.read_plan() (line ~3071), which
+            # returns {} — never None — when plan.json is absent, so an
+            # `is not None` check would always be True and defeat the flag
+            # entirely. A present-but-empty {} plan carries no steps/session
+            # data to re-plan from either, so it is semantically equivalent
+            # to "no plan" and correctly falls to fresh-dispatch here too.
             prompt = await self.briefing.build_architect_prompt(
                 self.task, worktree=self.worktree,
                 include_prior_proposals=bool(existing_plan),
