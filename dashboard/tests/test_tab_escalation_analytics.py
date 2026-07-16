@@ -352,3 +352,73 @@ class TestEscalationAnalyticsRoute:
         resp2 = client.get('/api/v2/dashboard/escalation-analytics')
         assert resp2.status_code == 200
         assert resp2.json()['ESCALATION_ANALYTICS']['parse_failures'] >= 1
+
+
+# ---------------------------------------------------------------------------
+# task 2659 (delta) — tab_escalation_analytics.jsx UI wiring
+# ---------------------------------------------------------------------------
+#
+# The fixtures/helpers above (tab_analytics_jsx_body, app_jsx_body,
+# shell_jsx_body, index_html_body, _extract_function_body,
+# _ScriptTagCollector, _find_script_position, _assert_script_loads_before)
+# were scaffolded in prereq-1; the tests below consume them.
+
+
+# ---------------------------------------------------------------------------
+# step-1 test: tab_escalation_analytics.jsx is served and exports the component
+# ---------------------------------------------------------------------------
+
+
+def test_tab_analytics_jsx_served_and_exports(_client) -> None:
+    """GET /static/redux/tab_escalation_analytics.jsx returns 200 with the expected wiring.
+
+    Asserts:
+    (a) 200 HTTP status.
+    (b) function EscalationAnalyticsTab( is declared.
+    (c) exports ADDITIVELY via window.DF_TABS.EscalationAnalyticsTab = (not
+        window.DF_TABS = {).
+    (d) reads window.DF_DATA.ESCALATION_ANALYTICS (or an aliased DF.ESCALATION_ANALYTICS).
+    (e) renders <ProjectGroup (subsection-per-project).
+    (f) fold state is persisted via useOpenSet( referencing 'df.open.escanalytics'.
+    """
+    resp = _client.get('/static/redux/tab_escalation_analytics.jsx')
+    assert resp.status_code == 200, (
+        f'Expected 200 for /static/redux/tab_escalation_analytics.jsx, got {resp.status_code}'
+    )
+    body = resp.text
+    assert 'function EscalationAnalyticsTab(' in body, (
+        'tab_escalation_analytics.jsx does not define `function EscalationAnalyticsTab(` — '
+        'the component must be declared as a named function for the export to work.'
+    )
+    # Additive export — must NOT clobber window.DF_TABS = {...} and must assign
+    # EscalationAnalyticsTab.
+    assert 'window.DF_TABS.EscalationAnalyticsTab' in body, (
+        'tab_escalation_analytics.jsx does not set window.DF_TABS.EscalationAnalyticsTab — '
+        'add `window.DF_TABS.EscalationAnalyticsTab = EscalationAnalyticsTab;` at the bottom '
+        'of the file to export additively without clobbering the existing window.DF_TABS object.'
+    )
+    assert 'window.DF_TABS = {' not in body, (
+        'tab_escalation_analytics.jsx clobbers window.DF_TABS = {...} — tabs.jsx already '
+        'creates that object; this file must mutate it additively instead.'
+    )
+    # Reads ESCALATION_ANALYTICS data
+    assert 'ESCALATION_ANALYTICS' in body, (
+        'tab_escalation_analytics.jsx does not reference ESCALATION_ANALYTICS — it should '
+        'read window.DF_DATA.ESCALATION_ANALYTICS (or an alias like DF.ESCALATION_ANALYTICS) '
+        'for its data source.'
+    )
+    # Renders ProjectGroup for subsection-per-project folding
+    assert '<ProjectGroup' in body, (
+        'tab_escalation_analytics.jsx does not render <ProjectGroup — each project must be '
+        'wrapped in a ProjectGroup from window.DF_SHELL for foldable sections.'
+    )
+    # Fold state persisted with the correct key
+    assert 'useOpenSet(' in body, (
+        'tab_escalation_analytics.jsx does not call useOpenSet( — add the local copy of '
+        "useOpenSet from tab_escalations.jsx and call it with project ids and 'df.open.escanalytics'."
+    )
+    assert "'df.open.escanalytics'" in body, (
+        "tab_escalation_analytics.jsx does not reference the localStorage key "
+        "'df.open.escanalytics' — pass it as the storageKey argument to useOpenSet so fold "
+        'state is persisted.'
+    )
