@@ -3021,6 +3021,59 @@ class GitOps:
             )
             return 127
 
+    # θ: warm-lane PROACTIVE soft-floor throttle helpers (task 2443) --------
+
+    async def _run_warm_lane_soft_guard(self) -> int:
+        """Invoke ``<project_root>/scripts/warm-lane-disk-guard.sh check --soft``.
+
+        θ (task 2443, §9.5): the proactive soft-floor counterpart to
+        :meth:`_run_warm_lane_disk_guard`, run BEFORE it's too late — a soft
+        floor ABOVE the hard floor lets the caller throttle new allocations
+        before the hard floor's exit-75 backstop is ever reached. Mirrors
+        the ``_run_warm_lane_disk_guard`` fail-soft helper pattern exactly:
+        absent script → 127 sentinel; any unexpected exception → 127; never
+        raises.
+
+        Returns:
+            0   — healthy (both hard and soft floors clear).
+            3   — soft pressure (above hard floor, below soft floor;
+                  stdout carries the ``@@REIFY_WARM_LANE_SOFT_PRESSURE@@``
+                  sentinel per the reify contract — not parsed here).
+            75  — hard disk pressure (EX_TEMPFAIL); takes precedence over
+                  soft per the reify script's own contract. Callers should
+                  rely on the ε hard-floor check for this outcome, not this
+                  method.
+            127 — script absent or exception (fail-open sentinel).
+            other non-zero — script error (treated as fail-open by caller).
+        """
+        try:
+            script = self.project_root / 'scripts' / 'warm-lane-disk-guard.sh'
+            if not script.exists():
+                logger.debug(
+                    '_run_warm_lane_soft_guard: script absent at %s — no-op', script,
+                )
+                return 127
+            cmd = [
+                str(script), 'check',
+                '--mount', str(self.worktree_base),
+                '--min-free-gib', str(self.config.warm_lane_min_free_gib),
+                '--min-free-inodes', str(self.config.warm_lane_min_free_inodes),
+                '--soft',
+                '--soft-free-gib', str(self.config.warm_lane_soft_free_gib),
+                '--soft-free-inodes', str(self.config.warm_lane_soft_free_inodes),
+            ]
+            rc, _, err = await _run(cmd, cwd=self.project_root)
+            if rc not in (0, 3, 75):
+                logger.warning(
+                    '_run_warm_lane_soft_guard: script exited %d (stderr=%r)', rc, err,
+                )
+            return rc
+        except Exception:
+            logger.warning(
+                '_run_warm_lane_soft_guard: unexpected error', exc_info=True,
+            )
+            return 127
+
     async def _run_warm_lane_gc_reclaim(self) -> int:
         """Invoke ``<project_root>/scripts/warm-lane-gc.sh reclaim``.
 
