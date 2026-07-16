@@ -260,8 +260,13 @@ async def apply_corrections(
         if correction.action == ACTION_ANNOTATE:
             await _apply_annotate(backend, project_root, correction, tag)
             summary['annotated'] += 1
-        # ACTION_REOPEN handling (+ per-op error isolation for both
-        # branches) lands in later steps of this task's step sequence.
+        elif correction.action == ACTION_REOPEN:
+            reopened = await _apply_reopen(backend, project_root, correction, tag)
+            if reopened:
+                summary['reopened'] += 1
+            # Not-persisted detection (reopen_failed / errors accounting)
+            # and per-op error isolation for both branches land in later
+            # steps of this task's step sequence.
 
     return summary
 
@@ -302,6 +307,55 @@ async def _apply_annotate(
         tag=tag,
     )
     logger.info('Annotated task %s (label=%s)', correction.task_id, correction.label)
+
+
+async def _apply_reopen(
+    backend: Any, project_root: str, correction: Correction, tag: str | None,
+) -> bool:
+    """Flip *correction*'s task ``done -> pending`` and verify it persisted.
+
+    Task 1175's own metadata documents that prior reconciliation reopens
+    wrote ``metadata.reopen_*`` fields but the top-level ``status`` silently
+    never flipped — so a bare ``set_task_status`` call is not trusted on its
+    own. Success requires BOTH:
+
+      1. ``set_task_status`` did not return the typed
+         :class:`StatusWriteNotPersistedResult` failure DTO
+         (``result.get('success') is False`` or
+         ``result.get('error') == 'status_write_not_persisted'``).
+      2. An independent ``get_task`` re-read confirms ``status == 'pending'``
+         — a belt-and-suspenders check against exactly the class of silent
+         non-persistence task 1175 suffered.
+
+    Only on a verified success is the audit-trail annotation written (the
+    same non-destructive ``x_provenance_audit`` merge path as
+    :func:`_apply_annotate`, with ``reopen_reason`` merged in) and ``True``
+    returned. Returns ``False`` on any not-persisted outcome — the caller
+    (a later step in this module's build-out) is responsible for
+    ``reopen_failed``/``errors`` accounting; this function never raises for
+    a not-persisted result.
+    """
+    result = await backend.set_task_status(correction.task_id, 'pending', project_root, tag)
+    write_persisted = (
+        result.get('success') is not False
+        and result.get('error') != 'status_write_not_persisted'
+    )
+
+    fresh = await backend.get_task(correction.task_id, project_root, tag)
+    reread_confirms_pending = fresh.get('status') == 'pending'
+
+    if not (write_persisted and reread_confirms_pending):
+        return False
+
+    await backend.update_task(
+        correction.task_id, project_root,
+        metadata=_annotation_metadata(
+            correction, extra={'reopen_reason': correction.reopen_reason},
+        ),
+        tag=tag,
+    )
+    logger.info('Reopened task %s (done -> pending)', correction.task_id)
+    return True
 
 
 # NOTE: the CLI entry point (main/_run, step 14) lands in a later commit of
