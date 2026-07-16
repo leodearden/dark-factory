@@ -3477,3 +3477,46 @@ def test_boundary7_liveness_during_window_does_not_stamp_clock(
         "deploy, not a single wedged-unit revive"
     )
 
+
+def test_boundary8_coordinator_fire_while_busy_link_seam(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Scenario 8 (I6) -- coordinator fire-while-busy, cross-tier LINK/
+    composition assertion. The coordinator's internal arm/debounce/force-
+    fire decision logic is owned by
+    orchestrator/tests/test_fleet_staleness_composition.py and is NOT
+    re-derived here -- ε only asserts the integration seam that makes
+    fire-while-busy safe under the shared 8h cap:
+
+    (a) the watchdog's FLEET_DEPLOY_CLOCK_PATH resolves to the SAME
+        data/orchestrator/last_redeploy_orchestrator.json relative path the
+        coordinator persists to (orchestrator.service_restart.
+        FLEET_DEPLOY_CLOCK_RELPATH) -- the single shared clock both tiers
+        honor (restates test_fleet_deploy_clock_path_matches_across_tiers
+        above as part of this scenario's acceptance signal).
+    (b) a bare OrchestratorConfig() exposes
+        orchestrator_restart_force_fire_after_secs (δ's fire-while-busy
+        knob), default 4500 (75 min).
+
+    Uses pytest.importorskip("orchestrator.config") so the otherwise
+    stdlib-only watchdog suite still collects and passes in a minimal env
+    where the orchestrator package/venv is not importable.
+    """
+    pytest.importorskip("orchestrator.config")
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.service_restart import FLEET_DEPLOY_CLOCK_RELPATH
+
+    monkeypatch.delenv("ORCH_FLEET_DEPLOY_CLOCK", raising=False)
+    wdog = _load_watchdog()
+    expected_path = str(pathlib.Path(wdog.REPO_DIR) / FLEET_DEPLOY_CLOCK_RELPATH)
+    assert wdog.FLEET_DEPLOY_CLOCK_PATH == expected_path, (
+        "the watchdog and the coordinator must honor the exact same shared "
+        "fleet-deploy clock path for fire-while-busy to be safe under the "
+        "8h cap"
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ORCH_CONFIG_PATH", raising=False)
+    cfg = OrchestratorConfig()
+    assert cfg.orchestrator_restart_force_fire_after_secs == 4500.0
+
