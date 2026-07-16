@@ -264,9 +264,16 @@ async def apply_corrections(
             reopened = await _apply_reopen(backend, project_root, correction, tag)
             if reopened:
                 summary['reopened'] += 1
-            # Not-persisted detection (reopen_failed / errors accounting)
-            # and per-op error isolation for both branches land in later
-            # steps of this task's step sequence.
+            else:
+                # Loud, not silent: a reopen that did not verifiably
+                # persist is recorded as a failure and counted as an
+                # error, but the batch is NOT aborted — the next
+                # correction still gets a chance to apply.
+                summary['reopen_failed'].append(correction.task_id)
+                summary['errors'] += 1
+            # Per-op error isolation (try/except around each correction so
+            # one raised exception never aborts the batch) lands in a
+            # later step of this task's step sequence.
 
     return summary
 
@@ -330,10 +337,14 @@ async def _apply_reopen(
     Only on a verified success is the audit-trail annotation written (the
     same non-destructive ``x_provenance_audit`` merge path as
     :func:`_apply_annotate`, with ``reopen_reason`` merged in) and ``True``
-    returned. Returns ``False`` on any not-persisted outcome — the caller
-    (a later step in this module's build-out) is responsible for
-    ``reopen_failed``/``errors`` accounting; this function never raises for
-    a not-persisted result.
+    returned.
+
+    On any not-persisted outcome — the not-persisted DTO OR a re-read that
+    still shows a non-``'pending'`` status — this logs loudly at ERROR
+    (never silently), skips the audit annotation entirely (a corrective
+    annotation must not claim a reopen that didn't happen), and returns
+    ``False`` without raising. The caller is responsible for
+    ``reopen_failed``/``errors`` accounting and for continuing the batch.
     """
     result = await backend.set_task_status(correction.task_id, 'pending', project_root, tag)
     write_persisted = (
@@ -345,6 +356,13 @@ async def _apply_reopen(
     reread_confirms_pending = fresh.get('status') == 'pending'
 
     if not (write_persisted and reread_confirms_pending):
+        actual_status = result.get('actual_status', fresh.get('status'))
+        logger.error(
+            'Reopen for task %s did NOT persist (set_task_status '
+            "reported error=%r, get_task re-read status=%r) - recording as "
+            'reopen_failed_to_persist and skipping the audit annotation.',
+            correction.task_id, result.get('error'), actual_status,
+        )
         return False
 
     await backend.update_task(
