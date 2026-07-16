@@ -1131,6 +1131,22 @@ class TaskInterceptor:
             else:
                 result = dict(await _do_set_task_status_write())
 
+        # 4b. False-success propagation guard (task 2649 step-11). The
+        # backend read-back verify (steps 3/4) reports a lost/suppressed
+        # status write explicitly instead of a fabricated success:
+        # {'success': False, 'error': 'status_write_not_persisted', ...}.
+        # Short-circuit BEFORE emitting task_status_changed (step 5) and
+        # BEFORE firing targeted reconciliation (step 6) so a write that
+        # never actually persisted cannot journal a fabricated transition
+        # or drive reconciliation into memory/graph for a status change
+        # that never happened. Covers both the guarded-recon and plain
+        # write branches above, which converge on `result` here. Happy-path
+        # SetTaskStatusResult payloads (message/tasks) have no 'success'
+        # key, so `result.get('success') is False` is False for them and
+        # this check is a no-op.
+        if result.get('success') is False and result.get('error') == 'status_write_not_persisted':
+            return result
+
         # 5. Emit event
         payload: dict[str, Any] = {
             'task_id': task_id,
