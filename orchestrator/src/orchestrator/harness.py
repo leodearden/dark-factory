@@ -78,6 +78,7 @@ from orchestrator.task_ground_truth import (
     RecoveryAction,
     TaskGroundTruth,
 )
+from orchestrator.task_runtime import TaskRuntimeState, build_task_runtime_snapshot
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_STATUSES,
@@ -9349,6 +9350,17 @@ Output JSON matching the schema. Every task must appear in the output.
             'halted': self._merge_worker.is_wip_halted,
             'owner_esc_id': self._merge_worker.halt_owner_esc_id,
         }
+
+    def task_runtime_snapshot(self) -> list[TaskRuntimeState]:
+        """Per-task runtime state for every active task on this host (task
+        2634, PRD plans/dashboard-task-runtime-endpoint-prd.md task alpha).
+
+        Thin delegator to :func:`orchestrator.task_runtime.build_task_runtime_snapshot`
+        — synchronous and side-effect-free, reading local disk via this
+        harness's own git_ops/event_store, for a later MCP tool to project
+        to the dashboard's wire schema.
+        """
+        return build_task_runtime_snapshot(git_ops=self.git_ops, event_store=self.event_store)
 
     def force_unhalt_merge_queue(self, reason: str) -> dict[str, Any]:
         """Operator escape hatch for orphan halts (no escalation owns the halt).
