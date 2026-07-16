@@ -395,8 +395,12 @@ class TestDeriveVerifyPlanModulePath:
         assert run.cmd == parse_config_command(mc.test_command)
         assert 'conftest' in run.reason.lower()
 
-    def test_structural_file_full_suites_pyright_and_skips_pytest(self):
-        """GOLDEN D2 module-side: a Protocol source file widens pyright, skips pytest."""
+    def test_structural_file_full_suites_pyright_and_pytest_at_task_role(self):
+        """GOLDEN D2 module-side, migrated by the task-role pytest floor (λ, task 2589
+        R3): a Protocol source file widens pyright (D2, role-independent) and — at the
+        default role='task' — now also full-suites pytest via the floor, instead of the
+        pre-λ SKIPPED. See test_structural_file_full_suites_pyright_and_skips_pytest_at_merge_role
+        below for the preserved legacy SKIPPED shape at role='merge' (R4)."""
         mc = ModuleConfig(
             prefix='orchestrator',
             test_command='uv run --project orchestrator --directory orchestrator pytest tests/',
@@ -413,6 +417,36 @@ class TestDeriveVerifyPlanModulePath:
         assert mc.type_check_command is not None
         assert pyright_run.cmd == parse_config_command(mc.type_check_command)
         assert STRUCTURAL_DIFF[0] in pyright_run.reason
+
+        pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert pytest_run is not None
+        assert pytest_run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.test_command is not None
+        assert pytest_run.cmd == parse_config_command(mc.test_command)
+
+    def test_structural_file_full_suites_pyright_and_skips_pytest_at_merge_role(self):
+        """R4 rollback golden: the SAME structural diff at role='merge' preserves the
+        pre-λ legacy shape — pytest stays SKIPPED. The task-role floor (R3) never
+        widens the merge gate; that widening is the separate, knob-gated
+        merge_verify_breadth='full' path."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --project orchestrator --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+            type_check_command=(
+                'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
+            ),
+        )
+        config = OrchestratorConfig(project_root=Path('/fake'), merge_verify_breadth='scoped')
+        plan = derive_verify_plan(
+            STRUCTURAL_DIFF, [mc], config, fake_worktree_reader, role='merge',
+        )
+
+        pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
+        assert pyright_run is not None
+        assert pyright_run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.type_check_command is not None
+        assert pyright_run.cmd == parse_config_command(mc.type_check_command)
 
         pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
         assert pytest_run is not None

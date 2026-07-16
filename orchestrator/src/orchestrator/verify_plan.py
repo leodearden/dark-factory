@@ -360,6 +360,13 @@ def _derive_module_runs(
                 mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
                 'pytest: file-scoped to touched test file(s)',
             ))
+        elif role == 'task':
+            test_cmd = parse_config_command(mc.test_command)
+            runs.append(PlannedRun(
+                mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
+                'pytest: source-only diff — owning-module full suite (task role); '
+                'sibling modules NOT run',
+            ))
         else:
             runs.append(PlannedRun(
                 mc.prefix, None, ScopeKind.SKIPPED,
@@ -658,7 +665,7 @@ def derive_verify_plan(
     if module_configs:
         runs: list[PlannedRun] = []
         for mc in module_configs:
-            runs.extend(_derive_module_runs(mc, existing_files, worktree_reader))
+            runs.extend(_derive_module_runs(mc, existing_files, worktree_reader, role=role))
         return VerifyPlan(runs=tuple(runs))
     return VerifyPlan(runs=tuple(_derive_fallback_runs(existing_files, config, worktree_reader)))
 
