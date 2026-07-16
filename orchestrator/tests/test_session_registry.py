@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import logging
 import os
 import re
@@ -2278,3 +2279,267 @@ def test_main_write_decision_refiling_same_id_overwrites_not_duplicates(
     assert len(listed) == 1
     assert listed[0].id == 'dec-park-4'
     assert listed[0].text == 'second?'
+
+
+# ---------------------------------------------------------------------------
+# Step-6: decision reaper (C8 close-on-resolve)
+# ---------------------------------------------------------------------------
+
+
+def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
+    """A still-pending escalation lives directly under the queue root."""
+    escalations_dir = tmp_path / 'escalations'
+    escalations_dir.mkdir()
+    (escalations_dir / 'esc-2303-2.json').write_text(
+        json.dumps({'status': 'pending', 'id': 'esc-2303-2'})
+    )
+
+    assert sr.read_escalation_status(escalations_dir, 'esc-2303-2') == 'pending'
+
+
+def test_read_escalation_status_falls_back_to_archive(tmp_path: Path) -> None:
+    """A resolved/dismissed escalation has been moved into archive/YYYY-MM-DD/
+    by escalation.queue._archive_resolved; read_escalation_status must find
+    it there when the queue-root file is absent.
+    """
+    escalations_dir = tmp_path / 'escalations'
+    archive_dir = escalations_dir / 'archive' / '2026-07-16'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-2303-2.json').write_text(json.dumps({'status': 'resolved'}))
+
+    assert sr.read_escalation_status(escalations_dir, 'esc-2303-2') == 'resolved'
+
+
+def test_read_escalation_status_multiple_archive_matches_picks_newest(tmp_path: Path) -> None:
+    """Duplicate ids across dated archive subdirs are not expected in normal
+    operation, but read_escalation_status's tie-break -- sorted matches,
+    take the last -- is an explicit, load-bearing contract and must prefer
+    the newer dated subdir.
+    """
+    escalations_dir = tmp_path / 'escalations'
+    older_dir = escalations_dir / 'archive' / '2026-07-15'
+    newer_dir = escalations_dir / 'archive' / '2026-07-16'
+    older_dir.mkdir(parents=True)
+    newer_dir.mkdir(parents=True)
+    (older_dir / 'esc-2303-2.json').write_text(json.dumps({'status': 'dismissed'}))
+    (newer_dir / 'esc-2303-2.json').write_text(json.dumps({'status': 'resolved'}))
+
+    assert sr.read_escalation_status(escalations_dir, 'esc-2303-2') == 'resolved'
+
+
+def test_read_escalation_status_unknown_id_returns_none(tmp_path: Path) -> None:
+    """No file at the root and none in the archive -> None, not a raise."""
+    escalations_dir = tmp_path / 'escalations'
+    escalations_dir.mkdir()
+
+    assert sr.read_escalation_status(escalations_dir, 'esc-does-not-exist') is None
+
+
+def test_read_escalation_status_corrupt_body_returns_none(tmp_path: Path) -> None:
+    """A corrupt/non-JSON escalation body must fail soft, returning None."""
+    escalations_dir = tmp_path / 'escalations'
+    escalations_dir.mkdir()
+    (escalations_dir / 'esc-bad.json').write_text('{not valid json')
+
+    assert sr.read_escalation_status(escalations_dir, 'esc-bad') is None
+
+
+def test_reap_answered_decisions_matrix(tmp_path: Path) -> None:
+    """One reap_answered_decisions call exercises the full close-on-resolve
+    matrix: resolved->ANSWERED, dismissed->DROPPED, pending/unknown->left
+    OPEN, an already-closed decision is skipped WITHOUT consulting the
+    callback, and a decision with no escalation_id is skipped WITHOUT
+    consulting the callback either.
+    """
+    sr.write_decision(
+        _make_decision(id='dec-resolved', escalation_id='esc-1', state=sr.DecisionState.OPEN),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(id='dec-dismissed', escalation_id='esc-2', state=sr.DecisionState.OPEN),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(id='dec-pending', escalation_id='esc-3', state=sr.DecisionState.OPEN),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(id='dec-unknown', escalation_id='esc-4', state=sr.DecisionState.OPEN),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(
+            id='dec-already-answered', escalation_id='esc-5', state=sr.DecisionState.ANSWERED
+        ),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(
+            id='dec-already-dropped', escalation_id='esc-6', state=sr.DecisionState.DROPPED
+        ),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(id='dec-no-escalation', escalation_id=None, state=sr.DecisionState.OPEN),
+        root=tmp_path,
+    )
+
+    # esc-4 deliberately absent from this map -> callback returns None for it.
+    # esc-5/esc-6 map to a close-worthy status too, but must never be
+    # consulted -- their decisions are already closed.
+    statuses = {
+        'esc-1': 'resolved',
+        'esc-2': 'dismissed',
+        'esc-3': 'pending',
+        'esc-5': 'resolved',
+        'esc-6': 'dismissed',
+    }
+    consulted: list[str] = []
+
+    def fake_status(decision: sr.DecisionRecord) -> str | None:
+        consulted.append(decision.id)
+        if decision.escalation_id is None:
+            return None
+        return statuses.get(decision.escalation_id)
+
+    reaped = sr.reap_answered_decisions(root=tmp_path, escalation_status=fake_status)
+
+    reaped_by_id = {r.id: (r.escalation_id, r.new_state) for r in reaped}
+    assert reaped_by_id == {
+        'dec-resolved': ('esc-1', 'answered'),
+        'dec-dismissed': ('esc-2', 'dropped'),
+    }
+    # Only the still-OPEN, escalation-bearing decisions are ever passed to
+    # the callback -- already-closed and no-escalation_id decisions are
+    # skipped before it is invoked.
+    assert set(consulted) == {'dec-resolved', 'dec-dismissed', 'dec-pending', 'dec-unknown'}
+
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-resolved'] == sr.DecisionState.ANSWERED
+    assert listed['dec-dismissed'] == sr.DecisionState.DROPPED
+    assert listed['dec-pending'] == sr.DecisionState.OPEN
+    assert listed['dec-unknown'] == sr.DecisionState.OPEN
+    assert listed['dec-already-answered'] == sr.DecisionState.ANSWERED
+    assert listed['dec-already-dropped'] == sr.DecisionState.DROPPED
+    assert listed['dec-no-escalation'] == sr.DecisionState.OPEN
+
+
+# ---------------------------------------------------------------------------
+# CLI reap-decisions verb (Fleet Cockpit C8: close-on-resolve driver)
+# ---------------------------------------------------------------------------
+
+
+def test_main_reap_decisions_closes_answered_from_archived_escalation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An escalation archived (resolved) closes its OPEN decision to
+    ANSWERED, and the closed id is echoed on stdout.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-07-16'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-resolved.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-cli-resolved',
+            project='df',
+            escalation_id='esc-resolved',
+            state=sr.DecisionState.OPEN,
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(escalations_dir)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-cli-resolved'] == sr.DecisionState.ANSWERED
+    assert 'dec-cli-resolved' in capsys.readouterr().out
+
+
+def test_main_reap_decisions_leaves_pending_escalation_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A still-pending (queue-root) escalation leaves its decision OPEN."""
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    escalations_dir.mkdir(parents=True)
+    (escalations_dir / 'esc-pending.json').write_text(json.dumps({'status': 'pending'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-cli-pending',
+            project='df',
+            escalation_id='esc-pending',
+            state=sr.DecisionState.OPEN,
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(escalations_dir)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-cli-pending'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_scopes_to_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A decision from a DIFFERENT project is left OPEN even though its
+    escalation has resolved -- decisions are fleet-global but escalations
+    are per-project, so reap-decisions is a per-project driver.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-07-16'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-other-project.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-other-project',
+            project='not-df',
+            escalation_id='esc-other-project',
+            state=sr.DecisionState.OPEN,
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(escalations_dir)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-other-project'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A nonexistent --escalations-dir must not raise or close anything:
+    read_escalation_status returns None for every lookup, and
+    reap_answered_decisions treats None as "leave OPEN".
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    bad_escalations_dir = tmp_path / 'does-not-exist'
+    sr.write_decision(
+        _make_decision(
+            id='dec-cli-badescdir',
+            project='df',
+            escalation_id='esc-whatever',
+            state=sr.DecisionState.OPEN,
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(
+        ['reap-decisions', '--project', 'df', '--escalations-dir', str(bad_escalations_dir)]
+    )
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-cli-badescdir'] == sr.DecisionState.OPEN

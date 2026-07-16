@@ -28,7 +28,7 @@ import re
 import shutil
 import sys
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -822,6 +822,141 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+_ESCALATION_ARCHIVE_SUBDIR = 'archive'
+"""Mirrors escalation.archive.ARCHIVE_SUBDIR BY CONVENTION, not by import:
+this module is deliberately stdlib-only with no intra-orchestrator imports
+(see module docstring), so it cannot import escalation.archive directly.
+Kept in sync by hand with that constant."""
+
+
+def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> str | None:
+    """Best-effort read of *escalation_id*'s ``status`` field (Fleet Cockpit C8 reaper).
+
+    Tries the queue-root file ``<escalations_dir>/<escalation_id>.json`` first
+    (a still-pending escalation lives there); if absent, falls back to a
+    recursive search under ``<escalations_dir>/archive/`` (a resolved/
+    dismissed escalation is moved into a dated ``archive/YYYY-MM-DD/`` subdir
+    by ``escalation.queue.EscalationQueue._archive_resolved``) and takes the
+    newest match (sorted, last).
+
+    Returns the raw ``status`` string, or None when: the id is unknown (no
+    root file, no archive match); the body is missing/unreadable or fails to
+    parse as JSON; or its ``status`` field is absent/not a string. Reads the
+    on-disk contract directly via stdlib ``json`` rather than importing
+    ``escalation.queue``/``escalation.models`` -- this module stays
+    stdlib-only and import-free of the rest of the orchestrator/escalation
+    packages (see module docstring). Fail-soft: never raises.
+
+    COST NOTE: the archive fallback is a recursive rglob over the *entire*
+    ``archive/`` tree, with no memoization across calls. When *escalation_id*
+    never resolves there -- purged by archive retention pruning, or never
+    existed -- every call still walks the full tree and returns None. A
+    caller that re-invokes this once per Main Loop cycle (the
+    ``reap-decisions`` CLI verb, see ``reap_answered_decisions``) therefore
+    repeats that full scan indefinitely for a decision pinned to such an id.
+    This is a known, currently-unbounded cost rather than something this
+    function bounds itself (e.g. via a persistent negative-lookup cache) --
+    doing so would need to answer staleness/TTL questions (a
+    once-dangling id could later appear) that are out of scope for this
+    read helper. The affected decision is simply left OPEN forever in that
+    case and needs explicit human closure, same as the no-``escalation_id``
+    case documented on ``reap_answered_decisions``.
+    """
+    base = Path(escalations_dir)
+    candidate = base / f'{escalation_id}.json'
+    if not candidate.is_file():
+        matches = sorted((base / _ESCALATION_ARCHIVE_SUBDIR).rglob(f'{escalation_id}.json'))
+        candidate = matches[-1] if matches else None
+    if candidate is None:
+        return None
+    try:
+        data = json.loads(candidate.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    status = data.get('status') if isinstance(data, dict) else None
+    return status if isinstance(status, str) else None
+
+
+DECISION_CLOSE_MAP: dict[str, DecisionState] = {
+    'resolved': DecisionState.ANSWERED,
+    'dismissed': DecisionState.DROPPED,
+}
+"""Maps a terminal escalation status to the DecisionState an OPEN decision
+resolving it should close to (Fleet Cockpit C8 reaper). Any other status
+(including 'pending') or None is absent from this map and leaves the
+decision OPEN -- see reap_answered_decisions."""
+
+
+@dataclass(frozen=True)
+class ReapedDecision:
+    """One DecisionRecord closed by reap_answered_decisions.
+
+    id: the closed decision's id.
+    escalation_id: the escalation whose terminal status triggered the close.
+    new_state: the DecisionState it was closed to, as its wire string (see
+        DECISION_CLOSE_MAP) -- e.g. 'answered' or 'dropped'.
+    """
+
+    id: str
+    escalation_id: str
+    new_state: str
+
+
+def reap_answered_decisions(
+    root: Path | str | None = None,
+    *,
+    escalation_status: Callable[[DecisionRecord], str | None],
+) -> list[ReapedDecision]:
+    """Close every OPEN decision whose escalation has reached a terminal status.
+
+    For each ``list_decisions(root)`` entry: a decision that is not
+    ``DecisionState.OPEN`` is skipped outright (already resolved -- no
+    re-close); a decision with no ``escalation_id`` is skipped WITHOUT ever
+    consulting *escalation_status* (there is nothing to resolve it against).
+    Otherwise *escalation_status* is called with the decision, and the
+    result is looked up in ``DECISION_CLOSE_MAP`` -- any status not in that
+    map (including ``'pending'`` or ``None``) leaves the decision OPEN.
+
+    A close-worthy result is applied via the existing
+    ``update_decision_state`` (itself fail-soft: a write fault there returns
+    None and is silently skipped here, matching its contract for direct
+    C8/cockpit callers) and is only recorded in the returned list when that
+    update actually succeeds.
+
+    *escalation_status* is injected rather than read directly here so this
+    stdlib-only, import-free core stays unit-testable with a fake callback
+    and never needs to know an escalations-dir path or project scoping --
+    see the ``reap-decisions`` CLI verb, which builds the production
+    closure.
+
+    LIMITATION: a decision whose ``escalation_id`` is well-formed but never
+    resolves to a close-worthy status via *escalation_status* (unknown id,
+    or one purged by archive retention pruning) is left OPEN indefinitely --
+    the same fail-open-on-absent-evidence outcome as the no-``escalation_id``
+    case above -- and needs explicit human closure. With the production
+    closure (``read_escalation_status``), this also means a full archive
+    scan repeats every call for that decision; see its COST NOTE.
+    """
+    reaped: list[ReapedDecision] = []
+    for decision in list_decisions(root):
+        if decision.state != DecisionState.OPEN:
+            continue
+        escalation_id = decision.escalation_id
+        if not escalation_id:
+            continue
+        status = escalation_status(decision)
+        new_state = DECISION_CLOSE_MAP.get(status) if status is not None else None
+        if new_state is None:
+            continue
+        updated = update_decision_state(decision.id, new_state, root=root)
+        if updated is None:
+            continue
+        reaped.append(
+            ReapedDecision(id=decision.id, escalation_id=escalation_id, new_state=str(new_state))
+        )
+    return reaped
 
 
 # ---------------------------------------------------------------------------
@@ -1771,6 +1906,43 @@ def _run_write_decision(
         print(record.id)
 
 
+def _run_reap_decisions(project: str, escalations_dir: str) -> None:
+    """Run the ``reap-decisions`` verb (Fleet Cockpit C8: close-on-resolve driver).
+
+    Builds the production ``escalation_status`` closure for
+    reap_answered_decisions: a decision belonging to a DIFFERENT project is
+    left alone (returns None -- unresolved), since DecisionRecords are
+    fleet-global (``~/.claude/fleet/decisions/``) but escalations are
+    per-project (``<project_root>/data/escalations``); otherwise defers to
+    read_escalation_status against *escalations_dir*. Project-scoping this
+    way makes the (global decisions <-> per-project escalations) join
+    correct without fragile project_id -> path auto-discovery. Root
+    resolves via $CLAUDE_FLEET_ROOT, same as every other verb.
+
+    A watcher runs this once per Main Loop cycle (SKILL.md "Closing parked
+    decisions on resolve") so a decision it (or anyone -- /unblock, an L2
+    cascade, the human) files closes once its escalation is actually
+    resolved/dismissed. Prints one ``f'{id} {new_state}'`` line per closed
+    decision, mirroring `write-decision` printing the filed id.
+    """
+
+    def _status(decision: DecisionRecord) -> str | None:
+        if decision.project != project:
+            return None
+        if decision.escalation_id is None:
+            # Belt-and-suspenders, not reachable via reap_answered_decisions
+            # today: it already skips any decision with a falsy
+            # escalation_id before ever calling this closure. Kept so this
+            # narrows `str | None` -> `str` for the read_escalation_status
+            # call below (typed to take a `str`) and stays correct if this
+            # closure is ever invoked from elsewhere.
+            return None
+        return read_escalation_status(escalations_dir, decision.escalation_id)
+
+    for reaped in reap_answered_decisions(escalation_status=_status):
+        print(f'{reaped.id} {reaped.new_state}')
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='session_registry')
     sub = parser.add_subparsers(dest='verb', required=True)
@@ -1833,6 +2005,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help='escalation severity to weight this ask (info|blocking|critical|urgent)',
     )
 
+    reap_decisions_p = sub.add_parser(
+        'reap-decisions',
+        help='close OPEN decisions whose escalation has resolved/dismissed (Fleet Cockpit C8)',
+    )
+    reap_decisions_p.add_argument('--project', required=True)
+    reap_decisions_p.add_argument('--escalations-dir', required=True)
+
     return parser
 
 
@@ -1876,6 +2055,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.session_id,
                 args.severity,
             )
+        elif args.verb == 'reap-decisions':
+            _run_reap_decisions(args.project, args.escalations_dir)
     except Exception:
         logger.error('session_registry %s failed', args.verb, exc_info=True)
         return 0
