@@ -432,3 +432,69 @@ class TestRow2TaskRoleSignal:
             'the registered sibling modB must never execute at role=task '
             '(no cross-module widening from the task-role floor)'
         )
+
+
+# ---------------------------------------------------------------------------
+# Row 3: "docs-only trivial, both roles" — R2 parity survives the inversion.
+# A `.md`-only diff stays TRIVIAL (ScopeKind.TRIVIAL, verify_plan.py) at
+# BOTH role='task'/'merge', breadth-independent, producer AND consumer.
+# ---------------------------------------------------------------------------
+
+# A dedicated row-3 main SHA (see ROW1_MAIN_SHA's docstring note on why every
+# row uses its own constant rather than sharing test_merge_queue_main_health.MAIN_SHA).
+ROW3_MAIN_SHA: str = 'r3main0000000000000000000000000000000000'
+
+
+class TestRow3DocsOnlyTrivialBothRoles:
+    """Row 3 (PRD boundary-test sketch): a docs-only diff (no ``.py``/``.rs``
+    file) short-circuits to ``ScopeKind.TRIVIAL`` ahead of BOTH the
+    module-config and fallback branches (verify_plan.derive_verify_plan) —
+    zero ``run_verification`` calls, independent of role or
+    ``merge_verify_breadth`` (R2). This row pins that the inversion (κ/λ)
+    never regresses this pre-existing invariant, at both the producer
+    (``run_scoped_verification``) and consumer (``_run_post_merge_verify``)
+    seams.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.exercise_merge_verify
+    @pytest.mark.parametrize('role', ['task', 'merge'])
+    async def test_row3_docs_only_trivial_both_roles(
+        self, tmp_path: Path, role: Literal['task', 'merge'],
+    ) -> None:
+        mod_a, _mod_b, config = _two_module_registry(tmp_path, breadth='full')
+        docs_files = _write_docs_only_diff(tmp_path)
+
+        # -- PRODUCER side: TRIVIAL short-circuit at THIS parametrized role.
+        result, executed, fake = await _drive_producer(
+            tmp_path, config, [mod_a], task_files=docs_files, role=role,
+        )
+        assert result.passed
+        assert 'No source files' in result.summary, (
+            f'expected the TRIVIAL short-circuit summary; got {result.summary!r}'
+        )
+        assert fake.await_count == 0, (
+            f'docs-only diff must execute zero commands (role={role!r}); '
+            f'got {fake.await_count} call(s)'
+        )
+        assert executed == {}
+
+        # -- CONSUMER side: parity check — the SAME docs-only diff also
+        # executes zero commands at the real merge gate (always role='merge'
+        # under the hood, regardless of this test's parametrized role).
+        consumer_fake = _run_verification_spy()
+        outcome = await _drive_merge_gate(
+            tmp_path,
+            task_id=f'row3-4041-{role}',
+            module_configs_registry={},
+            touched_module_configs=[],
+            task_files=docs_files,
+            task_files_content={DOCS_ONLY_PATH: DOCS_ONLY_CONTENT},
+            main_sha=ROW3_MAIN_SHA,
+            run_verification_fake=consumer_fake,
+        )
+        assert outcome is None, f'expected the verify-passed sentinel (None); got {outcome!r}'
+        assert consumer_fake.await_count == 0, (
+            f'docs-only diff must execute zero commands at the merge gate; '
+            f'got {consumer_fake.await_count} call(s)'
+        )
