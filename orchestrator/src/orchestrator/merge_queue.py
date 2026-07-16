@@ -1990,8 +1990,32 @@ async def _run_post_merge_verify(
     # verify.failing_test_ids not None (only merge+full breadth collects a
     # junit report; a 'scoped' pass says nothing about main-at-large) and a
     # non-empty merge_sha (nothing to key the seed on otherwise).
+    #
+    # Amendment (reviewer_comprehensive finding 1, task 2590): seed the
+    # EMPTY set rather than trusting verify.failing_test_ids verbatim.  We
+    # are on the pass path (verify.passed is True by construction — see the
+    # `if not verify.passed:` branch above, which always returns) so main
+    # has, by definition, no live failures.  The junit parser
+    # (_extract_failing_test_ids_from_junit) records any <testcase> with a
+    # <failure>/<error> child regardless of the run's overall outcome, so a
+    # rerun plugin (e.g. pytest-rerunfailures) that fails-then-passes a
+    # flaky test would otherwise seed that id into the baseline even though
+    # it is NOT actually red on main — silently masking a future genuine
+    # regression of that same test (the baseline-diff would wrongly treat
+    # it as pre-existing). Log loudly if that ever happens so the anomaly
+    # stays visible instead of silently degrading the baseline's soundness.
     if merge_sha and verify.failing_test_ids is not None:
-        seed_main_baseline(merge_sha, frozenset(verify.failing_test_ids))
+        if verify.failing_test_ids:
+            logger.warning(
+                'Task %s: post-merge verify passed but junit reported %d '
+                'failing test id(s) on a pass (%s) — seeding the EMPTY set '
+                'as the baseline for %s instead of trusting the parsed ids '
+                '(likely a rerun-plugin retry-to-pass; a passing verify has '
+                'no live failures by definition)',
+                req.task_id, len(verify.failing_test_ids),
+                ', '.join(sorted(verify.failing_test_ids)), merge_sha,
+            )
+        seed_main_baseline(merge_sha, frozenset())
 
     return None
 
