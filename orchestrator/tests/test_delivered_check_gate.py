@@ -494,6 +494,43 @@ class TestTickContextField:
 
 
 # ---------------------------------------------------------------------------
+# TestTerminalDepRecordsField (task 2692 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalDepRecordsField:
+    """``TickContext`` must carry a ``terminal_dep_records`` field defaulting
+    to an empty dict, mirroring ``external_cache`` / ``delivered_check_cache``.
+
+    Populated by ``_phase_backfill_terminal_dep_records`` with fetched
+    TERMINAL dep records that are missing from ``tasks_by_id`` (the
+    active-only ``get_tasks`` fetch excludes done/cancelled producers) —
+    see task 2692's root-cause analysis. Consulted ONLY by the two
+    delivered-check consumers (``_deps_satisfied``,
+    ``_compute_delivered_check_cache``) as a purely additive fallback —
+    never merged into ``tasks_by_id`` itself.
+    """
+
+    def test_terminal_dep_records_field_defaults_empty_dict(self):
+        ctx = TickContext(tasks=[], status_map={}, tasks_by_id={})
+        assert ctx.terminal_dep_records == {}
+
+    def test_terminal_dep_records_field_accepts_constructor_kwarg(self):
+        ctx = TickContext(
+            tasks=[], status_map={}, tasks_by_id={},
+            terminal_dep_records={'20': {'id': '20', 'status': 'done'}},
+        )
+        assert ctx.terminal_dep_records == {'20': {'id': '20', 'status': 'done'}}
+
+    def test_terminal_dep_records_default_not_shared_across_instances(self):
+        """Default factory must not share a mutable default across instances."""
+        ctx1 = TickContext(tasks=[], status_map={}, tasks_by_id={})
+        ctx2 = TickContext(tasks=[], status_map={}, tasks_by_id={})
+        ctx1.terminal_dep_records['x'] = {'id': 'x'}
+        assert ctx2.terminal_dep_records == {}
+
+
+# ---------------------------------------------------------------------------
 # TestSchedulerCallbacksOnDeliveredCheckBlock (task 2583 — step-3 RED / step-4 GREEN)
 # ---------------------------------------------------------------------------
 
