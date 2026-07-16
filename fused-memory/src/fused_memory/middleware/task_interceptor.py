@@ -817,6 +817,12 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
         resolved_provenance: dict | None = None
         resolved_reopen_reason: str | None = None
+        # Task 2649: reopen_*/done_provenance audit fields accumulate here
+        # instead of being persisted via separate stamp_audit_metadata calls.
+        # When non-empty at write time, the write goes through the single
+        # atomic tm.set_status_and_stamp_audit instead of plain
+        # tm.set_task_status — see _do_set_task_status_write below.
+        audit_fields: dict[str, Any] = {}
         # Task 2624: computed once and reused both by the recon_write_policy
         # gate below and by the lifecycle-reset guard around the write
         # further down, so the two stay in agreement on what counts as a
@@ -946,35 +952,25 @@ class TaskInterceptor:
                 if not reason:
                     return _terminal_exit_error(task_id, old_status, status)
                 resolved_reopen_reason = reason
-                try:
-                    # reopen_* are WRITE-AUTHORITY audit fields. Persist through
-                    # the privileged, non-protocol stamp_audit_metadata seam
-                    # rather than update_task: when a task is reopened out of a
-                    # TERMINAL_STATUS it may carry a metadata.done_provenance
-                    # stamped when it was marked done, and update_task now
-                    # UNCONDITIONALLY rejects any metadata.done_provenance
-                    # (SqliteTaskBackend floor, task C1) — a pre-merged blob
-                    # keyed off `before` would be rejected and the reopen audit
-                    # trail silently dropped. The seam does its own fresh-read
-                    # read-modify-write merge under the write-lock, preserving
-                    # every sibling key (memory_hints / files / external_deps /
-                    # done_provenance), so we pass only the reopen_* fields.
-                    await tm.stamp_audit_metadata(  # type: ignore[attr-defined]
-                        task_id=task_id,
-                        project_root=project_root,
-                        fields={
-                            'reopen_reason': reason,
-                            'reopen_from': old_status,
-                            'reopen_at': datetime.now(UTC).isoformat(),
-                        },
-                        tag=tag,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        'Failed to persist reopen_reason for task %s: %s',
-                        task_id,
-                        e,
-                    )
+                # reopen_* are WRITE-AUTHORITY audit fields. Accumulated here
+                # rather than persisted immediately: task 2649 merges them
+                # into metadata AND updates the status column in ONE atomic
+                # tm.set_status_and_stamp_audit call at write time (below)
+                # instead of a separate stamp_audit_metadata commit — the
+                # pre-2649 two-commit split left a window where an observer
+                # could see reopen_* applied but the status column
+                # unchanged. update_task remains unusable for this: when a
+                # task is reopened out of a TERMINAL_STATUS it may carry a
+                # metadata.done_provenance stamped when it was marked done,
+                # and update_task unconditionally rejects any
+                # metadata.done_provenance (SqliteTaskBackend floor, task
+                # C1). The atomic writer does its own fresh-read
+                # read-modify-write merge under the write-lock, preserving
+                # every sibling key (memory_hints / files / external_deps /
+                # done_provenance), so we pass only the reopen_* fields.
+                audit_fields['reopen_reason'] = reason
+                audit_fields['reopen_from'] = old_status
+                audit_fields['reopen_at'] = datetime.now(UTC).isoformat()
 
             # 2b. Done-provenance gate: validate done_provenance first (kind +
             # commit + ancestor backstop) so the verified result can decide
@@ -1019,30 +1015,19 @@ class TaskInterceptor:
                             )
 
                 if resolved_provenance is not None:
-                    try:
-                        # done_provenance is a WRITE-AUTHORITY field: update_task
-                        # now UNCONDITIONALLY rejects metadata.done_provenance
-                        # (SqliteTaskBackend floor, task C1). Persist through the
-                        # privileged, non-protocol stamp_audit_metadata seam —
-                        # the sole sanctioned done_provenance writer. The seam
-                        # does its own fresh-read read-modify-write merge under
-                        # the write-lock, preserving every sibling key
-                        # (memory_hints / files / external_deps / reopen_*), so
-                        # we pass only the field being stamped rather than a
-                        # pre-merged blob keyed off the (possibly stale)
-                        # ``before`` snapshot.
-                        await tm.stamp_audit_metadata(  # type: ignore[attr-defined]
-                            task_id=task_id,
-                            project_root=project_root,
-                            fields={'done_provenance': resolved_provenance},
-                            tag=tag,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            'Failed to persist done_provenance for task %s: %s',
-                            task_id,
-                            e,
-                        )
+                    # done_provenance is a WRITE-AUTHORITY field: update_task
+                    # unconditionally rejects metadata.done_provenance
+                    # (SqliteTaskBackend floor, task C1). Accumulated here
+                    # rather than persisted immediately — task 2649 merges it
+                    # into metadata AND updates the status column in ONE
+                    # atomic tm.set_status_and_stamp_audit call at write time
+                    # (below), preserving every sibling key (memory_hints /
+                    # files / external_deps / reopen_*) via the same
+                    # fresh-read read-modify-write merge stamp_audit_metadata
+                    # used, so we pass only the field being stamped rather
+                    # than a pre-merged blob keyed off the (possibly stale)
+                    # ``before`` snapshot.
+                    audit_fields['done_provenance'] = resolved_provenance
 
             # 2d. Pre-done hook gate: invoke a configurable subprocess validator.
             # Runs after all cheap/deterministic gates (same-status guard,
@@ -1100,11 +1085,25 @@ class TaskInterceptor:
             )
 
             async def _do_set_task_status_write() -> Any:
+                # Task 2649: an audit-carrying transition (reopen_* and/or
+                # done_provenance accumulated above) writes through the
+                # single atomic set_status_and_stamp_audit call instead of
+                # plain set_task_status, so the status column and the audit
+                # metadata commit together — both or neither.
+                if audit_fields:
+                    write_body = tm.set_status_and_stamp_audit(  # type: ignore[attr-defined]
+                        task_id, status, project_root, tag,
+                        audit_fields=audit_fields, **claimant_kwargs,
+                    )
+                else:
+                    write_body = tm.set_task_status(
+                        task_id, status, project_root, tag, **claimant_kwargs,
+                    )
                 return await self._journal_around(
                     'set_task_status',
                     project_root,
                     {'task_id': task_id, 'status': status, 'tag': tag},
-                    tm.set_task_status(task_id, status, project_root, tag, **claimant_kwargs),
+                    write_body,
                 )
 
             # Task 2624: code-enforced before/after live-task-write

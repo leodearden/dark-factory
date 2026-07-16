@@ -25,6 +25,12 @@ def taskmaster():
     tm = AsyncMock()
     tm.get_task = AsyncMock(return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'})
     tm.set_task_status = AsyncMock(return_value={'success': True})
+    # Task 2649: default for the atomic status+audit writer, mirroring
+    # set_task_status's default above — an audit-carrying transition
+    # (reopen_*/done_provenance) routes through this instead of plain
+    # set_task_status. Individual tests override this when they need to
+    # assert on the SetTaskStatusResult-shaped payload.
+    tm.set_status_and_stamp_audit = AsyncMock(return_value={'success': True})
     tm.get_tasks = AsyncMock(return_value={'tasks': []})
     tm.add_task = AsyncMock(return_value={'id': '2', 'title': 'New Task'})
     tm.update_task = AsyncMock(return_value={'success': True})
