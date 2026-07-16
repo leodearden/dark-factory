@@ -102,7 +102,8 @@ mandatory two-step verification:
 appear in search-result snippets and edge reference text but are NOT valid `delete_memory` \
 IDs — Graphiti returns `{{status: deleted}}` and silently no-ops, providing no error signal. \
 This is a recurrent failure that reinforcement memories alone have not prevented; \
-this section is the canonical enforcement point for UUID resolution.
+this section is the canonical enforcement point for UUID resolution. \
+(Regression-pinned in fused-memory/tests/test_delete_memory_truncated_uuid.py.)
 
 ## Terminal-State Pre-Check Discipline
 Before writing a `temporal_fact` whose content states or implies that a task reached a \
