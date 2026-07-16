@@ -54,6 +54,7 @@ from fused_memory.reconciliation.task_filter import (
     is_batch_plan_framing,
     is_count_snapshot,
     is_mixed_temporal_framing,
+    is_proposed_resolution_framing,
 )
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
 from fused_memory.server.near_duplicate_guard import (
@@ -847,6 +848,17 @@ def create_mcp_server(
         if temporal_context is None and is_batch_plan_framing(content):
             temporal_context = 'planning'
             logger.info('add_episode: auto-tagged batch-plan content as planning (task 2022)')
+        # task 2447: auto-upgrade proposed/conditional resolution-option prose
+        # (e.g. a task description's "RESOLUTION OPTIONS (architect call ...)"
+        # section) to temporal_context='planning' so an unchosen/aspirational
+        # option is never extracted as unqualified current-state fact (incident:
+        # episode 7882dcdc). Distinct log line keeps the two auto-tag shapes
+        # distinguishable. Only the unset default is upgraded, same as above.
+        elif temporal_context is None and is_proposed_resolution_framing(content):
+            temporal_context = 'planning'
+            logger.info(
+                'add_episode: auto-tagged proposed-resolution content as planning (task 2447)'
+            )
         parsed_reference_time = None
         if reference_time is not None:
             try:

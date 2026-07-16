@@ -27,6 +27,7 @@ from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_STATUSES,
     extract_batch_plan_task_ids,
     is_batch_plan_framing,
+    is_proposed_resolution_framing,
 )
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
@@ -258,41 +259,62 @@ class TargetedReconciler:
         scope: ProjectScope,
         statuses_cache: dict,
     ) -> bool:
-        """Return True when ep_uuid is a batch-plan episode with a still-active sibling.
+        """Return True when ep_uuid must be withheld from promotion.
 
-        Fetches the episode's original content and, when it matches the
-        is_batch_plan_framing batch-plan shape (task 2022 — e.g. "Merge-queue
-        ... queued together as df 1985-2002"), extracts its enumerated task ids
-        (extract_batch_plan_task_ids) and withholds promotion (returns True)
-        while ANY of them is still in ACTIVE_TASK_STATUSES. Without this gate,
-        completing any ONE enumerated sibling would promote the whole episode
-        and re-surface every other still-aspirational sibling's edges into
-        default factual search (task 2033).
+        Gates TWO planned-episode shapes:
 
-        Non-batch / non-string content promotes exactly as before this task
-        (returns False) — the common path, and also what a content-fetch
-        failure degrades to (fail-open: a transient Graphiti hiccup must not
-        regress ordinary per-task promotion).
+        1. Proposed-resolution (task 2447): when content matches
+           is_proposed_resolution_framing (e.g. a task description's
+           "RESOLUTION OPTIONS (architect call ...)" section), withholds
+           UNCONDITIONALLY and permanently — a proposed/possibly-unchosen
+           option must never auto-become fact merely because its source task
+           went done. No taskmaster status fetch is needed for this shape.
+
+        2. Batch-plan (task 2033): when content matches is_batch_plan_framing
+           (task 2022 — e.g. "Merge-queue ... queued together as df
+           1985-2002"), extracts its enumerated task ids
+           (extract_batch_plan_task_ids) and withholds promotion (returns
+           True) while ANY of them is still in ACTIVE_TASK_STATUSES. Without
+           this gate, completing any ONE enumerated sibling would promote the
+           whole episode and re-surface every other still-aspirational
+           sibling's edges into default factual search.
+
+        Content matching neither shape (or non-string content) promotes
+        exactly as before this task (returns False) — the common path, and
+        also what a content-fetch failure degrades to (fail-open: a
+        transient Graphiti hiccup must not regress ordinary per-task
+        promotion).
 
         statuses_cache is a plain dict used as a lazy, promotion-block-scoped
         cache (populated with key 'statuses' -> {...} | None on first use, empty
         before): the taskmaster status fetch happens at most once per
         _on_task_done call, shared across every candidate episode evaluated in
-        that call, and is skipped entirely when no candidate is batch-shaped.
-        A fetch failure OR a non-dict/malformed response both cache None, which
-        conservatively withholds every confirmed-batch candidate for the rest of
-        this block — self-healing, since promotion re-runs on the next related
-        task-done transition. (The malformed-response case is deliberately
-        treated the same as an exception rather than coerced to {}: silently
-        coercing to {} would make every enumerated id look "absent" — and
-        therefore non-blocking — which fails open exactly when we don't actually
-        know the statuses.)
+        that call, and is skipped entirely when no candidate is batch-shaped
+        (including every proposed-resolution candidate, which never reaches
+        the batch-plan check below).  A fetch failure OR a non-dict/malformed
+        response both cache None, which conservatively withholds every
+        confirmed-batch candidate for the rest of this block — self-healing,
+        since promotion re-runs on the next related task-done transition.
+        (The malformed-response case is deliberately treated the same as an
+        exception rather than coerced to {}: silently coercing to {} would
+        make every enumerated id look "absent" — and therefore non-blocking —
+        which fails open exactly when we don't actually know the statuses.)
         """
         try:
             content = await self.memory.get_episode_content(ep_uuid, scope.project_id)
         except Exception as e:
             logger.warning(f'get_episode_content failed for planned episode {ep_uuid}: {e}')
             content = None
+
+        # NOTE (amendment, reviewer_comprehensive naming_coherence finding, task
+        # 2447): this method now gates TWO planned-episode shapes (see
+        # docstring above) even though its name and the statuses_cache param
+        # still read as batch-plan-only. This early return is the shape-1
+        # (proposed-resolution) gate — unconditional, no statuses_cache
+        # involvement. Everything from here down is shape-2 (batch-plan,
+        # task 2033), which is what statuses_cache is scoped to.
+        if isinstance(content, str) and is_proposed_resolution_framing(content):
+            return True
 
         if not (isinstance(content, str) and is_batch_plan_framing(content)):
             return False

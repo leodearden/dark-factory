@@ -3525,3 +3525,165 @@ class TestLiveTaskStatusFraming:
         assert frames_live_task_status_as_current_fact('') is False, (
             'Expected False for empty string.'
         )
+
+
+# ---------------------------------------------------------------------------
+# is_proposed_resolution_framing (task 2447)
+# ---------------------------------------------------------------------------
+
+
+class TestIsProposedResolutionFraming:
+    """Tests for is_proposed_resolution_framing() in task_filter.py.
+
+    Detects proposed/conditional resolution-option prose in a task
+    description — a structurally-specific anchor phrase ("resolution
+    option(s)", "architect('s) call", "proposed fix/resolution/approach/
+    change/option", "candidate fix(es)", "not-yet-implemented") — the
+    ingest-time signal used to auto-upgrade temporal_context to 'planning'
+    so an aspirational/unchosen option never gets extracted as unqualified
+    current-state fact (incident: episode 7882dcdc, task 2444's RESOLUTION
+    OPTIONS section produced the contradicting edge "entry.verify_task is
+    awaited before the registry transition to FINALIZING occurs").
+
+    Deliberately does NOT fire on bare modal verbs (should/would/could/
+    propose) in isolation — those are ubiquitous in legitimate current-state
+    facts and would massively over-fire; see the negative fixtures below.
+    """
+
+    # ------------------------------------------------------------------ #
+    # positive fixtures (proposed-resolution framing -> True)
+    # ------------------------------------------------------------------ #
+
+    def test_positive_incident_resolution_options_architect_call(self):
+        """The real incident text (task 2444's RESOLUTION OPTIONS section) must fire."""
+        from fused_memory.reconciliation.task_filter import (
+            is_proposed_resolution_framing,
+        )
+
+        text = (
+            'RESOLUTION OPTIONS (architect call — pick one, land as a RED/GREEN pair):\n'
+            '(a) Move the VERIFYING->FINALIZING _note_transition to AFTER '
+            '`await entry.verify_task` ...'
+        )
+        assert is_proposed_resolution_framing(text) is True, (
+            f'Expected is_proposed_resolution_framing to return True for the incident '
+            f'RESOLUTION OPTIONS / architect call shape, got False.\ntext={text!r}'
+        )
+
+    def test_positive_proposed_fix_phrase(self):
+        """A 'Proposed fix: ...' phrasing must fire."""
+        from fused_memory.reconciliation.task_filter import (
+            is_proposed_resolution_framing,
+        )
+
+        text = 'Proposed fix: move the transition after the await.'
+        assert is_proposed_resolution_framing(text) is True, (
+            f'Expected is_proposed_resolution_framing to return True for a '
+            f"'Proposed fix:' shape, got False.\ntext={text!r}"
+        )
+
+    def test_positive_architects_call_candidate_fixes(self):
+        """An \"architect's call\" + \"candidate fixes\" shape must fire."""
+        from fused_memory.reconciliation.task_filter import (
+            is_proposed_resolution_framing,
+        )
+
+        text = "architect's call — pick one of the candidate fixes below"
+        assert is_proposed_resolution_framing(text) is True, (
+            f"Expected is_proposed_resolution_framing to return True for an "
+            f"architect's-call + candidate-fixes shape, got False.\ntext={text!r}"
+        )
+
+    def test_positive_architects_call_unicode_apostrophe(self):
+        """amendment (reviewer_comprehensive): the Unicode right single quote
+        (U+2019) possessive form "architect’s call" must fire, not just the
+        ASCII straight-apostrophe spelling — LLM-generated prose commonly emits
+        the curly quote."""
+        from fused_memory.reconciliation.task_filter import (
+            is_proposed_resolution_framing,
+        )
+
+        text = 'architect’s call — pick one of the options below'
+        assert is_proposed_resolution_framing(text) is True, (
+            f'Expected is_proposed_resolution_framing to return True for a '
+            f"Unicode-apostrophe 'architect’s call' shape, got False.\ntext={text!r}"
+        )
+
+    # ------------------------------------------------------------------ #
+    # negative fixtures (precision guards — must return False)
+    # ------------------------------------------------------------------ #
+
+    def test_negative_bare_modal_should(self):
+        """An ordinary current-state fact using a bare modal verb ('should') must
+        NOT fire — proves bare 'should' alone does not trigger the detector."""
+        from fused_memory.reconciliation.task_filter import (
+            is_proposed_resolution_framing,
+        )
+
+        text = 'The FINALIZING transition should fire after entry.verify_task resolves'
+        assert is_proposed_resolution_framing(text) is False, (
+            f'Expected is_proposed_resolution_framing to return False for a bare '
+            f'modal-verb current-state fact, got True.\ntext={text!r}'
+        )
+
+    def test_negative_extracted_edge_wording(self):
+        """The extracted-edge text itself, as a standalone assertion, must NOT fire —
+        proves the guard keys off source (task-description) framing, not edge wording."""
+        from fused_memory.reconciliation.task_filter import (
+            is_proposed_resolution_framing,
+        )
+
+        text = (
+            'InflightEntry.phase transitions to FINALIZING after entry.verify_task '
+            'is completed'
+        )
+        assert is_proposed_resolution_framing(text) is False, (
+            f'Expected is_proposed_resolution_framing to return False for the '
+            f'extracted-edge wording, got True.\ntext={text!r}'
+        )
+
+    def test_negative_batch_plan_independent(self):
+        """A batch-plan line must NOT fire — proves independence from is_batch_plan_framing."""
+        from fused_memory.reconciliation.task_filter import (
+            is_proposed_resolution_framing,
+        )
+
+        text = 'Merge-queue batch queued together as df 1985-2002'
+        assert is_proposed_resolution_framing(text) is False, (
+            f'Expected is_proposed_resolution_framing to return False for a '
+            f'batch-plan line, got True.\ntext={text!r}'
+        )
+
+    def test_negative_resolved_and_option_apart(self):
+        """'resolved' and 'option' appearing apart (not as the anchor phrase) must
+        NOT fire."""
+        from fused_memory.reconciliation.task_filter import (
+            is_proposed_resolution_framing,
+        )
+
+        text = 'We resolved the merge conflict and shipped the chosen option'
+        assert is_proposed_resolution_framing(text) is False, (
+            f'Expected is_proposed_resolution_framing to return False when '
+            f"'resolved'/'option' appear apart, got True.\ntext={text!r}"
+        )
+
+    def test_negative_bare_resolution_options_no_structural_cue(self):
+        """amendment (reviewer_comprehensive precision finding): a bare
+        'resolution options' substring with no nearby 'architect call' / 'pick
+        one' structural cue must NOT fire — proves the anchor requires the
+        co-occurrence, not just the standalone substring, since add_episode
+        applies this detector to all ingested content, not only task
+        descriptions."""
+        from fused_memory.reconciliation.task_filter import (
+            is_proposed_resolution_framing,
+        )
+
+        for text in (
+            'We evaluated the display resolution options and picked 1920x1080.',
+            'The merge-conflict resolution options were reviewed in standup.',
+        ):
+            assert is_proposed_resolution_framing(text) is False, (
+                f'Expected is_proposed_resolution_framing to return False for a bare '
+                f"'resolution options' substring with no structural cue, got True."
+                f'\ntext={text!r}'
+            )
