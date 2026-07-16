@@ -652,6 +652,11 @@ class TaskSteward:
             max_cap_retries=_MAX_CAP_RETRIES,
             rebuild_prompt=rebuild_prompt,
             resume_delivers_prompt=True,
+            cost_store=self.cost_store,
+            run_id=self.event_store.run_id if self.event_store else '',
+            task_id=self.task_id,
+            project_id=self.config.fused_memory.project_id,
+            role='steward',
             **kwargs,
         )
 
