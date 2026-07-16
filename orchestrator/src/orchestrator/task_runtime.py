@@ -166,6 +166,38 @@ def _build_non_pooled_snapshot(*, git_ops, event_store) -> list[TaskRuntimeState
     return results
 
 
+def _build_pooled_snapshot(*, git_ops, event_store) -> list[TaskRuntimeState]:
+    """Enumerate durable ``<worktree_base>/.lane-state/*.json`` records —
+    pooled (reify, autopilot-video, …) layout where a lane, not a per-task
+    worktree dir, is the durable task<->host binding.
+
+    Skips any record whose ``task_id`` is ``None`` (a task-less lane, e.g.
+    SEED/REGISTERED/a freshly-RELEASED lane) or whose mapped
+    :func:`_map_lane_state` is ``None`` (SEED/REGISTERED) — only lanes
+    currently bound to a task emit an entry.
+    """
+    worktree_base = git_ops.worktree_base
+    results: list[TaskRuntimeState] = []
+    for lane, record in git_ops._lane_lifecycle.all_records().items():
+        if record.task_id is None:
+            continue
+        lane_state = _map_lane_state(record.state)
+        if lane_state is None:
+            continue
+        meta_root = TaskArtifacts.meta_root_for(worktree_base, lane)
+        results.append(_read_task_entry(
+            task_id=int(record.task_id),
+            worktree=worktree_base / lane,
+            meta_root=meta_root,
+            has_worktree=(worktree_base / lane).is_dir(),
+            lane=lane,
+            lane_state=lane_state,
+            event_store=event_store,
+        ))
+    results.sort(key=lambda r: r.task_id)
+    return results
+
+
 def build_task_runtime_snapshot(*, git_ops, event_store=None) -> list[TaskRuntimeState]:
     """Per-task runtime snapshot for every active task on this host.
 
@@ -177,4 +209,4 @@ def build_task_runtime_snapshot(*, git_ops, event_store=None) -> list[TaskRuntim
     """
     if not git_ops.pool_in_use():
         return _build_non_pooled_snapshot(git_ops=git_ops, event_store=event_store)
-    return []
+    return _build_pooled_snapshot(git_ops=git_ops, event_store=event_store)
