@@ -107,7 +107,14 @@ import pytest
 from _serial_merge_worker import MergeWorker
 from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
 from test_train_integration import _SpyEventStore, build_group_merge_request, make_stacked_member
-from test_verify_scope_kappa import _executed_module_configs, _run_verification_spy
+from test_verify_scope_kappa import (
+    _FLEET_LINT_COMMAND,
+    _FLEET_TEST_COMMAND,
+    _FLEET_TYPE_COMMAND,
+    UNREGISTERED_PATH_DIFF,
+    _executed_module_configs,
+    _run_verification_spy,
+)
 from test_verify_scope_lambda import _two_module_registry
 from test_workflow_verify_infra_resume import _infra_category_result
 from test_workflow_verify_infra_resume import _make as _make_workflow
@@ -1161,12 +1168,33 @@ class TestRow8ScopedBreadthMergePlanByteIdenticalLegacy:
 # ---------------------------------------------------------------------------
 
 
-# NOTE (RED, step-17): _row9_unregistered_scripts_diff (the row-9
-# fallback/unregistered-path fixture) is intentionally NOT YET DEFINED here
-# — the test below references it and fails with a NameError until step-18
-# (GREEN) defines it, mirroring TestRow2TaskRoleSignal's RED-via-
-# _drive_producer split and TestRow8ScopedBreadthMergePlanByteIdenticalLegacy's
-# RED-via-_row8_assert_legacy_scoped_shape split, above.
+def _row9_unregistered_scripts_diff(tmp_path: Path) -> tuple[OrchestratorConfig, list[str]]:
+    """Write row 9's fallback-narrowing diff to *tmp_path* and return
+    ``(config, task_files)``.
+
+    Reuses kappa's ``UNREGISTERED_PATH_DIFF`` shape verbatim (a single
+    test file under an unregistered ``tests/scripts/`` path — no
+    ``ModuleConfig`` claims it, so ``module_configs=[]`` at every call
+    site) against the REAL dark_factory root-level fleet lint/type/test
+    chains (``_FLEET_LINT_COMMAND``/``_FLEET_TYPE_COMMAND``/
+    ``_FLEET_TEST_COMMAND``, test_verify_scope_kappa.py) — the same
+    OPAQUE multi-clause ``&&``-chain commands the real orchestrator/
+    config.yaml carries — so the fallback branch's OPAQUE first-clause
+    subproject rescoping (``_build_fallback_config``) is exercised for
+    real, not a synthetic single-clause stand-in.
+    """
+    test_path = UNREGISTERED_PATH_DIFF[0]
+    full = tmp_path / test_path
+    full.parent.mkdir(parents=True, exist_ok=True)
+    full.write_text('def test_x():\n    pass\n')
+
+    config = OrchestratorConfig(
+        project_root=tmp_path,
+        test_command=_FLEET_TEST_COMMAND,
+        lint_command=_FLEET_LINT_COMMAND,
+        type_check_command=_FLEET_TYPE_COMMAND,
+    )
+    return config, list(UNREGISTERED_PATH_DIFF)
 
 
 class TestRow9FallbackNarrowingNeverWholeRepoChain:
