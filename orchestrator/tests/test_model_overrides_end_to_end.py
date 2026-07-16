@@ -19,11 +19,11 @@ the whole owning package).
 from __future__ import annotations
 
 import pytest
+from shared.task_metadata import KNOWN_ROLE_NAMES, parse_metadata
 
 from orchestrator.agents.roles import ROLES
 from orchestrator.config import ModelsConfig, OrchestratorConfig
 from orchestrator.routing import RoleDefaults, RouteInputs, resolve_route
-from shared.task_metadata import KNOWN_ROLE_NAMES, parse_metadata
 
 
 @pytest.fixture(autouse=True)
