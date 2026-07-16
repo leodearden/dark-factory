@@ -172,6 +172,7 @@ from orchestrator.verify import (
     _derive_task_files_from_git,
     run_scoped_verification,
     run_verification,
+    seed_main_baseline,
     verify_failure_is_preexisting_on_main,
 )
 from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES
@@ -1948,6 +1949,17 @@ async def _run_post_merge_verify(
             disposition=disposition,
             failure_diagnostic=failure_diagnostic,
         )
+
+    # Task μ (verify-scope-inversion-prd.md, B2): seed the per-main-SHA
+    # failing-test-id baseline for free on every successful merge+full gate
+    # run. merge_sha is the merged tree the caller will CAS-advance main to
+    # — it IS the next main tip, so seeding it here means the very next
+    # gate's baseline lookup is a cache hit, never a probe. Gated on
+    # verify.failing_test_ids not None (only merge+full breadth collects a
+    # junit report; a 'scoped' pass says nothing about main-at-large) and a
+    # non-empty merge_sha (nothing to key the seed on otherwise).
+    if merge_sha and verify.failing_test_ids is not None:
+        seed_main_baseline(merge_sha, frozenset(verify.failing_test_ids))
 
     return None
 
