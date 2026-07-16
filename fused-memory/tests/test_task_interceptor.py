@@ -3949,6 +3949,180 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_sha
     assert persisted['unit'] == 'orchestrator-dark-factory.service'
 
 
+# ── Tests for the 'operational-verified' done_provenance kind (task 2679) ──
+#
+# Commitless kind for no-code operational tasks (2648/2650 task_kind-thrash
+# class): requires escalation_id (the resolving escalation, recorded
+# verbatim) + note, and is accepted only from non-recon-stage callers (reuse
+# of recon_write_policy's caller classification) -- a recon stage must not
+# self-authorize an operational close.
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_accepts_operational_verified(tmp_path):
+    """Direct-call: non-recon caller with escalation_id+note is accepted commitless."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'operational-verified', 'escalation_id': 'esc-123', 'note': 'restarted fused-memory'},
+        str(tmp_path),
+        require=False,
+        is_recon_stage=False,
+    )
+
+    assert err is None
+    assert resolved == {
+        'kind': 'operational-verified',
+        'escalation_id': 'esc-123',
+        'note': 'restarted fused-memory',
+    }
+    assert 'commit' not in resolved
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_operational_verified_requires_escalation_id(tmp_path):
+    """Direct-call: missing escalation_id is a structured rejection."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'operational-verified', 'note': 'restarted fused-memory'},
+        str(tmp_path),
+        require=False,
+        is_recon_stage=False,
+    )
+
+    assert resolved is None
+    assert err is not None
+    assert err['error'] == 'done_provenance_invalid'
+    assert 'escalation_id' in err['reason']
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_operational_verified_requires_note(tmp_path):
+    """Direct-call: missing note is a structured rejection."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'operational-verified', 'escalation_id': 'esc-123'},
+        str(tmp_path),
+        require=False,
+        is_recon_stage=False,
+    )
+
+    assert resolved is None
+    assert err is not None
+    assert err['error'] == 'done_provenance_invalid'
+    assert 'note' in err['reason']
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_operational_verified_rejects_recon_stage(tmp_path):
+    """Direct-call: a recon-stage caller cannot record operational-verified,
+    even with both required fields present."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'operational-verified', 'escalation_id': 'esc-123', 'note': 'restarted fused-memory'},
+        str(tmp_path),
+        require=False,
+        is_recon_stage=True,
+    )
+
+    assert resolved is None
+    assert err is not None
+    assert err['error'] == 'done_provenance_invalid'
+    assert 'recon' in err['reason'].lower()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_accepts_operational_verified_end_to_end(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """End-to-end: a non-recon caller's operational-verified close round-trips
+    escalation_id+note through the atomic audit write, with no commit required."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1',
+        'done',
+        str(tmp_path),
+        done_provenance={
+            'kind': 'operational-verified',
+            'escalation_id': 'esc-456',
+            'note': 'confirmed restart via systemctl status',
+        },
+        agent_id='claude-interactive',
+    )
+
+    assert 'error' not in result, f'expected acceptance but got: {result}'
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
+    assert persisted['kind'] == 'operational-verified'
+    assert persisted['escalation_id'] == 'esc-456'
+    assert persisted['note'] == 'confirmed restart via systemctl status'
+
+
+@pytest.mark.asyncio
+async def test_reopen_freshness_exempts_operational_verified(
+    tmp_path, event_buffer,
+):
+    """Regression guard mirroring test_reopen_freshness_exempts_commitless_kind:
+    operational-verified is commitless and therefore exempt from the alpha
+    reopen-freshness gate, even on a reopened task under enforce mode."""
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    seed_sha = _init_git_repo(tmp_path)
+
+    cfg = FusedMemoryConfig()
+    cfg.reconciliation.reject_stale_done_evidence = 'enforce'
+
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg)
+
+        first_done = await interceptor.set_task_status(
+            '1', 'done', project_root,
+            done_provenance={'kind': 'found_on_main', 'commit': seed_sha, 'note': 'seed'},
+        )
+        assert 'error' not in first_done, first_done
+
+        reopen_result = await interceptor.set_task_status(
+            '1', 'pending', project_root, reopen_reason='reverting: regression found',
+        )
+        assert 'error' not in reopen_result, reopen_result
+
+        result = await interceptor.set_task_status(
+            '1', 'done', project_root,
+            done_provenance={
+                'kind': 'operational-verified',
+                'escalation_id': 'esc-789',
+                'note': 'restarted after regression fix',
+            },
+            agent_id='claude-interactive',
+        )
+
+        assert 'error' not in result, result
+
+        fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await fresh.start()
+        try:
+            task = await fresh.get_task('1', project_root=project_root)
+        finally:
+            await fresh.close()
+        assert task['status'] == 'done', task
+        assert task['metadata']['done_provenance']['kind'] == 'operational-verified'
+    finally:
+        await backend.close()
+
+
 # ── Tests for same-status done_provenance repair (fix c, task 2401) ───────
 #
 # Legacy `done` tasks may carry `metadata.done_provenance` written before
