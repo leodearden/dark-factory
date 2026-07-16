@@ -2446,6 +2446,7 @@ class MemoryService:
 
         results: list[MemoryResult] = []
         failed_stores: list[SourceStore] = []
+        failure_diagnostics: list[dict] = []
         if task_list:
             done, pending = await asyncio.wait(
                 task_list, timeout=search_timeout, return_when=asyncio.ALL_COMPLETED
@@ -2469,11 +2470,15 @@ class MemoryService:
                     store_results = t.result()
                     results.extend(store_results)
                 except Exception as e:
+                    diag = _store_failure_diagnostics(
+                        store_list[i], e, query=query, project_id=project_id, reason='exception'
+                    )
                     logger.warning(
                         'search.store_failed',
                         extra={'store': store_list[i].value, 'error': str(e)},
                     )
                     failed_stores.append(store_list[i])
+                    failure_diagnostics.append(diag)
 
         # Sort: primary store results first, then by relevance score
         def sort_key(r: MemoryResult) -> tuple[int, float]:
@@ -2531,6 +2536,7 @@ class MemoryService:
             final,
             degraded=degraded,
             failed_stores=[s.value for s in failed_stores],
+            failure_diagnostics=failure_diagnostics,
         )
 
     async def _search_graphiti(
