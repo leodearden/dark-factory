@@ -457,7 +457,7 @@ class TestEscalationResolutionClass:
 
     def test_resolution_classes_contains_exactly_benign_and_actionable(self):
         """RESOLUTION_CLASSES contains exactly {'benign', 'actionable'} — no extras."""
-        assert RESOLUTION_CLASSES == frozenset({'benign', 'actionable'})
+        assert frozenset({'benign', 'actionable'}) == RESOLUTION_CLASSES
 
     # --- (c) round-trip to_dict/from_dict and to_json/from_json ---
 

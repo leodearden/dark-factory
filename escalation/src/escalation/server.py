@@ -22,7 +22,12 @@ from escalation.action_effects import effect_for
 from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
-from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, RESOLUTION_CLASSES, Escalation
+from escalation.models import (
+    BORN_AT_L2_SEVERITIES,
+    KNOWN_SEVERITIES,
+    RESOLUTION_CLASSES,
+    Escalation,
+)
 from escalation.queue import EscalationQueue
 
 logger = logging.getLogger(__name__)
