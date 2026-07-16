@@ -2036,8 +2036,7 @@ class Harness:
                 continue
             if not force:
                 metadata = t.get('metadata') or {}
-                files = metadata.get('files', [])
-                if files:
+                if metadata.get('files') or metadata.get('files_tagged_at'):
                     continue
             untagged.append(t)
 
