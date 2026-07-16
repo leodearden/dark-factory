@@ -167,6 +167,32 @@ Legacy summaries written before task 1588 lack `metadata.run_id`, and Stage 2 su
 written before task 9af436fe lack `metadata.stage`, so the Path 2 triple filter returns 0 \
 for them — Path 1 semantic search remains their fallback. New summaries have both paths.
 
+## Stage-2-Only Remediation Run Exception (task 2652)
+
+A Stage-2-only targeted remediation pass runs a focused Stage 1 → Stage 2 → Stage 3 \
+cycle under a fresh `run_id`. In that pass, Stage 1 (`memory_consolidator`) legitimately \
+early-returns and never writes its per-cycle summary — by design, not a bug — while \
+Stage 2 (`task_knowledge_sync`) still writes its own cycle_summary row unconditionally. \
+Checking Stage 1 (`memory_consolidator`) cycle_summary presence alone therefore produces \
+a recurring false positive: Stage 2 present, Stage 1 absent, misread as a genuine Stage 1 \
+write failure (recurring false positive: runs 43c5399e and fb4a7caa; tasks 2436/2437/2625).
+
+Before filing a missing Stage 1 (`memory_consolidator`) cycle_summary as a genuine absence:
+
+1. Check the Stage 2 summary for the SAME run_id via \
+`mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<run_id>, \
+stage='task_knowledge_sync')`.
+2. If it returns `present: true` AND `remediation: true`, the run was a Stage-2-only \
+targeted remediation pass in which Stage 1 legitimately never executed. SKIP the \
+missing-Stage-1-summary finding entirely — do not file it. (If you mention it at all \
+for context, mark it `actionable=false` and `severity='minor'`, never \
+`category='missing_knowledge'` with `actionable=true`.)
+3. Only flag a missing Stage 1 summary when the Stage 2 summary indicates a full, \
+non-remediation cycle (`present: true`, `remediation: false`) or when remediation status \
+is unknown (`remediation: null` — a legacy row predating this field, or the ledger row \
+absent entirely). Those cases retain today's behavior: report as missing, \
+`category='missing_knowledge'`, `actionable=true`.
+
 ## Cross-Project Routing Guard (IMPORTANT — task 1661)
 
 When calling `mcp__fused-memory__get_statuses`, `mcp__fused-memory__get_tasks`, or \
