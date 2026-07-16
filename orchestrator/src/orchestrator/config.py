@@ -1951,6 +1951,18 @@ class OrchestratorConfig(BaseSettings):
     # configs that do not merge defaults.yaml keep the old fallback behaviour.
     merge_verify_cold_command_timeout_secs: float | None = Field(default=None)
     merge_verify_workspace: bool = Field(default=False)
+    # Staged-rollout gate for the broad merge gate (λ, task 2589).  'scoped'
+    # (default) is the legacy per-touched-module verify plan — byte-identical
+    # rollback path.  'full' makes merge-role (role='merge') verify run EVERY
+    # REGISTERED module's full suite (pytest+ruff+pyright, per configured
+    # command), not just the modules touched by the merging diff — closing
+    # the source-only-diff hole where an untouched sibling module's tests
+    # never ran at merge time.  Restart-only: deliberately NOT in
+    # RELOADABLE_FIELDS, because flipping the gate's breadth mid-process
+    # could split behaviour across an in-flight merge on the most
+    # load-bearing lane.  Flipped 'scoped' → 'full' by the σ capstone and
+    # activated by the τ deterministic-deploy fleet restart.
+    merge_verify_breadth: Literal['scoped', 'full'] = Field(default='scoped')
     # Train-former opt-in knob (β).  OFF by default so β can land before γ/δ
     # complete the full stack; an always-on former would assign metadata.train
     # and route members to merge-deferred with no stacking (γ) in place, which
