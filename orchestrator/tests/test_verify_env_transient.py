@@ -805,6 +805,45 @@ class TestRunVerificationXdistWorkerCrashRetry:
         assert result.category == 'test_failure'
 
     @pytest.mark.asyncio
+    async def test_crash_with_known_load_flake_raises_verify_infra_error(self, tmp_path: Path):
+        """Acceptance: crash + enumerated known-flake FAILED line routes to the
+        bounded infra-retry, not the debugger (esc-2496-3)."""
+        config = self._make_config(tmp_path)
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'pytest' in cmd:
+                return 1, _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT, False
+            return 0, '', False
+
+        with (
+            patch('orchestrator.verify._run_cmd', side_effect=fake_cmd),
+            pytest.raises(verify.VerifyInfraError) as exc_info,
+        ):
+            await verify.run_verification(tmp_path, config)
+
+        assert exc_info.value.phase == 'xdist_worker_crash'
+        assert exc_info.value.errno is None
+
+    @pytest.mark.asyncio
+    async def test_crash_with_known_flake_plus_genuine_failure_does_not_raise(
+        self, tmp_path: Path,
+    ):
+        """Acceptance: a real in-scope FAILED co-occurring with the known flake
+        must still route to the debugger — no blanket retry."""
+        config = self._make_config(tmp_path)
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'pytest' in cmd:
+                return 1, _XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT, False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(tmp_path, config)
+
+        assert result.passed is False
+        assert result.category == 'test_failure'
+
+    @pytest.mark.asyncio
     async def test_merge_verify_does_not_raise(self, tmp_path: Path):
         """Case (c): the merge path (is_merge_verify=True) has no VerifyInfraError
         handler — an uncaught raise there would stall the merge queue, so the
