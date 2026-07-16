@@ -5,7 +5,7 @@ import contextlib
 import logging
 from dataclasses import asdict
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -1933,8 +1933,8 @@ class TestVerifyResultFailingTestIds:
     the generic asdict/**d codec (RED today: the field does not exist yet).
     """
 
-    def _make_result(self, **overrides) -> VerifyResult:
-        defaults = dict(
+    def _make_result(self, **overrides: Any) -> VerifyResult:
+        defaults: dict[str, Any] = dict(
             passed=True,
             test_output='',
             lint_output='',

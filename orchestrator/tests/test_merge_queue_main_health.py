@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -63,7 +63,7 @@ def _make_config(
     tmp_path: Path,
     *,
     escalate_preexisting: bool = True,
-    merge_verify_breadth: str = 'scoped',
+    merge_verify_breadth: Literal['scoped', 'full'] = 'scoped',
 ) -> OrchestratorConfig:
     return OrchestratorConfig(
         project_root=tmp_path,
