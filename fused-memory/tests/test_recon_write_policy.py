@@ -369,6 +369,143 @@ class TestExtractSnapshotToken:
 
 
 # ---------------------------------------------------------------------------
+# CLEARABLE_ANNOTATION_KEYS / is_terminal_annotation_clear
+# ---------------------------------------------------------------------------
+
+
+class TestIsTerminalAnnotationClear:
+    def test_clearable_annotation_keys_contains_possible_scope_mismatch(self):
+        assert 'possible_scope_mismatch' in recon_write_policy.CLEARABLE_ANNOTATION_KEYS
+
+    # -- positive: exemption applies ---------------------------------------
+
+    def test_clear_to_none_default_mode_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}},
+        ) is True
+
+    def test_clear_via_json_string_metadata_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': '{"possible_scope_mismatch": {"matched_paths": ["a"]}}'},
+        ) is True
+
+    def test_explicit_merge_mode_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {
+                'metadata': {'possible_scope_mismatch': None},
+                'metadata_mode': 'merge',
+            },
+        ) is True
+
+    def test_overwrite_to_non_null_value_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {
+                'metadata': {
+                    'possible_scope_mismatch': {
+                        'matched_paths': ['a'],
+                        'suggested_project': 'other_project',
+                        'source': 'prose',
+                    },
+                },
+            },
+        ) is True
+
+    # -- negative: task-content fields disqualify ---------------------------
+
+    def test_title_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'title': 'x'},
+        ) is False
+
+    def test_description_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'description': 'd'},
+        ) is False
+
+    def test_details_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'details': 'd'},
+        ) is False
+
+    def test_prompt_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'prompt': 'p'},
+        ) is False
+
+    def test_priority_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'priority': 'high'},
+        ) is False
+
+    def test_dependencies_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'dependencies': [1, 2]},
+        ) is False
+
+    # -- negative: non-allowlisted metadata keys -----------------------------
+
+    def test_non_allowlisted_key_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'arbitrary': 1}},
+        ) is False
+
+    def test_files_key_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'files': ['a/b.py']}},
+        ) is False
+
+    def test_done_provenance_key_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'done_provenance': {'kind': 'merged'}}},
+        ) is False
+
+    def test_mixed_allowlisted_and_non_allowlisted_keys_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None, 'arbitrary': 1}},
+        ) is False
+
+    # -- negative: non-merge modes -------------------------------------------
+
+    def test_metadata_mode_replace_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {
+                'metadata': {'possible_scope_mismatch': None},
+                'metadata_mode': 'replace',
+            },
+        ) is False
+
+    def test_append_true_additive_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'append': True},
+        ) is False
+
+    def test_append_false_replace_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'possible_scope_mismatch': None}, 'append': False},
+        ) is False
+
+    # -- negative: absent / empty / unparseable metadata ---------------------
+
+    def test_metadata_absent_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear({}) is False
+
+    def test_metadata_none_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear({'metadata': None}) is False
+
+    def test_metadata_empty_dict_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear({'metadata': {}}) is False
+
+    def test_metadata_non_dict_int_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear({'metadata': 42}) is False
+
+    def test_metadata_json_list_string_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear({'metadata': '[1,2]'}) is False
+
+    def test_metadata_unparseable_string_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_clear({'metadata': 'not json'}) is False
+
+
+# ---------------------------------------------------------------------------
 # Interceptor boundary fixtures (mirrors test_task_write_agent_id.py)
 # ---------------------------------------------------------------------------
 
