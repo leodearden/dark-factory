@@ -83,6 +83,17 @@ _ECHO_SOURCE = 'targeted_reconciliation'
 # hot path.
 _AUTHORITATIVE_PRECHECK_LIMIT = 25
 
+# Cap on the reopen-triggered stale-completion-echo scroll in
+# _delete_stale_completion_echoes (task 2433). Mirrors
+# _AUTHORITATIVE_PRECHECK_LIMIT's bounded-scroll rationale immediately above:
+# a handful of per-task memories (completion echoes, guard markers) is the
+# norm, so a small cap keeps the reopen-from-done sweep cheap while still
+# covering the common case — trading away deleting a stale echo that happens
+# to land outside the first N points for a task_id with a pathologically
+# large memory count, an accepted trade-off rather than an unbounded scroll
+# on every reopen.
+_STALE_ECHO_DELETE_LIMIT = 25
+
 # Metadata key recognized as an authoritative resolution/superseding marker
 # by _is_authoritative_resolution, in addition to a truthy `supersedes`
 # marker.  This is Stage 2's real, task_id-scoped "Completion-Note
@@ -634,6 +645,48 @@ class TargetedReconciler:
 
         return result
 
+    async def _delete_stale_completion_echoes(
+        self, task_id: str, scope: ProjectScope, run_id: str,
+    ) -> list[str]:
+        """Delete this reconciler's own completion-echo memories for *task_id*.
+
+        Task 2433: reopening a task out of a terminal 'done' status does not
+        clear a prior ``metadata.done_provenance`` (task_interceptor.py:963-967),
+        and the completion echo `_on_task_done` wrote for the earlier
+        done-transition is never otherwise removed — so it lingers in Mem0
+        search citing whatever (possibly stale or wrong) outcome that
+        transition captured, even after a later redone echo is written.
+
+        Matches ONLY memories whose metadata carries both
+        ``source == _ECHO_SOURCE`` and ``transition == 'done'`` — i.e.
+        exactly the completion echoes `_on_task_done`'s fast path writes —
+        so memory_hints, stage1/stage2 markers, and any other task_id-tagged
+        memory are never touched.
+
+        Returns the list of deleted memory ids (empty if none matched).
+        """
+        memories = await self.memory.get_memories_by_metadata(
+            project_id=scope.project_id, filters={'task_id': task_id},
+            limit=_STALE_ECHO_DELETE_LIMIT,
+        )
+        stale = [
+            m for m in memories
+            if isinstance(m, dict)
+            and (m.get('metadata') or {}).get('source') == _ECHO_SOURCE
+            and (m.get('metadata') or {}).get('transition') == 'done'
+        ]
+        deleted_ids: list[str] = []
+        for m in stale:
+            memory_id = m.get('id')
+            if not memory_id:
+                continue
+            await self.memory.delete_memory(
+                memory_id=memory_id, store='mem0', project_id=scope.project_id,
+                causation_id=run_id,
+            )
+            deleted_ids.append(memory_id)
+        return deleted_ids
+
     async def _on_task_blocked(
         self, task_id: str, scope: ProjectScope, task_before: dict, run_id: str
     ) -> dict:
@@ -643,6 +696,27 @@ class TargetedReconciler:
 
         title = task.get('title', '')
         description = task.get('description', '')
+
+        # Task 2433: on reopen-from-done, delete the stale completion echo
+        # the earlier done-transition wrote (see
+        # _delete_stale_completion_echoes docstring). Isolated in its own
+        # try/except so a Mem0 hiccup here never breaks hint attachment
+        # below.
+        try:
+            deleted_ids = await self._delete_stale_completion_echoes(task_id, scope, run_id)
+            if deleted_ids:
+                result['actions'].append({
+                    'type': 'stale_echo_deleted',
+                    'count': len(deleted_ids),
+                    'memory_ids': deleted_ids,
+                })
+                await self.journal.add_run_action(
+                    run_id, 'delete', 'memory', 'delete_memory',
+                    {'task_id': task_id, 'deleted': len(deleted_ids)},
+                    causation_id=run_id,
+                )
+        except Exception as e:
+            logger.warning(f'Stale completion-echo sweep failed for task {task_id}: {e}')
 
         related = await self.memory.search(
             query=f'blockers for: {title} {description}',
