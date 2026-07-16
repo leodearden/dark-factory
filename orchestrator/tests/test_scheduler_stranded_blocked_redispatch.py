@@ -17,12 +17,16 @@ park-protection carve-outs (deterministic task_kind boundary, cooldown,
 workflow_cancel_recent) are covered separately (step-07/08).
 """
 
+import asyncio
+import contextlib
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.harness import Harness
 from orchestrator.scheduler import _CONTINUE, Scheduler, TickContext
 
 FIXED_DT = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
@@ -312,3 +316,68 @@ class TestRedispatchStrandedBlockedParkProtection:
 
         assert result is _CONTINUE
         scheduler.set_task_status.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Harness wiring (step-11/12): the escalation queue injected into the
+# scheduler is the fail-safe consumer for mechanism 2's no-open-escalation
+# guard above (TestRedispatchStrandedBlockedCore.test_no_escalation_queue_
+# fails_safe) — without this wiring scheduler.escalation_queue stays None
+# forever in production and the sweep never fires.
+# ---------------------------------------------------------------------------
+
+
+def _build_harness(mock_orch_config) -> Harness:
+    """Construct a Harness with heavy constructors patched out (mirrors
+    test_harness_merge_registry_wiring.py's _build_harness)."""
+    mock_orch_config.max_concurrent_tasks = 2
+    mock_orch_config.fused_memory.project_id = 'test'
+
+    with patch('orchestrator.harness.McpLifecycle'), \
+         patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.BriefingAssembler'):
+        return Harness(mock_orch_config)
+
+
+@pytest.mark.asyncio
+class TestStartEscalationServerInjectsSchedulerEscalationQueue:
+    """_start_escalation_server wires the SAME escalation-queue instance into
+    scheduler.escalation_queue, mirroring the review_checkpoint.escalation_queue
+    injection immediately above it in harness.py (the Scheduler is built long
+    before self._escalation_queue exists, so constructor injection is
+    impossible — this is attribute injection at server-start time).
+
+    RED until step-12 adds the wiring line in harness.py.
+    """
+
+    async def test_scheduler_escalation_queue_is_harness_escalation_queue(
+        self, tmp_path: Path, mock_orch_config,
+    ):
+        h = _build_harness(mock_orch_config)
+
+        # Set up attributes _start_escalation_server reads from config
+        mock_orch_config.escalation.queue_dir = str(tmp_path / 'esc')
+        mock_orch_config.escalation.host = '127.0.0.1'
+        mock_orch_config.escalation.port = 19998
+        # _start_escalation_server wires review_checkpoint if not None
+        h.review_checkpoint = None
+        h.event_store = None
+
+        with patch('orchestrator.harness.create_server', return_value=MagicMock()), \
+             patch('uvicorn.Server') as mock_uv_cls:
+            # Make the uvicorn serve() coroutine return immediately so the
+            # background task finishes and doesn't leave a dangling Task.
+            mock_uv_cls.return_value.serve = AsyncMock()
+            await h._start_escalation_server()
+
+        assert h._escalation_queue is not None, 'sanity: the queue must be constructed'
+        assert h.scheduler.escalation_queue is h._escalation_queue, (
+            'Expected the SAME EscalationQueue instance as h._escalation_queue'
+        )
+
+        # Clean up the escalation background task if it's still running
+        task = getattr(h, '_escalation_task', None)
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
