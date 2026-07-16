@@ -1812,3 +1812,182 @@ async def test_first_pending_monotonic_lifecycle_on_note_merge() -> None:
         '_first_pending_monotonic must NOT reset on a note_merge re-arm'
     )
     assert coord._last_request_monotonic == 1500.0
+
+
+# ---------------------------------------------------------------------------
+# Force-fire escape BEHAVIOR (task 2398, fleet-redeploy δ): maybe_restart
+# bypasses agents_idle, the debounce, and the restart_precondition preference
+# once a pending restart's owed-age (from _first_pending_monotonic) reaches
+# force_fire_after_secs — but NEVER the min_interval wall-clock cap, which is
+# enforced unchanged afterward on both the polite and force-fire paths.
+# ---------------------------------------------------------------------------
+
+
+def _make_force_fire_coordinator(
+    *,
+    force_fire_after_secs: float,
+    require_idle: bool = True,
+    restart_precondition=None,
+    min_interval_secs: float = 0.0,
+    wall_now: list[float] | None = None,
+    debounce_secs: float = 300.0,
+    restart_executor: AsyncMock | None = None,
+) -> tuple[StaleServiceRestartCoordinator, list[float], list[float], AsyncMock]:
+    """Build a coordinator with independently-mutable monotonic (owed-age +
+    debounce) and wall (min-interval rate cap) clocks.
+
+    Returns ``(coord, current_time, wall_now, executor)``; ``current_time``
+    and ``wall_now`` are single-element mutable lists a test advances
+    directly, mirroring ``_make_coordinator_with_mutable_clock`` and
+    ``_make_rate_capped_coordinator`` above.
+    """
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(
+        return_value=(['orchestrator/src/orchestrator/harness.py'], None)
+    )
+    event_store = MagicMock()
+    executor = restart_executor or AsyncMock()
+    current_time: list[float] = [0.0]
+    resolved_wall_now = wall_now if wall_now is not None else [0.0]
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['orchestrator/src/'],
+        debounce_secs=debounce_secs,
+        enabled=True,
+        restart_executor=executor,
+        clock=lambda: current_time[0],
+        service_name='orchestrator',
+        require_idle=require_idle,
+        restart_precondition=restart_precondition,
+        min_interval_secs=min_interval_secs,
+        wall_clock=lambda: resolved_wall_now[0],
+        force_fire_after_secs=force_fire_after_secs,
+    )
+    return coord, current_time, resolved_wall_now, executor
+
+
+@pytest.mark.asyncio
+async def test_force_fire_i6_core_bypasses_agents_idle_gate() -> None:
+    """(a) I6 core: under saturation (agents_idle always False), maybe_restart
+    DEFERS while owed-age < force_fire_after_secs, then FIRES once owed-age
+    crosses the bound — bypassing the agents_idle gate entirely.
+    """
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0, require_idle=True, debounce_secs=300.0
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+    assert coord._first_pending_monotonic == 0.0
+
+    # Past debounce, but owed-age still short of the force-fire bound —
+    # defers because agents_idle=False and require_idle=True.
+    current_time[0] = 4499.0
+    assert await coord.maybe_restart(agents_idle=False) is False
+    assert coord.is_pending is True
+    executor.assert_not_awaited()
+
+    # Owed-age now >= bound — force-fire bypasses agents_idle.
+    current_time[0] = 4500.0
+    result = await coord.maybe_restart(agents_idle=False)
+
+    assert result is True
+    executor.assert_awaited_once()
+    # (f) pending cleared AND the owed-age anchor reset for the next burst.
+    assert coord.is_pending is False
+    assert coord._first_pending_monotonic is None
+
+
+@pytest.mark.asyncio
+async def test_force_fire_bypasses_debounce() -> None:
+    """(b) force-fire bypasses the debounce even with a just-now
+    _last_request_monotonic, as long as owed-age (from the FIRST arm) is
+    past the bound.
+    """
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0, require_idle=True, debounce_secs=300.0
+    )
+    await coord.note_merge('task-1', 'base', 'head')  # first arm at t=0
+
+    # Re-arm right at the force-fire bound: _last_request_monotonic becomes
+    # "now" (well inside the 300s debounce), but _first_pending_monotonic
+    # (owed-age anchor) is untouched by the re-arm.
+    current_time[0] = 4500.0
+    await coord.note_merge('task-2', 'base2', 'head2')
+    assert coord._first_pending_monotonic == 0.0
+    assert coord._last_request_monotonic == 4500.0
+
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False
+
+
+@pytest.mark.asyncio
+async def test_force_fire_bypasses_restart_precondition_preference() -> None:
+    """(c) force-fire bypasses the restart_precondition (merge-drain)
+    preference — it fires even though the precondition callable returns
+    False.
+    """
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        require_idle=True,
+        restart_precondition=lambda: False,
+        debounce_secs=0.0,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 4500.0
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False
+
+
+@pytest.mark.asyncio
+async def test_force_fire_still_honors_min_interval_clock() -> None:
+    """(d) force-fire NEVER bypasses the min_interval wall-clock cap: with a
+    recent-enough last fire (inside the 8h window), a force-fire-eligible
+    restart still DEFERS (pending retained, owed-age anchor untouched).
+    """
+    coord, current_time, wall_now, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        require_idle=True,
+        debounce_secs=300.0,
+        min_interval_secs=28800.0,
+        wall_now=[100_000.0],
+    )
+    coord._last_fire_wall = wall_now[0] - 3600.0  # 1h ago — inside the 8h cap
+
+    await coord.note_merge('task-1', 'base', 'head')
+    current_time[0] = 4500.0  # owed-age >= bound: force_fire would apply
+
+    result = await coord.maybe_restart(agents_idle=False)
+
+    assert result is False
+    executor.assert_not_awaited()
+    assert coord.is_pending is True
+    # Deferred (not fired) — the owed-age anchor must be untouched.
+    assert coord._first_pending_monotonic == 0.0
+
+
+@pytest.mark.asyncio
+async def test_force_fire_disabled_by_default_defers_forever_under_saturation() -> None:
+    """(e) Regression: force_fire_after_secs=0.0 (the default) NEVER
+    force-fires — under saturation (agents_idle=False) it defers
+    indefinitely regardless of owed-age.
+    """
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=0.0, require_idle=True, debounce_secs=300.0
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    # Owed-age far beyond any reasonable force-fire bound.
+    current_time[0] = 1_000_000.0
+    result = await coord.maybe_restart(agents_idle=False)
+
+    assert result is False
+    executor.assert_not_awaited()
+    assert coord.is_pending is True
