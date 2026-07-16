@@ -29,6 +29,7 @@ Invoked by scripts/orchestrator-watchdog.service (launched via
 scripts/orchestrator-watchdog.timer).
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -91,6 +92,36 @@ try:
     STALENESS_GRACE_SECS = int(os.environ["STALENESS_GRACE_SECS"])
 except (KeyError, ValueError):
     STALENESS_GRACE_SECS = 1800
+
+# Minimum wall-clock seconds between successive FLEET-WIDE redeploys, shared
+# with the event-driven restart coordinator
+# (orchestrator.service_restart.StaleServiceRestartCoordinator's
+# min_interval_secs, sourced from
+# OrchestratorConfig.orchestrator_restart_min_interval_secs, default 28800.0
+# = 8h). The watchdog is a stdlib-only systemd oneshot that cannot import the
+# orchestrator package, so this is a hardcoded env-mirror of the config
+# default (drift-tested in tests/scripts/test_orchestrator_watchdog.py
+# against a live OrchestratorConfig, task 2396 Open-Q1) rather than a live
+# read of it. 0 disables the cap entirely. Mirrors STALENESS_GRACE_SECS's
+# env-with-default try/except pattern immediately above — a typo'd env var
+# must not crash the oneshot watchdog.
+try:
+    ORCH_RESTART_MIN_INTERVAL_SECS = int(os.environ["ORCH_RESTART_MIN_INTERVAL_SECS"])
+except (KeyError, ValueError):
+    ORCH_RESTART_MIN_INTERVAL_SECS = 28800
+
+# Path to the shared fleet-deploy clock file: the SAME file
+# restart-all-orchestrators.sh stamps (atomically, only on its verified-fresh
+# exit-0 path) and the orchestrator's own StaleServiceRestartCoordinator
+# reads/seeds from (state_path, task 2371/2396). Mirrors
+# orchestrator.service_restart.FLEET_DEPLOY_CLOCK_RELPATH — neither this
+# stdlib script nor that constant can import each other, so the literal path
+# is duplicated here and guarded by a drift/consistency test. Env-overridable
+# so tests can point every tier at a tmp file without touching real data/.
+FLEET_DEPLOY_CLOCK_PATH = os.environ.get(
+    "ORCH_FLEET_DEPLOY_CLOCK",
+    os.path.join(REPO_DIR, "data", "orchestrator", "last_redeploy_orchestrator.json"),
+)
 
 
 def log(msg: str) -> None:
@@ -440,6 +471,55 @@ def _newest_watched_commit_epoch() -> int | None:
             "returning None (staleness undeterminable this tick)"
         )
         return None
+
+
+def _read_last_fleet_deploy_epoch() -> float | None:
+    """Return the last verified fleet-deploy epoch from FLEET_DEPLOY_CLOCK_PATH, or None.
+
+    Reads the same ``{ts, iso}`` JSON schema
+    ``StaleServiceRestartCoordinator._load_last_fire_wall`` reads and
+    ``restart-all-orchestrators.sh``'s ``stamp_fleet_deploy_clock`` writes, so
+    all three tiers agree on the shared clock's format.
+
+    Fail-open, mirroring ``_load_last_fire_wall``: returns None (never
+    raises) when the file is missing (no fleet deploy has ever verified
+    fresh, or a fresh checkout with no data/ yet), or when it is corrupt,
+    unreadable, or missing its ``ts`` key. Callers must treat None as
+    "the min-interval cap does not apply" (fail toward restarting, not
+    toward silence).
+    """
+    try:
+        with open(FLEET_DEPLOY_CLOCK_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+        return float(raw["ts"])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        log(
+            f"ignoring unreadable/corrupt fleet-deploy clock at "
+            f"{FLEET_DEPLOY_CLOCK_PATH}: {exc!r}"
+        )
+        return None
+
+
+def _within_fleet_deploy_min_interval() -> bool:
+    """Return True iff we are still inside the shared fleet-deploy min-interval window.
+
+    Reads the same on-disk clock ``restart-all-orchestrators.sh`` stamps only
+    on a verified-fresh fleet restart (never on mere fire/registration — see
+    the coordinator's ``stamp_clock_on_fire=False`` for the orchestrator's own
+    coordinator, task 2396). ORCH_RESTART_MIN_INTERVAL_SECS<=0 disables the
+    cap outright (the clock is not even read). A missing/unreadable clock
+    (``_read_last_fleet_deploy_epoch`` returns None) is treated as "outside
+    the window" — fail toward letting the backstop run, not toward silencing
+    it indefinitely.
+    """
+    if ORCH_RESTART_MIN_INTERVAL_SECS <= 0:
+        return False
+    last = _read_last_fleet_deploy_epoch()
+    if last is None:
+        return False
+    return (time.time() - last) < ORCH_RESTART_MIN_INTERVAL_SECS
 
 
 def main() -> None:
