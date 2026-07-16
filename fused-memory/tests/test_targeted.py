@@ -3376,10 +3376,82 @@ async def test_on_task_blocked_reopen_deletes_stale_completion_echo(
     query_call = mock_memory_service.get_memories_by_metadata.await_args
     assert query_call is not None
     assert query_call.kwargs.get('filters', {}).get('task_id') == '2531'
+    # Task 2433 review amendment (efficiency_robustness): source/transition
+    # are pushed into the server-side filter so _STALE_ECHO_DELETE_LIMIT
+    # bounds only this reconciler's completion echoes, not every
+    # task_id-tagged memory.
+    assert query_call.kwargs.get('filters', {}).get('source') == 'targeted_reconciliation'
+    assert query_call.kwargs.get('filters', {}).get('transition') == 'done'
+    assert query_call.kwargs.get('limit') == 25
 
     deleted_actions = [a for a in result.get('actions', []) if a['type'] == 'stale_echo_deleted']
     assert len(deleted_actions) == 1
     assert 'echo-stale' in deleted_actions[0].get('memory_ids', [])
+
+
+@pytest.mark.asyncio
+async def test_on_task_deferred_reopen_deletes_stale_completion_echo(
+    reconciler, mock_memory_service,
+):
+    """_on_task_deferred delegates straight to _on_task_blocked (see its
+    docstring), so the reopen-from-done stale-echo sweep must fire
+    identically for the 'deferred' transition. Regression for task 2433
+    review amendment (test_coverage): this delegation was previously an
+    asserted-but-untested contract."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+        {
+            'id': 'echo-stale-deferred',
+            'created_at': '2026-07-16T00:14:06',
+            'metadata': {
+                'source': 'targeted_reconciliation',
+                'task_id': '2531',
+                'transition': 'done',
+            },
+        },
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='2531', transition='deferred', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '2531', 'title': 'T', 'status': 'done'},
+    )
+
+    mock_memory_service.delete_memory.assert_awaited_once()
+    delete_kwargs = mock_memory_service.delete_memory.await_args.kwargs
+    assert delete_kwargs.get('memory_id') == 'echo-stale-deferred'
+    assert delete_kwargs.get('store') == 'mem0'
+
+    deleted_actions = [a for a in result.get('actions', []) if a['type'] == 'stale_echo_deleted']
+    assert len(deleted_actions) == 1
+    assert 'echo-stale-deferred' in deleted_actions[0].get('memory_ids', [])
+
+
+@pytest.mark.asyncio
+async def test_on_task_blocked_reopen_echo_sweep_error_does_not_break_hints(
+    reconciler, mock_memory_service,
+):
+    """A Mem0 hiccup during the reopen-from-done stale-echo scroll must be
+    swallowed by the sweep's own isolated try/except -- hint attachment
+    below it must still proceed normally. Regression for task 2433 review
+    amendment (test_coverage): the fail-safe path had no coverage."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(
+        side_effect=RuntimeError('qdrant unavailable'),
+    )
+    mock_memory_service.search = AsyncMock(return_value=[
+        MemoryResult(id='1', content='relevant info', source_store=SourceStore.mem0, entities=['EntityA']),
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='2531', transition='blocked', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '2531', 'title': 'T', 'status': 'done'},
+    )
+
+    mock_memory_service.delete_memory.assert_not_awaited()
+
+    deleted_actions = [a for a in result.get('actions', []) if a['type'] == 'stale_echo_deleted']
+    assert len(deleted_actions) == 0
+
+    hints_actions = [a for a in result.get('actions', []) if a['type'] == 'hints_attached']
+    assert len(hints_actions) == 1
 
 
 @pytest.mark.asyncio
