@@ -1932,6 +1932,7 @@ class TestConfigReload:
         'orphan_l0_timeout_secs',
         'watcher_rotation_escalations',
         'watcher_crashloop_window_secs',
+        'watcher_empty_queue_poll_secs',
         'review.full_review_min_tasks',
         'verify_env',
         'git.offline_lane_test_threads',

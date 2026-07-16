@@ -65,6 +65,11 @@ class TestWatcherConfig:
         config = OrchestratorConfig(project_root=tmp_path)
         assert config.watcher_crashloop_window_secs == 600
 
+    def test_watcher_empty_queue_poll_secs_default(self, tmp_path: Path) -> None:
+        """Idle re-check cadence when the L1 queue has no actionable work."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.watcher_empty_queue_poll_secs == 60.0
+
     # Invocation knobs
     def test_watcher_model_default(self, tmp_path: Path) -> None:
         config = OrchestratorConfig(project_root=tmp_path)
