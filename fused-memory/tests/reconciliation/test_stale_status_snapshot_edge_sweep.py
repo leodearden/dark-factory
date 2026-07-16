@@ -26,11 +26,34 @@ Covers:
 
 from __future__ import annotations
 
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     extract_snapshot_edge_task_ids,
     flatten_dedup_edges,
     select_stale_status_snapshot_edges,
+    sweep_stale_status_snapshot_edges,
 )
+
+
+def _make_memory_service() -> MagicMock:
+    """MagicMock memory_service with an AsyncMock .graphiti and .update_edge
+    (mirrors test_degenerate_task_node_sweep.py's _make_memory_service)."""
+    memory_service = MagicMock()
+    memory_service.graphiti = MagicMock()
+    memory_service.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+    memory_service.update_edge = AsyncMock()
+    return memory_service
+
+
+def _make_taskmaster() -> MagicMock:
+    """MagicMock taskmaster with an AsyncMock .get_statuses."""
+    taskmaster = MagicMock()
+    taskmaster.get_statuses = AsyncMock(return_value={})
+    return taskmaster
 
 
 class TestExtractSnapshotEdgeTaskIds:
@@ -229,3 +252,106 @@ class TestSelectStaleStatusSnapshotEdges:
 
         assert len(result) == 1
         assert result[0]['uuid'] == 'edge-carries-uuid'
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_status_snapshot_edges — core behavior
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepStaleStatusSnapshotEdgesCore:
+    """sweep_stale_status_snapshot_edges enumerates valid edges via
+    memory_service.graphiti.get_all_valid_edges, cross-references each
+    candidate id's CURRENT status via taskmaster.get_statuses (never
+    semantic search), and invalidates only the edges
+    select_stale_status_snapshot_edges identifies as stale.
+    """
+
+    @pytest.mark.asyncio
+    async def test_happy_path_invalidates_only_the_stale_edge(self):
+        """One stale edge (references done task 142) + one healthy edge
+        (references still-pending task 999). update_edge must be awaited
+        exactly once, for the stale edge's uuid only, with invalid_at set
+        and project_id threaded through; get_statuses must be called with
+        only the two referenced candidate ids."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+
+        stale_edge = {
+            'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': '',
+        }
+        healthy_edge = {
+            'uuid': 'edge-healthy', 'fact': 'Task 999 is an active pending task', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [stale_edge, healthy_edge]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'142': 'done', '999': 'pending'})
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        memory_service.update_edge.assert_awaited_once()
+        update_call = memory_service.update_edge.await_args
+        assert update_call.args[0] == 'edge-stale', (
+            f'Expected update_edge awaited for the stale edge uuid only, got {update_call!r}'
+        )
+        assert isinstance(update_call.kwargs.get('invalid_at'), datetime), (
+            'Expected update_edge called with a datetime invalid_at'
+        )
+        assert update_call.kwargs.get('project_id') == 'test_project'
+
+        taskmaster.get_statuses.assert_awaited_once()
+        get_statuses_call = taskmaster.get_statuses.await_args
+        assert get_statuses_call.args[0] == '/tmp/reify'
+        assert set(get_statuses_call.kwargs.get('ids', [])) == {'142', '999'}, (
+            'Expected get_statuses called with only the referenced candidate ids'
+        )
+
+        assert stats == {'scanned': 2, 'candidate_edges': 1, 'invalidated': 1, 'errors': 0}, (
+            f'Expected exactly the stale edge counted+invalidated, got stats={stats!r}'
+        )
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_status_snapshot_edges — guards
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepStaleStatusSnapshotEdgesGuards:
+    """Guard behavior: an unavailable taskmaster/project_root, or an
+    enumeration with no candidate ids, must short-circuit without
+    unnecessary backend calls."""
+
+    @pytest.mark.asyncio
+    async def test_taskmaster_none_yields_all_zero_stats_with_no_calls(self):
+        """taskmaster=None -> all-zero stats; get_all_valid_edges never awaited."""
+        memory_service = _make_memory_service()
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, None, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats == {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0}
+        memory_service.graphiti.get_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_candidate_ids_skips_get_statuses(self):
+        """Enumeration returns only count-only/non-status edges (no candidate
+        ids) -> get_statuses never awaited and invalidated == 0."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        count_only_edge = {
+            'uuid': 'edge-count', 'fact': 'There are 8 tasks in progress', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [count_only_edge]},
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        taskmaster.get_statuses.assert_not_awaited()
+        assert stats['invalidated'] == 0
