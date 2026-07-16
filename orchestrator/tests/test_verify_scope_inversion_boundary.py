@@ -254,6 +254,8 @@ async def _drive_merge_gate(
     main_sha: str,
     run_verification_fake: AsyncMock,
     git_ops: GitOps | None = None,
+    timeouts: dict[str, int] | None = None,
+    enospc_retries: dict[str, int] | None = None,
 ) -> MergeOutcome | None:
     """Drive the REAL merge-gate consumer chokepoint, ``_run_post_merge_verify``.
 
@@ -293,12 +295,25 @@ async def _drive_merge_gate(
     the cache lives one layer inside ``verify_failure_is_preexisting_on_main``,
     so that entry point itself is still called once per merge; only the
     expensive worktree-probe fallback is what the cache actually elides.
+
+    *timeouts* / *enospc_retries* let a caller inspect the merge-side
+    attempt-accounting dicts ``_run_post_merge_verify`` mutates in place
+    (the timeout loop-breaker and the shared ENOSPC/classified-infra retry
+    budget, respectively) — default ``None`` builds fresh empty dicts
+    per-call (byte-identical to every pre-existing call site, which never
+    needed to inspect them afterward). Row 6 passes its own dicts to assert
+    a persistent infra-transient outcome bumps NEITHER (no merge verify
+    attempt consumed).
     """
     config = _make_config(tmp_path, merge_verify_breadth='full')
     config._module_configs = dict(module_configs_registry)
     if git_ops is None:
         git_ops = _make_git_ops(tmp_path)
     git_ops.get_main_sha = AsyncMock(return_value=main_sha)
+    if timeouts is None:
+        timeouts = {}
+    if enospc_retries is None:
+        enospc_retries = {}
 
     task_wt = tmp_path / f'task-wt-{task_id}'
     task_wt.mkdir(parents=True, exist_ok=True)
@@ -316,7 +331,8 @@ async def _drive_merge_gate(
     with patch.object(verify, 'run_verification', new=run_verification_fake):
         return await _run_post_merge_verify(
             git_ops, req, merge_wt,
-            timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+            timeouts=timeouts, enospc_retries=enospc_retries,
+            max_timeouts=3, max_enospc=1,
         )
 
 
@@ -769,6 +785,7 @@ class TestRow6InfraTransientConsumesNoAttemptBothConsumers:
     """
 
     @pytest.mark.asyncio
+    @pytest.mark.exercise_merge_verify
     async def test_row6_infra_transient_consumes_no_attempt_both_consumers(
         self, tmp_path: Path,
     ) -> None:
