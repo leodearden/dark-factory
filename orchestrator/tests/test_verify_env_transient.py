@@ -656,6 +656,33 @@ _XDIST_CRASH_WITH_REAL_FAILURE_OUTPUT = (
     + '========== 1 failed, 2 passed in 5.00s ==========\n'
 )
 
+# Same crash signature, but co-occurring with the ENUMERATED known load-flake
+# failure (esc-2496-3): under host CPU oversubscription a bare second-worker
+# hard-crash ([gwN] node down) can co-occur with the PGID-liveness race in
+# test_cli.py::test_verify_merge_cancel_end_to_end, which emits a
+# genuine-looking FAILED line for that one known-flaky test. The allow-listed
+# FAILED line — and its E-traceback / failure summary — are attributable to
+# the known flake, not a real regression, so this must still reclassify as a
+# bare crash.
+_XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT = (
+    _XDIST_WORKER_CRASH_OUTPUT
+    + 'E   AssertionError: expected process group to be alive\n'
+    + 'FAILED orchestrator/tests/test_cli.py::test_verify_merge_cancel_end_to_end - '
+    'AssertionError: expected process group to be alive\n'
+    + '========== 1 failed, 2 passed in 5.00s ==========\n'
+)
+
+# Fixture (a) PLUS a genuine, non-allow-listed FAILED line — the strictness
+# guard: a real in-scope failure co-occurring with the known flake must still
+# route to the debugger, never blanket-discounted just because a
+# known-flake FAILED line is also present.
+_XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT = (
+    _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT
+    + 'E   AssertionError: expected 3, got 4\n'
+    + 'FAILED orchestrator/tests/test_scheduler.py::test_dispatch_order - AssertionError\n'
+    + '========== 2 failed, 2 passed in 5.00s ==========\n'
+)
+
 
 class TestBareXdistWorkerCrashDetector:
     """task 2365 step-1: verify._is_bare_xdist_worker_crash(output) pure helper.
@@ -691,6 +718,28 @@ class TestBareXdistWorkerCrashDetector:
             'E   TypeError: unexpected keyword argument\n'
         )
         assert verify._is_bare_xdist_worker_crash(output) is False
+
+    def test_crash_with_known_load_flake_failed_is_true(self):
+        """Crash signature + ONLY the enumerated known-load-flake FAILED line -> True.
+
+        esc-2496-3: a bare second-worker hard-crash co-occurring with the
+        known PGID-liveness race in
+        test_cli.py::test_verify_merge_cancel_end_to_end must still
+        reclassify as transient infra so the bounded retry fires instead of
+        the debugger.
+        """
+        assert verify._is_bare_xdist_worker_crash(_XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT) is True
+
+    def test_known_flake_plus_genuine_failure_is_false(self):
+        """Known-flake FAILED line PLUS a genuine, non-allow-listed FAILED line -> False.
+
+        Strictness guard: a real in-scope failure must still route to the
+        debugger even when a known load-flake FAILED line is also present —
+        never blanket-discount every FAILED line just because the crash
+        signature and one known flake co-occur.
+        """
+        result = verify._is_bare_xdist_worker_crash(_XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT)
+        assert result is False
 
 
 class TestRunVerificationXdistWorkerCrashRetry:
