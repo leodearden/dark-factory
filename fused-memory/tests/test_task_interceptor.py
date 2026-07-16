@@ -3245,6 +3245,278 @@ async def test_reopen_freshness_exempts_commitless_kind(
         await backend.close()
 
 
+@pytest.mark.asyncio
+async def test_reopen_freshness_merged_kind_stale_rejected_then_fresh_accepted(
+    tmp_path, event_buffer,
+):
+    """Coverage gap fix (reviewer follow-up on task 2674): every other
+    reopen-freshness test above exercises kind='found_on_main' only. The
+    gate's kind whitelist (``resolved_provenance.get('kind') not in
+    ('merged', 'found_on_main')``) is a single check shared by the
+    stale-reject and fresh-accept paths alike, but a regression narrowing
+    it to just 'found_on_main' would otherwise pass unnoticed. Drives
+    kind='merged' through both a stale rejection and a subsequent fresh
+    acceptance on the same task, against a real backend + real git repo.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    _init_git_repo(tmp_path)
+    stale_sha = _commit_on_main(tmp_path, 'stale_evidence.txt', '2020-01-01T00:00:00+00:00')
+
+    cfg = FusedMemoryConfig()
+    cfg.reconciliation.reject_stale_done_evidence = 'enforce'
+
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg)
+
+        # kind='merged' takes no 'note' -- unlike 'found_on_main' it is not
+        # required -- sharpening the distinction from the found_on_main
+        # coverage above.
+        stale_provenance = {'kind': 'merged', 'commit': stale_sha}
+
+        first_done = await interceptor.set_task_status(
+            '1', 'done', project_root, done_provenance=stale_provenance,
+        )
+        assert 'error' not in first_done, first_done
+
+        reopen_result = await interceptor.set_task_status(
+            '1', 'pending', project_root, reopen_reason='reverting: regression found',
+        )
+        assert 'error' not in reopen_result, reopen_result
+
+        stale_result = await interceptor.set_task_status(
+            '1',
+            'done',
+            project_root,
+            done_provenance=stale_provenance,
+            agent_id='claude-interactive',
+        )
+        assert stale_result['success'] is False
+        assert stale_result['error'] == 'done_evidence_stale'
+        assert stale_result['evidence_commit'] == stale_sha
+
+        after_reject = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await after_reject.start()
+        try:
+            task = await after_reject.get_task('1', project_root=project_root)
+        finally:
+            await after_reject.close()
+        assert task['status'] == 'pending', task
+
+        fresh_sha = _commit_on_main(tmp_path, 'fresh_evidence.txt', '2099-01-01T00:00:00+00:00')
+        fresh_result = await interceptor.set_task_status(
+            '1',
+            'done',
+            project_root,
+            done_provenance={'kind': 'merged', 'commit': fresh_sha},
+            agent_id='claude-interactive',
+        )
+        assert 'error' not in fresh_result, fresh_result
+
+        after_accept = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await after_accept.start()
+        try:
+            task = await after_accept.get_task('1', project_root=project_root)
+        finally:
+            await after_accept.close()
+        assert task['status'] == 'done', task
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_reopen_freshness_invalid_override_rejected_in_warn_mode(
+    tmp_path, event_buffer, caplog,
+):
+    """Coverage gap fix (reviewer follow-up on task 2674): the
+    override-invalid rejection is mode-independent BY DESIGN (see
+    ``_check_reopen_freshness``'s "Rollout-safety note" and
+    ``reject_stale_done_evidence``'s schema docstring) but was previously
+    only exercised under enforce config. Confirms warn mode (the alpha
+    rollout default) still rejects a malformed override rather than
+    silently proceeding, and does so WITHOUT also emitting the normal
+    ``done_evidence_stale_warn`` census line -- the override-invalid branch
+    returns before the enforce/warn mode dispatch that would log it.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    _init_git_repo(tmp_path)
+    stale_sha = _commit_on_main(tmp_path, 'stale_evidence.txt', '2020-01-01T00:00:00+00:00')
+
+    # No config override -- reject_stale_done_evidence stays at its 'warn' default.
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer)
+
+        stale_provenance = {'kind': 'found_on_main', 'commit': stale_sha, 'note': 'sibling'}
+
+        first_done = await interceptor.set_task_status(
+            '1', 'done', project_root, done_provenance=stale_provenance,
+        )
+        assert 'error' not in first_done, first_done
+
+        reopen_result = await interceptor.set_task_status(
+            '1', 'pending', project_root, reopen_reason='reverting: regression found',
+        )
+        assert 'error' not in reopen_result, reopen_result
+
+        malformed_override = {'escalation_id': 'esc-2'}  # missing 'reason'
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+            result = await interceptor.set_task_status(
+                '1',
+                'done',
+                project_root,
+                done_provenance={
+                    **stale_provenance, 'stale_evidence_override': malformed_override,
+                },
+                agent_id='claude-interactive',
+            )
+
+        assert result['success'] is False
+        assert result['error'] == 'done_evidence_stale_override_invalid'
+        assert result['task_id'] == '1'
+        assert result['agent_id'] == 'claude-interactive'
+
+        # The write must not persist even though rollout mode is 'warn'.
+        fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await fresh.start()
+        try:
+            task = await fresh.get_task('1', project_root=project_root)
+        finally:
+            await fresh.close()
+        assert task['status'] == 'pending', task
+
+        # The override-invalid branch returns before the warn-mode census
+        # log, so no done_evidence_stale_warn line should appear alongside
+        # the rejection.
+        stale_warn_records = [
+            r for r in caplog.records
+            if r.message.startswith('task_status.done_evidence_stale_warn')
+        ]
+        assert stale_warn_records == []
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
+    tmp_path, event_buffer, monkeypatch, caplog,
+):
+    """Coverage gap fix (reviewer follow-up on task 2674): distinguishes the
+    transient-git-failure fail-closed path (``evidence_dt`` is None because
+    git itself could not be queried) from the unparseable-``reopen_at``
+    fail-closed path already covered by
+    ``test_reopen_freshness_fail_closed_on_unparseable_reopen_at``.
+
+    By the time ``_check_reopen_freshness`` runs, ``_validate_done_provenance``
+    has already resolved + ancestor-checked the cited commit, so a genuine
+    "commit does not exist" scenario can never reach the gate --
+    ``_resolve_commit_committed_at`` is monkeypatched to simulate a ``git
+    show`` failure (binary hiccup, timeout) on an otherwise perfectly
+    valid, on-main commit, isolating the gate's OWN resolution step.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    seed_sha = _init_git_repo(tmp_path)
+
+    cfg = FusedMemoryConfig()
+    cfg.reconciliation.reject_stale_done_evidence = 'enforce'
+
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg)
+
+        first_done = await interceptor.set_task_status(
+            '1', 'done', project_root,
+            done_provenance={'kind': 'found_on_main', 'commit': seed_sha, 'note': 'seed'},
+        )
+        assert 'error' not in first_done, first_done
+
+        reopen_result = await interceptor.set_task_status(
+            '1', 'pending', project_root, reopen_reason='reverting: regression found',
+        )
+        assert 'error' not in reopen_result, reopen_result
+        reopened_task = await backend.get_task('1', project_root=project_root)
+        reopen_at = reopened_task['metadata']['reopen_at']
+
+        # A perfectly valid, resolvable, on-main commit -- NOT actually
+        # unresolvable. The monkeypatch below is what makes the gate's own
+        # `git show` step fail, isolated from commit resolution/ancestor
+        # checking in _validate_done_provenance (which runs first and would
+        # otherwise reject a genuinely bad commit before the gate even
+        # sees it).
+        evidence_sha = _commit_on_main(
+            tmp_path, 'transient_failure_evidence.txt', '2099-01-01T00:00:00+00:00',
+        )
+
+        async def _simulate_git_failure(project_root, sha):
+            return None
+
+        monkeypatch.setattr(
+            'fused_memory.middleware.task_interceptor._resolve_commit_committed_at',
+            _simulate_git_failure,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+            result = await interceptor.set_task_status(
+                '1',
+                'done',
+                project_root,
+                done_provenance={
+                    'kind': 'found_on_main', 'commit': evidence_sha, 'note': 'sibling',
+                },
+                agent_id='claude-interactive',
+            )
+
+        assert result['success'] is False
+        assert result['error'] == 'done_evidence_stale'
+        assert result['task_id'] == '1'
+        assert result['evidence_commit'] == evidence_sha
+        assert result['evidence_committed_at'] is None
+        assert result['reopen_at'] == reopen_at
+        assert result['agent_id'] == 'claude-interactive'
+
+        fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await fresh.start()
+        try:
+            task = await fresh.get_task('1', project_root=project_root)
+        finally:
+            await fresh.close()
+        assert task['status'] == 'pending', task
+
+        # The new distinct census signal (reviewer follow-up on task 2674)
+        # fires -- separable in logs from a genuine date-comparison
+        # staleness verdict (done_evidence_stale_warn).
+        unresolved_records = [
+            r for r in caplog.records
+            if r.message.startswith('task_status.done_evidence_stale_unresolved_commit')
+        ]
+        assert len(unresolved_records) == 1, (
+            f'expected exactly one census line, got: {[r.message for r in caplog.records]}'
+        )
+        msg = unresolved_records[0].message
+        assert 'task_id=1' in msg
+        assert evidence_sha in msg
+        assert reopen_at in msg
+        assert 'claude-interactive' in msg
+    finally:
+        await backend.close()
+
+
 # ── Tests for done_provenance.kind discriminator (2026-04-27 hardening) ────
 
 
