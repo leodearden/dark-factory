@@ -526,6 +526,70 @@ class TestMarkBlockedStampsLastBlockedAt:
 
 
 # ---------------------------------------------------------------------------
+# Amendment (task 2557 review): produce-side ordering invariant.
+# TestMarkBlockedStampsLastBlockedAt above only proves the stamp eventually
+# happens — it would not catch a regression that reordered the stamp to
+# after _spawn_dry_run_unblock. Because run_dry_run_unblock is fire-and-
+# forget (asyncio.create_task), the background task cannot run any of its
+# own code — including its own proposal-append update_task call — until the
+# CURRENT coroutine genuinely yields (e.g. the test's `asyncio.sleep(0)`).
+# With the fake, non-yielding scheduler used here, that means a post-hoc
+# check of relative order in scheduler.update_calls would show "stamp
+# first" regardless of which statement _mark_blocked calls first — it
+# can't distinguish correct from reordered source. So this test instead
+# records the order in which the two *call sites* inside _mark_blocked
+# actually fire: the stamp's scheduler.update_task(...) await vs. the
+# self._spawn_dry_run_unblock(...) invocation. That directly pins the
+# source-level sequencing described at workflow.py's `_mark_blocked`
+# comment (search "Awaited synchronously here, BEFORE the fire-and-forget"),
+# which is what guarantees a fresh investigation's proposal timestamp lands
+# after last_blocked_at under a real (slow, potentially-concurrent)
+# scheduler in production.
+# ---------------------------------------------------------------------------
+
+class TestMarkBlockedStampPrecedesDryRunSpawn:
+    @pytest.mark.asyncio
+    async def test_last_blocked_at_stamp_precedes_dry_run_spawn(self, tmp_path):
+        wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='52', enabled=True)
+
+        call_order: list[str] = []
+
+        real_update_task = scheduler.update_task
+
+        async def _tracking_update_task(task_id, metadata, *, append=False):
+            if isinstance(metadata, dict) and 'last_blocked_at' in metadata:
+                call_order.append('stamp')
+            return await real_update_task(task_id, metadata, append=append)
+
+        scheduler.update_task = _tracking_update_task  # type: ignore[method-assign]
+
+        real_spawn = wf._spawn_dry_run_unblock
+
+        def _tracking_spawn(*args, **kwargs):
+            call_order.append('spawn')
+            return real_spawn(*args, **kwargs)
+
+        wf._spawn_dry_run_unblock = _tracking_spawn  # type: ignore[method-assign]
+
+        async def _spy_dry_run(**kwargs):
+            pass
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._mark_blocked('verify exhausted', detail='All attempts failed')
+
+        await asyncio.sleep(0)  # let any background tasks register/finish
+        pending = list(wf._background_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        assert call_order == ['stamp', 'spawn'], (
+            'Expected the last_blocked_at stamp to be awaited BEFORE '
+            '_spawn_dry_run_unblock is invoked, so a freshly-produced '
+            f'proposal always compares as non-stale; got {call_order}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Protocol-conformance assertion (static-only; never executes at runtime).
 # Mirrors the if TYPE_CHECKING / SchedulerFacade conformance block near the
 # bottom of test_workflow_e2e.py.
