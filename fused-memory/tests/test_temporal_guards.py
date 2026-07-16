@@ -354,3 +354,96 @@ class TestBatchPlanAutoTagRoundTrip:
             'Batch-plan edge surfaced via include_planned=True should carry '
             "metadata['planned'] = True"
         )
+
+
+class TestProposedResolutionAutoTagRoundTrip:
+    """End-to-end regression (task 2447): the MCP add_episode tool auto-tags
+    proposed/conditional resolution-option prose as planning, so its
+    Graphiti-extracted edges are excluded from default search.
+
+    Incident shape: episode 7882dcdc (causation_id
+    3427792c-4ab5-4893-b52e-82bbbe576a1d, sourced from task 2444's
+    description) was ingested without temporal_context='planning', so its
+    proposed option (a) was extracted as an unqualified present-tense edge
+    ("entry.verify_task is awaited before the registry transition to
+    FINALIZING occurs") that contradicted verified current code.
+    """
+
+    @pytest.mark.asyncio
+    async def test_proposed_resolution_episode_registered_and_excluded(
+        self, service_with_real_registry
+    ):
+        """add_episode tool call with RESOLUTION-OPTIONS content and no
+        temporal_context: registers the episode as planned, excludes its edge
+        from default search, and surfaces it with include_planned=True.
+        """
+        from _fm_helpers import MockEdge
+
+        svc, reg = service_with_real_registry
+        project_id = 'integ-proposed-resolution-001'
+
+        # Inline the durable queue: capture the enqueued payload and run it
+        # through _execute_graphiti_write synchronously so registration runs
+        # within this test (mirrors the real dual_write_episode callback path).
+        async def _inline_enqueue(**kwargs):
+            if kwargs.get('operation') == 'add_episode':
+                await svc._execute_graphiti_write('add_episode', kwargs['payload'])
+            return 1
+
+        svc.durable_queue.enqueue = AsyncMock(side_effect=_inline_enqueue)
+
+        mcp_server = create_mcp_server(svc)
+
+        result = await mcp_server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': (
+                    'RESOLUTION OPTIONS (architect call — pick one): (a) Move the '
+                    'VERIFYING->FINALIZING _note_transition to AFTER await '
+                    'entry.verify_task ...'
+                ),
+                'project_id': project_id,
+            },
+        )
+        episode_id = result['episode_id']
+
+        # (a) auto-tag → registered as planned
+        assert await reg.is_planned(episode_id) is True, (
+            f'Proposed-resolution episode {episode_id!r} should be auto-tagged '
+            f'planning and registered in the planned-episode registry'
+        )
+
+        # Simulate the incident's premature completion edge extracted from this
+        # episode.
+        svc.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact=(
+                    'entry.verify_task is awaited before the registry transition '
+                    'to FINALIZING occurs'
+                ),
+                uuid='edge-proposed-resolution-1',
+                episodes=[episode_id],
+            )
+        ])
+        scope = Scope(project_id=project_id)
+
+        # Excluded from default search (this is the user-observable signal this
+        # task fixes: a proposed/unchosen option must not surface as fact).
+        default_results = await svc._search_graphiti(
+            'entry.verify_task', scope, limit=10, include_planned=False
+        )
+        assert len(default_results) == 0, (
+            'Proposed-resolution edge should be excluded from default search'
+        )
+
+        # Still recoverable via include_planned=True.
+        planned_results = await svc._search_graphiti(
+            'entry.verify_task', scope, limit=10, include_planned=True
+        )
+        assert len(planned_results) == 1, (
+            'Proposed-resolution edge should be visible with include_planned=True'
+        )
+        assert planned_results[0].metadata.get('planned') is True, (
+            'Proposed-resolution edge surfaced via include_planned=True should '
+            "carry metadata['planned'] = True"
+        )
