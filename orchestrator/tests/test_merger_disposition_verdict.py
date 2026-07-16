@@ -90,8 +90,8 @@ class TestResolveAndResubmitVerdictRouting:
 
         outcome = await f.wf._resolve_and_resubmit('B', 'conflict_X', merge_phase=True)
 
-        f.wf._submit_to_merge_queue.assert_awaited_once()
-        f.wf._mark_blocked.assert_not_awaited()
+        f.wf._submit_to_merge_queue.assert_awaited_once()  # type: ignore[attr-defined]
+        f.wf._mark_blocked.assert_not_awaited()  # type: ignore[attr-defined]
         assert outcome == WorkflowOutcome.DONE
 
     async def test_blocked_true_verdict_blocks_with_reason(self, tmp_path: Path):
@@ -105,10 +105,10 @@ class TestResolveAndResubmitVerdictRouting:
 
         outcome = await f.wf._resolve_and_resubmit('B', 'conflict_X', merge_phase=True)
 
-        f.wf._mark_blocked.assert_awaited_once()
-        args, _kwargs = f.wf._mark_blocked.await_args
+        f.wf._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
+        args, _kwargs = f.wf._mark_blocked.await_args  # type: ignore[attr-defined]
         assert 'ARCH' in args[0]
-        f.wf._submit_to_merge_queue.assert_not_awaited()
+        f.wf._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
         assert outcome == WorkflowOutcome.BLOCKED
 
     async def test_absent_verdict_is_failsafe_blocked(self, tmp_path: Path):
@@ -122,8 +122,8 @@ class TestResolveAndResubmitVerdictRouting:
 
         outcome = await f.wf._resolve_and_resubmit('B', 'conflict_X', merge_phase=True)
 
-        f.wf._mark_blocked.assert_awaited_once()
-        f.wf._submit_to_merge_queue.assert_not_awaited()
+        f.wf._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
+        f.wf._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
         assert outcome == WorkflowOutcome.BLOCKED
 
     async def test_stale_verdict_is_cleared_before_spawn(self, tmp_path: Path):
@@ -143,8 +143,8 @@ class TestResolveAndResubmitVerdictRouting:
 
         # If the stale verdict had survived uncleared, its blocked=False
         # would let this proceed to _submit_to_merge_queue instead.
-        f.wf._mark_blocked.assert_awaited_once()
-        f.wf._submit_to_merge_queue.assert_not_awaited()
+        f.wf._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
+        f.wf._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
         assert outcome == WorkflowOutcome.BLOCKED
 
     async def test_malformed_envelope_is_failsafe_blocked(self, tmp_path: Path):
@@ -159,8 +159,8 @@ class TestResolveAndResubmitVerdictRouting:
 
         outcome = await f.wf._resolve_and_resubmit('B', 'conflict_X', merge_phase=True)
 
-        f.wf._mark_blocked.assert_awaited_once()
-        f.wf._submit_to_merge_queue.assert_not_awaited()
+        f.wf._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
+        f.wf._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
         assert outcome == WorkflowOutcome.BLOCKED
 
     async def test_invocation_failure_still_blocks(self, tmp_path: Path):
@@ -178,6 +178,6 @@ class TestResolveAndResubmitVerdictRouting:
 
         outcome = await f.wf._resolve_and_resubmit('B', 'conflict_X', merge_phase=True)
 
-        f.wf._mark_blocked.assert_awaited_once()
-        f.wf._submit_to_merge_queue.assert_not_awaited()
+        f.wf._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
+        f.wf._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
         assert outcome == WorkflowOutcome.BLOCKED
