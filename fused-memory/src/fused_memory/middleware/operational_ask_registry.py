@@ -261,9 +261,12 @@ def match_candidate(
     Returns the first match in list order (deterministic). Returns ``None``
     when *entries* is empty or no entry matches.
 
-    Pure string operations — no regex, no async, no I/O.
+    Pure string operations — no regex, no async, no I/O. Never raises: even a
+    malformed (non-string) ``candidate.execution_class`` — e.g. an int or
+    list from a corrupt metadata write — degrades to a no-match on the axis
+    rather than raising, via the ``str(...)`` coercion below.
     """
-    execution_class = (candidate.execution_class or "").strip().lower()
+    execution_class = str(candidate.execution_class or "").strip().lower()
     if execution_class in _ROUTE_EXECUTION_CLASSES:
         return _EXECUTION_CLASS_ENTRY
 
