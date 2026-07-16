@@ -731,9 +731,20 @@ def report() -> int:
     is still within the fleet-wide commit-grace window. Treat 'stale' as
     "not running code from the newest watched commit", not as a prediction
     that a restart is imminent.
+
+    DEPLOY-AGE is a single fleet-wide value (age since the shared
+    fleet-deploy clock read via _read_last_fleet_deploy_epoch, task 2396 β)
+    rendered as hours-to-one-decimal and repeated on every row, like the
+    existing NEWEST WATCHED COMMIT column; 'unknown' when the clock is
+    absent/unreadable. Read-only: this never writes the clock file (I8).
     """
     commit_epoch = _newest_watched_commit_epoch()
     units = _enumerate_running_units()
+    now = time.time()
+    deploy_epoch = _read_last_fleet_deploy_epoch()
+    deploy_age_str = (
+        f"{(now - deploy_epoch) / 3600:.1f}h" if deploy_epoch is not None else "unknown"
+    )
 
     commit_str = _format_epoch(commit_epoch)
     print(
@@ -742,7 +753,10 @@ def report() -> int:
         "restraint gates staleness_pass() applies before actually restarting "
         "a unit."
     )
-    print(f"{'UNIT':<50} {'START':<24} {'NEWEST WATCHED COMMIT':<24} VERDICT")
+    print(
+        f"{'UNIT':<50} {'START':<24} {'NEWEST WATCHED COMMIT':<24} {'VERDICT':<10} "
+        "DEPLOY-AGE"
+    )
 
     any_stale = False
     for unit in units:
@@ -755,7 +769,10 @@ def report() -> int:
             any_stale = True
         else:
             verdict = "fresh"
-        print(f"{unit:<50} {start_str:<24} {commit_str:<24} {verdict}")
+        print(
+            f"{unit:<50} {start_str:<24} {commit_str:<24} {verdict:<10} "
+            f"{deploy_age_str}"
+        )
 
     return 1 if any_stale else 0
 
