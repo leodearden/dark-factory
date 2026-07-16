@@ -1633,6 +1633,36 @@ def test_main_launching_fail_soft_when_sweep_raises(
     assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
 
 
+def test_main_launching_fail_soft_when_prune_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mirrors test_main_launching_fail_soft_when_sweep_raises for the bounded
+    prune: a fault in reap_stale_records must never raise out of
+    _run_launching (it would corrupt the printed record dir spawn-claude.sh
+    captures into SESSION_RECORD_DIR), exactly like a fault in the mark sweep.
+    """
+    _set_env(monkeypatch, _launching_env(tmp_path))
+
+    calls: list[None] = []
+
+    def _boom(*_args: object, **_kwargs: object) -> list[sr.ReapedSessionRecord]:
+        calls.append(None)
+        raise OSError('prune on fire')
+
+    monkeypatch.setattr(sr, 'reap_stale_records', _boom)
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    assert calls  # the prune really was invoked (and really did raise)
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    assert capsys.readouterr().out.strip() == str(expected_dir)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
+
+
 def test_main_reap_marks_then_deletes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
