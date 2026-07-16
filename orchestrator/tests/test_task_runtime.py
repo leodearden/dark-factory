@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 from pathlib import Path
 
 import pytest
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.lane_lifecycle import LaneState
 from orchestrator.task_runtime import (
@@ -297,3 +299,68 @@ class TestReadFailureMarked:
         assert entry.task_id == 51
         assert entry.loops == 0
         assert entry.error is None
+
+
+# ---------------------------------------------------------------------------
+# `started` fallback: metadata.json created_at wins when present; an
+# event_store's earliest task_started event is consulted only when
+# created_at is absent; with no event_store and no created_at, started
+# stays None.
+# ---------------------------------------------------------------------------
+
+
+def _bare_task_dir(worktree_base: Path, name: str, task_id: str) -> Path:
+    """Create <worktree_base>/<name> plus a metadata.json with NO
+    'created_at' key (distinct from _make_task_artifacts, which always
+    stamps one via TaskArtifacts.init)."""
+    worktree = worktree_base / name
+    worktree.mkdir(parents=True, exist_ok=True)
+    meta_root = TaskArtifacts.meta_root_for(worktree_base, name)
+    meta_root.mkdir(parents=True, exist_ok=True)
+    (meta_root / 'metadata.json').write_text(json.dumps({'task_id': task_id}))
+    return worktree
+
+
+class TestStartedEventStoreFallback:
+    def test_started_falls_back_to_earliest_task_started_event(
+        self, git_repo: Path, tmp_path: Path,
+    ):
+        git_ops = GitOps(GitConfig(), git_repo)
+        worktree_base = git_ops.worktree_base
+        _bare_task_dir(worktree_base, '60', '60')
+
+        event_store = EventStore(tmp_path / 'events.db', run_id='run-1')
+        event_store.emit(EventType.task_started, task_id='60')
+        expected = event_store.fetch_events_by_type(EventType.task_started)[0]['timestamp']
+
+        result = build_task_runtime_snapshot(git_ops=git_ops, event_store=event_store)
+
+        assert len(result) == 1
+        entry = result[0]
+        assert entry.task_id == 60
+        assert entry.started == expected
+
+    def test_started_is_none_without_event_store_and_no_created_at(self, git_repo: Path):
+        git_ops = GitOps(GitConfig(), git_repo)
+        worktree_base = git_ops.worktree_base
+        _bare_task_dir(worktree_base, '61', '61')
+
+        result = build_task_runtime_snapshot(git_ops=git_ops, event_store=None)
+
+        assert len(result) == 1
+        assert result[0].started is None
+
+    def test_created_at_wins_over_event_store(self, git_repo: Path, tmp_path: Path):
+        git_ops = GitOps(GitConfig(), git_repo)
+        worktree_base = git_ops.worktree_base
+        ta = _make_task_artifacts(worktree_base, '62', '62')
+        expected_created_at = ta.read_created_at()
+        assert expected_created_at is not None
+
+        event_store = EventStore(tmp_path / 'events2.db', run_id='run-1')
+        event_store.emit(EventType.task_started, task_id='62')
+
+        result = build_task_runtime_snapshot(git_ops=git_ops, event_store=event_store)
+
+        assert len(result) == 1
+        assert result[0].started == expected_created_at
