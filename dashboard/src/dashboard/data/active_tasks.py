@@ -14,10 +14,20 @@ Output shape (per task) matches ``data.js`` mock fixtures:
         'description': '...',
         'details': '...',         # may be empty; many tasks have none
         'status': 'in-progress',
-        'agent': 'claude-task-19',  # or None if no worktree
-        'started': 14,              # minutes since metadata.created_at, 0 if unknown
-        'loops': 2,                 # iterations.jsonl line count
-        'attempts': 3,              # review files count
+        'agent': 'claude-task-19',  # TaskRuntimeEntry.has_worktree; None if no worktree
+        'started': 14,              # minutes since TaskRuntimeEntry.started (runtime snapshot)
+        'loops': 2,                 # TaskRuntimeEntry.loops (runtime snapshot)
+        'attempts': 3,              # TaskRuntimeEntry.attempts (runtime snapshot)
+        'lane': '_lane-7',          # TaskRuntimeEntry.lane, or None
+        'phase': 'EXECUTE',         # TaskRuntimeEntry.phase, or None
+        'lane_state': 'assigned',   # TaskRuntimeEntry.lane_state, or None
+        'runtime_offline': False,   # True iff this project's runtime snapshot is unreachable —
+                                     # loops/attempts/started/agent/lane/phase/lane_state are then
+                                     # ALL None (never a fabricated 0). A task absent from an
+                                     # online snapshot instead gets honest zeros/None with
+                                     # runtime_offline False; a per-task read failure on an online
+                                     # snapshot yields None fields with runtime_offline still False
+                                     # (honest error != offline). See _runtime_fields.
         'deps': [{'id': 'dark_factory/T-15', 'title': '...', 'done': True}, ...],
         'meta_files': ['src/...py', ...],  # taskmaster metadata.files; retained on API for
                                            # debugging/tooling — no frontend UI reads it directly
@@ -101,17 +111,6 @@ def _minutes_since(iso: str | None, *, now: datetime | None = None) -> int:
     delta = resolve_now(now) - ts
     minutes = int(delta.total_seconds() // 60)
     return max(minutes, 0)
-
-
-def _attempts_from_review_summary(summary: str) -> int:
-    """Total review attempts from a 'N/M passed' string. 0 on miss/dash."""
-    if not summary or '/' not in summary:
-        return 0
-    head = summary.split('/', 1)[1].split(' ', 1)[0]
-    try:
-        return int(head)
-    except ValueError:
-        return 0
 
 
 def _coalesce_prd(metadata: dict) -> str | None:

@@ -10,7 +10,6 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
-    _attempts_from_review_summary,
     _build_task_row,
     _minutes_since,
     collect_active_tasks,
@@ -21,16 +20,6 @@ from dashboard.data.active_tasks import (
 # ---------------------------------------------------------------------------
 # helpers used inside the aggregator
 # ---------------------------------------------------------------------------
-
-
-def test_attempts_from_review_summary_parses_passed_string():
-    assert _attempts_from_review_summary('2/5 passed') == 5
-    assert _attempts_from_review_summary('0/3 passed') == 3
-
-
-def test_attempts_from_review_summary_handles_dash_and_empty():
-    assert _attempts_from_review_summary('—') == 0
-    assert _attempts_from_review_summary('') == 0
 
 
 def test_minutes_since_handles_z_suffix_and_naive_iso():
