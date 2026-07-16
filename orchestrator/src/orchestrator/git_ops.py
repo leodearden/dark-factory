@@ -462,6 +462,14 @@ class WarmLaneUnavailable(Enum):
     * ``EXHAUSTED`` — all pool lanes are ASSIGNED; signal backpressure / requeue.
     * ``FAULT`` — seed/worktree-add failure or absent seed script; signal blocked + L1.
     * ``DISK_PRESSURE`` — seed exited 75 (EX_TEMPFAIL); transient infra; requeue.
+    * ``SOFT_PRESSURE`` — θ proactive soft-floor throttle (task 2443, §9.5):
+      the reify ε script's ``check --soft`` reported soft pressure (rc=3,
+      above the hard floor but below the soft one) for a FRESH allocation
+      (no lane already mapped to the branch).  Distinct from
+      ``DISK_PRESSURE``'s exit-75 — this is pure backpressure/defer
+      (inv.11), never an escalation or a fault, and the pool lane is never
+      touched (stays FREE).  A REUSE of an already-mapped branch is never
+      throttled this way.
     * ``BASE_ABSENT`` — the warm-lane CoW seed base is provably absent/empty
       (:meth:`GitOps._warm_lane_base_resolvable` returned
       :attr:`WarmBaseHealth.ABSENT`), detected either by the pre-acquire gate
@@ -483,6 +491,7 @@ class WarmLaneUnavailable(Enum):
     EXHAUSTED = 'exhausted'
     FAULT = 'fault'
     DISK_PRESSURE = 'disk_pressure'
+    SOFT_PRESSURE = 'soft_pressure'
     BASE_ABSENT = 'base_absent'
     DISABLED = 'disabled'
 
@@ -3739,6 +3748,19 @@ class GitOps:
             guard / nothing reclaimed — byte-identical to today until reify
             γ/δ are deployed.
 
+        **θ proactive soft-floor throttle** (``config.warm_lane_soft_floor``,
+        task 2443, §9.5): runs immediately AFTER the ε hard-floor check above
+        and BEFORE :func:`acquire_for`, and ONLY for a FRESH allocation (no
+        lane already mapped to *branch_name* — a reuse/live-requeue is never
+        throttled).  When the knob is True, runs ε's ``warm-lane-disk-guard.sh
+        check --soft`` (a soft floor ABOVE the hard floor).  On soft pressure
+        (rc=3), returns ``WarmLaneUnavailable.SOFT_PRESSURE`` so
+        :meth:`create_worktree` raises :class:`WarmLaneSoftPressure` →
+        workflow requeues as backpressure (inv.11: never an escalation/fault;
+        the hard-floor exit-75 path above is unchanged).  Independent of
+        ``warm_lane_disk_guard``; fail-open on absent script (rc 127) —
+        byte-identical to today until reify ships ``check --soft``.
+
         Returns:
             WorktreeInfo  — success; lane is ASSIGNED and seeded.
             WarmLaneUnavailable.EXHAUSTED — all pool lanes are ASSIGNED
@@ -3749,6 +3771,10 @@ class GitOps:
                 detected persistent pressure (rc=75 after reclaim), OR seed
                 exited 75 (EX_TEMPFAIL); transient disk pressure (caller should
                 requeue with annotation).
+            WarmLaneUnavailable.SOFT_PRESSURE — θ proactive soft-floor
+                throttle detected soft pressure (rc=3) for a FRESH allocation
+                (caller should requeue as backpressure; never an escalation —
+                distinct from DISK_PRESSURE's exit-75 hard floor).
             WarmLaneUnavailable.BASE_ABSENT — pre-acquire base-health gate
                 found the warm-lane CoW seed base provably absent/empty
                 (:meth:`_warm_lane_base_resolvable` returned
@@ -3814,6 +3840,21 @@ class GitOps:
         # the expected contract.
         if self.config.warm_lane_disk_guard and await self._warm_lane_disk_admission_blocked():
             return WarmLaneUnavailable.DISK_PRESSURE
+
+        # θ: proactive soft-floor throttle (task 2443, §9.5 inv.11/inv.12) —
+        # runs AFTER the ε hard-floor check above (so a hard-pressure result
+        # always wins/short-circuits first, byte-identical ε precedence) and
+        # BEFORE acquire_for (so a defer touches no lane; it stays FREE, same
+        # as ε).  Gated on BOTH the independent master knob AND a FRESH
+        # allocation: an already-mapped branch (assignment_for is not None)
+        # is a reuse/live-requeue, not new resident-divergent growth, so it
+        # is never throttled — only a fresh lane allocation defers.
+        if (
+            self.config.warm_lane_soft_floor
+            and self.warm_lane_pool.assignment_for(branch_name) is None
+            and await self._warm_lane_soft_pressure_defer(branch_name)
+        ):
+            return WarmLaneUnavailable.SOFT_PRESSURE
 
         acq = await self.warm_lane_pool.acquire_for(branch_name)
         if acq is None:
