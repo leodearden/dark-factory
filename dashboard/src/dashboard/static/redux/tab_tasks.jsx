@@ -6,6 +6,7 @@ const DF_T = window.DF_DATA;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusSubset } = window.DF_GRAPH_LAYOUT;
 const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
+const { rtCell } = window.DF_RUNTIME_FMT;
 
 // Persisted-state hook (same shape as elsewhere)
 function tasksPersistedState(key, def) {
@@ -517,8 +518,11 @@ function TaskDetail({ task, allTasks }) {
         <span className="k">status</span>
         <span><span className={`badge ${task.status === 'blocked' ? 'bad' : task.status === 'done' ? 'ok' : task.status === 'deferred' ? 'muted' : task.status === 'cancelled' ? 'muted' : task.status === 'pending' ? 'warn' : task.status === 'merge-deferred' ? 'merge-deferred' : 'accent'}`}>{task.status}</span></span>
         <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.agent || <span style={{ color: 'var(--fg-3)' }}>unassigned</span>}</span>
-        <span className="k">loops</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.loops}</span>
-        <span className="k">attempts</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.attempts}</span>
+        <span className="k">loops</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.loops)}</span>
+        <span className="k">attempts</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.attempts)}</span>
+        <span className="k">lane</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.lane)}</span>
+        <span className="k">phase</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.phase)}</span>
+        <span className="k">state</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.lane_state)}</span>
       </div>
 
       <div className="section-lbl">Description</div>
