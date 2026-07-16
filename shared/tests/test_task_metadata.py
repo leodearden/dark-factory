@@ -27,6 +27,8 @@ from shared.task_metadata import (
     MemoryHints,
     Milestone,
     RetryLedger,
+    RoutingDecisionMirror,
+    RoutingState,
     TaskMetadata,
     apply_migrations,
     parse_metadata,
@@ -464,6 +466,122 @@ class TestMilestone:
         assert dumped['x_extra'] == 'keep'
 
 
+class TestRoutingState:
+    """``metadata.routing`` — RoutingDecisionMirror + RoutingState (PRD γ, task 2533)."""
+
+    _MIN_DECISION = {
+        'role': 'implementer',
+        'model': 'sonnet',
+        'effort': 'high',
+        'budget_usd': 10.0,
+        'max_turns': 80,
+        'source_layer': 'config',
+    }
+
+    def test_routing_decision_mirror_constructs_with_required_fields(self):
+        d = RoutingDecisionMirror(**self._MIN_DECISION)
+        assert d.role == 'implementer'
+        assert d.model == 'sonnet'
+        assert d.effort == 'high'
+        assert d.budget_usd == 10.0
+        assert d.max_turns == 80
+        assert d.source_layer == 'config'
+
+    def test_routing_decision_mirror_defaults(self):
+        d = RoutingDecisionMirror(**self._MIN_DECISION)
+        assert d.rule_id is None
+        assert d.rejected == []
+        assert d.routing_tier == 0
+        assert d.decided_at is None
+
+    def test_routing_decision_mirror_unknown_subfield_retained_and_reemitted(self):
+        d = RoutingDecisionMirror(**self._MIN_DECISION, x_extra='keep')  # type: ignore[call-arg]
+        dumped = d.model_dump()
+        assert dumped['x_extra'] == 'keep'
+
+    def test_routing_state_defaults(self):
+        s = RoutingState()
+        assert s.latest is None
+        assert s.history == []
+        assert s.routing_tier == 0
+        assert s.simple_saturated is False
+
+    def test_routing_state_coerces_nested_latest_and_history_dicts(self):
+        s = RoutingState(
+            latest=dict(self._MIN_DECISION),  # type: ignore[arg-type]
+            history=[dict(self._MIN_DECISION), dict(self._MIN_DECISION)],  # type: ignore[list-item]
+        )
+        assert isinstance(s.latest, RoutingDecisionMirror)
+        assert s.latest.role == 'implementer'
+        assert len(s.history) == 2
+        assert all(isinstance(item, RoutingDecisionMirror) for item in s.history)
+
+    def test_routing_state_unknown_subfield_retained_and_reemitted(self):
+        s = RoutingState(x_extra='keep')  # type: ignore[call-arg]
+        dumped = s.model_dump()
+        assert dumped['x_extra'] == 'keep'
+
+
+class TestRoutingStateTransforms:
+    """RoutingState.with_decision / RoutingState.from_metadata (PRD γ, task 2533)."""
+
+    _MIN_DECISION = {
+        'role': 'implementer',
+        'model': 'sonnet',
+        'effort': 'high',
+        'budget_usd': 10.0,
+        'max_turns': 80,
+        'source_layer': 'config',
+    }
+
+    def _decision(self, **overrides) -> RoutingDecisionMirror:
+        return RoutingDecisionMirror(**{**self._MIN_DECISION, **overrides})
+
+    def test_routing_history_max_constant_is_five(self):
+        assert task_metadata_module._ROUTING_HISTORY_MAX == 5
+
+    def test_with_decision_sets_latest_and_appends_to_history(self):
+        s = RoutingState()
+        d = self._decision()
+        updated = s.with_decision(d)
+        assert updated.latest == d
+        assert updated.history == [d]
+
+    def test_with_decision_keeps_newest_five_of_seven_oldest_dropped_order_preserved(self):
+        s = RoutingState()
+        decisions = [self._decision(decided_at=str(i)) for i in range(7)]
+        for d in decisions:
+            s = s.with_decision(d)
+        assert len(s.history) == 5
+        assert s.history == decisions[-5:]
+        assert s.latest == decisions[-1]
+
+    def test_with_decision_preserves_routing_tier_simple_saturated_and_extra_field(self):
+        s = RoutingState(routing_tier=2, simple_saturated=True, x_extra='keep')  # type: ignore[call-arg]
+        updated = s.with_decision(self._decision())
+        assert updated.routing_tier == 2
+        assert updated.simple_saturated is True
+        assert updated.model_dump()['x_extra'] == 'keep'
+
+    def test_from_metadata_none_returns_default(self):
+        assert RoutingState.from_metadata(None) == RoutingState()
+
+    def test_from_metadata_empty_dict_returns_default(self):
+        assert RoutingState.from_metadata({}) == RoutingState()
+
+    def test_from_metadata_valid_routing_returns_typed_state_with_latest_populated(self):
+        state = RoutingState.from_metadata({'routing': {'latest': dict(self._MIN_DECISION)}})
+        assert isinstance(state, RoutingState)
+        assert isinstance(state.latest, RoutingDecisionMirror)
+        assert state.latest.role == 'implementer'
+
+    def test_from_metadata_non_dict_routing_value_returns_default_never_raises(self):
+        assert RoutingState.from_metadata({'routing': 'not-a-dict'}) == RoutingState()
+
+    def test_from_metadata_malformed_routing_dict_returns_default_never_raises(self):
+        assert RoutingState.from_metadata({'routing': {'history': 'bad'}}) == RoutingState()
+
+
 class TestTaskMetadataFields:
     def test_empty_defaults(self):
         tm = TaskMetadata()
@@ -629,6 +747,42 @@ class TestMilestoneRegistration:
     def test_malformed_slice_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'milestone': {'mode': 'delayed'}}, direction='write', enforce=True)
+
+
+class TestRoutingRegistration:
+    """``routing``'s registration with the W10 extension point + parse_metadata integration."""
+
+    _VALID_ROUTING = {
+        'latest': {
+            'role': 'implementer',
+            'model': 'sonnet',
+            'effort': 'high',
+            'budget_usd': 10.0,
+            'max_turns': 80,
+            'source_layer': 'config',
+        },
+        'history': [],
+    }
+
+    def test_registered_at_import(self):
+        assert task_metadata_module._SUBMODEL_REGISTRY['routing'] is RoutingState
+
+    def test_round_trip_no_warnings(self):
+        model, warnings = parse_metadata({'routing': self._VALID_ROUTING}, direction='write')
+        assert warnings == []
+        assert isinstance(model.routing, RoutingState)  # type: ignore[attr-defined]
+        dumped_routing = model.model_dump()['routing']
+        assert not isinstance(dumped_routing, BaseModel)
+        assert dumped_routing['latest']['role'] == 'implementer'
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'routing' not in unknown_key_fields
+
+    def test_malformed_slice_read_warns_and_retains_raw(self):
+        model, warnings = parse_metadata({'routing': {'history': 'bad'}}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == 'routing'
+        assert warnings[0].code == 'invalid_submodel'
+        assert model.model_dump()['routing'] == {'history': 'bad'}
 
 
 class TestMigrations:

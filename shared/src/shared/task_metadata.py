@@ -30,6 +30,8 @@ __all__ = [
     'MemoryHints',
     'Milestone',
     'RetryLedger',
+    'RoutingDecisionMirror',
+    'RoutingState',
     'SchemaWarning',
     'TaskMetadata',
     'apply_migrations',
@@ -259,6 +261,94 @@ class Milestone(BaseModel):
         return self
 
 
+class RoutingDecisionMirror(BaseModel):
+    """One resolved routing decision for a single LLM invocation (PRD γ).
+
+    Mirrors the fields of ``orchestrator.routing.RoutingDecision`` (task ε)
+    so that dataclass can be swapped in as this model's source with no
+    schema change (PRD invariant 7). ``extra='allow'`` so any of ε's
+    additional fields survive round-trip before this model is updated to
+    know about them by name.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    role: str
+    model: str
+    effort: str
+    budget_usd: float
+    max_turns: int
+    source_layer: str
+    rule_id: str | None = None
+    rejected: list[str] = Field(default_factory=list)
+    routing_tier: int = 0
+    decided_at: str | None = None
+
+
+# Bounded history length for RoutingState.with_decision (PRD Open-Q 3).
+_ROUTING_HISTORY_MAX = 5
+
+
+class RoutingState(BaseModel):
+    """``metadata.routing`` — the LATEST routing decision + bounded history (PRD γ).
+
+    ``latest`` mirrors the most recent per-invocation routing resolution;
+    ``history`` retains up to :data:`_ROUTING_HISTORY_MAX` of the most
+    recent decisions (oldest dropped first — see :meth:`with_decision`).
+    ``routing_tier``/``simple_saturated`` are counter/flag storage stamped
+    by later tasks (μ/ν) — this task only provides the typed slice, so
+    their defaults (0 / False) are inert until then.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    latest: RoutingDecisionMirror | None = None
+    history: list[RoutingDecisionMirror] = Field(default_factory=list)
+    routing_tier: int = 0
+    simple_saturated: bool = False
+
+    def with_decision(
+        self,
+        decision: RoutingDecisionMirror,
+        *,
+        history_max: int = _ROUTING_HISTORY_MAX,
+    ) -> RoutingState:
+        """Return a new RoutingState with ``decision`` as latest, appended to history.
+
+        Bounds ``history`` to the newest ``history_max`` entries (oldest
+        dropped first, order preserved). ``routing_tier``, ``simple_saturated``,
+        and any ``extra`` fields are preserved unchanged (``model_copy`` update
+        semantics) — this is a pure, unit-testable transform with no implicit
+        trimming of unrelated state.
+        """
+        return self.model_copy(
+            update={
+                'latest': decision,
+                'history': [*self.history, decision][-history_max:],
+            }
+        )
+
+    @classmethod
+    def from_metadata(cls, metadata: dict | None) -> RoutingState:
+        """Safely reconstruct a :class:`RoutingState` from ``metadata['routing']``.
+
+        Mirrors ``orchestrator.workflow._build_retry_ledger``'s tolerance: a
+        missing/None ``metadata``, a missing/non-dict ``routing`` key, or a
+        dict that fails validation all degrade to a fresh default
+        ``RoutingState()`` rather than raising — routing telemetry must
+        never block or crash a caller.
+        """
+        if not isinstance(metadata, dict):
+            return cls()
+        raw = metadata.get('routing')
+        if not isinstance(raw, dict):
+            return cls()
+        try:
+            return cls(**raw)
+        except (ValidationError, TypeError):
+            return cls()
+
+
 class TaskMetadata(BaseModel):
     """The versioned ``metadata`` JSON blob carried on every task (PRD §5).
 
@@ -321,6 +411,11 @@ def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
 # time (rather than lazily) guarantees the 'milestone' slice is validated
 # and typed before any of parse_metadata's many callers across packages run.
 register_metadata_submodel('milestone', Milestone)
+
+# routing (PRD γ, task 2533): registered the same way so 'routing' lands in
+# known_fields (no unknown_key census warning) and every parse_metadata
+# caller gets a validated, typed RoutingState slice.
+register_metadata_submodel('routing', RoutingState)
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:
