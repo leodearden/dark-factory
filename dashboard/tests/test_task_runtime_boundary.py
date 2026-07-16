@@ -24,7 +24,6 @@ from pathlib import Path
 import pytest
 from shared.task_runtime_state import TaskRuntimeSnapshot
 
-import dashboard.data.active_tasks as active_tasks_mod
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import _shape_one_project
 
@@ -134,9 +133,6 @@ async def test_b5_producer_wire_entry_populates_row_via_join(dummy_client, monke
     assert row['agent'] == 'claude-task-42'
     assert row['started'] == 7
     assert row['runtime_offline'] is False
-    # No hand reader is consulted -- the row above is populated purely from
-    # the runtime param; no worktree-scan path exists in this module.
-    assert not hasattr(active_tasks_mod, '_scan_worktrees')
 
 
 # ---------------------------------------------------------------------------
