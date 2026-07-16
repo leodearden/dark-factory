@@ -578,6 +578,47 @@ class TestDeriveTruthLiveClaimant:
 
         assert report.live_claimant is None
 
+    async def test_fresh_db_claimant_precedes_stale_plan_lock(
+        self, tmp_path: Path,
+    ) -> None:
+        # Task-2588 regression pin. A plan.lock whose owner_pid has died
+        # (2**31 - 1 — same dead-PID convention as
+        # test_plan_lock_dead_owner_pid_returns_none above) sits on disk
+        # alongside a FRESH db claimant. plan.lock/owner_pid forensics
+        # alone would read this task as unclaimed — the pre-2243 sweep's
+        # actual root cause for the 2588 un-claim (a live task reverted
+        # out from under its own still-live claimant). The db-claimant
+        # branch (task_ground_truth.py:368-376) must win: it returns
+        # BEFORE the stale plan.lock at line 378+ is ever consulted.
+        TaskArtifacts(tmp_path).root.mkdir(parents=True)
+        lock_path = TaskArtifacts(tmp_path).root / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': 'sess-dead-abc123',
+            'locked_at': '2026-07-12T00:00:00+00:00',
+            'owner_pid': 2 ** 31 - 1,
+        }))
+        fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
+        task = {
+            'status': 'in-progress',
+            'claimant_run_id': 'run-x/session-x/pid=123',
+            'heartbeat_at': '2026-07-12T11:55:00+00:00',  # 5 minutes stale
+        }
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(
+            scheduler=scheduler,
+            worktree_resolver=lambda tid: tmp_path,
+            now_fn=lambda: fixed_now,
+            heartbeat_ttl=timedelta(minutes=10),
+        )
+
+        report = await resolver.derive_truth('37')
+
+        assert report.live_claimant == Claimant(
+            run_id='run-x/session-x/pid=123',
+            heartbeat_at='2026-07-12T11:55:00+00:00',
+            source=ClaimantSource.DB,
+        )
+
     async def test_plan_lock_malformed_owner_pid_returns_none(self, tmp_path: Path) -> None:
         # A non-numeric owner_pid must be swallowed by the int(owner_pid)
         # TypeError/ValueError guard rather than raise out of derive_truth
