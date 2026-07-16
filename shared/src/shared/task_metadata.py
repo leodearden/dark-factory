@@ -52,8 +52,20 @@ __all__ = [
 # 'reviewer_comprehensive') and config.ModelsConfig's collapsed keys (e.g.
 # 'reviewer'), so every actually-dispatchable role is always pinnable.
 # orchestrator/tests carries a drift-guard test asserting
-# set(ROLES) <= KNOWN_ROLE_NAMES so this mirror can't silently diverge from
-# the real dispatch roles.
+# set(ROLES) <= KNOWN_ROLE_NAMES (and set(ModelsConfig.model_fields) <=
+# KNOWN_ROLE_NAMES) so this mirror can't silently diverge from either real
+# authority.
+#
+# CAVEAT -- collapsed ModelsConfig-only keys are accepted-but-INERT as a
+# model_overrides key: resolve_route's layer-1 metadata_override reader
+# keys strictly on `inputs.role_name`, which is always the full dispatch
+# identity from ROLES (e.g. 'reviewer_comprehensive'), never the collapsed
+# config key ('reviewer', 'triage', 'module_tagger' — present here only
+# because they are ModelsConfig fields). An override authored under one of
+# those three collapsed keys passes this shape guard but will silently
+# never match at resolve time. Authors pinning a model override MUST use
+# the full role_name (see orchestrator.agents.roles.ROLES), not the
+# collapsed config key.
 KNOWN_ROLE_NAMES: frozenset[str] = frozenset({
     'architect',
     'implementer',
