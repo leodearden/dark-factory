@@ -343,8 +343,8 @@ class TestAggregateProjectOrigin:
 
         impl = sources_by_name['implementer']
         # filings: ALL implementer records (terminal + pending), regardless
-        # of classification: 101-1, 102-1, 102-2, 102-3, 105-1, 106-1 = 6.
-        assert impl['filings'] == 6
+        # of classification: 101-1, 102-1, 102-2, 102-3, 105-0, 105-1, 106-1 = 7.
+        assert impl['filings'] == 7
         # classified (terminal, valid times): 101-1 benign(inferred),
         # 102-1 actionable(inferred), 105-1 actionable(inferred).
         assert impl['benign'] == 1
