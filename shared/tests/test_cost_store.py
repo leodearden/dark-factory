@@ -661,6 +661,7 @@ async def _seed_row(
     role: str,
     cost_usd: float,
     completed_at: str,
+    model: str = 'm',
 ) -> None:
     """Insert a minimal invocation row for cost_totals_in_window testing."""
     await store.save_invocation(
@@ -668,7 +669,7 @@ async def _seed_row(
         task_id=None,
         project_id='p',
         account_name='a',
-        model='m',
+        model=model,
         role=role,
         cost_usd=cost_usd,
         input_tokens=None,
@@ -788,6 +789,77 @@ class TestCostTotalsInWindow:
         store = CostStore(tmp_path / 'costs.db')
         with pytest.raises(RuntimeError, match='CostStore not opened'):
             await store.cost_totals_in_window(
+                '2026-01-01T00:00:00',
+                '2026-12-31T23:59:59',
+            )
+
+
+# ---------------------------------------------------------------------------
+# TestModelCostInWindow — CostStore.model_cost_in_window(model, start_iso, end_iso)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestModelCostInWindow:
+    """Tests for CostStore.model_cost_in_window(model, start_iso, end_iso) -> float."""
+
+    async def test_sums_only_in_window_rows_for_model(self, tmp_path: Path) -> None:
+        """Two in-window 'opus' rows + an in-window 'sonnet' row + an out-of-window
+        'opus' row -> only the two in-window 'opus' rows are summed."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_row(
+                store, role='implementer', cost_usd=2.0,
+                completed_at='2026-06-01T10:00:00', model='opus',
+            )
+            await _seed_row(
+                store, role='debugger', cost_usd=3.0,
+                completed_at='2026-06-01T11:00:00', model='opus',
+            )
+            await _seed_row(
+                store, role='implementer', cost_usd=5.0,
+                completed_at='2026-06-01T12:00:00', model='sonnet',
+            )
+            await _seed_row(
+                store, role='implementer', cost_usd=99.0,
+                completed_at='2026-05-31T23:59:59', model='opus',
+            )
+            result = await store.model_cost_in_window(
+                'opus',
+                '2026-06-01T00:00:00',
+                '2026-06-01T23:59:59',
+            )
+        assert result == pytest.approx(5.0)
+
+    async def test_model_with_no_rows_returns_zero(self, tmp_path: Path) -> None:
+        """A model with no matching rows in the window -> 0.0."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_row(
+                store, role='implementer', cost_usd=2.0,
+                completed_at='2026-06-01T10:00:00', model='sonnet',
+            )
+            result = await store.model_cost_in_window(
+                'opus',
+                '2026-06-01T00:00:00',
+                '2026-06-01T23:59:59',
+            )
+        assert result == 0.0
+
+    async def test_empty_db_returns_zero(self, tmp_path: Path) -> None:
+        """Empty table -> 0.0."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            result = await store.model_cost_in_window(
+                'opus',
+                '2026-01-01T00:00:00',
+                '2026-12-31T23:59:59',
+            )
+        assert result == 0.0
+
+    async def test_not_opened_raises_runtime_error(self, tmp_path: Path) -> None:
+        """Calling model_cost_in_window on a never-opened store raises RuntimeError."""
+        store = CostStore(tmp_path / 'costs.db')
+        with pytest.raises(RuntimeError, match='CostStore not opened'):
+            await store.model_cost_in_window(
+                'opus',
                 '2026-01-01T00:00:00',
                 '2026-12-31T23:59:59',
             )
