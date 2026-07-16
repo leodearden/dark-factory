@@ -37,6 +37,7 @@ from fused_memory.reconciliation.flag_dedup import (
     acknowledge_resolved_flags,
     compute_flag_signature,
     filter_blocked_snapshot_findings,
+    filter_false_phantom_task_creation_flags,
 )
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.prompts import (
@@ -2564,7 +2565,12 @@ class IntegrityCheck(BaseStage):
            task-count snapshot findings for projects with blocked-by-design write
            paths (e.g. autopilot_video).  Records
            report.stats['blocked_snapshot_findings_dropped'] = before - after.
-        2. Calls record_task_dump_spot_check() to record a non-destructive
+        2. Applies filter_false_phantom_task_creation_flags() to drop
+           phantom-tasks_created findings corroborated by a task that was
+           legitimately created in a different known project via cross-project
+           routing.  Records
+           report.stats['phantom_task_creation_findings_dropped'] = before - after.
+        3. Calls record_task_dump_spot_check() to record a non-destructive
            observability stat when the cached task tree contains contamination
            signals.
 
@@ -2585,6 +2591,22 @@ class IntegrityCheck(BaseStage):
             )
         else:
             report.stats['blocked_snapshot_findings_dropped'] = 0
+
+        # Layer 3 (finding-side) gate for false phantom-tasks_created findings
+        # (task-2525): drop a finding only when a cited task is positively
+        # confirmed present in a different known project (cross-project routing).
+        if report.items_flagged:
+            _before = len(report.items_flagged)
+            report.items_flagged = await filter_false_phantom_task_creation_flags(
+                taskmaster=self.taskmaster,
+                known_projects=self.known_projects,
+                flags=report.items_flagged,
+            )
+            report.stats['phantom_task_creation_findings_dropped'] = (
+                _before - len(report.items_flagged)
+            )
+        else:
+            report.stats['phantom_task_creation_findings_dropped'] = 0
 
         self.record_task_dump_spot_check(report)
         return report
