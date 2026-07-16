@@ -1,0 +1,95 @@
+"""B+H integration gate — producer leg (B1-B4).
+
+Task 2638 (epsilon), PRD ``plans/dashboard-task-runtime-endpoint-prd.md``.
+Drives ``orchestrator.task_runtime.build_task_runtime_snapshot`` (task alpha,
+2634) END-TO-END through the REAL escalation ``get_task_runtime_state`` MCP
+tool (task beta, 2635) — never a ``SimpleNamespace`` stub of the accessor's
+output, and never the raw accessor called in isolation from the tool.
+
+This closes a seam neither leg's own unit tests exercise alone:
+
+- ``escalation/tests/test_task_runtime_state_tool.py`` stubs the harness
+  with ``types.SimpleNamespace`` stand-ins for ``TaskRuntimeState`` and never
+  touches real disk.
+- ``orchestrator/tests/test_task_runtime.py`` calls
+  ``build_task_runtime_snapshot`` directly and never goes through the tool.
+
+Every test below builds a REAL tmp git repo with real ``.lane-state`` /
+``.task-meta`` artifacts (reusing ``test_task_runtime.py``'s fixture
+builders — the established cross-test-module reuse pattern
+``test_harness_task_runtime.py`` already uses), wraps
+``build_task_runtime_snapshot`` in a fixture harness, and drives the actual
+``get_task_runtime_state`` MCP tool end-to-end — asserting on the wire-JSON
+dict it emits.
+
+No product code (alpha/beta/gamma/delta) is modified — all four are already
+merged and green; this is a pure characterization/integration suite (every
+test passes on arrival).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import types
+from pathlib import Path
+
+import pytest
+from escalation.queue import EscalationQueue
+from escalation.server import create_server
+from test_task_runtime import _init_repo, _make_task_artifacts, _warm_config
+
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import GitConfig
+from orchestrator.git_ops import GitOps
+from orchestrator.lane_lifecycle import LaneState
+from orchestrator.task_runtime import build_task_runtime_snapshot
+
+# ---------------------------------------------------------------------------
+# Repo fixture — mirrors test_task_runtime.py's git_repo fixture (redefined
+# rather than cross-module-imported: conftest.py provides no shared git_repo
+# fixture, matching that module's own self-contained convention).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    """Temporary git repo with an initial commit + a resolvable warm base."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_init_repo(repo))
+    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
+    default_base.mkdir(parents=True, exist_ok=True)
+    (default_base / '.keep').write_text('warm base sentinel\n')
+    (repo / '.worktrees' / '.pool-root').touch()
+    return repo
+
+
+# ---------------------------------------------------------------------------
+# The alpha -> beta wire rope, reused by every B1-B4 test below.
+# ---------------------------------------------------------------------------
+
+
+def _tool_runtime_tasks(git_ops: GitOps, tmp_path: Path) -> tuple[dict[int, dict], bool]:
+    """Drive the REAL get_task_runtime_state MCP tool end-to-end against *git_ops*.
+
+    Wires a fixture harness whose ``task_runtime_snapshot()`` calls the real
+    ``build_task_runtime_snapshot(git_ops=...)`` — so this ropes alpha's
+    real-disk read (``LaneLifecycle`` + ``TaskArtifacts``) THROUGH beta's
+    tool projection (``_project_task_runtime_entry`` +
+    ``TaskRuntimeSnapshot.model_dump``) onto the wire: the seam neither leg's
+    own unit tests exercise alone.
+
+    Returns ``(by_task_id, offline)``: *by_task_id* maps each wire entry's
+    ``task_id`` to its full projected dict (``has_worktree``/``loops``/
+    ``attempts``/``started``/``lane``/``phase``/``lane_state``/``error``);
+    *offline* is the envelope's top-level ``offline`` flag (always ``False``
+    as emitted server-side — the dashboard synthesizes ``True`` client-side
+    when the escalation server itself is unreachable).
+    """
+    fixture = types.SimpleNamespace(
+        task_runtime_snapshot=lambda: build_task_runtime_snapshot(git_ops=git_ops, event_store=None),
+    )
+    server = create_server(EscalationQueue(tmp_path / 'esc'), harness=fixture)
+    tool = asyncio.run(server.get_tool('get_task_runtime_state'))
+    result = tool.fn()
+    return {t['task_id']: t for t in result['tasks']}, result['offline']
