@@ -592,6 +592,71 @@ class TestSubmitResolved:
             f'Expected a warning mentioning esc-1-1; got: {warning_messages}'
         )
 
+    def test_submit_resolved_explicit_resolution_class_round_trips(self, tmp_path: Path):
+        """submit_resolved(..., resolution_class='benign') stamps and round-trips."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        queue.submit_resolved(
+            esc, 'auto: terminal',
+            resolved_by='escalation-mcp-pre-submit-check',
+            resolution_class='benign',
+        )
+
+        result = queue.get('esc-1-1')
+        assert result is not None
+        assert result.resolution_class == 'benign', (
+            f"Expected resolution_class='benign', got: {result.resolution_class!r}"
+        )
+
+    def test_submit_resolved_defaults_resolution_class_per_resolved_by(self, tmp_path: Path):
+        """submit_resolved(..., resolved_by=<reaper-sweep resolver>, no explicit class)
+        stamps 'benign' via the same default_resolution_class_for_resolver helper
+        resolve() uses — one classification site for both terminal-write paths."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        queue.submit_resolved(esc, 'auto: terminal', resolved_by='auto-dismissed')
+
+        result = queue.get('esc-1-1')
+        assert result is not None
+        assert result.resolution_class == 'benign', (
+            f"Expected resolution_class='benign', got: {result.resolution_class!r}"
+        )
+
+    def test_submit_resolved_leaves_resolution_class_none_when_unstamped(self, tmp_path: Path):
+        """submit_resolved(..., resolved_by=<non-reaper-sweep>, no explicit class)
+        leaves resolution_class None (falls to the read-time effective_benign proxy)."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        queue.submit_resolved(
+            esc, 'auto: terminal', resolved_by='escalation-mcp-pre-submit-check'
+        )
+
+        result = queue.get('esc-1-1')
+        assert result is not None
+        assert result.resolution_class is None
+
+    def test_submit_resolved_rejects_invalid_resolution_class(self, tmp_path: Path):
+        """submit_resolved(..., resolution_class='meh') raises ValueError naming the
+        legal values and leaves *escalation* completely unmutated (INV-1) — the
+        record is never written to the queue at all."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        with pytest.raises(ValueError, match='benign'):
+            queue.submit_resolved(esc, 'auto: terminal', resolution_class='meh')
+
+        assert esc.status == 'pending', (
+            f"Expected the passed-in escalation to remain unmutated on rejection; "
+            f"got status={esc.status!r}"
+        )
+        assert esc.resolution_class is None
+        assert queue.get('esc-1-1') is None, (
+            'Expected nothing persisted to the queue on rejection'
+        )
+
     def test_submit_resolved_resolve_callback_exception_does_not_propagate(
         self, tmp_path: Path, caplog,
     ):
@@ -2544,6 +2609,254 @@ class TestResolveCascade:
         assert result is not None
         assert result.status == 'resolved'
         assert result.resolution == 'Fixed; no members'
+
+
+class TestResolveResolutionClassExplicit:
+    """EscalationQueue.resolve() accepts an explicit resolution_class, validated before any write."""
+
+    def test_actionable_round_trips_to_queue_get_and_archive(self, tmp_path: Path):
+        """(a) resolve(..., resolution_class='actionable') -> queue.get() and the archived JSON both carry it."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', resolution_class='actionable')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.resolution_class == 'actionable'
+
+        archived_files = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archived_files) == 1
+        data = json.loads(archived_files[0].read_text())
+        assert data['resolution_class'] == 'actionable', (
+            f"Expected archived JSON resolution_class='actionable'; got {data.get('resolution_class')!r}"
+        )
+
+    def test_dismiss_with_benign_round_trips(self, tmp_path: Path):
+        """(b) resolve(..., dismiss=True, resolution_class='benign') round-trips 'benign'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', dismiss=True, resolution_class='benign')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.status == 'dismissed'
+        assert updated.resolution_class == 'benign'
+
+    def test_invalid_class_raises_value_error_naming_legal_values_nothing_persisted(self, tmp_path: Path):
+        """(c) resolve(..., resolution_class='meh') raises ValueError naming benign/actionable; record unchanged."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        with pytest.raises(ValueError) as exc_info:
+            queue.resolve('esc-1-1', 'text', resolution_class='meh')
+
+        msg = str(exc_info.value)
+        assert 'benign' in msg, f"ValueError must name 'benign'; got: {msg!r}"
+        assert 'actionable' in msg, f"ValueError must name 'actionable'; got: {msg!r}"
+
+        record = queue.get('esc-1-1')
+        assert record is not None
+        assert record.status == 'pending', f"Record must stay pending (nothing persisted); got {record.status!r}"
+        assert record.resolution_class is None, (
+            f"Record must remain unstamped (nothing persisted); got {record.resolution_class!r}"
+        )
+
+
+class TestResolveResolutionClassDefaults:
+    """EscalationQueue.resolve() defaults resolution_class per resolved_by when the caller passes none."""
+
+    def test_auto_dismissed_defaults_benign(self, tmp_path: Path):
+        """(a) resolved_by='auto-dismissed' stamps resolution_class='benign'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', resolved_by='auto-dismissed')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.resolution_class == 'benign'
+
+    def test_harness_orphan_reaper_defaults_benign(self, tmp_path: Path):
+        """(a) resolved_by='harness-orphan-reaper' stamps resolution_class='benign'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', resolved_by='harness-orphan-reaper')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.resolution_class == 'benign'
+
+    def test_orchestrator_starvation_watchdog_defaults_benign(self, tmp_path: Path):
+        """(a) resolved_by='orchestrator-starvation-watchdog' stamps resolution_class='benign'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', resolved_by='orchestrator-starvation-watchdog')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.resolution_class == 'benign'
+
+    def test_interactive_leaves_none(self, tmp_path: Path):
+        """(b) resolved_by='interactive' (human tier) leaves resolution_class None — no auto-benign for humans."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', resolved_by='interactive')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.resolution_class is None
+
+    def test_no_resolved_by_leaves_none(self, tmp_path: Path):
+        """(b) resolve() with no resolved_by at all leaves resolution_class None."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.resolution_class is None
+
+    def test_dismiss_all_pending_stamps_benign(self, tmp_path: Path):
+        """(c) dismiss_all_pending('aged out') archives each dismissed L0 with resolution_class='benign' (boundary row 5)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+        queue.submit(_make_escalation('esc-2-1', task_id='2'))
+
+        count = queue.dismiss_all_pending('aged out')
+
+        assert count == 2
+        for esc_id in ('esc-1-1', 'esc-2-1'):
+            updated = queue.get(esc_id)
+            assert updated is not None
+            assert updated.status == 'dismissed'
+            assert updated.resolution_class == 'benign', (
+                f"Expected {esc_id} resolution_class='benign' after age-out dismiss; got {updated.resolution_class!r}"
+            )
+
+
+class TestResolveCascadeResolutionClass:
+    """EscalationQueue.resolve() cascade forwards the L2's stamped resolution_class to members."""
+
+    def _make_l1(self, queue: EscalationQueue, esc_id: str, task_id: str = 'task-1') -> Escalation:
+        """Submit a pending L1 escalation."""
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='L1 test escalation',
+            level=1,
+        )
+        queue.submit(esc)
+        return esc
+
+    def _make_l2_with_members(
+        self,
+        queue: EscalationQueue,
+        l2_id: str,
+        member_ids: list[str],
+    ) -> Escalation:
+        """Submit a pending L2 escalation referencing the given member ids."""
+        esc = Escalation(
+            id=l2_id,
+            task_id='task-cluster',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster',
+            level=2,
+            root_cause='Bad merge strategy',
+            members=list(member_ids),
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_members_inherit_explicit_benign_stamp(self, tmp_path: Path):
+        """(boundary row 2) resolve(L2, resolution_class='benign') -> both members archive resolution_class='benign'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l1(queue, 'esc-1-2', 'task-2')
+        self._make_l1(queue, 'esc-1-3', 'task-3')
+        l2 = self._make_l2_with_members(queue, 'esc-1-1', ['esc-1-2', 'esc-1-3'])
+
+        queue.resolve(l2.id, 'Resolved the root cause', resolution_class='benign')
+
+        for member_id in ('esc-1-2', 'esc-1-3'):
+            member = queue.get(member_id)
+            assert member is not None
+            assert member.status == 'resolved', f'Expected {member_id} resolved, got {member.status!r}'
+            assert member.resolution_class == 'benign', (
+                f"Expected {member_id} resolution_class='benign'; got {member.resolution_class!r}"
+            )
+
+    def test_members_inherit_benign_stamp_on_dismiss_path(self, tmp_path: Path):
+        """resolve(L2, dismiss=True, resolution_class='benign') -> members dismissed AND stamped benign."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l1(queue, 'esc-1-2', 'task-2')
+        self._make_l1(queue, 'esc-1-3', 'task-3')
+        l2 = self._make_l2_with_members(queue, 'esc-1-1', ['esc-1-2', 'esc-1-3'])
+
+        queue.resolve(l2.id, 'Dismissed: not actionable', dismiss=True, resolution_class='benign')
+
+        for member_id in ('esc-1-2', 'esc-1-3'):
+            member = queue.get(member_id)
+            assert member is not None
+            assert member.status == 'dismissed', f'Expected {member_id} dismissed, got {member.status!r}'
+            assert member.resolution_class == 'benign', (
+                f"Expected {member_id} resolution_class='benign'; got {member.resolution_class!r}"
+            )
+
+    def test_members_inherit_defaulted_benign_stamp(self, tmp_path: Path):
+        """Parent resolved with resolved_by='auto-dismissed' (no explicit class):
+        reaper-sweep-tier default stamps the parent 'benign', and that DEFAULTED
+        (not explicit) stamp still propagates to both members via the cascade."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l1(queue, 'esc-1-2', 'task-2')
+        self._make_l1(queue, 'esc-1-3', 'task-3')
+        l2 = self._make_l2_with_members(queue, 'esc-1-1', ['esc-1-2', 'esc-1-3'])
+
+        queue.resolve(l2.id, 'aged out', resolved_by='auto-dismissed')
+
+        parent = queue.get(l2.id)
+        assert parent is not None
+        assert parent.resolution_class == 'benign', (
+            f"Expected parent resolution_class='benign' (reaper-sweep default); "
+            f"got {parent.resolution_class!r}"
+        )
+
+        for member_id in ('esc-1-2', 'esc-1-3'):
+            member = queue.get(member_id)
+            assert member is not None
+            assert member.resolution_class == 'benign', (
+                f"Expected {member_id} resolution_class='benign' (inherited "
+                f"defaulted stamp); got {member.resolution_class!r}"
+            )
+
+    def test_members_inherit_none_when_parent_class_resolves_to_none(self, tmp_path: Path):
+        """resolve(L2, resolved_by='interactive', no explicit class) -> parent stays None -> members inherit None."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l1(queue, 'esc-1-2', 'task-2')
+        self._make_l1(queue, 'esc-1-3', 'task-3')
+        l2 = self._make_l2_with_members(queue, 'esc-1-1', ['esc-1-2', 'esc-1-3'])
+
+        queue.resolve(l2.id, 'Resolved by a human', resolved_by='interactive')
+
+        parent = queue.get(l2.id)
+        assert parent is not None
+        assert parent.resolution_class is None
+
+        for member_id in ('esc-1-2', 'esc-1-3'):
+            member = queue.get(member_id)
+            assert member is not None
+            assert member.resolution_class is None, (
+                f"Expected {member_id} resolution_class=None (inherited from parent); got {member.resolution_class!r}"
+            )
 
 
 # ---------------------------------------------------------------------------

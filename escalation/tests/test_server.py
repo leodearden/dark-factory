@@ -10,6 +10,7 @@ and tmp_path isolation with EscalationQueue.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import types
 from datetime import UTC, datetime
@@ -519,6 +520,34 @@ class TestL2DedupeBypass:
         assert esc.status == 'resolved'
 
     @pytest.mark.asyncio
+    async def test_terminal_task_auto_resolve_stamps_resolution_class_benign(self, tmp_path: Path):
+        """The task-already-terminal auto-resolve chokepoint (submit_resolved,
+        resolved_by='escalation-mcp-pre-submit-check') stamps resolution_class=
+        'benign' explicitly — this resolver isn't reaper-sweep tier, so leaving
+        it unstamped would have the effective_benign() proxy misread the closed
+        record as 'actionable'."""
+        async def _lookup(task_id: str) -> str:
+            return 'done'
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, task_status_lookup=_lookup)
+
+        result = await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='infra connection timeout',
+        )
+
+        assert result['status'] == 'resolved'
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.resolution_class == 'benign', (
+            f"Expected resolution_class='benign', got: {esc.resolution_class!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_l2_urgent_blocker_bypasses_dedupe(self, tmp_path: Path):
         """escalate_blocker(severity='urgent') with infra_issue also bypasses dedupe."""
         queue = EscalationQueue(tmp_path / 'esc')
@@ -965,6 +994,87 @@ class TestResolveIssueResolutionActionPersisted:
             f"Expected resolution_action='close_only'; got {result['resolution_action']!r}"
         )
 
+
+class TestResolveIssueResolutionClass:
+    """resolve_issue accepts an optional resolution_class, validated before any record mutation."""
+
+    def _seed_pending(self, queue: EscalationQueue, esc_id: str = 'esc-rc-0001') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='t-resolution-class',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='resolution_class test escalation',
+        )
+        queue.submit(esc)
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_actionable_round_trips_to_queue_get_and_archive(self, tmp_path: Path):
+        """(a) resolution_class='actionable' -> queue.get() and archived JSON both carry it (boundary row 1)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        await _resolve_issue(
+            server, escalation_id=esc.id, resolution='done', action='close_only',
+            resolution_class='actionable',
+        )
+
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.resolution_class == 'actionable', (
+            f"Expected resolution_class='actionable'; got {record.resolution_class!r}"
+        )
+
+        archived_files = list((queue.queue_dir / 'archive').rglob(f'{esc.id}.json'))
+        assert len(archived_files) == 1
+        data = json.loads(archived_files[0].read_text())
+        assert data['resolution_class'] == 'actionable', (
+            f"Expected archived JSON resolution_class='actionable'; got {data.get('resolution_class')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_resolution_class_leaves_none(self, tmp_path: Path):
+        """(b) resolve_issue with no resolution_class -> record has resolution_class None (boundary row 3)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        await _resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='resume',
+        )
+
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.resolution_class is None
+
+    @pytest.mark.asyncio
+    async def test_invalid_class_returns_error_code_record_unchanged(self, tmp_path: Path):
+        """(c) resolution_class='meh' -> error naming benign/actionable, code='invalid_resolution_class', record still pending (boundary row 4)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='resume',
+            resolution_class='meh',
+        )
+
+        assert 'error' in result, f"Expected error dict for invalid resolution_class; got: {result}"
+        assert 'benign' in result['error'], f"Error must name 'benign'; got: {result}"
+        assert 'actionable' in result['error'], f"Error must name 'actionable'; got: {result}"
+        assert result.get('code') == 'invalid_resolution_class', (
+            f"Expected code='invalid_resolution_class'; got: {result}"
+        )
+
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending', f"Record must stay pending; got {record.status!r}"
+        assert record.resolution_class is None, (
+            f"Record must remain unstamped; got {record.resolution_class!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

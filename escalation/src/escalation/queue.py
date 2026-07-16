@@ -16,7 +16,8 @@ from pathlib import Path
 from shared.timestamps import parse_timestamp_or_warn
 
 from escalation import archive
-from escalation.models import Escalation
+from escalation.classify import default_resolution_class_for_resolver
+from escalation.models import RESOLUTION_CLASSES, Escalation
 
 logger = logging.getLogger(__name__)
 
@@ -399,8 +400,17 @@ class EscalationQueue:
     def resolve(
         self, escalation_id: str, resolution: str, dismiss: bool = False,
         *, resolved_by: str | None = None, resolution_turns: int | None = None,
+        resolution_class: str | None = None,
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed.
+
+        ``resolution_class`` (plans/escalation-lifecycle-dashboard-prd.md Seam 1):
+        an optional explicit ``'benign' | 'actionable'`` classification stamp,
+        validated against ``RESOLUTION_CLASSES`` BEFORE the lock is taken —
+        an invalid value raises ``ValueError`` naming the legal values and
+        nothing is persisted (INV-1). When ``None``, the stamp defaults per
+        the caller's ``resolved_by`` (see ``escalation.classify.
+        default_resolution_class_for_resolver``).
 
         Concurrency: the get → status-check → mutate → _atomic_write →
         _archive_resolved critical section is serialized under
@@ -436,6 +446,12 @@ class EscalationQueue:
         rather than assuming terminality.  This ordering is stable — do not rely
         on members being resolved at the moment the L2 callback fires.
         """
+        if resolution_class is not None and resolution_class not in RESOLUTION_CLASSES:
+            raise ValueError(
+                f'invalid resolution_class {resolution_class!r}; '
+                f'expected one of {sorted(RESOLUTION_CLASSES)} or None'
+            )
+
         with escalation_id_lock(self.queue_dir, escalation_id):
             esc = self.get(escalation_id)
             if esc is None:
@@ -454,6 +470,10 @@ class EscalationQueue:
                 esc.resolved_by = resolved_by
             if resolution_turns is not None:
                 esc.resolution_turns = resolution_turns
+            esc.resolution_class = (
+                resolution_class if resolution_class is not None
+                else default_resolution_class_for_resolver(resolved_by)
+            )
 
             self._atomic_write(escalation_id, esc.to_json())
             self._archive_resolved(escalation_id, esc.resolved_at)
@@ -477,6 +497,7 @@ class EscalationQueue:
                         resolution,
                         dismiss=dismiss,
                         resolved_by=cascade_resolved_by,
+                        resolution_class=esc.resolution_class,
                     )
                 except Exception as e:
                     logger.warning(
@@ -599,6 +620,7 @@ class EscalationQueue:
         resolution: str,
         *,
         resolved_by: str | None = None,
+        resolution_class: str | None = None,
     ) -> Escalation:
         """Atomically write *escalation* directly in resolved state.
 
@@ -607,6 +629,15 @@ class EscalationQueue:
         fires only ``_resolve_callback`` — never ``_notify_callback``.  This
         eliminates the spurious "pending escalation" wake that the two-call
         path emits before the resolve callback fires.
+
+        ``resolution_class`` mirrors ``resolve()``'s Seam-1 stamp (see its
+        docstring): an optional explicit ``'benign' | 'actionable'`` value,
+        validated against ``RESOLUTION_CLASSES`` before *escalation* is
+        mutated at all — an invalid value raises ``ValueError`` naming the
+        legal values and leaves the passed-in object untouched (INV-1).  When
+        ``None``, the stamp defaults per *resolved_by* via the same
+        ``default_resolution_class_for_resolver`` helper ``resolve()`` uses
+        (INV-5 — one classification site for both terminal-write paths).
 
         Contract:
         - Mutates *escalation* in-place (status/resolution/resolved_at/resolved_by)
@@ -621,12 +652,22 @@ class EscalationQueue:
         - Fires ``_resolve_callback`` once (if set); never fires ``_notify_callback``.
         - Returns *escalation* (non-Optional — disk failures raise, no None case).
         """
+        if resolution_class is not None and resolution_class not in RESOLUTION_CLASSES:
+            raise ValueError(
+                f'invalid resolution_class {resolution_class!r}; '
+                f'expected one of {sorted(RESOLUTION_CLASSES)} or None'
+            )
+
         # Step 1: mutate in memory
         escalation.status = 'resolved'
         escalation.resolution = resolution
         escalation.resolved_at = datetime.now(UTC).isoformat()
         if resolved_by is not None:
             escalation.resolved_by = resolved_by
+        escalation.resolution_class = (
+            resolution_class if resolution_class is not None
+            else default_resolution_class_for_resolver(resolved_by)
+        )
 
         # Step 2: atomic write + best-effort archive under the per-id lock.
         # The lock prevents a concurrent same-id RMW from clobbering this write.

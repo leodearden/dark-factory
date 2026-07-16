@@ -45,6 +45,12 @@ BORN_AT_L2_SEVERITIES: frozenset[str] = frozenset({'critical', 'urgent'})
 # rather than silently misrouting escalations.
 KNOWN_SEVERITIES: frozenset[str] = frozenset({'info', 'blocking'}) | BORN_AT_L2_SEVERITIES
 
+# Legal values for Escalation.resolution_class (escalation-lifecycle-dashboard-prd.md
+# Seam 1).  Used to validate the resolve/dismiss chokepoint's optional
+# resolution_class param and return a clear error naming the two legal
+# values rather than silently accepting an arbitrary string.
+RESOLUTION_CLASSES: frozenset[str] = frozenset({'benign', 'actionable'})
+
 
 @dataclass
 class Escalation:
@@ -84,6 +90,12 @@ class Escalation:
     # None for records resolved before α1 or for L2 cascade members (β derives theirs
     # from the parent via resolved_by='l2-cascade:<id>' attribution).
     resolution_action: str | None = None
+    # Benign/actionable classification stamp (escalation-lifecycle-dashboard-prd.md
+    # Seam 1).  Written ONLY at a terminal-write chokepoint — queue.resolve() or
+    # queue.submit_resolved() — never author-supplied at filing time.  None means
+    # unstamped — readers fall back to the effective_benign() proxy (see
+    # escalation.classify).
+    resolution_class: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

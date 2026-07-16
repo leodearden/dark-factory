@@ -22,7 +22,12 @@ from escalation.action_effects import effect_for
 from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
-from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, Escalation
+from escalation.models import (
+    BORN_AT_L2_SEVERITIES,
+    KNOWN_SEVERITIES,
+    RESOLUTION_CLASSES,
+    Escalation,
+)
 from escalation.queue import EscalationQueue
 
 logger = logging.getLogger(__name__)
@@ -413,10 +418,17 @@ def create_server(
             # folding into a dedupe parent and resolving the wrong record.
             # Returns minimal shape: {id, status, resolution, resolved_by}.
             # The blocker wrapper adds 'action' separately.
+            # resolution_class='benign' is explicit (not left to the tier-default
+            # fallback): the underlying task was already terminal at filing time,
+            # so no action was needed or taken beyond this auto-close — the Seam-1
+            # definition of benign — and this resolver isn't in the reaper-sweep
+            # tier, so an unstamped record here would otherwise be misread as
+            # 'actionable' by the effective_benign() proxy.
             resolved = queue.submit_resolved(
                 esc,
                 f'auto-resolved: task already terminal (status={status})',
                 resolved_by='escalation-mcp-pre-submit-check',
+                resolution_class='benign',
             )
             return {
                 'id': resolved.id,
@@ -563,6 +575,7 @@ def create_server(
         action: str = 'resume',
         resolved_by: str | None = None,
         resolution_turns: int | None = None,
+        resolution_class: str | None = None,
         terminate: Any = None,
     ) -> dict[str, Any]:
         """Resolve or dismiss an escalation.
@@ -605,6 +618,16 @@ def create_server(
         ``resolved_by`` attributes the resolver (e.g. ``"steward"``, ``"interactive"``).
         ``resolution_turns`` records how many conversation turns resolution took.
 
+        ``resolution_class`` optionally stamps an explicit
+        ``'benign'``/``'actionable'`` classification
+        (escalation-lifecycle-dashboard-prd.md Contract Seam 1). Validated
+        against ``escalation.models.RESOLUTION_CLASSES`` before any gate runs
+        or the record is touched; an unrecognised value returns
+        ``{'error': ..., 'code': 'invalid_resolution_class'}`` with NO record
+        change. Written only at resolution — never author-supplied
+        otherwise. Not forwarded to the ``park`` action (the record stays
+        open at L2, unclassified until eventually resolved).
+
         **Table B** (``escalation.action_effects``) is the single authority for
         action legality, consulted BEFORE any record mutation:
 
@@ -642,6 +665,19 @@ def create_server(
                     "action='resume'|'restart'|'park'|'abandon'|'close_only' "
                     "— see resolve_issue docstring."
                 )
+            }
+
+        # resolution_class validation (escalation-lifecycle-dashboard-prd.md
+        # Contract Seam 1) — checked before any gate, read, or mutation, so an
+        # invalid value leaves the record fully untouched (INV-1 nothing-
+        # persisted-on-rejection).
+        if resolution_class is not None and resolution_class not in RESOLUTION_CLASSES:
+            return {
+                'error': (
+                    f'invalid resolution_class {resolution_class!r}; expected '
+                    f'one of {sorted(RESOLUTION_CLASSES)}'
+                ),
+                'code': 'invalid_resolution_class',
             }
 
         # Connection-capability gate (escalation-connection-capability-guard-prd.md,
@@ -784,6 +820,7 @@ def create_server(
         esc = queue.resolve(
             escalation_id, resolution, dismiss=dismiss,
             resolved_by=resolved_by, resolution_turns=resolution_turns,
+            resolution_class=resolution_class,
         )
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
