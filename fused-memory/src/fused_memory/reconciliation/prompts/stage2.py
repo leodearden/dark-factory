@@ -244,9 +244,13 @@ whenever the pre-check returns `count == 0` AND you proceed to write a protectiv
 completion-note / "task marked done, no knowledge captured" guard memory for an \
 already-done task, you MUST tag that `add_memory` call with \
 `metadata={{'stage2_suppress': True, 'task_id': str(task_id)}}` (merge these keys into \
-whatever other metadata the write already carries). This is the only writer of the \
-`stage2_suppress` key — mirroring the `cycle_summary` metadata convention below, it is \
-what makes the next cycle's deterministic count return `> 0` and suppress the duplicate. \
+whatever other metadata the write already carries). This prompt instruction is one writer \
+of the `stage2_suppress` key — TargetedReconciliation's own fast-path completion echo \
+(code, not a prompt instruction) now also stamps it on every `done` transition, so a task \
+completed via targeted reconciliation is already covered by the pre-check above even \
+before Stage 2 ever runs on it. For the guard memories described here, writing the key — \
+mirroring the `cycle_summary` metadata convention below — is what makes the next cycle's \
+deterministic count return `> 0` and suppress the duplicate. \
 `task_id` MUST be the same `str(task_id)` exact-string form the pre-check queries on, or \
 the count filter will not match. Omitting this metadata leaves the gate permanently inert \
 (the count stays 0 forever and the protective note is rewritten every cycle). Legacy \
