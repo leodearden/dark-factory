@@ -18,6 +18,7 @@ key — all four test bodies below fail today.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -164,8 +165,9 @@ class TestInvokeMirrorsRoutingMetadata:
 
         await _invoke_implementer(wf, tmp_path)
 
-        wf.scheduler.update_task.assert_awaited_once()
-        call_args = wf.scheduler.update_task.call_args
+        update_task_mock = cast(AsyncMock, wf.scheduler.update_task)
+        update_task_mock.assert_awaited_once()
+        call_args = update_task_mock.call_args
         assert call_args.kwargs.get('metadata_mode') == 'merge'
         payload = call_args.args[1]
         assert payload['routing']['latest']['model'] == 'sonnet'
