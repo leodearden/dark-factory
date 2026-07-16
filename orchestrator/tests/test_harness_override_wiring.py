@@ -48,13 +48,18 @@ class TestHarnessOverrideStoreIntegration:
 
         # Harness constructs its own OverrideStore at the same path.
         harness = Harness(config)
-        harness.scheduler._mcp_session = HermeticMcpSession()
+        injected_session = HermeticMcpSession()
+        harness.scheduler._mcp_session = injected_session
         # This test instance-mocks get_tasks and seeds empty-dependency tasks
         # below, so it is data-conditionally hermetic regardless of the
         # injected session — forbid_live_mcp's network spy alone can't prove
-        # the injection above actually took effect. This assertion is the
-        # real wiring guarantee (task 2644).
-        assert harness.scheduler._mcp_session is not None
+        # the injection above actually took effect. This identity check only
+        # guards against the attribute assignment above being silently lost
+        # (e.g. a future refactor of Harness construction clobbering it); it
+        # does NOT prove dispatch_tool actually routes through the injected
+        # session for this test. That routing guarantee is established by
+        # test_hermetic_mcp_session.py, backed by forbid_live_mcp.
+        assert harness.scheduler._mcp_session is injected_session
         # This test drives acquire_next() directly (bypassing Harness.run()'s
         # startup sweeps), so it must call finish_startup() itself (task 2235).
         harness.scheduler.finish_startup()
