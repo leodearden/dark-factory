@@ -1238,7 +1238,12 @@ async def _write_task_count_snapshot(
             populate with this cycle's prune runtime-observability counts
             (task 2646). Populated only when the prune is actually reached —
             left untouched if *taskmaster* is ``None`` or the fetch/filter
-            step fails before the prune call.
+            step fails before the prune call. Callers reading these keys
+            back out of ``report.stats`` MUST use ``.get(key, default)``
+            rather than direct indexing — see the "Conditional presence"
+            note on
+            ``task_count_snapshot_cadence.SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY``
+            (amendment round, task 2646 review).
 
     Returns:
         ``True`` on a successful write; ``None`` when *taskmaster* is

@@ -58,6 +58,18 @@ SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY: str = 'task_count_snapshot_prune_enumerated'
 ``get_memories_by_metadata``. ``0`` both when enumeration raised and when it
 genuinely found nothing — see :data:`SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY`
 to tell those two cases apart (task 2646).
+
+Counts raw enumerated members, including any that lack an ``id`` (those are
+excluded from the delete pass, not from this count) — so a nonzero
+enumerated value paired with a lower :data:`SNAPSHOT_PRUNED_STAT_KEY` is not
+by itself evidence of a delete failure; it may simply mean some enumerated
+records had no ``id``. Practically unlikely for Mem0 records, but worth
+ruling out before reading the gap as a delete-failure signal (amendment
+round, task 2646 review).
+
+Conditional presence: see the note after :data:`SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY`
+below — populated only when the prune is actually reached this cycle; read
+via ``report.stats.get(...)``, never direct indexing.
 """
 
 SNAPSHOT_PRUNED_STAT_KEY: str = 'task_count_snapshot_pruned'
@@ -65,6 +77,10 @@ SNAPSHOT_PRUNED_STAT_KEY: str = 'task_count_snapshot_pruned'
 ``kind='task_count_snapshot'`` Mem0 records ``_prune_task_count_snapshots``
 successfully deleted this cycle (excludes per-item delete failures; equal to
 the function's own ``int`` return value) — task 2646.
+
+Conditional presence: see the note after :data:`SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY`
+below — populated only when the prune is actually reached this cycle; read
+via ``report.stats.get(...)``, never direct indexing.
 """
 
 SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY: str = 'task_count_snapshot_prune_enumeration_ok'
@@ -77,6 +93,13 @@ enumerated, 0 pruned, ``enumeration_ok=0`` — the runtime no-op fingerprint
 behind the incident that motivated task 2646) from a genuine empty result (0
 enumerated, 0 pruned, ``enumeration_ok=1``) — a distinction a single
 delete-count int cannot make.
+
+Conditional presence: see the note after :data:`SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY`
+below — populated only when the prune is actually reached this cycle. Absent
+is a THIRD state, distinct from both ``0`` and ``1`` here: it means the
+prune never ran (e.g. the project is write-blocked, or there is no
+taskmaster), not that enumeration failed. Read via ``report.stats.get(...)``,
+never direct indexing, or the two states collapse.
 """
 
 SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY: str = 'task_count_snapshot_prune_truncated'
@@ -91,6 +114,19 @@ but a full page means older stale snapshots may remain unpruned this cycle
 so the prune provably did NOT delete every stale record. Without this flag a
 truncated/partial prune is reported identically to a clean, complete one
 (amendment round, task 2646 review).
+
+Conditional presence (all four ``task_count_snapshot_prune_*``/``_pruned``
+stats above, robustness finding — amendment round, task 2646 review):
+populated in ``report.stats`` only when ``_write_task_count_snapshot``'s
+prune call is actually reached this cycle — i.e. the project is not
+write-blocked (see ``is_snapshot_write_blocked``), ``taskmaster`` is
+available, and the pre-prune task fetch/filter step did not raise. On every
+short-circuit path the keys are left ABSENT, not zeroed — a bare ``0``
+would recreate, one level up, the exact enumeration-vs-absence ambiguity
+task 2646 exists to resolve. Downstream readers MUST use
+``report.stats.get(key, default)``, never direct indexing — mirrors the
+pre-existing :data:`SNAPSHOT_WRITTEN_STAT_KEY` / ``extract_snapshot_written``
+convention above, kept for the same reason.
 """
 
 TASK_COUNT_SNAPSHOT_MISS_THRESHOLD: int = 2
