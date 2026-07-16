@@ -103,6 +103,40 @@ async def project_root(tmp_path):
     return str(tmp_path / 'proj')
 
 
+def _init_git_repo(path) -> str:
+    """Create a minimal git repo at path with one commit; return full SHA.
+
+    Mirrors ``test_task_interceptor.py``'s ``_init_git_repo`` — needed here
+    so a ``done_provenance={'kind': 'merged', 'commit': ...}`` write has a
+    real ``main`` branch for the interceptor's ``_verify_commit_on_main``
+    ancestor backstop (``git merge-base --is-ancestor <sha> main``) to
+    resolve against.
+    """
+    import subprocess
+
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
+    subprocess.run(
+        ['git', '-C', str(path), 'config', 'user.email', 't@e.example'],
+        check=True,
+    )
+    subprocess.run(
+        ['git', '-C', str(path), 'config', 'user.name', 'T'],
+        check=True,
+    )
+    (path / 'seed.txt').write_text('seed\n')
+    subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)
+    subprocess.run(
+        ['git', '-C', str(path), 'commit', '-q', '-m', 'seed'],
+        check=True,
+    )
+    return subprocess.run(
+        ['git', '-C', str(path), 'rev-parse', 'HEAD'],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def test_taskstatus_vocabulary_includes_a_row_status_literals() -> None:
     """Not a boundary cell itself — ties the status string literals A1-A6
     assert against ('pending', 'in-progress', 'infra-hold', 'done') to the
@@ -257,6 +291,70 @@ async def test_a4_unknown_or_human_actor_safe_open_in_enforce_mode(tmp_path, age
 
         statuses = await backend.get_statuses(project_root)
         assert statuses['1'] == 'pending'
+    finally:
+        await _close_stack(interceptor, backend, event_buffer)
+
+
+@pytest.mark.asyncio
+async def test_deferred_to_done_with_provenance_no_would_reject_warn(tmp_path, caplog):
+    """Task 2668: a deferred task (planning-mode / merge-vehicle task created
+    directly in `deferred`) whose deliverable genuinely landed on main
+    out-of-band can now be closed `done` WITH valid `merged` provenance —
+    the log-mode `illegal_transition would-reject deferred->done` WARNING no
+    longer fires (the (DEFERRED, DONE) edge is now in the shared
+    transition-authority union), and the write persists as `done` through
+    the real interceptor+backend stack (mirrors A2's no-warn/persists
+    shape, applied to the deferred-origin completion pair).
+    """
+    interceptor, backend, project_root, event_buffer = await _fresh_stack(tmp_path)
+    try:
+        sha = _init_git_repo(tmp_path)
+        await backend.add_task(project_root=project_root, title='t')
+        await backend.set_task_status('1', 'deferred', project_root=project_root)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+            result = await interceptor.set_task_status(
+                '1', 'done', project_root, agent_id='orchestrator-x',
+                done_provenance={'kind': 'merged', 'commit': sha},
+            )
+        assert 'error' not in result, result
+        assert not any(
+            'illegal_transition would-reject' in r.message for r in caplog.records
+        ), [r.message for r in caplog.records]
+
+        statuses = await backend.get_statuses(project_root)
+        assert statuses['1'] == 'done'
+    finally:
+        await _close_stack(interceptor, backend, event_buffer)
+
+
+@pytest.mark.asyncio
+async def test_deferred_to_done_without_provenance_still_phantom_done_rejected(tmp_path):
+    """Task 2668 regression guard: the new (DEFERRED, DONE) transition-legality
+    edge must NOT open a phantom-done backdoor. The done-provenance gate (2b)
+    and phantom-done missing-files gate (2c) run BEFORE and short-circuit
+    ahead of the transition-legality gate (2e) — so a deferred->done write
+    WITHOUT done_provenance, on a task whose declared metadata.files does not
+    exist at project_root, is still rejected with 'done_gate_missing_files'
+    and the row stays 'deferred' (the write never lands), exactly as it
+    would from any other non-verified-provenance origin.
+    """
+    interceptor, backend, project_root, event_buffer = await _fresh_stack(tmp_path)
+    try:
+        await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps({'files': ['does_not_exist.py']}),
+        )
+        await backend.set_task_status('1', 'deferred', project_root=project_root)
+
+        result = await interceptor.set_task_status(
+            '1', 'done', project_root, agent_id='orchestrator-x',
+        )
+        assert result['success'] is False, result
+        assert result['error'] == 'done_gate_missing_files', result
+
+        statuses = await backend.get_statuses(project_root)
+        assert statuses['1'] == 'deferred'
     finally:
         await _close_stack(interceptor, backend, event_buffer)
 
