@@ -5604,6 +5604,11 @@ class TaskWorkflow:
         base. Reuses ``status.entries`` from the guard call rather than
         re-reading the iteration log.
 
+        Emits a single ``event='plan_step_rederive'`` iteration-log entry
+        (naming every re-derived step id) when at least one step is
+        re-derived; emits nothing on a clean pass, so the common case does
+        not pollute the log other tests/tools scan.
+
         Best-effort and defensive, identical posture to
         :meth:`_detect_tip_wip_commits` / :meth:`_reconcile_done_step_commits`:
         returns ``[]`` on any missing collaborator (``worktree``/``git_ops``/
@@ -5645,6 +5650,23 @@ class TaskWorkflow:
                             step_id, 'done', commit=commit_by_id.get(step_id, head),
                         )
                         rederived.append(step_id)
+
+            if rederived:
+                self.artifacts.append_iteration_log({
+                    'iteration': self.metrics.execute_iterations,
+                    'agent': 'orchestrator',
+                    'event': 'plan_step_rederive',
+                    'rederived_steps': rederived,
+                    'source': 'orchestrator',
+                    'summary': (
+                        f'Re-derived {len(rederived)} plan step(s) from branch '
+                        f'state after rebase: {rederived}'
+                    ),
+                })
+                logger.info(
+                    'Task %s: re-derived plan step status from branch state: %s',
+                    self.task_id, rederived,
+                )
             return rederived
         except Exception:
             logger.warning(
