@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.event_store import EventType
 from orchestrator.lane_lifecycle import LaneState
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,19 @@ def _extract_task_id(dirname: str) -> int | None:
     return int(match.group(1))
 
 
+def _earliest_task_started(event_store, task_id: str) -> str | None:
+    """Return the earliest emitted ``EventType.task_started`` event's
+    timestamp for *task_id*, or ``None`` if none match.
+
+    ``fetch_events_by_type`` returns rows already ordered by id (insertion
+    order), so the first matching row is the earliest.
+    """
+    for row in event_store.fetch_events_by_type(EventType.task_started):
+        if row.get('task_id') == task_id:
+            return row.get('timestamp')
+    return None
+
+
 def _read_task_entry(
     *,
     task_id: int,
@@ -128,6 +142,12 @@ def _read_task_entry(
     ``lane_state``/``has_worktree`` are resolved by the caller from the lane
     record / worktree dir (not the artifact read) and stay populated
     regardless of whether the read below succeeds.
+
+    ``started`` resolution: ``metadata.json``'s ``created_at`` wins outright
+    when present; only when it's ``None`` (and an ``event_store`` was
+    supplied) does the earliest ``task_started`` event's timestamp serve as
+    a fallback. A read failure already ``None``s ``started`` below, so the
+    fallback only ever applies on the success path.
     """
     artifacts = TaskArtifacts(worktree, meta_root)
     try:
@@ -135,7 +155,11 @@ def _read_task_entry(
         loops = len(entries)
         attempts = len(artifacts.read_reviews())
         phase = _derive_phase(artifacts.read_plan())
-        started = artifacts.read_created_at()
+        started = (
+            artifacts.read_created_at()
+            or (event_store and _earliest_task_started(event_store, str(task_id)))
+            or None
+        )
         error = None
     except Exception as exc:
         logger.warning(
