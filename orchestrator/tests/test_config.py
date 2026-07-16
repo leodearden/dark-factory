@@ -1111,6 +1111,52 @@ class TestMergeVerifyStormGuardFields:
         assert config.verify_use_cgroup_scope is True
 
 
+class TestMergeVerifyBreadthConfig:
+    """merge_verify_breadth (λ): restart-only knob gating the broad merge gate.
+
+    Default 'scoped' preserves legacy per-touched-module verify behaviour
+    (byte-identical rollback path). 'full' — flipped later by the σ
+    capstone — runs every REGISTERED module's full suite at merge-role
+    verify. See config.py's merge_verify_breadth field for the restart-only
+    rationale (task point 3 / design decision: mid-process flips could split
+    behaviour across an in-flight merge on the most load-bearing lane).
+    """
+
+    def test_defaults_to_scoped(self):
+        config = OrchestratorConfig()
+        assert config.merge_verify_breadth == 'scoped'
+
+    def test_full_override_accepted(self):
+        config = OrchestratorConfig(merge_verify_breadth='full')
+        assert config.merge_verify_breadth == 'full'
+
+    def test_invalid_value_rejected(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(merge_verify_breadth='branch')
+
+    def test_defaults_yaml_carries_scoped(self, monkeypatch, tmp_path):
+        """The shipped defaults.yaml explicitly carries merge_verify_breadth:
+        scoped (same guard pattern as test_defaults_yaml_has_park_stop_block
+        above), and that value flows through both a bare OrchestratorConfig()
+        and load_config() over an otherwise-empty explicit config file.
+        """
+        defaults = _load_package_defaults()
+        assert 'merge_verify_breadth' in defaults, (
+            "defaults.yaml is missing 'merge_verify_breadth'"
+        )
+        assert defaults['merge_verify_breadth'] == 'scoped'
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.merge_verify_breadth == 'scoped'
+
+        config_path = tmp_path / 'config.yaml'
+        config_path.write_text(yaml.dump({'project_root': str(tmp_path)}))
+        loaded = load_config(config_path)
+        assert loaded.merge_verify_breadth == 'scoped'
+
+
 class TestTrainFormerConfigFields:
     """Defaults and constraint for the β train-former config knobs."""
 
