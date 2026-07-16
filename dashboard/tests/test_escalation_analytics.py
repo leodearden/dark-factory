@@ -206,6 +206,12 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
+def _isoweek_key(dt: datetime) -> str:
+    """'YYYY-Www' ISO-week key, matching the implementation's tier_weekly bucketing."""
+    iso = dt.isocalendar()
+    return f'{iso.year}-W{iso.week:02d}'
+
+
 def golden_now() -> datetime:
     """Fixed reference `now` for the golden archive (2026-07-16, today)."""
     return datetime(2026, 7, 16, 18, 0, 0, tzinfo=UTC)
@@ -573,3 +579,115 @@ class TestAggregateProjectLifespan:
         open_by_id = {item['id']: item for item in lifespan['open_items']}
         assert open_by_id['esc-201-1']['breach_6h'] is False
         assert open_by_id['esc-201-1']['age_secs'] == timedelta(hours=3).total_seconds()
+
+
+# ---------------------------------------------------------------------------
+# step-9: Workflow block
+# ---------------------------------------------------------------------------
+
+
+class TestAggregateProjectWorkflow:
+    """_aggregate_project(...)['workflow'] over the golden mini-archive."""
+
+    def test_workflow_block(self, tmp_path):
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        archive = build_golden_archive(esc_dir, now)
+
+        # --- tier_weekly: independently regroup the 5 terminal records' known
+        # (resolved_at, tier) pairs by ISO week, rather than hand-computing
+        # week numbers.
+        expected_tier_by_resolved = [
+            (now - timedelta(days=9), 'reaper-sweep'),                        # 101-1
+            (now - timedelta(days=7), 'human'),                               # 102-1
+            (now - timedelta(days=6) + timedelta(hours=2), 'auto-watcher'),   # 103-1
+            (now - timedelta(days=5) + timedelta(hours=3), 'human'),          # 104-1
+            (now - timedelta(days=4) + timedelta(hours=1), 'human'),          # 105-1
+        ]
+        expected_tier_weekly: dict[str, dict[str, int]] = {}
+        for dt, tier in expected_tier_by_resolved:
+            wk = expected_tier_weekly.setdefault(_isoweek_key(dt), {})
+            wk[tier] = wk.get(tier, 0) + 1
+
+        # --- esc_per_done_daily fixture: pick the earliest/latest filing
+        # dates from the archive itself (never hand-copied) plus a
+        # done-only date the archive has no filings on.
+        expected_filings_by_date: dict[str, int] = {}
+        for esc in archive.values():
+            d = datetime.fromisoformat(esc['timestamp']).date().isoformat()
+            expected_filings_by_date[d] = expected_filings_by_date.get(d, 0) + 1
+        dated_days = sorted(expected_filings_by_date)
+        zero_done_day = dated_days[0]
+        two_done_day = dated_days[-1]
+        assert zero_done_day != two_done_day  # fixture must span >=2 distinct filing dates
+        done_only_day = '2026-01-01'  # well outside the archive's ~10-day span
+
+        runs_db = _make_runs_db(tmp_path, [
+            ('t1', 'done', f'{two_done_day}T09:00:00+00:00'),
+            ('t2', 'done', f'{two_done_day}T10:00:00+00:00'),
+            ('t3', 'done', f'{done_only_day}T09:00:00+00:00'),
+        ])
+
+        entry, _ = _aggregate_project('dark_factory', esc_dir, runs_db, now=now)
+        workflow = entry['workflow']
+
+        assert workflow['tier_weekly'] == expected_tier_weekly
+
+        # action_mix: terminal resolution_action, None -> 'unspecified'.
+        # 101-1 & 103-1 carry no resolution_action key -> unspecified;
+        # 102-1 -> fix_forward; 104-1 -> design_ruling; 105-1 -> restart.
+        assert workflow['action_mix'] == {
+            'unspecified': 2,
+            'fix_forward': 1,
+            'design_ruling': 1,
+            'restart': 1,
+        }
+
+        # churn_daily: only esc-102-2 (task 102, +12h after 102-1's
+        # resolved_at) counts; esc-102-3 (+48h) falls outside the 24h
+        # lookback window.
+        churn_date = (now - timedelta(days=7) + timedelta(hours=12)).date().isoformat()
+        assert workflow['churn_daily'] == {churn_date: 1}
+
+        # esc_per_done_daily: union of filing dates and done-by-day dates.
+        by_date = {row['date']: row for row in workflow['esc_per_done_daily']}
+        assert by_date[zero_done_day]['filings'] == expected_filings_by_date[zero_done_day]
+        assert by_date[zero_done_day]['done'] == 0
+        assert by_date[zero_done_day]['ratio'] is None
+
+        assert by_date[two_done_day]['filings'] == expected_filings_by_date[two_done_day]
+        assert by_date[two_done_day]['done'] == 2
+        assert by_date[two_done_day]['ratio'] == expected_filings_by_date[two_done_day] / 2
+
+        assert by_date[done_only_day]['filings'] == 0
+        assert by_date[done_only_day]['done'] == 1
+        assert by_date[done_only_day]['ratio'] == 0.0
+
+        # flow_daily: sparse cube over the 5 terminal-with-valid-times
+        # records, keyed by (date(resolved_at), source, level, tier, class).
+        # In this fixture every record lands on a distinct date so each
+        # cell's n == 1.
+        flow_cells = {
+            (row['date'], row['source'], row['level'], row['tier'], row['class'])
+            for row in workflow['flow_daily']
+        }
+        assert flow_cells == {
+            ((now - timedelta(days=9)).date().isoformat(), 'implementer', 0, 'reaper-sweep', 'benign'),
+            ((now - timedelta(days=7)).date().isoformat(), 'implementer', 0, 'human', 'actionable'),
+            (
+                (now - timedelta(days=6) + timedelta(hours=2)).date().isoformat(),
+                'architect', 1, 'auto-watcher', 'benign',
+            ),
+            (
+                (now - timedelta(days=5) + timedelta(hours=3)).date().isoformat(),
+                'architect', 2, 'human', 'actionable',
+            ),
+            (
+                (now - timedelta(days=4) + timedelta(hours=1)).date().isoformat(),
+                'implementer', 2, 'human', 'actionable',
+            ),
+        }
+        assert all(row['n'] == 1 for row in workflow['flow_daily'])
+        assert sum(row['n'] for row in workflow['flow_daily']) == len(entry['lifespan']['samples'])
