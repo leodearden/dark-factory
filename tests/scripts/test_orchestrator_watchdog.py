@@ -1440,6 +1440,41 @@ def test_orch_restart_min_interval_secs_env_override(monkeypatch: pytest.MonkeyP
     assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 60
 
 
+def test_fleet_deploy_clock_path_matches_across_tiers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shared clock-path literal must not silently diverge across tiers.
+
+    orchestrator.service_restart.FLEET_DEPLOY_CLOCK_RELPATH is the single
+    authoritative relative path (task 2396). Neither the stdlib watchdog
+    (FLEET_DEPLOY_CLOCK_PATH) nor restart-all-orchestrators.sh (CLOCK_FILE)
+    can import it, so each hardcodes its own mirror. If those mirrors ever
+    drifted from the authoritative constant, the watchdog would read a
+    different file than the script writes — permanently un-gating the
+    staleness backstop and silently reintroducing the I2 hole this task
+    closes, with every other test still green. This pins all three copies
+    together, mirroring test_orch_restart_min_interval_secs_matches_config_default
+    above.
+    """
+    from orchestrator.service_restart import FLEET_DEPLOY_CLOCK_RELPATH
+
+    # --- watchdog mirror (FLEET_DEPLOY_CLOCK_PATH) ---
+    monkeypatch.delenv("ORCH_FLEET_DEPLOY_CLOCK", raising=False)
+    wdog = _load_watchdog()
+    expected_watchdog_path = str(pathlib.Path(wdog.REPO_DIR) / FLEET_DEPLOY_CLOCK_RELPATH)
+    assert wdog.FLEET_DEPLOY_CLOCK_PATH == expected_watchdog_path
+
+    # --- bash script mirror (CLOCK_FILE default) ---
+    script_src = (REPO_ROOT / "scripts" / "restart-all-orchestrators.sh").read_text()
+    match = re.search(
+        r'CLOCK_FILE="\$\{ORCH_FLEET_DEPLOY_CLOCK:-\$REPO_DIR/([^}]+)\}"',
+        script_src,
+    )
+    assert match is not None, (
+        "restart-all-orchestrators.sh CLOCK_FILE default pattern not found — "
+        "did its literal shape change? Update this regex to match."
+    )
+    assert match.group(1) == FLEET_DEPLOY_CLOCK_RELPATH
+
+
 def test_orch_restart_min_interval_secs_malformed_env_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2024,9 +2059,9 @@ def test_staleness_pass_skips_when_within_fleet_deploy_min_interval(
 
     wdog.staleness_pass()
 
-    assert any("skip" in m and "8h since last fleet deploy" in m for m in log_messages), (
-        f"Expected a skip log line naming the 8h fleet-deploy window: {log_messages}"
-    )
+    assert any(
+        "skip" in m and str(wdog.ORCH_RESTART_MIN_INTERVAL_SECS) in m for m in log_messages
+    ), f"Expected a skip log line naming the fleet-deploy min-interval: {log_messages}"
 
 
 def test_staleness_pass_proceeds_when_fleet_deploy_gate_open(

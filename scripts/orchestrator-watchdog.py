@@ -633,7 +633,10 @@ def staleness_pass() -> None:
     brokenness is not a scheduled deploy).
     """
     if _within_fleet_deploy_min_interval():
-        log("skip: <8h since last fleet deploy")
+        log(
+            "skip: within fleet-deploy min-interval "
+            f"({ORCH_RESTART_MIN_INTERVAL_SECS}s) since last deploy"
+        )
         return
 
     commit_epoch = _newest_watched_commit_epoch()
