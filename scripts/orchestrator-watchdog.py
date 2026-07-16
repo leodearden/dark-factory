@@ -123,6 +123,18 @@ FLEET_DEPLOY_CLOCK_PATH = os.environ.get(
     os.path.join(REPO_DIR, "data", "orchestrator", "last_redeploy_orchestrator.json"),
 )
 
+# staleness_pass() is a stateless oneshot: every ~60s timer tick
+# (orchestrator-watchdog.timer's OnUnitActiveSec=60) is a FRESH process (see
+# module docstring), so there is no cross-tick memory to log the fleet-deploy
+# min-interval skip line only once per window. Logging on EVERY tick would
+# write ~480 near-identical lines to the journal over one full
+# ORCH_RESTART_MIN_INTERVAL_SECS (8h default) window, burying genuinely
+# actionable watchdog output. Re-emit the skip line at most once per this many
+# wall-clock seconds instead, bucketed purely off time.time() (no persisted
+# state needed) — deliberately much coarser than the ~60s tick cadence so most
+# ticks land inside an already-logged bucket and stay silent.
+SKIP_LOG_INTERVAL_SECS = 1800
+
 
 def log(msg: str) -> None:
     """Write *msg* to the systemd journal tagged as ``orchestrator-watchdog``."""
@@ -623,7 +635,10 @@ def staleness_pass() -> None:
     restraint that caps this backstop (like the event-driven coordinator) to
     at most once per ORCH_RESTART_MIN_INTERVAL_SECS, honoring a redeploy
     verified by EITHER tier (restart-all-orchestrators.sh is the sole on-disk
-    writer, stamped only on its verified-fresh exit-0 path).
+    writer, stamped only on its verified-fresh exit-0 path). The skip line is
+    itself rate-limited to at most once per SKIP_LOG_INTERVAL_SECS (see its
+    module-level docstring) — the gate check still runs every tick, only the
+    log emission is throttled.
 
     Delegation (task 2396): once ANY eligible unit is found stale, the
     per-unit loop below no longer restarts it directly — instead the whole
@@ -633,10 +648,14 @@ def staleness_pass() -> None:
     brokenness is not a scheduled deploy).
     """
     if _within_fleet_deploy_min_interval():
-        log(
-            "skip: within fleet-deploy min-interval "
-            f"({ORCH_RESTART_MIN_INTERVAL_SECS}s) since last deploy"
-        )
+        # Bucket on wall-clock time (not elapsed-since-deploy) so this needs
+        # no extra clock-file read beyond the one _within_fleet_deploy_min_
+        # interval() already did — see SKIP_LOG_INTERVAL_SECS above.
+        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+            log(
+                "skip: within fleet-deploy min-interval "
+                f"({ORCH_RESTART_MIN_INTERVAL_SECS}s) since last deploy"
+            )
         return
 
     commit_epoch = _newest_watched_commit_epoch()

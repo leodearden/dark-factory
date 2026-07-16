@@ -2028,18 +2028,23 @@ def test_staleness_pass_skips_when_within_fleet_deploy_min_interval(
     """staleness_pass returns immediately when the shared fleet-deploy clock
     reports we are still inside the min-interval window: no enumeration, no
     delegation, no restart_unit call — even with a would-be-stale unit
-    present — and it logs a line naming the skip (the PRD journal signal).
+    present — and it logs a line naming the skip (the PRD journal signal) at
+    a SKIP_LOG_INTERVAL_SECS bucket boundary.
 
     _newest_watched_commit_epoch, _enumerate_running_units, and restart_unit
     are all monkeypatched to fail the test outright if consulted, so this
     also pins that the fleet-deploy gate is checked BEFORE the existing
     commit-grace gate (top priority) rather than merely somewhere in the
-    pass.
+    pass. time.time() is pinned to an exact SKIP_LOG_INTERVAL_SECS multiple
+    (a bucket boundary) so the per-tick log rate-limit exercised by
+    test_staleness_pass_suppresses_skip_log_outside_log_bucket below cannot
+    make this assertion flaky.
     """
     wdog = _load_watchdog()
     log_messages: list[str] = []
 
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(wdog.time, "time", lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0)
     monkeypatch.setattr(
         wdog,
         "_newest_watched_commit_epoch",
@@ -2062,6 +2067,43 @@ def test_staleness_pass_skips_when_within_fleet_deploy_min_interval(
     assert any(
         "skip" in m and str(wdog.ORCH_RESTART_MIN_INTERVAL_SECS) in m for m in log_messages
     ), f"Expected a skip log line naming the fleet-deploy min-interval: {log_messages}"
+
+
+def test_staleness_pass_suppresses_skip_log_outside_log_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The skip line is rate-limited to at most once per SKIP_LOG_INTERVAL_SECS.
+
+    staleness_pass still returns immediately (no enumeration/delegation/
+    restart_unit — same top-priority gate as the test above) but does NOT
+    log when time.time() falls outside the bucket's logging slot. Without
+    this throttle, a single 8h fleet-deploy min-interval window would write
+    ~480 near-identical skip lines to the journal (one per ~60s tick),
+    burying genuinely actionable watchdog output (reviewer_comprehensive
+    amendment, task 2396).
+    """
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: True)
+    # Halfway into the bucket — well outside the logging slot near its start.
+    monkeypatch.setattr(
+        wdog.time,
+        "time",
+        lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 + wdog.SKIP_LOG_INTERVAL_SECS / 2,
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_newest_watched_commit_epoch",
+        lambda: pytest.fail("must not be consulted when the fleet-deploy gate is closed"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.staleness_pass()
+
+    assert log_messages == [], (
+        f"Expected no skip log line outside the log-rate-limit bucket: {log_messages}"
+    )
 
 
 def test_staleness_pass_proceeds_when_fleet_deploy_gate_open(
