@@ -83,6 +83,22 @@ _ECHO_SOURCE = 'targeted_reconciliation'
 # hot path.
 _AUTHORITATIVE_PRECHECK_LIMIT = 25
 
+# Cap on the reopen-triggered stale-completion-echo scroll in
+# _delete_stale_completion_echoes (task 2433). Mirrors
+# _AUTHORITATIVE_PRECHECK_LIMIT's bounded-scroll rationale immediately above,
+# but narrower: the scroll's server-side filter already restricts matches to
+# source == _ECHO_SOURCE AND transition == 'done' (task 2433 review
+# amendment — efficiency_robustness), so this cap bounds ONLY this
+# reconciler's own completion echoes for the task, not every task_id-tagged
+# memory — memory_hints, stage1/stage2 markers, etc. never compete for the
+# budget. A handful of completion echoes per task is the norm (at most one
+# per done-transition), so a small cap keeps the reopen-from-done sweep
+# cheap while still covering the common case — trading away deleting a
+# stale echo that happens to land outside the first N points for a task
+# redone pathologically many times, an accepted trade-off rather than an
+# unbounded scroll on every reopen.
+_STALE_ECHO_DELETE_LIMIT = 25
+
 # Metadata key recognized as an authoritative resolution/superseding marker
 # by _is_authoritative_resolution, in addition to a truthy `supersedes`
 # marker.  This is Stage 2's real, task_id-scoped "Completion-Note
@@ -634,6 +650,69 @@ class TargetedReconciler:
 
         return result
 
+    async def _delete_stale_completion_echoes(
+        self, task_id: str, scope: ProjectScope, run_id: str,
+    ) -> list[str]:
+        """Delete this reconciler's own completion-echo memories for *task_id*.
+
+        Task 2433 (repro: task 2531): a first done-transition's completion
+        echo can cite a WRONG outcome (task 2531's repro was a
+        found_on_main misattribution pointing at a sibling task's commit).
+        Reopening the task out of a terminal 'done' status does not clear
+        the prior ``metadata.done_provenance`` (task_interceptor.py:963-967
+        — ``update_task`` unconditionally rejects any
+        ``metadata.done_provenance`` write, and the reopen path itself only
+        ever *adds* ``reopen_*`` audit fields, never clears provenance), and
+        the completion echo `_on_task_done` wrote for that earlier
+        done-transition is never otherwise removed — so it lingers in Mem0
+        search citing whatever (possibly stale or wrong) outcome that
+        transition captured, even after a later redone echo is written.
+        This complements task 2647's `_fetch_done_provenance`, which already
+        makes the redone echo itself read the live provenance rather than a
+        cached value — that fix alone left the OLD echo behind; this sweep
+        removes it.
+
+        Matches ONLY memories whose metadata carries both
+        ``source == _ECHO_SOURCE`` and ``transition == 'done'`` — i.e.
+        exactly the completion echoes `_on_task_done`'s fast path writes —
+        so memory_hints, stage1/stage2 markers, and any other task_id-tagged
+        memory are never touched. The match is enforced twice (task 2433
+        review amendment — efficiency_robustness): server-side, via the
+        scroll's ``filters`` — Mem0 stores ``add_memory(metadata=...)`` keys
+        as top-level Qdrant payload fields and ``scroll_by_metadata``
+        matches ALL filter keys (see mem0_client.py's docstring), so passing
+        ``source``/``transition`` alongside ``task_id`` narrows the scroll
+        itself rather than sharing ``_STALE_ECHO_DELETE_LIMIT`` with every
+        other task_id-tagged memory; and client-side, as a cheap defensive
+        re-check that costs nothing once the result set is already this
+        small and guards against a backend that only partially honours the
+        filter.
+
+        Returns the list of deleted memory ids (empty if none matched).
+        """
+        memories = await self.memory.get_memories_by_metadata(
+            project_id=scope.project_id,
+            filters={'task_id': task_id, 'source': _ECHO_SOURCE, 'transition': 'done'},
+            limit=_STALE_ECHO_DELETE_LIMIT,
+        )
+        stale = [
+            m for m in memories
+            if isinstance(m, dict)
+            and (m.get('metadata') or {}).get('source') == _ECHO_SOURCE
+            and (m.get('metadata') or {}).get('transition') == 'done'
+        ]
+        deleted_ids: list[str] = []
+        for m in stale:
+            memory_id = m.get('id')
+            if not memory_id:
+                continue
+            await self.memory.delete_memory(
+                memory_id=memory_id, store='mem0', project_id=scope.project_id,
+                causation_id=run_id,
+            )
+            deleted_ids.append(memory_id)
+        return deleted_ids
+
     async def _on_task_blocked(
         self, task_id: str, scope: ProjectScope, task_before: dict, run_id: str
     ) -> dict:
@@ -643,6 +722,69 @@ class TargetedReconciler:
 
         title = task.get('title', '')
         description = task.get('description', '')
+
+        # Task 2433: on reopen-from-done (the PRE-transition status captured
+        # in task_before was 'done'), delete the stale completion echo the
+        # earlier done-transition wrote (see _delete_stale_completion_echoes
+        # docstring — task 2531 repro, complements task 2647's live-refetch
+        # fix). Gated to genuine reopen-from-done transitions only — an
+        # ordinary pending/in-progress->blocked transition has no prior
+        # completion echo to clean up, so it skips the extra Mem0 scroll
+        # entirely.
+        #
+        # Coverage scope (task 2433 review amendment —
+        # robustness_coverage_gap): this sweep fires ONLY for the two
+        # reopen-adjacent transitions this reconciler handles — 'blocked'
+        # (here) and 'deferred' (delegates straight here, see
+        # _on_task_deferred below). TaskInterceptor.STATUS_TRIGGERS =
+        # {'done', 'blocked', 'cancelled', 'deferred'} does NOT include
+        # 'pending' or 'in-progress', so a reopen straight from done to
+        # pending/in-progress fires NO reconciliation handler at all and
+        # this sweep never runs for that path — a stale echo persists there
+        # until some later blocked/deferred/done transition touches the
+        # task. Closing that gap would mean triggering reconciliation (or
+        # this sweep specifically) from the reopen path itself in
+        # task_interceptor.py, which sits outside this task's locked module
+        # scope (fused_memory/reconciliation/ + tests/test_targeted.py
+        # only) — intentionally left as a documented follow-up rather than
+        # expanded here.
+        #
+        # Ordering claim, precisely scoped (task 2433 review amendment —
+        # race_condition): "never on the 'done' transition itself" means
+        # this code path is unreachable from _on_task_done — it says
+        # nothing about ordering ACROSS separate reconcile_task invocations.
+        # reconcile_task runs as a fire-and-forget background task
+        # (task_interceptor.py's STATUS_TRIGGERS dispatch) with no
+        # completion-ordering guarantee, so for a done1 -> blocked -> done2
+        # sequence on the SAME task_id, this sweep's scroll+delete would in
+        # principle also match a done2 echo if that echo happened to be
+        # written before the scroll runs. This is not a practical risk:
+        # done2 can only be written after the full blocked -> redispatch ->
+        # done2 cycle (real agent-execution wall-clock — at minimum
+        # seconds), whereas this sweep's scroll+delete completes within the
+        # same handler invocation (milliseconds) — so the blocked
+        # transition's sweep always resolves long before any subsequent
+        # done2 echo exists to be mismatched. Documented as an accepted
+        # timing assumption, not a structurally enforced ordering guarantee.
+        #
+        # Isolated in its own try/except so a Mem0 hiccup here never breaks
+        # hint attachment below.
+        if task.get('status') == 'done':
+            try:
+                deleted_ids = await self._delete_stale_completion_echoes(task_id, scope, run_id)
+                if deleted_ids:
+                    result['actions'].append({
+                        'type': 'stale_echo_deleted',
+                        'count': len(deleted_ids),
+                        'memory_ids': deleted_ids,
+                    })
+                    await self.journal.add_run_action(
+                        run_id, 'delete', 'memory', 'delete_memory',
+                        {'task_id': task_id, 'deleted': len(deleted_ids)},
+                        causation_id=run_id,
+                    )
+            except Exception as e:
+                logger.warning(f'Stale completion-echo sweep failed for task {task_id}: {e}')
 
         related = await self.memory.search(
             query=f'blockers for: {title} {description}',
@@ -1157,7 +1299,12 @@ class TargetedReconciler:
     async def _on_task_deferred(
         self, task_id: str, scope: ProjectScope, task_before: dict, run_id: str
     ) -> dict:
-        """Task deferred. Similar to blocked — attach relevant knowledge hints."""
+        """Task deferred. Similar to blocked — attach relevant knowledge hints.
+
+        Also delegates the task 2433 reopen-from-done stale-completion-echo
+        sweep (see _on_task_blocked) — covered by
+        test_on_task_deferred_reopen_deletes_stale_completion_echo.
+        """
         return await self._on_task_blocked(task_id, scope, task_before, run_id)
 
 def _extract_task(task_data: dict) -> dict:
