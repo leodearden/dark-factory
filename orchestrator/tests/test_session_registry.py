@@ -975,6 +975,54 @@ def test_reap_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
     assert remaining == {'kept-running', 'kept-recent-terminal'}
 
 
+def test_reap_respects_limit_stops_after_n_removals(tmp_path: Path) -> None:
+    """A positive `limit` stops the sweep after that many dirs are actually
+    removed -- bounding both the rmtree work and the per-call scan cost, so
+    an opportunistic per-spawn prune driver stays cheap regardless of how
+    large the on-disk backlog has grown.
+    """
+    records = [
+        _make_record(session_slug=slug, status=sr.Status.EXITED, launcher_pid=os.getpid())
+        for slug in ('term-a', 'term-b', 'term-c')
+    ]
+    for r in records:
+        sr.write_record(r, root=tmp_path)
+        _set_mtime(
+            sr.record_path_for_slug(r.session_slug, root=tmp_path),
+            _NOW,
+            sr.TERMINAL_TTL + timedelta(hours=1),
+        )
+
+    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW, limit=1)
+
+    assert len(reaped) == 1
+    remaining = {p.name for p in sr.sessions_dir(root=tmp_path).iterdir()}
+    assert len(remaining) == 2
+
+
+def test_reap_default_limit_none_is_unbounded(tmp_path: Path) -> None:
+    """Explicit `limit=None` -- and the implicit default -- must reproduce
+    today's unbounded full sweep, so every pre-existing reap test keeps
+    passing unchanged.
+    """
+    records = [
+        _make_record(session_slug=slug, status=sr.Status.EXITED, launcher_pid=os.getpid())
+        for slug in ('term-d', 'term-e', 'term-f')
+    ]
+    for r in records:
+        sr.write_record(r, root=tmp_path)
+        _set_mtime(
+            sr.record_path_for_slug(r.session_slug, root=tmp_path),
+            _NOW,
+            sr.TERMINAL_TTL + timedelta(hours=1),
+        )
+
+    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW, limit=None)
+
+    assert len(reaped) == 3
+    assert list(sr.sessions_dir(root=tmp_path).iterdir()) == []
+
+
 def test_reap_continues_sweep_when_one_directory_fails_to_remove(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1521,6 +1569,42 @@ def test_main_launching_drains_prior_orphan_via_sweep(
     assert orphan_reloaded.exit_code == sr.ORPHAN_EXIT_CODE
 
 
+def test_main_launching_bound_prunes_old_terminal_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every spawn's `launching` path must also opportunistically bound-prune
+    terminal/stale record dirs (reap_stale_records(limit=REAP_BATCH_LIMIT)),
+    not just mark orphans exited -- otherwise the disk backlog is marked
+    terminal on every spawn but never actually reclaimed.
+    """
+    assert isinstance(sr.REAP_BATCH_LIMIT, int)
+    assert sr.REAP_BATCH_LIMIT > 0
+
+    old_terminal = _make_record(
+        session_slug='old-terminal', status=sr.Status.EXITED, exit_code=0, launcher_pid=os.getpid()
+    )
+    sr.write_record(old_terminal, root=tmp_path)
+    _set_mtime(
+        sr.record_path_for_slug('old-terminal', root=tmp_path),
+        datetime.now(UTC),
+        sr.TERMINAL_TTL + timedelta(hours=1),
+    )
+
+    _set_env(monkeypatch, _launching_env(tmp_path))
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    assert capsys.readouterr().out.strip() == str(expected_dir)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
+
+    assert not (sr.sessions_dir(root=tmp_path) / 'old-terminal').exists()
+
+
 def test_main_launching_fail_soft_when_sweep_raises(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1545,6 +1629,36 @@ def test_main_launching_fail_soft_when_sweep_raises(
     # The sweep fault is swallowed INSIDE _run_launching -- the printed dir
     # (what spawn-claude.sh captures into SESSION_RECORD_DIR) stays exactly
     # the new record's dir, never corrupted or suppressed by the fault.
+    assert capsys.readouterr().out.strip() == str(expected_dir)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
+
+
+def test_main_launching_fail_soft_when_prune_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mirrors test_main_launching_fail_soft_when_sweep_raises for the bounded
+    prune: a fault in reap_stale_records must never raise out of
+    _run_launching (it would corrupt the printed record dir spawn-claude.sh
+    captures into SESSION_RECORD_DIR), exactly like a fault in the mark sweep.
+    """
+    _set_env(monkeypatch, _launching_env(tmp_path))
+
+    calls: list[None] = []
+
+    def _boom(*_args: object, **_kwargs: object) -> list[sr.ReapedSessionRecord]:
+        calls.append(None)
+        raise OSError('prune on fire')
+
+    monkeypatch.setattr(sr, 'reap_stale_records', _boom)
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    assert calls  # the prune really was invoked (and really did raise)
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
     assert capsys.readouterr().out.strip() == str(expected_dir)
     assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
 

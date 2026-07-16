@@ -967,6 +967,20 @@ TERMINAL_TTL = timedelta(hours=24)
 """How long a terminal (EXITED/FAILED_TO_START) record survives after its
 last write before the reaper reclaims it, regardless of launcher_pid."""
 
+REAP_BATCH_LIMIT = 100
+"""Per-call cap on how many stale record dirs a single OPPORTUNISTIC
+(spawn-path) reap removes -- see reap_stale_records' `limit` param. Caps a
+single spawn's synchronous prune cost regardless of how large the on-disk
+backlog has grown, at the cost of draining a large backlog over several
+spawns rather than in one call. Drain order follows reap_stale_records'
+sorted(iterdir()) (directory-name) order, not oldest-first, so if the
+on-disk backlog ever grows faster than spawns can drain it,
+alphabetically-later stale dirs can persist longer than
+alphabetically-earlier ones (TERMINAL_TTL eligibility itself is unaffected
+either way). The CLI `reap` verb (_run_reap) stays unbounded (limit=None)
+so an operator wanting a full, immediate drain can still clear the entire
+backlog in a single invocation."""
+
 NON_TERMINAL_HEARTBEAT_TTL = timedelta(hours=1)
 """How long a non-terminal record survives with a dead launcher_pid and no
 fresh write (heartbeat) before the reaper reclaims it. A live launcher_pid
@@ -1021,6 +1035,7 @@ def reap_stale_records(
     root: Path | str | None = None,
     *,
     now: datetime | None = None,
+    limit: int | None = None,
 ) -> list[ReapedSessionRecord]:
     """Sweep ``<root>/sessions/*/`` and remove stale session-record directories.
 
@@ -1041,8 +1056,25 @@ def reap_stale_records(
       NON_TERMINAL_HEARTBEAT_TTL -> reaped, reason='stale_pid'.
     - otherwise -> kept.
 
+    Directories are visited in ``sorted(iterdir())`` order (directory-name
+    order, not age order).
+
     *now* is injectable for deterministic tests; defaults to the real UTC
     clock.
+
+    *limit* is None (the default) for an unbounded full sweep -- today's
+    behavior, unchanged. A positive int stops the sweep once *limit*
+    directories have actually been removed, bounding the rmtree work (the
+    dominant reclamation cost) per call -- this is what lets an
+    opportunistic per-spawn caller stay cheap regardless of backlog size.
+    The directory *scan* itself is NOT bounded by *limit* in the worst
+    case: directories are visited in sorted(iterdir()) (name) order and the
+    sweep only breaks after a removal, so if enough kept (non-stale)
+    directories sort ahead of the *limit*-th stale one, every one of them
+    is still stat'd and read before the sweep stops -- the scan remains
+    O(N) in the total directory count, short-circuiting only once *limit*
+    removals have occurred. A directory whose removal is attempted and
+    fails (logged, see below) does NOT count against *limit*.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -1085,6 +1117,8 @@ def reap_stale_records(
                 logger.error('reap_stale_records: failed to remove %s', slug_dir, exc_info=True)
                 continue
             reaped.append(ReapedSessionRecord(path=slug_dir, session_slug=slug, reason=reason))
+            if limit is not None and len(reaped) >= limit:
+                break
 
     return reaped
 
@@ -1715,13 +1749,16 @@ def _run_launching(env: Mapping[str, str]) -> str:
     """Build + write a LAUNCHING record from CLAUDE_SPAWN_* env; return its dir.
 
     Also opportunistically drives the liveness sweep
-    (``mark_orphaned_sessions_exited``): ``reap_stale_records``/this sweep
-    have no periodic production driver of their own (CLI-only), so every
-    spawn is what drains prior orphaned (unclean-death) records to
-    ``exited`` -- the backlog is bounded by spawn rate and self-limits as it
-    drains. Wrapped in a fail-soft guard: a sweep fault must never raise
-    here and must never write to stdout, or it would corrupt the printed
-    record dir spawn-claude.sh captures into ``SESSION_RECORD_DIR``.
+    (``mark_orphaned_sessions_exited``) AND a bounded prune
+    (``reap_stale_records(limit=REAP_BATCH_LIMIT)``): neither sweep has a
+    periodic production driver of its own (CLI-only), so every spawn is
+    what drains prior orphaned (unclean-death) records to ``exited`` AND
+    reclaims terminal/stale record dirs from disk -- the backlog is bounded
+    by spawn rate and self-limits as it drains, over successive spawns for
+    the bounded prune. Wrapped in a fail-soft guard: a sweep fault must
+    never raise here and must never write to stdout, or it would corrupt
+    the printed record dir spawn-claude.sh captures into
+    ``SESSION_RECORD_DIR``.
 
     Cost model (reviewer-flagged): the sweep is O(N) in the number of
     session directories -- one ``iterdir`` + one ``record.json`` parse per
@@ -1734,6 +1771,9 @@ def _run_launching(env: Mapping[str, str]) -> str:
     the right place to revisit if spawn latency ever becomes a problem is a
     dedicated periodic timer (systemd/cron) rather than this synchronous
     call -- out of this task's module scope (would touch harness/systemd).
+    The bounded prune (``limit=REAP_BATCH_LIMIT``) caps its own scan/rmtree
+    cost per call regardless of backlog size; the CLI ``reap`` verb
+    (``_run_reap``) remains the operator's unbounded full-drain path.
     """
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
     prompt = env.get('CLAUDE_SPAWN_PROMPT', '') or ''
@@ -1763,6 +1803,8 @@ def _run_launching(env: Mapping[str, str]) -> str:
     write_record(record)
     with contextlib.suppress(Exception):
         mark_orphaned_sessions_exited()
+    with contextlib.suppress(Exception):
+        reap_stale_records(limit=REAP_BATCH_LIMIT)
     return str(record_dir)
 
 
