@@ -3374,6 +3374,7 @@ async def test_on_task_blocked_reopen_deletes_stale_completion_echo(
 
     mock_memory_service.get_memories_by_metadata.assert_awaited()
     query_call = mock_memory_service.get_memories_by_metadata.await_args
+    assert query_call is not None
     assert query_call.kwargs.get('filters', {}).get('task_id') == '2531'
 
     deleted_actions = [a for a in result.get('actions', []) if a['type'] == 'stale_echo_deleted']
