@@ -40,6 +40,13 @@ logger = logging.getLogger(__name__)
 # (see FABLE_CANDIDATE_MODEL below).
 DEFAULT_ALLOWED_MODELS: tuple[str, ...] = ('haiku', 'sonnet', 'opus')
 
+# Default model ladder (weakest -> strongest), used by the resolver (task
+# epsilon) for ladder-relative rule bumps (RoutingRule.set.model == '+N',
+# clamped at the top). Distinct from DEFAULT_ALLOWED_MODELS: the ladder is an
+# ORDER consulted only for relative bumps, while the allowlist is an
+# unordered admission set consulted at every resolution layer.
+DEFAULT_LADDER: tuple[str, ...] = ('haiku', 'sonnet', 'opus')
+
 # Candidate model probed for availability even though it is not yet admitted
 # to the runtime allowlist — beta is the G3 gate that produces the
 # per-account fable-availability data task xi's admission gate consumes.
