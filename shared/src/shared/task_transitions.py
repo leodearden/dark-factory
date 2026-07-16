@@ -111,6 +111,7 @@ _UNION: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset(
         (TaskStatus.MERGE_DEFERRED, TaskStatus.DONE),  # workflow.py:1015/6424, harness.py:619/646
         (TaskStatus.BLOCKED, TaskStatus.DONE),  # train attribution workflow.py:6424
         (TaskStatus.PENDING, TaskStatus.DONE),  # recon found_on_main; operator direct-complete of a never-dispatched task is an out-of-band manual set_task_status/update_task write with no enumerated call site (unlike the anchored half of this pair)
+        (TaskStatus.DEFERRED, TaskStatus.DONE),  # operator/vehicle direct-complete of a deferred task whose deliverable landed out-of-band (planning-mode/merge-vehicle task landed via merge queue); manual set_task_status write, no enumerated orchestrator call site — mirrors the (PENDING, DONE) found-on-main rationale above
         # park
         (TaskStatus.IN_PROGRESS, TaskStatus.MERGE_DEFERRED),  # workflow.py:867/896
         # requeue
