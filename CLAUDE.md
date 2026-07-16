@@ -380,7 +380,7 @@ orchestrator's route resolver (see "Model Routing" below).
 ```
 {
   "implementer": "opus",
-  "reviewer": "haiku"
+  "reviewer_comprehensive": "haiku"
 }
 ```
 
