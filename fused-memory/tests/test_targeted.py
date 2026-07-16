@@ -3143,6 +3143,7 @@ async def test_on_task_done_completion_journal_has_echo_used_provenance(
                 'content_contains': [
                     'Task description (unverified, may be the original '
                     'problem statement): STALE pre-fix bug statement',
+                    '\nDetails: Ran the migration script against staging.',
                 ],
                 'content_not_contains': ['completed'],
                 'metadata_true': ['echo_unverified_completion'],
@@ -3197,7 +3198,10 @@ async def test_on_task_done_unverified_completion_reframe(
     outcome; (3) an authoritative resolution memory (branch 1, task 1984) is
     UNCHANGED -- still the title-only "completed." echo. Params 2 and 3 pin
     the boundary so the reframe cannot over-apply the new flag to the
-    verified/authoritative branches.
+    verified/authoritative branches. `task_before` also carries non-empty
+    `details` so param 1 covers the branch-3 "\nDetails: " append surviving
+    the reframe (branches 1/2 never read `details`, so their content_equals
+    assertions are unaffected by it being present).
     """
     mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=memories_return)
     mock_taskmaster.get_task = AsyncMock(return_value=get_task_return)
@@ -3209,6 +3213,7 @@ async def test_on_task_done_unverified_completion_reframe(
             'title': 'Autopilot task',
             'status': 'in-progress',
             'description': 'STALE pre-fix bug statement',
+            'details': 'Ran the migration script against staging.',
         },
     )
 
