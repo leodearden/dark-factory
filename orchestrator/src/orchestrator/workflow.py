@@ -93,7 +93,11 @@ from orchestrator.verify import (
     run_scoped_verification,
     verify_failure_is_preexisting_on_main,
 )
-from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES, FailureCategory
+from orchestrator.verify_categories import (
+    INFRA_TRANSIENT_CATEGORIES,
+    PREEXISTING_BREAK_SKIP_CATEGORIES,
+    FailureCategory,
+)
 from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     BlockDisposition,
     CancellationScope,
@@ -5836,8 +5840,11 @@ class TaskWorkflow:
         """Run :func:`run_scoped_verification` with bounded infra-error retry.
 
         Catches :class:`VerifyInfraError` (transient infra OSErrors — ENOSPC,
-        EDQUOT, EROFS, EIO, EMFILE, ENFILE) raised during verify and retries
-        up to ``config.verify_infra_retry_max_attempts`` times with exponential
+        EDQUOT, EROFS, EIO, EMFILE, ENFILE) raised during verify, and also
+        treats a RETURNED failing :class:`VerifyResult` whose ``category`` is
+        infra-transient (``category in INFRA_TRANSIENT_CATEGORIES`` — task ν,
+        verify-scope-inversion-prd.md) the same way — retries up to
+        ``config.verify_infra_retry_max_attempts`` times with exponential
         back-off, keeping the task CLAIMED (in-progress) throughout.
 
         Returns
@@ -5865,6 +5872,7 @@ class TaskWorkflow:
         max_backoff = self.config.verify_infra_retry_max_backoff_secs
 
         last_infra_exc: VerifyInfraError | None = None
+        last_infra_result: VerifyResult | None = None
 
         for infra_attempt in range(max_attempts):
             try:
@@ -5878,7 +5886,7 @@ class TaskWorkflow:
                 # applies independently, in the non-force_workspace
                 # module-config branch, for any train member whose task
                 # verify isn't force_workspace'd.
-                return await run_scoped_verification(
+                result = await run_scoped_verification(
                     self.worktree, self.config, self._module_configs,
                     task_files=self._task_files,
                     attempt_id=verify_attempt + 1,
@@ -5889,6 +5897,7 @@ class TaskWorkflow:
                 )
             except VerifyInfraError as exc:
                 last_infra_exc = exc
+                last_infra_result = None
                 delay = min(backoff_base * (2 ** infra_attempt), max_backoff)
                 logger.warning(
                     'Task %s: VerifyInfraError during verify (phase=%r errno=%r), '
@@ -5897,25 +5906,62 @@ class TaskWorkflow:
                     infra_attempt + 1, max_attempts, delay,
                 )
                 await asyncio.sleep(delay)
+                continue
+
+            # Task ν (verify-scope-inversion-prd.md): a RETURNED failing
+            # VerifyResult classified as infra-transient (category in
+            # INFRA_TRANSIENT_CATEGORIES — disk_full, semaphore_timeout,
+            # pytest_internalerror, env_transient) is retried within this
+            # SAME bounded window exactly like a caught VerifyInfraError, so
+            # it consumes no verify_attempt and never reaches the debugger.
+            if not result.passed and (result.category or '') in INFRA_TRANSIENT_CATEGORIES:
+                last_infra_exc = None
+                last_infra_result = result
+                delay = min(backoff_base * (2 ** infra_attempt), max_backoff)
+                logger.warning(
+                    'Task %s: verify returned infra-transient category %r, '
+                    'attempt %d/%d — backing off %.1fs',
+                    self.task_id, result.category,
+                    infra_attempt + 1, max_attempts, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            return result
 
         # Window exhausted — stash infra-hold info and signal caller to BLOCK.
-        # last_infra_exc is guaranteed non-None: the loop only reaches here
-        # after catching at least one VerifyInfraError (max_attempts >= 1).
-        assert last_infra_exc is not None
-        reason = (
-            f'Verify infra failure not resolved after {max_attempts} in-process '
-            f'retries (phase={last_infra_exc.phase!r} errno={last_infra_exc.errno})'
-        )
-        self._infra_hold_info = {
-            'reason': reason,
-            'detail': (
+        # Either last_infra_exc or last_infra_result is guaranteed non-None:
+        # the loop only reaches here after at least one infra-classified
+        # iteration (max_attempts >= 1) — a raised VerifyInfraError or a
+        # returned classified-infra VerifyResult — and each branch above
+        # resets the other to None, so whichever was seen LAST wins.
+        if last_infra_exc is not None:
+            reason = (
+                f'Verify infra failure not resolved after {max_attempts} in-process '
+                f'retries (phase={last_infra_exc.phase!r} errno={last_infra_exc.errno})'
+            )
+            detail = (
                 f'VerifyInfraError: phase={last_infra_exc.phase!r} '
                 f'errno={last_infra_exc.errno}'
-            ),
+            )
+            hold_phase = last_infra_exc.phase
+            hold_errno = last_infra_exc.errno
+        else:
+            assert last_infra_result is not None
+            reason = (
+                f'Verify infra-transient outcome not resolved after {max_attempts} '
+                f'in-process retries (category={last_infra_result.category!r})'
+            )
+            detail = last_infra_result.failure_report()
+            hold_phase = None
+            hold_errno = None
+        self._infra_hold_info = {
+            'reason': reason,
+            'detail': detail,
             'category': 'infra_issue',
             'escalate_to_human': True,
-            'phase': last_infra_exc.phase,
-            'errno': last_infra_exc.errno,
+            'phase': hold_phase,
+            'errno': hold_errno,
         }
         # No metadata write here (task 2200/ω4): the retired metadata.infra_hold
         # boolean is gone.  _infra_hold_info propagates to run() via the
