@@ -562,6 +562,59 @@ class TestEligibilityForwardsDeliveredCache:
 
         assert result == (True, None)
 
+    # --- terminal_dep_records forwarding (task 2692 — step-5 RED / step-6 GREEN)
+    #
+    # The dep is genuinely absent from tasks_by_id here (unlike the fixtures
+    # above, which smuggle it in directly) — mirroring the real active-only
+    # get_tasks fetch that excludes a done/cancelled producer.
+
+    def test_ineligible_when_terminal_dep_records_fallback_maps_dep_to_false(
+        self, scheduler: Scheduler
+    ):
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'10': task}
+
+        result = scheduler._eligible_for_dispatch(
+            task, '10', status_map, tasks_by_id,
+            delivered_check_cache={'20': False},
+            terminal_dep_records={'20': dep},
+        )
+
+        assert result == (False, None)
+
+    def test_eligible_when_terminal_dep_records_fallback_maps_dep_to_true(
+        self, scheduler: Scheduler
+    ):
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'10': task}
+
+        result = scheduler._eligible_for_dispatch(
+            task, '10', status_map, tasks_by_id,
+            delivered_check_cache={'20': True},
+            terminal_dep_records={'20': dep},
+        )
+
+        assert result == (True, None)
+
+    def test_terminal_dep_records_default_unset_byte_identical(self, scheduler: Scheduler):
+        """Without terminal_dep_records, a dep absent from tasks_by_id is
+        simply skipped by the delivered-check arm — eligible purely off
+        status, byte-identical to legacy behaviour."""
+        task = self._dependent()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'10': task}
+
+        result = scheduler._eligible_for_dispatch(
+            task, '10', status_map, tasks_by_id,
+            delivered_check_cache={'20': False},
+        )
+
+        assert result == (True, None)
+
 
 # ---------------------------------------------------------------------------
 # TestTickContextField (task 2580 — step-7 RED / step-8 GREEN)
