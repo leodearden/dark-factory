@@ -4104,11 +4104,17 @@ class TestCommitEffectPresentInMain:
         (e.g. another task's overlapping follow-up edit) are
         indistinguishable here and both return False — see the
         "Accepted risk" note on the primitive's docstring.
-    (c) TRUE for a no-ff merge commit whose plain (no -m/-c) diff-tree
-        touched-set is empty by git's own default behavior — path-based
-        revert detection is inapplicable, so this preserves prior
-        mark-done behavior for journal-hit and merge-marker shas (both of
-        which are merge commits).
+    (c) For a no-ff merge commit, the primitive checks the SECOND
+        PARENT's (branch) content — the paths it touched since its fork
+        point (``merge-base(parent1, parent2)``) — against current main
+        HEAD.  TRUE when that content is still present on main (the
+        merged feature is intact); FALSE when the branch introduced no
+        net content (empty touched set) or when main no longer carries
+        it (e.g. a later revert of the merge's deliverable — the
+        task-1175 "reverted merge" shape this replaces the old
+        unconditional-True empty-diff-tree no-op to catch).  See
+        ``test_true_for_merge_commit_when_branch_content_present_in_main``
+        and ``test_false_for_merge_commit_when_branch_content_absent_from_main``.
     (d) FALSE (not a false-positive True) when a touched path contains
         non-ASCII bytes and a later commit genuinely changes it — pins
         that the primitive resolves the real path via
@@ -4166,15 +4172,16 @@ class TestCommitEffectPresentInMain:
         )
         assert await git_ops.commit_effect_present_in_main(fix_sha) is False
 
-    async def test_true_for_merge_commit_with_empty_touched_set(
+    async def test_true_for_merge_commit_when_branch_content_present_in_main(
         self, git_ops: GitOps, git_repo: Path,
     ) -> None:
-        """A no-ff merge commit's plain diff-tree (no -m/-c) reports an
-        empty touched-set by git's own default behavior for merge commits
-        — path-based revert detection is inapplicable, so this must
-        return True and preserve prior mark-done behavior for
-        journal-hit and merge-marker shas (both of which are merge
-        commits).
+        """A no-ff merge commit whose SECOND-PARENT (branch) content is
+        still present at main HEAD — the merged feature file exists,
+        byte-identical, on main — returns True under the second-parent
+        effect check.  Positive counterpart to
+        ``test_false_for_merge_commit_when_branch_content_absent_from_main``;
+        together they replace the retired "empty diff-tree ⇒
+        unconditional True" no-op for merge commits.
         """
         rc, _, err = await _run(['git', 'checkout', '-b', 'feature'], cwd=git_repo)
         assert rc == 0, f'checkout feature failed: {err}'
@@ -4195,6 +4202,49 @@ class TestCommitEffectPresentInMain:
         merge_sha = merge_sha.strip()
 
         assert await git_ops.commit_effect_present_in_main(merge_sha) is True
+
+    async def test_false_for_merge_commit_when_branch_content_absent_from_main(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The task-1175 "reverted merge" shape: a no-ff merge commit
+        remains an ancestor of main forever (immutable history) but a
+        LATER commit on main removes the deliverable the branch
+        introduced.  The merge commit's own plain (no -m/-c) diff-tree
+        touched-set is empty by git's default behavior — the blind spot
+        that used to make this primitive return True unconditionally for
+        every merge commit — but the new second-parent check sees that
+        the branch's own content (relative to its fork point) no longer
+        matches main HEAD, so effect-present must be False.
+        """
+        rc, _, err = await _run(['git', 'checkout', '-b', 'task/1175'], cwd=git_repo)
+        assert rc == 0, f'checkout task/1175 failed: {err}'
+        (git_repo / 'deliverable.py').write_text('deliverable\n')
+        await _run(['git', 'add', 'deliverable.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'impl(1175): add deliverable'], cwd=git_repo,
+        )
+        assert rc == 0, f'deliverable commit failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'task/1175', '-m', 'Merge task/1175 into main'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'merge failed: {err}'
+        rc, merge_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        merge_sha = merge_sha.strip()
+
+        (git_repo / 'deliverable.py').unlink()
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'revert deliverable'], cwd=git_repo)
+        assert rc == 0, f'revert commit failed: {err}'
+
+        assert await git_ops.is_ancestor(merge_sha, 'main') is True, (
+            'merge commit must still be an ancestor of main — this is the blind spot'
+        )
+        assert await git_ops.commit_effect_present_in_main(merge_sha) is False
 
     async def test_detects_real_change_to_non_ascii_touched_path(
         self, git_ops: GitOps, git_repo: Path,
