@@ -22,10 +22,22 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
-from orchestrator.service_restart import StaleServiceRestartCoordinator
+from orchestrator.service_restart import (
+    FLEET_DEPLOY_CLOCK_RELPATH,
+    StaleServiceRestartCoordinator,
+)
+
+# Repo root + committed dark-factory orchestrator config, for the
+# stamp_clock_on_fire/orchestrator_restart_script drift guard below. Mirrors
+# tests/scripts/test_orchestrator_restart_config_drift.py's REPO_ROOT/
+# DF_CONFIG_PATH pattern (that file is outside this task's locked module
+# scope, so the guard lives here instead).
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DF_CONFIG_PATH = REPO_ROOT / "orchestrator" / "config.yaml"
 
 # ---------------------------------------------------------------------------
 # Fixture
@@ -660,6 +672,85 @@ class TestBuildOrchestratorRestartCoordinator:
 
         assert coord._min_interval_secs == 0.0
         assert coord._state_path is None
+
+    def test_orchestrator_coordinator_stamp_clock_on_fire_is_false(self, harness: Harness):
+        """The orchestrator's own coordinator never persists the clock on fire (task 2396).
+
+        restart-all-orchestrators.sh becomes the SOLE on-disk clock writer,
+        stamping only on its verified-fresh exit-0 path — closing the
+        "failed-detached-deploy silences the backstop for 8h" hole (I2).
+        """
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._stamp_clock_on_fire is False
+
+    def test_fused_memory_coordinator_stamp_clock_on_fire_is_true(self, harness: Harness):
+        """fused-memory keeps the stamp_clock_on_fire default (True) — byte-identical."""
+        coord = harness._build_service_restart_coordinator()
+
+        assert coord._stamp_clock_on_fire is True
+
+    def test_dashboard_coordinator_stamp_clock_on_fire_is_true(self, harness: Harness):
+        """dashboard keeps the stamp_clock_on_fire default (True) — byte-identical."""
+        coord = harness._build_dashboard_restart_coordinator()
+
+        assert coord._stamp_clock_on_fire is True
+
+    def test_state_path_value_preserved_via_fleet_deploy_clock_relpath(self, harness: Harness):
+        """The state_path VALUE survives the FLEET_DEPLOY_CLOCK_RELPATH refactor.
+
+        test_state_path_under_data_orchestrator (above) already pins the
+        literal path; this guards that the same value is produced once
+        harness.py builds it from the single-source-of-truth constant
+        (FLEET_DEPLOY_CLOCK_RELPATH) instead of an inline literal.
+        """
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        expected = Path(harness.config.project_root) / FLEET_DEPLOY_CLOCK_RELPATH
+        assert coord._state_path == expected
+
+
+# ---------------------------------------------------------------------------
+# reviewer_comprehensive amendment (task 2396): stamp_clock_on_fire=False /
+# orchestrator_restart_script coupling drift guard
+# ---------------------------------------------------------------------------
+
+
+def test_orchestrator_restart_script_is_clock_stamping_script_in_committed_config() -> None:
+    """orchestrator/config.yaml's orchestrator_restart_script must be the
+    clock-stamping script (scripts/restart-all-orchestrators.sh) as long as
+    the orchestrator's own coordinator sets stamp_clock_on_fire=False (task
+    2396) — see test_orchestrator_coordinator_stamp_clock_on_fire_is_false
+    above, which pins that premise.
+
+    _build_orchestrator_restart_coordinator hardcodes stamp_clock_on_fire=
+    False for the orchestrator's own coordinator: restart-all-orchestrators.sh
+    becomes the SOLE on-disk writer of the shared fleet-deploy clock.
+    OrchestratorConfig's own field default ('scripts/restart-orchestrator.sh',
+    see config.py) does NOT stamp that clock, and this file's ``harness``
+    fixture deliberately mirrors that non-stamping default for its own,
+    unrelated coverage (orchestrator_restart_script =
+    'scripts/restart-orchestrator.sh') — so nothing else in this file would
+    catch a real deployment drifting away from the stamping script. If that
+    ever happened (a config.yaml typo, or a revert to the field default),
+    BOTH the coordinator's own min_interval_secs cap and the watchdog's
+    shared-clock backstop gate would silently stop advancing on
+    self-redeploys, reintroducing the "backstop unaware of fleet deploys"
+    hole (I1/I2) this task closes — with every test in this file still
+    green. Pins the COMMITTED production config directly, mirroring
+    tests/scripts/test_orchestrator_restart_config_drift.py's pattern.
+    """
+    cfg = yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))
+    assert cfg.get("orchestrator_restart_script") == "scripts/restart-all-orchestrators.sh", (
+        "orchestrator/config.yaml's orchestrator_restart_script must stay "
+        "pointed at the clock-stamping script "
+        "(scripts/restart-all-orchestrators.sh): the orchestrator's own "
+        "coordinator is built with stamp_clock_on_fire=False (task 2396) and "
+        "relies entirely on this script to persist the shared fleet-deploy "
+        "clock. Any other value silently degrades both the coordinator's own "
+        "restart-safe rate cap and the watchdog's shared-clock backstop gate "
+        "to a same-process-lifetime-only cap that never survives a restart."
+    )
 
 
 # ---------------------------------------------------------------------------

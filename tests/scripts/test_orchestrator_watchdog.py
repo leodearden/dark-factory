@@ -1381,6 +1381,225 @@ def test_staleness_grace_secs_malformed_env_falls_back(monkeypatch: pytest.Monke
 
 
 # ---------------------------------------------------------------------------
+# ORCH_RESTART_MIN_INTERVAL_SECS + shared fleet-deploy clock tests
+# (task 2396, fleet-redeploy β)
+#
+# These cover the watchdog's clock-awareness primitives in isolation:
+# ORCH_RESTART_MIN_INTERVAL_SECS (the env-mirror of
+# OrchestratorConfig.orchestrator_restart_min_interval_secs),
+# _read_last_fleet_deploy_epoch() (fail-open JSON read of the shared clock
+# file), and _within_fleet_deploy_min_interval() (the gate predicate). None of
+# these are wired into staleness_pass() yet — that wiring is covered by the
+# staleness_pass fleet-deploy clock gate tests further below.
+# ---------------------------------------------------------------------------
+
+
+def test_orch_restart_min_interval_secs_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ORCH_RESTART_MIN_INTERVAL_SECS defaults to 28800 (8h) with no env override."""
+    monkeypatch.delenv("ORCH_RESTART_MIN_INTERVAL_SECS", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 28800
+
+
+def test_orch_restart_min_interval_secs_matches_config_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The watchdog's env-mirror default must not drift from OrchestratorConfig's.
+
+    The watchdog is a stdlib-only systemd oneshot that cannot import the
+    orchestrator package at runtime, so ORCH_RESTART_MIN_INTERVAL_SECS's
+    default is a hardcoded mirror of
+    OrchestratorConfig.orchestrator_restart_min_interval_secs (28800.0, task
+    2371). This drift test — mirroring
+    tests/scripts/test_orchestrator_restart_config_drift.py — pins the two
+    together so a future config.py change doesn't silently diverge from the
+    watchdog's copy (Open-Q1).
+    """
+    from orchestrator.config import OrchestratorConfig
+
+    monkeypatch.delenv("ORCH_RESTART_MIN_INTERVAL_SECS", raising=False)
+    # Anchor ORCH_CONFIG_PATH to this worktree's own committed config so the
+    # comparison is deterministic regardless of the ambient shell env (which
+    # may point ORCH_CONFIG_PATH at a different checkout).
+    monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "orchestrator" / "config.yaml"))
+    wdog = _load_watchdog()
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == pytest.approx(
+        OrchestratorConfig().orchestrator_restart_min_interval_secs
+    )
+
+
+def test_orch_restart_min_interval_secs_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ORCH_RESTART_MIN_INTERVAL_SECS honors a valid env override.
+
+    _load_watchdog() re-execs the module, so an env var set before the call
+    is picked up at (re)import time — mirrors STALENESS_GRACE_SECS's own
+    env-override test above.
+    """
+    monkeypatch.setenv("ORCH_RESTART_MIN_INTERVAL_SECS", "60")
+    wdog = _load_watchdog()
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 60
+
+
+def test_fleet_deploy_clock_path_matches_across_tiers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shared clock-path literal must not silently diverge across tiers.
+
+    orchestrator.service_restart.FLEET_DEPLOY_CLOCK_RELPATH is the single
+    authoritative relative path (task 2396). Neither the stdlib watchdog
+    (FLEET_DEPLOY_CLOCK_PATH) nor restart-all-orchestrators.sh (CLOCK_FILE)
+    can import it, so each hardcodes its own mirror. If those mirrors ever
+    drifted from the authoritative constant, the watchdog would read a
+    different file than the script writes — permanently un-gating the
+    staleness backstop and silently reintroducing the I2 hole this task
+    closes, with every other test still green. This pins all three copies
+    together, mirroring test_orch_restart_min_interval_secs_matches_config_default
+    above.
+    """
+    from orchestrator.service_restart import FLEET_DEPLOY_CLOCK_RELPATH
+
+    # --- watchdog mirror (FLEET_DEPLOY_CLOCK_PATH) ---
+    monkeypatch.delenv("ORCH_FLEET_DEPLOY_CLOCK", raising=False)
+    wdog = _load_watchdog()
+    expected_watchdog_path = str(pathlib.Path(wdog.REPO_DIR) / FLEET_DEPLOY_CLOCK_RELPATH)
+    assert wdog.FLEET_DEPLOY_CLOCK_PATH == expected_watchdog_path
+
+    # --- bash script mirror (CLOCK_FILE default) ---
+    script_src = (REPO_ROOT / "scripts" / "restart-all-orchestrators.sh").read_text()
+    match = re.search(
+        r'CLOCK_FILE="\$\{ORCH_FLEET_DEPLOY_CLOCK:-\$REPO_DIR/([^}]+)\}"',
+        script_src,
+    )
+    assert match is not None, (
+        "restart-all-orchestrators.sh CLOCK_FILE default pattern not found — "
+        "did its literal shape change? Update this regex to match."
+    )
+    assert match.group(1) == FLEET_DEPLOY_CLOCK_RELPATH
+
+
+def test_orch_restart_min_interval_secs_malformed_env_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed ORCH_RESTART_MIN_INTERVAL_SECS env value falls back to 28800.
+
+    A typo'd env var must not crash the oneshot watchdog — fall-safe ethos,
+    mirroring STALENESS_GRACE_SECS's malformed-env test above.
+    """
+    monkeypatch.setenv("ORCH_RESTART_MIN_INTERVAL_SECS", "not-an-int")
+    wdog = _load_watchdog()
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 28800
+
+
+def test_read_last_fleet_deploy_epoch_happy_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_read_last_fleet_deploy_epoch reads the float `ts` from the clock file.
+
+    Mirrors StaleServiceRestartCoordinator._load_last_fire_wall's {ts, iso}
+    schema and fail-open semantics (orchestrator/src/orchestrator/service_restart.py).
+    """
+    wdog = _load_watchdog()
+    clock_file = tmp_path / "last_redeploy_orchestrator.json"
+    clock_file.write_text('{"ts": 1783000000.0, "iso": "2026-07-16T00:00:00+00:00"}')
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+
+    result = wdog._read_last_fleet_deploy_epoch()
+    assert result == pytest.approx(1783000000.0)
+    assert isinstance(result, float)
+
+
+def test_read_last_fleet_deploy_epoch_missing_file_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_read_last_fleet_deploy_epoch returns None when the clock file does not exist.
+
+    A fleet that has never had a verified redeploy (or a fresh checkout) must
+    not be treated as perpetually inside the min-interval window.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(tmp_path / "absent.json"))
+    assert wdog._read_last_fleet_deploy_epoch() is None
+
+
+def test_read_last_fleet_deploy_epoch_corrupt_json_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_read_last_fleet_deploy_epoch returns None (fail-open) on unparseable JSON."""
+    wdog = _load_watchdog()
+    clock_file = tmp_path / "corrupt.json"
+    clock_file.write_text("{not-json")
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+    assert wdog._read_last_fleet_deploy_epoch() is None
+
+
+def test_read_last_fleet_deploy_epoch_missing_ts_key_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_read_last_fleet_deploy_epoch returns None when the `ts` key is absent."""
+    wdog = _load_watchdog()
+    clock_file = tmp_path / "no_ts.json"
+    clock_file.write_text('{"iso": "2026-07-16T00:00:00+00:00"}')
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+    assert wdog._read_last_fleet_deploy_epoch() is None
+
+
+def test_within_fleet_deploy_min_interval_true_when_recent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fleet_deploy_min_interval is True when now - last < min_interval."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 100.0)  # 100s ago
+
+    assert wdog._within_fleet_deploy_min_interval() is True
+
+
+def test_within_fleet_deploy_min_interval_false_when_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fleet_deploy_min_interval is False once min_interval has elapsed."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 28800.0 + 1.0)
+
+    assert wdog._within_fleet_deploy_min_interval() is False
+
+
+def test_within_fleet_deploy_min_interval_false_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fleet_deploy_min_interval is False when ORCH_RESTART_MIN_INTERVAL_SECS==0.
+
+    0 disables the cap entirely — the read of the clock file must not even
+    be attempted.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(
+        wdog,
+        "_read_last_fleet_deploy_epoch",
+        lambda: pytest.fail("must not be consulted when the cap is disabled"),
+    )
+
+    assert wdog._within_fleet_deploy_min_interval() is False
+
+
+def test_within_fleet_deploy_min_interval_false_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fleet_deploy_min_interval is False when the clock is unreadable/absent.
+
+    A never-deployed fleet (or an unreadable clock file) must not block the
+    backstop indefinitely — fail toward restarting, not toward silence.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: None)
+
+    assert wdog._within_fleet_deploy_min_interval() is False
+
+
+# ---------------------------------------------------------------------------
 # staleness_pass core tests
 #
 # These tests set every restraint gate permissive (enabled, past startup
@@ -1390,13 +1609,14 @@ def test_staleness_grace_secs_malformed_env_falls_back(monkeypatch: pytest.Monke
 
 
 def test_staleness_pass_core(monkeypatch: pytest.MonkeyPatch) -> None:
-    """staleness_pass restarts only the unit stale w.r.t. the newest watched commit.
+    """staleness_pass delegates a fleet-wide restart exactly once when a unit
+    is stale w.r.t. the newest watched commit (not a per-unit restart_unit call).
 
     Also exercises I6 convergence: once a restart refreshes a unit's start
-    epoch to newer-than-commit, a second pass issues no further restart.
+    epoch to newer-than-commit, a second pass delegates zero further times.
     """
     wdog = _load_watchdog()
-    restarted: list[str] = []
+    delegated: list[None] = []
     log_messages: list[str] = []
 
     now = 2_000_000_000.0
@@ -1409,9 +1629,10 @@ def test_staleness_pass_core(monkeypatch: pytest.MonkeyPatch) -> None:
     start_epochs = {
         stale_unit: commit_epoch - 100,  # started before the commit -> stale
         fresh_unit: commit_epoch + 100,  # started after the commit -> fresh
-        unknown_unit: None,  # undeterminable -> must not restart
+        unknown_unit: None,  # undeterminable -> must not count as stale
     }
 
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(
         wdog, "_enumerate_running_units", lambda: [stale_unit, fresh_unit, unknown_unit]
     )
@@ -1420,30 +1641,41 @@ def test_staleness_pass_core(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "_unit_start_epoch", lambda u: start_epochs[u])
-    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(
+        wdog,
+        "restart_unit",
+        lambda u: pytest.fail(f"staleness_pass must delegate, not call restart_unit for {u}"),
+    )
+    monkeypatch.setattr(wdog, "_delegate_fleet_restart", lambda: delegated.append(None))
     monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
 
     wdog.staleness_pass()
 
-    assert restarted == [stale_unit], f"Expected only {stale_unit} restarted, got {restarted}"
+    assert len(delegated) == 1, (
+        f"Expected exactly one delegated fleet restart, got {len(delegated)}"
+    )
     assert any(("WARNING" in m and stale_unit in m) for m in log_messages), (
         f"Expected a WARNING log line naming {stale_unit}: {log_messages}"
     )
 
     # --- Convergence (I6): a real restart refreshes the unit's start epoch,
-    # so a second pass must issue no further restart for the same unit.
-    restarted.clear()
+    # so a second pass must delegate zero further times.
+    delegated.clear()
     start_epochs[stale_unit] = commit_epoch + 50  # as if just restarted
     wdog.staleness_pass()
-    assert restarted == [], (
-        f"staleness_pass must self-clear once the unit's start epoch is fresh; got {restarted}"
+    assert delegated == [], (
+        f"staleness_pass must self-clear once the unit's start epoch is fresh; "
+        f"got {len(delegated)} delegation(s)"
     )
 
 
 def test_staleness_pass_isolates_per_unit_exception(monkeypatch: pytest.MonkeyPatch) -> None:
-    """staleness_pass must not let one unit's exception stop later units from processing."""
+    """staleness_pass must not let one unit's exception stop later units from
+    processing, and must still delegate exactly once for a stale unit found
+    after the exception.
+    """
     wdog = _load_watchdog()
-    restarted: list[str] = []
+    delegated: list[None] = []
 
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
@@ -1456,20 +1688,22 @@ def test_staleness_pass_isolates_per_unit_exception(monkeypatch: pytest.MonkeyPa
             raise RuntimeError("systemctl exploded")
         return commit_epoch - 100  # stale
 
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [boom_unit, stale_unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
     monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "_unit_start_epoch", fake_start_epoch)
-    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "_delegate_fleet_restart", lambda: delegated.append(None))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
     # Must not raise
     wdog.staleness_pass()
 
-    assert stale_unit in restarted, (
-        f"{stale_unit} must still be processed after {boom_unit} raised; got {restarted}"
+    assert len(delegated) == 1, (
+        f"{stale_unit} must still be processed after {boom_unit} raised, triggering "
+        f"exactly one delegated fleet restart; got {len(delegated)}"
     )
 
 
@@ -1482,6 +1716,11 @@ def test_staleness_pass_noop_when_commit_epoch_none(monkeypatch: pytest.MonkeyPa
         enumerated.append("called")
         return ["orchestrator-x.service"]
 
+    # Neutralize the fleet-deploy clock gate (task 2396 step-11): it is
+    # checked BEFORE commit_epoch, and _read_last_fleet_deploy_epoch reads a
+    # real on-disk file at the default path — this test must exercise the
+    # commit_epoch-None path specifically, not an incidental gate skip.
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: None)
     monkeypatch.setattr(wdog, "_enumerate_running_units", fake_enumerate)
     monkeypatch.setattr(wdog, "restart_unit", lambda _u: pytest.fail("must not restart"))
@@ -1494,91 +1733,99 @@ def test_staleness_pass_noop_when_commit_epoch_none(monkeypatch: pytest.MonkeyPa
 
 
 def test_staleness_pass_skips_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """staleness_pass must not restart a stale unit that is_unit_enabled reports False.
+    """staleness_pass must not delegate a fleet restart for a stale unit that
+    is_unit_enabled reports False.
 
     Disabling is explicit operator intent — the backstop must respect it,
     identically to main()'s existing enabled gate (I5).
     """
     wdog = _load_watchdog()
-    restarted: list[str] = []
+    delegated: list[None] = []
 
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
 
     disabled_unit = "orchestrator-disabled.service"
 
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [disabled_unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
     monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "_unit_start_epoch", lambda _u: commit_epoch - 100)  # stale
-    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "_delegate_fleet_restart", lambda: delegated.append(None))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
     wdog.staleness_pass()
 
-    assert restarted == [], f"Disabled unit must not be restarted; got {restarted}"
+    assert delegated == [], f"Disabled unit must not trigger a delegated restart; got {delegated}"
 
 
 def test_staleness_pass_skips_startup_grace(monkeypatch: pytest.MonkeyPatch) -> None:
-    """staleness_pass must not restart a stale, enabled unit within STARTUP_GRACE_SECS.
+    """staleness_pass must not delegate a fleet restart for a stale, enabled
+    unit within STARTUP_GRACE_SECS.
 
     Mirrors main()'s existing grace-window gate: a unit that just (re)started
     may not have converged on the new commit's effects yet, and restarting it
     again would risk an indefinite restart loop (I5).
     """
     wdog = _load_watchdog()
-    restarted: list[str] = []
+    delegated: list[None] = []
 
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
 
     grace_unit = "orchestrator-grace.service"
 
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [grace_unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 30.0)  # < 120s grace
     monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "_unit_start_epoch", lambda _u: commit_epoch - 100)  # stale
-    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "_delegate_fleet_restart", lambda: delegated.append(None))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
     wdog.staleness_pass()
 
-    assert restarted == [], f"Unit within startup grace must not be restarted; got {restarted}"
+    assert delegated == [], (
+        f"Unit within startup grace must not trigger a delegated restart; got {delegated}"
+    )
 
 
 def test_staleness_pass_none_elapsed_does_not_block_restart(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """staleness_pass must still restart a stale unit when elapsed is None (undeterminable).
+    """staleness_pass must still delegate a restart for a stale unit when
+    elapsed is None (undeterminable).
 
     None means "grace window does not apply" — fall-through, consistent with
     main()'s existing treatment of an undeterminable elapsed time.
     """
     wdog = _load_watchdog()
-    restarted: list[str] = []
+    delegated: list[None] = []
 
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
 
     unit = "orchestrator-unknown-elapsed.service"
 
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
     monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "_unit_start_epoch", lambda _u: commit_epoch - 100)  # stale
-    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "_delegate_fleet_restart", lambda: delegated.append(None))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
     wdog.staleness_pass()
 
-    assert restarted == [unit], (
-        f"A None elapsed must not block the staleness restart; got {restarted}"
+    assert len(delegated) == 1, (
+        f"A None elapsed must not block the delegated staleness restart; got {delegated}"
     )
 
 
@@ -1601,6 +1848,9 @@ def test_staleness_pass_commit_grace(monkeypatch: pytest.MonkeyPatch) -> None:
 
     stale_unit = "orchestrator-young-commit.service"
 
+    # Neutralize the fleet-deploy clock gate (task 2396 step-11) — see the
+    # comment in test_staleness_pass_noop_when_commit_epoch_none above.
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [stale_unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
@@ -1614,6 +1864,301 @@ def test_staleness_pass_commit_grace(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert restarted == [], (
         f"A commit younger than STALENESS_GRACE_SECS must suppress all restarts; got {restarted}"
+    )
+
+
+def test_staleness_pass_delegates_exactly_once_for_multiple_stale_units(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """staleness_pass delegates the fleet restart EXACTLY ONCE even when
+    multiple units are stale — delegation is fleet-wide, not per-unit.
+    """
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    stale_units = ["orchestrator-stale-a.service", "orchestrator-stale-b.service"]
+
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: list(stale_units))
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "_unit_start_epoch", lambda _u: commit_epoch - 100)  # both stale
+    monkeypatch.setattr(
+        wdog,
+        "restart_unit",
+        lambda u: pytest.fail(f"staleness_pass must never call restart_unit directly for {u}"),
+    )
+    monkeypatch.setattr(wdog, "_delegate_fleet_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert len(delegated) == 1, (
+        f"Expected exactly one delegation for {len(stale_units)} stale units; "
+        f"got {len(delegated)}"
+    )
+
+
+def test_staleness_pass_delegates_zero_times_when_all_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """staleness_pass delegates zero times when every enumerated unit is fresh (I6)."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    fresh_units = ["orchestrator-fresh-a.service", "orchestrator-fresh-b.service"]
+
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: list(fresh_units))
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "_unit_start_epoch", lambda _u: commit_epoch + 100)  # fresh
+    monkeypatch.setattr(wdog, "_delegate_fleet_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert delegated == [], (
+        f"Expected zero delegations when all units are fresh; got {delegated}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _delegate_fleet_restart tests (task 2396, fleet-redeploy β, step 11)
+# ---------------------------------------------------------------------------
+
+
+def test_delegate_fleet_restart_argv_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_delegate_fleet_restart fires a detached, named, drain-enabled systemd-run.
+
+    - starts with ["systemd-run", "--user"]
+    - includes --collect (transient unit auto-removed on exit) and --no-block
+      (detached — the oneshot never blocks on the restart)
+    - fires the fixed --unit=orch-fleet-staleness-redeploy.service name (the
+      natural overlap guard: a concurrent tick fails to re-register it)
+    - invokes restart-all-orchestrators.sh with --drain (so a watchdog-
+      initiated fleet restart drains+stamps identically to an operator- or
+      coordinator-driven one)
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    wdog._delegate_fleet_restart()
+
+    assert len(calls) == 1, f"Expected exactly one subprocess.run call, got {calls}"
+    argv = calls[0]
+    assert argv[:2] == ["systemd-run", "--user"], f"argv must start with systemd-run --user: {argv}"
+    assert "--collect" in argv, f"argv must include --collect: {argv}"
+    assert "--no-block" in argv, f"argv must include --no-block (detached): {argv}"
+    assert "--unit=orch-fleet-staleness-redeploy.service" in argv, (
+        f"argv must fire the fixed transient unit name (the overlap guard): {argv}"
+    )
+    assert any(a.endswith("scripts/restart-all-orchestrators.sh") for a in argv), (
+        f"argv must invoke restart-all-orchestrators.sh: {argv}"
+    )
+    assert "--drain" in argv, (
+        f"argv must pass --drain so watchdog-initiated restarts drain identically: {argv}"
+    )
+
+
+def test_delegate_fleet_restart_swallows_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_delegate_fleet_restart must not raise if the systemd-run call times out."""
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd, 10)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    # Must not raise
+    wdog._delegate_fleet_restart()
+
+    assert len(log_messages) >= 1, "a systemd-run timeout must be logged"
+
+
+def test_delegate_fleet_restart_swallows_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_delegate_fleet_restart must not raise if systemd-run is not on PATH."""
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "systemd-run")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    # Must not raise
+    wdog._delegate_fleet_restart()
+
+    assert len(log_messages) >= 1, "a missing systemd-run binary must be logged"
+
+
+# ---------------------------------------------------------------------------
+# staleness_pass fleet-deploy clock gate tests (task 2396, fleet-redeploy β,
+# step 9)
+#
+# These wire _within_fleet_deploy_min_interval() into staleness_pass() as a
+# top-priority, fleet-wide restraint gate — ahead of the existing
+# commit-grace/per-unit gates — so the once-per-8h fleet-deploy bound is
+# honored by the backstop, not just the event-driven coordinator. main()
+# (liveness) is untouched (I5): brokenness is not a scheduled deploy.
+# ---------------------------------------------------------------------------
+
+
+def test_staleness_pass_skips_when_within_fleet_deploy_min_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """staleness_pass returns immediately when the shared fleet-deploy clock
+    reports we are still inside the min-interval window: no enumeration, no
+    delegation, no restart_unit call — even with a would-be-stale unit
+    present — and it logs a line naming the skip (the PRD journal signal) at
+    a SKIP_LOG_INTERVAL_SECS bucket boundary.
+
+    _newest_watched_commit_epoch, _enumerate_running_units, and restart_unit
+    are all monkeypatched to fail the test outright if consulted, so this
+    also pins that the fleet-deploy gate is checked BEFORE the existing
+    commit-grace gate (top priority) rather than merely somewhere in the
+    pass. time.time() is pinned to an exact SKIP_LOG_INTERVAL_SECS multiple
+    (a bucket boundary) so the per-tick log rate-limit exercised by
+    test_staleness_pass_suppresses_skip_log_outside_log_bucket below cannot
+    make this assertion flaky.
+    """
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(wdog.time, "time", lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0)
+    monkeypatch.setattr(
+        wdog,
+        "_newest_watched_commit_epoch",
+        lambda: pytest.fail("must not be consulted when the fleet-deploy gate is closed"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_enumerate_running_units",
+        lambda: pytest.fail("must not enumerate units when the fleet-deploy gate is closed"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "restart_unit",
+        lambda u: pytest.fail("must not restart_unit when the fleet-deploy gate is closed"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.staleness_pass()
+
+    assert any(
+        "skip" in m and str(wdog.ORCH_RESTART_MIN_INTERVAL_SECS) in m for m in log_messages
+    ), f"Expected a skip log line naming the fleet-deploy min-interval: {log_messages}"
+
+
+def test_staleness_pass_suppresses_skip_log_outside_log_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The skip line is rate-limited to at most once per SKIP_LOG_INTERVAL_SECS.
+
+    staleness_pass still returns immediately (no enumeration/delegation/
+    restart_unit — same top-priority gate as the test above) but does NOT
+    log when time.time() falls outside the bucket's logging slot. Without
+    this throttle, a single 8h fleet-deploy min-interval window would write
+    ~480 near-identical skip lines to the journal (one per ~60s tick),
+    burying genuinely actionable watchdog output (reviewer_comprehensive
+    amendment, task 2396).
+    """
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: True)
+    # Halfway into the bucket — well outside the logging slot near its start.
+    monkeypatch.setattr(
+        wdog.time,
+        "time",
+        lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 + wdog.SKIP_LOG_INTERVAL_SECS / 2,
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_newest_watched_commit_epoch",
+        lambda: pytest.fail("must not be consulted when the fleet-deploy gate is closed"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.staleness_pass()
+
+    assert log_messages == [], (
+        f"Expected no skip log line outside the log-rate-limit bucket: {log_messages}"
+    )
+
+
+def test_staleness_pass_proceeds_when_fleet_deploy_gate_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """staleness_pass proceeds to its existing detection path when the
+    fleet-deploy gate is open (disabled, or the clock is absent/elapsed):
+    _enumerate_running_units must still be consulted.
+    """
+    wdog = _load_watchdog()
+    enumerated: list[str] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace
+
+    def fake_enumerate():
+        enumerated.append("called")
+        return []
+
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "_enumerate_running_units", fake_enumerate)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert enumerated == ["called"], (
+        "staleness_pass must still reach enumeration when the fleet-deploy gate is open"
+    )
+
+
+def test_main_liveness_unaffected_by_fleet_deploy_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """I5: the fleet-deploy clock gate must never affect main()'s liveness restarts.
+
+    main() still restarts a port-down unit via restart_unit even when
+    _within_fleet_deploy_min_interval() would report True (inside the 8h
+    fleet-deploy window) — liveness is uncapped, non-clock-gated, and
+    non-stamping; brokenness is not a scheduled deploy.
+    """
+    wdog = _load_watchdog()
+    restarted: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: port != 8102)  # df probe fails
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main()
+
+    assert restarted == ["orchestrator-dark-factory.service"], (
+        f"main() must still restart a port-down unit even when the fleet-deploy "
+        f"clock gate is engaged; got {restarted}"
     )
 
 
@@ -1655,10 +2200,12 @@ def _fleet_fake_run(
     with the mutating/log calls staleness_pass can also issue): list-units /
     is-enabled / the two distinct ``systemctl show`` calls (monotonic
     elapsed-secs, realtime start epoch) / git log / restart_unit's
-    stop-reset-failed-start sequence / systemd-cat (log()). Unhandled argv
-    shapes fail the test outright rather than returning a default result, so
-    a change to the real helpers' argv is caught here instead of silently
-    driving staleness_pass() off a wrong assumption.
+    stop-reset-failed-start sequence (used only by main(), retained here for
+    any test that also exercises liveness) / the systemd-run fleet-restart
+    delegation (task 2396) / systemd-cat (log()). Unhandled argv shapes fail
+    the test outright rather than returning a default result, so a change to
+    the real helpers' argv is caught here instead of silently driving
+    staleness_pass() off a wrong assumption.
 
     ``enabled`` defaults every unit to enabled (True); ``elapsed_secs``
     defaults every unit to 300.0s (past STARTUP_GRACE_SECS=120).
@@ -1700,6 +2247,8 @@ def _fleet_fake_run(
             ["systemctl", "--user", "start"],
         ):
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[0] == "systemd-run":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if cmd[0] == "systemd-cat":
             log_messages.append(str(kwargs.get("input", "")))
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -1711,15 +2260,19 @@ def _fleet_fake_run(
 def test_staleness_pass_e2e_restarts_stale_unit_then_converges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Scenario 1 (I6): end-to-end, staleness_pass() restarts a unit whose real
-    start epoch predates the newest watched commit, logs a WARNING naming it,
-    and self-clears on the very next pass once the unit reads fresh again.
+    """Scenario 1 (I6): end-to-end, staleness_pass() delegates a fleet restart
+    for a unit whose real start epoch predates the newest watched commit,
+    logs a WARNING naming it, and self-clears on the very next pass once the
+    unit reads fresh again.
 
     Unlike test_staleness_pass_core (which stubs every helper), this drives
     _enumerate_running_units, is_unit_enabled, _unit_start_elapsed_secs,
-    _newest_watched_commit_epoch, _unit_start_epoch, and restart_unit all
-    through ONE injected fake subprocess.run — the integration level above
-    α's helper-stubbed unit test. Expected GREEN against merged α.
+    _newest_watched_commit_epoch, and _unit_start_epoch all through ONE
+    injected fake subprocess.run — the integration level above α's
+    helper-stubbed unit test. The delegated systemd-run call itself is also
+    driven through the same fake (task 2396 step-11), rather than stubbing
+    _delegate_fleet_restart, so this test additionally pins the real argv
+    _delegate_fleet_restart builds.
     """
     wdog = _load_watchdog()
 
@@ -1740,35 +2293,36 @@ def test_staleness_pass_e2e_restarts_stale_unit_then_converges(
     )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
 
     wdog.staleness_pass()
 
-    restart_verbs = [
-        c[2]
-        for c in recorded_calls
-        if c[0] == "systemctl" and c[2] in {"stop", "reset-failed", "start"} and c[-1] == unit
-    ]
-    assert restart_verbs == ["stop", "reset-failed", "start"], (
-        f"Expected stop->reset-failed->start restart sequence for {unit}; got {restart_verbs}"
+    delegate_calls = [c for c in recorded_calls if c[0] == "systemd-run"]
+    assert len(delegate_calls) == 1, (
+        f"Expected exactly one systemd-run delegation for {unit}; got {delegate_calls}"
     )
+    argv = delegate_calls[0]
+    assert any(a.endswith("scripts/restart-all-orchestrators.sh") for a in argv), (
+        f"Delegated systemd-run argv must invoke restart-all-orchestrators.sh: {argv}"
+    )
+    assert "--drain" in argv, f"Delegated systemd-run argv must pass --drain: {argv}"
     assert any(("WARNING" in m and unit in m) for m in log_messages), (
         f"Expected a WARNING log line naming {unit}: {log_messages}"
     )
 
     # --- I6 convergence: a real restart would refresh the unit's start
     # epoch, so flip it to newer-than-commit and run staleness_pass() again —
-    # no further restart sequence must be issued (stateless self-clear).
+    # no further delegation must be issued (stateless self-clear).
     recorded_calls.clear()
     start_epochs[unit] = commit_epoch + 50
 
     wdog.staleness_pass()
 
-    restart_verbs_2 = [c[2] for c in recorded_calls if c[0] == "systemctl" and c[2] != "show"]
-    mutating_2 = [v for v in restart_verbs_2 if v in {"stop", "reset-failed", "start"}]
-    assert mutating_2 == [], (
-        f"staleness_pass must self-clear once {unit} reads fresh; got {mutating_2}"
+    delegate_calls_2 = [c for c in recorded_calls if c[0] == "systemd-run"]
+    assert delegate_calls_2 == [], (
+        f"staleness_pass must self-clear once {unit} reads fresh; got {delegate_calls_2}"
     )
 
 
@@ -1798,6 +2352,7 @@ def test_staleness_pass_e2e_commit_grace_suppresses_all_restarts(
     )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
 
@@ -1811,7 +2366,8 @@ def test_staleness_pass_e2e_commit_grace_suppresses_all_restarts(
 
 def test_staleness_pass_e2e_fresh_unit_not_restarted(monkeypatch: pytest.MonkeyPatch) -> None:
     """Scenario 3 (I5, end-to-end): a unit whose real start epoch is newer than
-    the newest watched commit performs zero mutating systemctl calls.
+    the newest watched commit performs zero mutating systemctl calls and zero
+    fleet-restart delegations.
     """
     wdog = _load_watchdog()
 
@@ -1832,6 +2388,7 @@ def test_staleness_pass_e2e_fresh_unit_not_restarted(monkeypatch: pytest.MonkeyP
     )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
 
@@ -1839,13 +2396,16 @@ def test_staleness_pass_e2e_fresh_unit_not_restarted(monkeypatch: pytest.MonkeyP
 
     assert recorded_calls, "fresh-unit scenario must still drive real subprocess calls"
     _assert_zero_mutating_calls(recorded_calls)
+    assert not any(c[0] == "systemd-run" for c in recorded_calls), (
+        f"A fresh unit must not trigger a fleet-restart delegation; got {recorded_calls}"
+    )
 
 
 def test_staleness_pass_e2e_disabled_unit_not_restarted(monkeypatch: pytest.MonkeyPatch) -> None:
     """Scenario 4 (I5, end-to-end): a disabled unit that is otherwise
-    stale-beyond-grace performs zero mutating systemctl calls — operator
-    intent (is-enabled) is respected before the staleness comparison ever
-    runs against that unit.
+    stale-beyond-grace performs zero mutating systemctl calls and zero
+    fleet-restart delegations — operator intent (is-enabled) is respected
+    before the staleness comparison ever runs against that unit.
     """
     wdog = _load_watchdog()
 
@@ -1867,12 +2427,16 @@ def test_staleness_pass_e2e_disabled_unit_not_restarted(monkeypatch: pytest.Monk
     )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
 
     wdog.staleness_pass()
 
     _assert_zero_mutating_calls(recorded_calls)
+    assert not any(c[0] == "systemd-run" for c in recorded_calls), (
+        f"A disabled unit must not trigger a fleet-restart delegation; got {recorded_calls}"
+    )
 
     # Positive confirmation that the DISABLED gate — not empty enumeration or
     # an early commit-grace return — is what suppressed the restart: an

@@ -29,6 +29,7 @@ Invoked by scripts/orchestrator-watchdog.service (launched via
 scripts/orchestrator-watchdog.timer).
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -91,6 +92,48 @@ try:
     STALENESS_GRACE_SECS = int(os.environ["STALENESS_GRACE_SECS"])
 except (KeyError, ValueError):
     STALENESS_GRACE_SECS = 1800
+
+# Minimum wall-clock seconds between successive FLEET-WIDE redeploys, shared
+# with the event-driven restart coordinator
+# (orchestrator.service_restart.StaleServiceRestartCoordinator's
+# min_interval_secs, sourced from
+# OrchestratorConfig.orchestrator_restart_min_interval_secs, default 28800.0
+# = 8h). The watchdog is a stdlib-only systemd oneshot that cannot import the
+# orchestrator package, so this is a hardcoded env-mirror of the config
+# default (drift-tested in tests/scripts/test_orchestrator_watchdog.py
+# against a live OrchestratorConfig, task 2396 Open-Q1) rather than a live
+# read of it. 0 disables the cap entirely. Mirrors STALENESS_GRACE_SECS's
+# env-with-default try/except pattern immediately above — a typo'd env var
+# must not crash the oneshot watchdog.
+try:
+    ORCH_RESTART_MIN_INTERVAL_SECS = int(os.environ["ORCH_RESTART_MIN_INTERVAL_SECS"])
+except (KeyError, ValueError):
+    ORCH_RESTART_MIN_INTERVAL_SECS = 28800
+
+# Path to the shared fleet-deploy clock file: the SAME file
+# restart-all-orchestrators.sh stamps (atomically, only on its verified-fresh
+# exit-0 path) and the orchestrator's own StaleServiceRestartCoordinator
+# reads/seeds from (state_path, task 2371/2396). Mirrors
+# orchestrator.service_restart.FLEET_DEPLOY_CLOCK_RELPATH — neither this
+# stdlib script nor that constant can import each other, so the literal path
+# is duplicated here and guarded by a drift/consistency test. Env-overridable
+# so tests can point every tier at a tmp file without touching real data/.
+FLEET_DEPLOY_CLOCK_PATH = os.environ.get(
+    "ORCH_FLEET_DEPLOY_CLOCK",
+    os.path.join(REPO_DIR, "data", "orchestrator", "last_redeploy_orchestrator.json"),
+)
+
+# staleness_pass() is a stateless oneshot: every ~60s timer tick
+# (orchestrator-watchdog.timer's OnUnitActiveSec=60) is a FRESH process (see
+# module docstring), so there is no cross-tick memory to log the fleet-deploy
+# min-interval skip line only once per window. Logging on EVERY tick would
+# write ~480 near-identical lines to the journal over one full
+# ORCH_RESTART_MIN_INTERVAL_SECS (8h default) window, burying genuinely
+# actionable watchdog output. Re-emit the skip line at most once per this many
+# wall-clock seconds instead, bucketed purely off time.time() (no persisted
+# state needed) — deliberately much coarser than the ~60s tick cadence so most
+# ticks land inside an already-logged bucket and stay silent.
+SKIP_LOG_INTERVAL_SECS = 1800
 
 
 def log(msg: str) -> None:
@@ -442,6 +485,55 @@ def _newest_watched_commit_epoch() -> int | None:
         return None
 
 
+def _read_last_fleet_deploy_epoch() -> float | None:
+    """Return the last verified fleet-deploy epoch from FLEET_DEPLOY_CLOCK_PATH, or None.
+
+    Reads the same ``{ts, iso}`` JSON schema
+    ``StaleServiceRestartCoordinator._load_last_fire_wall`` reads and
+    ``restart-all-orchestrators.sh``'s ``stamp_fleet_deploy_clock`` writes, so
+    all three tiers agree on the shared clock's format.
+
+    Fail-open, mirroring ``_load_last_fire_wall``: returns None (never
+    raises) when the file is missing (no fleet deploy has ever verified
+    fresh, or a fresh checkout with no data/ yet), or when it is corrupt,
+    unreadable, or missing its ``ts`` key. Callers must treat None as
+    "the min-interval cap does not apply" (fail toward restarting, not
+    toward silence).
+    """
+    try:
+        with open(FLEET_DEPLOY_CLOCK_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+        return float(raw["ts"])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        log(
+            f"ignoring unreadable/corrupt fleet-deploy clock at "
+            f"{FLEET_DEPLOY_CLOCK_PATH}: {exc!r}"
+        )
+        return None
+
+
+def _within_fleet_deploy_min_interval() -> bool:
+    """Return True iff we are still inside the shared fleet-deploy min-interval window.
+
+    Reads the same on-disk clock ``restart-all-orchestrators.sh`` stamps only
+    on a verified-fresh fleet restart (never on mere fire/registration — see
+    the coordinator's ``stamp_clock_on_fire=False`` for the orchestrator's own
+    coordinator, task 2396). ORCH_RESTART_MIN_INTERVAL_SECS<=0 disables the
+    cap outright (the clock is not even read). A missing/unreadable clock
+    (``_read_last_fleet_deploy_epoch`` returns None) is treated as "outside
+    the window" — fail toward letting the backstop run, not toward silencing
+    it indefinitely.
+    """
+    if ORCH_RESTART_MIN_INTERVAL_SECS <= 0:
+        return False
+    last = _read_last_fleet_deploy_epoch()
+    if last is None:
+        return False
+    return (time.time() - last) < ORCH_RESTART_MIN_INTERVAL_SECS
+
+
 def main() -> None:
     """Probe each watched port; restart the unit if the port is not listening."""
     for port, unit in WATCHED:
@@ -467,6 +559,56 @@ def main() -> None:
             log(f"watchdog error for {unit} (port {port}): {exc}")
 
 
+def _delegate_fleet_restart() -> None:
+    """Delegate a fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain.
+
+    Fires a detached, named transient unit via ``systemd-run --user`` rather
+    than restarting units in-process (task 2396, fleet-redeploy β): drain and
+    clock-stamping are then defined ONCE in the script and identical whether
+    the fleet restart was triggered by this backstop or by the event-driven
+    coordinator / an operator.
+
+    - ``--unit=orch-fleet-staleness-redeploy.service`` is a FIXED transient
+      unit name — the natural overlap guard. A second staleness_pass tick
+      while a redeploy is still running fails to re-register the same unit
+      name (systemd-run exits non-zero) and no-ops, so this stateless
+      oneshot needs no cross-tick bookkeeping to avoid piling up concurrent
+      fleet restarts.
+    - ``--collect`` removes the transient unit once it exits (success or
+      failure) so a LATER tick can re-register the same name.
+    - ``--no-block`` detaches: this call returns as soon as the transient
+      unit is *registered*, without waiting for restart-all-orchestrators.sh
+      to finish. Essential once γ's per-unit merge-drain gate can defer a
+      restart for up to ORCH_RESTART_FORCE_FIRE_AFTER_SECS (75 min default)
+      — the 60s oneshot watchdog (and its liveness pass) must never block on
+      that.
+    - ``--drain`` enables γ's per-unit merge-drain gate, so a watchdog-
+      initiated fleet restart drains + stamps identically to an operator- or
+      coordinator-driven ``restart-all-orchestrators.sh --drain``.
+
+    Fail-soft: a missing systemd-run binary, a timeout, or any other
+    registration error is logged and swallowed, never raised — a
+    registration hiccup must not crash the oneshot watchdog. The NEXT tick's
+    staleness_pass will simply try again (stateless — I6).
+    """
+    try:
+        subprocess.run(
+            [
+                "systemd-run",
+                "--user",
+                "--collect",
+                "--no-block",
+                "--unit=orch-fleet-staleness-redeploy.service",
+                os.path.join(REPO_DIR, "scripts", "restart-all-orchestrators.sh"),
+                "--drain",
+            ],
+            check=False,
+            timeout=10,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"_delegate_fleet_restart: systemd-run registration failed: {exc!r}")
+
+
 def staleness_pass() -> None:
     """Restart any running orchestrator unit stale w.r.t. the newest watched commit.
 
@@ -487,7 +629,35 @@ def staleness_pass() -> None:
     This is an accepted trade-off (never race the event-driven coordinator)
     rather than a bug; use `--report` to inspect actual per-unit staleness
     while a burst is in progress.
+
+    Shared fleet-deploy clock (task 2396, fleet-redeploy β): checked FIRST,
+    ahead of the commit-grace gate below — a top-priority, fleet-wide
+    restraint that caps this backstop (like the event-driven coordinator) to
+    at most once per ORCH_RESTART_MIN_INTERVAL_SECS, honoring a redeploy
+    verified by EITHER tier (restart-all-orchestrators.sh is the sole on-disk
+    writer, stamped only on its verified-fresh exit-0 path). The skip line is
+    itself rate-limited to at most once per SKIP_LOG_INTERVAL_SECS (see its
+    module-level docstring) — the gate check still runs every tick, only the
+    log emission is throttled.
+
+    Delegation (task 2396): once ANY eligible unit is found stale, the
+    per-unit loop below no longer restarts it directly — instead the whole
+    fleet-wide restart is delegated ONCE, after the loop, to
+    _delegate_fleet_restart(). restart_unit() remains used ONLY by main()
+    (liveness stays uncapped, non-clock-gated, and non-stamping — I5:
+    brokenness is not a scheduled deploy).
     """
+    if _within_fleet_deploy_min_interval():
+        # Bucket on wall-clock time (not elapsed-since-deploy) so this needs
+        # no extra clock-file read beyond the one _within_fleet_deploy_min_
+        # interval() already did — see SKIP_LOG_INTERVAL_SECS above.
+        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+            log(
+                "skip: within fleet-deploy min-interval "
+                f"({ORCH_RESTART_MIN_INTERVAL_SECS}s) since last deploy"
+            )
+        return
+
     commit_epoch = _newest_watched_commit_epoch()
     if commit_epoch is None:
         return  # undeterminable — fall safe, no restarts this tick
@@ -497,6 +667,7 @@ def staleness_pass() -> None:
         # limitation" paragraph above for the rapid-landing suppression case.
         return
 
+    stale_found = False
     for unit in _enumerate_running_units():
         try:
             if not is_unit_enabled(unit):
@@ -519,12 +690,15 @@ def staleness_pass() -> None:
             if start_epoch < commit_epoch:
                 log(
                     f"WARNING: {unit} started at {start_epoch} before the newest "
-                    f"watched commit ({commit_epoch}); restarting for staleness"
+                    f"watched commit ({commit_epoch}); flagging for fleet-wide staleness redeploy"
                 )
-                restart_unit(unit)
-                log(f"{unit} staleness restart issued")
+                stale_found = True
         except Exception as exc:  # noqa: BLE001
             log(f"staleness probe error for {unit}: {exc}")
+
+    if stale_found:
+        log("delegating fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain")
+        _delegate_fleet_restart()
 
 
 def _format_epoch(epoch: int | None) -> str:

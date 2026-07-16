@@ -72,7 +72,14 @@ VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
 SELF_UNIT="${SELF_UNIT:-orchestrator-dark-factory.service}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
 FLEET_DIR="${ORCH_FLEET_DIR:-/home/leo/src/dark-factory/data/fleet}"
+# Shared fleet-deploy clock (task 2396, fleet-redeploy β): this script is the
+# SOLE on-disk writer, stamped only once every unit has verified fresh below.
+# Mirrors the coordinator's {ts, iso} state_path schema (service_restart.py
+# FLEET_DEPLOY_CLOCK_RELPATH / _persist_last_fire_wall) so both the
+# coordinator and scripts/orchestrator-watchdog.py read what this writes.
+CLOCK_FILE="${ORCH_FLEET_DEPLOY_CLOCK:-$REPO_DIR/data/orchestrator/last_redeploy_orchestrator.json}"
 FORCE_FIRE_AFTER_SECS="${ORCH_RESTART_FORCE_FIRE_AFTER_SECS:-4500}"
 DRAIN_FRESH_WINDOW_SECS="${ORCH_DRAIN_FRESH_WINDOW_SECS:-120}"
 DRAIN_POLL_INTERVAL_SECS="${ORCH_DRAIN_POLL_INTERVAL_SECS:-30}"
@@ -263,6 +270,24 @@ drain_gate() {
     done
 }
 
+stamp_fleet_deploy_clock() {
+    # Atomically stamps CLOCK_FILE with the current epoch/UTC-ISO time:
+    # mktemp a sibling file IN the same directory, write it, then `mv -f`
+    # onto CLOCK_FILE (same-filesystem rename -- atomic). Schema is {ts,
+    # iso}, matching the coordinator's _persist_last_fire_wall, so
+    # float(raw['ts']) reads it identically from either writer. Called ONLY
+    # from the all-units-verified-fresh exit-0 path below -- never on a
+    # failed/partial verify or the early no-running-units exit -- so a
+    # failed fleet restart can never silence the watchdog backstop (I2).
+    local clock_dir tmp_file
+    clock_dir="$(dirname "$CLOCK_FILE")"
+    mkdir -p "$clock_dir"
+    tmp_file="$(mktemp "$clock_dir/.last_redeploy_orchestrator.XXXXXX")"
+    printf '{"ts": %s, "iso": "%s"}\n' \
+        "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" > "$tmp_file"
+    mv -f "$tmp_file" "$CLOCK_FILE"
+}
+
 # Enumerate running orchestrator units at run time (robust to which projects
 # are enabled on this host), deferring SELF_UNIT to the end.
 mapfile -t running_units < <(
@@ -304,6 +329,8 @@ if [[ ${#failures[@]} -gt 0 ]]; then
     echo "ERROR: restart did not verify fresh for: ${failures[*]}" >&2
     exit 1
 fi
+
+stamp_fleet_deploy_clock
 
 echo "All ${#ordered_units[@]} orchestrator unit(s) restarted and verified fresh."
 exit 0

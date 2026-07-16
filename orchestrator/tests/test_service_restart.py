@@ -1450,6 +1450,7 @@ def _make_rate_capped_coordinator(
     state_path: Path | None = None,
     debounce_secs: float = 0.0,
     restart_executor: AsyncMock | None = None,
+    stamp_clock_on_fire: bool = True,
 ) -> tuple[StaleServiceRestartCoordinator, AsyncMock, MagicMock]:
     """Build a coordinator wired with the wall-clock rate cap.
 
@@ -1476,6 +1477,7 @@ def _make_rate_capped_coordinator(
         min_interval_secs=min_interval_secs,
         wall_clock=lambda: wall_now[0],
         state_path=state_path,
+        stamp_clock_on_fire=stamp_clock_on_fire,
     )
     return coord, executor, event_store
 
@@ -1676,3 +1678,73 @@ async def test_rate_cap_evaluated_after_precondition_gate() -> None:
     assert await coord.maybe_restart(agents_idle=True) is True
     executor.assert_awaited_once()
     assert coord._last_fire_wall == wall_now[0]
+
+
+# ---------------------------------------------------------------------------
+# stamp_clock_on_fire (task 2396, fleet-redeploy β): the script — not the
+# coordinator — is the sole on-disk clock writer on verified success when
+# False. In-memory _last_fire_wall still advances (within-process double-fire
+# gating is retained); only the on-disk persist is suppressed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stamp_clock_on_fire_false_skips_disk_persist_but_updates_memory(
+    tmp_path: Path,
+) -> None:
+    """(a) stamp_clock_on_fire=False: a successful fire leaves state_path UNCHANGED
+    on disk (the script owns the verified-success write) while the in-memory
+    _last_fire_wall DOES advance to wall_now (within-process double-fire
+    gating is retained).
+    """
+    state_path = tmp_path / 'data' / 'orchestrator' / 'last_redeploy_orchestrator.json'
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    original_payload = {'ts': 12345.5, 'iso': 'original-untouched'}
+    state_path.write_text(json.dumps(original_payload), encoding='utf-8')
+
+    wall_now = [99_999.0]
+    coord, executor, _ = _make_rate_capped_coordinator(
+        min_interval_secs=28800.0,
+        wall_now=wall_now,
+        state_path=state_path,
+        stamp_clock_on_fire=False,
+    )
+    # Seed a prior fire well outside the cap window so this fire is not gated.
+    coord._last_fire_wall = wall_now[0] - 28800.0 - 1.0
+
+    await coord.note_merge('task-1', 'base', 'head')
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    executor.assert_awaited_once()
+    # In-memory clock advanced (retains within-process double-fire gating).
+    assert coord._last_fire_wall == wall_now[0]
+    # On-disk state is byte-identical to what was there before the fire — the
+    # coordinator must not have written anything.
+    on_disk = json.loads(state_path.read_text(encoding='utf-8'))
+    assert on_disk == original_payload, (
+        f'stamp_clock_on_fire=False must never persist to state_path; got {on_disk}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_stamp_clock_on_fire_default_true_still_persists(tmp_path: Path) -> None:
+    """(b) Regression: the default stamp_clock_on_fire=True still rewrites
+    state_path with the new ts on a successful fire (existing task-2371
+    behavior preserved byte-identical).
+    """
+    state_path = tmp_path / 'data' / 'orchestrator' / 'last_redeploy_orchestrator.json'
+    wall_now = [55_555.0]
+    coord, executor, _ = _make_rate_capped_coordinator(
+        min_interval_secs=28800.0, wall_now=wall_now, state_path=state_path
+    )
+    assert coord._stamp_clock_on_fire is True
+
+    await coord.note_merge('task-1', 'base', 'head')
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    executor.assert_awaited_once()
+    assert state_path.exists()
+    persisted = json.loads(state_path.read_text(encoding='utf-8'))
+    assert persisted['ts'] == 55_555.0

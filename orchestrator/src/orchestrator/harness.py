@@ -63,6 +63,7 @@ from orchestrator.scheduler import (
     SetTaskStatusRejected,
 )
 from orchestrator.service_restart import (
+    FLEET_DEPLOY_CLOCK_RELPATH,
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
@@ -6877,12 +6878,7 @@ Output JSON matching the schema. Every task must appear in the output.
         # no eager mkdir is needed here. Only the orchestrator's OWN coordinator
         # gets a non-zero cap — the fused-memory/dashboard builders keep the
         # 0.0 default (no gating), so their behaviour is unchanged.
-        redeploy_state_path = (
-            Path(self.config.project_root)
-            / 'data'
-            / 'orchestrator'
-            / 'last_redeploy_orchestrator.json'
-        )
+        redeploy_state_path = Path(self.config.project_root) / FLEET_DEPLOY_CLOCK_RELPATH
 
         return StaleServiceRestartCoordinator(
             git_ops=self.git_ops,
@@ -6899,6 +6895,17 @@ Output JSON matching the schema. Every task must appear in the output.
             restart_executor=_systemd_run_restart_executor,
             min_interval_secs=self.config.orchestrator_restart_min_interval_secs,
             state_path=redeploy_state_path,
+            # restart-all-orchestrators.sh is the SOLE on-disk clock writer,
+            # stamping only on its verified-fresh exit-0 path — the watchdog
+            # backstop reads the same file. Persisting here too (on mere fire/
+            # registration of a detached deploy that may later fail) would
+            # silently silence the backstop for a full min_interval_secs
+            # window (task 2396, fleet-redeploy β; closes hole I2).
+            # Caveat: this coordinator's OWN _last_fire_wall still re-seeds
+            # from state_path on every process restart, so it can transiently
+            # lag the script's post-restart stamp by one fire — see
+            # StaleServiceRestartCoordinator's stamp_clock_on_fire docstring.
+            stamp_clock_on_fire=False,
         )
 
     async def _maybe_restart_stale_service(self, *, agents_idle: bool) -> bool:
