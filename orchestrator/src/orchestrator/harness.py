@@ -6822,7 +6822,10 @@ Output JSON matching the schema. Every task must appear in the output.
           distinct transient unit name (``orch-selfrestart-on-merge-{n}.service``);
           collisions would require two fires within one process lifetime inside
           the ~30s external-verify window, which debounce + single-restart
-          coalescing + the drain gate below make effectively impossible.
+          coalescing make effectively impossible on their own — the
+          restart_precondition preference below narrows the polite-path window
+          further, though force-fire relies on debounce + coalescing alone
+          since it bypasses that preference.
         - ``restart_precondition``: ``self._merge_pipeline_idle`` — even at the
           run-loop's idle quiet-window (``agents_idle=True``), a merge can
           still be queued or in-flight/verifying; this gate additionally
@@ -6833,9 +6836,21 @@ Output JSON matching the schema. Every task must appear in the output.
           restart has been owed for ``orchestrator_restart_force_fire_after_secs``
           (fleet-redeploy PRD task delta), ``maybe_restart`` force-fires and
           bypasses ``agents_idle``, the debounce, AND this precondition —
-          though it never bypasses ``min_interval_secs`` below. Per-unit
-          merge-drain safety is delegated to restart-all-orchestrators.sh's
-          drain gate (task gamma) instead.
+          though it never bypasses ``min_interval_secs`` below. This
+          in-process force-fire path is NOT covered by
+          ``restart-all-orchestrators.sh``'s ``--drain`` merge-drain gate
+          (task gamma, ``drain_check.py``) — that gate only guards the
+          separate operator/deploy-triggered script path (e.g. a
+          ``task_kind='deterministic'`` deploy task's ``before_done.script``),
+          which this coordinator never invokes. The executor below always
+          runs ``scripts/restart-orchestrator.sh`` directly via
+          ``schedule_detached_systemd_restart``, and that script's own
+          ``--drain`` is an accepted-and-ignored no-op (see its header):
+          graceful shutdown is SIGTERM → cancel-main-task (``cli.py``'s
+          ``_make_cancel_handler``, bounded by ``TimeoutStopSec=90s``), and a
+          merge interrupted mid-verify by that shutdown is recovered from the
+          merge queue's durable, crash-safe journal (task 1772/2153) on the
+          next startup — not from a merge-drain gate at restart time.
 
         ``require_idle=True`` and ``script_args=[]`` mirror the fused-memory
         coordinator (idle-only; restart-orchestrator.sh takes no positional

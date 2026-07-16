@@ -550,6 +550,16 @@ class StaleServiceRestartCoordinator:
         reachable from the run-loop's idle branch) cannot starve a pending
         restart indefinitely under chronic fleet saturation.
 
+        This class does NOT itself provide an interrupt-safety net for
+        whatever ``restart_precondition`` was standing in for (e.g. a
+        merge-drain check) once force-fire bypasses it — that safety is
+        entirely the caller's responsibility (its restart_executor and the
+        service being restarted). See
+        ``Harness._build_orchestrator_restart_coordinator``'s docstring for
+        the concrete mechanism the orchestrator's own instance relies on
+        (SIGTERM graceful shutdown + durable merge-queue crash-recovery, NOT
+        a merge-drain gate at restart time).
+
         Returns True when the restart was fired; False otherwise (no side
         effects — caller may call again on the next idle tick).
         """
