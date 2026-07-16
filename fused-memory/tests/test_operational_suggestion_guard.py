@@ -152,6 +152,87 @@ class TestOperationalSuggestionFindingDetectionMatrix:
         assert 'restart' in finding.markers
         assert 'details' in finding.fields
 
+    @pytest.mark.parametrize(
+        'description',
+        [
+            'Confirm the retry logic handles timeouts.',
+            'Reload the config module after edit.',
+            'Deploy config schema field.',
+        ],
+    )
+    def test_weak_marker_suppressed_by_code_artifact_in_same_field(self, description):
+        """The generic ('weak') markers -- confirm/reload/deploy -- are
+        suppressed when the SAME field also names a code-level artifact
+        (logic/module/schema/field/...) rather than a running system: these
+        are genuine code-task sentences, not operational asks (task 2679
+        amendment pass, reviewer_comprehensive robustness finding)."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=description,
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None
+
+    def test_strong_marker_still_fires_alongside_code_artifact_noun(self):
+        """Unlike the weak markers, 'restart' (a specific/strong marker) is
+        NOT gated by a co-occurring code-artifact noun in the same field --
+        it still fires standalone."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description='Restart the service; the auth module needs a bounce.',
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert 'restart' in finding.markers
+
+    def test_cross_field_markers_aggregate_distinct_labels_and_fields(self):
+        """A marker in TITLE and a different marker in DETAILS -> both
+        marker labels appear (deduped) and both field names appear in
+        `fields` (deduped), in first-matched order."""
+        finding = operational_suggestion_finding(
+            title='Restart the ingestion worker',
+            description='',
+            details='Confirm the worker is healthy afterwards.',
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert finding.markers == ('restart', 'confirm')
+        assert finding.fields == ('title', 'details')
+
+    def test_same_marker_in_two_fields_dedupes_to_one_label(self):
+        """The same marker present in both TITLE and DESCRIPTION dedupes to
+        a single entry in `markers`, but BOTH field names appear in
+        `fields`."""
+        finding = operational_suggestion_finding(
+            title='Restart the ingestion worker',
+            description='Restart the ingestion worker again to be sure.',
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert finding.markers == ('restart',)
+        assert finding.fields == ('title', 'description')
+
+    def test_code_change_signal_in_details_only_suppresses_finding(self):
+        """A code-change signal located ONLY in `details` (not title/
+        description) still suppresses the finding -- the code-change check
+        scans the COMBINED title+description+details text, not just
+        title."""
+        finding = operational_suggestion_finding(
+            title='Ops task',
+            description='Restart the fused-memory service.',
+            details='This closes out the bug found during rollout.',
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None
+
 
 # ---------------------------------------------------------------------------
 # Payload shape for the warn outcome (WARN-ONLY -- no reject/enforce path)

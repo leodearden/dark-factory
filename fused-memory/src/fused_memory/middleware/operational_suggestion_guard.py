@@ -42,6 +42,18 @@ recon-stage-specific either.
   title + description + details text — the defense against a genuine code
   task whose prose merely MENTIONS operational terminology in passing.
 - None of the operational markers match any field.
+- The ONLY markers that matched are ``confirm``/``reload``/``deploy`` (the
+  "weak" markers — common enough in ordinary code-task prose to collide,
+  e.g. "Confirm the retry logic handles timeouts", "Reload the config
+  module after edit", "Deploy config schema field") AND the same field
+  also names a code-level artifact (module/schema/field/logic/function/
+  class/method/variable/parameter/argument/test) rather than a running
+  system. ``restart``/``redeploy``/``systemctl`` are specific enough to
+  fire standalone and are never gated this way. This is a precision
+  tradeoff, not a completeness guarantee — it targets the concrete
+  collision patterns above, not every possible false positive; the
+  ``operational_task_suggestion.flagged`` census WARNING rate remains the
+  rollout signal to watch for anything it misses.
 
 This module is declaration-only and WARN-ONLY: it never coerces
 ``task_kind`` or ``execution_class`` and never rejects a submission — see
@@ -94,6 +106,20 @@ _OPERATIONAL_MARKERS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r'\bconfirm\b', re.IGNORECASE), 'confirm'),
     (re.compile(r'\bdeploy\b', re.IGNORECASE), 'deploy'),
     (re.compile(r'\bsystemctl\b', re.IGNORECASE), 'systemctl'),
+)
+
+# task 2679 amendment pass (reviewer_comprehensive robustness finding):
+# "confirm"/"reload"/"deploy" are generic enough to occur routinely in
+# legitimate code-task prose (see module docstring). Gate these three
+# ("weak") markers: a match is suppressed when the SAME field also names a
+# code-level artifact rather than a running system -- "restart"/
+# "redeploy"/"systemctl" are specific enough to fire standalone and are
+# never gated.
+_WEAK_MARKER_LABELS: frozenset[str] = frozenset({'confirm', 'reload', 'deploy'})
+
+_CODE_ARTIFACT_RE = re.compile(
+    r'\b(?:module|schema|field|logic|function|class|method|variable|parameter|argument|test)\w*\b',
+    re.IGNORECASE,
 )
 
 
@@ -182,8 +208,15 @@ def operational_suggestion_finding(
     for field_name, text in fields.items():
         if not text:
             continue
+        field_has_code_artifact = bool(_CODE_ARTIFACT_RE.search(text))
         for pattern, label in _OPERATIONAL_MARKERS:
             if pattern.search(text):
+                if label in _WEAK_MARKER_LABELS and field_has_code_artifact:
+                    # Generic marker co-occurs with a code-level artifact
+                    # noun in this same field (e.g. "Reload the config
+                    # module after edit") -- treat as a code task, not an
+                    # operational ask. See _WEAK_MARKER_LABELS above.
+                    continue
                 if label not in matched_markers:
                     matched_markers.append(label)
                 if field_name not in matched_fields:
