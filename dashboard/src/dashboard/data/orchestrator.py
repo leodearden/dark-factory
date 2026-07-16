@@ -20,6 +20,16 @@ the upstream format changes, this module must be updated by hand.
    ``orchestrator/src/orchestrator/cli.py`` (grep that file for ``def run``).
    Anyone renaming the ``run`` command or its ``--prd``/``--config`` flags
    must update ``find_running_orchestrators`` to match.
+
+RETIRED: this module used to re-derive a second format — the ``.task/``
+artifact layout (``metadata.json``, ``plan.json``, ``iterations.jsonl``,
+``reviews/*.json``) — via a hand-rolled reader (``read_task_artifacts`` /
+``_scan_worktrees`` / ``_extract_task_id``). That reader has been deleted;
+per-task runtime state (loops/attempts/lane/phase) is now served by the
+escalation ``get_task_runtime_state`` MCP tool, with the orchestrator as
+the single owner of that format (see
+``plans/dashboard-task-runtime-endpoint-prd.md``). There is no longer a
+"future single owner" hand-off pending for this module.
 """
 
 from __future__ import annotations
