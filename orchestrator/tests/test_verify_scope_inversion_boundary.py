@@ -106,12 +106,15 @@ import pytest
 from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
 from test_verify_scope_kappa import _executed_module_configs, _run_verification_spy
 from test_verify_scope_lambda import _two_module_registry
+from test_workflow_verify_infra_resume import _infra_category_result
+from test_workflow_verify_infra_resume import _make as _make_workflow
 
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
+    TRANSIENT_INFRA_REASON_PREFIX,
     MergeOutcome,
     _run_post_merge_verify,
 )
@@ -121,7 +124,8 @@ from orchestrator.verify import (
     seed_main_baseline,
     verify_failure_is_preexisting_on_main,
 )
-from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES  # noqa: F401 — row 6 (later iteration)
+from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
+from orchestrator.workflow import WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # Golden diff (row 1) — CONSTRUCTED. See module docstring "Golden diff
@@ -737,4 +741,130 @@ class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
             f'{shared_git_ops.ephemeral_worktree.call_count} call(s) — the '
             f'μ B2 baseline cache should have short-circuited before ever '
             f'reaching a cold probe'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Row 6: "infra non-consumption" (ν, I1), BOTH consumers. A PERSISTENT
+# infra-transient classified VerifyResult (never clearing — a member of
+# INFRA_TRANSIENT_CATEGORIES, e.g. a semaphore-acquisition timeout, 2549
+# pattern) must consume ZERO attempts and dispatch NO debugger/steward at
+# EITHER consumer seam, and must eventually exhaust into a LOUD hold — never
+# a silent infinite retry — at both.
+# ---------------------------------------------------------------------------
+
+ROW6_MAIN_SHA: str = 'r6main0000000000000000000000000000000000'
+# Matches the default INFRA_TRANSIENT_CATEGORIES member both
+# test_workflow_verify_infra_resume._infra_category_result and
+# test_merge_queue._infra_category_verify_result already default to.
+ROW6_INFRA_CATEGORY: str = 'semaphore_timeout'
+
+
+class TestRow6InfraTransientConsumesNoAttemptBothConsumers:
+    """Row 6 (PRD boundary-test sketch): a PERSISTENT infra-transient
+    classified ``VerifyResult`` (never clears) must consume NO attempt and
+    dispatch NO debugger/steward at either consumer seam — ν's I1 guarantee —
+    and the bounded retry window must eventually EXHAUST into a LOUD hold
+    (never a silent infinite retry) at both.
+    """
+
+    @pytest.mark.asyncio
+    async def test_row6_infra_transient_consumes_no_attempt_both_consumers(
+        self, tmp_path: Path,
+    ) -> None:
+        assert ROW6_INFRA_CATEGORY in INFRA_TRANSIENT_CATEGORIES, (
+            f'sanity: {ROW6_INFRA_CATEGORY!r} must be an INFRA_TRANSIENT_CATEGORIES '
+            f'member for this row to exercise the intended ν policy path'
+        )
+
+        # -- TASK-verify side: drive the REAL _verify_debugfix_loop (via the
+        # test_workflow_verify_infra_resume.py TaskWorkflow factory) with a
+        # PERSISTENT infra-transient VerifyResult (never clears).
+        wf = _make_workflow(verify_infra_retry_max_attempts=3)
+
+        task_call_count = 0
+
+        async def always_infra_category(*args, **kwargs):
+            nonlocal task_call_count
+            task_call_count += 1
+            return _infra_category_result(category=ROW6_INFRA_CATEGORY)
+
+        with (
+            patch(
+                'orchestrator.workflow.run_scoped_verification',
+                side_effect=always_infra_category,
+            ),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+            patch.object(wf, '_invoke', new=AsyncMock()) as mock_invoke,
+        ):
+            task_outcome = await wf._verify_debugfix_loop()
+
+        assert task_outcome == WorkflowOutcome.BLOCKED, (
+            f'expected the persistent infra-transient hold pathway (BLOCKED); '
+            f'got {task_outcome!r}'
+        )
+        assert task_call_count == 3, (
+            f'expected the BOUNDED retry window (verify_infra_retry_max_attempts='
+            f'3) to exhaust rather than retry silently forever; got '
+            f'{task_call_count} call(s)'
+        )
+        assert wf.metrics.verify_attempts == 0, (
+            f'a persistent infra-transient failure must consume ZERO verify '
+            f'attempts; got {wf.metrics.verify_attempts}'
+        )
+        mock_invoke.assert_not_awaited()
+        assert not wf._mark_blocked.called, (  # type: ignore[attr-defined]
+            '_verify_debugfix_loop must not call _mark_blocked directly on '
+            'infra exhaustion (the hold pathway) — that is run()\'s job via '
+            'the _infra_hold_info stash'
+        )
+        # The LOUD tail: exhaustion must stamp a loud, human-escalating hold —
+        # never a silent drop.
+        assert wf._infra_hold_info is not None, (
+            '_infra_hold_info must be set on exhaustion (the loud hold signal)'
+        )
+        assert wf._infra_hold_info.get('category') == 'infra_issue'
+        assert wf._infra_hold_info.get('escalate_to_human') is True
+
+        # -- MERGE-verify side: drive the REAL merge gate (_run_post_merge_verify)
+        # with the SAME persistent infra-transient category. A single touched,
+        # unregistered-sibling module keeps the aggregate category exactly
+        # ROW6_INFRA_CATEGORY (no widening to muddy the classification).
+        mod_a, _mod_b, _config = _two_module_registry(tmp_path, breadth='full')
+        my_timeouts: dict[str, int] = {}
+        my_enospc_retries: dict[str, int] = {}
+        merge_fake = _fake_run_verification_by_module(
+            {mod_a.prefix: (False, [])}, category=ROW6_INFRA_CATEGORY,
+        )
+        outcome = await _drive_merge_gate(
+            tmp_path,
+            task_id='row6-1213',
+            module_configs_registry={'moda': mod_a},
+            touched_module_configs=[mod_a],
+            task_files=['moda/thing.py'],
+            task_files_content={'moda/thing.py': 'x = 1\n'},
+            main_sha=ROW6_MAIN_SHA,
+            run_verification_fake=merge_fake,
+            timeouts=my_timeouts,
+            enospc_retries=my_enospc_retries,
+        )
+
+        assert outcome is not None, (
+            'expected a blocked MergeOutcome (infra hold), got the '
+            'verify-passed sentinel'
+        )
+        assert outcome.status == 'blocked', f'expected blocked; got {outcome.status!r}'
+        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'a persistent infra-transient merge-verify failure must route the '
+            f'loud transient-infra hold; got {outcome.reason!r}'
+        )
+        assert my_timeouts == {}, (
+            f'a persistent infra-transient outcome must not bump the merge '
+            f'timeout loop-breaker (no merge verify attempt consumed); got '
+            f'{my_timeouts}'
+        )
+        assert merge_fake.await_count == 2, (
+            f'expected the BOUNDED shared enospc/infra retry budget (one '
+            f'in-place retry) to exhaust rather than retry silently forever; '
+            f'got {merge_fake.await_count} call(s)'
         )
