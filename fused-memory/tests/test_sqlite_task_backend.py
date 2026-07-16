@@ -4283,13 +4283,14 @@ async def test_get_statuses_and_get_task_agree_under_pinned_write_connection(
     to task 2455): get_statuses/get_statuses_raw already read via the
     unpinnable cached read connection (see
     ``test_get_statuses_hot_path_fresh_despite_pinned_write_connection``,
-    above) and are therefore fresh here. get_task, however, still reads
-    via the pinnable cached WRITE connection (``_get_connection``) — see
-    ``get_statuses_raw``'s "Snapshot consistency" note — so with that
+    above) and are therefore fresh here. As of task 2651 step-2, get_task
+    reads via that same cached read connection (:meth:`_get_read_connection`)
+    instead of the pinnable cached WRITE connection it used before — see
+    ``get_statuses_raw``'s "Snapshot consistency" note — so with the write
     connection pinned to a stale pre-commit snapshot and 'cancelled'
-    committed out-of-band, get_task disagrees with get_statuses even
-    though both are being asked about the same task immediately
-    afterwards.
+    committed out-of-band, get_task now agrees with get_statuses instead of
+    returning the stale pinned value. This test guards that convergence
+    against regression.
     """
     conn = await _pin_write_connection_then_commit_out_of_band(backend, project_root)
 
@@ -4301,6 +4302,34 @@ async def test_get_statuses_and_get_task_agree_under_pinned_write_connection(
     )
     assert task['status'] == 'cancelled', (
         f"get_task must agree with get_statuses (both fresh), got {task['status']!r}"
+    )
+
+    # Release the pin so the fixture's backend.close() isn't left mid-txn.
+    await conn.rollback()
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_tree_fresh_despite_pinned_write_connection(
+    backend, project_root,
+):
+    """get_tasks (the full-tree read) must reflect the latest committed
+    status even when the cached WRITE connection has a read transaction
+    pinned open.
+
+    Companion to
+    ``test_get_statuses_and_get_task_agree_under_pinned_write_connection``
+    (above), covering the full-tree read surface (``get_tasks`` /
+    ``_get_tasks_internal``), which task 2651 step-2's ``get_task`` reroute
+    does NOT touch — ``_get_tasks_internal`` still reads via the pinnable
+    cached WRITE connection (``_get_connection``) until it is rerouted too.
+    """
+    conn = await _pin_write_connection_then_commit_out_of_band(backend, project_root)
+
+    result = await backend.get_tasks(project_root)
+    by_id = {t['id']: t for t in result['tasks']}
+
+    assert by_id['1']['status'] == 'cancelled', (
+        f"get_tasks tree must reflect the fresh committed status, got {by_id['1']['status']!r}"
     )
 
     # Release the pin so the fixture's backend.close() isn't left mid-txn.
