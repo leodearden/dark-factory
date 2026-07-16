@@ -27,7 +27,12 @@ from pydantic import ValidationError
 from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.event_store import EventType
-from orchestrator.scheduler import Scheduler, SchedulerCallbacks, TickContext
+from orchestrator.scheduler import (
+    Scheduler,
+    SchedulerCallbacks,
+    TickContext,
+    _build_delivered_check_escalation,
+)
 
 # ---------------------------------------------------------------------------
 # TestRunnerGrepKind (task 2580 — step-1 RED / step-2 GREEN)
@@ -624,6 +629,74 @@ class TestDeliveredCheckGateEnabledSwitch:
 
         assert ctx.delivered_check_cache == {'20': True}
         sweep.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestBuildDeliveredCheckEscalation (task 2583 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDeliveredCheckEscalation:
+    """``_build_delivered_check_escalation`` — the PRD Resolved-6 summary/
+    detail renderer the grace-streak escalation (task 2583, epsilon)
+    consumes.  Pure rendering: no scheduler state, no side effects."""
+
+    def test_grep_kind_summary_and_detail(self):
+        check = {
+            'name': 'cap-one',
+            'kind': 'grep',
+            'pattern': 'foo',
+            'paths': ['src/'],
+            'expect': 'present',
+        }
+
+        summary, detail = _build_delivered_check_escalation(
+            task_id='10',
+            dep_id='20',
+            dep_status='done',
+            check=check,
+            main_sha='abcdef0123456789',
+        )
+
+        assert summary == (
+            "DEP_CAPABILITY_NOT_DELIVERED: task 10 — dep 20 done but check "
+            "'cap-one' fails on main@abcdef012345"
+        ), f'unexpected summary: {summary!r}'
+        assert 'grep' in detail
+        assert 'foo' in detail
+        assert 'src/' in detail
+        assert 'present' in detail
+        assert 'FAILED' in detail
+        assert 'set task 10 back to pending' in detail
+
+    def test_script_kind_detail_names_script_and_args_not_pattern(self):
+        check = {
+            'name': 'cap-two',
+            'kind': 'script',
+            'script': 'scripts/check_thing.sh',
+            'args': ['--foo', 'bar'],
+            'expect': 'exit_zero',
+        }
+
+        summary, detail = _build_delivered_check_escalation(
+            task_id='11',
+            dep_id='21',
+            dep_status='done',
+            check=check,
+            main_sha='0123456789abcdef',
+        )
+
+        assert summary == (
+            "DEP_CAPABILITY_NOT_DELIVERED: task 11 — dep 21 done but check "
+            "'cap-two' fails on main@0123456789ab"
+        ), f'unexpected summary: {summary!r}'
+        assert 'scripts/check_thing.sh' in detail
+        assert '--foo' in detail
+        assert 'bar' in detail
+        assert 'exit_zero' in detail
+        assert 'FAILED' in detail
+        assert 'pattern' not in detail, 'script-kind detail must not mention pattern'
+        assert 'set task 11 back to pending' in detail
 
 
 # ---------------------------------------------------------------------------
