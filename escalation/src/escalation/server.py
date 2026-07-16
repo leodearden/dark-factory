@@ -898,9 +898,19 @@ def create_server(
         only (root-only load; never resurrects an archived/resolved record).
         Does not change ``status``, ``level``, or ``updated_at``.
 
+        *triaged_by* attribution: when the connection sends an
+        X-Escalation-Identity header, that identity overrides the *triaged_by*
+        arg — mirroring ``resolve_issue``'s non-spoofable ``resolved_by``
+        override (server.py's identity gate). This is attribution ONLY, never
+        a deny path, so the tool stays ungated: reading the identity header
+        must never turn an annotation into a level denial.
+
         Returns the updated record as a full dict on success, or
         ``{'error': ...}`` when *escalation_id* is not found or not pending.
         """
+        identity = get_http_headers().get(_IDENTITY_HEADER)
+        if identity is not None:
+            triaged_by = identity
         esc = queue.stamp_triage(escalation_id, triaged_by=triaged_by, triage_note=triage_note)
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found or not pending'}
