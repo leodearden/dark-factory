@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import logging
 import os
 import re
@@ -2278,3 +2279,49 @@ def test_main_write_decision_refiling_same_id_overwrites_not_duplicates(
     assert len(listed) == 1
     assert listed[0].id == 'dec-park-4'
     assert listed[0].text == 'second?'
+
+
+# ---------------------------------------------------------------------------
+# Step-6: decision reaper (C8 close-on-resolve)
+# ---------------------------------------------------------------------------
+
+
+def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
+    """A still-pending escalation lives directly under the queue root."""
+    escalations_dir = tmp_path / 'escalations'
+    escalations_dir.mkdir()
+    (escalations_dir / 'esc-2303-2.json').write_text(
+        json.dumps({'status': 'pending', 'id': 'esc-2303-2'})
+    )
+
+    assert sr.read_escalation_status(escalations_dir, 'esc-2303-2') == 'pending'
+
+
+def test_read_escalation_status_falls_back_to_archive(tmp_path: Path) -> None:
+    """A resolved/dismissed escalation has been moved into archive/YYYY-MM-DD/
+    by escalation.queue._archive_resolved; read_escalation_status must find
+    it there when the queue-root file is absent.
+    """
+    escalations_dir = tmp_path / 'escalations'
+    archive_dir = escalations_dir / 'archive' / '2026-07-16'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-2303-2.json').write_text(json.dumps({'status': 'resolved'}))
+
+    assert sr.read_escalation_status(escalations_dir, 'esc-2303-2') == 'resolved'
+
+
+def test_read_escalation_status_unknown_id_returns_none(tmp_path: Path) -> None:
+    """No file at the root and none in the archive -> None, not a raise."""
+    escalations_dir = tmp_path / 'escalations'
+    escalations_dir.mkdir()
+
+    assert sr.read_escalation_status(escalations_dir, 'esc-does-not-exist') is None
+
+
+def test_read_escalation_status_corrupt_body_returns_none(tmp_path: Path) -> None:
+    """A corrupt/non-JSON escalation body must fail soft, returning None."""
+    escalations_dir = tmp_path / 'escalations'
+    escalations_dir.mkdir()
+    (escalations_dir / 'esc-bad.json').write_text('{not valid json')
+
+    assert sr.read_escalation_status(escalations_dir, 'esc-bad') is None
