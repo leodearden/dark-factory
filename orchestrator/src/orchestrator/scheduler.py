@@ -4887,7 +4887,22 @@ class Scheduler:
         to a fail-safe EMPTY cache instead of aborting the tick — no task
         gated by an unverified delivered check dispatches this tick, and
         the sweep retries next tick. Always continues.
+
+        **Kill switch (task 2583, epsilon):** when ``delivered_checks.enabled``
+        is ``False``, short-circuits to ``ctx.delivered_check_cache = None``
+        BEFORE building ``_pending_tasks`` or calling
+        ``_compute_delivered_check_cache`` — skips the whole sweep (no git,
+        no streaks, no escalation), not just an empty result. This MUST be
+        ``None`` and not ``{}``: ``_deps_satisfied``'s delivered-check arm
+        only disables itself when the cache is exactly ``None``
+        (``if delivered_check_cache is not None``) — an empty dict would
+        still activate the arm and withhold every dep carrying
+        ``metadata.delivered_checks`` (``cache.get(dep_id)`` is ``None``,
+        not ``True`` → blocked).
         """
+        if not self.config.delivered_checks.enabled:
+            ctx.delivered_check_cache = None
+            return _CONTINUE
         _pending_tasks = [t for t in ctx.tasks if t.get('status') == 'pending']
         try:
             cache = await self._compute_delivered_check_cache(
