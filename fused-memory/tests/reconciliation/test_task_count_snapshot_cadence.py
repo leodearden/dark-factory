@@ -667,6 +667,11 @@ class TestPruneSnapshotStats:
     async def test_genuine_empty_enumeration_sets_enumeration_ok(self):
         memory_service = AsyncMock()
         memory_service.get_memories_by_metadata.return_value = []
+        # Task 2655: an empty scroll now triggers a count cross-check (see
+        # TestPruneSilentEmptyGuard below) -- a confirmed count of 0 is what
+        # makes this a genuine empty pool rather than the swallowed-timeout
+        # fingerprint (empty scroll + count > 0).
+        memory_service.count_memories_by_metadata.return_value = 0
         observed = {}
 
         result = await _prune_task_count_snapshots(
@@ -736,6 +741,130 @@ class TestPruneSnapshotStats:
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
+
+
+# ---------------------------------------------------------------------------
+# _prune_task_count_snapshots -- silent-empty-enumeration guard (task 2655)
+# ---------------------------------------------------------------------------
+
+
+class TestPruneSilentEmptyGuard:
+    """The incident fingerprint (task 2655, 5th recorded recurrence):
+    ``Mem0Backend.scroll_by_metadata`` catches ``TimeoutError`` and returns
+    ``[]`` (mem0_client.py:392-407), while its sibling ``count_by_metadata``
+    (mem0_client.py:296-339) lets timeouts propagate. So an empty,
+    NON-exceptional scroll page is ambiguous: a genuine empty pool and a
+    swallowed Qdrant read timeout look identical to
+    ``enumeration_ok``/``enumerated`` alone.
+
+    This class pins the fix: on an empty scroll, cross-check via
+    ``count_memories_by_metadata`` (project 2655's chosen cross-check
+    primitive, since it propagates timeouts). A raised cross-check, or a
+    confirmed count > 0, is the swallowed-timeout fingerprint and flips
+    ``enumeration_ok`` to False; only a confirmed count of 0 keeps
+    ``enumeration_ok`` True. The cross-check itself must never raise
+    (preserves the prune's best-effort, never-raises contract), and must
+    not run at all on a non-empty scroll (hot path unaffected).
+    """
+
+    @pytest.mark.asyncio
+    async def test_swallowed_timeout_fingerprint_sets_enumeration_not_ok(self):
+        """(a) Empty scroll but the count cross-check reports 3 existing
+        snapshots -- the swallowed-timeout fingerprint. Nothing was
+        enumerated, so nothing is deleted, but enumeration_ok must be
+        observably 0 rather than looking like a genuine empty pool."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+        memory_service.count_memories_by_metadata.return_value = 3
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 0
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 0,
+            'task_count_snapshot_pruned': 0,
+            'task_count_snapshot_prune_enumeration_ok': 0,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+        memory_service.delete_memory.assert_not_awaited()
+        memory_service.count_memories_by_metadata.assert_awaited_once()
+        _, kwargs = memory_service.count_memories_by_metadata.await_args
+        assert kwargs['project_id'] == 'reify'
+        assert kwargs['filters'] == {'kind': TASK_COUNT_SNAPSHOT_KIND}
+
+    @pytest.mark.asyncio
+    async def test_count_cross_check_raises_sets_enumeration_not_ok_never_raises(self):
+        """(b) Empty scroll and the count cross-check itself raises -- still
+        degrades to enumeration_ok=0 rather than propagating (never-raise
+        contract preserved even for the new cross-check)."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+        memory_service.count_memories_by_metadata.side_effect = RuntimeError('mem0 down')
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 0
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 0,
+            'task_count_snapshot_pruned': 0,
+            'task_count_snapshot_prune_enumeration_ok': 0,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_confirmed_zero_count_keeps_enumeration_ok(self):
+        """(c) Empty scroll AND the count cross-check confirms 0 -- a
+        genuine empty pool, not the swallowed-timeout fingerprint."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+        memory_service.count_memories_by_metadata.return_value = 0
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 0
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 0,
+            'task_count_snapshot_pruned': 0,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+        memory_service.count_memories_by_metadata.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_empty_scroll_never_invokes_count_cross_check(self):
+        """(d) Hot path unaffected: a non-empty scroll page must not pay for
+        the extra count cross-check call at all, and enumeration_ok stays
+        True as before."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'm1', 'created_at': '2026-07-01T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm2', 'created_at': '2026-07-02T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+        ]
+        memory_service.delete_memory.return_value = None
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 2
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 2,
+            'task_count_snapshot_pruned': 2,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+            'task_count_snapshot_prune_truncated': 0,
+        }
+        memory_service.count_memories_by_metadata.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
