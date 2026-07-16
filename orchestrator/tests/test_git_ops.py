@@ -4278,6 +4278,124 @@ class TestCommitEffectPresentInMain:
 
 
 @pytest.mark.asyncio
+class TestFindTaskCitationCommit:
+    """Real-git tests for GitOps.find_task_citation_commit (task 2675 FIX 2).
+
+    git's ``--grep`` applies ``^``/``$`` per LINE across the whole commit
+    message, not just the subject line.  DEFAULT_COMMIT_CITATION_PATTERN's
+    alternatives are subject-shaped (``^(merge|impl|...)...`` /
+    ``^Merge task/{tid} into ``), but a BODY line that happens to start
+    with a conventional-commit token, or a body line of prose that itself
+    starts with ``Merge task/{tid} into ``, also satisfies those
+    line-anchored alternatives — creating a false citation from body
+    prose that was never meant to be one.  The consumer must constrain
+    matching to the SUBJECT line only.
+
+    RED cases (a)/(b): a commit whose subject is innocuous but whose body
+    contains a line matching one of the pattern's alternatives must
+    return None (no citation) — this fails today (returns that commit's
+    sha, since git's ``--grep`` matched the body line).
+
+    GUARD cases (c)/(d): a genuine subject citation (the canonical no-ff
+    merge subject, or a conventional-commit subject) must still return
+    that commit's sha, both before and after the fix — pins no
+    regression on the legitimate citation shapes.
+    """
+
+    async def test_none_when_only_body_has_conventional_token_mentioning_task(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Subject is innocuous; a BODY line starts with a
+        conventional-commit token ('fix') and separately mentions
+        task/1175 later in the same line — today's full-message,
+        per-line ``--grep`` matches that body line as a citation.
+        Subject-anchored matching must return None.
+        """
+        (git_repo / 'unrelated.py').write_text('cleanup\n')
+        await _run(['git', 'add', 'unrelated.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            [
+                'git', 'commit',
+                '-m', 'chore: cleanup unrelated thing',
+                '-m', 'fix the lingering task/1175 crash',
+            ],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'commit failed: {err}'
+
+        assert await git_ops.find_task_citation_commit('1175') is None
+
+    async def test_none_when_only_body_has_merge_prose_mentioning_task(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Subject is innocuous; a BODY line reads like merge prose
+        ('Merge task/1175 into main was reverted') — today's
+        full-message, per-line ``--grep`` matches ``^Merge task/{tid}
+        into `` against that body line as a citation. Subject-anchored
+        matching must return None.
+        """
+        (git_repo / 'notes.py').write_text('notes\n')
+        await _run(['git', 'add', 'notes.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            [
+                'git', 'commit',
+                '-m', 'chore: notes',
+                '-m', 'Merge task/1175 into main was reverted',
+            ],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'commit failed: {err}'
+
+        assert await git_ops.find_task_citation_commit('1175') is None
+
+    async def test_returns_sha_for_genuine_merge_subject(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A genuine canonical no-ff merge subject ``Merge task/1175 into
+        main`` still yields that commit's sha — positive guard for the
+        merge-marker citation shape.
+        """
+        rc, _, err = await _run(['git', 'checkout', '-b', 'task/1175'], cwd=git_repo)
+        assert rc == 0, f'checkout task/1175 failed: {err}'
+        (git_repo / 'deliverable.py').write_text('deliverable\n')
+        await _run(['git', 'add', 'deliverable.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'add deliverable'], cwd=git_repo)
+        assert rc == 0, f'deliverable commit failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'task/1175', '-m', 'Merge task/1175 into main'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'merge failed: {err}'
+        rc, merge_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        merge_sha = merge_sha.strip()
+
+        assert await git_ops.find_task_citation_commit('1175') == merge_sha
+
+    async def test_returns_sha_for_conventional_commit_subject(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A conventional-commit subject ``impl(1175): add thing`` still
+        yields that commit's sha — positive guard for the
+        conventional-commit citation shape.
+        """
+        (git_repo / 'thing.py').write_text('thing\n')
+        await _run(['git', 'add', 'thing.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'impl(1175): add thing'], cwd=git_repo,
+        )
+        assert rc == 0, f'commit failed: {err}'
+        rc, commit_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        commit_sha = commit_sha.strip()
+
+        assert await git_ops.find_task_citation_commit('1175') == commit_sha
+
+
+@pytest.mark.asyncio
 class TestMergeSubjectContract:
     """End-to-end contract: the merge subject written to main by merge_to_main
     equals _merge_subject output, and find_merge_marker locates that commit.
