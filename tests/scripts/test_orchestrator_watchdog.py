@@ -3335,3 +3335,38 @@ def test_boundary4_defers_busy_unit_while_others_proceed(tmp_path: pathlib.Path)
         f"while {unit_r} defers; got calls={state['calls']!r}"
     )
 
+
+def test_boundary5_force_restarts_busy_unit_after_grace(tmp_path: pathlib.Path) -> None:
+    """Scenario 5 (I3) -- drain force after grace: a unit R continuously
+    busy (fresh merge_idle:false heartbeat) is force-restarted once
+    ORCH_RESTART_FORCE_FIRE_AFTER_SECS elapses -- here 0, so immediately --
+    printing a "force-restarting" line, actually issuing the restart call,
+    and exiting 0 (one re-verified merge accepted; recover_pending_merges
+    makes it crash-safe -- see test_boundary10 below).
+    """
+    fleet_dir = tmp_path / "fleet"
+    unit_r = "orchestrator-reify.service"
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path, running_units=[unit_r], units={unit_r: {"scenario": "fresh"}},
+    )
+    _boundary_write_heartbeat(fleet_dir, unit_r, merge_idle=False, ts_epoch=time.time())
+
+    clock_file = tmp_path / "clock.json"
+
+    result = _boundary_run_drain_script(
+        bin_dir, state_path, fleet_dir, clock_file,
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": "0",
+        },
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "force-restarting" in result.stdout.lower(), (
+        f"expected a force-restart line; got stdout={result.stdout!r}"
+    )
+    state = _boundary_load_state(state_path)
+    assert ["--user", "restart", unit_r] in state["calls"], (
+        f"expected a restart call for {unit_r}; got calls={state['calls']!r}"
+    )
+
