@@ -18,6 +18,8 @@ import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, WorktreeKind
 from orchestrator.verify import VerifyResult
@@ -682,3 +684,141 @@ class TestBaselineDiffHelpers:
         from orchestrator.verify import is_wholly_preexisting
 
         assert is_wholly_preexisting([], ['X', 'Y']) is False
+
+
+# ---------------------------------------------------------------------------
+# Test 9 — step-13 (task μ, verify-scope-inversion-prd.md): per-main-SHA
+#          baseline cache + probe — seed_main_baseline / main_baseline_failing_ids.
+# ---------------------------------------------------------------------------
+
+
+async def _fake_git_run(cmd, **kwargs):
+    return (0, '', '')
+
+
+class TestMainBaselineFailingIds:
+    """seed_main_baseline seeds the cache for free (B2, every successful gate
+    run); main_baseline_failing_ids is cache-first and probes (ONE full-suite,
+    merge-role run, no task_files scoping) only on a genuine miss."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_baseline_cache(self):
+        """Scoped to this class only — the cache doesn't exist before step-14
+        lands, so an autouse fixture at module scope would error out every
+        already-passing test in this file during this step's RED phase."""
+        from orchestrator.verify import _BASELINE_FAILING_IDS_CACHE
+        _BASELINE_FAILING_IDS_CACHE.clear()
+        yield
+        _BASELINE_FAILING_IDS_CACHE.clear()
+
+    def test_seeded_baseline_is_returned_without_probing(self, tmp_path: Path) -> None:
+        """seed_main_baseline(sha, ids) primes the cache; a subsequent
+        main_baseline_failing_ids for that sha must be served from cache —
+        run_scoped_verification/ephemeral_worktree must NOT be invoked."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        verify_module.seed_main_baseline(MAIN_SHA, frozenset())
+
+        async def _explode(*args, **kwargs):
+            raise AssertionError('probe must not run on a cache hit')
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', side_effect=_explode),
+            patch.object(git_ops, 'ephemeral_worktree', side_effect=_explode),
+        ):
+            result = asyncio.run(
+                verify_module.main_baseline_failing_ids(config, [], git_ops, MAIN_SHA)
+            )
+
+        assert result == frozenset(), f'expected the seeded (empty) baseline; got {result!r}'
+
+    def test_cache_miss_probes_once_full_suite_merge_role_and_caches(self, tmp_path: Path) -> None:
+        """A cold sha invokes exactly ONE probe — full-suite (no task_files
+        scoping) and merge-role — and the result is cached: a second call
+        for the same sha does not re-probe."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        probe_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['m::1'],
+        )
+        probe_calls: list[dict] = []
+
+        async def _fake_verify(*args, **kwargs) -> VerifyResult:
+            probe_calls.append(kwargs)
+            return probe_result
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', side_effect=_fake_verify),
+            patch('orchestrator.git_ops._run', side_effect=_fake_git_run),
+        ):
+            result = asyncio.run(
+                verify_module.main_baseline_failing_ids(config, [], git_ops, MAIN_SHA)
+            )
+            assert result == frozenset({'m::1'}), (
+                f'expected the probe-derived id set; got {result!r}'
+            )
+            assert len(probe_calls) == 1, f'expected exactly 1 probe call; got {len(probe_calls)}'
+            assert probe_calls[0].get('role') == 'merge', (
+                f"expected a merge-role probe; got kwargs={probe_calls[0]!r}"
+            )
+            assert not probe_calls[0].get('task_files'), (
+                f'expected no task_files scoping (full-suite); got kwargs={probe_calls[0]!r}'
+            )
+
+            # Second call for the SAME sha: served from cache, no re-probe.
+            result2 = asyncio.run(
+                verify_module.main_baseline_failing_ids(config, [], git_ops, MAIN_SHA)
+            )
+        assert result2 == frozenset({'m::1'})
+        assert len(probe_calls) == 1, 'second call must be served from cache, no re-probe'
+
+    def test_probe_yielding_no_failing_test_ids_degrades_to_none_and_is_not_cached(
+        self, tmp_path: Path,
+    ) -> None:
+        """A probe result with failing_test_ids=None (OPAQUE / unreadable junit)
+        degrades to None (B3) and must NOT be cached — a transient hiccup
+        shouldn't pin a falsely-empty baseline for the TTL window."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        opaque_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='opaque failure', failing_test_ids=None,
+        )
+        probe_calls: list[dict] = []
+
+        async def _fake_verify(*args, **kwargs) -> VerifyResult:
+            probe_calls.append(kwargs)
+            return opaque_result
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', side_effect=_fake_verify),
+            patch('orchestrator.git_ops._run', side_effect=_fake_git_run),
+        ):
+            result = asyncio.run(
+                verify_module.main_baseline_failing_ids(config, [], git_ops, 'anothersha')
+            )
+            assert result is None, (
+                f'expected degrade (None) when the probe yields no junit ids; got {result!r}'
+            )
+
+            # Not cached: a second call for the same sha must probe again.
+            asyncio.run(
+                verify_module.main_baseline_failing_ids(config, [], git_ops, 'anothersha')
+            )
+        assert len(probe_calls) == 2, (
+            f'a None probe result must not be cached — expected a re-probe; '
+            f'got {len(probe_calls)} call(s)'
+        )
