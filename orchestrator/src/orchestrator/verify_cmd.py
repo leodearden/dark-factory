@@ -468,6 +468,25 @@ def _cargo_scope_structured(cmd: VerifyCmd, crates: list[str]) -> VerifyCmd:
 _PYTEST_INVOCATION_RE = re.compile(r'\bpytest\b[^&|;]*')
 
 
+def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
+    """Return *raw* with *suffix* appended to every pytest invocation.
+
+    Shared rewrite closure for ``serial_pytest``/``apply_pytest_numprocesses``'s
+    raw-retained (chained) path: matches each ``_PYTEST_INVOCATION_RE`` span,
+    strips trailing whitespace, appends *suffix*, then re-attaches the
+    trailing whitespace so an immediately-following chain operator (e.g.
+    `` && ``) survives untouched. *suffix* should include its own leading
+    space (e.g. ``' -n 16'``).
+    """
+    def _rewrite(match: re.Match[str]) -> str:
+        segment = match.group(0)
+        stripped = segment.rstrip()
+        trailing = segment[len(stripped) :]
+        return f'{stripped}{suffix}{trailing}'
+
+    return _PYTEST_INVOCATION_RE.sub(_rewrite, raw)
+
+
 def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
     """Return *cmd* with the serial-recovery flags applied to every pytest invocation.
 
@@ -484,13 +503,9 @@ def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
     if cmd.tool is not ToolKind.PYTEST:
         return cmd
     if cmd.raw is not None:
-        def _rewrite(match: re.Match[str]) -> str:
-            segment = match.group(0)
-            stripped = segment.rstrip()
-            trailing = segment[len(stripped) :]
-            return f"{stripped} -p no:xdist -o addopts=''{trailing}"
-
-        return replace(cmd, raw=_PYTEST_INVOCATION_RE.sub(_rewrite, cmd.raw))
+        return replace(
+            cmd, raw=_append_to_raw_pytest_invocations(cmd.raw, " -p no:xdist -o addopts=''")
+        )
     return replace(cmd, base_flags=(*cmd.base_flags, '-p', 'no:xdist', '-o', 'addopts='))
 
 
@@ -510,13 +525,7 @@ def apply_pytest_numprocesses(cmd: VerifyCmd, n: str) -> VerifyCmd:
     if cmd.tool is not ToolKind.PYTEST or n in {'', 'auto'}:
         return cmd
     if cmd.raw is not None:
-        def _rewrite(match: re.Match[str]) -> str:
-            segment = match.group(0)
-            stripped = segment.rstrip()
-            trailing = segment[len(stripped) :]
-            return f'{stripped} -n {n}{trailing}'
-
-        return replace(cmd, raw=_PYTEST_INVOCATION_RE.sub(_rewrite, cmd.raw))
+        return replace(cmd, raw=_append_to_raw_pytest_invocations(cmd.raw, f' -n {n}'))
     return replace(cmd, base_flags=(*cmd.base_flags, '-n', n))
 
 
