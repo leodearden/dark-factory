@@ -55,6 +55,32 @@ SNAPSHOT_TOKEN_KEYS: tuple[str, ...] = ('snapshot_status', 'observed_status')
 # (live-workflow) or Gate 3 (stale-snapshot) rejections — see :class:`Verdict`.
 TERMINAL_CORRECTIVE_PATH = 'set_task_status_done_provenance_repair'
 
+# Frozen-by-default allowlist (task 2684) of metadata keys a terminal-task
+# ``update_task`` write may clear via :func:`is_terminal_annotation_clear`.
+# Mirrors the ``_BLESSED_METADATA_KEYS`` convention in
+# ``shared.task_metadata``: a newly introduced metadata key stays BLOCKED on
+# terminal tasks until deliberately added here — the guard can never be
+# silently loosened by an unrelated new key. Seeded with the one known
+# non-load-bearing annotation marker
+# (``TaskInterceptor._attach_possible_scope_mismatch`` — an advisory
+# ``{matched_paths, suggested_project, source}`` blob with no bearing on
+# lifecycle/scheduling/locks/provenance). ``status`` and ``done_provenance``
+# are intentionally never eligible here — the ``update_task`` write-authority
+# floor already unconditionally rejects both for every caller, so they can
+# never reach this predicate.
+CLEARABLE_ANNOTATION_KEYS: frozenset[str] = frozenset({'possible_scope_mismatch'})
+
+# Task-content ``update_task`` kwargs that disqualify a write from the
+# terminal-annotation-clear exemption. Presence of any of these means the
+# caller is mutating task content, not merely clearing an advisory
+# annotation — a genuine freeze violation Gate 1 must still block.
+# ``status`` and ``metadata.done_provenance`` are deliberately excluded from
+# this list for the same reason noted on :data:`CLEARABLE_ANNOTATION_KEYS`:
+# the write-authority floor already rejects them unconditionally.
+_NON_METADATA_CONTENT_FIELDS: tuple[str, ...] = (
+    'title', 'description', 'details', 'prompt', 'priority', 'dependencies',
+)
+
 # ---------------------------------------------------------------------------
 # Verdict
 # ---------------------------------------------------------------------------
@@ -284,28 +310,40 @@ def check(
 # ---------------------------------------------------------------------------
 
 
-def extract_snapshot_token(metadata: object) -> str | None:
-    """Extract the snapshot status token from ``update_task``'s ``metadata`` kwarg.
+def _coerce_metadata_dict(metadata: object) -> dict | None:
+    """Coerce an ``update_task``-style ``metadata`` payload to a ``dict``.
 
-    Coerces *metadata* via dict/``json.loads`` — mirroring
-    ``_reject_done_provenance_in_update_metadata``'s inline coercion idiom
-    in ``task_interceptor.py``. Returns the value of the first
-    :data:`SNAPSHOT_TOKEN_KEYS` entry present, when that value is itself a
-    non-empty ``str``. Returns ``None`` when *metadata* is not a dict /
-    JSON-object string, contains neither key, or the first present key's
-    value is not a non-empty string (e.g. ``None``, a number, or a bool) —
-    such values are treated as an absent token rather than coerced via
-    ``str()``, so they can never spuriously disagree with a live status.
+    Shared coercion idiom (factored out of :func:`extract_snapshot_token`,
+    task 2684) mirroring ``_reject_done_provenance_in_update_metadata``'s
+    inline coercion in ``task_interceptor.py``. A ``dict`` passes through
+    unchanged; a ``str`` is parsed via ``json.loads`` and kept only if the
+    result is itself a ``dict``. Anything else — including a JSON string
+    that parses to a non-dict (e.g. a list), invalid JSON, or a non-str/dict
+    value such as ``None`` or ``42`` — returns ``None``.
     """
-    parsed: dict | None = None
     if isinstance(metadata, dict):
-        parsed = metadata
-    elif isinstance(metadata, str):
+        return metadata
+    if isinstance(metadata, str):
         try:
             loaded = json.loads(metadata)
         except (ValueError, TypeError):
             return None
-        parsed = loaded if isinstance(loaded, dict) else None
+        return loaded if isinstance(loaded, dict) else None
+    return None
+
+
+def extract_snapshot_token(metadata: object) -> str | None:
+    """Extract the snapshot status token from ``update_task``'s ``metadata`` kwarg.
+
+    Coerces *metadata* via :func:`_coerce_metadata_dict`. Returns the value
+    of the first :data:`SNAPSHOT_TOKEN_KEYS` entry present, when that value
+    is itself a non-empty ``str``. Returns ``None`` when *metadata* is not a
+    dict / JSON-object string, contains neither key, or the first present
+    key's value is not a non-empty string (e.g. ``None``, a number, or a
+    bool) — such values are treated as an absent token rather than coerced
+    via ``str()``, so they can never spuriously disagree with a live status.
+    """
+    parsed = _coerce_metadata_dict(metadata)
     if parsed is None:
         return None
     for key in SNAPSHOT_TOKEN_KEYS:
@@ -313,3 +351,43 @@ def extract_snapshot_token(metadata: object) -> str | None:
             val = parsed[key]
             return val if isinstance(val, str) and val else None
     return None
+
+
+def is_terminal_annotation_clear(update_kwargs: dict) -> bool:
+    """Is *update_kwargs* a pure, allowlisted, terminal-task annotation clear?
+
+    True iff ALL of the following hold — used to compute Gate 1's
+    ``is_annotation_clear`` bypass (task 2684) for a non-load-bearing
+    annotation-only ``update_task`` write against a terminal task:
+
+    (a) No :data:`_NON_METADATA_CONTENT_FIELDS` key in *update_kwargs* has a
+        non-``None`` value — a content mutation disqualifies unconditionally.
+    (b) The effective metadata merge mode is ``'merge'`` — mirroring
+        ``sqlite_task_backend._resolve_metadata_mode``'s precedence
+        (``metadata_mode`` wins; else ``append`` True->additive/False->replace;
+        else default merge) without importing the backend (keeps this module
+        dependency-light). ``replace`` would clobber load-bearing keys;
+        ``additive`` cannot overwrite/clear the target key (scalar-collision
+        old-wins) — only ``merge`` both preserves other keys and overwrites
+        the target.
+    (c) ``update_kwargs['metadata']`` coerces (via :func:`_coerce_metadata_dict`)
+        to a non-empty ``dict``.
+    (d) Every top-level key of that dict is in :data:`CLEARABLE_ANNOTATION_KEYS`.
+
+    A "clear" is a merge-overwrite (including to ``None``); this predicate
+    has no notion of key deletion (metadata has no such primitive).
+    """
+    if any(update_kwargs.get(field) is not None for field in _NON_METADATA_CONTENT_FIELDS):
+        return False
+
+    metadata_mode = update_kwargs.get('metadata_mode')
+    append = update_kwargs.get('append')
+    is_merge_mode = metadata_mode == 'merge' or (metadata_mode is None and append is None)
+    if not is_merge_mode:
+        return False
+
+    parsed = _coerce_metadata_dict(update_kwargs.get('metadata'))
+    if not parsed:
+        return False
+
+    return all(key in CLEARABLE_ANNOTATION_KEYS for key in parsed)
