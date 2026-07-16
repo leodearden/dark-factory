@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     extract_snapshot_edge_task_ids,
+    flatten_dedup_edges,
 )
 
 
@@ -83,3 +84,56 @@ class TestExtractSnapshotEdgeTaskIds:
             'Task 142 is pending as of 2026-07-14 (commit ab12cd)'
         )
         assert result == {142}
+
+
+# --------------------------------------------------------------------------- #
+# flatten_dedup_edges
+# --------------------------------------------------------------------------- #
+
+
+class TestFlattenDedupEdges:
+    """flatten_dedup_edges(grouped) flattens get_all_valid_edges' dict[entity_uuid,
+    list[EdgeDict]] shape into a flat list, deduped by edge['uuid'] — the backend
+    double-attributes each directed edge under both its source and target entity.
+    """
+
+    def test_double_attributed_edge_yields_once(self):
+        """An edge uuid appearing under two entity uuids (double-attribution) is
+        returned exactly once."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+        grouped = {
+            'entity-a': [edge],
+            'entity-b': [edge],
+        }
+
+        result = flatten_dedup_edges(grouped)
+
+        assert result == [edge], f'Expected the double-attributed edge exactly once, got {result!r}'
+
+    def test_multiple_distinct_edges_all_preserved(self):
+        """Distinct edge uuids across entities are all preserved."""
+        edge1 = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+        edge2 = {'uuid': 'edge-2', 'fact': 'Task 148 is in-progress', 'name': ''}
+        grouped = {
+            'entity-a': [edge1],
+            'entity-b': [edge2],
+        }
+
+        result = flatten_dedup_edges(grouped)
+
+        assert result == [edge1, edge2], f'Expected both distinct edges preserved, got {result!r}'
+
+    def test_empty_dict_yields_empty_list(self):
+        """An empty grouped dict yields []."""
+        assert flatten_dedup_edges({}) == []
+
+    def test_result_elements_retain_uuid_fact_name_keys(self):
+        """Flattened elements retain their original uuid/fact/name keys unmodified."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': 'orchestrator'}
+        grouped = {'entity-a': [edge]}
+
+        result = flatten_dedup_edges(grouped)
+
+        assert result[0]['uuid'] == 'edge-1'
+        assert result[0]['fact'] == 'Task 142 is an active pending task'
+        assert result[0]['name'] == 'orchestrator'
