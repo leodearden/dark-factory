@@ -975,6 +975,54 @@ def test_reap_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
     assert remaining == {'kept-running', 'kept-recent-terminal'}
 
 
+def test_reap_respects_limit_stops_after_n_removals(tmp_path: Path) -> None:
+    """A positive `limit` stops the sweep after that many dirs are actually
+    removed -- bounding both the rmtree work and the per-call scan cost, so
+    an opportunistic per-spawn prune driver stays cheap regardless of how
+    large the on-disk backlog has grown.
+    """
+    records = [
+        _make_record(session_slug=slug, status=sr.Status.EXITED, launcher_pid=os.getpid())
+        for slug in ('term-a', 'term-b', 'term-c')
+    ]
+    for r in records:
+        sr.write_record(r, root=tmp_path)
+        _set_mtime(
+            sr.record_path_for_slug(r.session_slug, root=tmp_path),
+            _NOW,
+            sr.TERMINAL_TTL + timedelta(hours=1),
+        )
+
+    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW, limit=1)
+
+    assert len(reaped) == 1
+    remaining = {p.name for p in sr.sessions_dir(root=tmp_path).iterdir()}
+    assert len(remaining) == 2
+
+
+def test_reap_default_limit_none_is_unbounded(tmp_path: Path) -> None:
+    """Explicit `limit=None` -- and the implicit default -- must reproduce
+    today's unbounded full sweep, so every pre-existing reap test keeps
+    passing unchanged.
+    """
+    records = [
+        _make_record(session_slug=slug, status=sr.Status.EXITED, launcher_pid=os.getpid())
+        for slug in ('term-d', 'term-e', 'term-f')
+    ]
+    for r in records:
+        sr.write_record(r, root=tmp_path)
+        _set_mtime(
+            sr.record_path_for_slug(r.session_slug, root=tmp_path),
+            _NOW,
+            sr.TERMINAL_TTL + timedelta(hours=1),
+        )
+
+    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW, limit=None)
+
+    assert len(reaped) == 3
+    assert list(sr.sessions_dir(root=tmp_path).iterdir()) == []
+
+
 def test_reap_continues_sweep_when_one_directory_fails_to_remove(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
