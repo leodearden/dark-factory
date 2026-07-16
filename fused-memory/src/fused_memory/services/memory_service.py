@@ -640,13 +640,15 @@ def _store_failure_diagnostics(
             this diagnostic.
 
     Returns:
-        dict with keys: store, reason, error_type, error, query_len, project_id.
+        dict with keys: store, reason, error_type, error, rate_limit_or_quota,
+        query_len, project_id.
     """
     return {
         'store': store.value,
         'reason': reason,
         'error_type': type(exc).__name__ if exc is not None else 'TimeoutError',
         'error': (str(exc)[:500] if exc is not None else 'search_timeout'),
+        'rate_limit_or_quota': _is_rate_limit_or_quota_error(exc) if exc is not None else False,
         'query_len': len(query),
         'project_id': project_id,
     }
