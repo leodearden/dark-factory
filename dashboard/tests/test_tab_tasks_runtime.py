@@ -1,0 +1,97 @@
+"""Wiring tests for the Tasks-tab TaskDetail pane's runtime fields in
+tab_tasks.jsx (task 2637, PRD Open-Q3).
+
+Tests parse JSX source as text and assert structural contracts.
+Follows the idiom established in test_tab_orchestrators.py / test_index_html.py.
+"""
+
+from __future__ import annotations
+
+import re
+
+import pytest
+from starlette.testclient import TestClient
+
+
+@pytest.fixture(scope='module')
+def _client():
+    from dashboard.app import app
+
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture(scope='module')
+def tab_tasks_jsx_body(_client):
+    return _client.get('/static/redux/tab_tasks.jsx').text
+
+
+def _extract_function_body(source: str, func_name: str) -> str:
+    """Extract the source text of a top-level ``function <func_name>(`` up to
+    (but not including) the next top-level ``function`` declaration, or to
+    end-of-file if it's the last one.
+
+    Used to scope structural assertions to a single component's render
+    function so an assertion can't be accidentally satisfied by an unrelated
+    component elsewhere in the same file (mirrors
+    test_tab_orchestrators.py's identically-named helper).
+    """
+    start_match = re.search(rf'^function {re.escape(func_name)}\(', source, re.MULTILINE)
+    assert start_match is not None, f'function {func_name}( not found in tab_tasks.jsx'
+    start = start_match.start()
+    next_match = re.search(r'^function \w+\(', source[start + 1 :], re.MULTILINE)
+    end = start + 1 + next_match.start() if next_match else len(source)
+    return source[start:end]
+
+
+@pytest.fixture(scope='module')
+def task_detail_body(tab_tasks_jsx_body):
+    """TaskDetail's own source text, scoped away from the other component
+    functions (TaskGraph, PrdBox, TasksTab, ...) in the same file."""
+    return _extract_function_body(tab_tasks_jsx_body, 'TaskDetail')
+
+
+class TestTaskDetailRuntimeFields:
+    """TaskDetail must mirror OrchTab's offline-'—' degradation for
+    loops/attempts, and additionally surface lane/phase/lane_state (task
+    2637, PRD Open-Q3 — droppable, but trivial given TaskDetail's existing
+    k/v grid already renders loops/attempts)."""
+
+    def test_tab_tasks_jsx_served(self, _client):
+        resp = _client.get('/static/redux/tab_tasks.jsx')
+        assert resp.status_code == 200
+
+    def test_task_detail_positive_anchor_function(self, tab_tasks_jsx_body):
+        """File must still export TaskDetail — guards against a renamed/empty file."""
+        assert 'function TaskDetail(' in tab_tasks_jsx_body
+
+    def test_destructures_runtime_fmt(self, tab_tasks_jsx_body):
+        """window.DF_RUNTIME_FMT (defined by runtime_format.js, loaded earlier
+        in index.html) must be destructured at module top level — checked
+        against the whole file since top-level destructures sit outside any
+        single component function."""
+        assert re.search(r'\bDF_RUNTIME_FMT\b', tab_tasks_jsx_body)
+
+    def test_loops_value_routes_through_rtcell(self, task_detail_body):
+        assert re.search(r'rtCell\(\s*task\.loops', task_detail_body)
+
+    def test_attempts_value_routes_through_rtcell(self, task_detail_body):
+        assert re.search(r'rtCell\(\s*task\.attempts', task_detail_body)
+
+    def test_lane_row_routes_through_rtcell(self, task_detail_body):
+        assert re.search(r'rtCell\(\s*task\.lane\b', task_detail_body)
+
+    def test_phase_row_routes_through_rtcell(self, task_detail_body):
+        assert re.search(r'rtCell\(\s*task\.phase\b', task_detail_body)
+
+    def test_lane_state_row_routes_through_rtcell(self, task_detail_body):
+        assert re.search(r'rtCell\(\s*task\.lane_state\b', task_detail_body)
+
+    def test_lane_kv_label_present(self, task_detail_body):
+        assert re.search(r'className="k">lane<', task_detail_body)
+
+    def test_phase_kv_label_present(self, task_detail_body):
+        assert re.search(r'className="k">phase<', task_detail_body)
+
+    def test_state_kv_label_present(self, task_detail_body):
+        assert re.search(r'className="k">state<', task_detail_body)
