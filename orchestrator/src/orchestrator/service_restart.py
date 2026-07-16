@@ -346,6 +346,22 @@ class StaleServiceRestartCoordinator:
         independent clock gate (``ORCH_RESTART_MIN_INTERVAL_SECS`` in
         scripts/orchestrator-watchdog.py), not this in-memory cap, as
         authoritative.
+    force_fire_after_secs:
+        Fleet-redeploy PRD task delta (fire-while-busy). Max MONOTONIC
+        seconds (``clock``) a pending restart may stay owed before
+        ``maybe_restart`` force-fires it — bypassing the ``agents_idle``
+        gate, the debounce, and the ``restart_precondition`` preference (but
+        NEVER the ``min_interval_secs`` wall-clock cap above, which is still
+        enforced unchanged on the force-fire path). Owed-age is measured
+        from ``_first_pending_monotonic`` (the non-resetting first-armed
+        timestamp), not from ``_last_request_monotonic`` (which resets on
+        every ``note_merge`` re-arm and so would never age under a
+        continuous merge stream). ``0.0`` (the default) DISABLES force-fire
+        entirely, preserving byte-identical behaviour for coordinators that
+        don't need it (fused-memory, dashboard). Used only by the
+        orchestrator's own self-redeploy coordinator, whose polite path
+        (``require_idle=True``) can otherwise starve indefinitely under
+        chronic fleet saturation.
     """
 
     def __init__(
@@ -369,6 +385,7 @@ class StaleServiceRestartCoordinator:
         wall_clock: Callable[[], float] = time.time,
         state_path: Path | None = None,
         stamp_clock_on_fire: bool = True,
+        force_fire_after_secs: float = 0.0,
     ) -> None:
         self._git_ops = git_ops
         self._event_store = event_store
@@ -416,6 +433,10 @@ class StaleServiceRestartCoordinator:
         # no persisted state). Seeded fail-open from state_path at construction:
         # a missing / corrupt / unreadable file must never raise here.
         self._last_fire_wall: float | None = self._load_last_fire_wall()
+        # Fire-while-busy force-fire threshold (fleet-redeploy PRD task
+        # delta). 0.0 disables — see the force_fire_after_secs docstring
+        # above.
+        self._force_fire_after_secs = force_fire_after_secs
 
         # State
         self._pending: bool = False
@@ -426,6 +447,15 @@ class StaleServiceRestartCoordinator:
         # Consecutive TRANSIENT executor failures since the last successful
         # fire (NOT reset by note_merge re-arming — see maybe_restart).
         self._consecutive_executor_failures: int = 0
+        # Monotonic timestamp of the FIRST note_merge that armed the current
+        # pending burst (False→True transition) — NOT reset by note_merge
+        # re-arming (mirrors _consecutive_executor_failures above), so it
+        # measures true owed-age under a continuous merge stream even though
+        # _last_request_monotonic keeps advancing. None while not pending;
+        # reset to None at every pending-clear site (permanent-fail,
+        # exhausted-transient, successful-fire) in maybe_restart, so
+        # pending=True iff _first_pending_monotonic is not None.
+        self._first_pending_monotonic: float | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -483,9 +513,15 @@ class StaleServiceRestartCoordinator:
         if not watched_changed:
             return False
 
-        # Arm / re-arm
+        # Arm / re-arm. Stamp _first_pending_monotonic ONLY on the False→True
+        # transition — it must NOT move on a re-arm (see its docstring in
+        # __init__), unlike _last_request_monotonic below, which is the
+        # debounce source and re-stamps on every note_merge.
+        now = self._clock()
+        if not self._pending:
+            self._first_pending_monotonic = now
         self._pending = True
-        self._last_request_monotonic = self._clock()
+        self._last_request_monotonic = now
         self._trigger_task_ids.append(task_id)
         self._trigger_merge_shas.append(head_sha)
         logger.info(
@@ -500,36 +536,81 @@ class StaleServiceRestartCoordinator:
     async def maybe_restart(self, *, agents_idle: bool) -> bool:
         """Fire the restart if all gate conditions are met.
 
-        Conditions: enabled AND pending AND agents_idle AND debounce elapsed
-        AND (no restart_precondition OR restart_precondition() is truthy).
+        Conditions: enabled AND pending AND (agents_idle AND debounce elapsed
+        AND (no restart_precondition OR restart_precondition() is truthy))
+        OR the force-fire escape (see below). In both cases the min_interval
+        wall-clock cap is still enforced afterward.
+
+        Force-fire escape (fleet-redeploy PRD task delta): once a pending
+        restart's owed-age (``clock() - _first_pending_monotonic``) reaches
+        ``force_fire_after_secs`` (disabled when ``0.0``), the agents_idle
+        gate, the debounce, and the restart_precondition preference are all
+        bypassed — but the min_interval cap below is NEVER bypassed. This
+        exists so the polite path (which requires ``agents_idle=True``, only
+        reachable from the run-loop's idle branch) cannot starve a pending
+        restart indefinitely under chronic fleet saturation.
+
+        This class does NOT itself provide an interrupt-safety net for
+        whatever ``restart_precondition`` was standing in for (e.g. a
+        merge-drain check) once force-fire bypasses it — that safety is
+        entirely the caller's responsibility (its restart_executor and the
+        service being restarted). See
+        ``Harness._build_orchestrator_restart_coordinator``'s docstring for
+        the concrete mechanism the orchestrator's own instance relies on
+        (SIGTERM graceful shutdown + durable merge-queue crash-recovery, NOT
+        a merge-drain gate at restart time).
 
         Returns True when the restart was fired; False otherwise (no side
         effects — caller may call again on the next idle tick).
         """
-        if not (
-            self._enabled
-            and self._pending
-            and (agents_idle or not self._require_idle)
-            and (self._clock() - self._last_request_monotonic >= self._debounce_secs)
-        ):
+        if not (self._enabled and self._pending):
             return False
 
-        if self._restart_precondition is not None:
-            try:
-                satisfied = self._restart_precondition()
-            except Exception:
-                logger.warning(
-                    f'{self._service_name} restart_precondition raised; deferring'
-                    ' (fail-safe) — pending stays set for the next idle tick.',
-                    exc_info=True,
-                )
+        now = self._clock()
+        first_pending = self._first_pending_monotonic
+        force_fire = (
+            self._force_fire_after_secs > 0
+            and first_pending is not None
+            and (now - first_pending) >= self._force_fire_after_secs
+        )
+
+        if not force_fire:
+            if not (
+                (agents_idle or not self._require_idle)
+                and (now - self._last_request_monotonic >= self._debounce_secs)
+            ):
                 return False
-            if not satisfied:
-                logger.info(
-                    f'{self._service_name} restart deferred: restart_precondition'
-                    ' not satisfied (pending retained).',
-                )
-                return False
+
+            if self._restart_precondition is not None:
+                try:
+                    satisfied = self._restart_precondition()
+                except Exception:
+                    logger.warning(
+                        f'{self._service_name} restart_precondition raised; deferring'
+                        ' (fail-safe) — pending stays set for the next idle tick.',
+                        exc_info=True,
+                    )
+                    return False
+                if not satisfied:
+                    logger.info(
+                        f'{self._service_name} restart deferred: restart_precondition'
+                        ' not satisfied (pending retained).',
+                    )
+                    return False
+        else:
+            # force_fire is only True when the `and` chain above proved
+            # first_pending is not None; re-assert so the type checker
+            # narrows it here too (its own narrowing doesn't survive past
+            # the boolean expression that produced `force_fire`).
+            assert first_pending is not None
+            logger.warning(
+                f'{self._service_name} restart FORCE-FIRING: pending restart owed'
+                ' %.0fs (>= %.0fs bound) — bypassing agents_idle, the debounce, and'
+                ' the merge-drain preference; the min_interval clock is still'
+                ' honored.',
+                now - first_pending,
+                self._force_fire_after_secs,
+            )
 
         # Restart-safe minimum-interval rate cap (wall-clock). Enforced AFTER
         # every other gate so it only ever gates an otherwise-ready fire. When
@@ -575,6 +656,7 @@ class StaleServiceRestartCoordinator:
             self._trigger_task_ids = []
             self._trigger_merge_shas = []
             self._consecutive_executor_failures = 0
+            self._first_pending_monotonic = None
             return False
         except Exception:
             # TRANSIENT: e.g. a momentary systemd-run registration hiccup
@@ -596,6 +678,7 @@ class StaleServiceRestartCoordinator:
                 self._trigger_task_ids = []
                 self._trigger_merge_shas = []
                 self._consecutive_executor_failures = 0
+                self._first_pending_monotonic = None
                 return False
             logger.warning(
                 f'{self._service_name} restart executor failed (transient, attempt'
@@ -635,6 +718,10 @@ class StaleServiceRestartCoordinator:
         # failures since the last successful fire, not a lifetime tally.
         # (note_merge re-arming does NOT reset it — only success/exhaustion do.)
         self._consecutive_executor_failures = 0
+        # Owed-age anchor: pending=True iff _first_pending_monotonic is not
+        # None (see __init__ docstring) — reset here so the next burst's
+        # force-fire window starts fresh from its own first arm.
+        self._first_pending_monotonic = None
 
         # Stamp the min-interval rate cap AFTER the fire succeeded. The
         # in-memory update is unconditional (retains within-process

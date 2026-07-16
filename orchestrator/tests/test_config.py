@@ -219,6 +219,13 @@ class TestDefaults:
         assert config.orchestrator_restart_watch_prefixes == ['orchestrator/src/']
         assert config.orchestrator_restart_script == 'scripts/restart-orchestrator.sh'
         assert config.orchestrator_restart_on_active_secs == 10
+        assert config.orchestrator_restart_force_fire_after_secs == 4500.0
+        assert 'orchestrator_restart_force_fire_after_secs' not in RELOADABLE_FIELDS, (
+            'orchestrator_restart_force_fire_after_secs requires a process '
+            'restart to take effect (matches its sibling '
+            'orchestrator_restart_min_interval_secs) and must NOT be in '
+            'RELOADABLE_FIELDS'
+        )
 
     def test_project_root_resolved_to_absolute(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)

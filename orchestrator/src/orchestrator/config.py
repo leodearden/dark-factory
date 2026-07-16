@@ -2173,6 +2173,26 @@ class OrchestratorConfig(BaseSettings):
             '0 disables.'
         ),
     )
+    # Force-fire escape for the orchestrator's own coordinator (fleet-redeploy
+    # PRD task delta): once a restart is pending, the coordinator normally
+    # only fires from the polite path (agents_idle + debounce + the
+    # merge-drain preference). Under chronic fleet saturation agents_idle is
+    # rarely true, so the polite path can starve indefinitely. Once a pending
+    # restart has been owed for this many seconds, maybe_restart bypasses
+    # agents_idle, the debounce, and the merge-drain preference — but NEVER
+    # the min_interval 8h clock above, which is still enforced unchanged.
+    # 0 disables force-fire (byte-identical behaviour); 75-min default.
+    # Deliberately NOT in RELOADABLE_FIELDS: red-tier / restart-only,
+    # matching its sibling orchestrator_restart_min_interval_secs.
+    orchestrator_restart_force_fire_after_secs: float = Field(
+        default=4500.0,
+        description=(
+            'Max seconds a pending orchestrator self-redeploy stays owed '
+            'before force-firing (bypassing agents_idle + debounce + the '
+            'merge-drain preference, but NOT the min_interval 8h clock); '
+            '75-min default.'
+        ),
+    )
 
     # Orphan L0 reaper — re-escalates level-0 escalations whose task has no
     # active workflow/steward (e.g. escalations emitted by the deep reviewer
