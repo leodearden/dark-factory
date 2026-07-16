@@ -3084,6 +3084,167 @@ async def test_reopen_freshness_invalid_override_rejected(
         await backend.close()
 
 
+@pytest.mark.asyncio
+async def test_reopen_freshness_fail_closed_on_unparseable_reopen_at(
+    taskmaster, reconciler, event_buffer, tmp_path,
+):
+    """Fail-closed (task 2674 S9/S10): an unparseable ``metadata.reopen_at``
+    must be treated as STALE, never silently passed through. Per S2 the
+    gate was fail-OPEN on unparseable dates (either side); S10 flips this
+    so a done-write is rejected (enforce) rather than proceeding when
+    reopen_at cannot be normalised to aware UTC.
+
+    Uses a MOCK taskmaster (not the real-backend harness the sibling tests
+    use) so ``before`` can carry a deliberately malformed ``reopen_at``
+    string that a real reopen write would never produce -- the atomic
+    reopen writer (task 2649) always stamps a valid ISO-8601 string. A
+    real git repo is still required so ``_validate_done_provenance`` can
+    resolve + ancestor-check the cited commit before the freshness gate
+    even runs.
+    """
+    sha = _init_git_repo(tmp_path)
+    project_root = str(tmp_path)
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'pending', 'metadata': {'reopen_at': 'not-a-date'}},
+    )
+
+    cfg = FusedMemoryConfig()
+    cfg.reconciliation.reject_stale_done_evidence = 'enforce'
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg)
+
+    result = await interceptor.set_task_status(
+        '1',
+        'done',
+        project_root,
+        done_provenance={'kind': 'found_on_main', 'commit': sha, 'note': 'sibling'},
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_evidence_stale'
+    taskmaster.set_status_and_stamp_audit.assert_not_called()
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reopen_freshness_accepts_fresh_evidence(
+    tmp_path, event_buffer, caplog,
+):
+    """Regression guard (task 2674 S9, GREEN since S2): evidence committed
+    AFTER the reopen is accepted in enforce mode with no census line -- the
+    gate rejects only PRE-reopen (stale) evidence, never evidence that
+    postdates the reopen.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    seed_sha = _init_git_repo(tmp_path)
+
+    cfg = FusedMemoryConfig()
+    cfg.reconciliation.reject_stale_done_evidence = 'enforce'
+
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg)
+
+        first_done = await interceptor.set_task_status(
+            '1', 'done', project_root,
+            done_provenance={'kind': 'found_on_main', 'commit': seed_sha, 'note': 'seed'},
+        )
+        assert 'error' not in first_done, first_done
+
+        reopen_result = await interceptor.set_task_status(
+            '1', 'pending', project_root, reopen_reason='reverting: regression found',
+        )
+        assert 'error' not in reopen_result, reopen_result
+
+        fresh_sha = _commit_on_main(tmp_path, 'fresh_evidence.txt', '2099-01-01T00:00:00+00:00')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+            result = await interceptor.set_task_status(
+                '1',
+                'done',
+                project_root,
+                done_provenance={
+                    'kind': 'found_on_main', 'commit': fresh_sha, 'note': 'fresh sibling',
+                },
+                agent_id='claude-interactive',
+            )
+
+        assert 'error' not in result, result
+
+        fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await fresh.start()
+        try:
+            task = await fresh.get_task('1', project_root=project_root)
+        finally:
+            await fresh.close()
+        assert task['status'] == 'done', task
+
+        stale_warn_records = [
+            r for r in caplog.records
+            if r.message.startswith('task_status.done_evidence_stale_warn')
+        ]
+        assert stale_warn_records == []
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_reopen_freshness_exempts_commitless_kind(
+    tmp_path, event_buffer,
+):
+    """Regression guard (task 2674 S9, GREEN since S2): a commitless
+    done_provenance kind (e.g. ``deterministic-deploy``) self-evidences and
+    is exempt from the reopen-freshness gate entirely -- even on a
+    reopened task under enforce mode.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    seed_sha = _init_git_repo(tmp_path)
+
+    cfg = FusedMemoryConfig()
+    cfg.reconciliation.reject_stale_done_evidence = 'enforce'
+
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg)
+
+        first_done = await interceptor.set_task_status(
+            '1', 'done', project_root,
+            done_provenance={'kind': 'found_on_main', 'commit': seed_sha, 'note': 'seed'},
+        )
+        assert 'error' not in first_done, first_done
+
+        reopen_result = await interceptor.set_task_status(
+            '1', 'pending', project_root, reopen_reason='reverting: regression found',
+        )
+        assert 'error' not in reopen_result, reopen_result
+
+        result = await interceptor.set_task_status(
+            '1', 'done', project_root,
+            done_provenance={'kind': 'deterministic-deploy'},
+        )
+
+        assert 'error' not in result, result
+
+        fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await fresh.start()
+        try:
+            task = await fresh.get_task('1', project_root=project_root)
+        finally:
+            await fresh.close()
+        assert task['status'] == 'done', task
+    finally:
+        await backend.close()
+
+
 # ── Tests for done_provenance.kind discriminator (2026-04-27 hardening) ────
 
 
