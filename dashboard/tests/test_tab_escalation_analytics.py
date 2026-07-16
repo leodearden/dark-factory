@@ -518,3 +518,63 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     assert v >= 30, (
         f'index.html cache-buster version is {v}, expected >= 30.'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-5 test: app.jsx wires the esc-analytics tab
+# ---------------------------------------------------------------------------
+
+
+def test_app_jsx_wires_analytics_tab(app_jsx_body: str) -> None:
+    """app.jsx must destructure EscalationAnalyticsTab from window.DF_TABS,
+    add an 'esc-analytics' tab entry, handle it in renderTab, and configure
+    toolbarConfig with showWindow: false (the tab owns its own client-side
+    window toggle rather than the global server-side window chip).
+
+    Asserts four structural wiring contracts:
+    (a) EscalationAnalyticsTab is destructured from window.DF_TABS.
+    (b) tabs[] contains an entry with id 'esc-analytics' and label 'Analytics'.
+    (c) renderTab switch has a `case 'esc-analytics':` branch returning
+        <EscalationAnalyticsTab projectFilter={projects} />.
+    (d) toolbarConfig has an 'esc-analytics' entry with showWindow: false.
+    """
+    # (a) EscalationAnalyticsTab destructured from window.DF_TABS
+    assert re.search(
+        r'const\s*\{[^}]*EscalationAnalyticsTab[^}]*\}\s*=\s*window\.DF_TABS', app_jsx_body
+    ), (
+        'app.jsx does not destructure EscalationAnalyticsTab from window.DF_TABS — add '
+        '`EscalationAnalyticsTab` to the `const { ... } = window.DF_TABS;` destructure.'
+    )
+    # (b) tabs[] entry
+    assert "id: 'esc-analytics'" in app_jsx_body, (
+        "app.jsx tabs array does not contain an entry with `id: 'esc-analytics'` — "
+        "add `{ id: 'esc-analytics', label: 'Analytics' }` to the tabs array."
+    )
+    assert re.search(r"id:\s*'esc-analytics'[^}]*label:\s*'Analytics'", app_jsx_body), (
+        "app.jsx tabs array entry for 'esc-analytics' does not have `label: 'Analytics'` — "
+        "add `{ id: 'esc-analytics', label: 'Analytics' }` to the tabs array."
+    )
+    # (c) renderTab switch case
+    assert "case 'esc-analytics':" in app_jsx_body, (
+        "app.jsx renderTab switch does not have `case 'esc-analytics':` — add the case "
+        'branch to render <EscalationAnalyticsTab projectFilter={projects} />.'
+    )
+    assert re.search(
+        r"case 'esc-analytics':\s*return\s*<EscalationAnalyticsTab\s+projectFilter=\{projects\}",
+        app_jsx_body,
+    ), (
+        "app.jsx renderTab `case 'esc-analytics':` does not return "
+        '<EscalationAnalyticsTab projectFilter={projects} /> — add it.'
+    )
+    # (d) toolbarConfig esc-analytics entry with showWindow: false
+    parts = app_jsx_body.split('toolbarConfig')
+    assert len(parts) > 1 and "'esc-analytics'" in parts[1], (
+        "app.jsx toolbarConfig does not have an 'esc-analytics' entry — add "
+        "`'esc-analytics': { showWindow: false, showAgents: false, search: false }` "
+        'to toolbarConfig.'
+    )
+    esc_analytics_entry = parts[1].split("'esc-analytics'", 1)[1][:200]
+    assert re.search(r'showWindow\s*:\s*false', esc_analytics_entry), (
+        "app.jsx toolbarConfig 'esc-analytics' entry does not set `showWindow: false` — "
+        'the tab owns its own client-side window toggle, not the global chip.'
+    )
