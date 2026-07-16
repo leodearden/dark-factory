@@ -2749,6 +2749,118 @@ async def test_reopen_atomic_contract_persists_against_real_backend(
         await backend.close()
 
 
+# ── Tests for the reopen-freshness gate (task 2674, PRD task alpha) ────────
+#
+# Closes Face B (re-derivation clobber, task-1175 shape): a legitimate
+# done->pending reopen re-marked done within one dispatch tick citing a
+# PRE-reopen commit. The gate fires only for commit-bearing done_provenance
+# kinds ('merged'/'found_on_main') on a task whose metadata.reopen_at is
+# set; it compares the evidence commit's committer date against reopen_at.
+
+
+def _commit_on_main(tmp_path, filename: str, date_iso: str) -> str:
+    """Create a commit on the current branch with a controlled committer/author date.
+
+    Returns the full SHA. Used to make evidence-commit staleness
+    deterministic relative to the interceptor-stamped ``reopen_at`` (which
+    is stamped as ``datetime.now(UTC)`` at reopen time, microsecond
+    resolution) rather than relying on wall-clock ordering within the same
+    test run — see task 2674 design decision on deterministic dates
+    ('2020-01-01...' == stale, '2099-01-01...' == fresh).
+
+    Assumes ``tmp_path`` is already an initialised git repo (e.g. via
+    ``_init_git_repo``) with ``user.email``/``user.name`` configured.
+    """
+    import subprocess
+
+    (tmp_path / filename).write_text(f'{filename}\n')
+    subprocess.run(['git', '-C', str(tmp_path), 'add', '-A'], check=True)
+    env = {**os.environ, 'GIT_COMMITTER_DATE': date_iso, 'GIT_AUTHOR_DATE': date_iso}
+    subprocess.run(
+        ['git', '-C', str(tmp_path), 'commit', '-q', '-m', f'evidence: {filename}'],
+        check=True,
+        env=env,
+    )
+    return subprocess.run(
+        ['git', '-C', str(tmp_path), 'rev-parse', 'HEAD'],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.mark.asyncio
+async def test_reopen_freshness_enforce_rejects_stale_evidence_real_backend(
+    tmp_path, event_buffer,
+):
+    """A done-write citing PRE-reopen evidence is rejected in enforce mode.
+
+    task-1175 shape (Face B): done -> reopen (pending) -> re-done within one
+    dispatch tick, citing the SAME stale (pre-reopen) commit as evidence.
+    Drives a real SqliteTaskBackend + real git repo so the rejection is
+    proven against actual persistence, not just call-routing.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    _init_git_repo(tmp_path)
+    stale_sha = _commit_on_main(tmp_path, 'stale_evidence.txt', '2020-01-01T00:00:00+00:00')
+
+    cfg = FusedMemoryConfig()
+    cfg.reconciliation.reject_stale_done_evidence = 'enforce'
+
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg)
+
+        stale_provenance = {'kind': 'found_on_main', 'commit': stale_sha, 'note': 'sibling'}
+
+        # (2)-(3): first done-write, before any reopen -- reopen_at is not
+        # yet set, so the gate is inert and this succeeds.
+        first_done = await interceptor.set_task_status(
+            '1', 'done', project_root, done_provenance=stale_provenance,
+        )
+        assert 'error' not in first_done, first_done
+
+        # (4): reopen done -> pending, stamping metadata.reopen_at (~now).
+        reopen_result = await interceptor.set_task_status(
+            '1', 'pending', project_root, reopen_reason='reverting: regression found',
+        )
+        assert 'error' not in reopen_result, reopen_result
+
+        # (5): re-issue done citing the SAME stale provenance.
+        result = await interceptor.set_task_status(
+            '1',
+            'done',
+            project_root,
+            done_provenance=stale_provenance,
+            agent_id='claude-interactive',
+        )
+
+        assert result['success'] is False
+        assert result['error'] == 'done_evidence_stale'
+        assert result['task_id'] == '1'
+        assert result['evidence_commit'] == stale_sha
+        assert result['evidence_committed_at']
+        assert result['reopen_at']
+        assert result['agent_id'] == 'claude-interactive'
+
+        # Independent fresh backend confirms the write was actually refused
+        # (status stayed 'pending', not merely an in-memory echo).
+        fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await fresh.start()
+        try:
+            task = await fresh.get_task('1', project_root=project_root)
+        finally:
+            await fresh.close()
+        assert task['status'] == 'pending', task
+    finally:
+        await backend.close()
+
+
 # ── Tests for done_provenance.kind discriminator (2026-04-27 hardening) ────
 
 
