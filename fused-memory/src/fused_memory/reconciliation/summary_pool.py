@@ -209,6 +209,7 @@ async def write_cycle_summary(
     trim_source: str,
     cap: int,
     now: datetime | None = None,
+    remediation: bool = False,
 ) -> bool:
     """Write the authoritative per-cycle ``cycle_summary`` ledger row (task 2229 W5-λ).
 
@@ -267,6 +268,18 @@ async def write_cycle_summary(
             Normalized via :func:`_assume_utc` and rendered with
             ``.isoformat()`` so the ledger's lexicographic TEXT ``gc()``
             comparison against ``expires_at`` stays correct.
+        remediation: Whether this write is from a Stage-2-only remediation
+            pass rather than a full cycle (task 2652). Stamped verbatim as
+            ``payload['remediation']`` (so it flows into the ledger row's
+            ``payload_json``) and as ``metadata['remediation']`` on the
+            best-effort Mem0 mirror. Defaults to ``False``, which is stamped
+            explicitly (not omitted) — only rows written before this change
+            lack the key entirely. Lets
+            :meth:`~fused_memory.services.memory_service.MemoryService.get_cycle_summary_presence`
+            disambiguate a Stage-2-only remediation run's expected missing
+            Stage 1 (``memory_consolidator``) cycle_summary from a genuine
+            Stage 1 write failure — see ``prompts/stage3.py``'s Stage-2-only
+            remediation run exception.
 
     Returns:
         ``True`` when the authoritative ledger upsert succeeded, ``False``
@@ -300,6 +313,7 @@ async def write_cycle_summary(
             'stats': report.stats,
             'llm_calls': report.llm_calls,
             'tokens_used': report.tokens_used,
+            'remediation': remediation,
         }
         if ledger is not None:
             record = ReconLedgerRecord(
@@ -346,6 +360,7 @@ async def write_cycle_summary(
                     'stage': stage,
                     'run_id': run_id,
                     'record_type': CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP,
+                    'remediation': remediation,
                 },
                 causation_id=run_id,
                 _source='cycle_summary_mirror',
