@@ -111,7 +111,7 @@ class TestRedispatchStrandedBlockedCore:
         """(a) No claimant, no heartbeat, dep done, no open escalation ->
         genuinely stranded -> flipped to pending exactly once."""
         scheduler = _make_scheduler()
-        scheduler.escalation_queue = _FakeEscalationQueue()
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
 
         task = _blocked_task('T1')
         ctx = _ctx_with_done_dep(task)
@@ -119,14 +119,16 @@ class TestRedispatchStrandedBlockedCore:
         result = await scheduler._phase_redispatch_stranded_blocked(ctx)
 
         assert result is _CONTINUE
-        scheduler.set_task_status.assert_awaited_once_with('T1', 'pending')
+        scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            'T1', 'pending'
+        )
 
     @pytest.mark.asyncio
     async def test_open_escalation_blocks_flip(self):
         """(b) Deliberately-parked /unblock: same null-claimant signature,
         but an open escalation exists -> must NOT be flipped."""
         scheduler = _make_scheduler()
-        scheduler.escalation_queue = _FakeEscalationQueue(
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
             by_task={'T1': [{'id': 'esc-1'}]}
         )
 
@@ -136,14 +138,14 @@ class TestRedispatchStrandedBlockedCore:
         result = await scheduler._phase_redispatch_stranded_blocked(ctx)
 
         assert result is _CONTINUE
-        scheduler.set_task_status.assert_not_awaited()
+        scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_deps_not_satisfied_blocks_flip(self):
         """(c) Dependency still in-progress -> not genuinely stranded (still
         legitimately waiting) -> must NOT be flipped."""
         scheduler = _make_scheduler()
-        scheduler.escalation_queue = _FakeEscalationQueue()
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
 
         task = _blocked_task('T1')
         ctx = _ctx_with_done_dep(task, dep_status='in-progress')
@@ -151,14 +153,14 @@ class TestRedispatchStrandedBlockedCore:
         result = await scheduler._phase_redispatch_stranded_blocked(ctx)
 
         assert result is _CONTINUE
-        scheduler.set_task_status.assert_not_awaited()
+        scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_live_claimant_blocks_flip(self):
         """(d) Blocked but LIVE (claimant + fresh heartbeat, ttl=300s default)
         -> is_stranded_blocked is False -> must NOT be flipped."""
         scheduler = _make_scheduler()
-        scheduler.escalation_queue = _FakeEscalationQueue()
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
 
         fresh_heartbeat = (FIXED_DT - timedelta(minutes=1)).isoformat()
         task = _blocked_task(
@@ -171,7 +173,7 @@ class TestRedispatchStrandedBlockedCore:
         result = await scheduler._phase_redispatch_stranded_blocked(ctx)
 
         assert result is _CONTINUE
-        scheduler.set_task_status.assert_not_awaited()
+        scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_no_escalation_queue_fails_safe(self):
@@ -187,14 +189,14 @@ class TestRedispatchStrandedBlockedCore:
         result = await scheduler._phase_redispatch_stranded_blocked(ctx)
 
         assert result is _CONTINUE
-        scheduler.set_task_status.assert_not_awaited()
+        scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_kill_switch_disables_sweep(self):
         """(f) config.stranded_blocked_redispatch_enabled=False -> sweep is
         entirely dormant, even for an otherwise-genuine crash-strand."""
         scheduler = _make_scheduler(stranded_blocked_redispatch_enabled=False)
-        scheduler.escalation_queue = _FakeEscalationQueue()
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
 
         task = _blocked_task('T1')
         ctx = _ctx_with_done_dep(task)
@@ -202,7 +204,7 @@ class TestRedispatchStrandedBlockedCore:
         result = await scheduler._phase_redispatch_stranded_blocked(ctx)
 
         assert result is _CONTINUE
-        scheduler.set_task_status.assert_not_awaited()
+        scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 class TestRedispatchStrandedBlockedParkProtection:
@@ -222,7 +224,7 @@ class TestRedispatchStrandedBlockedParkProtection:
         queue (which would otherwise pass the generic no-open-escalation
         gate)."""
         scheduler = _make_scheduler()
-        scheduler.escalation_queue = _FakeEscalationQueue()
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
 
         task = _deterministic_blocked_task('T1')
         ctx = _ctx_with_done_dep(task)
@@ -230,7 +232,7 @@ class TestRedispatchStrandedBlockedParkProtection:
         result = await scheduler._phase_redispatch_stranded_blocked(ctx)
 
         assert result is _CONTINUE
-        scheduler.set_task_status.assert_not_awaited()
+        scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_deterministic_gate_task_not_flipped_with_open_l2(self):
@@ -239,7 +241,7 @@ class TestRedispatchStrandedBlockedParkProtection:
         carve-out (not the generic open-escalation gate) is what protects
         it."""
         scheduler = _make_scheduler()
-        scheduler.escalation_queue = _FakeEscalationQueue(
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
             by_task={'T1': [{'id': 'esc-l2', 'level': 2}]}
         )
 
@@ -249,7 +251,7 @@ class TestRedispatchStrandedBlockedParkProtection:
         result = await scheduler._phase_redispatch_stranded_blocked(ctx)
 
         assert result is _CONTINUE
-        scheduler.set_task_status.assert_not_awaited()
+        scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_non_deterministic_control_still_flips(self):
@@ -257,7 +259,7 @@ class TestRedispatchStrandedBlockedParkProtection:
         (same null-claimant/done-dep/empty-queue shape) IS flipped — guards
         against the deterministic exclusion being too broad."""
         scheduler = _make_scheduler()
-        scheduler.escalation_queue = _FakeEscalationQueue()
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
 
         task = _blocked_task('T1')
         ctx = _ctx_with_done_dep(task)
@@ -265,14 +267,16 @@ class TestRedispatchStrandedBlockedParkProtection:
         result = await scheduler._phase_redispatch_stranded_blocked(ctx)
 
         assert result is _CONTINUE
-        scheduler.set_task_status.assert_awaited_once_with('T1', 'pending')
+        scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            'T1', 'pending'
+        )
 
     # -- (b) actively dispatched ----------------------------------------------
 
     @pytest.mark.asyncio
     async def test_actively_dispatched_task_not_flipped(self):
         scheduler = _make_scheduler()
-        scheduler.escalation_queue = _FakeEscalationQueue()
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
         scheduler._dispatched.add('T1')
 
         task = _blocked_task('T1')
@@ -281,7 +285,7 @@ class TestRedispatchStrandedBlockedParkProtection:
         result = await scheduler._phase_redispatch_stranded_blocked(ctx)
 
         assert result is _CONTINUE
-        scheduler.set_task_status.assert_not_awaited()
+        scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
     # -- (c) within dispatch/requeue cooldown window --------------------------
 
@@ -289,7 +293,7 @@ class TestRedispatchStrandedBlockedParkProtection:
     async def test_within_cooldown_window_not_flipped(self):
         fixed_monotonic = 1_000.0
         scheduler = _make_scheduler(time_source=lambda: fixed_monotonic)
-        scheduler.escalation_queue = _FakeEscalationQueue()
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
         scheduler._requeue_until['T1'] = fixed_monotonic + 100.0
 
         task = _blocked_task('T1')
@@ -298,14 +302,14 @@ class TestRedispatchStrandedBlockedParkProtection:
         result = await scheduler._phase_redispatch_stranded_blocked(ctx)
 
         assert result is _CONTINUE
-        scheduler.set_task_status.assert_not_awaited()
+        scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
     # -- (d) workflow just cancelled/parked (finally-block grace window) -----
 
     @pytest.mark.asyncio
     async def test_workflow_cancel_recent_not_flipped(self):
         scheduler = _make_scheduler()
-        scheduler.escalation_queue = _FakeEscalationQueue()
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
         scheduler.note_workflow_cancelled('T1')
         assert scheduler.workflow_cancel_recent('T1') is True
 
@@ -315,7 +319,7 @@ class TestRedispatchStrandedBlockedParkProtection:
         result = await scheduler._phase_redispatch_stranded_blocked(ctx)
 
         assert result is _CONTINUE
-        scheduler.set_task_status.assert_not_awaited()
+        scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
