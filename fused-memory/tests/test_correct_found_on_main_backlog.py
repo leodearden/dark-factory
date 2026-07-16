@@ -50,6 +50,7 @@ LABEL_REOPENED = _mod.LABEL_REOPENED
 LABEL_REVIEWED_BENIGN = _mod.LABEL_REVIEWED_BENIGN
 LABEL_PRESUMED_BENIGN_HISTORICAL = _mod.LABEL_PRESUMED_BENIGN_HISTORICAL
 apply_corrections = _mod.apply_corrections
+_apply_exit_code = _mod._apply_exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -529,3 +530,32 @@ class TestApplyCorrectionsErrorIsolation:
         assert summary['reopened'] == 1
         assert any(call['task_id'] == '2222' for call in backend.update_calls)
         assert all(call['task_id'] != '1111' for call in backend.update_calls)
+
+
+# ===========================================================================
+# Step-13/14: _apply_exit_code — pure summary -> process exit code helper
+# ===========================================================================
+
+class TestApplyExitCode:
+    """_apply_exit_code(summary) turns an apply_corrections summary into a
+    loud, non-zero process exit whenever anything went wrong — an apply
+    error or a non-persisted reopen alike — for CI/operator wiring."""
+
+    def test_clean_summary_exits_zero(self):
+        summary = {'errors': 0, 'reopen_failed': [], 'annotated': 3, 'reopened': 1}
+        assert _apply_exit_code(summary) == 0
+
+    def test_errors_present_exits_non_zero(self):
+        summary = {'errors': 1, 'reopen_failed': [], 'annotated': 2, 'reopened': 0}
+        assert _apply_exit_code(summary) != 0
+
+    def test_reopen_failed_present_exits_non_zero_even_with_errors_counted(self):
+        summary = {'errors': 1, 'reopen_failed': ['1175'], 'annotated': 0, 'reopened': 0}
+        assert _apply_exit_code(summary) != 0
+
+    def test_reopen_failed_present_exits_non_zero_even_without_errors(self):
+        # Defensive/belt-and-suspenders: a non-empty reopen_failed alone —
+        # independent of the errors counter — must still be loud, never a
+        # silent 0 exit (the exact task-1175 regression this script guards).
+        summary = {'errors': 0, 'reopen_failed': ['1175'], 'annotated': 0, 'reopened': 0}
+        assert _apply_exit_code(summary) != 0
