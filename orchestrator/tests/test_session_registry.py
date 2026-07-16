@@ -2381,6 +2381,8 @@ def test_reap_answered_decisions_matrix(tmp_path: Path) -> None:
 
     def fake_status(decision: sr.DecisionRecord) -> str | None:
         consulted.append(decision.id)
+        if decision.escalation_id is None:
+            return None
         return statuses.get(decision.escalation_id)
 
     reaped = sr.reap_answered_decisions(root=tmp_path, escalation_status=fake_status)

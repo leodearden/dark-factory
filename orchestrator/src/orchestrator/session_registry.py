@@ -28,7 +28,7 @@ import re
 import shutil
 import sys
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -862,6 +862,78 @@ def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> s
         return None
     status = data.get('status') if isinstance(data, dict) else None
     return status if isinstance(status, str) else None
+
+
+DECISION_CLOSE_MAP: dict[str, DecisionState] = {
+    'resolved': DecisionState.ANSWERED,
+    'dismissed': DecisionState.DROPPED,
+}
+"""Maps a terminal escalation status to the DecisionState an OPEN decision
+resolving it should close to (Fleet Cockpit C8 reaper). Any other status
+(including 'pending') or None is absent from this map and leaves the
+decision OPEN -- see reap_answered_decisions."""
+
+
+@dataclass(frozen=True)
+class ReapedDecision:
+    """One DecisionRecord closed by reap_answered_decisions.
+
+    id: the closed decision's id.
+    escalation_id: the escalation whose terminal status triggered the close.
+    new_state: the DecisionState it was closed to, as its wire string (see
+        DECISION_CLOSE_MAP) -- e.g. 'answered' or 'dropped'.
+    """
+
+    id: str
+    escalation_id: str
+    new_state: str
+
+
+def reap_answered_decisions(
+    root: Path | str | None = None,
+    *,
+    escalation_status: Callable[[DecisionRecord], str | None],
+) -> list[ReapedDecision]:
+    """Close every OPEN decision whose escalation has reached a terminal status.
+
+    For each ``list_decisions(root)`` entry: a decision that is not
+    ``DecisionState.OPEN`` is skipped outright (already resolved -- no
+    re-close); a decision with no ``escalation_id`` is skipped WITHOUT ever
+    consulting *escalation_status* (there is nothing to resolve it against).
+    Otherwise *escalation_status* is called with the decision, and the
+    result is looked up in ``DECISION_CLOSE_MAP`` -- any status not in that
+    map (including ``'pending'`` or ``None``) leaves the decision OPEN.
+
+    A close-worthy result is applied via the existing
+    ``update_decision_state`` (itself fail-soft: a write fault there returns
+    None and is silently skipped here, matching its contract for direct
+    C8/cockpit callers) and is only recorded in the returned list when that
+    update actually succeeds.
+
+    *escalation_status* is injected rather than read directly here so this
+    stdlib-only, import-free core stays unit-testable with a fake callback
+    and never needs to know an escalations-dir path or project scoping --
+    see the ``reap-decisions`` CLI verb, which builds the production
+    closure.
+    """
+    reaped: list[ReapedDecision] = []
+    for decision in list_decisions(root):
+        if decision.state != DecisionState.OPEN:
+            continue
+        escalation_id = decision.escalation_id
+        if not escalation_id:
+            continue
+        status = escalation_status(decision)
+        new_state = DECISION_CLOSE_MAP.get(status) if status is not None else None
+        if new_state is None:
+            continue
+        updated = update_decision_state(decision.id, new_state, root=root)
+        if updated is None:
+            continue
+        reaped.append(
+            ReapedDecision(id=decision.id, escalation_id=escalation_id, new_state=str(new_state))
+        )
+    return reaped
 
 
 # ---------------------------------------------------------------------------
