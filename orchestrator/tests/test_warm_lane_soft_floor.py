@@ -18,7 +18,7 @@ import pytest
 from pydantic import ValidationError
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, WarmLaneUnavailable, WorktreeInfo, _run
 
 # ---------------------------------------------------------------------------
 # Repo fixture (mirrors test_warm_lane_disk_guard.py's git_repo fixture)
@@ -94,6 +94,38 @@ async def _add_disk_guard_scripts(repo: Path) -> None:
     _write_disk_guard_stubs(scripts_dir)
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'add disk-guard stub script'], cwd=repo)
+
+
+async def _add_all_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
+    """Commit stub seed, debug-port, and disk-guard scripts into repo/scripts/.
+
+    Combines a seed + debug-port stub (mirrors test_git_ops._add_warm_lane_scripts)
+    with the disk-guard stub so acquire_warm_lane() can be exercised end-to-end.
+    """
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    seed = scripts_dir / 'seed-warm-lane.sh'
+    seed.write_text(
+        '#!/usr/bin/env bash\nmkdir -p "$2/target"\necho "seeded" > "$2/target/seeded.bin"\n'
+    )
+    seed.chmod(0o755)
+
+    debug = scripts_dir / 'setup-worktree-debug-port.sh'
+    debug.write_text(f'#!/usr/bin/env bash\necho {port}\n')
+    debug.chmod(0o755)
+
+    _write_disk_guard_stubs(scripts_dir)
+
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add all warm-lane stub scripts'], cwd=repo)
+
+
+async def _get_head(repo: Path) -> str:
+    """Return the HEAD commit SHA of the repo."""
+    rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0, f'git rev-parse HEAD failed (rc={rc})'
+    return out.strip()
 
 
 def _write_check_exits(repo: Path, exit_codes: list[int]) -> None:
@@ -322,3 +354,140 @@ class TestWarmLaneSoftPressureDefer:
             'mybranch' in t and 'soft' in t.lower() and 'deferring' in t.lower()
             for t in warning_texts
         ), f'Expected a soft-floor defer WARNING naming the branch; got: {warning_texts}'
+
+
+@pytest.mark.asyncio
+class TestAcquireWarmLaneSoftFloor:
+    """Integration: acquire_warm_lane() is gated by θ's soft-floor throttle
+    (step-7), which runs AFTER the ε hard-floor disk-guard and BEFORE
+    acquire_for — mirrors TestAcquireWarmLaneDiskGuard one floor earlier."""
+
+    async def test_soft_pressure_enum_member_exists(self):
+        """WarmLaneUnavailable.SOFT_PRESSURE is a distinct discriminant,
+        separate from DISK_PRESSURE (θ vs ε)."""
+        assert hasattr(WarmLaneUnavailable, 'SOFT_PRESSURE')
+        assert WarmLaneUnavailable.SOFT_PRESSURE is not WarmLaneUnavailable.DISK_PRESSURE
+
+    async def test_fresh_branch_soft_pressure_returns_soft_pressure(
+        self, git_repo: Path,
+    ):
+        """Fresh (unmapped) branch + soft rc=3 ⇒ SOFT_PRESSURE; lane stays FREE."""
+        from orchestrator.warm_lane_pool import LaneState
+
+        await _add_all_warm_lane_scripts(git_repo)
+        _write_check_exits(git_repo, [3])
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert result is WarmLaneUnavailable.SOFT_PRESSURE, (
+            f'Expected SOFT_PRESSURE; got {result!r}'
+        )
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.state(
+            git_ops.worktree_base / '_lane-0'
+        ) == LaneState.FREE, 'Lane-0 must stay FREE when soft-throttled (defer, not acquire)'
+
+    async def test_fresh_branch_soft_pressure_lane_dir_not_created(
+        self, git_repo: Path,
+    ):
+        """SOFT_PRESSURE path: no worktree-add/seed ran — lane dir absent
+        (mirrors test_still_pressured_lane_dir_not_created)."""
+        await _add_all_warm_lane_scripts(git_repo)
+        _write_check_exits(git_repo, [3])
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert not (git_ops.worktree_base / '_lane-0').exists(), (
+            'Lane dir must not be created when soft-floor admission defers'
+        )
+
+    async def test_reuse_not_throttled_even_under_soft_pressure(
+        self, git_repo: Path,
+    ):
+        """A branch already mapped in the pool (reuse) proceeds unthrottled
+        even when the soft guard would defer — only a FRESH allocation defers."""
+        await _add_all_warm_lane_scripts(git_repo)
+        # First acquire (fresh, unmapped): rc=0 healthy → succeeds, maps 'A'.
+        # Second acquire (reuse, mapped): rc=3 pre-loaded but must NEVER be
+        # consumed — assignment_for('A') is no longer None, so θ's gate
+        # short-circuits before invoking the soft guard at all.
+        _write_check_exits(git_repo, [0, 3])
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        first = await git_ops.acquire_warm_lane('A', start_ref)
+        assert isinstance(first, WorktreeInfo), f'First acquire must succeed; got {first!r}'
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.assignment_for('A') is not None, (
+            'Branch A must be mapped after a successful fresh acquire'
+        )
+
+        second = await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert isinstance(second, WorktreeInfo), (
+            f'Reuse must NOT be soft-throttled; got {second!r}'
+        )
+        assert _subcommands(git_repo) == ['check'], (
+            'θ soft guard must be consulted exactly once (the first, fresh '
+            f'acquire) and never on reuse; got {_subcommands(git_repo)}'
+        )
+
+    async def test_knob_off_soft_guard_not_invoked(
+        self, git_repo: Path,
+    ):
+        """warm_lane_soft_floor=False → soft guard script never runs; acquire proceeds."""
+        await _add_all_warm_lane_scripts(git_repo)
+        _write_check_exits(git_repo, [3])  # Would defer if wrongly consulted
+        config = GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+            warm_lane_soft_floor=False,  # master knob OFF → byte-identical
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'Knob-off must return WorktreeInfo; got {result!r}'
+        )
+        assert _read_call_log(git_repo) == [], (
+            'Soft guard script must NOT run when warm_lane_soft_floor=False'
+        )
+
+    async def test_hard_pressure_precedence_soft_not_consulted(
+        self, git_repo: Path,
+    ):
+        """ε hard rc=75 (still pressured after reclaim) ⇒ DISK_PRESSURE; θ's
+        soft guard is never consulted — the hard path wins/is unchanged."""
+        await _add_all_warm_lane_scripts(git_repo)
+        _write_check_exits(git_repo, [75, 75])
+        config = _make_soft_floor_config(warm_lane_disk_guard=True)
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert result is WarmLaneUnavailable.DISK_PRESSURE, (
+            f'ε hard floor must take precedence; got {result!r}'
+        )
+        check_lines = [
+            line for line in _read_call_log(git_repo) if line.split()[0] == 'check'
+        ]
+        assert len(check_lines) == 2, (
+            f'Expected exactly 2 ε check calls (check→reclaim→check); got {check_lines}'
+        )
+        assert all('--soft' not in line for line in check_lines), (
+            f'θ soft guard must not run once ε hard-floor already blocked; got {check_lines}'
+        )
