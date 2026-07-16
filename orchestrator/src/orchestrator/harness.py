@@ -823,6 +823,33 @@ class _OfflineLaneTaskClient:
         return statuses.get(task_id, '')
 
 
+def _extract_tagger_entries(payload: Any) -> list:
+    """Peel known StructuredOutput wrapper keys and return the entries list.
+
+    The module tagger's output_schema is object-rooted with a top-level
+    ``predictions`` key (renamed from ``tasks`` — task 2561 defect 3). When
+    the schema's sole key collides with the StructuredOutput tool's own
+    parameter name and the prompt's dominant domain noun, the model
+    sometimes double-wraps its answer. This accepts, in order: the current
+    flat ``{"predictions": [...]}`` shape, the legacy single-wrap
+    ``{"tasks": [...]}``, and the legacy double-wrap
+    ``{"tasks": {"tasks": [...]}}``. Bounded to a few iterations so
+    pathological nesting fails safe to ``[]`` — no tagging, no crash —
+    rather than looping, matching the existing bad-output early-return
+    semantics. Pure function, no side effects.
+    """
+    for _ in range(3):
+        if not isinstance(payload, dict):
+            break
+        if 'predictions' in payload:
+            payload = payload['predictions']
+        elif 'tasks' in payload:
+            payload = payload['tasks']
+        else:
+            break
+    return payload if isinstance(payload, list) else []
+
+
 class Harness:
     """Top-level orchestration loop."""
 
