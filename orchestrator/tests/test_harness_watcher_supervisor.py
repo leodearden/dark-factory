@@ -2727,3 +2727,85 @@ class TestWatcherHasActionableL1:
         )
         queue.submit(esc)
         assert h._watcher_has_actionable_l1() is False
+
+
+# ---------------------------------------------------------------------------
+# task 2629 step-5: _watcher_supervisor_loop consults the empty-queue precheck
+# ---------------------------------------------------------------------------
+
+class TestWatcherSupervisorLoopEmptyQueueSkip:
+    """_watcher_supervisor_loop skips the rotation launch when the L1 queue
+    has no actionable work, and launches normally otherwise.
+    """
+
+    @pytest.mark.asyncio
+    async def test_skip_when_empty_queue(self, tmp_path: Path) -> None:
+        """Empty queue (no L1s at all) -> rotation is never launched;
+        the loop sleeps watcher_empty_queue_poll_secs and re-checks.
+        """
+        h, _queue = _make_loop_harness_with_queue(tmp_path)
+        sleep_durations: list[float] = []
+        rotation_spy = AsyncMock()
+        h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+            raise asyncio.CancelledError()
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        rotation_spy.assert_not_called()
+        assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (
+            f'Expected exactly one recorded sleep of watcher_empty_queue_poll_secs '
+            f'({h.config.watcher_empty_queue_poll_secs}); got {sleep_durations}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_launch_when_actionable_l1_present(self, tmp_path: Path) -> None:
+        """An actionable pending L1 -> the rotation IS launched normally
+        (precheck must not block real work from being picked up).
+        """
+        from shared.cli_invoke import AgentResult
+
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        _submit_sample_l1(queue)
+        min_secs = h.config.watcher_misconfigured_min_rotation_secs
+
+        rotation_calls = 0
+        sleep_durations: list[float] = []
+        timestamps = _build_monotonic_timestamps([min_secs + 1.0])
+        monotonic_sequence = iter(timestamps)
+
+        def fake_monotonic() -> float:
+            return next(monotonic_sequence)
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls > 1:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        async def recording_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', recording_sleep),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        assert rotation_calls >= 1, (
+            'Expected _run_watcher_rotation to be invoked when an actionable L1 is pending'
+        )
+        assert sleep_durations == [h.config.watcher_subprocess_restart_backoff_secs], (
+            f'Expected the healthy-clean restart-backoff sleep (proving the rotation '
+            f'actually ran, not the empty-queue skip path); got {sleep_durations}'
+        )
