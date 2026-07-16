@@ -84,3 +84,18 @@ def effective_benign(record: Escalation) -> tuple[str | None, str]:
     if record.status == 'resolved':
         return 'actionable', 'inferred'
     return None, 'excluded'
+
+
+def default_resolution_class_for_resolver(resolved_by: str | None) -> str | None:
+    """Return the per-path benign default for *resolved_by*, or None.
+
+    Reuses ``classify_resolver_tier`` (single site, INV-5 — the reaper-sweep
+    resolver membership lives only in that function). Automated sweep closes
+    (age-out dismiss, orphan-reaper drop, starvation-watchdog self-clear,
+    revalidation sweep) are definitionally benign: nothing actionable happens
+    beyond closing a stale record. Every other tier — including human,
+    auto-watcher, steward, and cascade — defaults to None, leaving the record
+    unstamped so ``effective_benign``'s read-time proxy applies unless the
+    caller passes an explicit ``resolution_class``.
+    """
+    return 'benign' if classify_resolver_tier(resolved_by) == 'reaper-sweep' else None
