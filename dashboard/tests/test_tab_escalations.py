@@ -727,3 +727,86 @@ def test_tab_escalations_strip_mounted_and_wired(tab_escalations_jsx_body: str) 
         f'(index {strip_idx} vs {level_idx}) — the strip must sit at the TOP of the '
         f'tab, above the controls header.'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-3 test: EscalationStatStrip computes all four metrics from the
+# payload's existing daily series (no duplicated computation)
+# ---------------------------------------------------------------------------
+
+
+def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> None:
+    """EscalationStatStrip must compute all four metrics from series the
+    backend aggregator already emits, and render four labeled tiles.
+
+    Asserts, scoped to the EscalationStatStrip body:
+    (a) benign-rate — references flow_daily, the 'benign'/'actionable' class
+        literals, and stamped_share (the hint).
+    (b) 6h-breach — references open_items and breach_6h.
+    (c) esc-per-done — references esc_per_done_daily.
+    (d) churn — references churn_daily.
+    (e) at least four <C.StatTile tiles are rendered.
+    (f) human-readable tile labels are present (case-insensitive): 'benign',
+        '6h', a per-done token like 'done', and 'churn'.
+    """
+    strip_fn = _extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
+    assert strip_fn, (
+        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body — '
+        'add the component definition.'
+    )
+
+    # (a) benign-rate substrate
+    assert 'flow_daily' in strip_fn, (
+        'EscalationStatStrip does not reference flow_daily — the benign-rate tile '
+        'must be computed from workflow.flow_daily (the only per-day benign/'
+        'actionable series in the payload).'
+    )
+    assert "'benign'" in strip_fn, (
+        "EscalationStatStrip does not reference the 'benign' class literal — "
+        "sum flow_daily rows where class == 'benign'."
+    )
+    assert "'actionable'" in strip_fn, (
+        "EscalationStatStrip does not reference the 'actionable' class literal — "
+        "sum flow_daily rows where class == 'actionable'."
+    )
+    assert 'stamped_share' in strip_fn, (
+        'EscalationStatStrip does not reference stamped_share — add the all-time '
+        'stamped-share hint computed from origin.sources[].'
+    )
+
+    # (b) 6h-breach substrate
+    assert 'open_items' in strip_fn, (
+        'EscalationStatStrip does not reference lifespan.open_items — the '
+        '6h-breach tile must count the live pending queue.'
+    )
+    assert 'breach_6h' in strip_fn, (
+        'EscalationStatStrip does not reference breach_6h — count open_items '
+        'where breach_6h is truthy.'
+    )
+
+    # (c) esc-per-done substrate
+    assert 'esc_per_done_daily' in strip_fn, (
+        'EscalationStatStrip does not reference workflow.esc_per_done_daily — '
+        'the esc-per-done tile must be computed from it.'
+    )
+
+    # (d) churn substrate
+    assert 'churn_daily' in strip_fn, (
+        'EscalationStatStrip does not reference workflow.churn_daily — the '
+        'churn-24h tile must be computed from it.'
+    )
+
+    # (e) at least four StatTile occurrences
+    tile_count = len(re.findall(r'<C\.StatTile', strip_fn))
+    assert tile_count >= 4, (
+        f'EscalationStatStrip renders {tile_count} <C.StatTile tiles, expected >= 4 '
+        '(benign rate, 6h breaches, esc/done, churn).'
+    )
+
+    # (f) human-readable labels present (case-insensitive)
+    lower = strip_fn.lower()
+    for token in ('benign', '6h', 'done', 'churn'):
+        assert token in lower, (
+            f'EscalationStatStrip does not have a human-readable tile label '
+            f'containing {token!r} — add a descriptive label to the corresponding tile.'
+        )
