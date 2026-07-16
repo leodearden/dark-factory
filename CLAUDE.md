@@ -570,6 +570,30 @@ scoped to claude-backend roles only — a non-claude-backend role's model
 string is the harness-backend PRD's axis and is never checked against this
 claude-centric allowlist/ceiling.
 
+### Observability
+
+Every resolved invocation emits a `routing_decision` event (`event_store`
+`EventType.routing_decision`) carrying the full `RoutingDecision`
+(model/effort/budget_usd/max_turns, `source_layer`, `rule_id`, `rejected`)
+plus an inputs digest, and mirrors the latest decision to
+`task.metadata.routing` via `TaskWorkflow._record_routing_decision`. The
+mirror (`shared.task_metadata.RoutingState`) stores the latest decision, a
+bounded history (newest 5), a `routing_tier` counter, and a
+`simple_saturated` flag.
+
+### Adaptive-routing substrate (forthcoming automation)
+
+The resolver already supports the `min_routing_tier` and
+`simple_saturated` match conditions and ladder-relative `"+N"` bumps, and
+`metadata.routing` already stores `routing_tier`/`simple_saturated` — this
+is the substrate a later fleet rule (retry-tier escalation, saturation →
+full-path) will consume. **Not yet active on `main`:** the automatic
+retry-tier increment, the `simple_task` saturation auto-stamp,
+`claude-fable-5` admission, and the per-(model×role) rollup in the
+digest/dashboard (done/blocked/cap-hit rates, $/done). Today, operators see
+`routing_decision` events and `metadata.routing` per invocation — not yet
+an auto-escalating ladder or a rendered rollup panel.
+
 ## Session Lifecycle
 
 ### Starting a session
@@ -597,10 +621,12 @@ arguments — it always re-reads that process's own `ORCH_CONFIG_PATH`,
 never another project's.
 
 **Green tier** (hot-reloadable): per-role `models` / `budgets` /
-`max_turns` / `effort` / `timeouts` / `backends`, steward grace
-(`steward_completion_timeout`, `steward_lifetime_budget`), scheduler +
-watcher tuning, `review.*` checkpoint knobs, `unblock_auto.*`,
-`verify_env`, and the `git.offline_lane_*` leaf tunables.
+`max_turns` / `effort` / `timeouts` / `backends`, `routing.*`
+(`allowed_models` / `ladder` / `per_model_daily_ceiling_usd` / `rules` —
+see "Model Routing" above), steward grace (`steward_completion_timeout`,
+`steward_lifetime_budget`), scheduler + watcher tuning, `review.*`
+checkpoint knobs, `unblock_auto.*`, `verify_env`, and the
+`git.offline_lane_*` leaf tunables.
 
 **Red tier** (restart-only — edit is accepted but has no effect until
 restart): `max_concurrent_tasks`, pool sizes / `verify_runners`,
