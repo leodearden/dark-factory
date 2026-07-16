@@ -3953,13 +3953,24 @@ async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root, mo
     await backend.add_task(project_root=project_root, title='T-cancelled', status='cancelled')  # id=4
 
     # --- Set up spy on conn.execute ---
-    conn = await backend._get_connection(project_root)
+    # get_tasks reads via the cached read connection (_get_read_connection,
+    # task 2651), not the write connection (_get_connection) — spy on the
+    # former so this still captures the SQL get_tasks actually issues.
+    conn = await backend._get_read_connection(project_root)
     recorded_sql: list[str] = []
     _orig_execute = conn.execute
 
-    async def _spy_execute(sql: str, *args, **kwargs):
+    # NOT `async def`: aiosqlite's Connection.execute is a plain method that
+    # returns a Result wrapper supporting both `await conn.execute(...)` and
+    # `async with conn.execute(...) as cursor:` (see aiosqlite.core's
+    # `@contextmanager` helper). An `async def` spy would instead return a
+    # bare coroutine — awaitable, but not usable as an async context
+    # manager — breaking any caller that does `async with conn.execute(...)`
+    # (e.g. _fetch_dependencies, task 2651). Passing the Result straight
+    # through preserves both calling conventions.
+    def _spy_execute(sql: str, *args, **kwargs):
         recorded_sql.append(sql)
-        return await _orig_execute(sql, *args, **kwargs)
+        return _orig_execute(sql, *args, **kwargs)
 
     monkeypatch.setattr(conn, 'execute', _spy_execute)
 
@@ -4262,6 +4273,73 @@ async def test_get_statuses_hot_path_fresh_on_reused_warm_connection(
         'Expected _get_read_connection to have reused the cached connection '
         'across both calls above, not opened a new one'
     )
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_and_get_task_agree_under_pinned_write_connection(
+    backend, project_root,
+):
+    """get_task must agree with get_statuses even when the cached WRITE
+    connection has a read transaction pinned open.
+
+    Direct reproduction of the 2026-07-16 recurrence (task 2651 follow-up
+    to task 2455): get_statuses/get_statuses_raw already read via the
+    unpinnable cached read connection (see
+    ``test_get_statuses_hot_path_fresh_despite_pinned_write_connection``,
+    above) and are therefore fresh here. As of task 2651 step-2, get_task
+    reads via that same cached read connection (:meth:`_get_read_connection`)
+    instead of the pinnable cached WRITE connection it used before — see
+    ``get_statuses_raw``'s "Snapshot consistency" note — so with the write
+    connection pinned to a stale pre-commit snapshot and 'cancelled'
+    committed out-of-band, get_task now agrees with get_statuses instead of
+    returning the stale pinned value. This test guards that convergence
+    against regression.
+    """
+    conn = await _pin_write_connection_then_commit_out_of_band(backend, project_root)
+
+    status_map = await backend.get_statuses(project_root, ids=['1'])
+    task = await backend.get_task('1', project_root)
+
+    assert status_map['1'] == 'cancelled', (
+        f"Expected get_statuses to see fresh 'cancelled', got: {status_map}"
+    )
+    assert task['status'] == 'cancelled', (
+        f"get_task must agree with get_statuses (both fresh), got {task['status']!r}"
+    )
+
+    # Release the pin so the fixture's backend.close() isn't left mid-txn.
+    await conn.rollback()
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_tree_fresh_despite_pinned_write_connection(
+    backend, project_root,
+):
+    """get_tasks (the full-tree read) must reflect the latest committed
+    status even when the cached WRITE connection has a read transaction
+    pinned open.
+
+    Companion to
+    ``test_get_statuses_and_get_task_agree_under_pinned_write_connection``
+    (above), covering the full-tree read surface (``get_tasks`` /
+    ``_get_tasks_internal``), which task 2651 step-2's ``get_task`` reroute
+    does NOT itself touch. As of task 2651 step-4, ``_get_tasks_internal``
+    is separately rerouted to the same cached unpinnable read connection
+    (:meth:`_get_read_connection`) that ``get_task`` and ``get_statuses``
+    use — that reroute is exactly why the tree read stays fresh here even
+    with the write connection pinned to a stale pre-commit snapshot.
+    """
+    conn = await _pin_write_connection_then_commit_out_of_band(backend, project_root)
+
+    result = await backend.get_tasks(project_root)
+    by_id = {t['id']: t for t in result['tasks']}
+
+    assert by_id['1']['status'] == 'cancelled', (
+        f"get_tasks tree must reflect the fresh committed status, got {by_id['1']['status']!r}"
+    )
+
+    # Release the pin so the fixture's backend.close() isn't left mid-txn.
+    await conn.rollback()
 
 
 @pytest.mark.asyncio

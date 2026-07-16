@@ -128,9 +128,9 @@ class TestSqliteTaskBackendForeignKeysOff:
     async def test_foreign_keys_off_after_helper(self, tmp_path: Path) -> None:
         _real_connect = aiosqlite.connect
 
-        async def _connect_with_fk_on(path: str) -> aiosqlite.Connection:
+        async def _connect_with_fk_on(path: str, **kwargs) -> aiosqlite.Connection:
             """Open a real connection and enable foreign_keys before returning."""
-            conn = await _real_connect(path)
+            conn = await _real_connect(path, **kwargs)
             await conn.execute('PRAGMA foreign_keys=ON')
             return conn
 
