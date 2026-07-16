@@ -103,6 +103,44 @@ async def test_on_task_done_fast_path_write(reconciler, mock_memory_service):
 
 
 @pytest.mark.asyncio
+async def test_on_task_done_fast_path_write_stamps_stage2_suppress(reconciler, mock_memory_service):
+    """The fast-path completion echo must stamp stage2_suppress=True (task 2642).
+
+    Stage 2's "Completion-Note Suppression Pre-Check" gate
+    (prompts/stage2.py) is a deterministic
+    count_memories_by_metadata(project_id, {'task_id': str(task_id),
+    'stage2_suppress': True}) count -- it ONLY recognizes memories carrying
+    that key. Without this tag, a task completed via TargetedReconciliation
+    shortly before/during a Stage 2 cycle has count==0 and Stage 2
+    re-derives a duplicate completion summary. Tagging the always-written
+    fast-path echo closes that gap with zero LLM/prompt dependency.
+    """
+    task_before = {
+        'id': '5192', 'title': 'Fix the thing', 'status': 'in-progress',
+        'description': 'Some description',
+    }
+    await reconciler.reconcile_task(
+        task_id='5192', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before=task_before,
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert metadata.get('stage2_suppress') is True, (
+        "Expected fast-path completion echo to stamp stage2_suppress=True so "
+        f"Stage 2's count gate recognizes it, got metadata: {metadata}"
+    )
+    assert metadata.get('task_id') == '5192', (
+        f'Expected exact str(task_id) match for Stage 2\'s count filter, got: {metadata}'
+    )
+    # Additive, not a replacement -- the existing fields must still be present.
+    assert metadata.get('source') == 'targeted_reconciliation'
+    assert metadata.get('transition') == 'done'
+
+
+@pytest.mark.asyncio
 async def test_on_task_done_passes_causation_id(reconciler, mock_memory_service):
     """All memory calls during targeted recon pass causation_id=run_id."""
     task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
