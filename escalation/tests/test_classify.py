@@ -5,6 +5,8 @@ effective-benign predicate, and the per-path benign default helper
 
 from __future__ import annotations
 
+import pytest
+
 from escalation.classify import (
     classify_resolver_tier,
     default_resolution_class_for_resolver,
@@ -136,6 +138,13 @@ class TestEffectiveBenign:
         """Pending record (resolution_class=None, status='pending') -> (None, 'excluded')."""
         record = _make_escalation(status='pending', resolution_class=None)
         assert effective_benign(record) == (None, 'excluded')
+
+    def test_unmodeled_status_raises(self):
+        """An unstamped record with a status outside {pending,resolved,dismissed}
+        must raise, not silently resolve to ('excluded') — no-silent-fail-soft."""
+        record = _make_escalation(status='cancelled', resolution_class=None)
+        with pytest.raises(ValueError, match='cancelled'):
+            effective_benign(record)
 
 
 class TestDefaultResolutionClassForResolver:

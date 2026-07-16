@@ -74,8 +74,14 @@ def effective_benign(record: Escalation) -> tuple[str | None, str]:
       physically set either way).
     - Unstamped and ``status == 'dismissed'`` -> ``('benign', 'inferred')``.
     - Unstamped and ``status == 'resolved'`` -> ``('actionable', 'inferred')``.
-    - Otherwise (``status == 'pending'``) -> ``(None, 'excluded')`` — an open
+    - Unstamped and ``status == 'pending'`` -> ``(None, 'excluded')`` — an open
       escalation has no resolution to classify yet.
+
+    Raises ``ValueError`` for any other ``status`` value. Only ``'pending'``,
+    ``'resolved'``, and ``'dismissed'`` are modeled (models.Escalation.status);
+    an unrecognised status must be surfaced loudly rather than silently folded
+    into ``'excluded'`` (no-silent-fail-soft) — a future terminal status would
+    otherwise vanish from benign/actionable aggregation with no signal.
     """
     if record.resolution_class is not None:
         return record.resolution_class, 'stamped'
@@ -83,7 +89,12 @@ def effective_benign(record: Escalation) -> tuple[str | None, str]:
         return 'benign', 'inferred'
     if record.status == 'resolved':
         return 'actionable', 'inferred'
-    return None, 'excluded'
+    if record.status == 'pending':
+        return None, 'excluded'
+    raise ValueError(
+        f'effective_benign: unrecognized status {record.status!r} on escalation '
+        f'{record.id!r}; expected one of (pending, resolved, dismissed)'
+    )
 
 
 def default_resolution_class_for_resolver(resolved_by: str | None) -> str | None:
