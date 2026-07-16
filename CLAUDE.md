@@ -415,6 +415,63 @@ merge-lane `git.*` structural fields.
 allowlist and `skills/orchestrate/SKILL.md`'s "Reload Config (vs Restart)"
 section for the operator workflow.
 
+## Orchestrator Fleet Redeploy
+
+Three restart mechanisms act on the orchestrator fleet and are
+deliberately kept orthogonal — don't conflate them when debugging a
+restart:
+
+- **Liveness = brokenness.** `scripts/orchestrator-watchdog.py`'s `main()`
+  port-probe pass revives a wedged/port-down unit immediately: per-unit,
+  uncapped, not gated by the fleet-deploy clock, and it never stamps that
+  clock. A single wedged-unit revive is not a fleet deploy.
+- **Staleness = a scheduled fleet deploy.** The watchdog's staleness pass
+  is the backstop: capped to at most one fleet-wide redeploy per 8h
+  (`orchestrator_restart_min_interval_secs`) via the shared fleet-deploy
+  clock (`data/orchestrator/last_redeploy_orchestrator.json`), and it
+  delegates the actual restart to `scripts/restart-all-orchestrators.sh
+  --drain` — which is drain-aware (defers a unit that's mid-merge,
+  force-restarts it after ~75 min of continuous busy) and stamps the
+  clock only once the restart is fully verified (script exit 0).
+- **Coordinator = the polite, event-driven trigger for that same
+  deploy.** It fires on a clean window, or force-fires after
+  `orchestrator_restart_force_fire_after_secs` (default 4500s / 75 min)
+  of eligibility — bypassing the idle/debounce gates — but honors the
+  identical shared 8h clock, so the coordinator and the watchdog backstop
+  never both redeploy inside the same window.
+
+Both staleness and the coordinator funnel through the single
+`restart-all-orchestrators.sh --drain` chokepoint, so drain behavior and
+clock-stamping are defined once and can't drift between the two triggers.
+
+**Reading `--report`.** Run `scripts/orchestrator-watchdog.py --report`
+to inspect fleet state without touching it — it is strictly read-only
+(zero mutating `systemctl` calls, no clock write). Alongside the existing
+UNIT / START / NEWEST WATCHED COMMIT / VERDICT columns it prints:
+
+- **DEPLOY-AGE** — time since the last *verified* fleet deploy (the
+  shared clock), fleet-wide, rendered in hours; `unknown` if the clock
+  has never been stamped.
+- **MERGE-IDLE** — the unit's current heartbeat classification
+  (`idle` / `busy` / `stale` / `absent`) — the same classification the
+  drain gate itself uses.
+- **WOULD-DEFER** — `yes` iff MERGE-IDLE is `busy`: the one case the next
+  drain-aware deploy would actually hold back. `idle` proceeds
+  immediately; `stale` / `absent` proceed after the drain gate's short
+  unknown-grace.
+
+Reach for `--report` before manually restarting a unit, or to check
+whether an upcoming deploy is likely to be held up by an in-flight merge.
+
+**Soak signal to monitor (not a code premise).** The scheme assumes the
+8h window comfortably exceeds the longest single merge-verify (today,
+Reify verifies run >30 min but well under 8h). If any verify ever
+approaches 8h, the anti-livelock guarantee — a merge started right after
+a deploy survives to the next boundary — weakens. Treat this as an
+operational soak signal to watch, not something enforced in code; see
+`plans/orchestrator-fleet-redeploy-throughput-prd.md` (G6) for the full
+rationale.
+
 ## Working in the main checkout
 
 The `project_root` checkout (`/home/leo/src/dark-factory`) is **machine-operated**

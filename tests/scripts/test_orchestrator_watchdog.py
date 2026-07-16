@@ -7,9 +7,12 @@ No live systemd runtime is needed — all subprocess.run calls are monkeypatched
 """
 
 import importlib.util
+import json
+import os
 import pathlib
 import re
 import subprocess
+import time
 import types
 
 import pytest  # pyright: ignore[reportMissingImports]
@@ -2599,6 +2602,346 @@ def test_report_unknown_verdict_does_not_force_exit_1(monkeypatch: pytest.Monkey
     assert wdog.report() == 0
 
 
+def test_report_includes_deploy_age_column(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """report() gains a DEPLOY-AGE column: the fleet-wide age since the
+    shared fleet-deploy clock (task 2396 β), rendered in hours to one
+    decimal and repeated on every row — like the existing NEWEST WATCHED
+    COMMIT column. Pre-existing UNIT/START/NEWEST WATCHED COMMIT/VERDICT
+    columns must still be present. Fails today: report() has no DEPLOY-AGE
+    column yet.
+    """
+    wdog = _load_watchdog()
+
+    commit_epoch = 1_800_000_000
+    unit = "orchestrator-unit0.service"
+    start_epoch = commit_epoch + 100  # fresh
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{unit} loaded active running desc\n", stderr=""
+            )
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epoch}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    now = 2_000_000_000.0
+    clock_file = tmp_path / "clock.json"
+    clock_file.write_text(
+        f'{{"ts": {now - 3 * 3600}, "iso": "2026-07-15T21:00:00+00:00"}}'
+    )
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    wdog.report()
+
+    captured = capsys.readouterr()
+    header_line = next(line for line in captured.out.splitlines() if line.startswith("UNIT"))
+    for col in ("UNIT", "START", "NEWEST WATCHED COMMIT", "VERDICT", "DEPLOY-AGE"):
+        assert col in header_line, f"expected column {col!r} in header: {header_line!r}"
+
+    unit_line = next(line for line in captured.out.splitlines() if line.startswith(unit))
+    assert "3.0h" in unit_line, f"expected DEPLOY-AGE ~3.0h in row: {unit_line!r}"
+
+
+def test_report_deploy_age_unknown_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """DEPLOY-AGE renders 'unknown' when the shared fleet-deploy clock file
+    is absent (no fleet deploy has ever verified fresh, or a fresh checkout
+    with no data/ yet) — mirrors _read_last_fleet_deploy_epoch's fail-open
+    contract. Fails today: report() has no DEPLOY-AGE column yet.
+    """
+    wdog = _load_watchdog()
+
+    commit_epoch = 1_800_000_000
+    unit = "orchestrator-unit0.service"
+    start_epoch = commit_epoch + 100  # fresh
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{unit} loaded active running desc\n", stderr=""
+            )
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epoch}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(tmp_path / "absent.json"))
+    monkeypatch.setattr(wdog.time, "time", lambda: 2_000_000_000.0)
+
+    wdog.report()
+
+    captured = capsys.readouterr()
+    unit_line = next(line for line in captured.out.splitlines() if line.startswith(unit))
+    assert "unknown" in unit_line, f"expected DEPLOY-AGE 'unknown' in row: {unit_line!r}"
+
+
+def test_report_includes_merge_idle_and_would_defer_columns(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """report() gains MERGE-IDLE (idle/busy/stale/absent, matching
+    drain_check.classify exactly) and WOULD-DEFER (yes iff MERGE-IDLE is
+    'busy') columns, populated from real per-unit heartbeat files under a
+    tmp ORCH_FLEET_DIR. Fails today: report() has neither column yet.
+
+    All four units share the same start/commit relationship (fresh) so the
+    pre-existing VERDICT column can't be confused with the new MERGE-IDLE
+    values in this assertion; row values are extracted positionally
+    (the last four whitespace-separated tokens are VERDICT, DEPLOY-AGE,
+    MERGE-IDLE, WOULD-DEFER, in that order) so the START/NEWEST WATCHED
+    COMMIT timestamp columns' embedded spaces can't misalign a naive split.
+    """
+    wdog = _load_watchdog()
+
+    commit_epoch = 1_800_000_000
+    now = 2_000_000_000.0
+    # unit->(merge_idle, ts_epoch) heartbeat fixture, or None for "no file".
+    units = [
+        "orchestrator-alpha.service",  # idle: fresh + merge_idle=True
+        "orchestrator-bravo.service",  # busy: fresh + merge_idle=False
+        "orchestrator-charlie.service",  # stale: ts_epoch far outside the fresh window
+        "orchestrator-delta.service",  # absent: no heartbeat file at all
+    ]
+    start_epochs = {u: commit_epoch + 100 for u in units}  # all fresh vs. commit
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            stdout = "".join(f"{u} loaded active running desc\n" for u in units)
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            unit = cmd[3]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epochs[unit]}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    # Keep DEPLOY-AGE deterministically 'unknown' — irrelevant to this test.
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(tmp_path / "absent_clock.json"))
+
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    monkeypatch.setenv("ORCH_FLEET_DIR", str(fleet_dir))
+
+    def _write_heartbeat(unit: str, *, merge_idle: bool, ts_epoch: float) -> None:
+        (fleet_dir / f"{unit}.json").write_text(
+            json.dumps(
+                {
+                    "unit": unit,
+                    "merge_idle": merge_idle,
+                    "depth": 0,
+                    "queue_empty": merge_idle,
+                    "ts_epoch": ts_epoch,
+                }
+            )
+        )
+
+    _write_heartbeat(units[0], merge_idle=True, ts_epoch=now - 10)
+    _write_heartbeat(units[1], merge_idle=False, ts_epoch=now - 10)
+    _write_heartbeat(units[2], merge_idle=True, ts_epoch=now - 100_000)
+    # units[3] ("delta"/absent): deliberately no heartbeat file written.
+
+    wdog.report()
+
+    captured = capsys.readouterr()
+    header_line = next(line for line in captured.out.splitlines() if line.startswith("UNIT"))
+    assert "MERGE-IDLE" in header_line, f"expected MERGE-IDLE in header: {header_line!r}"
+    assert "WOULD-DEFER" in header_line, f"expected WOULD-DEFER in header: {header_line!r}"
+
+    expected_merge = {
+        units[0]: "idle",
+        units[1]: "busy",
+        units[2]: "stale",
+        units[3]: "absent",
+    }
+    expected_defer = {
+        units[0]: "no",
+        units[1]: "yes",
+        units[2]: "no",
+        units[3]: "no",
+    }
+    for unit in units:
+        line = next(entry for entry in captured.out.splitlines() if entry.startswith(unit))
+        tokens = line.split()
+        _verdict_tok, _deploy_age_tok, merge_tok, defer_tok = tokens[-4:]
+        assert merge_tok == expected_merge[unit], (
+            f"{unit}: expected MERGE-IDLE={expected_merge[unit]!r}, got {merge_tok!r} "
+            f"in line {line!r}"
+        )
+        assert defer_tok == expected_defer[unit], (
+            f"{unit}: expected WOULD-DEFER={expected_defer[unit]!r}, got {defer_tok!r} "
+            f"in line {line!r}"
+        )
+
+
+def test_report_merge_idle_degrades_to_unknown_when_drain_check_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """_classify_unit_heartbeat's fail-soft branch (scripts/orchestrator-
+    watchdog.py): when the lazy drain_check reuse path raises for any reason
+    (here, drain_check.resolve_fleet_dir() itself blowing up), report() must
+    still complete rather than crash, render MERGE-IDLE='unknown' with
+    WOULD-DEFER='no' for the affected row (never silently drop the row,
+    never guess a verdict), and log a WARNING naming the swallowed
+    exception -- honoring the loud-over-silent-degradation norm.
+
+    Regression lock for the except-block in _classify_unit_heartbeat, which
+    the four real-heartbeat-file cases above (idle/busy/stale/absent) never
+    exercise -- a future refactor that turned the swallow into a crash, or
+    that dropped the WARNING, would otherwise pass CI.
+    """
+    wdog = _load_watchdog()
+    import drain_check
+
+    commit_epoch = 1_800_000_000
+    now = 2_000_000_000.0
+    unit = "orchestrator-foxtrot.service"
+    start_epoch = commit_epoch + 100  # fresh vs. commit -- irrelevant to this test
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{unit} loaded active running desc\n", stderr=""
+            )
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epoch}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(tmp_path / "absent_clock.json"))
+
+    def _boom():
+        raise OSError("simulated: fleet dir unreadable")
+
+    monkeypatch.setattr(drain_check, "resolve_fleet_dir", _boom)
+
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda msg: logged.append(msg))
+
+    exit_code = wdog.report()
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    line = next(entry for entry in captured.out.splitlines() if entry.startswith(unit))
+    tokens = line.split()
+    _verdict_tok, _deploy_age_tok, merge_tok, defer_tok = tokens[-4:]
+    assert merge_tok == "unknown", (
+        f"expected MERGE-IDLE='unknown' when drain_check raises, got {merge_tok!r} "
+        f"in line {line!r}"
+    )
+    assert defer_tok == "no", (
+        f"expected WOULD-DEFER='no' when MERGE-IDLE is unknown, got {defer_tok!r} "
+        f"in line {line!r}"
+    )
+    assert any(
+        "WARNING" in msg and "_classify_unit_heartbeat" in msg for msg in logged
+    ), f"expected a WARNING naming _classify_unit_heartbeat's swallowed exception, got {logged!r}"
+
+
+def test_report_extended_columns_stay_read_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """I8 guard: report(), now populating DEPLOY-AGE/MERGE-IDLE/WOULD-DEFER,
+    still performs zero mutating systemctl calls and never writes the shared
+    fleet-deploy clock file.
+
+    Pre-seeds BOTH the clock file (with a sentinel payload, captured
+    byte-for-byte) and a per-unit heartbeat under a tmp ORCH_FLEET_DIR — so
+    the new columns are actually populated from real reads, not the
+    trivially-true empty/absent path — before driving report() through its
+    real helpers with a recording fake subprocess.run. Regression lock for
+    the read-only contract, independent of the mixed-fleet acceptance test
+    (scenario 9) added later.
+    """
+    wdog = _load_watchdog()
+
+    commit_epoch = 1_800_000_000
+    now = 2_000_000_000.0
+    unit = "orchestrator-echo.service"
+    start_epoch = commit_epoch + 100  # fresh
+
+    recorded_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        recorded_calls.append(list(cmd))
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{unit} loaded active running desc\n", stderr=""
+            )
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epoch}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda u: pytest.fail(f"report() must never restart {u}")
+    )
+
+    clock_file = tmp_path / "clock.json"
+    clock_payload = '{"ts": 1783000000.0, "iso": "2026-07-16T00:00:00+00:00"}'
+    clock_file.write_text(clock_payload)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    monkeypatch.setenv("ORCH_FLEET_DIR", str(fleet_dir))
+    (fleet_dir / f"{unit}.json").write_text(
+        json.dumps(
+            {
+                "unit": unit,
+                "merge_idle": True,
+                "depth": 0,
+                "queue_empty": True,
+                "ts_epoch": now - 10,
+            }
+        )
+    )
+
+    exit_code = wdog.report()
+
+    assert exit_code == 0
+    assert recorded_calls, "report() must have driven subprocess.run for this test to mean anything"
+    _assert_zero_mutating_calls(recorded_calls)
+    assert clock_file.read_text() == clock_payload, (
+        "report() must never write the shared fleet-deploy clock file"
+    )
+
+
 # ---------------------------------------------------------------------------
 # _cli tests
 # ---------------------------------------------------------------------------
@@ -2675,4 +3018,784 @@ def test_cli_defaults_to_sys_argv(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert calls == ["report"]
     assert exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# Boundary-scenario acceptance gate (task 2399, ε of
+# plans/orchestrator-fleet-redeploy-throughput-prd.md's §Boundary-test-sketch,
+# scenarios 1-10). Ties invariants I1-I9 to end-to-end behavior across the
+# now-landed α (fleet_heartbeat.py) / β (shared fleet-deploy clock) / γ
+# (drain gate) / δ (coordinator fire-while-busy) work.
+#
+# NOT to be confused with the "staleness_pass END-TO-END tests (δ task 2027,
+# scenarios 1-4)" block earlier in this file -- that numbering belongs to the
+# OLDER, now-superseded plans/orchestrator-fleet-staleness-prd.md. Every test
+# below is prefixed test_boundaryN_ (N = THIS PRD's own 1-10 numbering) to
+# keep the two schemes unambiguous.
+#
+# Per-contract UNIT coverage already exists in the α/β/γ/δ suites (this
+# module's own β-adjacent tests above, scripts/tests/test_restart_all_
+# orchestrators.py, orchestrator/tests/test_fleet_staleness_composition.py,
+# orchestrator/tests/test_merge_queue_restart_hook.py) -- this section adds
+# the acceptance-level restatement the PRD calls for, not duplicate unit
+# tests.
+# ---------------------------------------------------------------------------
+
+
+def test_boundary1_staleness_inside_window_real_clock_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Scenario 1 (I1) -- staleness inside the 8h window, via a REAL on-disk
+    fleet-deploy clock file (not a monkeypatched _within_fleet_deploy_min_
+    interval -- see test_staleness_pass_skips_when_within_fleet_deploy_min_
+    interval above for that unit-level variant). Exercises the real
+    _read_last_fleet_deploy_epoch() file-read + _within_fleet_deploy_min_
+    interval() comparison end-to-end, with a would-be-stale unit present in
+    the fleet, via the _fleet_fake_run harness.
+
+    Asserts neither tier acts (zero mutating systemctl calls AND zero
+    systemd-run fleet-restart delegation) and that a "skip: within
+    fleet-deploy min-interval" journal line naming
+    ORCH_RESTART_MIN_INTERVAL_SECS is logged -- "now" is pinned to a
+    SKIP_LOG_INTERVAL_SECS bucket boundary so the skip line is guaranteed
+    (not suppressed by the log-rate-limit throttle exercised by
+    test_staleness_pass_suppresses_skip_log_outside_log_bucket above).
+    """
+    wdog = _load_watchdog()
+
+    now = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0
+    clock_ts = now - 2 * 3600  # ~2h ago -- well inside the 28800s default window
+    clock_file = tmp_path / "clock.json"
+    clock_file.write_text(json.dumps({"ts": clock_ts, "iso": "2026-07-16T00:00:00+00:00"}))
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace, if ever reached
+    unit = "orchestrator-know-live.service"
+    start_epochs = {unit: commit_epoch - 100}  # would-be-stale if the gate did not close first
+
+    recorded_calls: list[list[str]] = []
+    log_messages: list[str] = []
+    fake_run = _fleet_fake_run(
+        units=[unit],
+        commit_epoch=commit_epoch,
+        start_epochs=start_epochs,
+        recorded_calls=recorded_calls,
+        log_messages=log_messages,
+    )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
+
+    wdog.staleness_pass()
+
+    assert not any(c[:3] == ["systemctl", "--user", "list-units"] for c in recorded_calls), (
+        f"the real fleet-deploy clock gate must close before enumeration; got {recorded_calls}"
+    )
+    _assert_zero_mutating_calls(recorded_calls)
+    assert not any(c[0] == "systemd-run" for c in recorded_calls), (
+        f"must not delegate a fleet restart while inside the real clock's "
+        f"min-interval window; got {recorded_calls}"
+    )
+    assert any(
+        "skip" in m and str(wdog.ORCH_RESTART_MIN_INTERVAL_SECS) in m for m in log_messages
+    ), f"Expected a skip log line naming the fleet-deploy min-interval: {log_messages}"
+
+
+# ---------------------------------------------------------------------------
+# Boundary scenarios 2-6 (I1/I2/I3/I4/I6): drive the REAL
+# scripts/restart-all-orchestrators.sh --drain via subprocess, against a
+# local fake multi-unit `systemctl` on PATH + crafted heartbeats.
+#
+# Reimplements -- rather than imports across test directories, which isn't
+# clean -- the proven harnesses in tests/scripts/test_restart_all_
+# orchestrators.py (fake-binary-on-PATH + clock-stamp pattern) and
+# scripts/tests/test_restart_all_orchestrators.py (multi-unit fake systemctl
+# with per-unit state + the drain env-knob techniques: force-fire=0 for
+# force, unknown-grace=0 for absent, a bounded subprocess timeout for defer).
+# ---------------------------------------------------------------------------
+
+RESTART_ALL_SCRIPT = REPO_ROOT / "scripts" / "restart-all-orchestrators.sh"
+
+# Stateful fake `systemctl`: `list-units` reports every entry in
+# running_units; `show -p FIELDS UNIT` and `restart UNIT` operate on
+# state["units"][UNIT], keyed by a "scenario" ("fresh" advances MainPID/
+# ActiveState/ActiveEnterTimestampMonotonic on restart, simulating a verified
+# restart; "stale" -- the default -- never advances, simulating a restart
+# that never came back up fresh). Every call is recorded into state["calls"]
+# for assertions. Verbatim reimplementation of
+# scripts/tests/test_restart_all_orchestrators.py's FAKE_SYSTEMCTL_SRC.
+_BOUNDARY_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
+"""Fake multi-unit `systemctl` for ε's --drain boundary scenarios."""
+import json
+import os
+import sys
+
+STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
+
+
+def _load():
+    with open(STATE_PATH) as f:
+        return json.load(f)
+
+
+def _save(state):
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f)
+
+
+def main(argv):
+    args = [a for a in argv[1:] if a != "--user"]
+    if not args:
+        return 1
+    verb, rest = args[0], args[1:]
+
+    state = _load()
+    state.setdefault("calls", []).append(argv[1:])
+
+    if verb == "list-units":
+        for unit in state.get("running_units", []):
+            print(f"{unit} loaded active running Orchestrator")
+        _save(state)
+        return 0
+
+    if verb == "restart":
+        unit = rest[0] if rest else ""
+        units = state.setdefault("units", {})
+        ustate = units.setdefault(unit, {})
+        scenario = ustate.get("scenario", "stale")
+        if scenario == "fresh":
+            ustate["MainPID"] = ustate.get("MainPID", 1000) + 1
+            ustate["ActiveState"] = "active"
+            ustate["ActiveEnterTimestampMonotonic"] = (
+                ustate.get("ActiveEnterTimestampMonotonic", 0) + 5_000_000
+            )
+            ustate["ActiveEnterTimestamp"] = "restarted"
+        _save(state)
+        return 0
+
+    if verb == "show":
+        fields = None
+        unit = None
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok == "-p":
+                fields = rest[i + 1]
+                i += 2
+            elif tok.startswith("--property="):
+                fields = tok.split("=", 1)[1]
+                i += 1
+            elif tok.startswith("-"):
+                i += 1
+            else:
+                unit = tok
+                i += 1
+        ustate = state.get("units", {}).get(unit, {})
+        current = {
+            "MainPID": str(ustate.get("MainPID", 0)),
+            "ActiveState": ustate.get("ActiveState", "active"),
+            "ActiveEnterTimestamp": ustate.get("ActiveEnterTimestamp", "baseline"),
+            "ActiveEnterTimestampMonotonic": str(ustate.get("ActiveEnterTimestampMonotonic", 0)),
+        }
+        keys = fields.split(",") if fields else list(current.keys())
+        for k in keys:
+            print(f"{k}={current.get(k, '')}")
+        _save(state)
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+'''
+
+
+def _boundary_make_fake_systemctl(base_dir, *, running_units, units=None):
+    """Write a fake multi-unit `systemctl` into <base_dir>/bin/.
+
+    Returns (bin_dir, state_path). parents=True/exist_ok=True so callers may
+    pass a not-yet-created base_dir (e.g. a fresh sub-scenario directory).
+    """
+    bin_dir = base_dir / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    fake = bin_dir / "systemctl"
+    fake.write_text(_BOUNDARY_FAKE_SYSTEMCTL_SRC)
+    fake.chmod(0o755)
+
+    state_path = base_dir / "systemctl_state.json"
+    state_path.write_text(json.dumps({
+        "running_units": list(running_units),
+        "units": units or {},
+        "calls": [],
+    }))
+    return bin_dir, state_path
+
+
+def _boundary_write_heartbeat(fleet_dir, unit, **overrides):
+    """Write a heartbeat JSON matching fleet_heartbeat.py's on-disk contract."""
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "unit": unit,
+        "merge_idle": True,
+        "depth": 0,
+        "queue_empty": True,
+        "ts_epoch": time.time(),
+    }
+    payload.update(overrides)
+    (fleet_dir / f"{unit}.json").write_text(json.dumps(payload))
+
+
+def _boundary_run_drain_script(
+    bin_dir, state_path, fleet_dir, clock_file, *, env=None, timeout=20
+):
+    """Run the REAL restart-all-orchestrators.sh --drain with the fake
+    systemctl prepended onto PATH."""
+    full_env = dict(os.environ)
+    full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
+    full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
+    full_env["ORCH_FLEET_DIR"] = str(fleet_dir)
+    full_env["ORCH_FLEET_DEPLOY_CLOCK"] = str(clock_file)
+    if env:
+        full_env.update(env)
+    return subprocess.run(
+        ["bash", str(RESTART_ALL_SCRIPT), "--drain"],
+        env=full_env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _boundary_load_state(state_path):
+    return json.loads(state_path.read_text())
+
+
+def _boundary_decode(maybe_bytes):
+    """subprocess.run's TimeoutExpired attaches partial output as bytes even
+    when text=True was passed to the original call -- normalize."""
+    if maybe_bytes is None:
+        return ""
+    if isinstance(maybe_bytes, bytes):
+        return maybe_bytes.decode(errors="replace")
+    return maybe_bytes
+
+
+_UNIT_SUITE_FAKE_SYSTEMCTL_PATH = REPO_ROOT / "scripts" / "tests" / "test_restart_all_orchestrators.py"
+
+
+def _fake_systemctl_functional_body(fake_systemctl_src: str) -> str:
+    """Strip the module-level shebang/docstring preamble, returning the fake
+    systemctl's actual behavior (from the first `import json` line onward).
+
+    The two copies' module docstrings are intentionally different -- each is
+    contextualized to its own test file -- so comparing from here down
+    isolates what actually matters for drift (the verbs/fields the fake
+    models) from that cosmetic difference.
+    """
+    marker = "\nimport json\n"
+    idx = fake_systemctl_src.index(marker)
+    return fake_systemctl_src[idx:]
+
+
+def test_boundary_fake_systemctl_matches_unit_suite_verbatim() -> None:
+    """DRIFT GUARD: _BOUNDARY_FAKE_SYSTEMCTL_SRC (this file's local
+    reimplementation, used by scenarios 2-6 above) must stay in lockstep
+    with scripts/tests/test_restart_all_orchestrators.py's
+    FAKE_SYSTEMCTL_SRC, which it deliberately reimplements rather than
+    imports across test directories (see the module comment above the
+    boundary-harness block). If the real restart-all-orchestrators.sh
+    starts querying a systemctl field neither fake models, or the unit
+    suite's fake gains support for it and this module's copy doesn't, this
+    test fails loudly instead of the two suites silently drifting apart.
+    """
+    unit_suite_src = _UNIT_SUITE_FAKE_SYSTEMCTL_PATH.read_text()
+    match = re.search(r"^FAKE_SYSTEMCTL_SRC = '''(.*?)'''$", unit_suite_src, re.S | re.M)
+    assert match, (
+        f"could not locate FAKE_SYSTEMCTL_SRC in {_UNIT_SUITE_FAKE_SYSTEMCTL_PATH} "
+        "-- has it been renamed or restructured?"
+    )
+    unit_suite_fake = match.group(1)
+
+    assert _fake_systemctl_functional_body(unit_suite_fake) == _fake_systemctl_functional_body(
+        _BOUNDARY_FAKE_SYSTEMCTL_SRC
+    ), (
+        "_BOUNDARY_FAKE_SYSTEMCTL_SRC has drifted from "
+        f"{_UNIT_SUITE_FAKE_SYSTEMCTL_PATH}'s FAKE_SYSTEMCTL_SRC -- update this "
+        "file's copy (or promote both to a shared fixture) to match."
+    )
+
+
+def test_boundary2_all_idle_restarts_and_stamps_clock(tmp_path: pathlib.Path) -> None:
+    """Scenario 2 (I1/I2/I6) -- staleness past 8h, all idle: the REAL
+    restart-all-orchestrators.sh --drain restarts every unit, verifies each
+    fresh, and stamps the shared fleet-deploy clock afterward.
+
+    Drives the actual bash script + drain_check.py end-to-end via subprocess
+    against a local fake multi-unit `systemctl` on PATH, with >=2 running
+    units, all heartbeats fresh + merge_idle=True (idle -> transparent, no
+    defer/force line). The clock file does not exist beforehand -- the
+    script's own stamp_fleet_deploy_clock is what creates it: a new
+    integration combo (drain-idle + verify + stamp together) beyond the
+    pre-existing per-contract suites, which test drain and stamping
+    separately.
+    """
+    fleet_dir = tmp_path / "fleet"
+    unit_a = "orchestrator-alpha.service"
+    unit_b = "orchestrator-bravo.service"
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path,
+        running_units=[unit_a, unit_b],
+        units={unit_a: {"scenario": "fresh"}, unit_b: {"scenario": "fresh"}},
+    )
+    _boundary_write_heartbeat(fleet_dir, unit_a, merge_idle=True, ts_epoch=time.time())
+    _boundary_write_heartbeat(fleet_dir, unit_b, merge_idle=True, ts_epoch=time.time())
+
+    clock_file = tmp_path / "clock.json"
+    assert not clock_file.exists()
+
+    result = _boundary_run_drain_script(
+        bin_dir, state_path, fleet_dir, clock_file,
+        env={"RESTART_VERIFY_TIMEOUT": "5"},
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    state = _boundary_load_state(state_path)
+    assert ["--user", "restart", unit_a] in state["calls"], state["calls"]
+    assert ["--user", "restart", unit_b] in state["calls"], state["calls"]
+    assert clock_file.exists(), "a fully-verified drain-aware restart must stamp the clock"
+    stamped = json.loads(clock_file.read_text())
+    assert isinstance(stamped["ts"], (int, float)), f"ts must be numeric; got {stamped!r}"
+
+
+def test_boundary3_failed_verify_leaves_clock_unchanged(tmp_path: pathlib.Path) -> None:
+    """Scenario 3 (I2 negative) -- stamp-on-verify only, WITH --drain: when
+    one unit's fake systemctl never advances ActiveEnterTimestampMonotonic
+    (never verifies fresh) after --drain restarts it, the script exits 1 and
+    the shared fleet-deploy clock is left byte-identical -- a failed/partial
+    verify must NOT stamp even under --drain, so a failed detached deploy
+    can never silence the watchdog backstop for a full min-interval window.
+    """
+    fleet_dir = tmp_path / "fleet"
+    unit_ok = "orchestrator-alpha.service"
+    unit_bad = "orchestrator-bravo.service"
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path,
+        running_units=[unit_ok, unit_bad],
+        units={unit_ok: {"scenario": "fresh"}, unit_bad: {"scenario": "stale"}},
+    )
+    _boundary_write_heartbeat(fleet_dir, unit_ok, merge_idle=True, ts_epoch=time.time())
+    _boundary_write_heartbeat(fleet_dir, unit_bad, merge_idle=True, ts_epoch=time.time())
+
+    clock_file = tmp_path / "clock.json"
+    sentinel = '{"ts": 1.0}'
+    clock_file.write_text(sentinel)
+
+    result = _boundary_run_drain_script(
+        bin_dir, state_path, fleet_dir, clock_file,
+        env={"RESTART_VERIFY_TIMEOUT": "2"},
+    )
+
+    assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert clock_file.read_text() == sentinel, (
+        f"clock file must be byte-identical after a failed verify even under "
+        f"--drain; got {clock_file.read_text()!r}"
+    )
+
+
+def test_boundary4_defers_busy_unit_while_others_proceed(tmp_path: pathlib.Path) -> None:
+    """Scenario 4 (I3) -- drain-defer: a unit R with a fresh
+    merge_idle:false heartbeat is withheld from restart while a large
+    ORCH_RESTART_FORCE_FIRE_AFTER_SECS is in effect -- proven via a bounded
+    subprocess timeout (the script is still polling, not merely fast),
+    mirroring scripts/tests/test_restart_all_orchestrators.py::
+    test_defer_withholds_restart_while_busy. R is ordered AFTER a plain idle
+    unit, so the idle unit's restart being recorded before the timeout shows
+    other units proceed while R defers.
+    """
+    fleet_dir = tmp_path / "fleet"
+    unit_idle = "orchestrator-alpha.service"
+    unit_r = "orchestrator-reify.service"
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path,
+        running_units=[unit_idle, unit_r],
+        units={unit_idle: {"scenario": "fresh"}, unit_r: {"scenario": "fresh"}},
+    )
+    _boundary_write_heartbeat(fleet_dir, unit_idle, merge_idle=True, ts_epoch=time.time())
+    _boundary_write_heartbeat(fleet_dir, unit_r, merge_idle=False, ts_epoch=time.time())
+
+    clock_file = tmp_path / "clock.json"
+
+    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+        _boundary_run_drain_script(
+            bin_dir, state_path, fleet_dir, clock_file,
+            env={
+                "RESTART_VERIFY_TIMEOUT": "5",
+                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": "99999",
+                "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            },
+            # Wide margin over the couple of bash+python3 subprocess spawns
+            # needed to reach the assertion point below (SELF_UNIT/list-units,
+            # the idle unit's drain-check+baseline+restart, R's drain-check)
+            # so a loaded CI host can't push the idle unit's restart past the
+            # cutoff and flake the ordering assertion; FORCE_FIRE_AFTER_SECS
+            # is 99999s, so widening this can't accidentally let R's own
+            # restart land before the timeout fires.
+            timeout=8,
+        )
+
+    stdout = _boundary_decode(exc_info.value.stdout)
+    assert f"deferring restart of {unit_r}: mid-merge" in stdout, (
+        f"expected a stable defer-prefix line naming {unit_r}; got stdout={stdout!r}"
+    )
+    state = _boundary_load_state(state_path)
+    assert ["--user", "restart", unit_r] not in state["calls"], (
+        f"{unit_r}'s restart must NOT have been recorded yet; got calls={state['calls']!r}"
+    )
+    assert ["--user", "restart", unit_idle] in state["calls"], (
+        f"the idle unit ordered before {unit_r} must already be restarted "
+        f"while {unit_r} defers; got calls={state['calls']!r}"
+    )
+
+
+def test_boundary5_force_restarts_busy_unit_after_grace(tmp_path: pathlib.Path) -> None:
+    """Scenario 5 (I3) -- drain force after grace: a unit R continuously
+    busy (fresh merge_idle:false heartbeat) is force-restarted once
+    ORCH_RESTART_FORCE_FIRE_AFTER_SECS elapses -- here 0, so immediately --
+    printing a "force-restarting" line, actually issuing the restart call,
+    and exiting 0 (one re-verified merge accepted; recover_pending_merges
+    makes it crash-safe -- see test_boundary10 below).
+    """
+    fleet_dir = tmp_path / "fleet"
+    unit_r = "orchestrator-reify.service"
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path, running_units=[unit_r], units={unit_r: {"scenario": "fresh"}},
+    )
+    _boundary_write_heartbeat(fleet_dir, unit_r, merge_idle=False, ts_epoch=time.time())
+
+    clock_file = tmp_path / "clock.json"
+
+    result = _boundary_run_drain_script(
+        bin_dir, state_path, fleet_dir, clock_file,
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": "0",
+        },
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "force-restarting" in result.stdout.lower(), (
+        f"expected a force-restart line; got stdout={result.stdout!r}"
+    )
+    state = _boundary_load_state(state_path)
+    assert ["--user", "restart", unit_r] in state["calls"], (
+        f"expected a restart call for {unit_r}; got calls={state['calls']!r}"
+    )
+
+
+def test_boundary6_absent_and_stale_heartbeat_proceed_after_grace(tmp_path: pathlib.Path) -> None:
+    """Scenario 6 (I4) -- absent/stale heartbeat proceeds after the short
+    unknown-grace: a unit with NO heartbeat file at all (absent) still
+    restarts once ORCH_DRAIN_UNKNOWN_GRACE_SECS elapses -- here 0, so
+    immediately -- a not-reporting unit must not block the fleet restart
+    forever (fail-toward-convergence, the opposite fail direction from the
+    confirmed-busy defer in test_boundary4/5 above). A second, stale-
+    heartbeat sub-case (heartbeat file present but its ts_epoch is far
+    outside the freshness window) exercises the same outcome via the other
+    "unknown" branch drain_check.classify() recognizes.
+    """
+    fleet_dir = tmp_path / "fleet"
+    unit_absent = "orchestrator-alpha.service"
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path, running_units=[unit_absent], units={unit_absent: {"scenario": "fresh"}},
+    )
+    # No heartbeat file written for unit_absent at all.
+    clock_file = tmp_path / "clock.json"
+
+    result = _boundary_run_drain_script(
+        bin_dir, state_path, fleet_dir, clock_file,
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_UNKNOWN_GRACE_SECS": "0",
+        },
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    state = _boundary_load_state(state_path)
+    assert ["--user", "restart", unit_absent] in state["calls"], (
+        f"expected a restart call for {unit_absent}; got calls={state['calls']!r}"
+    )
+
+    # --- stale-heartbeat sub-case: same outcome via the other unknown branch ---
+    fleet_dir_2 = tmp_path / "fleet2"
+    unit_stale_hb = "orchestrator-bravo.service"
+    bin_dir_2, state_path_2 = _boundary_make_fake_systemctl(
+        tmp_path / "run2",
+        running_units=[unit_stale_hb], units={unit_stale_hb: {"scenario": "fresh"}},
+    )
+    _boundary_write_heartbeat(
+        fleet_dir_2, unit_stale_hb, merge_idle=True, ts_epoch=time.time() - 99999
+    )
+    clock_file_2 = tmp_path / "clock2.json"
+
+    result_2 = _boundary_run_drain_script(
+        bin_dir_2, state_path_2, fleet_dir_2, clock_file_2,
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_UNKNOWN_GRACE_SECS": "0",
+            "ORCH_DRAIN_FRESH_WINDOW_SECS": "120",
+        },
+    )
+
+    assert result_2.returncode == 0, f"stdout={result_2.stdout!r} stderr={result_2.stderr!r}"
+    state_2 = _boundary_load_state(state_path_2)
+    assert ["--user", "restart", unit_stale_hb] in state_2["calls"], (
+        f"expected a restart call for {unit_stale_hb}; got calls={state_2['calls']!r}"
+    )
+
+
+def test_boundary7_liveness_during_window_does_not_stamp_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Scenario 7 (I5) -- liveness during the 8h window, non-stamping: with
+    a REAL on-disk fleet-deploy clock dated ~1h ago (inside the window,
+    sentinel {ts, iso}), main() still immediately revives a port-down unit
+    (liveness is uncapped and not clock-gated) AND the clock file is left
+    byte-identical afterward -- a single wedged-unit revive must never
+    advance the fleet-wide deploy clock. Extends
+    test_main_liveness_unaffected_by_fleet_deploy_gate above (which
+    monkeypatches _within_fleet_deploy_min_interval directly) with a real
+    on-disk clock file and the file-level non-stamping assertion.
+    """
+    wdog = _load_watchdog()
+
+    now = 2_000_000_000.0
+    clock_ts = now - 3600  # ~1h ago -- inside the 8h default window
+    clock_file = tmp_path / "clock.json"
+    sentinel_payload = json.dumps({"ts": clock_ts, "iso": "2026-07-15T23:00:00+00:00"})
+    clock_file.write_text(sentinel_payload)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    # Sanity: the fleet-deploy min-interval gate IS engaged for this pair.
+    assert wdog._within_fleet_deploy_min_interval() is True
+
+    restarted: list[str] = []
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: port != 8102)  # df probe fails (down)
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main()
+
+    assert restarted == ["orchestrator-dark-factory.service"], (
+        f"main() must immediately revive a port-down unit even inside the "
+        f"fleet-deploy min-interval window; got {restarted}"
+    )
+    assert clock_file.read_text() == sentinel_payload, (
+        "main()'s per-unit liveness revive must never stamp the shared "
+        "fleet-deploy clock -- that clock records a verified FLEET-WIDE "
+        "deploy, not a single wedged-unit revive"
+    )
+
+
+def test_boundary8_coordinator_fire_while_busy_link_seam(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Scenario 8 (I6) -- coordinator fire-while-busy, cross-tier LINK/
+    composition assertion. The coordinator's internal arm/debounce/force-
+    fire decision logic is owned by
+    orchestrator/tests/test_fleet_staleness_composition.py and is NOT
+    re-derived here -- ε only asserts the integration seam that makes
+    fire-while-busy safe under the shared 8h cap:
+
+    (a) the watchdog's FLEET_DEPLOY_CLOCK_PATH resolves to the SAME
+        data/orchestrator/last_redeploy_orchestrator.json relative path the
+        coordinator persists to (orchestrator.service_restart.
+        FLEET_DEPLOY_CLOCK_RELPATH) -- the single shared clock both tiers
+        honor (restates test_fleet_deploy_clock_path_matches_across_tiers
+        above as part of this scenario's acceptance signal).
+    (b) a bare OrchestratorConfig() exposes
+        orchestrator_restart_force_fire_after_secs (δ's fire-while-busy
+        knob), default 4500 (75 min).
+
+    Uses pytest.importorskip("orchestrator.config") so the otherwise
+    stdlib-only watchdog suite still collects and passes in a minimal env
+    where the orchestrator package/venv is not importable.
+    """
+    pytest.importorskip("orchestrator.config")
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.service_restart import FLEET_DEPLOY_CLOCK_RELPATH
+
+    monkeypatch.delenv("ORCH_FLEET_DEPLOY_CLOCK", raising=False)
+    wdog = _load_watchdog()
+    expected_path = str(pathlib.Path(wdog.REPO_DIR) / FLEET_DEPLOY_CLOCK_RELPATH)
+    assert wdog.FLEET_DEPLOY_CLOCK_PATH == expected_path, (
+        "the watchdog and the coordinator must honor the exact same shared "
+        "fleet-deploy clock path for fire-while-busy to be safe under the "
+        "8h cap"
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ORCH_CONFIG_PATH", raising=False)
+    cfg = OrchestratorConfig()
+    assert cfg.orchestrator_restart_force_fire_after_secs == 4500.0
+
+
+def test_boundary9_report_mixed_fleet_seven_columns(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """Scenario 9 (I8) -- `--report` on a mixed fleet: the flagship
+    user-observable signal, combining what
+    test_report_mixed_fleet_returns_1_and_lists_all_units /
+    test_report_includes_deploy_age_column /
+    test_report_includes_merge_idle_and_would_defer_columns /
+    test_report_extended_columns_stay_read_only exercise separately into one
+    integrated acceptance scenario: >=2 units (one stale start_epoch with a
+    busy heartbeat, one fresh with an idle heartbeat) and a tmp
+    ORCH_FLEET_DEPLOY_CLOCK ~3h old, pre-seeded and byte-captured.
+
+    Asserts report() lists every unit; the header carries all seven columns
+    (UNIT/START/NEWEST WATCHED COMMIT/VERDICT/DEPLOY-AGE/MERGE-IDLE/
+    WOULD-DEFER); each row's VERDICT/DEPLOY-AGE/MERGE-IDLE/WOULD-DEFER
+    values (extracted positionally -- the last four whitespace-separated
+    tokens -- since the START/NEWEST WATCHED COMMIT date columns embed
+    spaces, mirroring test_report_includes_merge_idle_and_would_defer_
+    columns's technique) are correct; report() returns 1 (a stale unit is
+    present); recorded subprocess argv contains ZERO mutating systemctl
+    verbs; and the clock file is byte-identical afterward (no clock write).
+    """
+    wdog = _load_watchdog()
+
+    commit_epoch = 1_800_000_000
+    now = 2_000_000_000.0
+    unit_stale = "orchestrator-stale.service"  # started before the commit, busy heartbeat
+    unit_fresh = "orchestrator-fresh.service"  # started after the commit, idle heartbeat
+    units = [unit_stale, unit_fresh]
+    start_epochs = {unit_stale: commit_epoch - 100, unit_fresh: commit_epoch + 100}
+
+    recorded_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        recorded_calls.append(list(cmd))
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            stdout = "".join(f"{u} loaded active running desc\n" for u in units)
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            unit = cmd[3]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epochs[unit]}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda u: pytest.fail(f"report() must never restart {u}")
+    )
+
+    clock_file = tmp_path / "clock.json"
+    clock_payload = json.dumps({"ts": now - 3 * 3600, "iso": "2026-07-15T21:00:00+00:00"})
+    clock_file.write_text(clock_payload)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    monkeypatch.setenv("ORCH_FLEET_DIR", str(fleet_dir))
+    (fleet_dir / f"{unit_stale}.json").write_text(
+        json.dumps(
+            {
+                "unit": unit_stale,
+                "merge_idle": False,
+                "depth": 1,
+                "queue_empty": False,
+                "ts_epoch": now - 10,
+            }
+        )
+    )
+    (fleet_dir / f"{unit_fresh}.json").write_text(
+        json.dumps(
+            {
+                "unit": unit_fresh,
+                "merge_idle": True,
+                "depth": 0,
+                "queue_empty": True,
+                "ts_epoch": now - 10,
+            }
+        )
+    )
+
+    exit_code = wdog.report()
+
+    assert exit_code == 1, "a stale unit is present -> report() must return 1"
+
+    captured = capsys.readouterr()
+    header_line = next(line for line in captured.out.splitlines() if line.startswith("UNIT"))
+    for col in (
+        "UNIT", "START", "NEWEST WATCHED COMMIT", "VERDICT",
+        "DEPLOY-AGE", "MERGE-IDLE", "WOULD-DEFER",
+    ):
+        assert col in header_line, f"expected column {col!r} in header: {header_line!r}"
+
+    for unit in units:
+        assert unit in captured.out, f"report() output must list {unit}: {captured.out}"
+
+    stale_line = next(line for line in captured.out.splitlines() if line.startswith(unit_stale))
+    fresh_line = next(line for line in captured.out.splitlines() if line.startswith(unit_fresh))
+
+    s_verdict, s_deploy_age, s_merge, s_defer = stale_line.split()[-4:]
+    f_verdict, f_deploy_age, f_merge, f_defer = fresh_line.split()[-4:]
+
+    assert s_verdict == "stale"
+    assert s_deploy_age == "3.0h"
+    assert s_merge == "busy"
+    assert s_defer == "yes"
+
+    assert f_verdict == "fresh"
+    assert f_deploy_age == "3.0h"
+    assert f_merge == "idle"
+    assert f_defer == "no"
+
+    assert recorded_calls, "report() must have driven subprocess.run through its real helpers"
+    _assert_zero_mutating_calls(recorded_calls)
+    assert clock_file.read_text() == clock_payload, (
+        "report() must never write the shared fleet-deploy clock file"
+    )
+
+
+def test_boundary10_recover_pending_merges_link_seam() -> None:
+    """Scenario 10 (I9) -- crash-safe force-restart, existing-behavior LINK
+    test. The drain gate's force-restart-after-grace path (scenario 5 above)
+    can safely kill a unit mid-merge only because a crash-safe recovery path
+    exists: on boot, `recover_pending_merges` replays the durable merge-queue
+    journal and re-enqueues surviving records while dropping any branch
+    that's gone / already an ancestor of main (idempotency -- no double-land)
+    -- so a force-restarted merge is neither double-landed nor lost.
+
+    That behavior -- idempotent recovery, no double-land, task-not-lost -- is
+    owned and already exercised by
+    orchestrator/tests/test_merge_queue_restart_hook.py and is NOT
+    re-derived here, per the task's explicit "existing-behavior link test"
+    framing (PRD scenario 10 / I9). ε only asserts the integration seam: the
+    recovery function the drain gate's crash-safety story depends on is
+    present and callable.
+
+    Uses pytest.importorskip("orchestrator.merge_queue_store") so the
+    otherwise stdlib-only watchdog suite still collects and passes in a
+    minimal env where the orchestrator package/venv is not importable.
+    """
+    pytest.importorskip("orchestrator.merge_queue_store")
+    from orchestrator.merge_queue_store import recover_pending_merges
+
+    assert callable(recover_pending_merges), (
+        "the drain gate's force-restart-mid-merge path (scenario 5) relies "
+        "on recover_pending_merges for crash-safe recovery on boot -- it "
+        "must be present and callable"
+    )
 
