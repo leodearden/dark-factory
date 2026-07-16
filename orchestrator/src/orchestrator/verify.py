@@ -404,17 +404,55 @@ _XDIST_WORKER_CRASH_RE = re.compile(
 )
 
 
+# Small, ENUMERATED allow-list of known load-induced test flakes (esc-2496-3),
+# grounded in the same config.yaml task-2361 worker-kill-catalog reasoning as
+# _XDIST_WORKER_CRASH_RE above: under host CPU oversubscription, a bare
+# second-worker hard-crash ([gwN] node down) can co-occur with an unrelated,
+# already-known load-induced flake in a DIFFERENT test — one whose ``FAILED``
+# line would otherwise defeat _is_bare_xdist_worker_crash's veto below and
+# misroute a code-complete task to the debugger instead of the bounded infra
+# retry (task 2496). Kept to a single entry today — the PGID-liveness race in
+# test_verify_merge_cancel_end_to_end — to minimize the accepted fail-safe
+# tradeoff documented on _is_bare_xdist_worker_crash below.
+_KNOWN_LOAD_FLAKE_NODEID_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r'(?:^|/)test_cli\.py::test_verify_merge_cancel_end_to_end\b'),
+)
+
+
+def _is_known_load_flake_nodeid(nodeid: str) -> bool:
+    """Return True iff *nodeid* matches an enumerated known load-flake test."""
+    return any(rx.search(nodeid) for rx in _KNOWN_LOAD_FLAKE_NODEID_RES)
+
+
 def _is_bare_xdist_worker_crash(output: str) -> bool:
     """Return True when *output* is a bare xdist worker crash with no real failure.
 
     A hard ``os._exit()`` worker kill (task 2361) produces no assertion
-    traceback, so the presence of ANY genuine pytest failure marker —
-    ``_PYTEST_TRACEBACK_E_RE`` (``^E   ...``), ``_PYTEST_FAILED_LINE_RE``
-    (``^FAILED ...``), or ``_PYTEST_FAILURE_SUMMARY_RE`` (``=== N failed
-    ===``) — reliably indicates a genuine failure occurred alongside the
-    crash, and suppresses reclassification: never mask a real failure. The
-    fail-safe direction is to surface the failure unchanged (status quo)
-    whenever a real failure marker is also present.
+    traceback, so the presence of a genuine pytest failure marker normally
+    indicates a real failure occurred alongside the crash. However, under
+    host CPU oversubscription a bare crash can co-occur with an unrelated,
+    already-known load-induced test flake (esc-2496-3) whose own ``^FAILED
+    `` line would otherwise defeat this discriminator and misroute a
+    code-complete task to the debugger (task 2496).
+
+    To stay strict while accommodating that case: once the crash signature
+    is present, every ``^FAILED `` line is inspected individually. If ANY
+    names a test that is not on the narrow, enumerated
+    ``_KNOWN_LOAD_FLAKE_NODEID_RES`` allow-list (or has no extractable
+    node-id), this returns ``False`` — never mask a real failure. If there
+    is at least one ``FAILED`` line and every one of them is an
+    allow-listed known flake, the accompanying ``^E   `` traceback lines
+    and ``=== N failed ===`` summary are attributable to those flakes and
+    this returns ``True``. When there are NO ``FAILED`` lines at all, this
+    falls back to the original strict guard: any ``^E   ``/failure-summary
+    marker suppresses reclassification.
+
+    Accepted fail-safe tradeoff: a genuine regression IN an allow-listed
+    known-flake test, co-occurring with a crash, is discounted here and
+    goes to the bounded infra-retry; if it recurs (a real regression
+    doesn't self-heal, unlike a load flake) the retry window is exhausted
+    and it lands in infra_hold + escalate_to_human instead of the debugger
+    — a human sees it, nothing is silently greened.
 
     Returns ``False`` for falsy *output* or when the crash signature itself
     is absent.
@@ -423,9 +461,15 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
         return False
     if not _XDIST_WORKER_CRASH_RE.search(output):
         return False
+    failed_lines = _PYTEST_FAILED_LINE_RE.findall(output)
+    if failed_lines:
+        for line in failed_lines:
+            match = _FAILED_LINE_NODEID_RE.match(line)
+            if match is None or not _is_known_load_flake_nodeid(match.group(1)):
+                return False
+        return True
     return not (
         _PYTEST_TRACEBACK_E_RE.search(output)
-        or _PYTEST_FAILED_LINE_RE.search(output)
         or _PYTEST_FAILURE_SUMMARY_RE.search(output)
     )
 
