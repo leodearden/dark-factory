@@ -54,6 +54,11 @@ def index_html_body(_client):
     return _client.get('/static/redux/index.html').text
 
 
+@pytest.fixture(scope='module')
+def charts_jsx_body(_client):
+    return _client.get('/static/redux/charts.jsx').text
+
+
 # ---------------------------------------------------------------------------
 # Helper: extract a named seed block from window.DF_DATA (brace-aware).
 # Copied from test_tab_escalations.py — see that module for the full rationale
@@ -396,6 +401,13 @@ def test_tab_analytics_jsx_served_and_exports(_client) -> None:
     (d) reads window.DF_DATA.ESCALATION_ANALYTICS (or an aliased DF.ESCALATION_ANALYTICS).
     (e) renders <ProjectGroup (subsection-per-project).
     (f) fold state is persisted via useOpenSet( referencing 'df.open.escanalytics'.
+
+    (d)-(f) are scoped to the extracted `EscalationAnalyticsTab` function body
+    via `_extract_function_body`, and (c)'s export check requires the actual
+    `=` assignment syntax rather than a bare dotted-path substring — this
+    file's own header comment mentions "window.DF_TABS.EscalationAnalyticsTab"
+    in prose, so an unscoped raw substring check would still pass even if the
+    real wiring were deleted from the component.
     """
     resp = _client.get('/static/redux/tab_escalation_analytics.jsx')
     assert resp.status_code == 200, (
@@ -406,9 +418,17 @@ def test_tab_analytics_jsx_served_and_exports(_client) -> None:
         'tab_escalation_analytics.jsx does not define `function EscalationAnalyticsTab(` — '
         'the component must be declared as a named function for the export to work.'
     )
+    tab_body = _extract_function_body(body, 'EscalationAnalyticsTab')
+    assert tab_body, (
+        'Could not locate the `function EscalationAnalyticsTab(` body in '
+        'tab_escalation_analytics.jsx.'
+    )
     # Additive export — must NOT clobber window.DF_TABS = {...} and must assign
-    # EscalationAnalyticsTab.
-    assert 'window.DF_TABS.EscalationAnalyticsTab' in body, (
+    # EscalationAnalyticsTab. Requires the assignment's `=` (not just the
+    # dotted path) so a prose mention in a comment cannot satisfy the check.
+    assert re.search(
+        r'window\.DF_TABS\.EscalationAnalyticsTab\s*=\s*EscalationAnalyticsTab\b', body
+    ), (
         'tab_escalation_analytics.jsx does not set window.DF_TABS.EscalationAnalyticsTab — '
         'add `window.DF_TABS.EscalationAnalyticsTab = EscalationAnalyticsTab;` at the bottom '
         'of the file to export additively without clobbering the existing window.DF_TABS object.'
@@ -417,24 +437,25 @@ def test_tab_analytics_jsx_served_and_exports(_client) -> None:
         'tab_escalation_analytics.jsx clobbers window.DF_TABS = {...} — tabs.jsx already '
         'creates that object; this file must mutate it additively instead.'
     )
-    # Reads ESCALATION_ANALYTICS data
-    assert 'ESCALATION_ANALYTICS' in body, (
-        'tab_escalation_analytics.jsx does not reference ESCALATION_ANALYTICS — it should '
+    # Reads ESCALATION_ANALYTICS data — scoped to the component body so a
+    # token surviving only in a comment cannot produce a false pass.
+    assert 'ESCALATION_ANALYTICS' in tab_body, (
+        'EscalationAnalyticsTab does not reference ESCALATION_ANALYTICS — it should '
         'read window.DF_DATA.ESCALATION_ANALYTICS (or an alias like DF.ESCALATION_ANALYTICS) '
         'for its data source.'
     )
     # Renders ProjectGroup for subsection-per-project folding
-    assert '<ProjectGroup' in body, (
-        'tab_escalation_analytics.jsx does not render <ProjectGroup — each project must be '
+    assert '<ProjectGroup' in tab_body, (
+        'EscalationAnalyticsTab does not render <ProjectGroup — each project must be '
         'wrapped in a ProjectGroup from window.DF_SHELL for foldable sections.'
     )
     # Fold state persisted with the correct key
-    assert 'useOpenSet(' in body, (
-        'tab_escalation_analytics.jsx does not call useOpenSet( — add the local copy of '
+    assert 'useOpenSet(' in tab_body, (
+        'EscalationAnalyticsTab does not call useOpenSet( — add the local copy of '
         "useOpenSet from tab_escalations.jsx and call it with project ids and 'df.open.escanalytics'."
     )
-    assert "'df.open.escanalytics'" in body, (
-        "tab_escalation_analytics.jsx does not reference the localStorage key "
+    assert "'df.open.escanalytics'" in tab_body, (
+        "EscalationAnalyticsTab does not reference the localStorage key "
         "'df.open.escanalytics' — pass it as the storageKey argument to useOpenSet so fold "
         'state is persisted.'
     )
@@ -978,3 +999,42 @@ def test_tab_analytics_workflow_panel(tab_analytics_jsx_body: str) -> None:
         'WorkflowPanel does not reference `flow_daily` — the esc-flow-slot must be '
         'fed the windowed flow_daily data.'
     )
+
+
+# ---------------------------------------------------------------------------
+# amendment: pin charts.jsx's chart padding to the value RegimeMarkers assumes
+# ---------------------------------------------------------------------------
+
+
+def test_charts_jsx_padding_matches_analytics_marker_overlay(charts_jsx_body: str) -> None:
+    """Pin charts.jsx's LineChart/StackedAreaChart padL/padR to the values
+    tab_escalation_analytics.jsx's RegimeMarkers overlay hardcodes as
+    `_CHART_PAD_L`/`_CHART_PAD_R` (38/12).
+
+    charts.jsx is intentionally NOT modified by the escalation-analytics tab
+    (see task 2659 design decisions: markers/ECDF are composed locally from
+    existing primitives instead of extending the shared chart primitives, to
+    avoid a broader-scope edit and contention with sibling tasks also
+    building on charts.jsx). RegimeMarkers therefore duplicates padL/padR as
+    private constants rather than importing them from charts.jsx, so that
+    duplication is invisible to any test scoped to tab_escalation_analytics.jsx
+    alone — if charts.jsx's padding ever changes, the overlay would silently
+    drift out of alignment with the chart it decorates. This test is the
+    tripwire: it fails loudly the moment the two constants diverge, without
+    requiring charts.jsx to export anything.
+    """
+    for fn_name in ('LineChart', 'StackedAreaChart'):
+        fn_body = _extract_function_body(charts_jsx_body, fn_name)
+        assert fn_body, f'Could not locate the {fn_name}( function body in charts.jsx.'
+        assert re.search(r'padL\s*=\s*38\b', fn_body), (
+            f'charts.jsx {fn_name} no longer declares padL = 38 — '
+            'tab_escalation_analytics.jsx hardcodes _CHART_PAD_L = 38 for its '
+            'RegimeMarkers overlay (see that file) and must be updated to match, '
+            'or charts.jsx should export the constant instead.'
+        )
+        assert re.search(r'padR\s*=\s*12\b', fn_body), (
+            f'charts.jsx {fn_name} no longer declares padR = 12 — '
+            'tab_escalation_analytics.jsx hardcodes _CHART_PAD_R = 12 for its '
+            'RegimeMarkers overlay (see that file) and must be updated to match, '
+            'or charts.jsx should export the constant instead.'
+        )
