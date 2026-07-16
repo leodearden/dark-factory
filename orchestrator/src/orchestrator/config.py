@@ -2035,6 +2035,20 @@ class OrchestratorConfig(BaseSettings):
     verify_admission_nice_merge: str = Field(default='')
     verify_admission_nice_task: str = Field(default='')
     verify_admission_nice_background: str = Field(default='')
+    # pytest-xdist worker count applied to the test leg for roles {task,
+    # background} only ('merge' is never `-n`-capped — it bypasses admission
+    # slot-counting and is latency-critical). Default 'auto' is the T6
+    # benchmark report's recommendation (plans/verify-oversubscription-
+    # benchmark-2026-07-14.md): a sustained, heavily-contended host precluded
+    # a clean-idle-window measurement supporting a specific cap, so the
+    # behavior-preserving value is kept — '' or 'auto' is a no-op (byte-
+    # identical to today's `-n auto` pyproject addopts); any other value is
+    # rendered as a literal `-n <value>` (see verify_cmd.apply_pytest_numprocesses).
+    # Validated below (_validate_verify_admission_pytest_n) against
+    # pytest-xdist's own accepted -n values, so a typo fails loud at config
+    # load/reload instead of silently reaching pytest-xdist and failing the
+    # whole test leg at verify time.
+    verify_admission_pytest_n: str = Field(default='auto')
 
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
@@ -2760,6 +2774,32 @@ class OrchestratorConfig(BaseSettings):
     def _resolve_project_root(cls, v: Path) -> Path:
         return v.resolve()
 
+    @field_validator('verify_admission_pytest_n', mode='before')
+    @classmethod
+    def _validate_verify_admission_pytest_n(cls, v: Any) -> Any:
+        """Reject a malformed `-n` value at config load/reload (task 2394 T6).
+
+        Mirrors pytest-xdist's own accepted ``-n``/``--numprocesses`` values:
+        ``'auto'``/``'logical'`` (worker-count strategies), ``''`` (this
+        knob's own no-op sentinel — see the field comment above), or a
+        positive-integer string. Anything else (a typo like ``'1six'``, or a
+        non-positive count like ``'0'``) would otherwise reach pytest-xdist
+        unvalidated and fail the whole test leg only when a task/background
+        verify next runs — this fails loud at construction/reload instead.
+        Non-str values are passed through so pydantic's own type-coercion
+        error reports the type mismatch rather than this validator's.
+        """
+        if not isinstance(v, str):
+            return v
+        if v in {'', 'auto', 'logical'}:
+            return v
+        if v.isdigit() and int(v) > 0:
+            return v
+        raise ValueError(
+            "verify_admission_pytest_n must be '', 'auto', 'logical', or a "
+            f"positive-integer string (pytest-xdist's accepted -n values); got {v!r}"
+        )
+
     @model_validator(mode='after')
     def _default_verify_admission_slots_dir(self) -> 'OrchestratorConfig':
         """Fill the per-project verify-admission slots dir when unset.
@@ -3215,15 +3255,17 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'git.offline_lane_test_threads',
         'git.offline_lane_poll_interval_secs',
         'git.offline_lane_red_advances_before_blocker',
-        # Verify admission control (task 2390 T2) — all six knobs are
-        # green-tier: an operator can retune slot counts / nice tiers /
-        # toggle the gate without a process restart.
+        # Verify admission control (task 2390 T2; task 2394 T6 adds the
+        # seventh, `_pytest_n`) — all seven knobs are green-tier: an operator
+        # can retune slot counts / nice tiers / the -n cap / toggle the gate
+        # without a process restart.
         'verify_admission_enabled',
         'verify_admission_task_slots',
         'verify_admission_slots_dir',
         'verify_admission_nice_merge',
         'verify_admission_nice_task',
         'verify_admission_nice_background',
+        'verify_admission_pytest_n',
         # Merge-role internal-fanout cap (task 2393, T5) — same knob family:
         # read fresh per run_scoped_verification call, so a live reload
         # lowers the merge fan-out without a restart.

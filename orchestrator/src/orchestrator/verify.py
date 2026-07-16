@@ -40,6 +40,7 @@ from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
+    apply_pytest_numprocesses,
     cargo_scope,
     govern_cpu,
     parse_config_command,
@@ -3307,6 +3308,24 @@ async def run_verification(
         # gated by the shared.verify_admission flock semaphore + role nice
         # tier; lint/type ride alongside within the same verify, ungated.
         admission = _verify_admission_active(config) and label == 'test'
+        # -n cap (task 2394 T6): applies only to roles {task, background} —
+        # 'merge' is never -n-capped (bypasses admission slot-counting,
+        # latency-critical). No-op when the knob is '' or 'auto' (the
+        # apply_pytest_numprocesses no-op guard) — byte-identical to today.
+        # Must precede the nice-prefix bash-wrap below, and config_cmd above
+        # intentionally stays un-rewritten (same treatment as the nice
+        # prefix: an execution detail layered onto cmd, not the persisted
+        # config command).
+        # Identity-check the mutation before rendering (mirrors
+        # _govern_cpu_str's `governed is parsed` guard above): a non-pytest
+        # test leg (cmd.tool is not PYTEST) makes apply_pytest_numprocesses
+        # return the same object, so skip the parse->render round-trip
+        # entirely rather than reformatting a command that wasn't actually
+        # touched.
+        if admission and role in {'task', 'background'} and config.verify_admission_pytest_n not in {'', 'auto'}:
+            parsed = parse_config_command(cmd)
+            mutated = apply_pytest_numprocesses(parsed, config.verify_admission_pytest_n)
+            cmd = cmd if mutated is parsed else render(mutated)
         if admission:
             prefix = _resolve_nice_prefix(config, role)
             if prefix:

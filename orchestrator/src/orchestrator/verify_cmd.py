@@ -468,6 +468,25 @@ def _cargo_scope_structured(cmd: VerifyCmd, crates: list[str]) -> VerifyCmd:
 _PYTEST_INVOCATION_RE = re.compile(r'\bpytest\b[^&|;]*')
 
 
+def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
+    """Return *raw* with *suffix* appended to every pytest invocation.
+
+    Shared rewrite closure for ``serial_pytest``/``apply_pytest_numprocesses``'s
+    raw-retained (chained) path: matches each ``_PYTEST_INVOCATION_RE`` span,
+    strips trailing whitespace, appends *suffix*, then re-attaches the
+    trailing whitespace so an immediately-following chain operator (e.g.
+    `` && ``) survives untouched. *suffix* should include its own leading
+    space (e.g. ``' -n 16'``).
+    """
+    def _rewrite(match: re.Match[str]) -> str:
+        segment = match.group(0)
+        stripped = segment.rstrip()
+        trailing = segment[len(stripped) :]
+        return f'{stripped}{suffix}{trailing}'
+
+    return _PYTEST_INVOCATION_RE.sub(_rewrite, raw)
+
+
 def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
     """Return *cmd* with the serial-recovery flags applied to every pytest invocation.
 
@@ -484,14 +503,62 @@ def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
     if cmd.tool is not ToolKind.PYTEST:
         return cmd
     if cmd.raw is not None:
-        def _rewrite(match: re.Match[str]) -> str:
-            segment = match.group(0)
-            stripped = segment.rstrip()
-            trailing = segment[len(stripped) :]
-            return f"{stripped} -p no:xdist -o addopts=''{trailing}"
-
-        return replace(cmd, raw=_PYTEST_INVOCATION_RE.sub(_rewrite, cmd.raw))
+        return replace(
+            cmd, raw=_append_to_raw_pytest_invocations(cmd.raw, " -p no:xdist -o addopts=''")
+        )
     return replace(cmd, base_flags=(*cmd.base_flags, '-p', 'no:xdist', '-o', 'addopts='))
+
+
+def _is_serial_forced(cmd: VerifyCmd) -> bool:
+    """True when *cmd* has been forced serial (xdist plugin disabled).
+
+    ``serial_pytest`` disables xdist by appending ``-p no:xdist`` — to
+    ``base_flags`` for a structured command, or into every ``pytest``
+    invocation in ``raw`` for a chain. With the xdist plugin disabled pytest
+    does not register the ``-n``/``--numprocesses`` option, so injecting
+    ``-n`` afterwards makes pytest exit with ``unrecognized arguments: -n``.
+    ``apply_pytest_numprocesses`` consults this to stay a no-op on any
+    already-serial command (the env-transient and flaky-scoped recovery
+    re-runs both pass such commands back through the injection site).
+
+    ``no:xdist`` is checked across both ``base_flags`` and ``targets``: a
+    freshly ``serial_pytest``-ed structured command carries the ``-p
+    no:xdist`` pair in ``base_flags``, but once that rendered string is
+    re-parsed at the injection site (verify.py's recovery re-runs render then
+    feed the command back through ``parse_config_command``) the bare
+    ``no:xdist`` value token lands in ``targets`` — so both must be consulted
+    to detect a round-tripped serial command.
+    """
+    if cmd.raw is not None:
+        return 'no:xdist' in cmd.raw
+    return 'no:xdist' in cmd.base_flags or 'no:xdist' in cmd.targets
+
+
+def apply_pytest_numprocesses(cmd: VerifyCmd, n: str) -> VerifyCmd:
+    """Return *cmd* with a `-n <n>` pytest-xdist worker-count flag applied.
+
+    Appends ``-n <n>`` to a structured command's ``base_flags``, or — for a
+    raw-retained pytest chain — to every ``pytest`` invocation's arguments in
+    ``raw`` via the same localised regex rewrite ``serial_pytest`` uses, so
+    each chained invocation gets its own cap independently.
+
+    A no-op (returns *cmd* unchanged) unless ``cmd.tool is ToolKind.PYTEST``
+    (covers OPAQUE and every other tool — P1), and also when *n* is ``''`` or
+    ``'auto'`` — the byte-identical guard: the pyproject ``-n auto`` addopts
+    already picks a worker count, so there is nothing to override — and when
+    the command has already been forced serial (``-p no:xdist``): with xdist
+    disabled the ``-n`` option is unregistered, so injecting it would fail the
+    run with ``unrecognized arguments: -n``. The serial-recovery re-runs
+    (env-transient at verify.py's env-recovery retry, flaky-scoped isolated
+    re-run) build their command via ``serial_pytest`` and then pass it back
+    through the same injection site, so this guard is what keeps the ``-n``
+    knob from breaking those recovery paths.
+    """
+    if cmd.tool is not ToolKind.PYTEST or n in {'', 'auto'} or _is_serial_forced(cmd):
+        return cmd
+    if cmd.raw is not None:
+        return replace(cmd, raw=_append_to_raw_pytest_invocations(cmd.raw, f' -n {n}'))
+    return replace(cmd, base_flags=(*cmd.base_flags, '-n', n))
 
 
 def govern_cpu(cmd: VerifyCmd, exec_path: str | None) -> VerifyCmd:
