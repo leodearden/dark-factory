@@ -261,6 +261,23 @@ class TaskArtifacts:
         metadata = json.loads(meta_path.read_text())
         return metadata.get('base_commit')
 
+    def read_created_at(self) -> str | None:
+        """Read the created_at timestamp stored at init time.
+
+        Mirrors ``read_base_commit``'s shape, but is exception-tolerant for a
+        corrupt/unreadable metadata.json (returns ``None`` instead of
+        raising) so a runtime "started" lookup never raises.
+        """
+        meta_path = self._read_path('metadata.json')
+        if not meta_path.exists():
+            return None
+        try:
+            metadata = json.loads(meta_path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning('Corrupt metadata.json at %s: %s', meta_path, exc)
+            return None
+        return metadata.get('created_at')
+
     def update_base_commit(self, new_base: str) -> None:
         """Update the base_commit in metadata.json after a rebase."""
         meta_path = self._read_path('metadata.json')
