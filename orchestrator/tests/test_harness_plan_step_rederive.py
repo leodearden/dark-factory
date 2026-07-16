@@ -207,3 +207,89 @@ class TestRederiveStepStatusNoWorkGuard:
         assert result == []
         plan = artifacts.read_plan()
         assert plan['steps'][0]['status'] == 'pending'
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED: crash-safety / best-effort contract (mirrors
+# TestDetectTipWipCommits/TestReconcileDoneStepCommits' defensive tests)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRederiveStepStatusDefensive:
+    async def test_worktree_none_returns_empty_and_does_not_raise(
+        self, config, git_ops, task_assignment,
+    ):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'impl.py').write_text('implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_plan(artifacts, workflow, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+        ])
+        artifacts.append_iteration_log({
+            'agent': 'implementer', 'steps_completed': ['step-1'], 'commit': step_commit,
+        })
+        workflow.worktree = None
+
+        result = await workflow._rederive_step_status_from_branch_state()
+
+        assert result == []
+        assert artifacts.read_plan()['steps'][0]['status'] == 'pending'
+
+    async def test_git_ops_none_returns_empty_and_does_not_raise(
+        self, config, git_ops, task_assignment,
+    ):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'impl.py').write_text('implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_plan(artifacts, workflow, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+        ])
+        artifacts.append_iteration_log({
+            'agent': 'implementer', 'steps_completed': ['step-1'], 'commit': step_commit,
+        })
+        workflow.git_ops = None  # type: ignore[assignment]
+
+        result = await workflow._rederive_step_status_from_branch_state()
+
+        assert result == []
+        assert artifacts.read_plan()['steps'][0]['status'] == 'pending'
+
+    async def test_internal_failure_returns_empty_and_does_not_raise(
+        self, config, git_ops, task_assignment,
+    ):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'impl.py').write_text('implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_plan(artifacts, workflow, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+        ])
+        artifacts.append_iteration_log({
+            'agent': 'implementer', 'steps_completed': ['step-1'], 'commit': step_commit,
+        })
+        workflow._get_head_commit = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('boom'),
+        )
+
+        result = await workflow._rederive_step_status_from_branch_state()
+
+        assert result == []
+        assert artifacts.read_plan()['steps'][0]['status'] == 'pending'
