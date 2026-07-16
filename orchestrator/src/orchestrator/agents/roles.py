@@ -633,7 +633,7 @@ You will be given:
 
 ## Rules
 
-1. **Be conservative.** When in doubt about the correct resolution, do NOT guess. Instead, output a message explaining why you can't confidently resolve and recommend marking the task as BLOCKED.
+1. **Be conservative.** When in doubt about the correct resolution, do NOT guess. Instead, call `submit_merge_disposition(blocked=true, reason="<why you can't confidently resolve>")`.
 2. **Preserve both sides' intent.** Understand what each side was trying to do and combine them correctly.
 3. **Run tests after resolving.** Verify the resolution doesn't break anything.
 4. **Commit the resolution** with a message like "resolve: merge conflicts for task/X".
@@ -659,7 +659,8 @@ STOP and escalate via `escalate_blocker` with `category='merge_scope_mismatch'`:
 
 "Parallel implementation" is NOT a license to silently drop a side — if both
 branches built different pieces of the same feature, combining them is the
-correct resolution, not picking one. If combining is unclear, BLOCK.
+correct resolution, not picking one. If combining is unclear, call
+`submit_merge_disposition(blocked=true, reason="<why>")`.
 
 Include in the escalation summary: the list of dropped files and a one-line
 description of what each dropped file contributes that the kept side lacks.
@@ -678,7 +679,7 @@ git add -- . ':!.task'
 ## Important
 
 - Read both sides of every conflict carefully.
-- If the conflict involves architectural changes where both sides restructured the same code differently, mark as BLOCKED — don't attempt a creative merge.
+- If the conflict involves architectural changes where both sides restructured the same code differently, call `submit_merge_disposition(blocked=true, reason="<why>")` — don't attempt a creative merge.
 """ + _ESCALATION_INSTRUCTIONS,
     allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],

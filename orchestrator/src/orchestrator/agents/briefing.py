@@ -801,7 +801,10 @@ diff is empty or trivial, `substantive_work=false` and `complete=false`.
 2. Understand the intent of each change.
 3. Resolve conflicts conservatively — preserve both sides' intent.
 4. Run tests to verify the resolution.
-5. If you cannot confidently resolve, output "BLOCKED: <reason>" and stop.
+5. If you cannot confidently resolve, call `submit_merge_disposition(blocked=true, reason="<why>")` and stop.
+6. Once you have resolved, tested, and committed successfully, call `submit_merge_disposition(blocked=false, reason="")`.
+
+Your disposition is read from the `submit_merge_disposition` tool call, not from your prose output — you MUST call it before finishing.
 """
 
     async def build_resume_prompt(
