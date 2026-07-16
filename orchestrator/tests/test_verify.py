@@ -3234,6 +3234,72 @@ class TestVerifyResultCategoryAndPaths:
             f'Expected cargo_cli_error (higher priority), got {agg.category!r}'
         )
 
+    # (f) _aggregate_results unions failing_test_ids across children (task μ,
+    # verify-scope-inversion-prd.md step-09). RED: _aggregate_results drops
+    # the field (defaults None) today.
+    def test_aggregate_results_all_none_failing_test_ids_stays_none(self):
+        """Every child with failing_test_ids=None (the default) aggregates to None."""
+        r1 = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        r2 = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+
+        agg = _aggregate_results([r1, r2])
+
+        assert agg.failing_test_ids is None
+
+    def test_aggregate_results_unions_and_sorts_failing_test_ids(self):
+        """A None/non-empty mix unions the non-None children's ids, sorted+deduped.
+
+        None contributes nothing but does not suppress a sibling's collected
+        ids — the aggregate is non-None once ANY child is non-None.
+        """
+        r_none = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        r_x = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['x::1'],
+        )
+        r_y = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['y::2'],
+        )
+
+        agg = _aggregate_results([r_none, r_x, r_y])
+
+        assert agg.failing_test_ids == ['x::1', 'y::2'], (
+            f'expected the sorted union of non-None children; got {agg.failing_test_ids!r}'
+        )
+
+    def test_aggregate_results_dedupes_failing_test_ids_across_children(self):
+        """The same failing id reported by two children collapses to one entry."""
+        r1 = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['dup::1', 'a::1'],
+        )
+        r2 = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['dup::1', 'b::1'],
+        )
+
+        agg = _aggregate_results([r1, r2])
+
+        assert agg.failing_test_ids == ['a::1', 'b::1', 'dup::1'], (
+            f'expected sorted+deduped union; got {agg.failing_test_ids!r}'
+        )
+
+    def test_aggregate_results_empty_list_child_is_non_none_contribution(self):
+        """A child with failing_test_ids=[] (collected, zero failing) still makes
+        the aggregate non-None — distinct from a child that never collected (None)."""
+        r_empty = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', failing_test_ids=[],
+        )
+        r_none = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+
+        agg = _aggregate_results([r_empty, r_none])
+
+        assert agg.failing_test_ids == [], (
+            f'expected [] (collected, zero failing), not None; got {agg.failing_test_ids!r}'
+        )
+
 
 class TestPersistAttemptLogs:
     """Tests for ``_persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint)``.
