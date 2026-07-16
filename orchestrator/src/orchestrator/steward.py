@@ -652,6 +652,14 @@ class TaskSteward:
             max_cap_retries=_MAX_CAP_RETRIES,
             rebuild_prompt=rebuild_prompt,
             resume_delivers_prompt=True,
+            # NOTE: cost_store/run_id/task_id/project_id/role below are
+            # consumed by invoke_with_cap_retry's OWN internal guarded
+            # save_invocation call (cli_invoke.py, capped=unattributed_cap)
+            # — unlike workflow._invoke/review_checkpoint.py, which don't
+            # pass cost_store through and instead call save_invocation
+            # externally afterward (capped=False). Do not add a second,
+            # external save_invocation call here — that would double-count
+            # this invocation's cost.
             cost_store=self.cost_store,
             run_id=self.event_store.run_id if self.event_store else '',
             task_id=self.task_id,
@@ -742,6 +750,11 @@ class TaskSteward:
                 mcp_config=mcp_config,
                 effort=self.config.effort.triage,
                 backend=self.config.backends.triage,
+                # NOTE: same internal-save delegation as _invoke_with_session
+                # above — cost_store here feeds invoke_with_cap_retry's own
+                # guarded save_invocation (capped=unattributed_cap); do not
+                # add a second, external save_invocation call for this
+                # invocation (see the fuller note above).
                 cost_store=self.cost_store,
                 run_id=self.event_store.run_id if self.event_store else '',
                 task_id=self.task_id,
