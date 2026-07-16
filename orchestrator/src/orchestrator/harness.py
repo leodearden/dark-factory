@@ -3835,6 +3835,27 @@ Output JSON matching the schema. Every task must appear in the output.
         plan.lock unlink, and the ``_recovered_plans``/``_preserved_worktrees``
         retention bookkeeping.
 
+        FORENSIC NOTE (task 2588 closeout, task 2623): the 2588 un-claim (an
+        in-progress task reverted to pending with claimant_run_id/
+        heartbeat_at nulled) was NOT caused by fused-memory ``update_task``
+        performing a full-row UPDATE — that premise is refuted;
+        ``SqliteTaskBackend.update_task`` never writes ``status`` /
+        ``claimant_run_id`` / ``heartbeat_at``. The actual root cause was the
+        PRE-2243 plan.lock/owner_pid-only sweep: it misjudged a live task
+        whose DB claimant was fresh but whose plan.lock was stale or not
+        visible cross-process, and reverted/un-claimed it out from under its
+        own live owner. Task 2243 (W10-θ2) fixed this whole class by making
+        ``recovery_for``'s DB-claimant resolution (``_resolve_live_claimant``,
+        task_ground_truth.py:368-376) the primary cross-process liveness
+        signal, consulted BEFORE plan.lock — see the paragraph above. Guarded
+        by two regression pins so a future refactor cannot silently reorder
+        DB-claimant-vs-plan.lock precedence without tripping them:
+        ``test_task_ground_truth.py::TestDeriveTruthLiveClaimant::
+        test_fresh_db_claimant_precedes_stale_plan_lock`` (resolver-level)
+        and ``test_reconcile_stranded.py::TestReconcileStrandedInProgress::
+        test_stale_plan_lock_but_live_db_claimant_left_alone`` (sweep-level,
+        end-to-end through this function's caller).
+
         For warm tasks the real worktree is the assigned pool lane, not
         ``worktree_base/<tid>``.  ``_resolve_task_worktree`` handles both cases.
         """

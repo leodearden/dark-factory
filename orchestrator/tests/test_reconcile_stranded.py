@@ -666,6 +666,58 @@ class TestReconcileStrandedInProgress:
         # Stale lock must be deleted
         assert not lock_path.exists()
 
+    async def test_stale_plan_lock_but_live_db_claimant_left_alone(
+        self, harness: Harness, monkeypatch, caplog
+    ):
+        """Task-2588 regression pin.
+
+        plan.lock/owner_pid forensics alone would call this task unclaimed
+        (dead owner_pid — same staging as test_stale_plan_lock_cleared_and_
+        reverted above) — the pre-2243 sweep's actual root cause for the
+        2588 un-claim (a live task reverted out from under its own live
+        claimant). But get_task returns a FRESH db claimant
+        (claimant_run_id + heartbeat within _RECONCILE_HEARTBEAT_TTL), so
+        recovery_for's live_claimant resolution defers to the db signal and
+        classifies LEAVE: _revert_in_progress_if_no_live_claimant must
+        never be dispatched — no revert, no un-claim, lock preserved.
+        """
+        harness.scheduler.get_statuses.return_value = ({'62': 'in-progress'}, None)  # type: ignore[attr-defined]
+        # Same dead-PID staging as test_stale_plan_lock_cleared_and_reverted:
+        # plan.lock/owner_pid forensics alone would read "stale".
+        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
+        lock_dir = harness.git_ops.worktree_base / '62' / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': '62-dead0001',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': 99999,
+        }))
+
+        # But the DB row carries a fresh claimant — the live cross-process
+        # signal task 2243 made primary over plan.lock/owner_pid forensics.
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={
+                'status': 'in-progress',
+                'metadata': {},
+                'claimant_run_id': 'run-x/session-x/pid=123',
+                'heartbeat_at': datetime.now(UTC).isoformat(),
+            },
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress()
+
+        # Must NOT revert or un-claim.
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        # plan.lock must be preserved.
+        assert lock_path.exists()
+        # Worktree must not be cleaned up.
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        # No revert must have been logged ('reverted task' matches the
+        # stable log format).
+        assert not any('reverted task' in r.message for r in caplog.records)
+
     async def test_in_progress_with_open_l1_left_intact(
         self, harness: Harness, monkeypatch
     ):
