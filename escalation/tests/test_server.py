@@ -520,6 +520,34 @@ class TestL2DedupeBypass:
         assert esc.status == 'resolved'
 
     @pytest.mark.asyncio
+    async def test_terminal_task_auto_resolve_stamps_resolution_class_benign(self, tmp_path: Path):
+        """The task-already-terminal auto-resolve chokepoint (submit_resolved,
+        resolved_by='escalation-mcp-pre-submit-check') stamps resolution_class=
+        'benign' explicitly — this resolver isn't reaper-sweep tier, so leaving
+        it unstamped would have the effective_benign() proxy misread the closed
+        record as 'actionable'."""
+        async def _lookup(task_id: str) -> str:
+            return 'done'
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, task_status_lookup=_lookup)
+
+        result = await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='infra connection timeout',
+        )
+
+        assert result['status'] == 'resolved'
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.resolution_class == 'benign', (
+            f"Expected resolution_class='benign', got: {esc.resolution_class!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_l2_urgent_blocker_bypasses_dedupe(self, tmp_path: Path):
         """escalate_blocker(severity='urgent') with infra_issue also bypasses dedupe."""
         queue = EscalationQueue(tmp_path / 'esc')

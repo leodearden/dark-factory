@@ -91,9 +91,10 @@ class Escalation:
     # from the parent via resolved_by='l2-cascade:<id>' attribution).
     resolution_action: str | None = None
     # Benign/actionable classification stamp (escalation-lifecycle-dashboard-prd.md
-    # Seam 1).  Written ONLY at the resolve/dismiss chokepoint (queue.resolve());
-    # never author-supplied at filing time.  None means unstamped — readers fall
-    # back to the effective_benign() proxy (see escalation.classify).
+    # Seam 1).  Written ONLY at a terminal-write chokepoint — queue.resolve() or
+    # queue.submit_resolved() — never author-supplied at filing time.  None means
+    # unstamped — readers fall back to the effective_benign() proxy (see
+    # escalation.classify).
     resolution_class: str | None = None
 
     def to_dict(self) -> dict:

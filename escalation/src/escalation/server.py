@@ -418,10 +418,17 @@ def create_server(
             # folding into a dedupe parent and resolving the wrong record.
             # Returns minimal shape: {id, status, resolution, resolved_by}.
             # The blocker wrapper adds 'action' separately.
+            # resolution_class='benign' is explicit (not left to the tier-default
+            # fallback): the underlying task was already terminal at filing time,
+            # so no action was needed or taken beyond this auto-close — the Seam-1
+            # definition of benign — and this resolver isn't in the reaper-sweep
+            # tier, so an unstamped record here would otherwise be misread as
+            # 'actionable' by the effective_benign() proxy.
             resolved = queue.submit_resolved(
                 esc,
                 f'auto-resolved: task already terminal (status={status})',
                 resolved_by='escalation-mcp-pre-submit-check',
+                resolution_class='benign',
             )
             return {
                 'id': resolved.id,

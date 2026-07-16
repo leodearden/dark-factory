@@ -620,6 +620,7 @@ class EscalationQueue:
         resolution: str,
         *,
         resolved_by: str | None = None,
+        resolution_class: str | None = None,
     ) -> Escalation:
         """Atomically write *escalation* directly in resolved state.
 
@@ -628,6 +629,15 @@ class EscalationQueue:
         fires only ``_resolve_callback`` — never ``_notify_callback``.  This
         eliminates the spurious "pending escalation" wake that the two-call
         path emits before the resolve callback fires.
+
+        ``resolution_class`` mirrors ``resolve()``'s Seam-1 stamp (see its
+        docstring): an optional explicit ``'benign' | 'actionable'`` value,
+        validated against ``RESOLUTION_CLASSES`` before *escalation* is
+        mutated at all — an invalid value raises ``ValueError`` naming the
+        legal values and leaves the passed-in object untouched (INV-1).  When
+        ``None``, the stamp defaults per *resolved_by* via the same
+        ``default_resolution_class_for_resolver`` helper ``resolve()`` uses
+        (INV-5 — one classification site for both terminal-write paths).
 
         Contract:
         - Mutates *escalation* in-place (status/resolution/resolved_at/resolved_by)
@@ -642,12 +652,22 @@ class EscalationQueue:
         - Fires ``_resolve_callback`` once (if set); never fires ``_notify_callback``.
         - Returns *escalation* (non-Optional — disk failures raise, no None case).
         """
+        if resolution_class is not None and resolution_class not in RESOLUTION_CLASSES:
+            raise ValueError(
+                f'invalid resolution_class {resolution_class!r}; '
+                f'expected one of {sorted(RESOLUTION_CLASSES)} or None'
+            )
+
         # Step 1: mutate in memory
         escalation.status = 'resolved'
         escalation.resolution = resolution
         escalation.resolved_at = datetime.now(UTC).isoformat()
         if resolved_by is not None:
             escalation.resolved_by = resolved_by
+        escalation.resolution_class = (
+            resolution_class if resolution_class is not None
+            else default_resolution_class_for_resolver(resolved_by)
+        )
 
         # Step 2: atomic write + best-effort archive under the per-id lock.
         # The lock prevents a concurrent same-id RMW from clobbering this write.
