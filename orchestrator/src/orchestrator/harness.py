@@ -7580,6 +7580,20 @@ Output JSON matching the schema. Every task must appear in the output.
         deliberate tradeoff to catch genuine squash/rebase/manual landings
         (see :meth:`~orchestrator.git_ops.GitOps.branch_content_in_main`'s
         docstring for the accepted-risk rationale).
+
+        **done_evidence_stale short-circuit** (task 2677): if any of the
+        three flip attempts below hits ``_mark_in_progress_done`` and that
+        call's ``scheduler.mark_done`` is refused by the found_on_main
+        provenance-integrity gate (evidence predates the task's
+        ``reopen_at``), ``_mark_in_progress_done`` catches the rejection,
+        routes it to the shared ``ProvenanceConflictSink``, and returns
+        ``False`` — but this gate still returns ``True`` immediately after
+        (a contested task must never dispatch while under arbitration). The
+        ``should_skip`` pre-check right after ``metadata`` is resolved below
+        makes that terminal-for-this-tick outcome cheap on every SUBSEQUENT
+        tick at the same ``reopen_at``: it short-circuits before the
+        git-ancestry subprocess work and before re-attempting the
+        already-rejected write.
         """
         if (
             self._escalation_queue is not None
@@ -7590,6 +7604,20 @@ Output JSON matching the schema. Every task must appear in the output.
         branch = f'{self.git_ops.config.branch_prefix}{task_id}'
         task = await self.scheduler.get_task(task_id)
         metadata = (task.get('metadata') or {}) if task else {}
+
+        # task 2677: a prior tick may have already had this exact
+        # (task_id, reopen_at) rejected as done_evidence_stale by
+        # _mark_in_progress_done below — the sink's in-memory memo makes
+        # that terminal-for-this-tick. Short-circuit BEFORE the git-ancestry
+        # work (is_ancestor / find_task_citation_commit /
+        # commit_effect_present_in_main are each a subprocess) rather than
+        # re-deriving the same contested evidence and re-attempting the
+        # already-doomed write every dispatch tick.
+        if self._provenance_conflict_sink.should_skip(
+            task_id, reopen_at=metadata.get('reopen_at'),
+        ):
+            return True
+
         branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
         branch_exists = branch_tip_sha is not None
 
