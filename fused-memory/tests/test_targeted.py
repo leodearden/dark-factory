@@ -2342,6 +2342,15 @@ class TestShouldWithholdProposedResolutionAcceptsScope:
             id='plain_prior_echo',
         ),
         pytest.param(
+            {
+                'source': 'targeted_reconciliation',
+                'task_id': '5',
+                'stage2_suppress': True,
+            },
+            False,
+            id='targeted_echo_with_suppress_not_authoritative',
+        ),
+        pytest.param(
             {'source': 'stage1_flag_marker', 'task_id': '7', 'flag_type': 'x'},
             False,
             id='non_authoritative_flag_marker_source',
@@ -2377,6 +2386,15 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
     Plain prior targeted echoes (source='targeted_reconciliation', no
     supersedes, no stage2_suppress) are deliberately NOT authoritative, so a
     task's own earlier echoes never trigger suppression or oscillation.
+
+    `stage2_suppress` is authoritative only when the memory is NOT this
+    reconciler's own echo (source != _ECHO_SOURCE):
+    `targeted_echo_with_suppress_not_authoritative` below locks in that even
+    once TargetedReconciliation's own completion echo also stamps
+    `stage2_suppress` (to seed Stage 2's suppression count gate), that
+    self-echo must stay non-authoritative to this pre-check — otherwise a
+    task's own prior echo would suppress its next completion description,
+    regressing the task-1984 invariant above.
     """
     from fused_memory.reconciliation.targeted import _is_authoritative_resolution
 
