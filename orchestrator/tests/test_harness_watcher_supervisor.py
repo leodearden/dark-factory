@@ -2820,6 +2820,58 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
         )
 
     @pytest.mark.asyncio
+    async def test_skip_when_empty_queue_resolves_stale_outage_l2(self, tmp_path: Path) -> None:
+        """Empty L1 queue with a stale outage L2 open -> the skip path both
+        skips the rotation launch AND resolves the outage L2.
+
+        Reaching the empty-queue skip branch proves the supervisor loop is
+        alive and the queue is readable (the precheck fails open on a
+        None/erroring queue), which is exactly the 'watcher is up again'
+        signal the outage L2 represents -- so a stale L2 must not linger as
+        a false alarm just because the L1 queue happens to be drained.
+        """
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+
+        # Pre-file the outage L2; leave the L1 queue EMPTY (no _submit_sample_l1
+        # call) so _watcher_has_actionable_l1() returns False and the loop
+        # takes the empty-queue skip path.
+        h._file_watcher_outage_l2('watcher_crashloop')
+        pending_before = [
+            e for e in queue.get_pending()
+            if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+        ]
+        assert len(pending_before) == 1, 'Pre-condition: outage L2 must be filed before loop runs'
+
+        sleep_durations: list[float] = []
+        rotation_spy = AsyncMock()
+        h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+            raise asyncio.CancelledError()
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        rotation_spy.assert_not_called()
+        assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (
+            f'Expected exactly one recorded sleep of watcher_empty_queue_poll_secs '
+            f'({h.config.watcher_empty_queue_poll_secs}); got {sleep_durations}'
+        )
+
+        pending_after = [
+            e for e in queue.get_pending()
+            if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+        ]
+        assert len(pending_after) == 0, (
+            f'Expected the stale outage L2 to be resolved on the empty-queue skip path; '
+            f'still pending: {pending_after}'
+        )
+
+    @pytest.mark.asyncio
     async def test_launch_when_actionable_l1_present(self, tmp_path: Path) -> None:
         """An actionable pending L1 -> the rotation IS launched normally
         (precheck must not block real work from being picked up).
