@@ -5591,8 +5591,19 @@ class TaskWorkflow:
         Unions every ``.task/iterations.jsonl`` entry's ``steps_completed``
         into the set of step IDs genuinely completed on this branch, then
         flips any plan.json step currently "pending" whose ID is in that set
-        to "done" — recording the commit the log entry reported the step
-        completed at (last-wins across entries naming the same step id).
+        to "done" — recording the post-rebase HEAD (not the log entry's own
+        ``commit``) as the step's commit. The log-reported commit is a
+        *pre-rebase* SHA: this method runs immediately after
+        ``rebase_preserving_task_commits`` has already rewritten the branch
+        onto the new base, so that SHA is virtually guaranteed to be
+        unreachable from the new HEAD. Recording it anyway would manufacture
+        exactly the "done step with an orphaned commit" condition
+        :meth:`_reconcile_done_step_commits` exists to repair — and that
+        repair only succeeds when the step's code happens to have been
+        folded into a WIP safety-commit sitting at HEAD; otherwise it falls
+        through to a non-blocking info escalation on every such rebase.
+        Recording ``head`` directly satisfies the reachable-commit invariant
+        up front instead of depending on that downstream heuristic.
 
         GUARD: only reconciles when :meth:`_has_prior_implementation`
         (called with the current branch HEAD, i.e. SHA-primary mode) reports
@@ -5603,6 +5614,18 @@ class TaskWorkflow:
         ``iterations.jsonl`` on a branch that has no real commits beyond
         base. Reuses ``status.entries`` from the guard call rather than
         re-reading the iteration log.
+
+        **Granularity caveat**: the guard above is branch-level, not
+        per-step — it only asserts that *some* genuine work landed on this
+        branch, then trusts every step id named anywhere in the union of
+        ``steps_completed``. It does not verify that any individual step's
+        own commit is reachable or that its claimed files actually changed.
+        A log entry that over-claims (names a step in ``steps_completed``
+        whose own change was later reverted or failed) is still flipped to
+        "done" as long as the branch has real work elsewhere. This mirrors
+        the project's existing trust-the-durable-log design (see this
+        task's design_decisions) — per-step correctness depends entirely on
+        implementer log fidelity, not on independent per-step verification.
 
         Emits a single ``event='plan_step_rederive'`` iteration-log entry
         (naming every re-derived step id) when at least one step is
@@ -5630,13 +5653,8 @@ class TaskWorkflow:
                 return []
 
             completed_ids: set[str] = set()
-            commit_by_id: dict[str, str] = {}
             for entry in status.entries:
-                for step_id in entry.get('steps_completed') or []:
-                    completed_ids.add(step_id)
-                    entry_commit = entry.get('commit')
-                    if entry_commit:
-                        commit_by_id[step_id] = entry_commit
+                completed_ids.update(entry.get('steps_completed') or [])
 
             plan = self.artifacts.read_plan()
             rederived: list[str] = []
@@ -5646,9 +5664,9 @@ class TaskWorkflow:
                         continue
                     if item.get('status') == 'pending' and item.get('id') in completed_ids:
                         step_id = item['id']
-                        self.artifacts.update_step_status(
-                            step_id, 'done', commit=commit_by_id.get(step_id, head),
-                        )
+                        # Always record post-rebase HEAD, never the log's
+                        # pre-rebase commit — see the docstring above.
+                        self.artifacts.update_step_status(step_id, 'done', commit=head)
                         rederived.append(step_id)
 
             if rederived:
