@@ -7,6 +7,7 @@ test_audit_found_on_main_provenance.py / test_audit_duplicate_tasks.py.
 from __future__ import annotations
 
 import importlib.util
+import json
 import types
 from pathlib import Path
 
@@ -338,3 +339,42 @@ class TestApplyCorrectionsDryRun:
         assert {(p['task_id'], p['action']) for p in planned} == {
             ('1175', ACTION_REOPEN), ('9999', ACTION_ANNOTATE),
         }
+
+
+# ===========================================================================
+# Step-5/6: apply_corrections — annotate apply path
+# ===========================================================================
+
+@pytest.mark.asyncio
+class TestApplyCorrectionsAnnotate:
+    """apply=True on an annotate correction writes a single, non-destructive
+    x_provenance_audit merge — never a status write."""
+
+    async def test_annotate_writes_single_non_destructive_update_task_call(self):
+        correction = _correction(
+            '9999', ACTION_ANNOTATE, label=LABEL_PRESUMED_BENIGN_HISTORICAL, ref='main',
+            reasons=['commit message cites task(s) 77, not task 9999'],
+        )
+        backend = FakeCorrectionsBackend()
+        summary = await apply_corrections(backend, '/proj', [correction], apply=True)
+
+        # No status write for an annotate-only correction.
+        assert backend.status_calls == []
+
+        assert len(backend.update_calls) == 1
+        call = backend.update_calls[0]
+        assert call['task_id'] == '9999'
+        assert call['project_root'] == '/proj'
+        # metadata_mode left at its 'merge' default — never forced to
+        # 'replace', which would otherwise wipe done_provenance/files.
+        assert call['kwargs'] == {}
+
+        payload = json.loads(call['metadata'])
+        annotation = payload['x_provenance_audit']
+        assert annotation['label'] == LABEL_PRESUMED_BENIGN_HISTORICAL
+        assert annotation['reasons'] == correction.reasons
+        assert annotation['ref'] == 'main'
+        assert annotation.get('audited_at')
+
+        assert summary['annotated'] == 1
+        assert summary['needs_human_review'] == ['9999']
