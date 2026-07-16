@@ -13695,6 +13695,12 @@ class TestRunPostMergeVerify:
             f'classified-infra outcome must not bump the timeout loop-breaker: {timeouts}'
         )
         mock_spawn_dry_run.assert_not_called()
+        assert result.failure_category == '', (
+            f'persistent classified-infra-transient outcome must leave failure_category '
+            f'empty (byte-identical to the persistent-ENOSPC branch), so the TRAIN verify '
+            f'gate never mis-tags it as a cross-member interaction candidate; '
+            f'got: {result.failure_category!r}'
+        )
 
     async def test_genuine_test_failure_not_treated_as_infra_transient(self) -> None:
         """(task ν) NARROWNESS: a genuine test_failure category is NOT retried
