@@ -603,17 +603,20 @@ async def run(
     there was nothing left to enumerate). The ground truth is always
     consulted when the scroll came back at/over the limit (ambiguous: a real
     truncation, or the pool size happens to equal the limit exactly) OR came
-    back completely empty (ambiguous: a genuinely-empty pool, or
-    ``scroll_by_metadata`` swallowing a Qdrant timeout into a bare ``[]`` —
-    see its docstring — which must not be mistaken for "nothing to prune").
-    If any project's scan under-counted, this hard-aborts with a
-    ``scan_truncated`` payload *before* the deletion-cap check and before any
-    ``--apply`` deletes — a truncated scan must never silently reach a
+    back completely empty (ambiguous: a genuinely-empty pool, or an
+    under-count/race between the scroll and ``count_by_metadata`` — a real
+    Qdrant read-timeout now *raises* out of ``scroll_by_metadata`` — see its
+    docstring — rather than returning a swallowed ``[]``, so a scanned-zero
+    result here must not be mistaken for "nothing to prune"). If any
+    project's scan under-counted, this hard-aborts with a ``scan_truncated``
+    payload *before* the deletion-cap check and before any ``--apply``
+    deletes — a truncated scan must never silently reach a
     classification/deletion decision. The abort separately flags any
-    scanned-zero project (``possible_timeout_projects``) as a probable
-    scroll timeout rather than an inadequate ``--scan-limit``, and notes that
-    on a live system a small overshoot can reflect a benign race between the
-    scroll and the ground-truth count rather than a real undercount.
+    scanned-zero project (``possible_undercount_projects``) as a probable
+    count/scroll race or under-count rather than an inadequate
+    ``--scan-limit``, and notes that on a live system a small overshoot can
+    reflect a benign race between the scroll and the ground-truth count
+    rather than a real undercount.
 
     Parameters
     ----------
@@ -693,13 +696,15 @@ async def run(
         # proves the pool was fully enumerated -- skip the extra
         # count_by_metadata round-trip in that (common) case, halving Qdrant
         # reads. A `scrolled` result of exactly zero is deliberately NOT
-        # short-circuited: scroll_by_metadata also returns `[]` (logging a
-        # WARNING, never raising) on a Qdrant timeout, which is
-        # indistinguishable from a genuinely-empty pool without cross-
-        # checking -- always consult the ground truth for that case so a
-        # timeout cannot masquerade as "nothing to prune". The ground truth
-        # is likewise always consulted when the scroll came back at/over
-        # `scan_limit` (the potential-truncation case).
+        # short-circuited: scroll_by_metadata returning `[]` is
+        # indistinguishable from a genuinely-empty pool vs. a benign
+        # under-count/race against count_by_metadata without cross-checking
+        # (a real Qdrant read-timeout now raises instead of returning `[]`,
+        # so it can never reach this branch) -- always consult the ground
+        # truth for that case so a race cannot masquerade as "nothing to
+        # prune". The ground truth is likewise always consulted when the
+        # scroll came back at/over `scan_limit` (the potential-truncation
+        # case).
         if 0 < len(scrolled) < scan_limit:
             expected = len(scrolled)
         else:
@@ -729,19 +734,21 @@ async def run(
     # cycle_summary total (see check_scan_completeness).
     truncated = check_scan_completeness(per_project_counts)
     if truncated:
-        # A truncated project that scanned exactly zero records is the
-        # signature of scroll_by_metadata swallowing a Qdrant timeout into a
-        # bare `[]` (see its docstring) rather than an actually-empty pool --
-        # raising --scan-limit would not fix that, so it is flagged
-        # separately from the generic remedy below.
-        possible_timeout_projects = sorted(
+        # A truncated project that scanned exactly zero records reflects an
+        # under-count or benign race between the scroll and the
+        # count_by_metadata ground truth (never a swallowed timeout --
+        # scroll_by_metadata now raises on a real Qdrant read-timeout, see
+        # its docstring) rather than an actually-empty pool -- raising
+        # --scan-limit would not fix a race, so it is flagged separately
+        # from the generic remedy below.
+        possible_undercount_projects = sorted(
             pid for pid in truncated if per_project_counts[pid][0] == 0
         )
         truncation_payload: dict[str, Any] = {
             'aborted': True,
             'scan_truncated': True,
             'truncated_projects': truncated,
-            'possible_timeout_projects': possible_timeout_projects,
+            'possible_undercount_projects': possible_undercount_projects,
             'scan_limit': scan_limit,
             'dry_run': not args.apply,
             'generated_at': generated_at,
@@ -757,13 +764,14 @@ async def run(
             f'(current: {scan_limit}).',
             file=sys.stderr,
         )
-        if possible_timeout_projects:
+        if possible_undercount_projects:
             print(
-                f'NOTE: {possible_timeout_projects} scanned 0 cycle_summary '
-                f'records despite a non-zero ground-truth count -- this is '
-                f'the signature of a Mem0/Qdrant scroll timeout (logged as a '
-                f'WARNING by scroll_by_metadata), not an inadequate '
-                f'--scan-limit; check logs for a timeout before raising it.',
+                f'NOTE: {possible_undercount_projects} scanned 0 cycle_summary '
+                f'records despite a non-zero ground-truth count -- this reflects '
+                f'an under-count or a benign race between scroll_by_metadata and '
+                f'count_by_metadata, not an inadequate --scan-limit; a real '
+                f'Qdrant read-timeout would raise instead of returning 0 results, '
+                f'so check logs for a raised TimeoutError separately.',
                 file=sys.stderr,
             )
         print(
