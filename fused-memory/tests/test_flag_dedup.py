@@ -2631,6 +2631,97 @@ class TestConfirmTaskAbsent:
 
 
 # ---------------------------------------------------------------------------
+# task-2525 step-1: confirm_task_present (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmTaskPresent:
+    """RED tests for confirm_task_present(get_task_result) (task-2525 step-1).
+
+    confirm_task_present is the positive-present inverse of confirm_task_absent:
+    returns True ONLY when the result positively confirms the task DOES exist
+    (a plain task-record dict, no error keys, carrying at least one
+    task-identity key). Any not-found, inconclusive, or non-dict result
+    returns False (fail-safe: uncertain presence must never be treated as
+    corroboration).
+
+    RED until step-2 adds confirm_task_present to flag_dedup.py.
+    """
+
+    def test_true_for_valid_task_record(self):
+        """Returns True for a valid task record dict carrying several identity keys."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_present
+
+        task_record = {
+            'id': '42',
+            'title': 'Some real task',
+            'status': 'in-progress',
+            'dependencies': [],
+        }
+        assert confirm_task_present(task_record) is True, (
+            'confirm_task_present must return True for a valid task record'
+        )
+
+    def test_true_for_dict_with_only_task_id_key(self):
+        """Returns True when the only identity key present is 'task_id'."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_present
+
+        minimal_record = {'task_id': '42'}
+        assert confirm_task_present(minimal_record) is True, (
+            "confirm_task_present must return True when 'task_id' is the only identity key"
+        )
+
+    def test_false_for_not_found_error_dict(self):
+        """Returns False for the canonical not-found error dict (task is absent, not present)."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_present
+
+        not_found = {
+            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 42',
+            'error_type': 'TaskmasterError',
+        }
+        assert confirm_task_present(not_found) is False, (
+            'confirm_task_present must return False for a not-found error dict'
+        )
+
+    def test_false_for_generic_inconclusive_error_dict(self):
+        """Returns False for a generic/inconclusive error dict (e.g. timeout)."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_present
+
+        timeout_error = {
+            'error': 'Connection timeout reaching Taskmaster backend',
+            'error_type': 'TimeoutError',
+        }
+        assert confirm_task_present(timeout_error) is False, (
+            'confirm_task_present must return False for inconclusive errors (fail-safe)'
+        )
+
+    def test_false_for_none(self):
+        """Returns False for None input (fail-safe)."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_present
+
+        assert confirm_task_present(None) is False, (
+            'confirm_task_present must return False for None (fail-safe)'
+        )
+
+    def test_false_for_empty_dict(self):
+        """Returns False for an empty dict (no identity keys => not confirmed present)."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_present
+
+        assert confirm_task_present({}) is False, (
+            'confirm_task_present must return False for an empty dict (fail-safe)'
+        )
+
+    def test_false_for_non_dict_inputs(self):
+        """Returns False for non-dict inputs (str, int, list, bool) — fail-safe."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_present
+
+        for bad in ['a task exists', 42, [], True]:
+            assert confirm_task_present(bad) is False, (
+                f'confirm_task_present must return False for non-dict {bad!r} (fail-safe)'
+            )
+
+
+# ---------------------------------------------------------------------------
 # Step 9: filter_false_absence_flags (RED tests)
 # ---------------------------------------------------------------------------
 
