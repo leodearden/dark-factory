@@ -312,6 +312,15 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     'Bash(git rev-parse:*)',
     'Bash(git branch:*)',
     'Bash(git ls-files:*)',
+    # Subagent delegation for deep RCA on hard/investigation-class items
+    # (task 2629): the sonnet top-level rotation spawns an opus subagent via
+    # the Task tool for read-only deep-dive investigation feeding
+    # promote_to_l2 (see SKILL.md "Delegating deep RCA to an opus subagent").
+    # The spawned subagent inherits this same allowed/disallowed-tools
+    # posture, so it cannot edit code or touch main regardless of its prompt.
+    # Covered by TestWatcherAllowedTools.test_task_in_allowed_tools — keep in
+    # lockstep with that test if this entry ever moves or is removed.
+    'Task',
     # Escalation MCP: read + autonomous resolve + L1→L2 promotion
     # (promote_to_l2 is needed by the consumer-per-level contract so the
     # watcher can escalate out-of-scope L1s directly to a human L2 stream)

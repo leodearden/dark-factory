@@ -28,6 +28,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import (
     _WATCHER_ALLOWED_TOOLS,
+    _WATCHER_DISALLOWED_TOOLS,
     _WATCHER_ESCALATION_HEADERS,
     _WATCHER_MAX_BACKOFF_SECS,
     _WATCHER_TIMEOUT_GRACE_SECS,
@@ -2643,6 +2644,30 @@ class TestWatcherAllowedTools:
             f'current list: {_WATCHER_ALLOWED_TOOLS}'
         )
 
+    def test_task_in_allowed_tools(self) -> None:
+        """'Task' must be in _WATCHER_ALLOWED_TOOLS, and not in the disallowed list.
+
+        The sonnet top-level rotation (task 2629) delegates hard or
+        investigation-class items to an opus subagent via the Task tool
+        (SKILL.md "Delegating deep RCA to an opus subagent") instead of
+        running the whole rotation on opus. Task is not blocked by
+        bypassPermissions, so the delegation works today without this entry
+        — but a future tightening of the tool policy (e.g. an exhaustive
+        allowlist, or adding Task to _WATCHER_DISALLOWED_TOOLS) could
+        silently break this cost-optimization design with no test failing.
+        This assertion makes the dependency explicit and enforced.
+        """
+        assert 'Task' in _WATCHER_ALLOWED_TOOLS, (
+            "'Task' must be in _WATCHER_ALLOWED_TOOLS so the watcher rotation "
+            'can delegate deep RCA to an opus subagent (task 2629); '
+            f'current list: {_WATCHER_ALLOWED_TOOLS}'
+        )
+        assert 'Task' not in _WATCHER_DISALLOWED_TOOLS, (
+            "'Task' must not be in _WATCHER_DISALLOWED_TOOLS — that would "
+            'silently break the opus-subagent deep-RCA delegation (task 2629); '
+            f'current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task 2629 step-3: _watcher_has_actionable_l1 — empty-queue rotation precheck
@@ -2740,6 +2765,22 @@ class TestWatcherHasActionableL1:
             level=0,
         )
         queue.submit(esc)
+        assert h._watcher_has_actionable_l1() is False
+
+    def test_only_pending_l2_no_l1_returns_false(self, tmp_path: Path) -> None:
+        """Only a pending L2 cluster, no standalone pending L1 at all — not actionable.
+
+        Complements test_only_l0_returns_false: that test reaches the
+        `if not l1_ids: return False` guard via an L0-only queue. This test
+        reaches the same guard directly via a pure-L2 queue — the common
+        steady state this precheck exists to handle, where an L2 cluster has
+        unresolved members but the queue holds no pending level-1 escalation
+        of its own (e.g. its members were resolved individually and archived).
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+        _submit_sample_l2(
+            queue, 'task-l2-only-cluster', members=['task-already-resolved-1']
+        )
         assert h._watcher_has_actionable_l1() is False
 
 
