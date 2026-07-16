@@ -2464,6 +2464,12 @@ class MemoryService:
                     f'Search timed out for stores: {[s.value for s in timed_out_stores]}'
                 )
             failed_stores.extend(timed_out_stores)
+            failure_diagnostics.extend(
+                _store_failure_diagnostics(
+                    store, None, query=query, project_id=project_id, reason='timeout'
+                )
+                for store in timed_out_stores
+            )
 
             for i, t in enumerate(task_list):
                 if t not in done:
