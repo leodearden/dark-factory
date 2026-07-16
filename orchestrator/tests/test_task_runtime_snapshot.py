@@ -162,3 +162,27 @@ class TestB2NonPooled:
         assert entry['lane'] is None
         assert entry['lane_state'] is None
         assert entry['phase'] == 'EXECUTE'
+
+
+# ---------------------------------------------------------------------------
+# B3 — Quarantined lane surfaced
+# ---------------------------------------------------------------------------
+
+
+class TestB3Quarantined:
+    def test_quarantined_lane_surfaces_lane_state(self, git_repo: Path, tmp_path: Path):
+        """A lane transitioned to QUARANTINED surfaces lane_state=='quarantined'
+        end-to-end — the state the OLD dashboard hand reader (pre-2636) was
+        blind to.
+        """
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        lifecycle = git_ops._lane_lifecycle
+        lifecycle.note_assigned('_lane-5', task_id='43')
+        lifecycle.transition('_lane-5', LaneState.QUARANTINED)
+
+        by_task, offline = _tool_runtime_tasks(git_ops, tmp_path)
+
+        assert offline is False
+        entry = by_task[43]
+        assert entry['lane_state'] == 'quarantined'
+        assert entry['lane'] == '_lane-5'
