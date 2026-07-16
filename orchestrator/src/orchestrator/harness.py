@@ -2155,13 +2155,35 @@ task, include it with an empty "files" list rather than omitting it.
                 logger.warning('Module tagger produced no parseable output')
                 return
 
-        entries = _extract_tagger_entries(payload)
+        # Index predictions by task id. A missing/empty files list normalizes
+        # to [] so a task the agent predicted no files for is still
+        # indexable (defect 1) rather than absent from the mapping.
+        pred_by_id = {
+            str(e.get('id', '')): (e.get('files') or [])
+            for e in _extract_tagger_entries(payload)
+            if isinstance(e, dict) and e.get('id') is not None
+        }
+
+        # Stamp files_tagged_at for EVERY task in the untagged batch — not
+        # just the ones present in the agent's response — so a task the
+        # agent can't (or won't) predict files for still gets marked as
+        # processed and never re-enters the tagging batch on the next cycle
+        # (defect 1: an LLM-spend leak — 73 tagger sessions mined in one
+        # month). The 'files' key is written ONLY when the prediction is
+        # non-empty; otherwise the sentinel is written alone, and
+        # scheduler.update_task's default merge mode preserves any
+        # pre-existing real files rather than clobbering them when a
+        # force-retag's agent response skips a task.
+        tagged_at = datetime.now(UTC).isoformat()
 
         tagged_count = 0
-        for entry in entries:
-            task_id = str(entry.get('id', ''))
-            files = entry.get('files', [])
-            if task_id and files:
+        for t in untagged:
+            task_id = str(t.get('id', ''))
+            if not task_id:
+                continue
+            files = pred_by_id.get(task_id, [])
+            metadata_payload: dict[str, Any] = {'files_tagged_at': tagged_at}
+            if files:
                 # Persist file-level paths only: strip directory-shaped entries
                 # before writing so the lock-charter guard on update_task /
                 # task_interceptor.update_task accepts the write. Without this,
@@ -2169,9 +2191,9 @@ task, include it with an empty "files" list rather than omitting it.
                 # ENTIRE payload (LockCharterViolation), silently dropping the
                 # valid file-level entries too. Consistent with the strip in
                 # _persist_files_metadata / _reconcile_metadata_files_for_done.
-                await self.scheduler.update_task(
-                    task_id, json.dumps({'files': sanitize_files_for_persist(files)})
-                )
+                metadata_payload['files'] = sanitize_files_for_persist(files)
+            await self.scheduler.update_task(task_id, json.dumps(metadata_payload))
+            if files:
                 # Populate in-memory cache via the single cache-writing seam.
                 # module_charter.derive_modules (called inside seed_modules)
                 # applies the α strip so a directory-only charter cannot
