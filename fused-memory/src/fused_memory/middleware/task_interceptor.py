@@ -4709,6 +4709,30 @@ def _done_evidence_stale_error(
     }
 
 
+def _valid_stale_evidence_override(override: object, is_recon_stage: bool) -> bool:
+    """True iff ``override`` is a well-formed, non-recon-stage bypass assertion.
+
+    A recon-stage caller may never self-authorize a stale-evidence bypass —
+    the override is a human/orchestrator-sanctioned exception, not a claim
+    a reconciliation stage can make about its own write. Otherwise valid
+    iff ``override`` is a dict carrying non-empty string ``escalation_id``
+    and ``reason`` fields (both are recorded verbatim as Stage-2 audit
+    substrate — see :func:`_check_reopen_freshness`).
+    """
+    if is_recon_stage:
+        return False
+    if not isinstance(override, dict):
+        return False
+    escalation_id = override.get('escalation_id')
+    reason = override.get('reason')
+    return (
+        isinstance(escalation_id, str)
+        and bool(escalation_id)
+        and isinstance(reason, str)
+        and bool(reason)
+    )
+
+
 async def _check_reopen_freshness(
     task_id: str,
     resolved_provenance: dict | None,
@@ -4736,15 +4760,25 @@ async def _check_reopen_freshness(
     on either side currently returns None (fail-OPEN) — S10 flips this to
     fail-closed (treat as stale).
 
-    On stale: ``mode == 'enforce'`` returns the typed
+    On stale, BEFORE the enforce/warn mode dispatch: a well-formed,
+    non-recon-stage ``raw_done_provenance['stale_evidence_override']``
+    (validated by :func:`_valid_stale_evidence_override`) bypasses the gate
+    unconditionally (both modes). The override is mutated onto
+    ``resolved_provenance`` VERBATIM — the caller persists
+    ``resolved_provenance`` into ``audit_fields['done_provenance']``, so
+    this is Stage-2 audit substrate, not a live cross-service escalation
+    lookup (fused-memory has no orchestrator-escalation client).
+
+    Absent a valid override: ``mode == 'enforce'`` returns the typed
     :func:`_done_evidence_stale_error` rejection (the caller must abort the
     write); otherwise (warn mode) emits one ``task_status.done_evidence_stale_warn``
     census WARNING (stable grep anchor) and returns None (the write
     proceeds).
 
-    ``raw_done_provenance``/``is_recon_stage`` are accepted now (stable
-    signature) but not yet used — the ``stale_evidence_override`` handling
-    lands in S6/S8.
+    A present-but-invalid override (malformed shape, or a recon-stage
+    caller) is NOT yet distinguished from "no override" — it falls through
+    to the mode dispatch above. The loud ``done_evidence_stale_override_invalid``
+    rejection for that case lands in S8.
     """
     if not isinstance(resolved_provenance, dict):
         return None
@@ -4763,6 +4797,22 @@ async def _check_reopen_freshness(
 
     stale = evidence_dt is not None and reopen_dt is not None and evidence_dt < reopen_dt
     if not stale:
+        return None
+
+    override = (
+        raw_done_provenance.get('stale_evidence_override')
+        if isinstance(raw_done_provenance, dict)
+        else None
+    )
+    if override is not None and _valid_stale_evidence_override(override, is_recon_stage):
+        resolved_provenance['stale_evidence_override'] = {
+            'escalation_id': override['escalation_id'],
+            'reason': override['reason'],
+        }
+        logger.info(
+            'task_status.done_evidence_stale_override_accepted task_id=%s escalation_id=%s',
+            task_id, override['escalation_id'],
+        )
         return None
 
     if mode == 'enforce':
