@@ -1500,6 +1500,7 @@ class TaskInterceptor:
             priority=str(kwargs.get('priority') or 'medium'),
             spawned_from=meta.get('spawned_from'),
             spawn_context=str(meta.get('spawn_context') or 'manual'),
+            execution_class=meta.get('execution_class'),
         )
 
     def _files_scope_check(
