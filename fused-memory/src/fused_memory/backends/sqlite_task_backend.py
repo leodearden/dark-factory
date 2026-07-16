@@ -1204,6 +1204,22 @@ class SqliteTaskBackend:
         convention. A future caller that queries this connection directly
         should use the same pattern (or otherwise guarantee the cursor is
         closed) rather than assume it's automatic.
+
+        Serialization trade-off (task 2651): this connection is now shared
+        by both the "hot" status reads (:meth:`get_statuses_raw` via
+        :meth:`_statuses_from_conn`) and the heavier full-tree reads
+        (:meth:`get_task`, :meth:`_get_tasks_internal`/:meth:`get_tasks`).
+        aiosqlite serializes every ``execute``/``fetch`` on a connection
+        through that connection's single background worker thread, so a
+        large ``get_tasks`` scan can head-of-line-block a concurrent
+        ``get_statuses`` hot read that would previously have run on the
+        separate write connection's thread instead. This is an accepted
+        trade-off, not an oversight: the freshness convergence this
+        connection exists for requires get_task/get_tasks and get_statuses
+        to read the SAME connection, so splitting the tree reads back onto
+        a connection of their own would reopen the two-connections-can-
+        disagree gap task 2651 closes. Revisit if tree-read latency is ever
+        observed to starve the hot status path in practice.
         """
         if self._closed:
             raise RuntimeError('SqliteTaskBackend is closed')
@@ -1312,6 +1328,18 @@ class SqliteTaskBackend:
         opens is always released; see that method's docstring's Guardrail
         note. Safe for the write-connection callers too (``fetchall()``
         already exhausts the cursor there).
+
+        Intra-call read skew: callers issue the tasks-row SELECT and this
+        dependencies SELECT as two separate statements, each opening and
+        closing its own cursor against the (possibly shared) read
+        connection — not one joint snapshot. A write committed between the
+        two can leave a task's ``dependencies`` reflecting a different
+        point in time than its own row within the SAME ``get_task``/
+        ``get_tasks`` call. This is the same kind of ordinary read skew
+        :meth:`get_statuses_raw`'s "Snapshot consistency" note already
+        treats as benign for cross-call reads, just also possible
+        intra-call now; it self-heals on the next call and no in-tree
+        caller depends on stronger atomicity here.
         """
         async with conn.execute(
             'SELECT task_id, depends_on FROM dependencies WHERE tag = ?',
@@ -1493,7 +1521,10 @@ class SqliteTaskBackend:
         is fed by :meth:`get_statuses_fresh`, not this method — see
         ``reconciliation/harness.py``'s ``_fetch_task_count_census`` — and
         that comparison already treats single-cycle divergence as an
-        advisory read-skew artifact rather than an error.
+        advisory read-skew artifact rather than an error. The same kind of
+        skew can also occur WITHIN a single :meth:`get_task`/:meth:`get_tasks`
+        call, between a task's own row and its dependency edges — see
+        :meth:`_fetch_dependencies`'s "Intra-call read skew" note.
 
         Args:
             project_root: Absolute path to the project root.
