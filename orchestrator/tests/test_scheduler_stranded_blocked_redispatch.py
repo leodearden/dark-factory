@@ -55,6 +55,7 @@ def _make_scheduler(*, time_source=None, **config_overrides) -> Scheduler:
         kwargs['time_source'] = time_source
     scheduler = Scheduler(config, **kwargs)
     scheduler.set_task_status = AsyncMock()  # type: ignore[method-assign]
+    scheduler.set_task_claimant = AsyncMock()  # type: ignore[method-assign]
     return scheduler
 
 
@@ -122,6 +123,36 @@ class TestRedispatchStrandedBlockedCore:
         scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             'T1', 'pending'
         )
+        # The stale (already-null) claimant is explicitly cleared alongside
+        # the flip, mirroring the slot-release NULL-claimant convention
+        # (harness.py:5693-5696) so a redispatched task never carries a
+        # claimant that no longer owns it.
+        scheduler.set_task_claimant.assert_awaited_once_with(  # type: ignore[attr-defined]
+            'T1', claimant_run_id=None, heartbeat_at=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stranded_blocked_task_with_unresolved_external_dep_still_flips(self):
+        """External deps are intentionally NOT checked by this sweep's
+        ``_deps_satisfied`` call (only LOCAL deps gate the flip — see the
+        docstring): ``ctx.external_cache`` is still empty when this phase
+        runs (it runs before ``_phase_external_dep_policy``), so forwarding
+        it would make external deps look permanently unsatisfied. The task
+        still flips to pending; the REAL external-dep status is re-checked
+        by ``_phase_external_dep_policy`` + ``_eligible_for_dispatch`` before
+        it is ever actually dispatched."""
+        scheduler = _make_scheduler()
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
+
+        task = _blocked_task('T1', metadata={'external_deps': ['other_project:99']})
+        ctx = _ctx_with_done_dep(task)
+
+        result = await scheduler._phase_redispatch_stranded_blocked(ctx)
+
+        assert result is _CONTINUE
+        scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            'T1', 'pending'
+        )
 
     @pytest.mark.asyncio
     async def test_open_escalation_blocks_flip(self):
@@ -139,6 +170,9 @@ class TestRedispatchStrandedBlockedCore:
 
         assert result is _CONTINUE
         scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        # No flip -> the claimant clear (which is coupled to the flip) must
+        # not fire either.
+        scheduler.set_task_claimant.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_deps_not_satisfied_blocks_flip(self):
@@ -154,6 +188,9 @@ class TestRedispatchStrandedBlockedCore:
 
         assert result is _CONTINUE
         scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        # No flip -> the claimant clear (which is coupled to the flip) must
+        # not fire either.
+        scheduler.set_task_claimant.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_live_claimant_blocks_flip(self):
@@ -174,6 +211,9 @@ class TestRedispatchStrandedBlockedCore:
 
         assert result is _CONTINUE
         scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        # No flip -> the claimant clear (which is coupled to the flip) must
+        # not fire either.
+        scheduler.set_task_claimant.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_no_escalation_queue_fails_safe(self):
@@ -190,6 +230,9 @@ class TestRedispatchStrandedBlockedCore:
 
         assert result is _CONTINUE
         scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        # No flip -> the claimant clear (which is coupled to the flip) must
+        # not fire either.
+        scheduler.set_task_claimant.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_kill_switch_disables_sweep(self):
@@ -205,6 +248,9 @@ class TestRedispatchStrandedBlockedCore:
 
         assert result is _CONTINUE
         scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        # No flip -> the claimant clear (which is coupled to the flip) must
+        # not fire either.
+        scheduler.set_task_claimant.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 class TestRedispatchStrandedBlockedParkProtection:
@@ -233,6 +279,9 @@ class TestRedispatchStrandedBlockedParkProtection:
 
         assert result is _CONTINUE
         scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        # No flip -> the claimant clear (which is coupled to the flip) must
+        # not fire either.
+        scheduler.set_task_claimant.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_deterministic_gate_task_not_flipped_with_open_l2(self):
@@ -252,6 +301,9 @@ class TestRedispatchStrandedBlockedParkProtection:
 
         assert result is _CONTINUE
         scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        # No flip -> the claimant clear (which is coupled to the flip) must
+        # not fire either.
+        scheduler.set_task_claimant.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_non_deterministic_control_still_flips(self):
@@ -270,6 +322,9 @@ class TestRedispatchStrandedBlockedParkProtection:
         scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             'T1', 'pending'
         )
+        scheduler.set_task_claimant.assert_awaited_once_with(  # type: ignore[attr-defined]
+            'T1', claimant_run_id=None, heartbeat_at=None,
+        )
 
     # -- (b) actively dispatched ----------------------------------------------
 
@@ -286,6 +341,9 @@ class TestRedispatchStrandedBlockedParkProtection:
 
         assert result is _CONTINUE
         scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        # No flip -> the claimant clear (which is coupled to the flip) must
+        # not fire either.
+        scheduler.set_task_claimant.assert_not_awaited()  # type: ignore[attr-defined]
 
     # -- (c) within dispatch/requeue cooldown window --------------------------
 
@@ -303,6 +361,9 @@ class TestRedispatchStrandedBlockedParkProtection:
 
         assert result is _CONTINUE
         scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        # No flip -> the claimant clear (which is coupled to the flip) must
+        # not fire either.
+        scheduler.set_task_claimant.assert_not_awaited()  # type: ignore[attr-defined]
 
     # -- (d) workflow just cancelled/parked (finally-block grace window) -----
 
@@ -320,6 +381,9 @@ class TestRedispatchStrandedBlockedParkProtection:
 
         assert result is _CONTINUE
         scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        # No flip -> the claimant clear (which is coupled to the flip) must
+        # not fire either.
+        scheduler.set_task_claimant.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------

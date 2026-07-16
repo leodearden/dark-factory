@@ -4732,11 +4732,33 @@ class Scheduler:
         guard for a non-deterministic human ``/unblock`` park), so it must
         never flip.
 
+        **"deps resolved" is LOCAL deps only.** The ``_deps_satisfied`` call
+        below intentionally omits ``external_status_cache`` (leaving the
+        cross-project external-dep gate inactive, matching legacy
+        no-cache-supplied behaviour) instead of forwarding
+        ``ctx.external_cache``: this phase runs BEFORE
+        ``_phase_external_dep_policy`` in ``_TICK_PHASE_ORDER`` — the phase
+        that actually populates ``ctx.external_cache`` from a live
+        ``get_external_statuses`` call each tick — so ``ctx.external_cache``
+        is always still its empty per-tick default here. Forwarding it would
+        make every ``metadata.external_deps`` entry look permanently
+        unsatisfied, so a stranded blocked task with external deps would
+        never be swept, even long after those deps finish. Omitting it is
+        safe: flipping to ``pending`` does not dispatch, so the REAL
+        external-dep status is re-checked by ``_phase_external_dep_policy``
+        + ``_eligible_for_dispatch`` before the task is ever actually
+        assigned.
+
         Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``.
         Writes: none on ctx — a task flipped this tick is picked up on the
         NEXT tick (the server row flips via ``set_task_status``, but this
         tick's in-memory ``ctx.tasks`` still reads 'blocked'), avoiding a
-        current-tick candidate-set race. Always continues.
+        current-tick candidate-set race. Also clears the stale
+        ``claimant_run_id``/``heartbeat_at`` via ``set_task_claimant``
+        (best-effort) immediately before the status flip, mirroring the
+        slot-release NULL-claimant convention at harness.py:5693-5696, so a
+        redispatched task is never left carrying a claimant that no longer
+        owns it. Always continues.
         """
         if not self.config.stranded_blocked_redispatch_enabled:
             return _CONTINUE
@@ -4781,6 +4803,16 @@ class Scheduler:
                 'pending (no live claimant, deps satisfied, no open escalation)',
                 tid,
             )
+            # Clear the stale claimant BEFORE the status flip — mirrors the
+            # slot-release ordering at harness.py:5693-5696. The task is
+            # still 'blocked' here (not yet dispatch-contestable), so
+            # nothing should be racing in a fresh claimant stamp; clearing
+            # first means a concurrent orchestrator that dispatches into
+            # this task right after it goes 'pending' below can never have
+            # its fresh stamp clobbered by a late-landing clear.
+            # Best-effort — set_task_claimant already swallows its own
+            # errors, so this can never block the flip.
+            await self.set_task_claimant(tid, claimant_run_id=None, heartbeat_at=None)
             await self.set_task_status(tid, 'pending')
 
         return _CONTINUE
