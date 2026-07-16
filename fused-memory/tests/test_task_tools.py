@@ -935,6 +935,71 @@ async def test_submit_task_non_recon_without_execution_class_accepted(
 
 
 # ------------------------------------------------------------------
+# submit_task operational-suggestion guard (task 2679, part 2) — warn-only
+# boundary wiring
+#
+# The unit-level detection matrix for operational_suggestion_finding /
+# operational_suggestion_warning lives in test_operational_suggestion_guard.py;
+# these tests assert the guard is WIRED into the submit_task tool boundary
+# and is WARN-ONLY: a flagged submission still reaches the interceptor with
+# metadata NOT coerced (task_kind/execution_class untouched by this guard),
+# and a submission that doesn't need the suggestion gets no warning key.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_submit_task_operational_phrasing_flagged_without_coercion(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """(a) A task_kind='normal' submission whose description declares
+    restart/confirm phrasing with no metadata.files carries an
+    'operational_suggestion_warning' in the result, AND the interceptor is
+    still awaited once with metadata NOT coerced -- task_kind stays
+    'normal' and no execution_class is injected for this non-recon
+    caller -- proving warn-only, never-coerce."""
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'Restart fused-memory',
+            'description': 'Restart the fused-memory service and confirm it is back up.',
+            'agent_id': 'claude-interactive',
+        },
+    )
+    assert 'operational_suggestion_warning' in result
+    task_interceptor.submit_task.assert_awaited_once()
+    forwarded = task_interceptor.submit_task.call_args.kwargs.get('metadata')
+    assert isinstance(forwarded, dict), f'metadata not normalised to dict; got {forwarded!r}'
+    assert forwarded.get('task_kind') == 'normal', (
+        f'task_kind must not be coerced; got {forwarded!r}'
+    )
+    assert 'execution_class' not in forwarded, (
+        f'execution_class must not be injected for a non-recon caller; got {forwarded!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_submit_task_clean_normal_submission_has_no_operational_warning(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """(b) A clean normal task with no operational phrasing gets no
+    'operational_suggestion_warning' key in the result."""
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'Add a retry helper to the sync client',
+            'description': 'Wrap the sync client call in a bounded retry loop.',
+            'agent_id': 'claude-interactive',
+        },
+    )
+    assert 'operational_suggestion_warning' not in result
+    task_interceptor.submit_task.assert_awaited_once()
+
+
+# ------------------------------------------------------------------
 # trigger_reconciliation without taskmaster
 # ------------------------------------------------------------------
 
