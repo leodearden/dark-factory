@@ -1,7 +1,7 @@
 """recon_report MCP namespace — in-process state + tool scaffold (task α/β).
 
-Provides ten tools: start_report / add_finding / set_stat / inc_stat / complete /
-delete_finding / cite_entity / cite_edge / cite_task / cite_memory.
+Provides eleven tools: start_report / add_finding / set_stat / inc_stat / complete /
+delete_finding / cite_entity / cite_edge / cite_task / cite_memory / cite_run.
 State is owned by :class:`ReconReportState`; tools are thin delegates registered
 by :func:`create_recon_report_server`.  This split lets unit tests drive the state
 directly without spinning up FastMCP.
@@ -1623,7 +1623,7 @@ This server provides the recon_report MCP namespace for the Dark Factory
 reconciliation pipeline.
 
 Tools: start_report, add_finding, set_stat, inc_stat, complete, delete_finding,
-       cite_entity, cite_edge, cite_task, cite_memory.
+       cite_entity, cite_edge, cite_task, cite_memory, cite_run.
 
 Usage pattern (per PRD §9.2):
 1. start_report — open a new report at the start of a stage run.
@@ -1645,6 +1645,10 @@ Citation tools (call after add_finding, before or after complete):
 7. cite_edge(run_id, finding_id, edge_uuid) — validate UUID and attach edge.
 8. cite_task(run_id, finding_id, project_id, task_id) — look up task and attach.
 9. cite_memory(run_id, finding_id, memory_id, store) — look up memory and attach.
+10. cite_run(run_id, finding_id, cited_run_id) — confirm a quoted run_id exists
+                  (via mem0 count) and attach it.  Copy cited_run_id verbatim
+                  from a fresh tool result's run_id/metadata.run_id field —
+                  never re-type or paraphrase it from memory.
 """
 
 
@@ -1809,6 +1813,23 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         """
         return await state.cite_memory(
             run_id=run_id, finding_id=finding_id, memory_id=memory_id, store=store
+        )
+
+    @mcp.tool()
+    async def cite_run(run_id: str, finding_id: str, cited_run_id: str) -> dict:
+        """Confirm a cited run_id exists (via mem0 count) and attach it to a finding.
+
+        PRD §9.2 (task-2595) — cite_run(run_id, finding_id, cited_run_id).
+        Returns {run_id, match_count} or a structured error dict.
+        invalid_uuid_shape when cited_run_id doesn't match the canonical UUID regex.
+        run_not_found when the UUID is valid but no mem0 records carry it as
+        their run_id (count_memories_by_metadata returns 0) — this is the
+        structural fix for run_id transcription drift: copy cited_run_id
+        verbatim from the run_id/metadata.run_id field of a fresh tool
+        result, never re-type or paraphrase it from memory.
+        """
+        return await state.cite_run(
+            run_id=run_id, finding_id=finding_id, cited_run_id=cited_run_id
         )
 
     return mcp
