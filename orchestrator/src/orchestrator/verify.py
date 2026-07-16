@@ -12,6 +12,7 @@ import shlex
 import shutil
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -573,6 +574,61 @@ def _extract_failing_test_ids(test_output: str) -> list[str]:
             seen.add(node_id)
             ordered.append(node_id)
     return ordered
+
+
+def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
+    """Parse a pytest junitxml report at *path* into failing/errored test ids.
+
+    Task μ (verify-scope-inversion-prd.md): the STRUCTURED counterpart to
+    :func:`_extract_failing_test_ids` above (which regexes pytest stdout) —
+    this is the baseline-attribution signal, parsed via stdlib
+    ``xml.etree.ElementTree`` rather than a regex. The SAME parser feeds both
+    the per-main-SHA baseline probe and a branch's merge-gate result, so diff
+    consistency — not exact pytest-node-id fidelity — is what matters (see
+    ``diff_new_failures``/``is_wholly_preexisting``).
+
+    A ``<testcase>`` counts as failing iff it has a ``<failure>`` or
+    ``<error>`` child (a ``<skipped>`` child does not count). Its id is
+    ``f'{classname}::{name}'``; when ``classname`` is absent, falls back to
+    ``f'{file}::{name}'`` (the ``file`` attribute some junit writers emit),
+    then to the bare ``name`` when neither is present. ``<testcase>``
+    elements are found via ``root.iter('testcase')`` so both the modern
+    ``<testsuites><testsuite>...`` wrapping and a bare ``<testsuite>`` root
+    are handled uniformly, and multiple ``<testsuite>`` blocks are all
+    covered.
+
+    Returns:
+        - ``None`` when *path* does not exist, or the file is empty/malformed
+          (``ET.ParseError``) — "no junit collected", the B3 degrade signal
+          callers fall back on.
+        - ``[]`` when the report parses but no testcase is failing/errored
+          ("junit collected, zero failing" — main/branch genuinely clean).
+        - Otherwise a sorted, de-duplicated list of failing/errored ids.
+
+    Never raises: any unexpected parse-time exception is treated the same as
+    ``ET.ParseError`` (fail-soft to ``None``).
+    """
+    try:
+        tree = ET.parse(path)
+    except (OSError, ET.ParseError):
+        return None
+    root = tree.getroot()
+    if root is None:
+        return None
+
+    ids: set[str] = set()
+    for testcase in root.iter('testcase'):
+        if testcase.find('failure') is None and testcase.find('error') is None:
+            continue
+        name = testcase.get('name', '')
+        classname = testcase.get('classname')
+        if classname:
+            test_id = f'{classname}::{name}'
+        else:
+            file_attr = testcase.get('file')
+            test_id = f'{file_attr}::{name}' if file_attr else name
+        ids.add(test_id)
+    return sorted(ids)
 
 
 def _extract_cause_hint(output: str) -> str:
