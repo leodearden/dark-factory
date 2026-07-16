@@ -635,7 +635,13 @@ def _store_failure_diagnostics(
         query: The search query text — only its length is recorded (``query_len``),
             not its content, matching the write-journal's existing
             query[:200]-truncation-not-full-body convention.
-        project_id: The project scope the search ran under.
+        project_id: The project scope the search ran under. Deliberately embedded
+            in every per-store dict (even though one search() call shares a single
+            project_id across all its diagnostics) so each entry is independently
+            self-describing — a log shipper or downstream consumer reading one
+            failure_diagnostics entry (e.g. off a WARNING's ``extra``) never needs
+            to join back against the parent SearchResults or the enclosing
+            search() call's scope to know which project it came from.
         reason: ``'exception'`` or ``'timeout'`` — which degrade variant produced
             this diagnostic.
 
@@ -650,6 +656,9 @@ def _store_failure_diagnostics(
         'error': (str(exc)[:500] if exc is not None else 'search_timeout'),
         'rate_limit_or_quota': _is_rate_limit_or_quota_error(exc) if exc is not None else False,
         'query_len': len(query),
+        # Intentionally repeated per-entry (not deduped onto SearchResults) so
+        # each diagnostic stays self-contained for independent log consumption —
+        # see the `project_id` Args note above.
         'project_id': project_id,
     }
 
