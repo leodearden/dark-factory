@@ -40,6 +40,7 @@ from orchestrator.verify_cmd import (
     apply_pytest_numprocesses,
     parse_config_command,
     render,
+    serial_pytest,
 )
 
 # Module-local wiring-test fixtures (not conftest.py — a conftest.py edit
@@ -181,6 +182,44 @@ class TestApplyPytestNumprocesses:
     def test_noop_on_opaque(self):
         cmd = parse_config_command('mypy src/')
         assert apply_pytest_numprocesses(cmd, '16') == cmd
+
+
+class TestApplyPytestNumprocessesSerialRecoveryCollision:
+    """Regression: `-n` must NOT be injected onto a command already forced
+    serial (``-p no:xdist``). verify.py's env-transient recovery
+    (verify.py:3458) and flaky-scoped isolated re-run (verify.py:5164) both
+    build their recovered command via ``serial_pytest`` — which disables the
+    xdist plugin — and then pass it back through ``_run_or_skip_timed``, which
+    re-hits the ``apply_pytest_numprocesses`` injection site. With xdist
+    disabled pytest does not register the ``-n``/``--numprocesses`` option, so
+    injecting ``-n 16`` would make pytest exit with
+    ``unrecognized arguments: -n``, defeating the shared-venv-transient
+    recovery safety net precisely when the operator has set the knob to the
+    recommended value. Dormant at the shipped 'auto' default, but the knob is
+    green-tier/hot-reloadable — so setting it live must not break recovery.
+    """
+
+    def test_structured_serial_forced_command_is_not_dash_n_injected(self):
+        # What verify.py:3458 (_serial_pytest_str) produces for a structured
+        # command, fed back through the injection site with a numeric knob.
+        recovered = serial_pytest(parse_config_command('uv run pytest tests/'))
+        result = apply_pytest_numprocesses(recovered, '16')
+        rendered = render(result)
+        assert result is recovered, 'apply_pytest_numprocesses must no-op on a serial-forced command'
+        assert '-p no:xdist' in rendered
+        assert '-n 16' not in rendered
+
+    def test_chained_serial_forced_command_is_not_dash_n_injected(self):
+        raw = (
+            'cd shared && uv run pytest tests/ && '
+            'cd ../orchestrator && uv run pytest tests/'
+        )
+        recovered = serial_pytest(parse_config_command(raw))
+        result = apply_pytest_numprocesses(recovered, '16')
+        rendered = render(result)
+        assert result is recovered, 'apply_pytest_numprocesses must no-op on a serial-forced chain'
+        assert rendered.count('no:xdist') == 2
+        assert '-n 16' not in rendered
 
 
 class TestPytestNWiring:
@@ -409,4 +448,57 @@ class TestPytestNWiring:
         test_cmd = next(c for c in captured_cmds if _leg_for_cmd(c) == 'test')
         assert test_cmd.count('-n 16') == 2, (
             f'expected -n 16 injected into both chained pytest invocations; got {test_cmd!r}'
+        )
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_env_recovery_rerun_is_not_dash_n_injected(self, tmp_path):
+        """End-to-end regression: on an ENV_TRANSIENT (vanished-xdist)
+        failure, verify.py's forced-serial recovery re-run passes its
+        ``-p no:xdist`` command back through the ``-n`` injection site. With
+        xdist disabled pytest does not register the ``-n`` option, so a
+        re-injected ``-n 16`` would fail the recovery run with
+        ``unrecognized arguments: -n`` — defeating the shared-venv-transient
+        safety net at exactly the recommended live knob value. Assert the
+        recovered command is serial and carries NO ``-n 16``.
+        """
+        captured_cmds: list[str] = []
+        test_leg_calls = {'n': 0}
+
+        async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured_cmds.append(cmd)
+            if 'pytest' in cmd and 'tests/' in cmd:
+                test_leg_calls['n'] += 1
+                if test_leg_calls['n'] == 1:
+                    # First test leg: a shared-venv-mutation transient
+                    # (concurrent `uv sync` vanished xdist) → ENV_TRANSIENT.
+                    return 1, "ModuleNotFoundError: No module named 'xdist'", False
+                # The forced-serial recovery re-run passes.
+                return 0, '', False
+            return 0, '', False
+
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+            verify_admission_pytest_n='16',
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(),
+                role='task',
+                attempt_id=None,
+            )
+
+        # The recovery re-run is the (only) test-leg command carrying the
+        # serial marker.
+        recovered = next(c for c in captured_cmds if 'no:xdist' in c)
+        assert '-n 16' not in recovered, (
+            f'forced-serial recovery re-run must not carry -n 16 (xdist '
+            f'disabled → unregistered option); got {recovered!r}'
         )
