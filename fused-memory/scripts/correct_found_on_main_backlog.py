@@ -57,8 +57,11 @@ Usage
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
 import logging
+import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -384,5 +387,119 @@ async def _apply_reopen(
     return True
 
 
-# NOTE: the CLI entry point (main/_run, step 14) lands in a later commit of
-# this same task's step sequence.
+# ---------------------------------------------------------------------------
+# Exit-code helper (pure)
+# ---------------------------------------------------------------------------
+
+def _apply_exit_code(summary: dict[str, Any]) -> int:
+    """Pure ``apply_corrections`` summary -> process exit code, for CI/operator wiring.
+
+    Non-zero whenever anything went wrong: an apply-time error (any
+    exception isolated by ``apply_corrections``' per-op try/except) OR a
+    non-empty ``reopen_failed`` — checked independently of the ``errors``
+    counter so a non-persisted reopen is ALWAYS loud even if some future
+    caller forgets to also bump ``errors`` for it. This is the exact
+    regression guard task 1175 needs: a silent, "successful"-looking exit
+    must never mask a done -> pending flip that didn't actually persist.
+
+    A clean dry-run or apply (``errors == 0`` and ``reopen_failed == []``)
+    exits 0.
+    """
+    if summary.get('errors', 0) > 0:
+        return 1
+    if summary.get('reopen_failed'):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI / main
+# ---------------------------------------------------------------------------
+
+async def _run(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+
+    import os  # noqa: PLC0415
+
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+
+    # Sibling import: audit_found_on_main_provenance.py lives alongside this
+    # script in fused-memory/scripts/, which is sys.path[0] when this file
+    # is invoked directly (`python scripts/correct_found_on_main_backlog.py`).
+    # Deferred to runtime (never a module-level import) so the test suite
+    # can importlib-load this module in isolation without the scripts/ dir
+    # on sys.path — see test_correct_found_on_main_backlog.py's _load_module.
+    from audit_found_on_main_provenance import GitFacts, build_audit_report  # noqa: PLC0415
+
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    config = FusedMemoryConfig()
+    if config.taskmaster is None:
+        logger.error('Task backend not configured in fused-memory config')
+        return 1
+
+    backend = SqliteTaskBackend(config.taskmaster)
+    await backend.start()
+    try:
+        raw = await backend.get_tasks(args.project_root)
+        tasks = raw.get('tasks') or []
+        logger.info('Fetched %d task(s) from task backend', len(tasks))
+
+        git = GitFacts(args.project_root)
+        report = await build_audit_report(tasks, git, ref=args.ref)
+
+        corrections = plan_corrections(report)
+        summary = await apply_corrections(
+            backend, args.project_root, corrections, apply=args.apply,
+        )
+        output = {'project_root': args.project_root, 'ref': args.ref, **summary}
+        print(json.dumps(output, indent=2, default=str))
+
+        if not args.apply:
+            logger.info(
+                'Dry run — nothing was modified. Use --apply to reopen task 1175 '
+                "and annotate every other flagged task's metadata.x_provenance_audit.",
+            )
+        else:
+            logger.info(
+                'Applied: reopened %d, annotated %d, errors %d, reopen_failed=%s',
+                summary['reopened'], summary['annotated'], summary['errors'],
+                summary['reopen_failed'],
+            )
+        return _apply_exit_code(summary)
+    finally:
+        await backend.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        '--project-root', required=True,
+        help='Absolute filesystem path to the project (required by Taskmaster + git)',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to fused-memory config file (sets CONFIG_PATH env var)',
+    )
+    parser.add_argument(
+        '--ref', default='main',
+        help='Git ref to (re-)audit commit lineage against (default: main)',
+    )
+    parser.add_argument(
+        '--apply', action='store_true',
+        help=(
+            'Reopen task 1175 (done -> pending, with a post-write persistence '
+            "verify) and annotate every other flagged task's "
+            'metadata.x_provenance_audit (default: dry-run, report only).'
+        ),
+    )
+    args = parser.parse_args()
+    return asyncio.run(_run(args))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
