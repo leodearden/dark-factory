@@ -314,18 +314,82 @@ def _config_key(role_name: str) -> str:
     return 'reviewer' if role_name.startswith('reviewer') else role_name
 
 
-def _rule_matches(rule: RoutingRule, inputs: RouteInputs) -> bool:
-    """Return True iff *rule* matches *inputs*.
+def _task_simple_saturated(task_metadata: Mapping[str, Any]) -> bool:
+    """Read ``metadata.routing.simple_saturated``, defaulting to False.
 
-    Step epsilon-4 stub: only the ``role`` condition is evaluated here --
-    the remaining closed-vocabulary conditions (``plan_min_steps``,
-    ``plan_min_modules``, ``module_prefix``, ``min_routing_tier``,
-    ``min_dispatch_count``, ``simple_saturated``, ``task_complexity``,
-    ``task_priority``) are filled in by a later step's evaluator (PRD task
-    epsilon step-6) -- until then they are silently not enforced.
+    Mirrors ``shared.task_metadata.RoutingState``'s on-disk storage shape
+    (``metadata['routing']['simple_saturated']``) without importing that
+    module (kept import-light) -- a missing/non-dict ``routing`` key
+    degrades to False rather than raising, matching
+    ``RoutingState.from_metadata``'s own tolerant-degrade philosophy.
+    """
+    routing_state = task_metadata.get('routing')
+    if not isinstance(routing_state, dict):
+        return False
+    return bool(routing_state.get('simple_saturated', False))
+
+
+def _rule_matches(rule: RoutingRule, inputs: RouteInputs) -> bool:
+    """Return True iff every condition *rule.match* sets is satisfied (AND).
+
+    Closed vocabulary (PRD task epsilon): ``role`` (membership),
+    ``task_complexity``/``task_priority`` (equality vs ``inputs.
+    task_metadata``), ``plan_min_steps``/``plan_min_modules``/
+    ``module_prefix`` (plan-shape conditions -- a ``None`` plan_shape fails
+    ANY of these three), ``min_routing_tier``, ``min_dispatch_count``,
+    ``simple_saturated``. When both ``module_prefix`` and
+    ``plan_min_modules`` are present, ``plan_min_modules`` counts only the
+    prefix-matched modules (not the total) -- this is what reproduces the
+    pre-epsilon Rust heuristic (``_select_model_for_role``) exactly.
     """
     match = rule.match
-    return match.role is None or inputs.role_name in match.role
+
+    if match.role is not None and inputs.role_name not in match.role:
+        return False
+    if (
+        match.task_complexity is not None
+        and inputs.task_metadata.get('complexity') != match.task_complexity
+    ):
+        return False
+    if (
+        match.task_priority is not None
+        and inputs.task_metadata.get('priority') != match.task_priority
+    ):
+        return False
+    if match.min_routing_tier is not None and inputs.routing_tier < match.min_routing_tier:
+        return False
+    if match.min_dispatch_count is not None and inputs.dispatch_count < match.min_dispatch_count:
+        return False
+    if (
+        match.simple_saturated is not None
+        and _task_simple_saturated(inputs.task_metadata) != match.simple_saturated
+    ):
+        return False
+
+    needs_plan = (
+        match.plan_min_steps is not None
+        or match.plan_min_modules is not None
+        or match.module_prefix is not None
+    )
+    if needs_plan:
+        plan_shape = inputs.plan_shape
+        if plan_shape is None:
+            return False
+        if match.plan_min_steps is not None and plan_shape.step_count < match.plan_min_steps:
+            return False
+        if match.module_prefix is not None:
+            prefixed = [m for m in plan_shape.module_paths if m.startswith(match.module_prefix)]
+            if not prefixed:
+                return False
+            if match.plan_min_modules is not None and len(prefixed) < match.plan_min_modules:
+                return False
+        elif (
+            match.plan_min_modules is not None
+            and len(plan_shape.module_paths) < match.plan_min_modules
+        ):
+            return False
+
+    return True
 
 
 def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDecision:
