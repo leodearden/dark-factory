@@ -994,6 +994,28 @@ class TaskInterceptor:
                 if validation_err is not None:
                     return validation_err
 
+                # 2b-bis. Reopen-freshness gate (task 2674, PRD task alpha):
+                # refuse (enforce) or warn-census (S4) a done-write that cites
+                # commit-bearing evidence dated BEFORE this task's most recent
+                # reopen (metadata.reopen_at, stamped atomically by 2a above
+                # on a prior write). Must run after validate_done_provenance
+                # succeeds (needs the ancestor-checked resolved SHA) and
+                # before audit_fields['done_provenance'] is set below, so an
+                # accepted stale_evidence_override (S6) mutates
+                # resolved_provenance in time to be persisted.
+                _reopen_freshness_err = await _check_reopen_freshness(
+                    task_id,
+                    resolved_provenance,
+                    done_provenance,
+                    before,
+                    project_root,
+                    agent_id,
+                    is_recon_stage_write,
+                    self._reject_stale_done_evidence_mode(),
+                )
+                if _reopen_freshness_err is not None:
+                    return _reopen_freshness_err
+
                 _verified_provenance = (
                     isinstance(resolved_provenance, dict)
                     and resolved_provenance.get('kind')
@@ -4144,6 +4166,20 @@ class TaskInterceptor:
         task_status = getattr(cfg, 'task_status', None)
         return bool(getattr(task_status, 'enforce_transitions', False))
 
+    def _reject_stale_done_evidence_mode(self) -> str:
+        """Return the reopen-freshness gate mode: ``'warn'`` or ``'enforce'``.
+
+        ``'warn'`` (the default) when config or its ``reconciliation``
+        section is absent — mirrors :meth:`_require_done_provenance`, whose
+        every-caller-not-yet-updated phased-rollout shape this gate reuses
+        (task 2674 / PRD task alpha).
+        """
+        cfg = self._config
+        if cfg is None:
+            return 'warn'
+        recon = getattr(cfg, 'reconciliation', None)
+        return getattr(recon, 'reject_stale_done_evidence', 'warn')
+
 
 def _extract_status(task_data: dict) -> str:
     """Extract status from Taskmaster get_task response."""
@@ -4569,6 +4605,291 @@ async def _resolve_commit_sha(project_root: str, commit: str) -> str | dict:
     if not sha or len(sha) < 7:
         return {'reason': 'empty rev-parse output'}
     return sha
+
+
+# ── Reopen-freshness gate (task 2674, PRD task alpha) ───────────────────
+#
+# Closes Face B (re-derivation clobber, task-1175 shape): a legitimate
+# done->pending reopen re-marked done within one dispatch tick citing a
+# PRE-reopen commit. Fires only for commit-bearing done_provenance kinds
+# ('merged'/'found_on_main') on a task whose metadata.reopen_at is set
+# (task 2649 stamps this atomically on every terminal-exit reopen).
+
+
+async def _resolve_commit_committed_at(project_root: str, sha: str) -> str | None:
+    """Resolve a commit's committer date via ``git show -s --format=%cI``.
+
+    Returns the stripped ``%cI`` (strict ISO-8601, offset-aware) string on
+    success, or None on any failure (git binary missing, non-zero exit,
+    timeout, empty output). Modeled directly on :func:`_resolve_commit_sha`'s
+    subprocess/timeout/error-handling shape for consistent semantics.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'git',
+            '-C',
+            project_root,
+            'show',
+            '-s',
+            '--format=%cI',
+            sha,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        except TimeoutError:
+            proc.kill()
+            # Reap the killed child promptly rather than leaving it as a
+            # transient zombie until GC finalizes the Process object.
+            await proc.wait()
+            return None
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+    if proc.returncode != 0:
+        return None
+    committed_at = stdout.decode('utf-8', errors='replace').strip()
+    return committed_at or None
+
+
+def _extract_reopen_at(before: Any) -> str | None:
+    """Return ``metadata.reopen_at`` from a Taskmaster ``before`` snapshot.
+
+    Uses :func:`_parse_metadata_value` so a JSON-string metadata blob is
+    handled identically to an already-parsed dict. Returns None when
+    absent, empty, or unresolvable — callers treat that as "never
+    reopened" (the reopen-freshness gate stays inert).
+    """
+    raw = before.get('metadata') if isinstance(before, dict) else None
+    parsed, _warnings = _parse_metadata_value(raw)
+    if not isinstance(parsed, dict):
+        return None
+    reopen_at = parsed.get('reopen_at')
+    return reopen_at if isinstance(reopen_at, str) and reopen_at else None
+
+
+def _parse_aware_utc(value: str) -> datetime | None:
+    """Parse an ISO-8601 datetime string to an aware UTC :class:`datetime`.
+
+    A naive (no ``tzinfo``) input is assumed to already be UTC; an aware
+    input is converted via ``astimezone(UTC)``. Returns None on any parse
+    failure — the reopen-freshness gate's caller treats an unparseable
+    date as fail-closed (stale), never as a silent pass.
+    """
+    try:
+        dt = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _done_evidence_stale_error(
+    task_id: str,
+    evidence_commit: str | None,
+    evidence_committed_at: str | None,
+    reopen_at: str | None,
+    agent_id: str | None,
+) -> dict:
+    """Structured error returned when the reopen-freshness gate rejects (enforce-mode).
+
+    Structured fields only, no prose — MCP callers (scheduler, steward)
+    branch on ``error`` uniformly, matching :func:`_terminal_exit_error` /
+    :func:`_done_gate_error`'s shape.
+    """
+    return {
+        'success': False,
+        'error': 'done_evidence_stale',
+        'task_id': task_id,
+        'evidence_commit': evidence_commit,
+        'evidence_committed_at': evidence_committed_at,
+        'reopen_at': reopen_at,
+        'agent_id': agent_id,
+    }
+
+
+def _done_evidence_stale_override_invalid_error(task_id: str, agent_id: str | None) -> dict:
+    """Structured error for a present-but-invalid ``stale_evidence_override``.
+
+    Mode-independent (returned in both enforce and warn) — an explicit
+    malformed override, or one supplied by a recon-stage caller, is always
+    a loud caller error, never a silent fall-through to the plain
+    :func:`_done_evidence_stale_error` rejection.
+    """
+    return {
+        'success': False,
+        'error': 'done_evidence_stale_override_invalid',
+        'task_id': task_id,
+        'agent_id': agent_id,
+        'hint': (
+            'stale_evidence_override requires a non-recon-stage caller and '
+            'non-empty escalation_id + reason fields'
+        ),
+    }
+
+
+def _valid_stale_evidence_override(override: object, is_recon_stage: bool) -> bool:
+    """True iff ``override`` is a well-formed, non-recon-stage bypass assertion.
+
+    A recon-stage caller may never self-authorize a stale-evidence bypass —
+    the override is a human/orchestrator-sanctioned exception, not a claim
+    a reconciliation stage can make about its own write. Otherwise valid
+    iff ``override`` is a dict carrying non-empty string ``escalation_id``
+    and ``reason`` fields (both are recorded verbatim as Stage-2 audit
+    substrate — see :func:`_check_reopen_freshness`).
+    """
+    if is_recon_stage:
+        return False
+    if not isinstance(override, dict):
+        return False
+    escalation_id = override.get('escalation_id')
+    reason = override.get('reason')
+    return (
+        isinstance(escalation_id, str)
+        and bool(escalation_id)
+        and isinstance(reason, str)
+        and bool(reason)
+    )
+
+
+async def _check_reopen_freshness(
+    task_id: str,
+    resolved_provenance: dict | None,
+    raw_done_provenance: object,
+    before: Any,
+    project_root: str,
+    agent_id: str | None,
+    is_recon_stage: bool,
+    mode: str,
+) -> dict | None:
+    """Reject (enforce) or no-op (warn) a done-write citing PRE-reopen evidence.
+
+    Inert (returns None immediately) unless ALL of:
+      - ``resolved_provenance`` is a dict with ``kind`` in
+        ``{'merged', 'found_on_main'}`` (commitless kinds — deterministic-*
+        — self-evidence and are exempt);
+      - it carries a truthy ``commit``;
+      - ``before`` (the pre-write task snapshot) has a non-empty
+        ``metadata.reopen_at`` (a task that was never reopened has nothing
+        to be stale against).
+
+    When the gate fires, the evidence commit's committer date and
+    ``reopen_at`` are both normalised to aware UTC and compared. Evidence
+    dated before the reopen is STALE. Fail-CLOSED (task 2674 S10): an
+    unparseable date on either side (git failure / parse failure) is ALSO
+    treated as stale — a gate that cannot prove freshness must not certify
+    it, so the comparison never silently passes on indeterminate input.
+    This deliberately does not distinguish a transient git failure (binary
+    hiccup, timeout) from a genuinely pre-reopen commit — both fail closed
+    identically; see ``task_status.done_evidence_stale_unresolved_commit``
+    below for the observability seam that at least makes the two cases
+    distinguishable in logs ahead of the task-gamma enforce flip.
+
+    Whenever the evidence commit's committer date cannot be resolved at
+    all (``_resolve_commit_committed_at`` returns None), a
+    ``task_status.done_evidence_stale_unresolved_commit`` WARNING (stable
+    grep anchor) is logged unconditionally — in both modes, and whether or
+    not an override subsequently bypasses the gate — purely as a
+    diagnostic aid; it does not itself change the accept/reject outcome.
+
+    On stale, BEFORE the enforce/warn mode dispatch: a well-formed,
+    non-recon-stage ``raw_done_provenance['stale_evidence_override']``
+    (validated by :func:`_valid_stale_evidence_override`) bypasses the gate
+    unconditionally (both modes). The override is mutated onto
+    ``resolved_provenance`` VERBATIM — the caller persists
+    ``resolved_provenance`` into ``audit_fields['done_provenance']``, so
+    this is Stage-2 audit substrate, not a live cross-service escalation
+    lookup (fused-memory has no orchestrator-escalation client).
+
+    Absent any override: ``mode == 'enforce'`` returns the typed
+    :func:`_done_evidence_stale_error` rejection (the caller must abort the
+    write); otherwise (warn mode) emits one ``task_status.done_evidence_stale_warn``
+    census WARNING (stable grep anchor) and returns None (the write
+    proceeds).
+
+    A present-but-invalid override (malformed shape, or a recon-stage
+    caller) is distinguished from "no override": it returns the typed
+    :func:`_done_evidence_stale_override_invalid_error` rejection,
+    mode-independently (enforce and warn alike) — an explicit malformed
+    override is always a loud caller error, never a silent fall-through to
+    the plain ``done_evidence_stale`` rejection or (worse) an accept. Only
+    the no-override stale path proceeds to the enforce/warn mode dispatch.
+
+    Rollout-safety note: this makes the override-invalid rejection the
+    ONE case where 'warn' mode is not purely observational — every other
+    branch of 'warn' mode (no override, or a *valid* override) never
+    blocks a write. This is intentional (a malformed override is a caller
+    bug, not a staleness verdict the rollout mode should suppress — see
+    task 2674 design decisions), not an oversight; callers relying on
+    warn-mode being unconditionally non-blocking during the alpha rollout
+    must still handle ``done_evidence_stale_override_invalid``.
+    """
+    if not isinstance(resolved_provenance, dict):
+        return None
+    if resolved_provenance.get('kind') not in ('merged', 'found_on_main'):
+        return None
+    evidence_commit = resolved_provenance.get('commit')
+    if not evidence_commit:
+        return None
+    reopen_at = _extract_reopen_at(before)
+    if not reopen_at:
+        return None
+
+    evidence_committed_at = await _resolve_commit_committed_at(project_root, evidence_commit)
+    if evidence_committed_at is None:
+        # Distinguishable from a genuine date-based staleness verdict: this
+        # fires whenever `git show` itself failed (binary missing, timeout,
+        # non-zero exit) rather than because the comparison found the
+        # evidence dated before reopen_at. The disposition is unchanged
+        # (still fail-closed — see the module docstring), but this gives
+        # operators a grep-stable way to tell "couldn't prove freshness
+        # because git errored" apart from "proved stale" ahead of the
+        # task-gamma enforce flip. Logged unconditionally (both modes),
+        # before the override/mode dispatch below.
+        logger.warning(
+            'task_status.done_evidence_stale_unresolved_commit task_id=%s '
+            'evidence_commit=%s reopen_at=%s agent_id=%s',
+            task_id, evidence_commit, reopen_at, agent_id,
+        )
+    evidence_dt = _parse_aware_utc(evidence_committed_at) if evidence_committed_at else None
+    reopen_dt = _parse_aware_utc(reopen_at)
+
+    stale = evidence_dt is None or reopen_dt is None or evidence_dt < reopen_dt
+    if not stale:
+        return None
+
+    override = (
+        raw_done_provenance.get('stale_evidence_override')
+        if isinstance(raw_done_provenance, dict)
+        else None
+    )
+    if override is not None:
+        if _valid_stale_evidence_override(override, is_recon_stage):
+            resolved_provenance['stale_evidence_override'] = {
+                'escalation_id': override['escalation_id'],
+                'reason': override['reason'],
+            }
+            logger.info(
+                'task_status.done_evidence_stale_override_accepted task_id=%s escalation_id=%s',
+                task_id, override['escalation_id'],
+            )
+            return None
+        return _done_evidence_stale_override_invalid_error(task_id, agent_id)
+
+    if mode == 'enforce':
+        return _done_evidence_stale_error(
+            task_id, evidence_commit, evidence_committed_at, reopen_at, agent_id,
+        )
+    logger.warning(
+        'task_status.done_evidence_stale_warn task_id=%s evidence_commit=%s '
+        'evidence_committed_at=%s reopen_at=%s agent_id=%s',
+        task_id, evidence_commit, evidence_committed_at, reopen_at, agent_id,
+    )
+    return None
 
 
 def _merged_audit_metadata(before: dict, audit_fields: dict) -> dict:

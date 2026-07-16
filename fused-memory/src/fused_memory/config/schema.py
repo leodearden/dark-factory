@@ -597,6 +597,33 @@ class ReconciliationConfig(BaseModel):
     # sessions) can be updated to pass provenance before enforcement flips on.
     require_done_provenance: bool = Field(default=False)
 
+    # Reopen-freshness gate (task 2674, PRD task alpha) — governs whether a
+    # done-write citing commit-bearing done_provenance (kind in {"merged",
+    # "found_on_main"}) on a task whose metadata.reopen_at is set gets
+    # rejected when the evidence commit's committer date predates reopen_at
+    # (i.e. the cited evidence is stale — from before the reopen). 'warn'
+    # (default) logs a 'task_status.done_evidence_stale_warn' census WARNING
+    # and lets the write proceed; 'enforce' returns a typed
+    # done_evidence_stale rejection instead. This is the alpha default —
+    # the enforce flip is task gamma, gated on task beta (orchestrator
+    # consumer) landing first. Mirrors the require_done_provenance /
+    # enforce_transitions warn->enforce phased-rollout precedent above.
+    reject_stale_done_evidence: Literal['warn', 'enforce'] = Field(
+        default='warn',
+        description=(
+            "Reopen-freshness gate mode. 'warn' (default): a stale-evidence "
+            "done-write on a reopened task logs a "
+            "'task_status.done_evidence_stale_warn' WARNING and proceeds. "
+            "'enforce': the write is rejected with a typed "
+            "done_evidence_stale error. Task alpha ships warn; task gamma "
+            "flips the default to enforce after task beta lands. NOTE: a "
+            "present-but-invalid stale_evidence_override (malformed shape, "
+            "or supplied by a recon-stage caller) always rejects with "
+            "done_evidence_stale_override_invalid regardless of this "
+            'setting — that one rejection is not gated by warn/enforce.'
+        ),
+    )
+
     # Judge-halt trend detector. A halt fires when the most recent
     # `halt_trend_consecutive_required` verdicts are all non-ok AND at least
     # `halt_trend_moderate_count` non-ok verdicts sit within the last
