@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import re
 
-from fused_memory.reconciliation.task_filter import TASK_REF_RE
+from fused_memory.reconciliation.task_filter import INACTIVE_TASK_STATUSES, TASK_REF_RE
 
 logger = logging.getLogger(__name__)
 
@@ -170,3 +170,36 @@ def flatten_dedup_edges(grouped: dict[str, list[dict]]) -> list[dict]:
             seen.add(uuid)
             result.append(edge)
     return result
+
+
+# --------------------------------------------------------------------------- #
+# select_stale_status_snapshot_edges — pure decision core
+# --------------------------------------------------------------------------- #
+
+
+def select_stale_status_snapshot_edges(edges: list[dict], statuses: dict[str, str]) -> list[dict]:
+    """Return the subset of *edges* whose asserted status is now contradicted.
+
+    An edge is selected (stale) iff ``extract_snapshot_edge_task_ids`` returns
+    at least one id AND any one of those ids resolves (via *statuses*) to a
+    positively-terminal status (``INACTIVE_TASK_STATUSES`` — done/cancelled).
+    An aggregate edge referencing several ids is selected as a whole the
+    moment ANY single referenced id is terminal — the snapshot as asserted no
+    longer holds.
+
+    Invalidate-only-on-positively-terminal: an id absent from *statuses*, or
+    mapped to any non-terminal/unknown value, never contributes to
+    selection — a transient census gap or genuinely-still-active task can
+    only under-select (self-heals next cycle), never wrongly select a valid
+    edge.
+
+    Pure: no I/O, no side effects.
+    """
+    selected: list[dict] = []
+    for edge in edges:
+        ids = extract_snapshot_edge_task_ids(edge.get('fact') or '')
+        if not ids:
+            continue
+        if any(statuses.get(str(i)) in INACTIVE_TASK_STATUSES for i in ids):
+            selected.append(edge)
+    return selected
