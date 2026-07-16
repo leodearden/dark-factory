@@ -404,7 +404,7 @@ Per `(account, model)` pair, the artifact records one status (from `routing.clas
 | `capped` | account is at or near its usage cap |
 | `no_token` | account's OAuth token env var is unresolvable — the model was never invoked for it |
 | `invoke_error` | the invocation call itself raised (network/subprocess) |
-| `error` | any other classified failure |
+| `error` | any other classified failure outcome (not a raised exception — that's `invoke_error`) |
 
 This artifact is the input a future fable-admission gate consumes to decide whether `claude-fable-5` is safe to add to `routing.allowed_models` fleet-wide — running the probe does not itself admit it.
 
