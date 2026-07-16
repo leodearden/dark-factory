@@ -2352,6 +2352,28 @@ class OrchestratorConfig(BaseSettings):
     # is resolved.  Self-dedupes via the pending-escalation check.
     stranded_blocked_escalate_enabled: bool = Field(default=True)
 
+    # Task 2408 — claimant-liveness gate.  Two mechanisms share one liveness
+    # signal (shared.task_claimant): mechanism 1 refuses dispatch into a
+    # `pending` task that currently has a LIVE claimant (has_live_claimant,
+    # consumed by Scheduler._eligible_for_dispatch); mechanism 2 is a tick
+    # phase that sweep-redispatches a genuinely-stranded `blocked` task
+    # (is_stranded_blocked — no live claimant, deps resolved, not
+    # deliberately parked) back to `pending`.  claimant_liveness_ttl_secs is
+    # the SHARED heartbeat-staleness threshold consumed by BOTH mechanisms —
+    # 300s = 5x the 60s claimant_heartbeat_interval_secs so a briefly-delayed
+    # heartbeat (GC pause / backend hiccup) is never misread as stranded.
+    # This is the "separate, W10-owned stranded-ttl" the
+    # claimant_heartbeat_interval_secs comment above already anticipates.
+    claimant_liveness_ttl_secs: float = Field(default=300.0)
+    # Kill-switch for mechanism 1 (the acquire_next live-claimant dispatch
+    # refusal in _eligible_for_dispatch).
+    claimant_dispatch_gate_enabled: bool = Field(default=True)
+    # Kill-switch for mechanism 2 (the blocked->pending direct redispatch
+    # sweep).  Complements stranded_blocked_escalate_enabled above — that
+    # knob gates a re-file-never-flip backstop; this one gates the direct
+    # blocked->pending flip safety net.
+    stranded_blocked_redispatch_enabled: bool = Field(default=True)
+
     # Scheduler park-and-stop (AFK hardening, task 1322).
     # When park_stop_parked_threshold tasks transition to 'blocked' within
     # park_stop_parked_window_hours, the scheduler is paused automatically.
