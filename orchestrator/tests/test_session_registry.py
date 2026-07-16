@@ -1569,6 +1569,42 @@ def test_main_launching_drains_prior_orphan_via_sweep(
     assert orphan_reloaded.exit_code == sr.ORPHAN_EXIT_CODE
 
 
+def test_main_launching_bound_prunes_old_terminal_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every spawn's `launching` path must also opportunistically bound-prune
+    terminal/stale record dirs (reap_stale_records(limit=REAP_BATCH_LIMIT)),
+    not just mark orphans exited -- otherwise the disk backlog is marked
+    terminal on every spawn but never actually reclaimed.
+    """
+    assert isinstance(sr.REAP_BATCH_LIMIT, int)
+    assert sr.REAP_BATCH_LIMIT > 0
+
+    old_terminal = _make_record(
+        session_slug='old-terminal', status=sr.Status.EXITED, exit_code=0, launcher_pid=os.getpid()
+    )
+    sr.write_record(old_terminal, root=tmp_path)
+    _set_mtime(
+        sr.record_path_for_slug('old-terminal', root=tmp_path),
+        datetime.now(UTC),
+        sr.TERMINAL_TTL + timedelta(hours=1),
+    )
+
+    _set_env(monkeypatch, _launching_env(tmp_path))
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    assert capsys.readouterr().out.strip() == str(expected_dir)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
+
+    assert not (sr.sessions_dir(root=tmp_path) / 'old-terminal').exists()
+
+
 def test_main_launching_fail_soft_when_sweep_raises(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
