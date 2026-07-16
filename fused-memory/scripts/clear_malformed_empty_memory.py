@@ -126,3 +126,42 @@ def classify_payload(payload: dict | None) -> str:
     if is_malformed_empty_payload(payload):
         return 'malformed'
     return 'healthy'
+
+
+# ---------------------------------------------------------------------------
+# Thin async I/O
+# ---------------------------------------------------------------------------
+
+async def retrieve_payload(qdrant_client, collection: str, memory_id: str) -> dict | None:
+    """Retrieve the raw Qdrant payload for *memory_id* in *collection*.
+
+    Calls ``qdrant_client.retrieve(collection_name=collection,
+    ids=[memory_id], with_payload=True, with_vectors=False)`` -- vectors are
+    never needed here (this script only inspects/deletes, never re-upserts).
+
+    Returns:
+        The first returned record's payload as a plain dict, or None when
+        retrieve returns an empty list (the record does not exist -- already
+        deleted, or never existed).
+    """
+    records = await qdrant_client.retrieve(
+        collection_name=collection,
+        ids=[memory_id],
+        with_payload=True,
+        with_vectors=False,
+    )
+    if not records:
+        return None
+    return dict(records[0].payload or {})
+
+
+async def delete_point(qdrant_client, collection: str, memory_id: str) -> None:
+    """Delete the *memory_id* point from *collection* via a direct Qdrant
+    point delete (PointIdsList) -- NOT Mem0's AsyncMemory.delete(), which
+    would KeyError on a null-payload record (module docstring)."""
+    from qdrant_client.http import models as qmodels  # noqa: PLC0415
+
+    await qdrant_client.delete(
+        collection_name=collection,
+        points_selector=qmodels.PointIdsList(points=[memory_id]),
+    )
