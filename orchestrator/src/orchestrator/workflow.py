@@ -4844,6 +4844,16 @@ class TaskWorkflow:
             if corrupted:
                 self._escalate_corruption(corrupted)
 
+            # Reconcile any done step's commit orphaned by a rebase (this
+            # dispatch's inter-iteration rebase above, or a prior
+            # dispatch's warm-lane/requeue rebase) before the WIP detector
+            # runs — the re-read picks up any reconciled commit_sha so
+            # _detect_tip_wip_commits' own done-step dedup correctly
+            # excludes it instead of re-surfacing it as unattributed
+            # pending work (task 2386).
+            await self._reconcile_done_step_commits()
+            self.plan = self.artifacts.read_plan()
+
             wip_notice = await self._detect_tip_wip_commits()
 
             # Snapshot completed steps before invocation
