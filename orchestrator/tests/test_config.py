@@ -2030,18 +2030,31 @@ class TestSimpleTaskDeprecatedScalarHonoring:
         OrchestratorConfig construction / diff_config call, not just the
         rare ones where an operator actually sets a deprecated scalar. This
         test exercises both paths -- construction (including the migration
-        branch) and diff_config -- inside one shared filter and asserts
-        neither raises.
+        branch) and diff_config -- and asserts none of the warnings raised
+        is pydantic's deprecated-field-access warning.
+
+        Warnings are captured (record=True + simplefilter('always')), not
+        promoted to errors, then filtered down to pydantic's specific
+        marker for this mechanism: category DeprecationWarning with the
+        fixed message 'deprecated' -- the exact (and only) message pydantic
+        emits for a bool ``Field(deprecated=True)`` access, which is what
+        both simple_task_budget_usd and simple_task_max_turns use (pydantic
+        does not embed the field name in the message, so matching can't be
+        done on field name text). This narrows the regression signal to
+        the exact mechanism under test, so an incidental, unrelated
+        DeprecationWarning from pydantic internals or a transitive library
+        during construction cannot fail this test the way a blanket
+        simplefilter('error', DeprecationWarning) would.
 
         Note: the migration's ``logger.warning(...)`` calls are Python
         ``logging``, orthogonal to the ``warnings`` module, so they never
-        trip this filter.
+        appear in the captured list regardless.
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
 
-        with warnings.catch_warnings():
-            warnings.simplefilter('error', DeprecationWarning)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
 
             a = OrchestratorConfig()
             b = OrchestratorConfig(
@@ -2049,6 +2062,18 @@ class TestSimpleTaskDeprecatedScalarHonoring:
                 simple_task_max_turns=7,
             )
             diff_config(a, b)
+
+        deprecated_field_access_warnings = [
+            w for w in caught
+            if issubclass(w.category, DeprecationWarning) and str(w.message) == 'deprecated'
+        ]
+        assert deprecated_field_access_warnings == [], (
+            'Expected no pydantic deprecated-field-access warning (a getattr '
+            'regression in _honor_deprecated_simple_task_scalars or '
+            '_iter_leaves reading simple_task_budget_usd / '
+            'simple_task_max_turns) during OrchestratorConfig construction '
+            f'or diff_config; got: {[str(w.message) for w in deprecated_field_access_warnings]}'
+        )
 
     def test_default_scalars_neither_migrate_nor_warn(
         self, monkeypatch, tmp_path, caplog: pytest.LogCaptureFixture,
