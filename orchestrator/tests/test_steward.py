@@ -234,6 +234,39 @@ def _make_pre_triage_gate(token: str = 'tok-a', cap_effects=None) -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
+# Cost telemetry: constructor wiring (task 2461)
+# ---------------------------------------------------------------------------
+
+
+class TestStewardCostStoreConstructor:
+    """TaskSteward accepts an optional cost_store dependency and stores it verbatim.
+
+    FAILS RED today: TaskSteward.__init__ (steward.py:88-110) has no
+    cost_store parameter, so passing cost_store= raises TypeError, and the
+    attribute is absent (AttributeError) when omitted.
+    """
+
+    def test_cost_store_stored_when_provided(
+        self, worktree, mock_config, mock_mcp, mock_briefing, mock_queue,
+    ):
+        sentinel = object()
+        steward = TaskSteward(
+            task_id='42',
+            task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
+            worktree=worktree,
+            config=mock_config,
+            mcp=mock_mcp,
+            escalation_queue=mock_queue,
+            briefing=mock_briefing,
+            cost_store=sentinel,
+        )
+        assert steward.cost_store is sentinel
+
+    def test_cost_store_defaults_to_none(self, steward):
+        assert steward.cost_store is None
+
+
+# ---------------------------------------------------------------------------
 # Session Persistence
 # ---------------------------------------------------------------------------
 
