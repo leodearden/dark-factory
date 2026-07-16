@@ -100,10 +100,22 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Literal
+from unittest.mock import AsyncMock, patch
 
+import pytest
+from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
+from test_verify_scope_kappa import _executed_module_configs, _run_verification_spy
 from test_verify_scope_lambda import _two_module_registry
 
+from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.merge_queue import (
+    MAIN_HEALTH_RED_REASON_PREFIX,
+    MergeOutcome,
+    _run_post_merge_verify,
+)
+from orchestrator.verify import VerifyResult, run_scoped_verification, seed_main_baseline
+from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES  # noqa: F401 — row 6 (later iteration)
 
 # ---------------------------------------------------------------------------
 # Golden diff (row 1) — CONSTRUCTED. See module docstring "Golden diff
