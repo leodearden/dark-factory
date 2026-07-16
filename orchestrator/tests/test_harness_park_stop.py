@@ -1039,7 +1039,7 @@ class TestHarnessCostCeiling:
 
     @pytest.mark.asyncio
     async def test_enforce_cost_ceilings_both_under_no_pause(
-        self, tmp_path: Path, _cost_store_factory
+        self, tmp_path: Path, _cost_store_factory, forbid_live_mcp
     ) -> None:
         """When both ceilings are NOT exceeded, scheduler is not paused."""
         config = OrchestratorConfig(
