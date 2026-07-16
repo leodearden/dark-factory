@@ -17,6 +17,7 @@ decisions for the point-by-point mirror rationale.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -27,7 +28,12 @@ from pydantic import ValidationError
 from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.event_store import EventType
-from orchestrator.scheduler import Scheduler, TickContext
+from orchestrator.scheduler import (
+    Scheduler,
+    SchedulerCallbacks,
+    TickContext,
+    _build_delivered_check_escalation,
+)
 
 # ---------------------------------------------------------------------------
 # TestRunnerGrepKind (task 2580 — step-1 RED / step-2 GREEN)
@@ -473,8 +479,40 @@ class TestTickContextField:
         """Default factory must not share a mutable default across instances."""
         ctx1 = TickContext(tasks=[], status_map={}, tasks_by_id={})
         ctx2 = TickContext(tasks=[], status_map={}, tasks_by_id={})
+        assert ctx1.delivered_check_cache is not None
         ctx1.delivered_check_cache['x'] = True
         assert ctx2.delivered_check_cache == {}
+
+    def test_delivered_check_cache_accepts_none(self):
+        """task 2583 (epsilon): the annotation widens to dict[str, bool] |
+        None so the kill switch (delivered_checks.enabled=False) can signal
+        'gate off' distinctly from 'sweep ran, found nothing checked' ({})."""
+        ctx = TickContext(
+            tasks=[], status_map={}, tasks_by_id={}, delivered_check_cache=None,
+        )
+        assert ctx.delivered_check_cache is None
+
+
+# ---------------------------------------------------------------------------
+# TestSchedulerCallbacksOnDeliveredCheckBlock (task 2583 — step-3 RED / step-4 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerCallbacksOnDeliveredCheckBlock:
+    """``SchedulerCallbacks`` must carry an ``on_delivered_check_block`` hook,
+    defaulting to None, mirroring ``on_external_dep_block`` — the structural
+    plumbing the grace-streak escalation (task 2583, epsilon) invokes."""
+
+    def test_defaults_to_none(self):
+        assert SchedulerCallbacks().on_delivered_check_block is None
+
+    def test_accepts_constructor_kwarg(self):
+        async def _fn(task_id, *, summary, detail, category):
+            pass
+
+        callbacks = SchedulerCallbacks(on_delivered_check_block=_fn)
+
+        assert callbacks.on_delivered_check_block is _fn
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +544,161 @@ class TestDeliveredChecksConfig:
         """The scheduler-tuning green tier: an operator may retune the sweep
         budget via mcp__escalation__reload_config without a restart."""
         assert 'delivered_checks.max_checks_per_tick' in RELOADABLE_FIELDS
+
+    # --- task 2583 (epsilon) knobs: enabled / grace_cycles / check_timeout_secs -
+
+    def test_default_enabled_is_true(self):
+        """The gate is inert without metadata.delivered_checks on any dep, so
+        it defaults ON — an operator must opt OUT explicitly."""
+        config = OrchestratorConfig()
+        assert config.delivered_checks.enabled is True
+
+    def test_default_grace_cycles_is_3(self):
+        config = OrchestratorConfig()
+        assert config.delivered_checks.grace_cycles == 3
+
+    def test_grace_cycles_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            DeliveredChecksConfig(grace_cycles=0)
+
+    def test_grace_cycles_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            DeliveredChecksConfig(grace_cycles=-1)
+
+    def test_default_check_timeout_secs_is_120(self):
+        config = OrchestratorConfig()
+        assert config.delivered_checks.check_timeout_secs == 120
+
+    def test_check_timeout_secs_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            DeliveredChecksConfig(check_timeout_secs=0)
+
+    def test_check_timeout_secs_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            DeliveredChecksConfig(check_timeout_secs=-1)
+
+    def test_epsilon_knobs_are_hot_reloadable(self):
+        """Same green tier as max_checks_per_tick — no restart needed to
+        retune the grace window, flip the kill switch, or adjust the
+        per-check wall-clock timeout."""
+        assert 'delivered_checks.enabled' in RELOADABLE_FIELDS
+        assert 'delivered_checks.grace_cycles' in RELOADABLE_FIELDS
+        assert 'delivered_checks.check_timeout_secs' in RELOADABLE_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# TestDeliveredCheckGateEnabledSwitch (task 2583 — step-5 RED / step-6 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestDeliveredCheckGateEnabledSwitch:
+    """``Scheduler._phase_delivered_check_gate`` kill switch: with
+    ``delivered_checks.enabled=False``, the phase must short-circuit to
+    ``ctx.delivered_check_cache = None`` WITHOUT running the sweep at all —
+    no git, no streaks, no escalation. Must be ``None``, not ``{}``:
+    ``_deps_satisfied`` only disables its delivered-check arm when the cache
+    is exactly ``None`` (an empty dict still activates the arm and withholds
+    every checked dep)."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+        scheduler.finish_startup()
+        return scheduler
+
+    @pytest.mark.asyncio
+    async def test_disabled_short_circuits_to_none_cache_and_skips_sweep(
+        self, scheduler: Scheduler
+    ):
+        scheduler.config.delivered_checks.enabled = False
+        sweep = AsyncMock(side_effect=AssertionError('sweep must not run when disabled'))
+        scheduler._compute_delivered_check_cache = sweep
+        ctx = TickContext(tasks=[], status_map={}, tasks_by_id={})
+
+        await scheduler._phase_delivered_check_gate(ctx)
+
+        assert ctx.delivered_check_cache is None
+        sweep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enabled_default_runs_sweep_and_sets_dict(self, scheduler: Scheduler):
+        sweep = AsyncMock(return_value={'20': True})
+        scheduler._compute_delivered_check_cache = sweep
+        ctx = TickContext(tasks=[], status_map={}, tasks_by_id={})
+
+        await scheduler._phase_delivered_check_gate(ctx)
+
+        assert ctx.delivered_check_cache == {'20': True}
+        sweep.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestBuildDeliveredCheckEscalation (task 2583 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDeliveredCheckEscalation:
+    """``_build_delivered_check_escalation`` — the PRD Resolved-6 summary/
+    detail renderer the grace-streak escalation (task 2583, epsilon)
+    consumes.  Pure rendering: no scheduler state, no side effects."""
+
+    def test_grep_kind_summary_and_detail(self):
+        check = {
+            'name': 'cap-one',
+            'kind': 'grep',
+            'pattern': 'foo',
+            'paths': ['src/'],
+            'expect': 'present',
+        }
+
+        summary, detail = _build_delivered_check_escalation(
+            task_id='10',
+            dep_id='20',
+            dep_status='done',
+            check=check,
+            main_sha='abcdef0123456789',
+        )
+
+        assert summary == (
+            "DEP_CAPABILITY_NOT_DELIVERED: task 10 — dep 20 done but check "
+            "'cap-one' fails on main@abcdef012345"
+        ), f'unexpected summary: {summary!r}'
+        assert 'grep' in detail
+        assert 'foo' in detail
+        assert 'src/' in detail
+        assert 'present' in detail
+        assert 'FAILED' in detail
+        assert 'set task 10 back to pending' in detail
+
+    def test_script_kind_detail_names_script_and_args_not_pattern(self):
+        check = {
+            'name': 'cap-two',
+            'kind': 'script',
+            'script': 'scripts/check_thing.sh',
+            'args': ['--foo', 'bar'],
+            'expect': 'exit_zero',
+        }
+
+        summary, detail = _build_delivered_check_escalation(
+            task_id='11',
+            dep_id='21',
+            dep_status='done',
+            check=check,
+            main_sha='0123456789abcdef',
+        )
+
+        assert summary == (
+            "DEP_CAPABILITY_NOT_DELIVERED: task 11 — dep 21 done but check "
+            "'cap-two' fails on main@0123456789ab"
+        ), f'unexpected summary: {summary!r}'
+        assert 'scripts/check_thing.sh' in detail
+        assert '--foo' in detail
+        assert 'bar' in detail
+        assert 'exit_zero' in detail
+        assert 'FAILED' in detail
+        assert 'pattern' not in detail, 'script-kind detail must not mention pattern'
+        assert 'set task 11 back to pending' in detail
 
 
 # ---------------------------------------------------------------------------
@@ -1042,6 +1235,263 @@ class TestComputeDeliveredCheckCache:
         # still no hold event / no _streak_delivered_hold bump for errored.
         assert self._held_events(scheduler) == []
         assert scheduler._streak_delivered_hold.value('10') == 0
+
+    # --- (k) check_timeout_secs: a hung check is treated as ERRORED --------
+
+    @pytest.mark.asyncio
+    async def test_check_exceeding_timeout_is_treated_as_errored(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """task 2583 (epsilon): check_timeout_secs is an outer asyncio.wait_for
+        backstop around each run_delivered_check call. A check that hangs
+        past the timeout maps to ERRORED — the same fail-safe outcome as a
+        runner exception (row 7): dep left uncached, no hold event, no
+        streak bump (neither _streak_delivered_hold nor the epsilon
+        _streak_delivered_fail)."""
+        scheduler.config.delivered_checks.check_timeout_secs = 0.01
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+
+        async def _slow_runner(check, *, project_root, ref='main'):
+            await asyncio.sleep(1)
+            return DeliveredCheckResult.DELIVERED
+
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', _slow_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert result == {}
+        assert ('20', 'sha1') not in scheduler._delivered_check_cache
+        assert self._held_events(scheduler) == []
+        assert scheduler._streak_delivered_hold.value('10') == 0
+        assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
+
+
+# ---------------------------------------------------------------------------
+# TestDeliveredCheckGraceEscalation (task 2583 — step-9 RED / step-10 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestDeliveredCheckGraceEscalation:
+    """Grace-streak escalation (task 2583, epsilon): after
+    ``delivered_checks.grace_cycles`` consecutive ran-and-FAILED sweep
+    ticks for a given (dependent, dep) pair, ``_compute_delivered_check_cache``
+    invokes ``on_delivered_check_block`` INSTEAD OF (not in addition to)
+    the per-tick ``_note_delivered_hold`` visibility event on that tick, and
+    clears the fail-streak so a persistent failure can re-fire after
+    ``grace_cycles`` more ticks. A DELIVERED tick clears the fail-streak
+    (streak-reset-on-pass); an ERRORED tick leaves it untouched (delta's
+    fail-safe contract, PRD row 7 — never a bump on error).
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        config.delivered_checks.grace_cycles = 3
+        scheduler = Scheduler(
+            config,
+            event_store=_RecordingEventStore(),  # type: ignore[arg-type]
+            callbacks=SchedulerCallbacks(on_delivered_check_block=AsyncMock()),
+        )
+        scheduler.finish_startup()
+        return scheduler
+
+    _ONE_CHECK = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+
+    def _dependent(self, task_id: str = '10', dep_id: str = '20') -> dict:
+        return {
+            'id': task_id,
+            'status': 'pending',
+            'dependencies': [{'id': dep_id}],
+            'metadata': {},
+        }
+
+    def _dep(self, dep_id: str = '20', status: str = 'done', checks: list | None = None) -> dict:
+        checks = self._ONE_CHECK if checks is None else checks
+        return {
+            'id': dep_id,
+            'status': status,
+            'dependencies': [],
+            'metadata': {'delivered_checks': checks},
+        }
+
+    def _fake_sha(self, sha: str = 'sha1'):
+        async def _resolve():
+            return sha
+
+        return _resolve
+
+    def _fake_runner(self, results: dict):
+        async def _fake(check, *, project_root, ref='main'):
+            outcome = results[check['name']]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        return _fake
+
+    def _held_events(self, scheduler: Scheduler) -> list[tuple[str, dict]]:
+        _event_store = scheduler.event_store
+        assert _event_store is not None
+        return [
+            (evt, data)
+            for evt, data in _event_store.events  # type: ignore[attr-defined]
+            if evt == str(EventType.delivered_check_gate_held)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_escalates_on_grace_cycles_consecutive_failures(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner({'cap-one': DeliveredCheckResult.FAILED}),
+        )
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+        callback = scheduler._callbacks.on_delivered_check_block
+        assert callback is not None
+
+        await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        callback.assert_not_called()
+
+        await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        callback.assert_called_once()
+        call_args, call_kwargs = callback.call_args
+        assert call_args[0] == '10'
+        assert call_kwargs['category'] == 'dependency_capability'
+        assert 'DEP_CAPABILITY_NOT_DELIVERED' in call_kwargs['summary']
+        assert 'cap-one' in call_kwargs['summary']
+        assert '20' in call_kwargs['summary']
+        assert 'sha1' in call_kwargs['summary']
+        assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
+        # No held event on the escalation (3rd) tick — only ticks 1 and 2.
+        assert len(self._held_events(scheduler)) == 2
+
+    @pytest.mark.asyncio
+    async def test_streak_resets_on_pass(self, scheduler: Scheduler, monkeypatch):
+        sha_box = {'value': 'sha1'}
+
+        async def _resolve():
+            return sha_box['value']
+
+        scheduler._resolve_main_sha = _resolve
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner({'cap-one': DeliveredCheckResult.FAILED}),
+        )
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert scheduler._streak_delivered_fail.value(('10', '20')) == 1
+
+        sha_box['value'] = 'sha2'
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED}),
+        )
+
+        await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
+        assert scheduler._callbacks.on_delivered_check_block is not None
+        scheduler._callbacks.on_delivered_check_block.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_bump_on_error(self, scheduler: Scheduler, monkeypatch):
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner({'cap-one': DeliveredCheckResult.ERRORED}),
+        )
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
+        assert scheduler._callbacks.on_delivered_check_block is not None
+        scheduler._callbacks.on_delivered_check_block.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_re_escalates_after_grace_cycles_more_failures(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Clear-then-fire contract: once the fail-streak is cleared by a
+        first escalation, ``grace_cycles`` MORE consecutive FAILED ticks
+        (e.g. an operator re-pends the task but the underlying capability
+        is still broken) re-fires a SECOND escalation rather than staying
+        silent forever."""
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner({'cap-one': DeliveredCheckResult.FAILED}),
+        )
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+        callback = scheduler._callbacks.on_delivered_check_block
+        assert callback is not None
+
+        # First 3 consecutive FAILED ticks -> streak hits grace_cycles (3)
+        # -> first escalation, streak cleared.
+        for _ in range(3):
+            await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        callback.assert_called_once()
+        assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
+
+        # 3 MORE consecutive FAILED ticks (still the same SHA, still
+        # failing) -> the cleared streak climbs back to grace_cycles and
+        # re-fires a second, independent escalation.
+        for _ in range(3):
+            await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert callback.call_count == 2
+        assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
+        second_call_args, second_call_kwargs = callback.call_args_list[1]
+        assert second_call_args[0] == '10'
+        assert 'DEP_CAPABILITY_NOT_DELIVERED' in second_call_kwargs['summary']
+        assert 'cap-one' in second_call_kwargs['summary']
+
+    @pytest.mark.asyncio
+    async def test_per_dependent_dep_keying_escalates_independently(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner({'cap-one': DeliveredCheckResult.FAILED}),
+        )
+        task_a = self._dependent(task_id='10', dep_id='20')
+        task_b = self._dependent(task_id='11', dep_id='20')
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task_a, '11': task_b}
+        callback = scheduler._callbacks.on_delivered_check_block
+        assert callback is not None
+
+        for _ in range(3):
+            await scheduler._compute_delivered_check_cache(
+                [task_a, task_b], status_map, tasks_by_id
+            )
+
+        assert callback.call_count == 2
+        called_task_ids = {c.args[0] for c in callback.call_args_list}
+        assert called_task_ids == {'10', '11'}
 
 
 # ---------------------------------------------------------------------------

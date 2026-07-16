@@ -1,4 +1,5 @@
-"""Tests for Harness external-dep escalation sink (task 1580).
+"""Tests for Harness external-dep and delivered-check escalation sinks
+(task 1580; task 2583 adds the delivered-check sink).
 
 Asserts that:
 - After Harness construction, scheduler._callbacks.on_external_dep_block is set
@@ -6,6 +7,8 @@ Asserts that:
 - Invoking the callback sets the task to 'blocked' via scheduler.set_task_status.
 - Invoking the callback submits exactly one L1 Escalation to the escalation queue.
 - A second invocation with an open L1 is deduplicated (no duplicate submission).
+- Task 2583 (epsilon): the same shape for on_delivered_check_block, but filing
+  a BORN-AT-L2 escalation (severity='critical', level=2) instead of an L1.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ def _install_mock_escalation_queue(harness: Harness) -> MagicMock:
     """Attach a MagicMock EscalationQueue to the harness and return it."""
     mock_queue = MagicMock(spec=EscalationQueue)
     mock_queue.has_open_l1.return_value = False   # default: no open L1
+    mock_queue.get_by_task.return_value = []      # default: no open L2 (task 2583)
     mock_queue.make_id.return_value = 'esc-test-external-1'
     harness._escalation_queue = mock_queue
     return mock_queue
@@ -149,6 +153,144 @@ class TestHarnessExternalDepBlockWiring:
             summary='EXTERNAL_DEP_UNRESOLVED: ...',
             detail='detail',
             category='dependency_discovered',
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestHarnessDeliveredCheckBlockWiring (task 2583 — step-13 RED / step-14 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestHarnessDeliveredCheckBlockWiring:
+    """Harness must wire on_delivered_check_block into the Scheduler's
+    SchedulerCallbacks bundle at construction time (task 2583, epsilon).
+
+    Mirrors TestHarnessExternalDepBlockWiring, but the filed escalation is
+    BORN AT L2 (severity='critical', level=2, agent_role=
+    'orchestrator-scheduler' — a harness-sentinel role) instead of L1, and
+    dedupe is scoped to level=2 + agent_role rather than the broad
+    has_open_l1.
+    """
+
+    _SUMMARY = (
+        "DEP_CAPABILITY_NOT_DELIVERED: task 42 — dep 5 done but check "
+        "'cap' fails on main@abc123456789"
+    )
+
+    def test_callback_installed_after_construction(self, tmp_path: Path) -> None:
+        """After Harness construction, scheduler._callbacks.on_delivered_check_block
+        is not None."""
+        harness = _make_harness(tmp_path)
+
+        assert harness.scheduler._callbacks.on_delivered_check_block is not None, (
+            'Harness must wire on_delivered_check_block into the SchedulerCallbacks '
+            'bundle at Scheduler construction time'
+        )
+
+    @pytest.mark.asyncio
+    async def test_callback_sets_task_blocked(self, tmp_path: Path) -> None:
+        """Invoking the callback sets the task to 'blocked' via scheduler.set_task_status."""
+        harness = _make_harness(tmp_path)
+        _install_mock_escalation_queue(harness)
+        harness.scheduler.set_task_status = AsyncMock(return_value=True)
+
+        assert harness.scheduler._callbacks.on_delivered_check_block is not None
+        await harness.scheduler._callbacks.on_delivered_check_block(
+            '42',
+            summary=self._SUMMARY,
+            detail='detail',
+            category='dependency_capability',
+        )
+
+        harness.scheduler.set_task_status.assert_called_once_with('42', 'blocked')
+
+    @pytest.mark.asyncio
+    async def test_callback_submits_l2_escalation(self, tmp_path: Path) -> None:
+        """Invoking the callback submits exactly one born-at-L2 Escalation."""
+        harness = _make_harness(tmp_path)
+        mock_queue = _install_mock_escalation_queue(harness)
+        harness.scheduler.set_task_status = AsyncMock(return_value=True)
+
+        assert harness.scheduler._callbacks.on_delivered_check_block is not None
+        await harness.scheduler._callbacks.on_delivered_check_block(
+            '42',
+            summary=self._SUMMARY,
+            detail='detail',
+            category='dependency_capability',
+        )
+
+        mock_queue.submit.assert_called_once()
+        submitted: Escalation = mock_queue.submit.call_args.args[0]
+        assert submitted.task_id == '42', (
+            f'Escalation task_id must be "42"; got {submitted.task_id!r}'
+        )
+        assert submitted.level == 2, (
+            f'Must file a born-at-L2 escalation; got level={submitted.level}'
+        )
+        assert submitted.severity == 'critical', (
+            f'Born-at-L2 requires a BORN_AT_L2_SEVERITIES severity; got {submitted.severity!r}'
+        )
+        assert submitted.agent_role == 'orchestrator-scheduler', (
+            f'Must file with a harness-sentinel agent_role; got {submitted.agent_role!r}'
+        )
+        assert submitted.category == 'dependency_capability', (
+            f'Escalation category must be dependency_capability; got {submitted.category!r}'
+        )
+        assert 'DEP_CAPABILITY_NOT_DELIVERED' in submitted.summary, (
+            f'Escalation summary must carry the prefix; got {submitted.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_callback_deduplicates_on_open_l2(self, tmp_path: Path) -> None:
+        """Second invocation with an open L2 must NOT submit a duplicate escalation."""
+        harness = _make_harness(tmp_path)
+        mock_queue = _install_mock_escalation_queue(harness)
+        harness.scheduler.set_task_status = AsyncMock(return_value=True)
+
+        assert harness.scheduler._callbacks.on_delivered_check_block is not None
+
+        # First call — no open L2 yet → submits
+        mock_queue.get_by_task.return_value = []
+        await harness.scheduler._callbacks.on_delivered_check_block(
+            '42',
+            summary=self._SUMMARY,
+            detail='detail',
+            category='dependency_capability',
+        )
+
+        # Second call — an open L2 now exists → must NOT submit again
+        mock_queue.get_by_task.return_value = [MagicMock()]
+        await harness.scheduler._callbacks.on_delivered_check_block(
+            '42',
+            summary=self._SUMMARY,
+            detail='detail',
+            category='dependency_capability',
+        )
+
+        assert mock_queue.submit.call_count == 1, (
+            f'Should deduplicate: submit called {mock_queue.submit.call_count} times '
+            f'(expected exactly 1)'
+        )
+        # Dedupe must be scoped to level=2 + agent_role — NOT the broad
+        # has_open_l1 the external-dep filer uses (that would mask/be masked
+        # by an unrelated open L1/L2 for the same task).
+        mock_queue.get_by_task.assert_any_call(
+            '42', status='pending', level=2, agent_role='orchestrator-scheduler'
+        )
+
+    @pytest.mark.asyncio
+    async def test_callback_no_escalation_queue_is_safe(self, tmp_path: Path) -> None:
+        """With no escalation queue installed, callback must not raise."""
+        harness = _make_harness(tmp_path)
+        harness._escalation_queue = None
+        harness.scheduler.set_task_status = AsyncMock(return_value=True)
+
+        # Must not raise even without a queue.
+        assert harness.scheduler._callbacks.on_delivered_check_block is not None
+        await harness.scheduler._callbacks.on_delivered_check_block(
+            '99',
+            summary=self._SUMMARY,
+            detail='detail',
+            category='dependency_capability',
         )
 
 

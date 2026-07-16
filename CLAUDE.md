@@ -121,6 +121,52 @@ deploy capstones in `dark_factory` with a `dark_factory`-internal dependency
 **retired**. Use a `task_kind='deterministic'` deploy or gate task with normal
 deps instead. See "Deterministic task kind" below.
 
+### Delivered-check dependency gate (`metadata.delivered_checks`)
+
+A **local** (same-project) dep can additionally carry `metadata.delivered_checks`
+— a list of check descriptors (`name`, `kind: 'grep'|'script'`, and either a
+`pattern`+`paths` or a `script`+`args`, plus an `expect`) asserting that the
+capability the dep claims to deliver is actually present on the committed
+`main` tree, not just that the task record reached a terminal status. Every
+scheduler tick, `Scheduler._compute_delivered_check_cache` sweeps every
+distinct TERMINAL (`done`/`cancelled`) local dep carrying this metadata
+against `main` and caches the result per `(dep_task_id, main_sha)` — a
+capability landing on `main` self-heals the very next tick with no operator
+action, since a new SHA prunes the stale cache entry.
+
+**Dispatch-time policy**
+
+| Check outcome | Scheduler action |
+|---|---|
+| All checks DELIVERED on `main@SHA` | Satisfied — dep counts toward dispatch |
+| ≥1 check FAILED, consecutive-fail streak `< grace_cycles` | Withheld; `delivered_check_gate_held` event emitted each held tick (hold-visibility only) |
+| ≥1 check FAILED, streak reaches `grace_cycles` | Born-at-L2 `dependency_capability` escalation naming the failed check/pattern-or-script/dep id/`main` SHA; dependent → `blocked`; streak cleared (re-fires on a later re-crossing) |
+| A check ERRORS (git/script failure) or exceeds `check_timeout_secs` | Fail-safe wait — dep left uncached, **no** streak bump on either counter, retried next tick |
+| `delivered_checks.enabled = false` | Gate entirely inert — no sweep, no cache, no streaks, no escalation; `_deps_satisfied` takes its legacy arm-off path as if the metadata didn't exist |
+
+The born-at-L2 escalation (`agent_role='orchestrator-scheduler'`, `severity='critical'`)
+bypasses the auto-watcher and routes straight to a human, mirroring the
+cross-project external-dep gate's L1 filer but one level up — a persistently
+false capability claim is a "someone must look at this now" condition, not a
+routine triage item.
+
+**Config knobs** (`delivered_checks.*`, all green-tier hot-reloadable via
+`mcp__escalation__reload_config`):
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Kill switch — set `false` to disable the gate entirely |
+| `grace_cycles` | `3` | Consecutive FAILED ticks (per dependent, dep pair) before the born-at-L2 escalation fires |
+| `check_timeout_secs` | `120` | Per-check wall-clock timeout; a hung check maps to the same fail-safe outcome as a runner error |
+| `max_checks_per_tick` | `50` | Per-tick fan-out budget across all checked deps (task 2580, delta) |
+
+**Manual re-pend recipe:** exactly like the external-dep gate, a dependent
+blocked by this escalation is **not auto-re-pended**. Once the underlying
+capability actually lands on `main` (or the check itself is fixed), an
+operator must manually set the dependent back to `pending` to reopen it —
+`resolve_issue` on the escalation records the human decision but does not by
+itself unblock the task.
+
 ### Simple-task fast path (`metadata.complexity`)
 
 Set `metadata.complexity = "simple"` to route a task to the single-agent

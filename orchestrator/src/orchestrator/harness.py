@@ -834,6 +834,10 @@ class Harness:
         #   - on_external_dep_block: an external dep is cancelled or persistently
         #     unresolvable → Harness._block_and_escalate_external_dep (needs the
         #     harness's EscalationQueue and set_task_status).
+        #   - on_delivered_check_block (task 2583, epsilon): a delivered check has
+        #     FAILED for delivered_checks.grace_cycles consecutive ticks →
+        #     Harness._block_and_escalate_delivered_check, filing BORN-AT-L2
+        #     (not on_external_dep_block's L1).
         #   - on_starvation_warn / on_starvation_resolve (task 1880): a
         #     deps-satisfied pending task starved past both thresholds files a
         #     non-blocking INFO escalation; resolved when the task dispatches
@@ -852,6 +856,7 @@ class Harness:
             callbacks=SchedulerCallbacks(
                 on_park_stop_trip=self.pause_scheduler,
                 on_external_dep_block=self._block_and_escalate_external_dep,
+                on_delivered_check_block=self._block_and_escalate_delivered_check,
                 on_starvation_warn=self._file_starvation_info,
                 on_starvation_resolve=self._resolve_starvation_info,
                 warm_base_health_probe=self._probe_warm_base_health,
@@ -4408,6 +4413,88 @@ Output JSON matching the schema. Every task must appear in the output.
         self._escalation_queue.submit(esc)
         logger.warning(
             'Filed L1 external-dep escalation %s for task %s',
+            esc.id,
+            task_id,
+        )
+
+    async def _block_and_escalate_delivered_check(
+        self,
+        task_id: str,
+        *,
+        summary: str,
+        detail: str,
+        category: str,
+    ) -> None:
+        """Block a task and file a BORN-AT-L2 escalation for a delivered
+        check that has FAILED for ``delivered_checks.grace_cycles``
+        consecutive scheduler ticks (task 2583, epsilon).
+
+        Wired as ``on_delivered_check_block`` in the ``SchedulerCallbacks``
+        bundle passed to the Scheduler constructor, alongside
+        ``on_external_dep_block``. Structurally mirrors
+        ``_block_and_escalate_external_dep`` but files with
+        ``severity='critical'`` and ``level=2`` explicitly — combined with
+        ``agent_role='orchestrator-scheduler'`` (a harness-sentinel role,
+        ``escalation/server.py`` ``_is_harness_sentinel_role``), the record
+        is BORN AT L2: it bypasses the auto-watcher and routes straight to
+        a human (``escalation/models.py`` ``BORN_AT_L2_SEVERITIES``).
+
+        Sets the task to ``blocked`` via ``scheduler.set_task_status`` and
+        submits the L2 ``Escalation``. Deduped via a scoped
+        ``get_by_task(task_id, status='pending', level=2,
+        agent_role='orchestrator-scheduler')`` read — no new EscalationQueue
+        method (escalation/ is out of this task's module scope); the
+        role+level scoping keeps this dedupe from masking, or being masked
+        by, an unrelated open L2 for the same task (e.g. the deterministic
+        runner's ``orchestrator-deterministic`` L2). No-ops gracefully when
+        no escalation queue is attached (bare-Harness unit tests stay
+        green).
+        """
+        # Set task to blocked regardless of queue state — the queue is only for
+        # human notification; the gate stays closed via the delivered-check cache.
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+        except Exception:
+            logger.warning(
+                'Delivered-check block for task %s — set_task_status raised; '
+                'will still attempt to file escalation',
+                task_id,
+                exc_info=True,
+            )
+
+        if not self._escalation_queue:
+            logger.warning(
+                'Delivered-check block for task %s — no escalation queue, skipping L2 file',
+                task_id,
+            )
+            return
+
+        if self._escalation_queue.get_by_task(
+            task_id, status='pending', level=2, agent_role='orchestrator-scheduler'
+        ):
+            logger.warning(
+                'Delivered-check block for task %s — open L2 already exists, '
+                'suppressing duplicate',
+                task_id,
+            )
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self._escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-scheduler',
+            severity='critical',
+            category=category,
+            summary=summary[:200],
+            detail=detail,
+            suggested_action='manual_intervention',
+            level=2,
+        )
+        self._escalation_queue.submit(esc)
+        logger.warning(
+            'Filed L2 delivered-check escalation %s for task %s',
             esc.id,
             task_id,
         )

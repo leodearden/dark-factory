@@ -401,6 +401,7 @@ class SchedulerCallbacks:
 
     on_park_stop_trip: Callable[[str], Any] | None = None
     on_external_dep_block: Callable[..., Any] | None = None
+    on_delivered_check_block: Callable[..., Any] | None = None
     on_starvation_warn: Callable[..., Any] | None = None
     on_starvation_resolve: Callable[..., Any] | None = None
     warm_base_health_probe: Callable[..., Any] | None = None
@@ -465,6 +466,53 @@ def _render_retry_cap_report(
         '',
     ])
     return '\n'.join(lines)
+
+
+def _build_delivered_check_escalation(
+    *,
+    task_id: str,
+    dep_id: str,
+    dep_status: str,
+    check: dict,
+    main_sha: str,
+) -> tuple[str, str]:
+    """Render the PRD Resolved-6 summary/detail pair for a delivered-check
+    grace-streak escalation (task 2583, epsilon).
+
+    ``check`` is the FAILED check's full descriptor, as authored in the
+    dep's ``metadata.delivered_checks`` — looked up by name at the call
+    site (:meth:`Scheduler._compute_delivered_check_cache`) rather than
+    passed in from delta's minimal ``_delivered_check_fail_detail`` shape,
+    so the escalation can name the pattern/script/args/paths/expect that
+    delta's dispatch-gate cache does not persist.
+
+    Pure rendering — no side effects, no scheduler state.
+    """
+    name = check.get('name')
+    kind = check.get('kind')
+    sha12 = main_sha[:12]
+    summary = (
+        f'DEP_CAPABILITY_NOT_DELIVERED: task {task_id} — dep {dep_id} '
+        f'{dep_status} but check {name!r} fails on main@{sha12}'
+    )
+    lines = [
+        f'Delivered check {name!r} (kind={kind}) failed against main@{sha12}.',
+        f'Dependency: task {dep_id} (status={dep_status}).',
+    ]
+    if kind == 'script':
+        lines.append(f'script: {check.get("script")}')
+        lines.append(f'args: {check.get("args", [])}')
+    else:
+        lines.append(f'pattern: {check.get("pattern")}')
+    lines.append(f'paths: {check.get("paths", [])}')
+    lines.append(f'expect: {check.get("expect")}')
+    lines.append('observed: FAILED')
+    lines.append(
+        f'Blocked dependents are NOT auto-re-pended — set task {task_id} back '
+        f'to pending after the capability lands on main.'
+    )
+    detail = '\n'.join(lines)
+    return summary, detail
 
 
 class McpSessionLike(Protocol):
@@ -591,7 +639,7 @@ class TickContext:
     max_id: int = 0
     external_cache: dict[str, str] = field(default_factory=dict)
     external_resolver_failed: bool = False
-    delivered_check_cache: dict[str, bool] = field(default_factory=dict)
+    delivered_check_cache: dict[str, bool] | None = field(default_factory=dict)
     overrides: dict[str, OverrideRow] = field(default_factory=dict)
     overrides_for_diff: dict[str, OverrideRow] = field(default_factory=dict)
     effective_priorities: dict[str, str] = field(default_factory=dict)
@@ -1395,6 +1443,18 @@ class Scheduler:
         # other. Bumped by _note_delivered_hold on every tick a dependent is
         # withheld by a cached-False (ran-and-FAILED) delivered check.
         self._streak_delivered_hold = StreakCounter()
+        # Per-(dependent_task_id, dep_task_id) count of CONSECUTIVE
+        # ran-and-FAILED sweep ticks (task 2583, epsilon). Distinct from
+        # _streak_delivered_hold (which is keyed by dependent only, and
+        # covers ANY checked dep): this counter is keyed per (dependent,
+        # dep) pair so two dependents sharing the same failing dep escalate
+        # independently. Bumped only on a ran-and-FAILED tick — NEVER on
+        # errored/absent (delta's fail-safe contract, PRD row 7). Cleared
+        # (a) once it crosses delivered_checks.grace_cycles and fires the
+        # born-at-L2 escalation (clear-then-fire — lets a persistent
+        # failure re-escalate after a resolve), or (b) on an all-DELIVERED
+        # tick for that dependent (streak-reset-on-pass).
+        self._streak_delivered_fail = StreakCounter(key_fn=lambda k: k[0])
         # Persistent per-(dep_task_id, main_sha) delivered-check result cache
         # (task 2580, delta). Keyed by the SHA the check was evaluated
         # against so a new commit on main naturally self-heals: stale
@@ -1436,6 +1496,7 @@ class Scheduler:
         self._streak_registry.register('hold', self._streak_hold)
         self._streak_registry.register('resolver_degraded', self._streak_resolver_degraded)
         self._streak_registry.register('delivered_hold', self._streak_delivered_hold)
+        self._streak_registry.register('delivered_fail', self._streak_delivered_fail)
         self._streak_registry.register(
             'starvation', self._streak_starvation, on_gc=self._starvation_gc_resolve
         )
@@ -2850,9 +2911,27 @@ class Scheduler:
                     over_budget = True
                     break
                 used += 1
-                result = await run_delivered_check(
-                    check, project_root=self._project_root, ref=main_sha
-                )
+                try:
+                    result = await asyncio.wait_for(
+                        run_delivered_check(
+                            check, project_root=self._project_root, ref=main_sha
+                        ),
+                        timeout=self.config.delivered_checks.check_timeout_secs,
+                    )
+                except TimeoutError:
+                    # Fail-safe (task 2583, epsilon): a hung check (primarily
+                    # the timeout-less grep kind; defense-in-depth for
+                    # scripts, which also carry their own descriptor
+                    # timeout_secs) maps to ERRORED — same downstream
+                    # handling as a runner exception (row 7: left uncached,
+                    # no hold event, no streak bump, retried next sweep).
+                    logger.warning(
+                        'Delivered-check %r (dep %s) exceeded '
+                        'check_timeout_secs=%s — treating as ERRORED (fail-safe)',
+                        check.get('name'), dep_id,
+                        self.config.delivered_checks.check_timeout_secs,
+                    )
+                    result = DeliveredCheckResult.ERRORED
                 results.append((check, result))
 
             if over_budget:
@@ -2926,19 +3005,124 @@ class Scheduler:
                 dep_id, error_streak, errored_names,
             )
 
-        # Hold-visibility: per dependent, decided from THIS tick's projection.
+        # Hold-visibility + grace-streak escalation: per dependent, decided
+        # from THIS tick's projection (task 2583, epsilon layers the
+        # grace-streak escalate branch onto delta's hold-only loop).
+        #
+        # Deliberate single-dep-at-a-time accounting (reviewed, not an
+        # oversight): `next(...)` below picks only the FIRST failing dep in
+        # `dep_ids` order. If a dependent carries delivered_checks on two+
+        # deps that ALL fail in the same tick, only that first dep's
+        # `_streak_delivered_fail` counter advances this tick; a second
+        # simultaneously-broken capability's grace clock only starts once
+        # the first is cleared — either by escalating (task goes `blocked`,
+        # so dispatch is moot) or by the first dep passing (leaving the
+        # second still-failing dep to become "the first failing dep" on a
+        # later tick). This mirrors `_apply_external_dep_policy`, which
+        # likewise tracks/escalates one blocking cause per dependent at a
+        # time. Acceptable because a single escalation already blocks the
+        # task; a second broken capability is still surfaced by name, just
+        # not concurrently with the first.
         for task_id, dep_ids in deps_by_dependent.items():
             failed_dep_id = next(
                 (dep_id for dep_id in dep_ids if projection.get(dep_id) is False), None
             )
             if failed_dep_id is not None:
-                self._note_delivered_hold(task_id, detail=fail_detail_by_dep.get(failed_dep_id))
+                fail_count = self._streak_delivered_fail.bump((task_id, failed_dep_id))
+                grace_cycles = self.config.delivered_checks.grace_cycles
+                if fail_count >= grace_cycles:
+                    # Clear-then-fire: lets a persistent failure re-escalate
+                    # after grace_cycles more ticks if it's ever resolved and
+                    # then regresses again. Also clear the hold streak and
+                    # SKIP _note_delivered_hold this tick — a task being
+                    # escalated+blocked is not "still waiting" (mirrors
+                    # _apply_external_dep_policy's blocked_this_tick
+                    # suppression).
+                    self._streak_delivered_fail.clear((task_id, failed_dep_id))
+                    self._streak_delivered_hold.clear(task_id)
+                    await self._fire_delivered_check_escalation(
+                        task_id=task_id,
+                        dep_id=failed_dep_id,
+                        status_map=status_map,
+                        checked_deps=checked_deps,
+                        fail_detail_by_dep=fail_detail_by_dep,
+                        main_sha=main_sha,
+                    )
+                else:
+                    self._note_delivered_hold(
+                        task_id, detail=fail_detail_by_dep.get(failed_dep_id)
+                    )
             elif all(projection.get(dep_id) is True for dep_id in dep_ids):
                 self._streak_delivered_hold.clear(task_id)
+                for dep_id in dep_ids:
+                    self._streak_delivered_fail.clear((task_id, dep_id))
             # else: at least one dep absent this tick (errored/over-budget) —
-            # leave the streak untouched, no visibility spam (row 7).
+            # leave both streaks untouched, no visibility spam (row 7).
 
         return projection
+
+    async def _fire_delivered_check_escalation(
+        self,
+        *,
+        task_id: str,
+        dep_id: str,
+        status_map: dict[str, str],
+        checked_deps: dict[str, dict],
+        fail_detail_by_dep: dict[str, dict | None],
+        main_sha: str,
+    ) -> None:
+        """Fire the grace-streak born-at-L2 escalation for a delivered check
+        that has FAILED for ``delivered_checks.grace_cycles`` consecutive
+        sweep ticks (task 2583, epsilon).
+
+        Looks up the failed check's full descriptor by name from the dep's
+        ``metadata.delivered_checks`` (via *checked_deps*) so the rendered
+        escalation can name the pattern/script/args/paths/expect that
+        delta's minimal ``fail_detail_by_dep`` entry does not carry; falls
+        back to that minimal entry if the descriptor can't be found
+        (defensive only — the name comes from that same dep's own checks
+        list, so this should not happen in practice). Renders via
+        :func:`_build_delivered_check_escalation` and invokes
+        ``self._callbacks.on_delivered_check_block`` if installed, wrapped
+        in try/except so a callback failure can't abort the sweep; logs a
+        WARNING when no callback is installed (bare-Scheduler unit tests).
+        """
+        detail = fail_detail_by_dep.get(dep_id) or {}
+        check_name = detail.get('name')
+        dep_task = checked_deps.get(dep_id) or {}
+        checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
+        check = next((c for c in checks if c.get('name') == check_name), None)
+        if check is None:
+            check = {'name': check_name, 'kind': detail.get('kind')}
+        dep_status = status_map.get(dep_id, 'unknown')
+        summary, esc_detail = _build_delivered_check_escalation(
+            task_id=task_id,
+            dep_id=dep_id,
+            dep_status=dep_status,
+            check=check,
+            main_sha=main_sha,
+        )
+        if self._callbacks.on_delivered_check_block is not None:
+            try:
+                await self._callbacks.on_delivered_check_block(
+                    task_id,
+                    summary=summary,
+                    detail=esc_detail,
+                    category='dependency_capability',
+                )
+            except Exception:
+                logger.warning(
+                    'on_delivered_check_block callback raised for task %s — '
+                    'grace-streak escalation may not have been filed',
+                    task_id,
+                    exc_info=True,
+                )
+        else:
+            logger.warning(
+                'Delivered-check grace-streak exhausted for task %s (dep %s, '
+                'check %r) — no on_delivered_check_block callback installed',
+                task_id, dep_id, check_name,
+            )
 
     async def _apply_starvation_watchdog(self, candidates: list[dict]) -> None:
         """Per-tick starvation watchdog over the dispatch-eligible candidate list.
@@ -4886,7 +5070,22 @@ class Scheduler:
         to a fail-safe EMPTY cache instead of aborting the tick — no task
         gated by an unverified delivered check dispatches this tick, and
         the sweep retries next tick. Always continues.
+
+        **Kill switch (task 2583, epsilon):** when ``delivered_checks.enabled``
+        is ``False``, short-circuits to ``ctx.delivered_check_cache = None``
+        BEFORE building ``_pending_tasks`` or calling
+        ``_compute_delivered_check_cache`` — skips the whole sweep (no git,
+        no streaks, no escalation), not just an empty result. This MUST be
+        ``None`` and not ``{}``: ``_deps_satisfied``'s delivered-check arm
+        only disables itself when the cache is exactly ``None``
+        (``if delivered_check_cache is not None``) — an empty dict would
+        still activate the arm and withhold every dep carrying
+        ``metadata.delivered_checks`` (``cache.get(dep_id)`` is ``None``,
+        not ``True`` → blocked).
         """
+        if not self.config.delivered_checks.enabled:
+            ctx.delivered_check_cache = None
+            return _CONTINUE
         _pending_tasks = [t for t in ctx.tasks if t.get('status') == 'pending']
         try:
             cache = await self._compute_delivered_check_cache(
