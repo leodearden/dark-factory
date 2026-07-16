@@ -4265,6 +4265,41 @@ async def test_get_statuses_hot_path_fresh_on_reused_warm_connection(
 
 
 @pytest.mark.asyncio
+async def test_get_statuses_and_get_task_agree_under_pinned_write_connection(
+    backend, project_root,
+):
+    """get_task must agree with get_statuses even when the cached WRITE
+    connection has a read transaction pinned open.
+
+    Direct reproduction of the 2026-07-16 recurrence (task 2651 follow-up
+    to task 2455): get_statuses/get_statuses_raw already read via the
+    unpinnable cached read connection (see
+    ``test_get_statuses_hot_path_fresh_despite_pinned_write_connection``,
+    above) and are therefore fresh here. get_task, however, still reads
+    via the pinnable cached WRITE connection (``_get_connection``) — see
+    ``get_statuses_raw``'s "Snapshot consistency" note — so with that
+    connection pinned to a stale pre-commit snapshot and 'cancelled'
+    committed out-of-band, get_task disagrees with get_statuses even
+    though both are being asked about the same task immediately
+    afterwards.
+    """
+    conn = await _pin_write_connection_then_commit_out_of_band(backend, project_root)
+
+    status_map = await backend.get_statuses(project_root, ids=['1'])
+    task = await backend.get_task('1', project_root)
+
+    assert status_map['1'] == 'cancelled', (
+        f"Expected get_statuses to see fresh 'cancelled', got: {status_map}"
+    )
+    assert task['status'] == 'cancelled', (
+        f"get_task must agree with get_statuses (both fresh), got {task['status']!r}"
+    )
+
+    # Release the pin so the fixture's backend.close() isn't left mid-txn.
+    await conn.rollback()
+
+
+@pytest.mark.asyncio
 async def test_close_drains_cached_read_connections(backend, project_root):
     """close() must drain the cached read connections opened by
     :meth:`~SqliteTaskBackend._get_read_connection` (task 2455), not just
