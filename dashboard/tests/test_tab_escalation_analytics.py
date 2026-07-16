@@ -422,3 +422,99 @@ def test_tab_analytics_jsx_served_and_exports(_client) -> None:
         "'df.open.escanalytics' — pass it as the storageKey argument to useOpenSet so fold "
         'state is persisted.'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-3 test: index.html registers tab_escalation_analytics.jsx in correct
+# load order
+# ---------------------------------------------------------------------------
+
+
+def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> None:
+    """index.html must include tab_escalation_analytics.jsx, loaded AFTER
+    data.js, shell.jsx, and tabs.jsx and BEFORE app.jsx; must be a classic
+    synchronous script (no defer/async/type=module); and all
+    /static/redux/*?v= cache-busters must share a single version >= 30.
+
+    Checks:
+    (a) tab_escalation_analytics.jsx script tag exists.
+    (b) Loads after data.js.
+    (c) Loads after shell.jsx.
+    (d) Loads after tabs.jsx.
+    (e) Loads before app.jsx.
+    (f) Not deferred/async/module.
+    (g) All /static/redux/ v= cache-busters share one version >= 30.
+    """
+    _TAB_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
+
+    # (a) tab_escalation_analytics.jsx script tag must exist
+    result = _find_script_position(index_html_body, _TAB_ANALYTICS_PREFIX)
+    assert result is not None, (
+        f'No <script src="{_TAB_ANALYTICS_PREFIX}..."> tag found in index.html — '
+        'add it after tab_escalations.jsx and before app.jsx.'
+    )
+    _, analytics_attrs = result
+
+    # (f) Must be a classic synchronous script
+    assert 'defer' not in analytics_attrs, (
+        'tab_escalation_analytics.jsx script tag has defer= — remove it; classic '
+        'synchronous scripts are required for Babel-standalone transpilation.'
+    )
+    assert 'async' not in analytics_attrs, (
+        'tab_escalation_analytics.jsx script tag has async= — remove it.'
+    )
+    assert (analytics_attrs.get('type') or '').lower() in ('text/babel', ''), (
+        'tab_escalation_analytics.jsx script must have type="text/babel" (or no type) — '
+        f'got {analytics_attrs.get("type")!r}.'
+    )
+
+    # (b) Loads after data.js
+    _assert_script_loads_before(
+        index_html_body,
+        '/static/redux/data.js',
+        _TAB_ANALYTICS_PREFIX,
+        'data.js',
+        'tab_escalation_analytics.jsx',
+        'data.js must load before tab_escalation_analytics.jsx so window.DF_DATA is seeded.',
+    )
+
+    # (c) Loads after shell.jsx
+    _assert_script_loads_before(
+        index_html_body,
+        '/static/redux/shell.jsx',
+        _TAB_ANALYTICS_PREFIX,
+        'shell.jsx',
+        'tab_escalation_analytics.jsx',
+        'shell.jsx must load before tab_escalation_analytics.jsx so window.DF_SHELL is available.',
+    )
+
+    # (d) Loads after tabs.jsx
+    _assert_script_loads_before(
+        index_html_body,
+        '/static/redux/tabs.jsx',
+        _TAB_ANALYTICS_PREFIX,
+        'tabs.jsx',
+        'tab_escalation_analytics.jsx',
+        'tabs.jsx must load before tab_escalation_analytics.jsx so window.DF_TABS is available to mutate.',
+    )
+
+    # (e) Loads before app.jsx
+    _assert_script_loads_before(
+        index_html_body,
+        _TAB_ANALYTICS_PREFIX,
+        '/static/redux/app.jsx',
+        'tab_escalation_analytics.jsx',
+        'app.jsx',
+        'tab_escalation_analytics.jsx must load before app.jsx so EscalationAnalyticsTab is set on window.DF_TABS.',
+    )
+
+    # (g) All /static/redux/ v= cache-busters share one version >= 30
+    versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
+    assert len(versions) == 1, (
+        f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
+        'bump all of them uniformly to the same value.'
+    )
+    v = int(next(iter(versions)))
+    assert v >= 30, (
+        f'index.html cache-buster version is {v}, expected >= 30.'
+    )
