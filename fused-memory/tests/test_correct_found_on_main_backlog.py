@@ -421,3 +421,74 @@ class TestApplyCorrectionsReopenHappyPath:
         annotation = payload['x_provenance_audit']
         assert annotation['label'] == LABEL_REOPENED
         assert annotation['reopen_reason'] == REOPEN_DISPOSITIONS['1175']
+
+
+# ===========================================================================
+# Step-9/10: apply_corrections — reopen silent-write-failure guard (task 1175
+# regression: a "successful" status write that doesn't actually persist)
+# ===========================================================================
+
+@pytest.mark.asyncio
+class TestApplyCorrectionsReopenNotPersisted:
+    """A reopen whose flip did not verifiably persist must be recorded
+    loudly (reopen_failed + errors), never silently trusted — this is the
+    exact task-1175 regression this script exists to guard against. The
+    batch must keep processing subsequent corrections (loud, not aborting)."""
+
+    async def test_not_persisted_dto_is_recorded_reopen_failed_and_batch_continues(self):
+        reopen_correction = _correction(
+            '1175', ACTION_REOPEN, label=LABEL_REOPENED, ref='main',
+            reasons=['declared file(s) missing from the ref HEAD: fused-memory/tests/x.py'],
+            reopen_reason=REOPEN_DISPOSITIONS['1175'],
+        )
+        annotate_correction = _correction(
+            '9999', ACTION_ANNOTATE, label=LABEL_PRESUMED_BENIGN_HISTORICAL,
+        )
+        backend = FakeCorrectionsBackend(
+            status_results={
+                '1175': {
+                    'success': False,
+                    'error': 'status_write_not_persisted',
+                    'task_id': '1175',
+                    'requested_status': 'pending',
+                    'actual_status': 'done',
+                },
+            },
+        )
+        summary = await apply_corrections(
+            backend, '/proj', [reopen_correction, annotate_correction], apply=True,
+        )
+
+        assert '1175' in summary['reopen_failed']
+        assert summary['errors'] >= 1
+        assert summary['reopened'] == 0
+
+        # No audit-trail annotation is written for the not-persisted reopen
+        # itself — loud failure, not a paper trail implying success.
+        assert all(call['task_id'] != '1175' for call in backend.update_calls)
+
+        # The batch is NOT aborted: the following annotate correction still
+        # gets applied (loud-but-non-aborting).
+        assert summary['annotated'] == 1
+        assert any(call['task_id'] == '9999' for call in backend.update_calls)
+
+    async def test_reread_still_shows_done_is_recorded_reopen_failed(self):
+        """set_task_status reports success, but the independent get_task
+        re-read still shows 'done' — the exact silent-non-persist shape
+        task 1175 suffered under prior reconciliation reopens."""
+        reopen_correction = _correction(
+            '1175', ACTION_REOPEN, label=LABEL_REOPENED, ref='main',
+            reopen_reason=REOPEN_DISPOSITIONS['1175'],
+        )
+        backend = FakeCorrectionsBackend(
+            get_task_results={'1175': {'status': 'done'}},
+        )
+        summary = await apply_corrections(backend, '/proj', [reopen_correction], apply=True)
+
+        assert len(backend.status_calls) == 1
+        assert len(backend.get_task_calls) == 1
+
+        assert '1175' in summary['reopen_failed']
+        assert summary['errors'] >= 1
+        assert summary['reopened'] == 0
+        assert all(call['task_id'] != '1175' for call in backend.update_calls)
