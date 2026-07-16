@@ -626,6 +626,39 @@ class TestModelOverridesShapeAuthority:
             assert role in KNOWN_ROLE_NAMES
 
 
+class TestModelOverridesField:
+    """``TaskMetadata.model_overrides`` — the typed round-tripping field
+    itself (PRD adaptive-model-routing task ζ). A plain ``dict[str, str]``
+    field mirroring ``external_deps: list[str]`` — role-name/value shape
+    validation is NOT duplicated here as a model_validator; it stays
+    single-sourced in ``validate_model_overrides``
+    (``TestModelOverridesShapeAuthority`` above) / the fused-memory guard
+    that delegates to it.
+    """
+
+    def test_default_is_empty_dict(self):
+        assert TaskMetadata().model_overrides == {}
+
+    def test_constructs_with_value(self):
+        tm = TaskMetadata(model_overrides={'implementer': 'haiku'})
+        assert tm.model_overrides == {'implementer': 'haiku'}
+
+    def test_parse_metadata_write_enforce_round_trips(self):
+        model, _ = parse_metadata(
+            {'model_overrides': {'implementer': 'haiku'}},
+            direction='write',
+            enforce=True,
+        )
+        assert model.model_dump()['model_overrides'] == {'implementer': 'haiku'}
+
+    def test_parse_metadata_read_emits_no_unknown_key_warning(self):
+        _, warnings = parse_metadata(
+            {'model_overrides': {'implementer': 'haiku'}}, direction='read'
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'model_overrides' not in unknown_key_fields
+
+
 class TestTaskMetadataFields:
     def test_empty_defaults(self):
         tm = TaskMetadata()
