@@ -2342,6 +2342,20 @@ class VerifyResult:
     # derive_verify_plan's docstring ("Fidelity" paragraph) for what its raw,
     # unreconciled return value alone still omits.
     plan: dict | None = None
+    # Machine-readable failing/errored pytest node ids, parsed from a
+    # structured merge-role run's junitxml report (task μ,
+    # verify-scope-inversion-prd.md — the baseline-attribution signal;
+    # see _extract_failing_test_ids_from_junit and with_junitxml in
+    # verify_cmd.py). Deliberately a plain JSON-native `list[str] | None`
+    # (mirrors `contention`/`plan` immediately above), so it round-trips
+    # losslessly through the generic codec (asdict / VerifyResult(**d)).
+    #
+    # None = "no junit collected" — role != 'merge', breadth != 'full', an
+    # OPAQUE/raw-retained test command, or an unreadable/malformed junit
+    # report — the B3 degrade signal callers fall back on. `[]` = "junit
+    # collected, zero failing" (main/branch genuinely clean under this
+    # run) and must NOT be conflated with None.
+    failing_test_ids: list[str] | None = None
     # Wall-clock verify cost.  For a single-module run: max(test, lint, type)
     # when the three commands ran concurrently (asyncio.gather), or their sum
     # when run serially.  For a multi-module run: max across child
