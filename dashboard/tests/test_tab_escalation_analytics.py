@@ -888,3 +888,93 @@ def test_tab_analytics_lifespan_panel(tab_analytics_jsx_body: str) -> None:
         'the filed→triaged→resolved segment block must render only when present, '
         'not be zero-filled.'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-15 test: Workflow panel
+# ---------------------------------------------------------------------------
+
+
+def test_tab_analytics_workflow_panel(tab_analytics_jsx_body: str) -> None:
+    """The Workflow panel (tier-absorption chart + action mix + churn/throughput
+    + a reserved ζ flow-diagram mount seam).
+
+    Asserts, scoped to the Workflow panel's own function body:
+    (a) A 100%-normalized `StackedAreaChart` of tier absorption from
+        `tier_weekly`, with a per-week normalization (division by a week
+        total).
+    (b) A total-volume `Sparkline` above the tier-absorption chart.
+    (c) An action-mix `Donut` from `action_mix`.
+    (d) A churn `LineChart` from `churn_daily`.
+    (e) An esc-per-done `LineChart` from `esc_per_done_daily`, plotting
+        `ratio`.
+    (f) A reserved `esc-flow-slot` mount seam fed the windowed `flow_daily`.
+    """
+    body = tab_analytics_jsx_body
+
+    assert 'function WorkflowPanel(' in body, (
+        'tab_escalation_analytics.jsx does not define `function WorkflowPanel(` — '
+        'add the Workflow panel component.'
+    )
+    workflow_body = _extract_function_body(body, 'WorkflowPanel')
+    assert workflow_body, 'Could not locate the WorkflowPanel( function body.'
+
+    # (a) 100%-normalized StackedAreaChart of tier absorption from tier_weekly.
+    assert 'tier_weekly' in workflow_body, (
+        'WorkflowPanel does not reference `tier_weekly` — the tier-absorption '
+        'chart must be built from workflow.tier_weekly.'
+    )
+    assert '<C.StackedAreaChart' in workflow_body, (
+        'WorkflowPanel does not render <C.StackedAreaChart — the 100%-normalized '
+        'tier-absorption chart must use the StackedAreaChart primitive.'
+    )
+    assert re.search(r'/\s*\w*[Tt]otal\b', workflow_body), (
+        'WorkflowPanel does not divide by a week-total-like variable — the '
+        'tier-absorption chart must be 100%-normalized (each tier count ÷ week '
+        'total), not raw counts.'
+    )
+
+    # (b) total-volume Sparkline above the tier-absorption chart.
+    assert '<C.Sparkline' in workflow_body, (
+        'WorkflowPanel does not render <C.Sparkline — add a total-volume '
+        'sparkline above the tier-absorption chart.'
+    )
+
+    # (c) action-mix Donut.
+    assert 'action_mix' in workflow_body, (
+        'WorkflowPanel does not reference `action_mix` — add the action-mix donut.'
+    )
+    assert '<C.Donut' in workflow_body, (
+        'WorkflowPanel does not render <C.Donut — the action-mix chart must use '
+        'the Donut primitive.'
+    )
+
+    # (d)/(e) churn + esc-per-done LineCharts (two distinct charts).
+    assert 'churn_daily' in workflow_body, (
+        'WorkflowPanel does not reference `churn_daily` — add the churn LineChart.'
+    )
+    assert 'esc_per_done_daily' in workflow_body, (
+        'WorkflowPanel does not reference `esc_per_done_daily` — add the '
+        'esc-per-done LineChart.'
+    )
+    line_chart_positions = [m.start() for m in re.finditer(r'<C\.LineChart', workflow_body)]
+    assert len(line_chart_positions) >= 2, (
+        'WorkflowPanel must render at least two <C.LineChart charts — one for '
+        'churn_daily, one for esc_per_done_daily.'
+    )
+    assert any(
+        'ratio' in workflow_body[max(0, i - 400) : i] for i in line_chart_positions
+    ), (
+        'No <C.LineChart in WorkflowPanel is fed a `ratio`-derived series nearby — '
+        'the esc-per-done chart must plot esc_per_done_daily[].ratio.'
+    )
+
+    # (f) reserved esc-flow-slot mount seam, fed the windowed flow_daily.
+    assert 'esc-flow-slot' in workflow_body, (
+        'WorkflowPanel does not render an `esc-flow-slot` placeholder — reserve a '
+        'stable mount seam for the ζ lifecycle-flow-diagram component (dep on δ).'
+    )
+    assert 'flow_daily' in workflow_body, (
+        'WorkflowPanel does not reference `flow_daily` — the esc-flow-slot must be '
+        'fed the windowed flow_daily data.'
+    )
