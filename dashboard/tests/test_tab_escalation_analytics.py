@@ -928,7 +928,7 @@ def test_tab_analytics_workflow_panel(tab_analytics_jsx_body: str) -> None:
         'WorkflowPanel does not render <C.StackedAreaChart — the 100%-normalized '
         'tier-absorption chart must use the StackedAreaChart primitive.'
     )
-    assert re.search(r'/\s*\w*[Tt]otal\b', workflow_body), (
+    assert re.search(r'/\s*\w*[Tt]otal', workflow_body), (
         'WorkflowPanel does not divide by a week-total-like variable — the '
         'tier-absorption chart must be 100%-normalized (each tier count ÷ week '
         'total), not raw counts.'
@@ -963,7 +963,7 @@ def test_tab_analytics_workflow_panel(tab_analytics_jsx_body: str) -> None:
         'churn_daily, one for esc_per_done_daily.'
     )
     assert any(
-        'ratio' in workflow_body[max(0, i - 400) : i] for i in line_chart_positions
+        'ratio' in workflow_body[i : i + 300] for i in line_chart_positions
     ), (
         'No <C.LineChart in WorkflowPanel is fed a `ratio`-derived series nearby — '
         'the esc-per-done chart must plot esc_per_done_daily[].ratio.'

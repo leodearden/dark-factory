@@ -104,6 +104,38 @@ function sliceRowsByWindow(rows, generatedAt, win, dateOf) {
   return rows.filter(row => dateOf(row) >= cutoff);
 }
 
+// tier_weekly is keyed by ISO-8601 week ("YYYY-Www", matching Python's
+// `isocalendar()`), NOT a calendar date — comparing week keys against a
+// "YYYY-MM-DD" cutoff would compare apples to oranges, so the cutoff date is
+// first converted to its own week key (nearest-Thursday algorithm) and week
+// keys are then compared as strings (valid since both sides are zero-padded
+// "YYYY-Www").
+function dateToIsoWeekKey(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return null;
+  const isoDayNum = (d.getUTCDay() + 6) % 7 + 1; // Mon=1..Sun=7
+  const thursday = new Date(d.getTime());
+  thursday.setUTCDate(d.getUTCDate() + 4 - isoDayNum);
+  const isoYear = thursday.getUTCFullYear();
+  const jan1 = new Date(Date.UTC(isoYear, 0, 1));
+  const week = Math.ceil(((thursday.getTime() - jan1.getTime()) / 86400000 + 1) / 7);
+  return `${isoYear}-W${String(week).padStart(2, '0')}`;
+}
+
+// Filters a `{week: value}` object (tier_weekly) down to weeks on/after the
+// window cutoff's own week. 'all' (or an unresolvable cutoff) returns the
+// object unchanged.
+function sliceWeeklyByWindow(weeklyObj, generatedAt, win) {
+  const cutoffDate = windowCutoffDate(generatedAt, win);
+  const cutoffWeek = cutoffDate && dateToIsoWeekKey(cutoffDate);
+  if (!cutoffWeek || !weeklyObj) return weeklyObj || {};
+  const out = {};
+  for (const week of Object.keys(weeklyObj)) {
+    if (week >= cutoffWeek) out[week] = weeklyObj[week];
+  }
+  return out;
+}
+
 // ── Regime-marker overlay ──
 //
 // charts.jsx's primitives (LineChart/StackedAreaChart) plot points at evenly
@@ -384,6 +416,97 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
   );
 }
 
+// ── Workflow panel ──
+//
+// 100%-normalized weekly tier-absorption chart (+ a total-volume sparkline),
+// an action-mix donut, churn/throughput time charts, and a reserved mount
+// seam for ζ's lifecycle-flow diagram (depends on δ).
+
+function WorkflowPanel({ workflow, win, generatedAt, regimeMarkers }) {
+  const tierWeekly = sliceWeeklyByWindow(workflow.tier_weekly, generatedAt, win);
+  const weeks = Object.keys(tierWeekly).sort();
+  const weekTotals = weeks.map(w => Object.values(tierWeekly[w] || {}).reduce((s, n) => s + n, 0));
+
+  // 100%-normalized: every tier is stacked every week (even at 0) so each
+  // week's band heights always sum to exactly 1.0 — StackedAreaChart
+  // auto-scales its y-axis to the max stacked total, which is then 1.0.
+  const stacks = _RESOLVER_TIERS.map(t => ({
+    key: t,
+    color: _TIER_COLORS[t] || C.PALETTE.fg3,
+    values: weeks.map((w, wi) => (weekTotals[wi] > 0 ? ((tierWeekly[w] || {})[t] || 0) / weekTotals[wi] : 0)),
+  }));
+
+  const actionEntries = Object.entries(workflow.action_mix || {}).sort((a, b) => b[1] - a[1]);
+  const donutData = actionEntries.map(([action, count], i) => ({
+    label: action,
+    value: count,
+    color: _CATEGORY_COLORS[i % _CATEGORY_COLORS.length],
+  }));
+  const totalActions = actionEntries.reduce((s, [, count]) => s + count, 0);
+
+  const churnDaily = sliceDailyByWindow(workflow.churn_daily, generatedAt, win);
+  const churnDates = Object.keys(churnDaily).sort();
+
+  const escPerDoneDaily = sliceRowsByWindow(workflow.esc_per_done_daily || [], generatedAt, win, row => row.date);
+  // charts.jsx's LineChart has no null/gap support (not modified — see design
+  // decisions), so a null ratio (done == 0 that day) is OMITTED rather than
+  // plotted as a misleading zero.
+  const epdRows = escPerDoneDaily.filter(row => row.ratio != null);
+  const epdDates = epdRows.map(row => row.date);
+
+  const flowDaily = sliceRowsByWindow(workflow.flow_daily || [], generatedAt, win, row => row.date);
+
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+        Workflow — resolver mix &amp; throughput
+      </div>
+      {weeks.length > 0 && (
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ height: 22, marginBottom: 4 }}><C.Sparkline values={weekTotals} /></div>
+          <C.StackedAreaChart stacks={stacks} labels={weeks} formatY={v => `${Math.round(v * 100)}%`} />
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
+        {donutData.length > 0 && (
+          <C.Donut data={donutData} centerLabel="actions" centerValue={totalActions} />
+        )}
+      </div>
+      {churnDates.length > 0 && (
+        <>
+          <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Churn — same-task re-filings within 24h</div>
+          <TimeChart labels={churnDates} markers={regimeMarkers}>
+            <C.LineChart
+              series={[{ key: 'churn', color: C.PALETTE.bad, values: churnDates.map(d => churnDaily[d] || 0) }]}
+              labels={churnDates}
+              formatX={fmtDateTime}
+            />
+          </TimeChart>
+        </>
+      )}
+      {epdDates.length > 0 && (
+        <>
+          <div style={{ fontSize: 10, color: 'var(--fg-3)', margin: '10px 0 4px' }}>Escalations filed per task done</div>
+          <TimeChart labels={epdDates} markers={regimeMarkers}>
+            <C.LineChart
+              series={[{ key: 'ratio', color: C.PALETTE.accent, values: epdRows.map(row => row.ratio) }]}
+              labels={epdDates}
+              formatX={fmtDateTime}
+            />
+          </TimeChart>
+        </>
+      )}
+      {/* ζ lifecycle flow diagram / mini-Sankey mounts here, fed the windowed
+          `flowDaily` computed above (dep on δ) — reserved seam, not yet built. */}
+      <div className="esc-flow-slot">
+        <span style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+          {flowDaily.length} flow row{flowDaily.length !== 1 ? 's' : ''} in window — lifecycle flow diagram pending
+        </span>
+      </div>
+    </div>
+  );
+}
+
 // ── EscalationAnalyticsTab ──
 
 function EscalationAnalyticsTab({ projectFilter }) {
@@ -397,9 +520,10 @@ function EscalationAnalyticsTab({ projectFilter }) {
 
   const [openMap, toggle] = useOpenSet(projectIds, true, 'df.open.escanalytics');
   const [win, setWin] = usePersistedState('df.escanalytics.window', '28d');
-  // Shared across every project's panels via TimeChart (Origin/Lifespan/
-  // Workflow, added in later steps) — regime markers are a single
-  // cross-project timeline, not per-project data.
+  // Shared across every project's date-axis charts via TimeChart (Origin's
+  // filings chart, Workflow's churn/esc-per-done charts) — regime markers
+  // are a single cross-project timeline, not per-project data. Lifespan's
+  // only chart is the threshold-axis ECDF, so it doesn't consume these.
   const regimeMarkers = analytics.regime_markers || [];
 
   return (
@@ -435,7 +559,12 @@ function EscalationAnalyticsTab({ projectFilter }) {
               win={win}
               generatedAt={analytics.generated_at}
             />
-            {/* Workflow panel lands in a later step */}
+            <WorkflowPanel
+              workflow={p.workflow}
+              win={win}
+              generatedAt={analytics.generated_at}
+              regimeMarkers={regimeMarkers}
+            />
           </ProjectGroup>
         </div>
       ))}
