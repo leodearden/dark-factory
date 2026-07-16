@@ -368,7 +368,16 @@ async def _cross_unit_verify_then_advance_to_done():
     PID + strictly-later monotonic, RP-5), and the real DeployState chain
     then advances RAN->VERIFIED->DONE, every edge legal per `_LEGAL` (the
     recording escalation_sink is never invoked). Returns
-    (restart_outcome, final_phase, sink_calls).
+    (restart_outcome, final_state, sink_calls).
+
+    Field-accumulation note: to_metadata() always re-dumps the FULL
+    accumulated deploy_state slice (never a partial/field-level merge — see
+    its docstring), so each step below builds its DeployState from the
+    PRIOR step's object via model_copy(update=...) rather than
+    constructing a fresh one from scratch. A from-scratch DeployState per
+    step would silently drop already-written fields (e.g. ran_at) the
+    moment the next metadata.update() lands, which would defeat the point
+    of exercising the real accumulated-state contract here.
 
     Scope note: like D1a, the RAN->VERIFIED->DONE writes are driven
     directly via enforce_transition() + DeployState.to_metadata() rather
@@ -412,21 +421,21 @@ async def _cross_unit_verify_then_advance_to_done():
     def recording_sink(task_id: str, old: DeployPhase, new: DeployPhase) -> None:
         sink_calls.append((task_id, old, new))
 
-    metadata: dict = DeployState(
-        phase=DeployPhase.RAN, ran_at='2026-07-15T00:00:00+00:00',
-    ).to_metadata()
+    ran_state = DeployState(phase=DeployPhase.RAN, ran_at='2026-07-15T00:00:00+00:00')
+    metadata: dict = ran_state.to_metadata()
 
     enforce_transition(DeployPhase.RAN, DeployPhase.VERIFIED, task_id=tid, escalation_sink=recording_sink)
-    metadata.update(
-        DeployState(phase=DeployPhase.VERIFIED, verified_at='2026-07-15T00:05:00+00:00').to_metadata()
+    verified_state = ran_state.model_copy(
+        update={'phase': DeployPhase.VERIFIED, 'verified_at': '2026-07-15T00:05:00+00:00'},
     )
+    metadata.update(verified_state.to_metadata())
 
     enforce_transition(DeployPhase.VERIFIED, DeployPhase.DONE, task_id=tid, escalation_sink=recording_sink)
-    metadata.update(DeployState(phase=DeployPhase.DONE).to_metadata())
+    done_state = verified_state.model_copy(update={'phase': DeployPhase.DONE})
+    metadata.update(done_state.to_metadata())
 
     final_state = DeployState.from_metadata(metadata)
-    final_phase = final_state.phase if final_state is not None else None
-    return restart_outcome, final_phase, sink_calls
+    return restart_outcome, final_state, sink_calls
 
 
 @pytest.mark.asyncio
@@ -438,11 +447,18 @@ class TestD1CrossUnitVerifyToDone:
 
         from orchestrator.proc_supervision import RestartDisposition
 
-        restart_outcome, final_phase, sink_calls = await _cross_unit_verify_then_advance_to_done()
+        restart_outcome, final_state, sink_calls = await _cross_unit_verify_then_advance_to_done()
 
         assert restart_outcome.disposition == RestartDisposition.DEPLOYED_AND_VERIFIED
         assert restart_outcome.escalated is False
-        assert final_phase == DeployPhase.DONE
+        assert final_state is not None
+        assert final_state.phase == DeployPhase.DONE
+        # Lock in field-accumulation fidelity: to_metadata() always re-dumps
+        # the FULL deploy_state slice, so these must survive the VERIFIED
+        # and DONE merges rather than being silently dropped by a
+        # from-scratch DeployState at each step.
+        assert final_state.ran_at == '2026-07-15T00:00:00+00:00'
+        assert final_state.verified_at == '2026-07-15T00:05:00+00:00'
         assert sink_calls == []
 
 
