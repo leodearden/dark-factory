@@ -56,6 +56,33 @@ def _role_defaults(
     return RoleDefaults(model=model, effort=effort, budget_usd=budget_usd, max_turns=max_turns)
 
 
+def _cfg_with_rules(*rules: RoutingRule) -> OrchestratorConfig:
+    """A minimal OrchestratorConfig carrying only the given policy rules."""
+    return OrchestratorConfig(routing=RoutingConfig(rules=list(rules)))
+
+
+def _inputs(
+    *,
+    role_name: str = 'implementer',
+    task_metadata: dict | None = None,
+    plan_shape: PlanShape | None = None,
+    routing_tier: int = 0,
+    dispatch_count: int = 0,
+    role_defaults: RoleDefaults | None = None,
+) -> RouteInputs:
+    """A RouteInputs with sensible defaults; role_defaults defaults to a
+    'sonnet' sentinel distinguishable from any rule's opus/haiku set.model."""
+    return RouteInputs(
+        role_name=role_name,
+        task_id='1',
+        task_metadata={} if task_metadata is None else task_metadata,
+        plan_shape=plan_shape,
+        routing_tier=routing_tier,
+        dispatch_count=dispatch_count,
+        role_defaults=role_defaults if role_defaults is not None else _role_defaults(model='sonnet'),
+    )
+
+
 class TestPlanShapeIsPureData:
     """Sanity: PlanShape is a frozen dataclass carrying step_count + module_paths."""
 
@@ -202,3 +229,253 @@ class TestLayerPrecedencePolicyRule:
         assert decision.model == 'sonnet'
         assert decision.source_layer == 'config'
         assert decision.rule_id is None
+
+
+# ---------------------------------------------------------------------------
+# step-5: closed condition-vocabulary matching (RED until step-6's evaluator)
+#
+# Each condition is exercised match vs non-match via a single policy rule
+# whose `set={model: 'opus'}` -- `rule_id is not None` <=> the rule matched.
+# role_defaults/config always resolve to 'sonnet' (never 'opus'), so 'opus'
+# in the resolved model is unambiguous proof the rule fired.
+# ---------------------------------------------------------------------------
+
+
+class TestConditionTaskComplexity:
+    """task_complexity: equality vs task_metadata['complexity']."""
+
+    def test_matches_when_equal(self):
+        rule = RoutingRule(id='r', match=RuleMatch(task_complexity='simple'), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(task_metadata={'complexity': 'simple'}), _cfg_with_rules(rule),
+        )
+        assert decision.model == 'opus'
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_different(self):
+        rule = RoutingRule(id='r', match=RuleMatch(task_complexity='simple'), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(task_metadata={'complexity': 'full'}), _cfg_with_rules(rule),
+        )
+        assert decision.model == 'sonnet'
+        assert decision.rule_id is None
+
+
+class TestConditionTaskPriority:
+    """task_priority: equality vs task_metadata['priority']."""
+
+    def test_matches_when_equal(self):
+        rule = RoutingRule(id='r', match=RuleMatch(task_priority='critical'), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(task_metadata={'priority': 'critical'}), _cfg_with_rules(rule),
+        )
+        assert decision.model == 'opus'
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_different(self):
+        rule = RoutingRule(id='r', match=RuleMatch(task_priority='critical'), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(task_metadata={'priority': 'low'}), _cfg_with_rules(rule),
+        )
+        assert decision.model == 'sonnet'
+        assert decision.rule_id is None
+
+
+class TestConditionPlanMinSteps:
+    """plan_min_steps: plan_shape.step_count >= N; None plan_shape -> no match."""
+
+    def test_matches_when_step_count_at_or_above_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(plan_min_steps=12), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(plan_shape=PlanShape(step_count=12, module_paths=())),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_step_count_below_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(plan_min_steps=12), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(plan_shape=PlanShape(step_count=11, module_paths=())),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id is None
+
+    def test_does_not_match_when_plan_shape_is_none(self):
+        rule = RoutingRule(id='r', match=RuleMatch(plan_min_steps=12), set=RuleSet(model='opus'))
+        decision = resolve_route(_inputs(plan_shape=None), _cfg_with_rules(rule))
+        assert decision.rule_id is None
+
+
+class TestConditionPlanMinModulesUnscoped:
+    """plan_min_modules alone (no module_prefix): total module count >= N."""
+
+    def test_matches_when_module_count_at_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(plan_min_modules=3), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(plan_shape=PlanShape(step_count=1, module_paths=('a', 'b', 'c'))),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_module_count_below_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(plan_min_modules=3), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(plan_shape=PlanShape(step_count=1, module_paths=('a', 'b'))),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id is None
+
+
+class TestConditionModulePrefix:
+    """module_prefix alone: >=1 module startswith prefix."""
+
+    def test_matches_when_at_least_one_module_has_prefix(self):
+        rule = RoutingRule(id='r', match=RuleMatch(module_prefix='crates/'), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(plan_shape=PlanShape(step_count=1, module_paths=('crates/a', 'lib/b'))),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_no_module_has_prefix(self):
+        rule = RoutingRule(id='r', match=RuleMatch(module_prefix='crates/'), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(plan_shape=PlanShape(step_count=1, module_paths=('lib/a', 'lib/b'))),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id is None
+
+
+class TestConditionModulePrefixScopedPlanMinModules:
+    """module_prefix + plan_min_modules together: count of PREFIX-MATCHED
+    modules >= N (not the total module count) -- reproduces the Rust
+    heuristic exactly."""
+
+    def test_three_prefixed_plus_one_other_matches_threshold_three(self):
+        rule = RoutingRule(
+            id='r',
+            match=RuleMatch(plan_min_modules=3, module_prefix='crates/'),
+            set=RuleSet(model='opus'),
+        )
+        decision = resolve_route(
+            _inputs(
+                plan_shape=PlanShape(
+                    step_count=1,
+                    module_paths=('crates/a', 'crates/b', 'crates/c', 'lib/other'),
+                ),
+            ),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id == 'r'
+
+    def test_two_prefixed_does_not_match_threshold_three(self):
+        rule = RoutingRule(
+            id='r',
+            match=RuleMatch(plan_min_modules=3, module_prefix='crates/'),
+            set=RuleSet(model='opus'),
+        )
+        decision = resolve_route(
+            _inputs(
+                plan_shape=PlanShape(
+                    step_count=1,
+                    module_paths=('crates/a', 'crates/b', 'lib/other', 'lib/another'),
+                ),
+            ),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id is None
+
+
+class TestConditionMinRoutingTier:
+    """min_routing_tier: inputs.routing_tier >= N."""
+
+    def test_matches_when_tier_at_or_above_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(min_routing_tier=1), set=RuleSet(model='opus'))
+        decision = resolve_route(_inputs(routing_tier=1), _cfg_with_rules(rule))
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_tier_below_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(min_routing_tier=1), set=RuleSet(model='opus'))
+        decision = resolve_route(_inputs(routing_tier=0), _cfg_with_rules(rule))
+        assert decision.rule_id is None
+
+
+class TestConditionMinDispatchCount:
+    """min_dispatch_count: inputs.dispatch_count >= N."""
+
+    def test_matches_when_dispatch_count_at_or_above_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(min_dispatch_count=2), set=RuleSet(model='opus'))
+        decision = resolve_route(_inputs(dispatch_count=2), _cfg_with_rules(rule))
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_dispatch_count_below_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(min_dispatch_count=2), set=RuleSet(model='opus'))
+        decision = resolve_route(_inputs(dispatch_count=1), _cfg_with_rules(rule))
+        assert decision.rule_id is None
+
+
+class TestConditionSimpleSaturated:
+    """simple_saturated: equality vs task_metadata['routing']['simple_saturated']
+    (mirrors shared.task_metadata.RoutingState's on-disk storage shape)."""
+
+    def test_matches_when_true_and_saturated(self):
+        rule = RoutingRule(id='r', match=RuleMatch(simple_saturated=True), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(task_metadata={'routing': {'simple_saturated': True}}),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_true_and_not_saturated(self):
+        rule = RoutingRule(id='r', match=RuleMatch(simple_saturated=True), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(task_metadata={'routing': {'simple_saturated': False}}),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id is None
+
+    def test_does_not_match_when_true_and_metadata_absent(self):
+        rule = RoutingRule(id='r', match=RuleMatch(simple_saturated=True), set=RuleSet(model='opus'))
+        decision = resolve_route(_inputs(task_metadata={}), _cfg_with_rules(rule))
+        assert decision.rule_id is None
+
+
+class TestConditionsAreAnded:
+    """Two conditions on one rule must BOTH hold -- one satisfied + one not
+    is a non-match."""
+
+    def test_both_conditions_hold_matches(self):
+        rule = RoutingRule(
+            id='r',
+            match=RuleMatch(role=['implementer'], min_routing_tier=1),
+            set=RuleSet(model='opus'),
+        )
+        decision = resolve_route(
+            _inputs(role_name='implementer', routing_tier=1), _cfg_with_rules(rule),
+        )
+        assert decision.rule_id == 'r'
+
+    def test_one_condition_failing_is_a_non_match(self):
+        rule = RoutingRule(
+            id='r',
+            match=RuleMatch(role=['implementer'], min_routing_tier=1),
+            set=RuleSet(model='opus'),
+        )
+        decision = resolve_route(
+            _inputs(role_name='implementer', routing_tier=0), _cfg_with_rules(rule),
+        )
+        assert decision.rule_id is None
+
+
+class TestFirstMatchWins:
+    """When two rules both match, the FIRST in list order supplies the
+    overrides and its id is recorded -- the second is never consulted."""
+
+    def test_first_of_two_matching_rules_wins(self):
+        first = RoutingRule(id='first', match=RuleMatch(role=['implementer']), set=RuleSet(model='opus'))
+        second = RoutingRule(id='second', match=RuleMatch(role=['implementer']), set=RuleSet(model='haiku'))
+        decision = resolve_route(
+            _inputs(role_name='implementer'), _cfg_with_rules(first, second),
+        )
+        assert decision.model == 'opus'
+        assert decision.rule_id == 'first'
