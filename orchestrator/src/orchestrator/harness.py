@@ -2034,8 +2034,14 @@ class Harness:
         for t in tasks:
             if t.get('status') in skip_statuses:
                 continue
+            metadata = t.get('metadata') or {}
+            if metadata.get('task_kind') == 'deterministic':
+                # Deterministic tasks carry no worktree and no code (CLAUDE.md
+                # "Deterministic task kind"), so a file-lock prediction is
+                # meaningless for them — exclude them in every mode, including
+                # a force-retag.
+                continue
             if not force:
-                metadata = t.get('metadata') or {}
                 if metadata.get('files') or metadata.get('files_tagged_at'):
                     continue
             untagged.append(t)
