@@ -1,0 +1,15 @@
+[Unit]
+Description=Fused-memory stage1_flag_marker sweep (recurring drain; task 2693, follow-up to task 2596's unwired sweep)
+Documentation=file:///home/leo/src/dark-factory/fused-memory/scripts/sweep_orphan_flag_markers.py
+
+[Service]
+Type=oneshot
+# All logic lives in the committed wrapper script -- the unit itself is a
+# thin systemd shell around it (mirrors scripts/legibility-trickle@.service).
+WorkingDirectory=/home/leo/src/dark-factory
+ExecStart=/home/leo/src/dark-factory/scripts/fused-memory-flag-marker-sweep.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=timers.target
