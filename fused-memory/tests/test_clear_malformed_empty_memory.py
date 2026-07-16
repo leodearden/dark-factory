@@ -493,3 +493,35 @@ class TestBuildParser:
         assert args.memory_id == 'X'
         assert args.project_id == 'reify'
         assert args.apply is True
+
+
+# ===========================================================================
+# Tests: main() fatal-error exit-code path
+# ===========================================================================
+
+class TestMainFatalErrorHandling:
+    """Tests for main()'s top-level try/except around asyncio.run -- the
+    one previously-untested leg of the exit-code contract (0 dry-run /
+    0 malformed / 1 healthy-apply / 2 fatal)."""
+
+    def test_returns_2_and_logs_exception_on_fatal_error(self, monkeypatch, caplog):
+        """If asyncio.run(...) raises, main() must catch it, log via
+        logger.exception (sweep_orphan_flag_markers.main pattern), and
+        return 2 -- without ever printing a report or calling
+        resolve_exit_code."""
+        monkeypatch.setattr(sys, 'argv', ['clear_malformed_empty_memory.py', '--memory-id', 'id1'])
+
+        def _boom(coro, *args, **kwargs):
+            coro.close()  # avoid a 'coroutine was never awaited' warning
+            raise RuntimeError('simulated fatal error')
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _boom)
+
+        with caplog.at_level('ERROR'):
+            result = _mod.main()
+
+        assert result == 2
+        assert any(
+            rec.levelname == 'ERROR' and 'fatal error during cleanup' in rec.message
+            for rec in caplog.records
+        ), f'Expected an ERROR log for the fatal error, got: {[r.message for r in caplog.records]}'
