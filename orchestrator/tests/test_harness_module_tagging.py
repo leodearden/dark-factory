@@ -768,3 +768,81 @@ async def test_tag_skips_task_with_sentinel(harness):
         mock_invoke.assert_not_called()
 
     harness.scheduler.update_task.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Deterministic task exclusion (task 2561 defect 2 / acceptance b)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tag_excludes_deterministic_tasks(harness):
+    """task_kind='deterministic' tasks must never enter the tagging batch.
+
+    Deterministic tasks carry no worktree and no code (CLAUDE.md
+    "Deterministic task kind"), so a file-lock prediction is meaningless
+    for them.
+
+    Fails now: the batch loop has no task_kind filter, so the
+    deterministic task '2' is included in the prompt and can be updated.
+    """
+    tasks = [
+        {
+            'id': '1', 'title': 'Normal task', 'description': '',
+            'status': 'pending', 'metadata': {}, 'dependencies': [],
+        },
+        {
+            'id': '2', 'title': 'Deterministic task', 'description': '',
+            'status': 'pending', 'metadata': {'task_kind': 'deterministic'},
+            'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+
+    agent_response = {'predictions': [{'id': '1', 'files': ['a.py']}]}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
+        await harness._tag_task_modules()
+
+    prompt = mock_invoke.call_args.kwargs['prompt']
+    assert '"1"' in prompt
+    assert '"2"' not in prompt, (
+        f'Deterministic task "2" must not appear in the tagger prompt; got prompt={prompt!r}'
+    )
+
+    update_ids = {c.args[0] for c in harness.scheduler.update_task.call_args_list}
+    assert '2' not in update_ids, (
+        f'update_task must not be awaited for deterministic task "2"; got ids={update_ids!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_tag_skips_when_only_deterministic(harness):
+    """If the only untagged task is deterministic, the batch is empty and
+    the agent must not be invoked at all.
+
+    Fails now: no task_kind filter, so the deterministic task fills the
+    batch and the agent is invoked.
+    """
+    tasks = [
+        {
+            'id': '2', 'title': 'Deterministic task', 'description': '',
+            'status': 'pending', 'metadata': {'task_kind': 'deterministic'},
+            'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock()) as mock_invoke:
+        await harness._tag_task_modules()
+        mock_invoke.assert_not_called()
+
+    harness.scheduler.update_task.assert_not_called()
