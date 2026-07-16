@@ -2946,3 +2946,85 @@ def test_cli_defaults_to_sys_argv(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls == ["report"]
     assert exit_code == 0
 
+
+# ---------------------------------------------------------------------------
+# Boundary-scenario acceptance gate (task 2399, ε of
+# plans/orchestrator-fleet-redeploy-throughput-prd.md's §Boundary-test-sketch,
+# scenarios 1-10). Ties invariants I1-I9 to end-to-end behavior across the
+# now-landed α (fleet_heartbeat.py) / β (shared fleet-deploy clock) / γ
+# (drain gate) / δ (coordinator fire-while-busy) work.
+#
+# NOT to be confused with the "staleness_pass END-TO-END tests (δ task 2027,
+# scenarios 1-4)" block earlier in this file -- that numbering belongs to the
+# OLDER, now-superseded plans/orchestrator-fleet-staleness-prd.md. Every test
+# below is prefixed test_boundaryN_ (N = THIS PRD's own 1-10 numbering) to
+# keep the two schemes unambiguous.
+#
+# Per-contract UNIT coverage already exists in the α/β/γ/δ suites (this
+# module's own β-adjacent tests above, scripts/tests/test_restart_all_
+# orchestrators.py, orchestrator/tests/test_fleet_staleness_composition.py,
+# orchestrator/tests/test_merge_queue_restart_hook.py) -- this section adds
+# the acceptance-level restatement the PRD calls for, not duplicate unit
+# tests.
+# ---------------------------------------------------------------------------
+
+
+def test_boundary1_staleness_inside_window_real_clock_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Scenario 1 (I1) -- staleness inside the 8h window, via a REAL on-disk
+    fleet-deploy clock file (not a monkeypatched _within_fleet_deploy_min_
+    interval -- see test_staleness_pass_skips_when_within_fleet_deploy_min_
+    interval above for that unit-level variant). Exercises the real
+    _read_last_fleet_deploy_epoch() file-read + _within_fleet_deploy_min_
+    interval() comparison end-to-end, with a would-be-stale unit present in
+    the fleet, via the _fleet_fake_run harness.
+
+    Asserts neither tier acts (zero mutating systemctl calls AND zero
+    systemd-run fleet-restart delegation) and that a "skip: within
+    fleet-deploy min-interval" journal line naming
+    ORCH_RESTART_MIN_INTERVAL_SECS is logged -- "now" is pinned to a
+    SKIP_LOG_INTERVAL_SECS bucket boundary so the skip line is guaranteed
+    (not suppressed by the log-rate-limit throttle exercised by
+    test_staleness_pass_suppresses_skip_log_outside_log_bucket above).
+    """
+    wdog = _load_watchdog()
+
+    now = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0
+    clock_ts = now - 2 * 3600  # ~2h ago -- well inside the 28800s default window
+    clock_file = tmp_path / "clock.json"
+    clock_file.write_text(json.dumps({"ts": clock_ts, "iso": "2026-07-16T00:00:00+00:00"}))
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace, if ever reached
+    unit = "orchestrator-know-live.service"
+    start_epochs = {unit: commit_epoch - 100}  # would-be-stale if the gate did not close first
+
+    recorded_calls: list[list[str]] = []
+    log_messages: list[str] = []
+    fake_run = _fleet_fake_run(
+        units=[unit],
+        commit_epoch=commit_epoch,
+        start_epochs=start_epochs,
+        recorded_calls=recorded_calls,
+        log_messages=log_messages,
+    )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
+
+    wdog.staleness_pass()
+
+    assert not any(c[:3] == ["systemctl", "--user", "list-units"] for c in recorded_calls), (
+        f"the real fleet-deploy clock gate must close before enumeration; got {recorded_calls}"
+    )
+    _assert_zero_mutating_calls(recorded_calls)
+    assert not any(c[0] == "systemd-run" for c in recorded_calls), (
+        f"must not delegate a fleet restart while inside the real clock's "
+        f"min-interval window; got {recorded_calls}"
+    )
+    assert any(
+        "skip" in m and str(wdog.ORCH_RESTART_MIN_INTERVAL_SECS) in m for m in log_messages
+    ), f"Expected a skip log line naming the fleet-deploy min-interval: {log_messages}"
+
