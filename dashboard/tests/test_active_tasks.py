@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -16,6 +15,7 @@ from dashboard.data.active_tasks import (
     collect_done_counts,
     collect_tasks_with_counts,
 )
+from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 # ---------------------------------------------------------------------------
 # helpers used inside the aggregator
@@ -91,39 +91,53 @@ def _shape_task(task: dict) -> dict:
     }
 
 
-def _make_project(root, *, project_dir, tasks, worktrees=None):
-    """Lay down per-worktree .task/ artifacts and return ``(project_root, shaped_tasks)``.
+def _make_project(root, *, project_dir, tasks):
+    """Create a project root dir and return ``(project_root, shaped_tasks)``.
 
     The tasks themselves no longer live on disk — fused-memory MCP owns task
     state — so we return them in their dashboard-shaped form for the caller
-    to register against ``fetch_tasks`` via monkeypatch.
+    to register against ``fetch_tasks`` via monkeypatch. Per-task runtime
+    state (loops/attempts/agent/lane/phase/lane_state) is likewise sourced
+    over MCP now, not read from a ``.worktrees/.task`` artifact tree — see
+    ``_runtime_entry``/``_register_runtime`` below.
     """
     project_root = root / project_dir
     project_root.mkdir(parents=True, exist_ok=True)
-
-    if worktrees:
-        worktrees_dir = project_root / '.worktrees'
-        worktrees_dir.mkdir()
-        for task_id, metadata, files, iteration_lines, review_files in worktrees:
-            wt = worktrees_dir / str(task_id)
-            wt.mkdir()
-            task_dir = wt / '.task'
-            task_dir.mkdir()
-            if metadata is not None:
-                (task_dir / 'metadata.json').write_text(json.dumps(metadata))
-            if files is not None:
-                (task_dir / 'plan.json').write_text(json.dumps({'steps': [], 'files': files}))
-            if iteration_lines is not None:
-                (task_dir / 'iterations.jsonl').write_text(
-                    '\n'.join('{}' for _ in range(iteration_lines)) + ('\n' if iteration_lines else ''),
-                )
-            if review_files is not None:
-                reviews = task_dir / 'reviews'
-                reviews.mkdir()
-                for i, verdict in enumerate(review_files):
-                    (reviews / f'r{i}.json').write_text(json.dumps({'verdict': verdict}))
-
     return project_root, [_shape_task(t) for t in tasks]
+
+
+def _runtime_entry(task_id: int, **overrides) -> TaskRuntimeEntry:
+    """A ``TaskRuntimeEntry`` with sane defaults; ``overrides`` replace fields."""
+    base = dict(
+        task_id=task_id,
+        has_worktree=True,
+        loops=0,
+        attempts=0,
+        started=None,
+        lane=None,
+        phase=None,
+        lane_state=None,
+        error=None,
+    )
+    base.update(overrides)
+    return TaskRuntimeEntry(**base)
+
+
+def _register_runtime(monkeypatch, mapping: dict[str, list[TaskRuntimeEntry]]) -> None:
+    """Monkeypatch ``fetch_task_runtime`` to return a fixed ``{label: TaskRuntimeSnapshot}``.
+
+    *mapping* maps project label -> list of ``TaskRuntimeEntry``. A label
+    absent from *mapping* is simply absent from the returned dict (mirroring
+    a real fan-out that only covers configured ``escalation_urls``) — tests
+    that need an explicit "online but empty" snapshot for a label must
+    include it with an empty list.
+    """
+    snapshots = {label: TaskRuntimeSnapshot(tasks=entries) for label, entries in mapping.items()}
+
+    async def _fake_fetch_task_runtime(client, escalation_urls):
+        return dict(snapshots)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_task_runtime', _fake_fetch_task_runtime)
 
 
 @pytest.fixture()
@@ -143,27 +157,12 @@ def two_project_config(tmp_path, monkeypatch):
             {'id': 21, 'title': 'dedup index', 'status': 'in-progress',
              'dependencies': []},
         ],
-        worktrees=[
-            (19,
-             {'task_id': '19', 'title': 'consolidation retry', 'created_at': started},
-             ['src/agents/consolidation.py', 'src/store/graphiti_adapter.py'],
-             2,  # iterations.jsonl lines
-             ['PASS', 'FAIL', 'FAIL']),  # 1/3 passed → attempts == 3
-            (21,
-             {'task_id': '21', 'title': 'dedup index', 'created_at': started},
-             ['src/store/dedup.py'],
-             1,
-             ['PASS']),
-        ],
     )
     reify_root, reify_tasks = _make_project(
         tmp_path,
         project_dir='reify',
         tasks=[{'id': 8, 'title': 'parser recovery', 'status': 'blocked',
                 'dependencies': []}],
-        worktrees=[(8, {'task_id': '8', 'title': 'parser recovery',
-                        'created_at': started},
-                    ['parser/recovery.rs'], 0, [])],
     )
 
     by_root = {df_root.resolve(): df_tasks, reify_root.resolve(): reify_tasks}
@@ -172,6 +171,16 @@ def two_project_config(tmp_path, monkeypatch):
         return list(by_root.get(project_root.resolve(), []))
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_runtime(monkeypatch, {
+        'dark-factory': [
+            # 1/3 reviews passed -> attempts == 3 (total review count, not pass count)
+            _runtime_entry(19, loops=2, attempts=3, started=started),
+            _runtime_entry(21, loops=1, attempts=1, started=started),
+        ],
+        'reify': [
+            _runtime_entry(8, loops=0, attempts=0, started=started),
+        ],
+    })
 
     return DashboardConfig(project_root=df_root, known_project_roots=[reify_root])
 
@@ -223,13 +232,13 @@ async def test_collect_active_tasks_started_uses_provided_now(tmp_path, monkeypa
         tmp_path,
         project_dir='fixedclock',
         tasks=[{'id': 1, 'title': 'a', 'status': 'in-progress', 'dependencies': []}],
-        worktrees=[(1, {'task_id': '1', 'title': 'a', 'created_at': created_at}, [], 0, [])],
     )
 
     async def _fake(client, config, project_root):
         return list(shaped)
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_runtime(monkeypatch, {'fixedclock': [_runtime_entry(1, started=created_at)]})
     cfg = DashboardConfig(project_root=root)
 
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg, now=fixed)
@@ -254,13 +263,11 @@ async def test_collect_tasks_with_counts_started_uses_provided_now_across_projec
         tmp_path,
         project_dir='df',
         tasks=[{'id': 1, 'title': 'a', 'status': 'in-progress', 'dependencies': []}],
-        worktrees=[(1, {'task_id': '1', 'title': 'a', 'created_at': df_created}, [], 0, [])],
     )
     reify_root, reify_tasks = _make_project(
         tmp_path,
         project_dir='reify',
         tasks=[{'id': 2, 'title': 'b', 'status': 'pending', 'dependencies': []}],
-        worktrees=[(2, {'task_id': '2', 'title': 'b', 'created_at': reify_created}, [], 0, [])],
     )
     by_root = {df_root.resolve(): df_tasks, reify_root.resolve(): reify_tasks}
 
@@ -268,6 +275,10 @@ async def test_collect_tasks_with_counts_started_uses_provided_now_across_projec
         return list(by_root.get(project_root.resolve(), []))
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_runtime(monkeypatch, {
+        'df': [_runtime_entry(1, started=df_created)],
+        'reify': [_runtime_entry(2, started=reify_created)],
+    })
     cfg = DashboardConfig(project_root=df_root, known_project_roots=[reify_root])
 
     active, _, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
@@ -277,7 +288,7 @@ async def test_collect_tasks_with_counts_started_uses_provided_now_across_projec
 
 @pytest.mark.asyncio
 async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, monkeypatch, dummy_client):
-    """A pending task with no worktree should still appear with empty fields."""
+    """A pending task absent from an ONLINE runtime map still appears, with honest zeros."""
     root, shaped = _make_project(
         tmp_path, project_dir='solo',
         tasks=[{'id': 1, 'title': 'lonely', 'status': 'pending', 'dependencies': []}],
@@ -287,6 +298,10 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
         return list(shaped)
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    # Project is online (a snapshot is registered for its label) but the
+    # snapshot carries no entry for task 1 — the honest-zero case, distinct
+    # from an offline project (see the runtime-offline tests below).
+    _register_runtime(monkeypatch, {'solo': []})
     cfg = DashboardConfig(project_root=root)
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
     assert active == [{
@@ -294,6 +309,7 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
         'description': '', 'details': '', 'status': 'pending', 'agent': None,
         'started': 0, 'loops': 0, 'attempts': 0, 'deps': [],
         'meta_files': [], 'train': None, 'external_deps': [], 'prd': None,
+        'lane': None, 'phase': None, 'lane_state': None, 'runtime_offline': False,
     }]
 
 
@@ -311,6 +327,143 @@ async def test_collect_active_tasks_surfaces_offline_projects(tmp_path, monkeypa
     active, offline_projects = await collect_active_tasks(client=dummy_client, config=cfg)
     assert active == []
     assert offline_projects == ['offline-project']
+
+
+# ---------------------------------------------------------------------------
+# get_task_runtime_state MCP join (task 2636 step-3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_runtime_join_populates_lane_phase_lane_state(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """An online runtime entry's loops/attempts/lane/phase/lane_state/agent all
+    join onto the row; started is computed via _minutes_since against `now`.
+    """
+    fixed = datetime(2026, 7, 16, 12, 0, 0, tzinfo=UTC)
+    entry_started = (fixed - timedelta(minutes=7)).isoformat()
+    root, shaped = _make_project(
+        tmp_path, project_dir='warmlane',
+        tasks=[{'id': 42, 'title': 'warm task', 'status': 'in-progress', 'dependencies': []}],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_runtime(monkeypatch, {
+        'warmlane': [_runtime_entry(
+            42, loops=3, attempts=1, started=entry_started,
+            lane='_lane-7', phase='EXECUTE', lane_state='assigned',
+        )],
+    })
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg, now=fixed)
+    assert len(active) == 1
+    row = active[0]
+    assert row['loops'] == 3
+    assert row['attempts'] == 1
+    assert row['agent'] == 'claude-task-42'
+    assert row['started'] == 7
+    assert row['lane'] == '_lane-7'
+    assert row['phase'] == 'EXECUTE'
+    assert row['lane_state'] == 'assigned'
+    assert row['runtime_offline'] is False
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_runtime_offline_snapshot_yields_all_none(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """A project whose runtime snapshot reports offline=True gets honest None
+    fields (never a fabricated 0), with runtime_offline=True.
+    """
+    root, shaped = _make_project(
+        tmp_path, project_dir='downlane',
+        tasks=[{'id': 5, 'title': 'stuck task', 'status': 'in-progress', 'dependencies': []}],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    async def _offline_fetch_task_runtime(client, escalation_urls):
+        return {'downlane': TaskRuntimeSnapshot(offline=True)}
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_task_runtime', _offline_fetch_task_runtime)
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    assert len(active) == 1
+    row = active[0]
+    for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
+        assert row[key] is None, f'expected {key}=None when runtime offline, got {row[key]!r}'
+    assert row['runtime_offline'] is True
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_no_escalation_url_treated_as_offline(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """A project absent from the runtime map entirely (no escalation URL
+    configured for it) is treated identically to an explicit offline=True
+    snapshot — we genuinely have no runtime source for it either way.
+    """
+    root, shaped = _make_project(
+        tmp_path, project_dir='nourl',
+        tasks=[{'id': 6, 'title': 'no url task', 'status': 'pending', 'dependencies': []}],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_runtime(monkeypatch, {})  # no label registered for 'nourl' at all
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    assert len(active) == 1
+    row = active[0]
+    for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
+        assert row[key] is None, f'expected {key}=None when no escalation URL, got {row[key]!r}'
+    assert row['runtime_offline'] is True
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_runtime_per_task_read_failure_stays_online(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """A per-task artifact read failure (loops/attempts/phase=None, error set)
+    is honest but distinct from project-offline: runtime_offline stays False.
+    """
+    root, shaped = _make_project(
+        tmp_path, project_dir='flaky',
+        tasks=[{'id': 9, 'title': 'flaky task', 'status': 'in-progress', 'dependencies': []}],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_runtime(monkeypatch, {
+        'flaky': [_runtime_entry(
+            9, loops=None, attempts=None, started=None, phase=None,
+            lane_state=None, error='wire-contract violation: bad enum value',
+        )],
+    })
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    assert len(active) == 1
+    row = active[0]
+    assert row['loops'] is None
+    assert row['attempts'] is None
+    assert row['phase'] is None
+    assert row['runtime_offline'] is False, (
+        'a per-task read failure is an honest error, not an offline project'
+    )
 
 
 @pytest.mark.asyncio
