@@ -1867,7 +1867,7 @@ class TaskKnowledgeSync(BaseStage):
         if not is_snapshot_write_blocked(self.project_id):
             task_count_snapshot_written = await _write_task_count_snapshot(
                 self.memory, self.taskmaster, self.project_root, self.project_id,
-                run_id, run_window_start,
+                run_id, run_window_start, stats=report.stats,
             )
         if task_count_snapshot_written is None:
             task_count_snapshot_written = await _verify_task_count_snapshot_written(
