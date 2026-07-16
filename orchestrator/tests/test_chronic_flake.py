@@ -21,6 +21,7 @@ Covers:
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from importlib import resources as pkg_resources
 
 import yaml
@@ -339,3 +340,70 @@ class TestBuildChronicFlakeFixTaskArguments:
         assert metadata['chronic_flake_count'] == 3
         assert metadata['chronic_flake_window'] == 20
         assert metadata['roles'] == ['implementer', 'verifier']
+
+
+# ── Step-9 / Step-10: FilingLedger rate-limit persistence ─────────────────────
+
+
+class TestFilingLedger:
+    """``FilingLedger``: a small persistent JSON store ({test: last_filed_iso})
+    backing the per-test rate limit — injectable ``now`` (never
+    ``datetime.now()`` internally), tolerant of a missing or corrupt on-disk
+    file. Durability verified via re-open (a SECOND instance at the same
+    path), mirroring ``LandedOutbox``'s test idiom."""
+
+    def test_fresh_ledger_should_file_is_true(self, tmp_path):
+        from orchestrator.chronic_flake import FilingLedger
+        ledger = FilingLedger(tmp_path / 'chronic_flake_filings.json')
+        now = datetime(2026, 7, 17, tzinfo=UTC)
+        assert ledger.should_file('test_a.sh', now, 7) is True
+
+    def test_record_save_reload_rate_limits_within_window(self, tmp_path):
+        from orchestrator.chronic_flake import FilingLedger
+        path = tmp_path / 'chronic_flake_filings.json'
+        now = datetime(2026, 7, 17, tzinfo=UTC)
+        ledger = FilingLedger(path)
+        ledger.record('test_a.sh', now)
+        ledger.save()
+
+        reloaded = FilingLedger(path)
+        assert reloaded.should_file('test_a.sh', now, 7) is False
+
+    def test_should_file_true_again_once_rate_limit_window_elapses(self, tmp_path):
+        from orchestrator.chronic_flake import FilingLedger
+        path = tmp_path / 'chronic_flake_filings.json'
+        now = datetime(2026, 7, 17, tzinfo=UTC)
+        ledger = FilingLedger(path)
+        ledger.record('test_a.sh', now)
+        ledger.save()
+
+        reloaded = FilingLedger(path)
+        later = now + timedelta(days=8)
+        assert reloaded.should_file('test_a.sh', later, 7) is True
+
+    def test_load_tolerates_missing_file(self, tmp_path):
+        from orchestrator.chronic_flake import FilingLedger
+        ledger = FilingLedger(tmp_path / 'does-not-exist.json')
+        now = datetime(2026, 7, 17, tzinfo=UTC)
+        assert ledger.should_file('test_a.sh', now, 7) is True
+
+    def test_load_tolerates_corrupt_file(self, tmp_path):
+        from orchestrator.chronic_flake import FilingLedger
+        path = tmp_path / 'chronic_flake_filings.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('not valid json {{{')
+        ledger = FilingLedger(path)
+        now = datetime(2026, 7, 17, tzinfo=UTC)
+        assert ledger.should_file('test_a.sh', now, 7) is True
+
+    def test_second_test_name_is_independent(self, tmp_path):
+        from orchestrator.chronic_flake import FilingLedger
+        path = tmp_path / 'chronic_flake_filings.json'
+        now = datetime(2026, 7, 17, tzinfo=UTC)
+        ledger = FilingLedger(path)
+        ledger.record('test_a.sh', now)
+        ledger.save()
+
+        reloaded = FilingLedger(path)
+        assert reloaded.should_file('test_a.sh', now, 7) is False
+        assert reloaded.should_file('test_b.sh', now, 7) is True
