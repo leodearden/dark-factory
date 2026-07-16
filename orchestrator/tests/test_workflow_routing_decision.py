@@ -184,3 +184,55 @@ class TestInvokeMirrorsRoutingMetadata:
         routing = wf.task['metadata']['routing']
         assert len(routing['history']) == 2
         assert routing['latest'] == routing['history'][-1]
+
+
+@pytest.mark.asyncio
+class TestInvokeRoutingDecisionGracefulDegradation:
+    """Routing telemetry must never block or crash ``_invoke`` (PRD γ).
+
+    ``_record_routing_decision`` is built around three independent failure
+    boundaries: the scheduler mirror write, an absent event store, and the
+    decision-record construction itself. Each must degrade silently without
+    affecting the invocation's own success/failure.
+    """
+
+    async def test_scheduler_failure_still_updates_in_memory_metadata(
+        self, tmp_path: Path,
+    ) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+        wf.scheduler.update_task = AsyncMock(side_effect=RuntimeError('boom'))
+
+        await _invoke_implementer(wf, tmp_path)
+
+        # The event still fires and the in-memory mirror is still updated
+        # even though the awaited scheduler write raised.
+        assert len(_routing_decision_entries(rec)) == 1
+        assert wf.task['metadata']['routing']['latest']['model'] == 'sonnet'
+
+    async def test_missing_event_store_does_not_raise(self, tmp_path: Path) -> None:
+        wf = _make_workflow(event_store=_RecordingEventStore())
+        wf.event_store = None
+
+        await _invoke_implementer(wf, tmp_path)
+
+        update_task_mock = cast(AsyncMock, wf.scheduler.update_task)
+        update_task_mock.assert_awaited_once()
+        assert wf.task['metadata']['routing']['latest']['model'] == 'sonnet'
+
+    async def test_decision_build_failure_does_not_raise(self, tmp_path: Path) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+
+        with patch(
+            'orchestrator.workflow.RoutingDecisionMirror',
+            side_effect=RuntimeError('boom'),
+        ):
+            await _invoke_implementer(wf, tmp_path)
+
+        # The build failure is caught before either write is attempted, so
+        # neither the event nor the metadata mirror (in-memory or scheduler)
+        # is touched.
+        assert _routing_decision_entries(rec) == []
+        cast(AsyncMock, wf.scheduler.update_task).assert_not_awaited()
+        assert 'metadata' not in wf.task
