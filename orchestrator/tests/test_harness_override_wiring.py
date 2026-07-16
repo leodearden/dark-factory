@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _orch_helpers import HermeticMcpSession
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
@@ -26,7 +27,7 @@ def config(tmp_path: Path) -> OrchestratorConfig:
 class TestHarnessOverrideStoreIntegration:
     @pytest.mark.asyncio
     async def test_scheduler_dispatches_pinned_override_through_canonical_db_path(
-        self, config: OrchestratorConfig
+        self, config: OrchestratorConfig, forbid_live_mcp
     ):
         """A pin pre-written to config.overrides_db_path drives Harness
         scheduler's dispatch order — proves the OverrideStore reaches the
@@ -47,6 +48,18 @@ class TestHarnessOverrideStoreIntegration:
 
         # Harness constructs its own OverrideStore at the same path.
         harness = Harness(config)
+        injected_session = HermeticMcpSession()
+        harness.scheduler._mcp_session = injected_session
+        # This test instance-mocks get_tasks and seeds empty-dependency tasks
+        # below, so it is data-conditionally hermetic regardless of the
+        # injected session — forbid_live_mcp's network spy alone can't prove
+        # the injection above actually took effect. This identity check only
+        # guards against the attribute assignment above being silently lost
+        # (e.g. a future refactor of Harness construction clobbering it); it
+        # does NOT prove dispatch_tool actually routes through the injected
+        # session for this test. That routing guarantee is established by
+        # test_hermetic_mcp_session.py, backed by forbid_live_mcp.
+        assert harness.scheduler._mcp_session is injected_session
         # This test drives acquire_next() directly (bypassing Harness.run()'s
         # startup sweeps), so it must call finish_startup() itself (task 2235).
         harness.scheduler.finish_startup()

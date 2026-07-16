@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import gc
 import inspect
+import json
 import logging
 import threading
 import time
@@ -138,6 +139,119 @@ def idle_psi_sample() -> PsiSample:
         io_some10=0.0,
         read_ok=True,
     )
+
+
+class HermeticMcpSession:
+    """In-process ``McpSessionLike`` double that performs zero network I/O.
+
+    Task 2644: inject into a real ``Scheduler`` (via the ``mcp_session=``
+    constructor kwarg, or post-construction as ``scheduler._mcp_session =
+    HermeticMcpSession(...)``) so ``dispatch_tool`` (scheduler.py:1787-1794)
+    takes the ``self._mcp_session.call_tool`` branch instead of falling
+    through to the live ``mcp_call(...)`` HTTP path — the seam that leaves a
+    bare ``Scheduler(config)`` unit test vulnerable to a saturated shared
+    ``:8002`` fused-memory server under ``pytest -n auto`` (one ``get_tasks``
+    measured 130ms unloaded vs 13.5s loaded, ~100x).
+
+    Modelled on ``evals.runner._StubMcpSession`` and
+    ``test_cross_project_dispatch_integration.TwoProjectMcpSession`` for the
+    JSON-RPC 2.0 envelope shape (``_next_id``/``_envelope``) and the
+    ``McpSessionLike``-conformant ``call_tool(name, arguments, timeout)``
+    signature, extended to cover ``get_external_statuses`` and
+    ``set_task_claimant`` (which ``_StubMcpSession`` lacks).
+
+    All responses are benign/empty (or echo request fields) because the
+    tests this stub serves assert in-memory scheduler logic — pin dispatch
+    via the local ``OverrideStore``, cost-ceiling pause via ``CostStore``,
+    reblock cooldown in ``_run_slot`` — none of which consumes MCP-returned
+    data. Unknown tool names raise ``NotImplementedError`` rather than
+    returning a silent empty stub, per this project's loud-over-silent-
+    degradation norm: an unanticipated phase call should surface as a test
+    failure, not a quietly-wrong pass.
+
+    ``get_external_statuses`` is the one exception to "responses are
+    empty": per the production contract (Scheduler.get_external_statuses,
+    scheduler.py:2286-2312), a response missing any requested dep key is
+    parsed as resolver-degraded (``(partial_dict, ExternalResolverError)``,
+    the fail-safe/wait branch) rather than success — so an unconditional
+    ``{}`` would silently exercise that degraded branch for any future test
+    that seeds ``metadata.external_deps``. This stub instead echoes back
+    every requested dep key (defaulting to the ``'unknown_task'`` sentinel
+    unless overridden via ``external_statuses=``), so the response always
+    satisfies "every requested key present" and resolves ``(statuses,
+    None)`` unless the caller deliberately seeds a degraded/sentinel value.
+    """
+
+    def __init__(
+        self,
+        tasks: list[dict] | None = None,
+        external_statuses: dict[str, str] | None = None,
+    ) -> None:
+        self._tasks: list[dict] = tasks if tasks is not None else []
+        self._external_statuses: dict[str, str] = (
+            external_statuses if external_statuses is not None else {}
+        )
+        self._request_id = 0
+
+    def _next_id(self) -> int:
+        self._request_id += 1
+        return self._request_id
+
+    def _envelope(self, text: str) -> dict:
+        return {
+            'jsonrpc': '2.0',
+            'id': self._next_id(),
+            'result': {
+                'content': [{'type': 'text', 'text': text}],
+            },
+        }
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict,
+        timeout: float = 30,
+    ) -> dict:
+        """Dispatch an in-memory MCP tool call and return a JSON-RPC envelope.
+
+        Supported tools: ``get_tasks``, ``get_statuses``,
+        ``get_external_statuses``, ``set_task_claimant``, ``set_task_status``,
+        ``get_task``, ``update_task``. Unknown tool names raise
+        ``NotImplementedError``.
+        """
+        if name == 'get_tasks':
+            return self._envelope(json.dumps({'tasks': self._tasks}))
+        if name == 'get_statuses':
+            return self._envelope(json.dumps({'statuses': {}}))
+        if name == 'get_external_statuses':
+            # Flat {dep: status} dict, no wrapper key — matches the
+            # production get_external_statuses contract (Scheduler.
+            # get_external_statuses parses via parse_tool_result(result,
+            # None, dict), i.e. whole-inner-dict mode). Echo a status for
+            # every requested dep (defaulting to 'unknown_task' unless
+            # overridden via the constructor's external_statuses= map) so
+            # the response never falls into the resolver-degraded
+            # missing-key branch by accident — see class docstring.
+            deps = arguments.get('deps') or []
+            statuses = {
+                dep: self._external_statuses.get(dep, 'unknown_task')
+                for dep in deps
+            }
+            return self._envelope(json.dumps(statuses))
+        if name == 'set_task_claimant':
+            return self._envelope(json.dumps({}))
+        if name == 'set_task_status':
+            return self._envelope(json.dumps({
+                'id': arguments.get('id'), 'status': arguments.get('status'),
+            }))
+        if name == 'get_task':
+            return self._envelope(json.dumps({'id': arguments.get('id')}))
+        if name == 'update_task':
+            return self._envelope(json.dumps({'id': arguments.get('id')}))
+        raise NotImplementedError(
+            f'HermeticMcpSession: unknown tool {name!r} — add a branch in '
+            'call_tool if this tool is needed by the test'
+        )
 
 
 def drain_async_mock_coroutines() -> int:
