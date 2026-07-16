@@ -44,6 +44,9 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     ESCALATION_CATEGORY,
+    SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY,
+    SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY,
+    SNAPSHOT_PRUNED_STAT_KEY,
     SNAPSHOT_WRITTEN_STAT_KEY,
     TASK_COUNT_SNAPSHOT_CATEGORY,
     TASK_COUNT_SNAPSHOT_KIND,
@@ -85,6 +88,15 @@ class TestConstants:
 
     def test_stat_key_value(self):
         assert SNAPSHOT_WRITTEN_STAT_KEY == 'task_count_snapshot_written'
+
+    def test_prune_enumerated_stat_key_value(self):
+        assert SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY == 'task_count_snapshot_prune_enumerated'
+
+    def test_pruned_stat_key_value(self):
+        assert SNAPSHOT_PRUNED_STAT_KEY == 'task_count_snapshot_pruned'
+
+    def test_prune_enumeration_ok_stat_key_value(self):
+        assert SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY == 'task_count_snapshot_prune_enumeration_ok'
 
     def test_miss_threshold_value(self):
         assert TASK_COUNT_SNAPSHOT_MISS_THRESHOLD == 2
@@ -557,6 +569,69 @@ class TestPruneTaskCountSnapshots:
         memory_service.delete_memory.assert_awaited_once()
         _, kwargs = memory_service.delete_memory.await_args
         assert kwargs['memory_id'] == 'm2'
+
+
+# ---------------------------------------------------------------------------
+# _prune_task_count_snapshots -- optional stats dict (task 2646 step-1/2, step-3/4)
+# ---------------------------------------------------------------------------
+
+
+class TestPruneSnapshotStats:
+    """_prune_task_count_snapshots(..., stats=observed) populates observed
+    with the three runtime-observability counts (task 2646).
+
+    The crux this class exists to pin: a silent enumeration failure (the
+    incident fingerprint -- prune deletes nothing, canonical write still
+    proceeds) must be OBSERVABLY DISTINCT from a genuine empty result. A
+    single delete-count int cannot make this distinction; enumeration_ok
+    is the flag that does.
+    """
+
+    @pytest.mark.asyncio
+    async def test_full_success_populates_all_three_stats(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'm1', 'created_at': '2026-07-01T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm2', 'created_at': '2026-07-02T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm3', 'created_at': '2026-07-03T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+        ]
+        memory_service.delete_memory.return_value = None
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 3
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 3,
+            'task_count_snapshot_pruned': 3,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_partial_delete_failure_counts_only_successes(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'm1', 'created_at': '2026-07-01T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm2', 'created_at': '2026-07-02T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+            {'id': 'm3', 'created_at': '2026-07-03T00:00:00+00:00', 'metadata': {'kind': 'task_count_snapshot'}},
+        ]
+        memory_service.delete_memory.side_effect = [
+            {'status': 'deleted'}, RuntimeError('boom'), {'status': 'deleted'},
+        ]
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 2
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 3,
+            'task_count_snapshot_pruned': 2,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+        }
 
 
 # ---------------------------------------------------------------------------
