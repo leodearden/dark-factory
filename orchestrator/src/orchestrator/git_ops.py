@@ -216,6 +216,20 @@ class TrainStackResult:
 # The ``{tid}`` placeholder is interpolated via ``str.format`` with the
 # escaped task id; a ``\b`` (word boundary) at each side blocks substring
 # overlap so ``task/3399`` doesn't match a row that cites ``task/339``.
+#
+# Subject-only (task 2675 FIX 2): this pattern is written with ``^``
+# anchors as if applied to a single SUBJECT line, but git's ``--grep``
+# applies ``^``/``$`` per LINE across the whole commit message — a BODY
+# line that happens to start with a conventional-commit token, or with
+# ``Merge task/{tid} into ``, would otherwise false-cite.
+# ``find_task_citation_commit`` uses ``--grep`` only as a coarse
+# full-message PRE-filter (a sound superset) and then re-applies this
+# same pattern string, compiled as a Python ``re`` (no ``re.MULTILINE``,
+# so ``^`` anchors to the start of the string), to each candidate's
+# SUBJECT ONLY — body-only matches are therefore never treated as
+# citations. A caller-supplied ``pattern_template`` override must
+# therefore be valid as both a git ``--extended-regexp`` (ERE) pattern
+# *and* a Python ``re`` pattern.
 DEFAULT_COMMIT_CITATION_PATTERN: str = (
     r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
     r'(\(\b{tid}\b[):]|.*\btask/{tid}\b)'
@@ -5498,7 +5512,7 @@ class GitOps:
     async def find_task_citation_commit(
         self, tid: str, *, pattern_template: str | None = None,
     ) -> str | None:
-        """Search main's history for a commit whose subject cites *tid*.
+        """Search main's history for a commit whose SUBJECT cites *tid*.
 
         Used by the reconciler to gate the ``is_ancestor==True`` fast-path:
         ``is_ancestor`` returns True trivially for zero-commit branches
@@ -5506,18 +5520,38 @@ class GitOps:
         false-positives blocked/escalated tasks.  Requiring a positive
         citation on main rejects that degenerate case.
 
+        Matching is constrained to each candidate commit's SUBJECT line
+        only (task 2675 FIX 2): git's ``--grep`` applies ``^``/``$`` per
+        LINE across the whole commit message, so a BODY line that merely
+        happens to start with a conventional-commit token, or with
+        ``Merge task/{tid} into ``, would otherwise false-cite.  ``--grep``
+        is used only as a coarse, uncapped full-message PRE-filter (a
+        sound superset — any subject match is necessarily a message
+        match); each candidate's subject is then re-tested against the
+        same pattern, compiled as a Python ``re`` (see
+        ``DEFAULT_COMMIT_CITATION_PATTERN``'s doc comment). Candidates are
+        walked in git-log order (most-recent-first) and the first whose
+        SUBJECT matches wins, so a body-only false match on a newer
+        commit can never shadow an older genuine subject citation.
+
         Args:
             tid: Bare task id (no ``task/`` prefix); the prefix is added
                 by the default pattern where appropriate.
             pattern_template: Optional override for the citation pattern.
                 Defaults to ``DEFAULT_COMMIT_CITATION_PATTERN``.  Empty
                 string disables the check by returning None immediately
-                (caller opt-out for projects without citation conventions).
+                (caller opt-out for projects without citation
+                conventions).  Must be valid as both a git
+                ``--extended-regexp`` pattern and a Python ``re`` pattern
+                — an uncompilable override is treated as fail-safe
+                no-citation (logs a warning and returns None), mirroring
+                the prior git-error-means-None behavior.
 
         Returns:
-            The 40-char commit SHA of the most recent matching commit on
-            main, or None when no commit cites the task or the pattern is
-            disabled.
+            The 40-char commit SHA of the most recent commit on main
+            whose SUBJECT cites *tid*, or None when no commit's subject
+            cites the task, the pattern is disabled, or an override
+            pattern fails to compile as a Python ``re``.
         """
         template = (
             pattern_template
@@ -5526,20 +5560,36 @@ class GitOps:
         )
         if template == '':
             return None
-        pattern = template.format(tid=re.escape(tid))
+        pattern_str = template.format(tid=re.escape(tid))
+        try:
+            compiled = re.compile(pattern_str)
+        except re.error:
+            logger.warning(
+                'find_task_citation_commit: pattern_template is not a '
+                'valid Python re pattern (tid=%s); treating as '
+                'no-citation (fail-safe): %r',
+                tid, pattern_str,
+            )
+            return None
         rc, out, _ = await _run(
             [
                 'git', 'log', self.config.main_branch,
                 '--extended-regexp',
-                f'--grep={pattern}',
-                '--max-count=1',
-                '--format=%H',
+                f'--grep={pattern_str}',
+                '-z',
+                '--format=%H%x1f%s',
             ],
             cwd=self.project_root,
         )
         if rc != 0 or not out:
             return None
-        return out
+        for record in out.split('\0'):
+            if not record:
+                continue
+            sha, _, subject = record.partition('\x1f')
+            if compiled.search(subject):
+                return sha.strip()
+        return None
 
     async def rebase_onto_main(self, worktree: Path, onto: str | None = None) -> bool:
         """Rebase the task branch in *worktree* onto *onto* (default: main).
