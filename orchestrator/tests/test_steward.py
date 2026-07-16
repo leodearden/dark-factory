@@ -534,6 +534,12 @@ class TestStewardInvokeWithCapRetryWiring:
         assert kwargs['run_id'] == 'run-abc'
         assert kwargs['task_id'] == '42'
         assert kwargs['project_id'] == steward.config.fused_memory.project_id
+        # The recorded cost row's model comes from invoke_kwargs['model']
+        # inside invoke_with_cap_retry (cli_invoke.py), not from the
+        # cost-telemetry kwargs asserted above — pin it too so a dropped
+        # `model` kwarg (which would silently fall back to 'opus' in the
+        # recorded row) is caught here.
+        assert kwargs['model'] == mock_config.models.steward
 
     async def test_forwards_empty_run_id_when_no_event_store(
         self, steward, worktree, mock_mcp,
@@ -2303,7 +2309,9 @@ class TestPreTriageUsageGateCleanup:
         # invoke_with_cap_retry sets account_name='' when no gate is provided
         assert mock_result.account_name == ''
 
-    async def test_forwards_cost_telemetry_kwargs(self, steward: TaskSteward):
+    async def test_forwards_cost_telemetry_kwargs(
+        self, steward: TaskSteward, mock_config,
+    ):
         """cost_store/run_id/task_id/project_id/role='triage' are forwarded to
         invoke_with_cap_retry so its guarded save_invocation block fires
         (task 2461). FAILS RED today: none of these kwargs are forwarded."""
@@ -2322,6 +2330,12 @@ class TestPreTriageUsageGateCleanup:
         assert kwargs['run_id'] == 'run-abc'
         assert kwargs['task_id'] == '42'
         assert kwargs['project_id'] == steward.config.fused_memory.project_id
+        # The recorded cost row's model comes from invoke_kwargs['model']
+        # inside invoke_with_cap_retry (cli_invoke.py), not from the
+        # cost-telemetry kwargs asserted above — pin it too so a dropped
+        # `model` kwarg (which would silently fall back to 'opus' in the
+        # recorded row) is caught here.
+        assert kwargs['model'] == mock_config.models.triage
 
 
 # ---------------------------------------------------------------------------
