@@ -85,6 +85,41 @@ function sevClass(sev) {
   return 'esc-sev-low';
 }
 
+// ── Window slicing (trailing 7d, anchored to the payload's own generated_at
+//    clock — never Date.now(), so the window stays consistent with the
+//    server's clock and immune to browser-clock skew; same discipline as
+//    tab_escalation_analytics.jsx) ──
+
+// Returns the inclusive cutoff date (YYYY-MM-DD) `days` before `generatedAt`,
+// or null when generatedAt is missing/unparseable (callers fall back to all
+// rows via the slice helpers below — no crash before the first poll
+// resolves).
+function windowCutoffDate(generatedAt, days = 7) {
+  if (!generatedAt) return null;
+  const end = new Date(generatedAt);
+  if (isNaN(end.getTime())) return null;
+  return new Date(end.getTime() - days * 86400000).toISOString().slice(0, 10);
+}
+
+// Filters an array of `{date, ...}` rows (flow_daily / esc_per_done_daily)
+// down to rows on/after the window cutoff. A null cutoff (unresolvable
+// generatedAt) returns rows unchanged.
+function sliceRowsByWindow(rows, cutoff) {
+  if (!cutoff || !rows) return rows || [];
+  return rows.filter(row => row.date >= cutoff);
+}
+
+// Filters a `{date: value}` object (churn_daily) down to keys on/after the
+// window cutoff. A null cutoff returns the object unchanged.
+function sliceDailyByWindow(dailyObj, cutoff) {
+  if (!cutoff || !dailyObj) return dailyObj || {};
+  const out = {};
+  for (const date of Object.keys(dailyObj)) {
+    if (date >= cutoff) out[date] = dailyObj[date];
+  }
+  return out;
+}
+
 // ── EscalationStatStrip — four-tile summary (benign rate, 6h breaches,
 //    esc/done, churn), reading the ESCALATION_ANALYTICS payload already
 //    wired into DF_DATA by the analytics tab (no duplicated computation) ──
@@ -96,16 +131,18 @@ function EscalationStatStrip({ analytics, projectFilter }) {
     return projectFilter.includes(p.project);
   });
 
-  // NOTE: still unwindowed here (full-series sums across every row the
-  // payload carries) — the trailing-7d cutoff anchored to generated_at is
-  // added in step-6.
+  // Trailing-7d window anchored to the payload's own generated_at clock. A
+  // null cutoff (generated_at missing/unparseable, e.g. pre-first-poll)
+  // falls back to all rows via the slice helpers' pass-through.
+  const cutoff = windowCutoffDate(a.generated_at, 7);
 
   // (a) benign rate — workflow.flow_daily is the only per-day benign/
   // actionable series in the payload; sum n by class across every filtered
-  // project (cross-project rollup).
+  // project's WINDOWED rows (cross-project rollup).
   let benignN = 0, actionableN = 0;
   for (const p of projects) {
-    for (const row of (p.workflow || {}).flow_daily || []) {
+    const flowDaily = sliceRowsByWindow((p.workflow || {}).flow_daily || [], cutoff);
+    for (const row of flowDaily) {
       if (row.class === 'benign') benignN += row.n;
       else if (row.class === 'actionable') actionableN += row.n;
     }
@@ -135,22 +172,25 @@ function EscalationStatStrip({ analytics, projectFilter }) {
   }
   const breachCount = openItems.filter(item => item.breach_6h).length;
 
-  // (c) esc-per-done — aggregate ratio sum(filings)/sum(done), NOT a mean of
-  // daily ratios (undefined/biased on low-volume or done==0 days).
+  // (c) esc-per-done — aggregate ratio sum(filings)/sum(done) over the
+  // WINDOWED rows, NOT a mean of daily ratios (undefined/biased on
+  // low-volume or done==0 days).
   let filingsSum = 0, doneSum = 0;
   for (const p of projects) {
-    for (const row of (p.workflow || {}).esc_per_done_daily || []) {
+    const epd = sliceRowsByWindow((p.workflow || {}).esc_per_done_daily || [], cutoff);
+    for (const row of epd) {
       filingsSum += row.filings || 0;
       doneSum += row.done || 0;
     }
   }
   const escPerDone = doneSum > 0 ? filingsSum / doneSum : null;
 
-  // (d) churn-24h rate — sum(churn_daily)/sum(esc_per_done_daily filings);
-  // both are keyed by filed-date (date(timestamp)), so they reconcile.
+  // (d) churn-24h rate — sum(WINDOWED churn_daily)/sum(WINDOWED
+  // esc_per_done_daily filings); both are keyed by filed-date
+  // (date(timestamp)), so they reconcile.
   let churnSum = 0;
   for (const p of projects) {
-    const churnDaily = (p.workflow || {}).churn_daily || {};
+    const churnDaily = sliceDailyByWindow((p.workflow || {}).churn_daily || {}, cutoff);
     for (const n of Object.values(churnDaily)) churnSum += n;
   }
   const churnRate = filingsSum > 0 ? churnSum / filingsSum : null;
