@@ -181,3 +181,28 @@ def test_install_copies_units_enables_timer_and_kicks_drain(tmp_path):
     assert ["daemon-reload"] in calls, f"calls={calls!r}"
     assert ["enable", "--now", TIMER_NAME] in calls, f"calls={calls!r}"
     assert ["start", SERVICE_NAME] in calls, f"calls={calls!r}"
+
+
+# ---------------------------------------------------------------------------
+# step-5: RED -- fail loud when the timer is absent from `list-timers`
+# ---------------------------------------------------------------------------
+
+def test_install_fails_loud_when_timer_absent_from_list_timers(tmp_path):
+    xdg_config = tmp_path / "xdg-config"
+
+    result = _run_script(
+        tmp_path,
+        env={
+            "XDG_CONFIG_HOME": str(xdg_config),
+            "FAKE_SYSTEMCTL_OMIT_LIST_TIMERS": "1",
+        },
+    )
+
+    assert result.returncode != 0, (
+        f"Expected a non-zero exit when list-timers omits the enabled timer "
+        f"(self-verify failure); stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert TIMER_NAME in result.stderr, (
+        f"Expected stderr to name the missing timer unit {TIMER_NAME!r}; "
+        f"stderr={result.stderr!r}"
+    )
