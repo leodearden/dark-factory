@@ -683,6 +683,41 @@ _XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT = (
     + '========== 2 failed, 2 passed in 5.00s ==========\n'
 )
 
+# Crash signature + a FAILED line with no extractable pytest node-id (no
+# ``.py::`` substring — e.g. a doctest target). "No extractable node-id"
+# must be treated the same as "not on the allow-list": False.
+_XDIST_CRASH_WITH_UNPARSEABLE_FAILED_NODEID_OUTPUT = (
+    _XDIST_WORKER_CRASH_OUTPUT
+    + 'E   AssertionError: doctest output mismatch\n'
+    + 'FAILED some_doctest.txt::x\n'
+    + '========== 1 failed, 2 passed in 5.00s ==========\n'
+)
+
+# Fixture (a) PLUS a genuine ERROR (fixture/setup) failure for a DIFFERENT
+# test. An ERROR failure surface produces no FAILED line of its own, so the
+# per-FAILED-line allow-list check alone would never see it — the veto must
+# independently check for a co-occurring ERROR node-id.
+_XDIST_CRASH_KNOWN_FLAKE_PLUS_ERROR_NODEID_OUTPUT = (
+    _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT
+    + 'ERROR orchestrator/tests/test_other.py::test_needs_fixture - '
+    'Exception: fixture setup failed\n'
+)
+
+# Fixture (a) PLUS a genuine whole-module collection ERROR (bare file, no
+# ``::``, no FAILED line) — same strictness guard as above, bare-file form.
+_XDIST_CRASH_KNOWN_FLAKE_PLUS_COLLECTION_ERROR_OUTPUT = (
+    _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT
+    + "ERROR orchestrator/tests/test_broken.py - ImportError: cannot import name 'foo'\n"
+)
+
+# Fixture (a) PLUS a genuine INTERNALERROR (pytest plugin/internal crash) —
+# same strictness guard, no FAILED line of its own.
+_XDIST_CRASH_KNOWN_FLAKE_PLUS_INTERNALERROR_OUTPUT = (
+    _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT
+    + 'INTERNALERROR> Traceback (most recent call last):\n'
+    + 'INTERNALERROR> RuntimeError: plugin crashed\n'
+)
+
 
 class TestBareXdistWorkerCrashDetector:
     """task 2365 step-1: verify._is_bare_xdist_worker_crash(output) pure helper.
@@ -739,6 +774,54 @@ class TestBareXdistWorkerCrashDetector:
         signature and one known flake co-occur.
         """
         result = verify._is_bare_xdist_worker_crash(_XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT)
+        assert result is False
+
+    def test_crash_with_unparseable_failed_nodeid_is_false(self):
+        """A FAILED line with no extractable ``.py::`` node-id -> False.
+
+        "No extractable node-id" must be treated the same as "not on the
+        allow-list" — never assume an unparseable FAILED line is a known
+        flake just because the crash signature is present.
+        """
+        result = verify._is_bare_xdist_worker_crash(
+            _XDIST_CRASH_WITH_UNPARSEABLE_FAILED_NODEID_OUTPUT
+        )
+        assert result is False
+
+    def test_known_flake_plus_error_nodeid_is_false(self):
+        """Known-flake FAILED line PLUS a genuine ERROR (fixture/setup) failure
+        for a different test -> False.
+
+        An ERROR failure surface produces no FAILED line of its own, so the
+        per-FAILED-line allow-list check alone would never see it. Before
+        the ERROR/INTERNALERROR veto, this output would have returned True
+        (the lone FAILED line is the allow-listed known flake), silently
+        masking the genuine ERROR.
+        """
+        result = verify._is_bare_xdist_worker_crash(
+            _XDIST_CRASH_KNOWN_FLAKE_PLUS_ERROR_NODEID_OUTPUT
+        )
+        assert result is False
+
+    def test_known_flake_plus_collection_error_is_false(self):
+        """Known-flake FAILED line PLUS a genuine whole-module collection ERROR
+        (bare file, no ``::``) -> False. Same gap as the ERROR-node-id case
+        above, for the bare-file collection-failure form."""
+        result = verify._is_bare_xdist_worker_crash(
+            _XDIST_CRASH_KNOWN_FLAKE_PLUS_COLLECTION_ERROR_OUTPUT
+        )
+        assert result is False
+
+    def test_known_flake_plus_internalerror_is_false(self):
+        """Known-flake FAILED line PLUS a genuine INTERNALERROR -> False.
+
+        A pytest plugin/internal crash produces no FAILED line of its own
+        either, so it needs the same independent veto as the ERROR cases
+        above.
+        """
+        result = verify._is_bare_xdist_worker_crash(
+            _XDIST_CRASH_KNOWN_FLAKE_PLUS_INTERNALERROR_OUTPUT
+        )
         assert result is False
 
 
