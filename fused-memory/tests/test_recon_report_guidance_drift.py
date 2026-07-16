@@ -54,6 +54,7 @@ _AGENT_CALLED_REPORT_TOOLS = (
     'cite_edge',
     'cite_task',
     'cite_memory',
+    'cite_run',
 )
 
 
