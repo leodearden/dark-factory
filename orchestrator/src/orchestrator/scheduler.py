@@ -23,6 +23,7 @@ from shared.locking import (
 )
 from shared.mcp_envelope import parse_tool_result, resolver_failed
 from shared.psi import PsiSample, read_psi_sample
+from shared.task_claimant import has_live_claimant
 from shared.task_metadata import parse_metadata
 
 from orchestrator import git_ops
@@ -3847,10 +3848,30 @@ class Scheduler:
         the dispatch-cooldown signal for the task (or None), forwarded so the
         caller can pass it to post-dispatch bookkeeping without a second
         evaluation.
+
+        Task 2408 mechanism 1: also refuses dispatch when the task currently
+        carries a LIVE claimant (a fresh ``claimant_run_id``/``heartbeat_at``
+        pair — see ``shared.task_claimant.has_live_claimant``). A normal
+        freshly-pending task has a null claimant (claimant is stamped only at
+        dispatch, see ``TaskWorkflow``), so this is a no-op in the common
+        case and only fires as a safety net against dispatching into an
+        already-claimed worktree (reconcile/race/multi-host). Gated by
+        ``config.claimant_dispatch_gate_enabled``.
         """
         if task.get('status') != 'pending':
             return False, None
         if tid in self._dispatched:
+            return False, None
+        if self.config.claimant_dispatch_gate_enabled and has_live_claimant(
+            task,
+            self._wall_now(),
+            timedelta(seconds=self.config.claimant_liveness_ttl_secs),
+        ):
+            logger.info(
+                'Task %s dispatch refused: live claimant %r (task 2408 mechanism 1)',
+                tid,
+                task.get('claimant_run_id'),
+            )
             return False, None
         if self._deferred_watch_gated(task):
             return False, None
