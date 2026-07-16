@@ -360,6 +360,12 @@ async def write_cycle_summary(
                     'stage': stage,
                     'run_id': run_id,
                     'record_type': CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP,
+                    # Mirror-only copy, stamped for parity/observability with
+                    # the ledger payload above. No read path consumes it —
+                    # get_cycle_summary_presence reads solely from the
+                    # ledger's payload_json['remediation'] (the authoritative
+                    # source); do not add a fallback read of this mirror copy
+                    # (task 2652).
                     'remediation': remediation,
                 },
                 causation_id=run_id,
