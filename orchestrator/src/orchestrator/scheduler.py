@@ -1229,6 +1229,7 @@ class Scheduler:
         'park_gc',
         'stale_sweep',
         'cooldown_gc',
+        'redispatch_stranded_blocked',
         'external_dep_policy',
         'delivered_check_gate',
         'stamp_milestone',
