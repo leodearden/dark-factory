@@ -3520,3 +3520,128 @@ def test_boundary8_coordinator_fire_while_busy_link_seam(
     cfg = OrchestratorConfig()
     assert cfg.orchestrator_restart_force_fire_after_secs == 4500.0
 
+
+def test_boundary9_report_mixed_fleet_seven_columns(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """Scenario 9 (I8) -- `--report` on a mixed fleet: the flagship
+    user-observable signal, combining what
+    test_report_mixed_fleet_returns_1_and_lists_all_units /
+    test_report_includes_deploy_age_column /
+    test_report_includes_merge_idle_and_would_defer_columns /
+    test_report_extended_columns_stay_read_only exercise separately into one
+    integrated acceptance scenario: >=2 units (one stale start_epoch with a
+    busy heartbeat, one fresh with an idle heartbeat) and a tmp
+    ORCH_FLEET_DEPLOY_CLOCK ~3h old, pre-seeded and byte-captured.
+
+    Asserts report() lists every unit; the header carries all seven columns
+    (UNIT/START/NEWEST WATCHED COMMIT/VERDICT/DEPLOY-AGE/MERGE-IDLE/
+    WOULD-DEFER); each row's VERDICT/DEPLOY-AGE/MERGE-IDLE/WOULD-DEFER
+    values (extracted positionally -- the last four whitespace-separated
+    tokens -- since the START/NEWEST WATCHED COMMIT date columns embed
+    spaces, mirroring test_report_includes_merge_idle_and_would_defer_
+    columns's technique) are correct; report() returns 1 (a stale unit is
+    present); recorded subprocess argv contains ZERO mutating systemctl
+    verbs; and the clock file is byte-identical afterward (no clock write).
+    """
+    wdog = _load_watchdog()
+
+    commit_epoch = 1_800_000_000
+    now = 2_000_000_000.0
+    unit_stale = "orchestrator-stale.service"  # started before the commit, busy heartbeat
+    unit_fresh = "orchestrator-fresh.service"  # started after the commit, idle heartbeat
+    units = [unit_stale, unit_fresh]
+    start_epochs = {unit_stale: commit_epoch - 100, unit_fresh: commit_epoch + 100}
+
+    recorded_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        recorded_calls.append(list(cmd))
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            stdout = "".join(f"{u} loaded active running desc\n" for u in units)
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            unit = cmd[3]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epochs[unit]}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda u: pytest.fail(f"report() must never restart {u}")
+    )
+
+    clock_file = tmp_path / "clock.json"
+    clock_payload = json.dumps({"ts": now - 3 * 3600, "iso": "2026-07-15T21:00:00+00:00"})
+    clock_file.write_text(clock_payload)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    monkeypatch.setenv("ORCH_FLEET_DIR", str(fleet_dir))
+    (fleet_dir / f"{unit_stale}.json").write_text(
+        json.dumps(
+            {
+                "unit": unit_stale,
+                "merge_idle": False,
+                "depth": 1,
+                "queue_empty": False,
+                "ts_epoch": now - 10,
+            }
+        )
+    )
+    (fleet_dir / f"{unit_fresh}.json").write_text(
+        json.dumps(
+            {
+                "unit": unit_fresh,
+                "merge_idle": True,
+                "depth": 0,
+                "queue_empty": True,
+                "ts_epoch": now - 10,
+            }
+        )
+    )
+
+    exit_code = wdog.report()
+
+    assert exit_code == 1, "a stale unit is present -> report() must return 1"
+
+    captured = capsys.readouterr()
+    header_line = next(line for line in captured.out.splitlines() if line.startswith("UNIT"))
+    for col in (
+        "UNIT", "START", "NEWEST WATCHED COMMIT", "VERDICT",
+        "DEPLOY-AGE", "MERGE-IDLE", "WOULD-DEFER",
+    ):
+        assert col in header_line, f"expected column {col!r} in header: {header_line!r}"
+
+    for unit in units:
+        assert unit in captured.out, f"report() output must list {unit}: {captured.out}"
+
+    stale_line = next(line for line in captured.out.splitlines() if line.startswith(unit_stale))
+    fresh_line = next(line for line in captured.out.splitlines() if line.startswith(unit_fresh))
+
+    s_verdict, s_deploy_age, s_merge, s_defer = stale_line.split()[-4:]
+    f_verdict, f_deploy_age, f_merge, f_defer = fresh_line.split()[-4:]
+
+    assert s_verdict == "stale"
+    assert s_deploy_age == "3.0h"
+    assert s_merge == "busy"
+    assert s_defer == "yes"
+
+    assert f_verdict == "fresh"
+    assert f_deploy_age == "3.0h"
+    assert f_merge == "idle"
+    assert f_defer == "no"
+
+    assert recorded_calls, "report() must have driven subprocess.run through its real helpers"
+    _assert_zero_mutating_calls(recorded_calls)
+    assert clock_file.read_text() == clock_payload, (
+        "report() must never write the shared fleet-deploy clock file"
+    )
+
