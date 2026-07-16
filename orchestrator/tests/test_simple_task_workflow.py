@@ -86,8 +86,8 @@ def _make(
     config.steward_completion_timeout = 300.0
     config.project_root = project_root
     config.simple_task_enabled = True
-    config.simple_task_budget_usd = 1.50
-    config.simple_task_max_turns = 30
+    config.budgets.simple_task = 1.50
+    config.max_turns.simple_task = 30
 
     handle_blast_radius_expansion = AsyncMock(return_value=blast_radius_grants)
     update_task = AsyncMock(return_value=True)
