@@ -3953,7 +3953,10 @@ async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root, mo
     await backend.add_task(project_root=project_root, title='T-cancelled', status='cancelled')  # id=4
 
     # --- Set up spy on conn.execute ---
-    conn = await backend._get_connection(project_root)
+    # get_tasks reads via the cached read connection (_get_read_connection,
+    # task 2651), not the write connection (_get_connection) — spy on the
+    # former so this still captures the SQL get_tasks actually issues.
+    conn = await backend._get_read_connection(project_root)
     recorded_sql: list[str] = []
     _orig_execute = conn.execute
 

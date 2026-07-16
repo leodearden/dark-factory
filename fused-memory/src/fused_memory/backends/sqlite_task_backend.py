@@ -1174,7 +1174,9 @@ class SqliteTaskBackend:
     async def _get_read_connection(self, project_root: str) -> aiosqlite.Connection:
         """Return a cached per-project AUTOCOMMIT connection for hot status reads.
 
-        Used by :meth:`get_statuses_raw` (task 2455). Unlike
+        Used by :meth:`get_statuses_raw` (task 2455) and, as of task 2651,
+        :meth:`get_task` and :meth:`_get_tasks_internal` (backing
+        :meth:`get_tasks`) — plus :meth:`list_tags` (task 2603). Unlike
         :meth:`_get_connection`'s cached connection — opened in Python
         sqlite3's legacy deferred-transaction mode, so a read transaction
         left open on it pins a stale WAL snapshot (task 2388) — this
@@ -1192,14 +1194,16 @@ class SqliteTaskBackend:
         raised before the statement was exhausted) would keep an implicit
         WAL read transaction open on *this* connection and re-introduce the
         task-2388 stale-snapshot pin, this time on the cached read
-        connection. :meth:`_statuses_from_conn` (the sole current caller)
+        connection. Every current caller — :meth:`_statuses_from_conn`,
+        :meth:`get_task`, :meth:`_get_tasks_internal` (including the
+        :meth:`_fetch_dependencies` call it makes), and :meth:`list_tags` —
         enforces this deterministically via ``async with conn.execute(...)
-        as cursor:``, which closes the cursor even if ``fetchall()`` or the
-        row-coercion step raises — so the invariant no longer depends on a
-        reader happening to fully drain the cursor by convention. A future
-        caller that queries this connection directly should use the same
-        pattern (or otherwise guarantee the cursor is closed) rather than
-        assume it's automatic.
+        as cursor:``, which closes the cursor even if ``fetchall()``/
+        ``fetchone()`` or a row-coercion step raises — so the invariant no
+        longer depends on a reader happening to fully drain the cursor by
+        convention. A future caller that queries this connection directly
+        should use the same pattern (or otherwise guarantee the cursor is
+        closed) rather than assume it's automatic.
         """
         if self._closed:
             raise RuntimeError('SqliteTaskBackend is closed')
@@ -1327,19 +1331,20 @@ class SqliteTaskBackend:
     ) -> list[dict[str, Any]]:
         if statuses is not None and not statuses:
             return []
-        conn = await self._get_connection(project_root)
+        conn = await self._get_read_connection(project_root)
         if statuses is None:
-            cursor = await conn.execute(
+            async with conn.execute(
                 'SELECT * FROM tasks WHERE tag = ? ORDER BY id',
                 (tag,),
-            )
+            ) as cursor:
+                rows = await cursor.fetchall()
         else:
             placeholders = ','.join('?' * len(statuses))
-            cursor = await conn.execute(
+            async with conn.execute(
                 f'SELECT * FROM tasks WHERE tag = ? AND status IN ({placeholders}) ORDER BY id',
                 (tag, *statuses),
-            )
-        rows = await cursor.fetchall()
+            ) as cursor:
+                rows = await cursor.fetchall()
         deps = await self._fetch_dependencies(conn, tag)
         return [
             _row_to_task(row, deps.get(row['id'], []), project_root=project_root)
@@ -1633,16 +1638,17 @@ class SqliteTaskBackend:
         read connection unpinnable (see :meth:`_get_read_connection`'s
         Guardrail note).
 
-        Snapshot consistency: because this reads via :meth:`_get_read_connection`
-        while :meth:`get_task`/:meth:`get_tasks` read via the cached WRITE
-        connection (:meth:`_get_connection`), the two can observe different
-        WAL snapshots — the same cross-connection caveat documented on
-        :meth:`get_statuses_raw`. A caller combining them (e.g.
+        Snapshot consistency: as of task 2651, :meth:`get_task`/
+        :meth:`get_tasks` also read via :meth:`_get_read_connection`, so
+        this method and they now share the same cached connection — no
+        cross-connection WAL-snapshot divergence between them. They remain
+        independent calls, though: a caller combining them (e.g.
         :class:`~fused_memory.maintenance.backfill_curator_corpus.BackfillManager`'s
         cross-tag prune sweep, which calls this and then ``get_tasks`` once
-        per tag) should treat a tag created concurrently with the read as a
-        benign, self-healing miss for that cycle rather than assume the two
-        calls agree to the instant.
+        per tag) should still treat a tag created concurrently with the
+        read as a benign, self-healing miss for that cycle rather than
+        assume the two calls agree to the instant — the ordinary read-skew
+        any two sequential reads have, not a pinned-connection artifact.
 
         Args:
             project_root: Absolute path to the project root.
