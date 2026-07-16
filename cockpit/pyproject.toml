@@ -16,6 +16,9 @@ dependencies = [
     "orchestrator",
 ]
 
+[project.scripts]
+cockpit = "cockpit.app:main"
+
 [tool.uv.sources]
 orchestrator = { workspace = true }
 

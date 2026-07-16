@@ -1020,3 +1020,16 @@ class CockpitApp(App):
         """
         cfg = CockpitUIConfig(selected_slug=self._selected_slug, poll_interval=self.poll_interval)
         save_ui_config(cfg, self.fleet_root)
+
+
+def main() -> None:
+    """Console-script entrypoint (`uv run cockpit` / `[project.scripts] cockpit`).
+
+    Constructs a plain CockpitApp with every constructor kwarg left at its
+    default (fleet_root/scanner/backend/etc. all self-resolve -- see
+    CockpitApp.__init__) and runs it. This is the one-command replacement
+    for the ad-hoc `uv run python -c "from cockpit.app import CockpitApp;
+    CockpitApp().run()"` invocation (C10 acceptance follow-up, task 2303 /
+    esc-2303-2).
+    """
+    CockpitApp().run()
