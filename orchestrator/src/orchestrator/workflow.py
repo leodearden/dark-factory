@@ -1027,6 +1027,22 @@ class TaskWorkflow:
         # is the durable source-of-truth dedup for non-consecutive repeats.
         self._last_routed_suggestion_hash: str | None = None
 
+        # Dedup guard for _reconcile_done_step_commits' flag-for-review
+        # branch (task 2386 amendment). That method runs on every
+        # _execute_iterations loop iteration, and an unreconcilable orphaned
+        # done-step commit (content mismatch / unresolvable original / no
+        # WIP run at HEAD) is deliberately left unchanged rather than
+        # guessed — so without this guard the identical condition would
+        # re-fire _escalate_unreconciled_done_step and file a fresh info
+        # Escalation every iteration up to max_execute_iterations, flooding
+        # the queue with duplicates for one underlying anomaly. Keyed by
+        # (step_id, stale_commit) rather than step_id alone so a genuinely
+        # *new* orphaning event (the commit changes again) still escalates.
+        # Never reset — including across _execute_iterations re-entry from
+        # _replan/_amend — so the guard holds for this workflow instance's
+        # whole lifetime.
+        self._unreconciled_done_step_escalations: set[tuple[str, str]] = set()
+
         # One-shot guard for the architect plan-tightening retry.  Set
         # True on first _try_narrow_plan call regardless of outcome so
         # the workflow never loops the narrowing pass on the same task.
@@ -5318,8 +5334,8 @@ class TaskWorkflow:
         (``not is_ancestor(commit, head)``), this locates the contiguous run
         of WIP safety-commits sitting at HEAD (the same walk-and-stop over
         ``get_commit_subjects`` + :func:`is_wip_safety_commit` that
-        :meth:`_detect_tip_wip_commits` performs) and content-matches the
-        orphaned commit's own changed-file set
+        :meth:`_detect_tip_wip_commits` performs) and matches by filename
+        set the orphaned commit's own changed-file set
         (:meth:`GitOps.get_commit_changed_files`) against the WIP run's
         union changed-file set. On a match — the orphaned commit's files are
         non-empty and a subset of the WIP run's files — the step is
@@ -5328,7 +5344,22 @@ class TaskWorkflow:
         mismatch, an unresolvable original commit (empty file set — e.g.
         GC'd), or no WIP run at HEAD at all, the step is left unchanged and
         :meth:`_escalate_unreconciled_done_step` files a non-blocking info
-        escalation flagging it for review instead.
+        escalation flagging it for review instead — deduped per
+        ``(step_id, stale_commit)`` via
+        ``self._unreconciled_done_step_escalations`` so a still-stuck orphan
+        doesn't re-escalate on every ``_execute_iterations`` loop iteration
+        (see that attribute's docstring in ``__init__``).
+
+        **Heuristic, not a content diff**: the match above is a
+        *filename-set* subset check only — it never compares file contents
+        or blob shas. A WIP commit that happens to touch a superset of the
+        orphaned step's filenames but with unrelated content would still
+        count as a match and get silently re-pointed. This is accepted
+        given the best-effort posture (the fallback on any doubt is an
+        escalation, never silence) — :meth:`GitOps.branch_content_in_main`
+        shows the byte-level ``git diff --quiet`` pattern this could
+        upgrade to if the filename heuristic ever proves too loose in
+        practice.
 
         Best-effort and defensive, identical posture to
         :meth:`_detect_tip_wip_commits`: no-ops on any missing collaborator
@@ -5379,8 +5410,14 @@ class TaskWorkflow:
                     # Mismatch, unresolvable original (empty file set — e.g.
                     # GC'd), or no WIP run at HEAD at all: cannot safely
                     # auto-reconcile. Flag for review and leave the commit
-                    # unchanged rather than guess.
-                    self._escalate_unreconciled_done_step(item['id'], commit, wip_tip_sha)
+                    # unchanged rather than guess. Deduped by
+                    # _unreconciled_done_step_escalations so a still-stuck
+                    # orphan doesn't re-file an info escalation on every
+                    # _execute_iterations loop iteration.
+                    escalation_key = (item['id'], commit)
+                    if escalation_key not in self._unreconciled_done_step_escalations:
+                        self._unreconciled_done_step_escalations.add(escalation_key)
+                        self._escalate_unreconciled_done_step(item['id'], commit, wip_tip_sha)
         except Exception:
             logger.warning(
                 'Done-step commit reconciliation failed; leaving plan commits unchanged',
@@ -5392,7 +5429,7 @@ class TaskWorkflow:
     ) -> None:
         """Submit a non-blocking info escalation for a done step whose
         recorded ``commit`` is orphaned but could not be safely
-        content-matched against the tip WIP safety-commit run (content
+        filename-matched against the tip WIP safety-commit run (filename-set
         mismatch, an unresolvable/GC'd original commit, or no WIP run
         sitting at HEAD at all).
 
@@ -5427,13 +5464,15 @@ class TaskWorkflow:
             detail=(
                 f'Step {step_id} recorded commit {stale_commit}, which is no '
                 'longer reachable from HEAD (likely rewritten/orphaned by an '
-                'inter-iteration or warm-lane rebase). Its content could not '
-                f'be verified against the tip WIP safety-commit run (tip sha '
-                f'{tip_desc}) — either the files did not match, the original '
-                'commit is unresolvable (possibly garbage-collected), or no '
-                'WIP safety-commit run sits at HEAD. Verify manually via '
-                f'`git show {stale_commit}` against the WIP commit(s) and '
-                "re-point the step's commit if appropriate."
+                "inter-iteration or warm-lane rebase). Its filenames could "
+                f'not be matched against the tip WIP safety-commit run (tip '
+                f'sha {tip_desc}) — either the changed-file sets did not '
+                'match (this is a filename check only, not a byte-content '
+                'diff), the original commit is unresolvable (possibly '
+                'garbage-collected), or no WIP safety-commit run sits at '
+                f'HEAD. Verify manually via `git show {stale_commit}` '
+                "against the WIP commit(s) and re-point the step's commit "
+                'if appropriate.'
             ),
             suggested_action='verify_wip_reconciliation',
             worktree=str(self.worktree) if self.worktree else None,

@@ -6290,8 +6290,9 @@ class GitOps:
         yields an empty changed-file set rather than propagating a failure.
 
         Used by ``TaskWorkflow._reconcile_done_step_commits`` (task 2386) to
-        content-match an orphaned done-step commit against the tip WIP
-        safety-commit run's changed-file set.
+        match, by filename set only (not byte content), an orphaned
+        done-step commit against the tip WIP safety-commit run's
+        changed-file set.
         """
         rc, output, _ = await _run(
             ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', '--root', sha],
