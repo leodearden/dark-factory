@@ -1455,6 +1455,16 @@ class ReconReportState:
         change was needed: ``count_memories_by_metadata`` already existed as
         the exact Qdrant metadata-equality count primitive.
 
+        Caveat (reviewed task-2595 amendment): this existence check is
+        Mem0/Qdrant-only, so it can false-negative for a run that genuinely
+        existed — a run whose cycle summary predates the
+        ``metadata.run_id`` convention, or whose provenance lives only in
+        Graphiti, will also read as ``run_not_found``. Treat ``run_not_found``
+        as "not confirmed via mem0", not as infallible proof the run_id
+        never existed — it is a strong self-correction signal for the
+        common case (a mistyped/re-typed id), not a guarantee for every
+        historical run.
+
         Returns {run_id, match_count} on success, or a structured error dict
         (run_id_unknown / finding_unknown / invalid_uuid_shape / run_not_found
         / service_not_configured). UUID shape is checked before any service
@@ -1485,6 +1495,15 @@ class ReconReportState:
         if self._memory_service is None:
             return _ERR_SERVICE_UNAVAILABLE.copy()
 
+        # Deliberately not narrowed to a specific exception type here, unlike
+        # cite_edge's `except EdgeNotFoundError` or cite_memory's `except
+        # (EdgeNotFoundError, MemoryNotFoundError)`: a transient backend/
+        # connection failure inside count_memories_by_metadata propagates as
+        # a raw ToolError to the caller instead of being swallowed into a
+        # fail-safe result. This matches cite_entity's get_entity call and
+        # cite_task's get_task call, which are equally unnarrowed — a
+        # transient hiccup should surface loudly rather than risk masquerading
+        # as a (possibly wrong) "confirmed absent" run_not_found verdict.
         count = await self._memory_service.count_memories_by_metadata(
             finding_entry.project_id, {'run_id': cited_run_id}
         )
@@ -1827,7 +1846,10 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         their run_id (count_memories_by_metadata returns 0) — this is the
         structural fix for run_id transcription drift: copy cited_run_id
         verbatim from the run_id/metadata.run_id field of a fresh tool
-        result, never re-type or paraphrase it from memory.
+        result, never re-type or paraphrase it from memory. Note: this check
+        is mem0-only, so a legacy run predating the metadata.run_id
+        convention (or one whose provenance lives only in Graphiti) can also
+        surface as run_not_found even though it once existed.
         """
         return await state.cite_run(
             run_id=run_id, finding_id=finding_id, cited_run_id=cited_run_id
