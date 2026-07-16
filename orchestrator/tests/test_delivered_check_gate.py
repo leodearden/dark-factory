@@ -378,6 +378,114 @@ class TestDepsSatisfiedDeliveredGate:
             is True
         )
 
+    # --- terminal_dep_records fallback (task 2692 — step-3 RED / step-4 GREEN)
+    #
+    # The active-only get_tasks fetch that seeds tasks_by_id excludes
+    # DONE/CANCELLED producers, so a just-completed dep carrying
+    # metadata.delivered_checks is genuinely ABSENT from tasks_by_id (not
+    # smuggled in like the fixtures above). terminal_dep_records is the
+    # dedicated fallback the scheduler backfills for exactly this case.
+
+    def test_terminal_dep_records_fallback_consulted_when_absent_from_tasks_by_id_cached_false(
+        self, scheduler: Scheduler
+    ):
+        """Dep genuinely absent from tasks_by_id (active-only fetch excluded
+        it) but present in terminal_dep_records — cache=False must still
+        withhold, exactly as if the record had been found in tasks_by_id."""
+        task = self._dependent()
+        dep = self._dep(status='done')
+        status_map = {'20': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, {},
+                delivered_check_cache={'20': False},
+                terminal_dep_records={'20': dep},
+            )
+            is False
+        )
+
+    def test_terminal_dep_records_fallback_consulted_when_absent_from_tasks_by_id_cached_true(
+        self, scheduler: Scheduler
+    ):
+        task = self._dependent()
+        dep = self._dep(status='done')
+        status_map = {'20': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, {},
+                delivered_check_cache={'20': True},
+                terminal_dep_records={'20': dep},
+            )
+            is True
+        )
+
+    def test_terminal_dep_records_fallback_absent_from_cache_not_satisfied(
+        self, scheduler: Scheduler
+    ):
+        """Dep absent from BOTH tasks_by_id and the cache, but present in
+        terminal_dep_records — fail-safe wait (not satisfied), mirroring
+        test_done_dep_checks_absent_from_cache_not_satisfied above."""
+        task = self._dependent()
+        dep = self._dep(status='done')
+        status_map = {'20': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, {},
+                delivered_check_cache={},
+                terminal_dep_records={'20': dep},
+            )
+            is False
+        )
+
+    def test_terminal_dep_records_unset_byte_identical(self, scheduler: Scheduler):
+        """terminal_dep_records omitted (default None): a dep absent from
+        tasks_by_id is simply skipped by the arm — byte-identical to
+        legacy behaviour (no fallback source is consulted at all)."""
+        task = self._dependent()
+        status_map = {'20': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, {}, delivered_check_cache={'20': False}
+            )
+            is True
+        )
+
+    def test_terminal_dep_records_explicit_none_byte_identical(self, scheduler: Scheduler):
+        """Passing terminal_dep_records=None explicitly is identical to
+        omitting it — the fallback stays inert."""
+        task = self._dependent()
+        status_map = {'20': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, {},
+                delivered_check_cache={'20': False},
+                terminal_dep_records=None,
+            )
+            is True
+        )
+
+    def test_terminal_dep_records_fallback_not_consulted_when_dep_already_in_tasks_by_id(
+        self, scheduler: Scheduler
+    ):
+        """When the dep record IS already present in tasks_by_id,
+        terminal_dep_records must never be consulted — tasks_by_id wins.
+        Proven behaviourally: tasks_by_id's record carries checks (so the
+        arm applies and cache=False blocks); terminal_dep_records carries a
+        record for the SAME id with NO checks, which would make the arm a
+        silent no-op (returns True) if it were consulted instead."""
+        task = self._dependent()
+        dep_in_tasks_by_id = self._dep(status='done', with_checks=True)
+        dep_in_terminal_records = self._dep(status='done', with_checks=False)
+        status_map = {'20': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, {'20': dep_in_tasks_by_id},
+                delivered_check_cache={'20': False},
+                terminal_dep_records={'20': dep_in_terminal_records},
+            )
+            is False
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestEligibilityForwardsDeliveredCache (task 2580 — step-7 RED / step-8 GREEN)
