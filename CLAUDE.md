@@ -369,6 +369,52 @@ kind" above. The delayed anchor waits on the same local +
 `metadata.external_deps` dependency gate described in "Cross-project task
 dependencies" above.
 
+### Per-task model pin (`metadata.model_overrides`)
+
+Set `metadata.model_overrides` on a task to pin specific agent roles to a
+specific model for that task only — the highest-precedence layer in the
+orchestrator's route resolver (see "Model Routing" below).
+
+**Shape:** an object mapping full role name → model string:
+
+```
+{
+  "implementer": "opus",
+  "reviewer_comprehensive": "haiku"
+}
+```
+
+**Validation split** — submit-time SHAPE guard vs. resolve-time model
+STRING check, because fused-memory does not know the orchestrator's
+allowlist:
+- `submit_task`/`update_task` shape-validate at write time via
+  `shared.task_metadata.validate_model_overrides` against
+  `KNOWN_ROLE_NAMES` — an unknown role name, or a non-string/empty-string
+  model value, raises `ValidationError` and the write is rejected. The
+  fused-memory `model_overrides_guard` mirrors this at both `submit_task`
+  and `update_task`.
+- The orchestrator resolver separately validates the model *string*
+  against `routing.allowed_models` (and any configured per-model ceiling)
+  at resolve time, fail-safe — see "Model Routing" below.
+
+**Fail-safe semantics:** a well-formed override naming a model outside
+`routing.allowed_models` (or past its configured daily ceiling) is skipped
+at resolve time, recorded in `RoutingDecision.rejected`, WARN-logged, and
+never blocks dispatch — the override is the resolver's highest-precedence
+layer (`metadata_override`) and sets `model` only (never
+effort/budget_usd/max_turns).
+
+**Role-name caveat:** keys must be the full dispatch role name from
+`orchestrator.agents.roles.ROLES` (e.g. `implementer`,
+`reviewer_comprehensive`), not a collapsed config key. `reviewer`,
+`triage`, and `module_tagger` are accepted by the shape guard (
+`KNOWN_ROLE_NAMES` is a superset covering both `ROLES` and `ModelsConfig`'s
+collapsed keys) but are accepted-but-**inert** as override keys — the
+resolver's layer-1 reader keys strictly on the literal `role_name` it was
+invoked with, never the collapsed config key, so an override authored
+under one of these three collapsed keys silently never matches at resolve
+time.
+
 ### Task metadata vocabulary & census
 
 `parse_metadata` (`shared/src/shared/task_metadata.py`) validates every
@@ -418,6 +464,136 @@ grow `None`-valued noise on every task). Add a key there only for a
 genuinely load-bearing, stable convention; Tier-B/C drift should be fixed
 by renaming to the canonical key or moving under `x_`, not by blessing it.
 
+## Model Routing
+
+The orchestrator resolves `(model, effort, budget_usd, max_turns)` for
+every LLM invocation through a single layered resolver,
+`orchestrator.routing.resolve_route` (adopted by `TaskWorkflow._invoke`).
+This section documents the operator-facing `routing.*` config block; see
+"Per-task model pin (`metadata.model_overrides`)" above for the task-author
+knob.
+
+### Config block (`routing.*`)
+
+```yaml
+routing:
+  allowed_models: [haiku, sonnet, opus]   # fail-fast admission list
+  ladder: [haiku, sonnet, opus]           # weakest -> strongest, for "+N" bumps
+  per_model_daily_ceiling_usd: {}         # optional per-model trailing-24h USD ceiling
+  rules: []                               # ordered policy table, first match wins
+```
+
+- **`allowed_models`** — the fail-fast admission list. Defaults to
+  `routing.DEFAULT_ALLOWED_MODELS` (`haiku`, `sonnet`, `opus`) — the
+  single-sourced "allowlist home" both this schema's default and the
+  fail-fast validator read from. Every claude-backend role's configured
+  model (`models.<role>`) and `unblock_auto.model` is validated against
+  this list by `OrchestratorConfig._validate_models_in_allowlist` — a
+  model string outside the list raises a `ValidationError` at config load
+  or reload. `claude-fable-5` is deliberately **not** yet admitted (see
+  "Adaptive-routing substrate" below).
+- **`ladder`** — models ordered weakest → strongest. Defaults to
+  `routing.DEFAULT_LADDER` (same order as `allowed_models` at stock
+  config). Consulted **only** for a policy rule's ladder-relative `"+N"`
+  bump (below); irrelevant to every other layer. A bump clamps at the
+  ladder top; a model absent from `ladder` cannot be bumped from.
+- **`per_model_daily_ceiling_usd`** — optional per-model trailing-24h USD
+  spend ceiling. Empty by default, so the ceiling check never trips and no
+  extra `cost_store` read fires at stock config.
+- **`rules`** — the ordered policy-rule table (first match wins), empty in
+  the schema default — the shipped default rule
+  (`rust-large-plan-implementer`) lives in `defaults.yaml`, not here, so it
+  can be retuned without a code change.
+
+### Closed condition/override vocabulary
+
+Each `RoutingRule` is `{id, match, set}`. Both `match` and `set` use
+`extra='forbid'` — an unrecognized key (e.g. a typo) raises a structured
+`ValidationError` naming the key, at both initial config load and
+hot-reload time. A mis-typed rule condition fails loud, never silently
+matches nothing (or everything).
+
+`match` (all optional; a rule matches iff every condition it sets holds):
+
+| Condition | Matches when |
+|---|---|
+| `role` | `role_name` is a member of this list |
+| `task_complexity` | `task_metadata['complexity']` equals this value |
+| `task_priority` | `task_metadata['priority']` equals this value — **caveat:** reads `metadata['priority']`, NOT the task's top-level `priority` field (where priority actually lives elsewhere in this codebase); populate `metadata['priority']` explicitly if you need this condition to fire |
+| `plan_min_steps` | the task's plan has at least this many steps (requires a plan — a `None` plan_shape fails this and the other two plan conditions) |
+| `plan_min_modules` | the plan touches at least this many modules — counts only `module_prefix`-matched modules when both are set (reproduces the pre-resolver Rust heuristic exactly) |
+| `module_prefix` | at least one plan module path starts with this string |
+| `min_routing_tier` | the task's persisted `routing_tier` counter is at least this value |
+| `min_dispatch_count` | the task's dispatch count is at least this value |
+| `simple_saturated` | `metadata.routing.simple_saturated` equals this bool |
+
+`set` (all optional — a rule may set any subset; unset fields fall through
+to the next-lower layer):
+
+| Field | Notes |
+|---|---|
+| `model` | absolute model string, or ladder-relative `"+N"` (resolved against `ladder`, clamped at the top) |
+| `effort` | reasoning effort |
+| `budget_usd` | per-invocation USD budget |
+| `max_turns` | per-invocation turn cap |
+
+### Layered precedence
+
+`resolve_route` resolves highest-precedence first; each of
+`effort`/`budget_usd`/`max_turns` is resolved independently, field-by-field,
+from the highest layer that specifies it — `source_layer` tracks only
+`model`'s provenance:
+
+1. **`metadata_override`** — `task.metadata.model_overrides[role_name]`, if
+   present (see "Per-task model pin" above). Sets `model` only.
+2. **`policy_rule`** — the first matching rule in `routing.rules` (list
+   order). `rule_id` is recorded as soon as a rule matches, independent of
+   whether its `set.model` goes on to apply.
+3. **`config`** — `config.models` / `budgets` / `max_turns` / `effort`,
+   keyed by role (the `reviewer*` → `reviewer` config-key collapse applies
+   here too).
+4. **`role_default`** — the role's own dataclass defaults. Always
+   available and unconditional — this is the only layer never subject to
+   fail-safe validation, which is why `resolve_route` never raises.
+
+### Fail-safe validation
+
+Whenever layer 3, 2, or 1 would set `model`, the candidate (after
+ladder-relative resolution, if applicable) is checked against
+`routing.allowed_models` and `per_model_daily_ceiling_usd`. On failure,
+that layer's model assignment is skipped — `model`/`source_layer` keep
+whatever the next-lower-precedence layer already validated — and a
+namespaced `"<layer>:<reason>"` string (`model-not-in-allowlist` or
+`model-ceiling-exhausted`) is appended to `RoutingDecision.rejected`. **A
+dispatch is never blocked by a routing mis-config.** This validation is
+scoped to claude-backend roles only — a non-claude-backend role's model
+string is the harness-backend PRD's axis and is never checked against this
+claude-centric allowlist/ceiling.
+
+### Observability
+
+Every resolved invocation emits a `routing_decision` event (`event_store`
+`EventType.routing_decision`) carrying the full `RoutingDecision`
+(model/effort/budget_usd/max_turns, `source_layer`, `rule_id`, `rejected`)
+plus an inputs digest, and mirrors the latest decision to
+`task.metadata.routing` via `TaskWorkflow._record_routing_decision`. The
+mirror (`shared.task_metadata.RoutingState`) stores the latest decision, a
+bounded history (newest 5), a `routing_tier` counter, and a
+`simple_saturated` flag.
+
+### Adaptive-routing substrate (forthcoming automation)
+
+The resolver already supports the `min_routing_tier` and
+`simple_saturated` match conditions and ladder-relative `"+N"` bumps, and
+`metadata.routing` already stores `routing_tier`/`simple_saturated` — this
+is the substrate a later fleet rule (retry-tier escalation, saturation →
+full-path) will consume. **Not yet active on `main`:** the automatic
+retry-tier increment, the `simple_task` saturation auto-stamp,
+`claude-fable-5` admission, and the per-(model×role) rollup in the
+digest/dashboard (done/blocked/cap-hit rates, $/done). Today, operators see
+`routing_decision` events and `metadata.routing` per invocation — not yet
+an auto-escalating ladder or a rendered rollup panel.
+
 ## Session Lifecycle
 
 ### Starting a session
@@ -445,10 +621,12 @@ arguments — it always re-reads that process's own `ORCH_CONFIG_PATH`,
 never another project's.
 
 **Green tier** (hot-reloadable): per-role `models` / `budgets` /
-`max_turns` / `effort` / `timeouts` / `backends`, steward grace
-(`steward_completion_timeout`, `steward_lifetime_budget`), scheduler +
-watcher tuning, `review.*` checkpoint knobs, `unblock_auto.*`,
-`verify_env`, and the `git.offline_lane_*` leaf tunables.
+`max_turns` / `effort` / `timeouts` / `backends`, `routing.*`
+(`allowed_models` / `ladder` / `per_model_daily_ceiling_usd` / `rules` —
+see "Model Routing" above), steward grace (`steward_completion_timeout`,
+`steward_lifetime_budget`), scheduler + watcher tuning, `review.*`
+checkpoint knobs, `unblock_auto.*`, `verify_env`, and the
+`git.offline_lane_*` leaf tunables.
 
 **Red tier** (restart-only — edit is accepted but has no effect until
 restart): `max_concurrent_tasks`, pool sizes / `verify_runners`,

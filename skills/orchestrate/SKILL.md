@@ -335,12 +335,21 @@ It takes **no path argument** — it always re-reads the process's own `ORCH_CON
 | Edit | Action |
 |---|---|
 | Per-role `models` / `budgets` / `max_turns` / `effort` / `timeouts` / `backends` | Reload |
+| `routing.*` (`allowed_models` / `ladder` / `per_model_daily_ceiling_usd` / `rules`) | Reload |
 | Steward grace (`steward_completion_timeout`, `steward_lifetime_budget`) | Reload |
 | Scheduler + starvation-watchdog tuning, loop-pass thresholds (`idle_poll_secs`, `orphan_l0_timeout_secs`, watcher-rotation params) | Reload |
 | `review.*` checkpoint knobs, `unblock_auto.*`, `verify_env` | Reload |
 | `git.offline_lane_*` leaf tunables (test threads, poll interval, red-advance count) | Reload |
 | `max_concurrent_tasks`, pool sizes / `verify_runners`, `escalation` bind host/port, `sandbox.backend`, `project_root`, merge-lane `git.*` structural fields (`branch_prefix`, `main_branch`, `persistent_merge_worktree`, …) | **Restart** — these are startup-baked (semaphores, pool sizes, bound sockets, module globals); reload reports them in `restart_required` without touching the running process |
 | Any code change (not just YAML) | **Restart** — reload only re-reads config, never code |
+
+`routing.*` is green-tier hot-reloadable like the other per-role knobs — its
+leaves are auto-covered by `RELOADABLE_FIELDS` through
+`config._submodel_leaf_paths` (task 2535 step-16 confirmed this), matching
+the existing per-role `models`/`budgets`/`max_turns`/`effort`/`backends`
+reload semantics. An operator can install/retune a policy rule or bump
+`allowed_models`/ceilings without a restart, then read `applied` /
+`restart_required` in the reload response as usual.
 
 When unsure, reload first — it's cheap and non-destructive (fail-closed on bad YAML, never half-applies), then check the response for anything in `restart_required` and restart only if something you actually need is on that list.
 
@@ -362,6 +371,48 @@ When unsure, reload first — it's cheap and non-destructive (fail-closed on bad
 Every call — success or failure — appends a `config_reload` event row to `runs.db` and fires a WARNING journal line whenever `restart_required` is non-empty or `reloaded=false`, so an AFK operator can audit what happened after the fact.
 
 See `CLAUDE.md`'s "Orchestrator Config Reload" section for the quick-reference tier summary, and `plans/config-hot-reload-prd.md` for the full allowlist and invariants.
+
+---
+
+## Model Routing
+
+The orchestrator resolves `(model, effort, budget_usd, max_turns)` for every LLM invocation through a layered resolver (`routing.resolve_route`). See `CLAUDE.md`'s "Model Routing" section for the `routing.*` config block, the closed match/set vocabulary, and the layered precedence — this section covers the operator-facing CLI and how to read what was actually decided.
+
+### Probing model availability
+
+`orchestrator probe-models` exercises every configured pool account (`config.usage_cap.accounts`) × candidate model — default `config.routing.allowed_models` plus the fable candidate model (`claude-fable-5`) — with a cheap 1-turn invocation, and writes a deterministic, committable YAML availability artifact:
+
+```bash
+cd /home/leo/src/dark-factory
+uv run --project orchestrator orchestrator probe-models --config "$TARGET_CONFIG" \
+  [--models m1,m2] [--output PATH]
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--config` | required (or `ORCH_CONFIG_PATH`) | Same target-project rule as every other subcommand — selects `project_root` and the probed account/model config |
+| `--models` | `routing.allowed_models` + the fable candidate | Comma-separated override for the probed model set |
+| `--output` | `routing.DEFAULT_PROBE_ARTIFACT_PATH` (`config/model-availability.yaml`) | Where to write the rendered artifact |
+
+Per `(account, model)` pair, the artifact records one status (from `routing.classify_probe_outcome`, except `no_token`/`invoke_error` which the probe runner assigns directly around it):
+
+| Status | Meaning |
+|---|---|
+| `available` | invocation succeeded |
+| `unavailable` | model not found for this account |
+| `auth_error` | account auth failed |
+| `capped` | account is at or near its usage cap |
+| `no_token` | account's OAuth token env var is unresolvable — the model was never invoked for it |
+| `invoke_error` | the invocation call itself raised (network/subprocess) |
+| `error` | any other classified failure outcome (not a raised exception — that's `invoke_error`) |
+
+This artifact is the input a future fable-admission gate consumes to decide whether `claude-fable-5` is safe to add to `routing.allowed_models` fleet-wide — running the probe does not itself admit it.
+
+### Reading routing decisions
+
+Today's per-invocation routing visibility: every resolved invocation emits a `routing_decision` event, and each task's `metadata.routing` carries the latest decision (`model`, `source_layer`, `rule_id`, `rejected` reasons) plus bounded history. There's no dedicated CLI query yet — `metadata.routing` is the practical read path, via `get_task`/`get_tasks` (see "Check Status" below).
+
+**Forthcoming:** a per-(model×role) rollup (done/blocked/cap-hit rates, $/done) in the digest and dashboard is not yet rendered — this section will be updated once that lands.
 
 ---
 
