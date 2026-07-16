@@ -197,6 +197,46 @@ class TestCheckGate1Terminal:
         assert 'set_task_status' in hint
         assert 'done_provenance' in hint
 
+    def test_annotation_clear_exempts_done_task_from_gate_1(self):
+        verdict = _check('update_task', live_status='done', is_annotation_clear=True)
+        assert verdict.is_rejection is False
+        assert verdict.error_type != 'ReconTerminalWriteRejected'
+
+    def test_annotation_clear_exempts_cancelled_task_from_gate_1(self):
+        verdict = _check('update_task', live_status='cancelled', is_annotation_clear=True)
+        assert verdict.is_rejection is False
+        assert verdict.error_type != 'ReconTerminalWriteRejected'
+
+    def test_annotation_clear_false_still_rejects(self):
+        verdict = _check('update_task', live_status='done', is_annotation_clear=False)
+        assert verdict.is_rejection is True
+        assert verdict.error_type == 'ReconTerminalWriteRejected'
+
+    def test_annotation_clear_omitted_defaults_false_still_rejects(self):
+        """Backward compatibility: existing callers that never pass
+        is_annotation_clear must see unchanged Gate 1 behavior."""
+        verdict = _check('update_task', live_status='done')
+        assert verdict.is_rejection is True
+        assert verdict.error_type == 'ReconTerminalWriteRejected'
+
+    def test_annotation_clear_still_subject_to_gate_3_stale_snapshot(self):
+        """The exemption bypasses Gate 1 only — Gate 3 (stale snapshot)
+        still composes and fires on a clear write carrying a stale token."""
+        verdict = _check(
+            'update_task',
+            live_status='done',
+            is_annotation_clear=True,
+            snapshot_token='pending',
+        )
+        assert verdict.is_rejection is True
+        assert verdict.error_type == 'ReconStaleSnapshotRejected'
+
+    def test_annotation_clear_on_non_terminal_task_is_unaffected(self):
+        verdict = _check(
+            'update_task', live_status='in-progress', is_annotation_clear=False,
+        )
+        assert verdict.is_rejection is False
+
 
 # ---------------------------------------------------------------------------
 # check() gate 2 — live workflow (set_task_status only)
