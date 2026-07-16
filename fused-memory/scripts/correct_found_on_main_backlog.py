@@ -57,8 +57,10 @@ Usage
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger('correct_found_on_main_backlog')
@@ -254,9 +256,52 @@ async def apply_corrections(
     if not apply:
         return summary
 
-    # Execution (reopen/annotate branches, per-op isolation) lands in later
-    # steps of this task's step sequence.
+    for correction in corrections:
+        if correction.action == ACTION_ANNOTATE:
+            await _apply_annotate(backend, project_root, correction, tag)
+            summary['annotated'] += 1
+        # ACTION_REOPEN handling (+ per-op error isolation for both
+        # branches) lands in later steps of this task's step sequence.
+
     return summary
+
+
+def _annotation_metadata(correction: Correction, *, extra: dict[str, Any] | None = None) -> str:
+    """Build the JSON-encoded ``{'x_provenance_audit': {...}}`` metadata patch.
+
+    Always carries ``label``/``reasons``/``ref``/``audited_at``; *extra*
+    (e.g. ``reopen_reason`` for the reopen audit trail) is merged in on top.
+    Freshly stamps ``audited_at`` on every call — this is a write-time
+    fact, never carried over from the Correction itself.
+    """
+    annotation: dict[str, Any] = {
+        'label': correction.label,
+        'reasons': correction.reasons,
+        'ref': correction.ref,
+        'audited_at': datetime.now(UTC).isoformat(),
+    }
+    if extra:
+        annotation.update(extra)
+    return json.dumps({'x_provenance_audit': annotation})
+
+
+async def _apply_annotate(
+    backend: Any, project_root: str, correction: Correction, tag: str | None,
+) -> None:
+    """Merge-write *correction*'s reviewed disposition into metadata.x_provenance_audit.
+
+    Uses ``update_task``'s DEFAULT metadata_mode (``'merge'``) —
+    ``metadata_mode`` is never passed, let alone set to ``'replace'`` — so
+    ``done_provenance``/``files`` and every sibling metadata key survive
+    untouched. A corrective annotation must never destroy the very
+    provenance record it documents.
+    """
+    await backend.update_task(
+        correction.task_id, project_root,
+        metadata=_annotation_metadata(correction),
+        tag=tag,
+    )
+    logger.info('Annotated task %s (label=%s)', correction.task_id, correction.label)
 
 
 # NOTE: the CLI entry point (main/_run, step 14) lands in a later commit of
