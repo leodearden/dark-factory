@@ -522,6 +522,66 @@ class TestRoutingState:
         assert dumped['x_extra'] == 'keep'
 
 
+class TestRoutingStateTransforms:
+    """RoutingState.with_decision / RoutingState.from_metadata (PRD γ, task 2533)."""
+
+    _MIN_DECISION = {
+        'role': 'implementer',
+        'model': 'sonnet',
+        'effort': 'high',
+        'budget_usd': 10.0,
+        'max_turns': 80,
+        'source_layer': 'config',
+    }
+
+    def _decision(self, **overrides) -> RoutingDecisionMirror:
+        return RoutingDecisionMirror(**{**self._MIN_DECISION, **overrides})
+
+    def test_routing_history_max_constant_is_five(self):
+        assert task_metadata_module._ROUTING_HISTORY_MAX == 5
+
+    def test_with_decision_sets_latest_and_appends_to_history(self):
+        s = RoutingState()
+        d = self._decision()
+        updated = s.with_decision(d)
+        assert updated.latest == d
+        assert updated.history == [d]
+
+    def test_with_decision_keeps_newest_five_of_seven_oldest_dropped_order_preserved(self):
+        s = RoutingState()
+        decisions = [self._decision(decided_at=str(i)) for i in range(7)]
+        for d in decisions:
+            s = s.with_decision(d)
+        assert len(s.history) == 5
+        assert s.history == decisions[-5:]
+        assert s.latest == decisions[-1]
+
+    def test_with_decision_preserves_routing_tier_simple_saturated_and_extra_field(self):
+        s = RoutingState(routing_tier=2, simple_saturated=True, x_extra='keep')  # type: ignore[call-arg]
+        updated = s.with_decision(self._decision())
+        assert updated.routing_tier == 2
+        assert updated.simple_saturated is True
+        assert updated.model_dump()['x_extra'] == 'keep'
+
+    def test_from_metadata_none_returns_default(self):
+        assert RoutingState.from_metadata(None) == RoutingState()
+
+    def test_from_metadata_empty_dict_returns_default(self):
+        assert RoutingState.from_metadata({}) == RoutingState()
+
+    def test_from_metadata_valid_routing_returns_typed_state_with_latest_populated(self):
+        state = RoutingState.from_metadata({'routing': {'latest': dict(self._MIN_DECISION)}})
+        assert isinstance(state, RoutingState)
+        assert isinstance(state.latest, RoutingDecisionMirror)
+        assert state.latest.role == 'implementer'
+
+    def test_from_metadata_non_dict_routing_value_returns_default_never_raises(self):
+        assert RoutingState.from_metadata({'routing': 'not-a-dict'}) == RoutingState()
+
+    def test_from_metadata_malformed_routing_dict_returns_default_never_raises(self):
+        assert RoutingState.from_metadata({'routing': {'history': 'bad'}}) == RoutingState()
+
+
 class TestTaskMetadataFields:
     def test_empty_defaults(self):
         tm = TaskMetadata()
