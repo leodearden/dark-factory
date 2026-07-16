@@ -3316,8 +3316,16 @@ async def run_verification(
         # intentionally stays un-rewritten (same treatment as the nice
         # prefix: an execution detail layered onto cmd, not the persisted
         # config command).
+        # Identity-check the mutation before rendering (mirrors
+        # _govern_cpu_str's `governed is parsed` guard above): a non-pytest
+        # test leg (cmd.tool is not PYTEST) makes apply_pytest_numprocesses
+        # return the same object, so skip the parse->render round-trip
+        # entirely rather than reformatting a command that wasn't actually
+        # touched.
         if admission and role in {'task', 'background'} and config.verify_admission_pytest_n not in {'', 'auto'}:
-            cmd = render(apply_pytest_numprocesses(parse_config_command(cmd), config.verify_admission_pytest_n))
+            parsed = parse_config_command(cmd)
+            mutated = apply_pytest_numprocesses(parsed, config.verify_admission_pytest_n)
+            cmd = cmd if mutated is parsed else render(mutated)
         if admission:
             prefix = _resolve_nice_prefix(config, role)
             if prefix:

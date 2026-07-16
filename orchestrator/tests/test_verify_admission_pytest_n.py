@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 from orchestrator.config import (
     RELOADABLE_FIELDS,
@@ -90,6 +91,26 @@ class TestVerifyAdmissionPytestNConfigDefault:
         cfg = OrchestratorConfig()
         assert isinstance(cfg.verify_admission_pytest_n, str)
         assert cfg.verify_admission_pytest_n == 'auto'
+
+
+class TestVerifyAdmissionPytestNValidation:
+    """A malformed value is rejected at construction/reload rather than
+    reaching pytest-xdist unvalidated and only failing the whole test leg
+    the next time a task/background verify runs (mirrors
+    TestVerifyAdmissionTaskSlotsValidation in test_config_verify_admission_
+    reload.py). Accepted values mirror pytest-xdist's own `-n` grammar plus
+    this knob's own '' no-op sentinel.
+    """
+
+    @pytest.mark.parametrize('bad_value', ['1six', 'sixteen', '0', '-1', '3.5', ' 16'])
+    def test_malformed_value_rejected(self, bad_value):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(verify_admission_pytest_n=bad_value)
+
+    @pytest.mark.parametrize('good_value', ['', 'auto', 'logical', '1', '16'])
+    def test_valid_values_accepted(self, good_value):
+        cfg = OrchestratorConfig(verify_admission_pytest_n=good_value)
+        assert cfg.verify_admission_pytest_n == good_value
 
 
 class TestVerifyAdmissionPytestNReloadDisposition:
@@ -295,4 +316,97 @@ class TestPytestNWiring:
 
         assert captured_cmds[0] == _TEST_CMD, (
             'disabled admission must never inject -n (or nice/bash-c wrap) the test leg'
+        )
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('test_command', 'expected_inner'),
+        [
+            (
+                'cd orchestrator && uv run pytest tests/ -x',
+                'cd orchestrator && uv run pytest -x -n 16 tests/',
+            ),
+            (
+                # The actual shape used in orchestrator/config.yaml's per-subproject
+                # test_command legs today: an '='-joined value flag (a single
+                # token), not a separate-token value flag. Confirms the
+                # parse->render round-trip (verify.py:3326-3328) is
+                # argv-equivalent to the input plus '-n 16' for a realistic,
+                # currently-deployed module command shape.
+                'cd orchestrator && uv run pytest tests/ --timeout=300',
+                'cd orchestrator && uv run pytest --timeout=300 -n 16 tests/',
+            ),
+        ],
+    )
+    async def test_realistic_module_command_is_argv_equivalent_with_dash_n_appended(
+        self, tmp_path, test_command, expected_inner
+    ):
+        captured_cmds: list[str] = []
+
+        async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+            verify_admission_pytest_n='16',
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(test_command=test_command),
+                role='task',
+                attempt_id=None,
+            )
+
+        test_cmd = next(c for c in captured_cmds if _leg_for_cmd(c) == 'test')
+        # role='task' also gets the nice-prefix bash-c wrap (T2); the inner
+        # payload is what apply_pytest_numprocesses/render produced.
+        expected = 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(expected_inner)
+        assert test_cmd == expected, (
+            f'expected the parse->render round-trip to be argv-equivalent to '
+            f'{test_command!r} plus -n 16; got {test_cmd!r}'
+        )
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_chained_module_command_gets_dash_n_on_each_invocation(self, tmp_path):
+        chained_cmd = (
+            'cd shared && uv run pytest tests/ && '
+            'cd ../orchestrator && uv run pytest tests/'
+        )
+        captured_cmds: list[str] = []
+
+        async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+            verify_admission_pytest_n='16',
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(test_command=chained_cmd),
+                role='task',
+                attempt_id=None,
+            )
+
+        test_cmd = next(c for c in captured_cmds if _leg_for_cmd(c) == 'test')
+        assert test_cmd.count('-n 16') == 2, (
+            f'expected -n 16 injected into both chained pytest invocations; got {test_cmd!r}'
         )

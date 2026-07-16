@@ -2044,6 +2044,10 @@ class OrchestratorConfig(BaseSettings):
     # behavior-preserving value is kept — '' or 'auto' is a no-op (byte-
     # identical to today's `-n auto` pyproject addopts); any other value is
     # rendered as a literal `-n <value>` (see verify_cmd.apply_pytest_numprocesses).
+    # Validated below (_validate_verify_admission_pytest_n) against
+    # pytest-xdist's own accepted -n values, so a typo fails loud at config
+    # load/reload instead of silently reaching pytest-xdist and failing the
+    # whole test leg at verify time.
     verify_admission_pytest_n: str = Field(default='auto')
 
     # Steward lifecycle
@@ -2769,6 +2773,32 @@ class OrchestratorConfig(BaseSettings):
     @classmethod
     def _resolve_project_root(cls, v: Path) -> Path:
         return v.resolve()
+
+    @field_validator('verify_admission_pytest_n', mode='before')
+    @classmethod
+    def _validate_verify_admission_pytest_n(cls, v: Any) -> Any:
+        """Reject a malformed `-n` value at config load/reload (task 2394 T6).
+
+        Mirrors pytest-xdist's own accepted ``-n``/``--numprocesses`` values:
+        ``'auto'``/``'logical'`` (worker-count strategies), ``''`` (this
+        knob's own no-op sentinel — see the field comment above), or a
+        positive-integer string. Anything else (a typo like ``'1six'``, or a
+        non-positive count like ``'0'``) would otherwise reach pytest-xdist
+        unvalidated and fail the whole test leg only when a task/background
+        verify next runs — this fails loud at construction/reload instead.
+        Non-str values are passed through so pydantic's own type-coercion
+        error reports the type mismatch rather than this validator's.
+        """
+        if not isinstance(v, str):
+            return v
+        if v in {'', 'auto', 'logical'}:
+            return v
+        if v.isdigit() and int(v) > 0:
+            return v
+        raise ValueError(
+            "verify_admission_pytest_n must be '', 'auto', 'logical', or a "
+            f"positive-integer string (pytest-xdist's accepted -n values); got {v!r}"
+        )
 
     @model_validator(mode='after')
     def _default_verify_admission_slots_dir(self) -> 'OrchestratorConfig':
