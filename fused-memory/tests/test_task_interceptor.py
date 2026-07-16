@@ -6293,6 +6293,32 @@ class TestExtractMetaFiles:
             f'but was called {call_count[0]} time(s)'
         )
 
+    def test_build_candidate_threads_execution_class_from_dict_metadata(self):
+        """(task 2687) _build_candidate extracts metadata.execution_class onto
+        CandidateTask.execution_class — the field that feeds the
+        operational-ask registry's execution_class routing axis."""
+        kwargs = {'title': 'T', 'metadata': {'execution_class': 'operational'}}
+        candidate = TaskInterceptor._build_candidate(kwargs)
+        assert candidate is not None
+        assert candidate.execution_class == 'operational'
+
+    def test_build_candidate_threads_execution_class_from_json_string_metadata(self):
+        """(task 2687) A JSON-string metadata value is parsed the same way."""
+        kwargs = {'title': 'T', 'metadata': '{"execution_class": "decision"}'}
+        candidate = TaskInterceptor._build_candidate(kwargs)
+        assert candidate is not None
+        assert candidate.execution_class == 'decision'
+
+    def test_build_candidate_execution_class_defaults_to_none(self):
+        """(task 2687) Absent execution_class (or metadata=None) yields None."""
+        candidate = TaskInterceptor._build_candidate({'title': 'T'})
+        assert candidate is not None
+        assert candidate.execution_class is None
+
+        candidate2 = TaskInterceptor._build_candidate({'title': 'T', 'metadata': None})
+        assert candidate2 is not None
+        assert candidate2.execution_class is None
+
 
 # ---------------------------------------------------------------------------
 # Regression tests — prompt-only fallback must also scan metadata files

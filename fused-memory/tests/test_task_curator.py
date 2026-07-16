@@ -197,6 +197,65 @@ class TestCandidateHash:
         b = CandidateTask(title='T', spawned_from='43')
         assert a.payload_hash() != b.payload_hash()
 
+    def test_execution_class_affects_hash(self):
+        """(task 2687) match_candidate routes on execution_class FIRST and
+        unconditionally, so two otherwise-identical candidates differing only in
+        execution_class must NOT collide — otherwise the first-processed
+        candidate's cached routing decision (e.g. a deterministic pure-gate) is
+        wrongly returned for the second (e.g. a code_tdd change), silently
+        skipping the architect.
+        """
+        a = CandidateTask(title='T', description='D', details='X', execution_class='operational')
+        b = CandidateTask(title='T', description='D', details='X', execution_class='code_tdd')
+        assert a.payload_hash() != b.payload_hash()
+
+    def test_execution_class_none_vs_set_differ(self):
+        """(task 2687) An untagged candidate must not collide with a tagged one."""
+        a = CandidateTask(title='T', description='D', details='X')
+        b = CandidateTask(title='T', description='D', details='X', execution_class='operational')
+        assert a.payload_hash() != b.payload_hash()
+
+    def test_execution_class_operational_vs_decision_differ(self):
+        """(task 2687) 'operational' and 'decision' are both non-code_tdd routing
+        values but must not collide with each other either — payload_hash must
+        distinguish every pairwise combination of execution_class values.
+        """
+        a = CandidateTask(title='T', description='D', details='X', execution_class='operational')
+        b = CandidateTask(title='T', description='D', details='X', execution_class='decision')
+        assert a.payload_hash() != b.payload_hash()
+
+    def test_execution_class_hash_idempotent(self):
+        """(task 2687) Hashing execution_class must not break idempotency: two
+        candidates that agree on execution_class (including both untagged/None)
+        still hash equal.
+        """
+        a1 = CandidateTask(title='T', description='D', details='X')
+        a2 = CandidateTask(title='T', description='D', details='X')
+        assert a1.payload_hash() == a2.payload_hash()
+
+        b1 = CandidateTask(title='T', description='D', details='X', execution_class='operational')
+        b2 = CandidateTask(title='T', description='D', details='X', execution_class='operational')
+        assert b1.payload_hash() == b2.payload_hash()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-2687 step-1 RED: TestCandidateTaskExecutionClass
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCandidateTaskExecutionClass:
+    """CandidateTask carries metadata.execution_class so the operational-ask
+    registry's match_candidate() can consult it as a routing axis (task 2687).
+    """
+
+    def test_execution_class_set_from_kwarg(self):
+        c = CandidateTask(title='x', execution_class='operational')
+        assert c.execution_class == 'operational'
+
+    def test_execution_class_defaults_to_none(self):
+        c = CandidateTask(title='x')
+        assert c.execution_class is None
+
 
 class TestHashShapeContract16:
     """Shape-contract regression guard for the two task_curator.py sha256 mirror sites
@@ -5166,6 +5225,57 @@ class TestCuratorMaybeRouteDeterministic:
         assert decision is not None
         assert decision.action == "route_deterministic"
         assert curator._check_cache(payload_hash) is None
+
+    async def test_execution_class_operational_routes_without_substring_match(self, tmp_path):
+        """(task 2687) A candidate tagged metadata.execution_class='operational'
+        routes to route_deterministic even though it matches none of the
+        registry's substring entries."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Restart fused-memory service to activate an echo-write suppression fix",
+            description="Nothing about pruning cycle summaries here.",
+            execution_class="operational",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is not None
+        assert decision.action == "route_deterministic"
+        assert decision.justification.startswith("operational-ask-registry:")
+
+    async def test_execution_class_code_tdd_does_not_route_without_substring_match(
+        self, tmp_path,
+    ):
+        """(task 2687) An equivalent candidate tagged execution_class='code_tdd'
+        does NOT route — unchanged pre-existing substring-only behavior."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Restart fused-memory service to activate an echo-write suppression fix",
+            description="Nothing about pruning cycle summaries here.",
+            execution_class="code_tdd",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
