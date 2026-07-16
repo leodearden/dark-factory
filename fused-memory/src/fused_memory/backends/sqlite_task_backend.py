@@ -44,6 +44,7 @@ from fused_memory.backends.task_backend_types import (
     GetTasksResult,
     RemoveTaskResult,
     SetTaskStatusResult,
+    StatusWriteNotPersistedResult,
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
@@ -176,7 +177,7 @@ class _StatusWriteNotPersisted(Exception):
             f'requested {requested_status!r}, actual {actual_status!r}',
         )
 
-    def to_error_dict(self) -> dict:
+    def to_error_dict(self) -> StatusWriteNotPersistedResult:
         return {
             'success': False,
             'error': 'status_write_not_persisted',
@@ -1677,7 +1678,7 @@ class SqliteTaskBackend:
         *,
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
-    ) -> SetTaskStatusResult:
+    ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Update ``status``, optionally stamping/clearing the claimant columns.
 
         ``claimant_run_id``/``heartbeat_at`` are tri-state (task 2182, PRD
@@ -1801,7 +1802,7 @@ class SqliteTaskBackend:
         audit_fields: dict,
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
-    ) -> SetTaskStatusResult:
+    ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Atomically update ``status`` AND merge ``audit_fields`` into metadata.
 
         The sole atomic status+audit writer (task 2649). Calling

@@ -694,6 +694,7 @@ async def test_set_task_status_claimant_fails_safe_when_columns_absent(tmp_path,
     finally:
         await b.close()
 
+    assert 'message' in result  # narrows SetTaskStatusResult | StatusWriteNotPersistedResult
     assert 'in-progress' in result['message']
     assert one['status'] == 'in-progress'
     assert one['claimant_run_id'] is None

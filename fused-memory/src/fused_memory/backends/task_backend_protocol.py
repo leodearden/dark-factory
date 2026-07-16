@@ -19,6 +19,7 @@ from fused_memory.backends.task_backend_types import (
     GetTasksResult,
     RemoveTaskResult,
     SetTaskStatusResult,
+    StatusWriteNotPersistedResult,
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
@@ -128,7 +129,7 @@ class TaskBackendProtocol(Protocol):
         *,
         claimant_run_id: str | None = None,
         heartbeat_at: str | None = None,
-    ) -> SetTaskStatusResult:
+    ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Update ``status``, optionally stamping the claimant columns.
 
         ``claimant_run_id``/``heartbeat_at`` (task 2182, PRD C4/D4) are
@@ -136,6 +137,10 @@ class TaskBackendProtocol(Protocol):
         (a sentinel default leaves the column untouched); the protocol exposes
         them as ``None``-defaulted so callers may supply them and backends stay
         assignable to this shape.
+
+        Returns :class:`StatusWriteNotPersistedResult` instead of a fabricated
+        success (task 2649) when a post-write read-back shows the status
+        column did not actually take the requested value.
         """
         ...
 
