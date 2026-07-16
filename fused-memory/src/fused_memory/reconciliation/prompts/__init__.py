@@ -104,6 +104,7 @@ _RECON_REPORT_PLACEHOLDERS = {
     'project_id': '<project_id>',
     'memory_id': '<uuid>',
     'store': "<'mem0'|'graphiti'>",
+    'cited_run_id': '<full 36-char run UUID>',
 }
 
 
@@ -153,6 +154,7 @@ def render_recon_report_tool_guidance() -> str:
     cite_edge_call = render_call('cite_edge')
     cite_task_call = render_call('cite_task')
     cite_memory_call = render_call('cite_memory')
+    cite_run_call = render_call('cite_run')
     set_stat_call = render_call('set_stat')
     inc_stat_call = render_call('inc_stat')
     complete_call = render_call('complete')
@@ -178,6 +180,11 @@ def render_recon_report_tool_guidance() -> str:
         ' sole dedup anchor there.\n'
         f'- `{cite_memory_call}` — `memory_id` must be the full 36-char UUID from the'
         ' `id` field of a fresh tool result.\n'
+        f'- `{cite_run_call}` — whenever a finding\'s description or'
+        ' suggested_action references another reconciliation run\'s run_id, call this'
+        ' to confirm it exists and attach it. Copy `cited_run_id` verbatim from the'
+        ' `run_id` or `metadata.run_id` field of a fresh tool result — never re-type'
+        ' or paraphrase a run_id from memory.\n'
         f'For stats counters use `{set_stat_call}` or'
         f' `{inc_stat_call}`. When all findings are recorded'
         ' and all work is done, call'
@@ -226,6 +233,13 @@ _RECON_REPORT_TOOL_GUIDANCE_FALLBACK = (
     ' finding_id=<finding_id from add_finding response>, memory_id=<uuid>,'
     " store=<'mem0'|'graphiti'>)` — `memory_id` must be the full 36-char UUID from the"
     ' `id` field of a fresh tool result.\n'
+    '- `mcp__recon-report__cite_run(run_id=<from Reconciliation Context>,'
+    ' finding_id=<finding_id from add_finding response>,'
+    " cited_run_id=<full 36-char run UUID>)` — whenever a finding's description or"
+    " suggested_action references another reconciliation run's run_id, call this to"
+    ' confirm it exists and attach it. Copy `cited_run_id` verbatim from the `run_id`'
+    ' or `metadata.run_id` field of a fresh tool result — never re-type or paraphrase'
+    ' a run_id from memory.\n'
     'For stats counters use `mcp__recon-report__set_stat(run_id=<from Reconciliation'
     ' Context>, key=<key>, value=<value>)` or `mcp__recon-report__inc_stat(run_id=<from'
     ' Reconciliation Context>, key=<key>, delta=<delta>)`. When all findings are recorded'
