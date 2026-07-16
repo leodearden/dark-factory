@@ -810,3 +810,67 @@ def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> No
             f'EscalationStatStrip does not have a human-readable tile label '
             f'containing {token!r} — add a descriptive label to the corresponding tile.'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-5 test: strip windows its series to a trailing 7d anchored to
+# analytics.generated_at (never Date.now())
+# ---------------------------------------------------------------------------
+
+
+def test_tab_escalations_strip_window_anchored_7d(tab_escalations_jsx_body: str) -> None:
+    """The strip's series must be windowed to a trailing 7d anchored to the
+    payload's own generated_at clock, never Date.now() — immune to
+    browser-clock skew (matches the analytics tab's clock discipline).
+
+    Asserts:
+    (1) a `function windowCutoffDate(` helper is defined whose body
+        references `generatedAt` and does NOT call `Date.now(`.
+    (2) the EscalationStatStrip body references `generated_at` (reads the
+        payload clock).
+    (3) `Date.now(` does not appear anywhere in the EscalationStatStrip body.
+    (4) a 7-day window is expressed near the cutoff/window logic.
+    """
+    body = tab_escalations_jsx_body
+
+    # (1) windowCutoffDate helper, generatedAt-anchored, no Date.now()
+    cutoff_fn = _extract_function_body(body, 'windowCutoffDate')
+    assert cutoff_fn, (
+        'tab_escalations.jsx does not define `function windowCutoffDate(` — add a '
+        'local generated_at-anchored cutoff helper (copy the pattern from '
+        'tab_escalation_analytics.jsx).'
+    )
+    assert 'generatedAt' in cutoff_fn, (
+        'windowCutoffDate does not reference `generatedAt` in its body — it must '
+        'anchor the cutoff to the payload clock, not the browser clock.'
+    )
+    assert 'Date.now(' not in cutoff_fn, (
+        'windowCutoffDate calls Date.now( — the cutoff must be anchored exclusively '
+        'to generatedAt (immune to browser-clock skew), never Date.now().'
+    )
+
+    # (2)/(3) EscalationStatStrip anchors to generated_at, never Date.now()
+    strip_fn = _extract_function_body(body, 'EscalationStatStrip')
+    assert strip_fn, (
+        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body.'
+    )
+    assert 'generated_at' in strip_fn, (
+        'EscalationStatStrip does not reference generated_at — anchor the window '
+        'cutoff to analytics.generated_at.'
+    )
+    assert 'Date.now(' not in strip_fn, (
+        'EscalationStatStrip calls Date.now( — the window must be anchored '
+        'exclusively to analytics.generated_at, never the browser clock.'
+    )
+
+    # (4) 7-day window literal expressed near the cutoff/window logic — either
+    # a `windowCutoffDate(..., 7)` call site in the strip, or a `days * 7`
+    # (or `7 * days`) expression inside the helper itself.
+    assert (
+        re.search(r'windowCutoffDate\([^)]*,\s*7\s*\)', strip_fn)
+        or re.search(r'days\s*\*\s*7\b|\b7\s*\*\s*days', cutoff_fn)
+    ), (
+        'No 7-day window literal found — express the trailing-7d window via a '
+        '`windowCutoffDate(..., 7)` call in EscalationStatStrip (or an equivalent '
+        '`days * 7` expression in the windowCutoffDate helper itself).'
+    )
