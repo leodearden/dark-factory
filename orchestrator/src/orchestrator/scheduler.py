@@ -631,6 +631,20 @@ class TickContext:
     / ``psi_*`` written across phases). Co-located here (not a new module)
     to avoid a circular import — it references ``OverrideRow``, ``PsiSample``,
     and ``TaskAssignment``, all already defined/imported in this module.
+
+    ``terminal_dep_records`` (task 2692, δ/ε follow-up): holds fetched
+    TERMINAL (done/cancelled) dep records that are referenced by a pending
+    task but absent from ``tasks_by_id`` — the active-only ``get_tasks``
+    fetch that seeds ``tasks_by_id`` excludes done/cancelled producers, so
+    a just-completed dep carrying ``metadata.delivered_checks`` would
+    otherwise be invisible to the delivered-check gate. Populated by
+    ``_phase_backfill_terminal_dep_records`` (via the lean per-id
+    ``get_task`` primitive) and consulted ONLY by the two delivered-check
+    consumers (``_deps_satisfied``, ``_compute_delivered_check_cache``) as
+    a purely additive fallback when ``tasks_by_id.get(dep_id)`` is
+    ``None`` — NEVER merged into ``tasks_by_id`` itself, since ~20 other
+    phases (``_phase_stale_sweep``, ``_phase_park_gc``, ...) assume
+    ``tasks_by_id`` holds only active tasks.
     """
 
     tasks: list[dict]
@@ -640,6 +654,7 @@ class TickContext:
     external_cache: dict[str, str] = field(default_factory=dict)
     external_resolver_failed: bool = False
     delivered_check_cache: dict[str, bool] | None = field(default_factory=dict)
+    terminal_dep_records: dict[str, dict] = field(default_factory=dict)
     overrides: dict[str, OverrideRow] = field(default_factory=dict)
     overrides_for_diff: dict[str, OverrideRow] = field(default_factory=dict)
     effective_priorities: dict[str, str] = field(default_factory=dict)
