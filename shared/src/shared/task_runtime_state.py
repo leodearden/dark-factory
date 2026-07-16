@@ -33,6 +33,18 @@ model living in ``shared/`` and imported directly by each consumer
 (``from shared.task_runtime_state import ...``), deliberately NOT
 re-exported via ``shared/__init__.py`` (outside the enumerated public-API
 surface that ``__all__`` / ``test_public_api.py`` track).
+
+Cross-package vocabulary coupling: ``phase``/``lane_state`` are
+machine-checked ``Literal`` vocabularies here, but free-form ``str`` on the
+``orchestrator.task_runtime.TaskRuntimeState`` source (today's
+``_derive_phase``/``_LANE_STATE_MAP`` only ever emit values inside this
+vocab, but that is not an enforced invariant). The producer
+(``escalation.server.get_task_runtime_state``) is responsible for handling
+a future out-of-vocab value gracefully — it degrades that one task to an
+honest per-task error entry instead of letting the ``ValidationError``
+fail the whole snapshot; see ``escalation.server._project_task_runtime_entry``.
+This model itself still raises on construction with an out-of-vocab value
+(INV-1) — it does not silently widen the type to catch drift.
 """
 
 from typing import Literal

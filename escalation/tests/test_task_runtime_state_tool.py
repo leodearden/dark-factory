@@ -110,6 +110,52 @@ _HONEST_FAILURE_EXPECTED = {
     'error': 'RuntimeError: boom',
 }
 
+# A stand-in that omits `error` entirely (every other fixture in this suite
+# sets it explicitly) -- exercises the tool's getattr(s, 'error', None)
+# fallback, the only reason getattr is used instead of a direct s.error read
+# like the other 8 fields.
+_NO_ERROR_ATTR_ENTRY = types.SimpleNamespace(
+    task_id=21,
+    has_worktree=False,
+    loops=0,
+    attempts=0,
+    started=None,
+    lane=None,
+    phase='PLAN',
+    lane_state=None,
+)
+
+# An out-of-vocab `phase` -- today's orchestrator source (_derive_phase)
+# only ever emits 'PLAN'/'EXECUTE'/'DONE', but the source types phase as
+# free-form str while the wire model narrows it to a Literal. Pins the
+# tool's behavior at that boundary: isolated per-task degradation, not a
+# whole-snapshot failure.
+_BOGUS_PHASE_ENTRY = types.SimpleNamespace(
+    task_id=99,
+    has_worktree=True,
+    loops=5,
+    attempts=2,
+    started='2026-07-16T00:00:00+00:00',
+    lane='_lane-1',
+    phase='VERIFY',
+    lane_state='assigned',
+    error=None,
+)
+
+# An out-of-vocab `lane_state` -- today's _LANE_STATE_MAP only ever emits
+# 'assigned'/'quarantined'/'released', same boundary concern as phase above.
+_BOGUS_LANE_STATE_ENTRY = types.SimpleNamespace(
+    task_id=100,
+    has_worktree=True,
+    loops=1,
+    attempts=0,
+    started='2026-07-16T00:00:00+00:00',
+    lane='_lane-2',
+    phase='PLAN',
+    lane_state='weird',
+    error=None,
+)
+
 
 @pytest.mark.asyncio
 class TestGetTaskRuntimeStateTool:
@@ -152,3 +198,60 @@ class TestGetTaskRuntimeStateTool:
         assert entry['phase'] is None
         assert entry['started'] is None
         assert entry['error'] == 'RuntimeError: boom'
+
+    async def test_missing_error_attribute_defaults_to_none(self, tmp_path: Path):
+        """A snapshot stand-in that omits `error` entirely exercises the
+        tool's getattr(s, 'error', None) fallback (the other 8 fields are
+        read directly as `s.<field>`, so this is the one path where a
+        missing attribute must not raise AttributeError)."""
+        harness = types.SimpleNamespace(
+            task_runtime_snapshot=lambda: [_NO_ERROR_ATTR_ENTRY],
+        )
+        server = create_server(EscalationQueue(tmp_path / 'esc'), harness=harness)
+        result = await _call_get_task_runtime_state(server)
+        assert result['tasks'][0]['error'] is None
+
+    async def test_out_of_vocab_phase_degrades_to_isolated_error_entry(self, tmp_path: Path):
+        """A `phase` outside the wire model's Literal vocabulary (the
+        orchestrator source types it as free-form str -- see
+        `_project_task_runtime_entry`'s docstring) must not raise and take
+        down the whole snapshot. The offending task degrades to an honest
+        per-task error entry; a healthy task in the same call is unaffected."""
+        harness = types.SimpleNamespace(
+            task_runtime_snapshot=lambda: [_BOGUS_PHASE_ENTRY, _POOLED_ENTRY],
+        )
+        server = create_server(EscalationQueue(tmp_path / 'esc'), harness=harness)
+        result = await _call_get_task_runtime_state(server)
+        assert result['offline'] is False
+        bogus, healthy = result['tasks']
+        assert bogus['task_id'] == 99
+        assert bogus['has_worktree'] is True
+        assert bogus['loops'] is None
+        assert bogus['attempts'] is None
+        assert bogus['started'] is None
+        assert bogus['lane'] is None
+        assert bogus['phase'] is None
+        assert bogus['lane_state'] is None
+        assert bogus['error'] is not None
+        assert 'wire-contract violation' in bogus['error']
+        # Isolation: the next task in the same snapshot still renders normally.
+        assert healthy == _POOLED_EXPECTED
+
+    async def test_out_of_vocab_lane_state_degrades_to_isolated_error_entry(self, tmp_path: Path):
+        """Same boundary as phase above, for `lane_state`."""
+        harness = types.SimpleNamespace(
+            task_runtime_snapshot=lambda: [_BOGUS_LANE_STATE_ENTRY],
+        )
+        server = create_server(EscalationQueue(tmp_path / 'esc'), harness=harness)
+        result = await _call_get_task_runtime_state(server)
+        bogus = result['tasks'][0]
+        assert bogus['task_id'] == 100
+        assert bogus['has_worktree'] is True
+        assert bogus['loops'] is None
+        assert bogus['attempts'] is None
+        assert bogus['started'] is None
+        assert bogus['lane'] is None
+        assert bogus['phase'] is None
+        assert bogus['lane_state'] is None
+        assert bogus['error'] is not None
+        assert 'wire-contract violation' in bogus['error']
