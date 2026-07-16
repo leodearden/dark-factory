@@ -326,8 +326,6 @@ class TestAllRecords:
 
 
 @pytest.mark.asyncio
-
-
 class TestQuarantine:
     async def test_quarantine_delegates_and_persists_quarantined_state(
         self, tmp_path: Path,
