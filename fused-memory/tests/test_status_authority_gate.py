@@ -328,6 +328,37 @@ async def test_deferred_to_done_with_provenance_no_would_reject_warn(tmp_path, c
         await _close_stack(interceptor, backend, event_buffer)
 
 
+@pytest.mark.asyncio
+async def test_deferred_to_done_without_provenance_still_phantom_done_rejected(tmp_path):
+    """Task 2668 regression guard: the new (DEFERRED, DONE) transition-legality
+    edge must NOT open a phantom-done backdoor. The done-provenance gate (2b)
+    and phantom-done missing-files gate (2c) run BEFORE and short-circuit
+    ahead of the transition-legality gate (2e) — so a deferred->done write
+    WITHOUT done_provenance, on a task whose declared metadata.files does not
+    exist at project_root, is still rejected with 'done_gate_missing_files'
+    and the row stays 'deferred' (the write never lands), exactly as it
+    would from any other non-verified-provenance origin.
+    """
+    interceptor, backend, project_root, event_buffer = await _fresh_stack(tmp_path)
+    try:
+        await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps({'files': ['does_not_exist.py']}),
+        )
+        await backend.set_task_status('1', 'deferred', project_root=project_root)
+
+        result = await interceptor.set_task_status(
+            '1', 'done', project_root, agent_id='orchestrator-x',
+        )
+        assert result['success'] is False, result
+        assert result['error'] == 'done_gate_missing_files', result
+
+        statuses = await backend.get_statuses(project_root)
+        assert statuses['1'] == 'deferred'
+    finally:
+        await _close_stack(interceptor, backend, event_buffer)
+
+
 # ── A5-A6: claimant round-trip + is_stranded over a backend-fetched row ─
 
 
