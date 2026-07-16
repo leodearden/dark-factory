@@ -3287,3 +3287,51 @@ def test_boundary3_failed_verify_leaves_clock_unchanged(tmp_path: pathlib.Path) 
         f"--drain; got {clock_file.read_text()!r}"
     )
 
+
+def test_boundary4_defers_busy_unit_while_others_proceed(tmp_path: pathlib.Path) -> None:
+    """Scenario 4 (I3) -- drain-defer: a unit R with a fresh
+    merge_idle:false heartbeat is withheld from restart while a large
+    ORCH_RESTART_FORCE_FIRE_AFTER_SECS is in effect -- proven via a bounded
+    subprocess timeout (the script is still polling, not merely fast),
+    mirroring scripts/tests/test_restart_all_orchestrators.py::
+    test_defer_withholds_restart_while_busy. R is ordered AFTER a plain idle
+    unit, so the idle unit's restart being recorded before the timeout shows
+    other units proceed while R defers.
+    """
+    fleet_dir = tmp_path / "fleet"
+    unit_idle = "orchestrator-alpha.service"
+    unit_r = "orchestrator-reify.service"
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path,
+        running_units=[unit_idle, unit_r],
+        units={unit_idle: {"scenario": "fresh"}, unit_r: {"scenario": "fresh"}},
+    )
+    _boundary_write_heartbeat(fleet_dir, unit_idle, merge_idle=True, ts_epoch=time.time())
+    _boundary_write_heartbeat(fleet_dir, unit_r, merge_idle=False, ts_epoch=time.time())
+
+    clock_file = tmp_path / "clock.json"
+
+    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+        _boundary_run_drain_script(
+            bin_dir, state_path, fleet_dir, clock_file,
+            env={
+                "RESTART_VERIFY_TIMEOUT": "5",
+                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": "99999",
+                "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            },
+            timeout=3,
+        )
+
+    stdout = _boundary_decode(exc_info.value.stdout)
+    assert f"deferring restart of {unit_r}: mid-merge" in stdout, (
+        f"expected a stable defer-prefix line naming {unit_r}; got stdout={stdout!r}"
+    )
+    state = _boundary_load_state(state_path)
+    assert ["--user", "restart", unit_r] not in state["calls"], (
+        f"{unit_r}'s restart must NOT have been recorded yet; got calls={state['calls']!r}"
+    )
+    assert ["--user", "restart", unit_idle] in state["calls"], (
+        f"the idle unit ordered before {unit_r} must already be restarted "
+        f"while {unit_r} defers; got calls={state['calls']!r}"
+    )
+
