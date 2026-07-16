@@ -2279,6 +2279,34 @@ class TestShouldWithholdProposedResolutionAcceptsScope:
         assert result is True
         mock_taskmaster.get_statuses.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_dual_matching_content_withholds_via_proposed_resolution_first(
+        self, reconciler, mock_memory_service, mock_taskmaster
+    ):
+        """amendment (reviewer_comprehensive test_coverage finding): content
+        matching BOTH is_proposed_resolution_framing AND is_batch_plan_framing
+        (a 'RESOLUTION OPTIONS (architect call ...)' header alongside a
+        'queued together as df 1985-2002' batch-plan line) must withhold via
+        the proposed-resolution branch — unconditionally, with no
+        get_statuses fetch — pinning that this precedence (proposed-resolution
+        checked, and short-circuited on, before the batch-plan/statuses_cache
+        logic) does not silently change if the method is reordered later."""
+        scope = ProjectScope(ProjectId('test-project'), ProjectRoot('/tmp/test'))
+        mock_memory_service.get_episode_content = AsyncMock(
+            return_value=(
+                'RESOLUTION OPTIONS (architect call — pick one, land as a RED/GREEN '
+                'pair), queued together as df 1985-2002: '
+                '(a) Move the VERIFYING->FINALIZING _note_transition to AFTER '
+                'await entry.verify_task ...'
+            )
+        )
+        mock_taskmaster.get_statuses = AsyncMock(return_value={'1990': 'in-progress'})
+
+        result = await reconciler._should_withhold_batch_promotion('ep-uuid', scope, {})
+
+        assert result is True
+        mock_taskmaster.get_statuses.assert_not_awaited()
+
 
 # ── Pre-echo authoritative-resolution check (task 1984) ─────────────────────
 #

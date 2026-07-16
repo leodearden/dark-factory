@@ -306,6 +306,13 @@ class TargetedReconciler:
             logger.warning(f'get_episode_content failed for planned episode {ep_uuid}: {e}')
             content = None
 
+        # NOTE (amendment, reviewer_comprehensive naming_coherence finding, task
+        # 2447): this method now gates TWO planned-episode shapes (see
+        # docstring above) even though its name and the statuses_cache param
+        # still read as batch-plan-only. This early return is the shape-1
+        # (proposed-resolution) gate — unconditional, no statuses_cache
+        # involvement. Everything from here down is shape-2 (batch-plan,
+        # task 2033), which is what statuses_cache is scoped to.
         if isinstance(content, str) and is_proposed_resolution_framing(content):
             return True
 
