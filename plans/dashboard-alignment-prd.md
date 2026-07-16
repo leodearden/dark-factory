@@ -214,6 +214,15 @@ future single owner: stream W11's `TaskArtifacts` (which also plans to
 relocate `.task/` out of the git tree — this doc block is what W11 greps for
 to find the dashboard reader).
 
+**Retirement note (2026-07-16):** the `.task/`-layout half of this doc block
+and the W11 hand-off it describes are retired.
+`plans/dashboard-task-runtime-endpoint-prd.md` deleted the dashboard's
+hand-rolled `.task/` reader and replaced per-task runtime state with the
+escalation `get_task_runtime_state` MCP tool (the orchestrator remains the
+single owner of the `TaskArtifacts` format on its own side). No stale
+"W11 will take over this reader" pointer survives — there is no reader left
+to take over.
+
 ## Resolved design decisions
 
 1. **Enum home + consumption mode**: program decision #5 verbatim. Hard import
@@ -264,7 +273,7 @@ No novel substrate — G3 verified by direct grep (see capability manifest).
 |---|---|---|---|---|
 | W1 (merge-queue-reliability) | produces → W1 consumes | `OutcomeKind` in `merge_types.py` | **M3 (this PRD)** — W1 must not introduce a competing outcome enum (program seam table) | queued (task α) |
 | W1 | file-contention only | α edits emit call sites inside merge_queue.py / merge_gates.py which W1 refactors | n/a — additive literal→member conversion; scheduler module locks serialize | noted |
-| W11 (worktree-lane-lifecycle) | consumes ← W11 will own | `.task/` path derivation (`TaskArtifacts`) | **W11** — M3 documents the dashboard reader, moves no derivation logic | queued (task ζ, doc-only) |
+| W11 (worktree-lane-lifecycle) | consumes ← W11 will own | `.task/` path derivation (`TaskArtifacts`) | **W11** — M3 documented the dashboard reader, moved no derivation logic | **retired** — dashboard reader deleted; per-task runtime now served via the escalation `get_task_runtime_state` MCP tool (`plans/dashboard-task-runtime-endpoint-prd.md`) |
 | M2 / W10 | none | no shared files | — | — |
 
 ## Decomposition plan
@@ -359,6 +368,11 @@ Labels α…ζ; deps in parentheses. Signals are the G2 user-observable signals.
   Consumer: stream W11 (documented hand-off point) + operators reading the
   module. Document-only by explicit brief instruction ("otherwise leave and
   document — do not build a new API layer").
+  **Retired (2026-07-16):** the `.task/`-layout half of this hand-off is
+  moot — `plans/dashboard-task-runtime-endpoint-prd.md` task ζ (2639) deleted
+  the dashboard's hand-rolled reader and retired this doc block's
+  "W11 greps for this marker" pointer; per-task runtime state is now served
+  by the escalation `get_task_runtime_state` MCP tool.
 
 Dependency edges: β→α, δ→γ, δ→β, ε2→ε1, ε2→δ. No out-of-batch or
 cross-project deps.
