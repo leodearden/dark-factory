@@ -3008,6 +3008,21 @@ class Scheduler:
         # Hold-visibility + grace-streak escalation: per dependent, decided
         # from THIS tick's projection (task 2583, epsilon layers the
         # grace-streak escalate branch onto delta's hold-only loop).
+        #
+        # Deliberate single-dep-at-a-time accounting (reviewed, not an
+        # oversight): `next(...)` below picks only the FIRST failing dep in
+        # `dep_ids` order. If a dependent carries delivered_checks on two+
+        # deps that ALL fail in the same tick, only that first dep's
+        # `_streak_delivered_fail` counter advances this tick; a second
+        # simultaneously-broken capability's grace clock only starts once
+        # the first is cleared — either by escalating (task goes `blocked`,
+        # so dispatch is moot) or by the first dep passing (leaving the
+        # second still-failing dep to become "the first failing dep" on a
+        # later tick). This mirrors `_apply_external_dep_policy`, which
+        # likewise tracks/escalates one blocking cause per dependent at a
+        # time. Acceptable because a single escalation already blocks the
+        # task; a second broken capability is still surfaced by name, just
+        # not concurrently with the first.
         for task_id, dep_ids in deps_by_dependent.items():
             failed_dep_id = next(
                 (dep_id for dep_id in dep_ids if projection.get(dep_id) is False), None
