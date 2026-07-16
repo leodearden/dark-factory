@@ -262,7 +262,10 @@ escalation has since resolved (`resolved` → `answered`) or been dismissed (`di
 ever writes the decision's own state field) and fail-soft, exactly like `write-decision` — a
 registry fault is logged and swallowed, never raised, so it can never crash the watch loop. A
 decision filed with **no** `escalation_id` is never auto-closed this way and needs explicit human
-closure.
+closure. Likewise, a decision whose `escalation_id` never resolves to a status — the escalation
+was purged by archive retention pruning, or never existed — also stays `open` forever and needs
+the same explicit human closure; until then, every cycle repeats a full scan of the escalations
+archive looking for it.
 
 ## Caveat: recon re-files until the go-forward fix lands
 

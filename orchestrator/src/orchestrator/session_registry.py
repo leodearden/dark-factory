@@ -848,6 +848,21 @@ def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> s
     ``escalation.queue``/``escalation.models`` -- this module stays
     stdlib-only and import-free of the rest of the orchestrator/escalation
     packages (see module docstring). Fail-soft: never raises.
+
+    COST NOTE: the archive fallback is a recursive rglob over the *entire*
+    ``archive/`` tree, with no memoization across calls. When *escalation_id*
+    never resolves there -- purged by archive retention pruning, or never
+    existed -- every call still walks the full tree and returns None. A
+    caller that re-invokes this once per Main Loop cycle (the
+    ``reap-decisions`` CLI verb, see ``reap_answered_decisions``) therefore
+    repeats that full scan indefinitely for a decision pinned to such an id.
+    This is a known, currently-unbounded cost rather than something this
+    function bounds itself (e.g. via a persistent negative-lookup cache) --
+    doing so would need to answer staleness/TTL questions (a
+    once-dangling id could later appear) that are out of scope for this
+    read helper. The affected decision is simply left OPEN forever in that
+    case and needs explicit human closure, same as the no-``escalation_id``
+    case documented on ``reap_answered_decisions``.
     """
     base = Path(escalations_dir)
     candidate = base / f'{escalation_id}.json'
@@ -915,6 +930,14 @@ def reap_answered_decisions(
     and never needs to know an escalations-dir path or project scoping --
     see the ``reap-decisions`` CLI verb, which builds the production
     closure.
+
+    LIMITATION: a decision whose ``escalation_id`` is well-formed but never
+    resolves to a close-worthy status via *escalation_status* (unknown id,
+    or one purged by archive retention pruning) is left OPEN indefinitely --
+    the same fail-open-on-absent-evidence outcome as the no-``escalation_id``
+    case above -- and needs explicit human closure. With the production
+    closure (``read_escalation_status``), this also means a full archive
+    scan repeats every call for that decision; see its COST NOTE.
     """
     reaped: list[ReapedDecision] = []
     for decision in list_decisions(root):
@@ -1907,6 +1930,12 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
         if decision.project != project:
             return None
         if decision.escalation_id is None:
+            # Belt-and-suspenders, not reachable via reap_answered_decisions
+            # today: it already skips any decision with a falsy
+            # escalation_id before ever calling this closure. Kept so this
+            # narrows `str | None` -> `str` for the read_escalation_status
+            # call below (typed to take a `str`) and stays correct if this
+            # closure is ever invoked from elsewhere.
             return None
         return read_escalation_status(escalations_dir, decision.escalation_id)
 
