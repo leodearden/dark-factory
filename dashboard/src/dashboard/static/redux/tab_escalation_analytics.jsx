@@ -10,7 +10,7 @@
  */
 const { useState: uS, useEffect: uE, useMemo } = React;
 const DF = window.DF_DATA;
-const { ProjectGroup, Segmented, fmtUptime, taskId } = window.DF_SHELL;
+const { ProjectGroup, Segmented, fmtUptime, fmtDateTime, taskId } = window.DF_SHELL;
 const C = window.DF_CHARTS;
 
 // ── Local helpers (tab_escalations.jsx-compatible copies; not exported from
@@ -153,6 +153,101 @@ function TimeChart({ labels, markers, children }) {
   );
 }
 
+// ── Origin panel ──
+//
+// Top-N-by-source filings/day (long tail folded into an 'other' stack) + a
+// benign-rate table (one row per origin.sources[] entry).
+const _TOP_N_SOURCES = 6;
+// Categorical color cycling — same convention as tabs.jsx's per-account/
+// per-status donut/legend coloring ([CP.accent, CP.ok, CP.warn, CP.info,
+// CP.accent2, CP.bad][i % 6]).
+const _CATEGORY_COLORS = [
+  C.PALETTE.accent, C.PALETTE.ok, C.PALETTE.warn, C.PALETTE.info, C.PALETTE.accent2, C.PALETTE.bad,
+];
+
+function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
+  const daily = sliceDailyByWindow(origin.daily_by_source, generatedAt, win);
+  const dates = Object.keys(daily).sort();
+
+  // Rank sources by total windowed filings; top-N get their own stack, the
+  // long tail folds into a single 'other' band so the chart stays readable
+  // regardless of how many distinct agent_role values the archive has seen.
+  const totalsBySource = {};
+  for (const d of dates) {
+    for (const [src, n] of Object.entries(daily[d] || {})) {
+      totalsBySource[src] = (totalsBySource[src] || 0) + n;
+    }
+  }
+  const ranked = Object.entries(totalsBySource).sort((a, b) => b[1] - a[1]).map(([src]) => src);
+  const topSources = ranked.slice(0, _TOP_N_SOURCES);
+  const otherSources = ranked.slice(_TOP_N_SOURCES);
+
+  const stacks = topSources.map((src, i) => ({
+    key: src,
+    color: _CATEGORY_COLORS[i % _CATEGORY_COLORS.length],
+    values: dates.map(d => (daily[d] || {})[src] || 0),
+  }));
+  if (otherSources.length > 0) {
+    stacks.push({
+      key: 'other',
+      color: C.PALETTE.fg3,
+      values: dates.map(d => otherSources.reduce((sum, src) => sum + ((daily[d] || {})[src] || 0), 0)),
+    });
+  }
+
+  // Benign-rate table: sorted DESC by benign COUNT (volume × rate) — a
+  // source with a high rate but tiny volume sorts below a high-volume,
+  // slightly-less-benign source, which is the more actionable ordering for
+  // "where should triage attention go".
+  const rows = [...(origin.sources || [])].sort((a, b) => b.benign - a.benign);
+
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+        Origin — filings by source
+      </div>
+      {stacks.length > 0 && (
+        <TimeChart labels={dates} markers={regimeMarkers}>
+          <C.StackedAreaChart stacks={stacks} labels={dates} formatX={fmtDateTime} />
+        </TimeChart>
+      )}
+      <table className="tbl" style={{ marginTop: 10 }}>
+        <thead>
+          <tr>
+            <th>Source</th>
+            <th className="num">Filings</th>
+            <th>Benign / actionable</th>
+            <th>Stamped / inferred</th>
+            <th>Trend</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(s => {
+            const benignPct = Math.round((s.benign_rate || 0) * 100);
+            const stampedPct = Math.round((s.stamped_share || 0) * 100);
+            return (
+              <tr key={s.source}>
+                <td>{s.source}</td>
+                <td className="num mono">{s.filings}</td>
+                <td>
+                  <div style={{ display: 'flex', height: 6, width: 90, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
+                    <div style={{ width: `${benignPct}%`, background: C.PALETTE.ok }} title={`benign ${s.benign}`} />
+                    <div style={{ width: `${100 - benignPct}%`, background: C.PALETTE.bad }} title={`actionable ${s.actionable}`} />
+                  </div>
+                </td>
+                <td className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>{stampedPct}% / {100 - stampedPct}%</td>
+                <td style={{ width: 90, height: 22 }}><C.Sparkline values={s.daily_spark || []} /></td>
+                <td>{s.predictably_benign && <span className="badge ok">predictably benign</span>}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 // ── EscalationAnalyticsTab ──
 
 function EscalationAnalyticsTab({ projectFilter }) {
@@ -193,7 +288,13 @@ function EscalationAnalyticsTab({ projectFilter }) {
             open={!!openMap[p.project]}
             onToggle={() => toggle(p.project)}
           >
-            {/* Origin / Lifespan / Workflow panels land in later steps */}
+            <OriginPanel
+              origin={p.origin}
+              win={win}
+              generatedAt={analytics.generated_at}
+              regimeMarkers={regimeMarkers}
+            />
+            {/* Lifespan / Workflow panels land in later steps */}
           </ProjectGroup>
         </div>
       ))}

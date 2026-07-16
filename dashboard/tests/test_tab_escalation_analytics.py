@@ -712,3 +712,92 @@ def test_tab_analytics_window_toggle_and_crosscutting(tab_analytics_jsx_body: st
         'wrapper that composes a chart primitive with the RegimeMarkers overlay so '
         'every panel chart gets regime markers consistently.'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-11 test: Origin panel
+# ---------------------------------------------------------------------------
+
+
+def test_tab_analytics_origin_panel(tab_analytics_jsx_body: str) -> None:
+    """The Origin panel (top-N-by-source filings chart + benign-rate table).
+
+    Asserts, scoped to the Origin panel's own function body:
+    (a) A `StackedAreaChart` fed `daily_by_source`, with the long tail folded
+        into an `'other'` bucket.
+    (b) A benign-rate table over `origin.sources` referencing `benign_rate`,
+        `stamped_share` (stamped-vs-inferred split), and `actionable`
+        (benign/actionable segmented bar).
+    (c) A `predictably_benign` badge.
+    (d) A per-source `Sparkline` fed by `daily_spark`.
+    (e) Rows sorted by benign COUNT — a `.sort(` referencing `.benign`.
+    """
+    body = tab_analytics_jsx_body
+
+    assert 'function OriginPanel(' in body, (
+        'tab_escalation_analytics.jsx does not define `function OriginPanel(` — '
+        'add the Origin panel component.'
+    )
+    origin_body = _extract_function_body(body, 'OriginPanel')
+    assert origin_body, 'Could not locate the OriginPanel( function body.'
+
+    # (a) StackedAreaChart over daily_by_source, long tail folded into 'other'.
+    assert 'daily_by_source' in origin_body, (
+        'OriginPanel does not reference `daily_by_source` — the filings-by-source '
+        'chart must be built from origin.daily_by_source.'
+    )
+    assert '<C.StackedAreaChart' in origin_body, (
+        'OriginPanel does not render <C.StackedAreaChart — the top-N-by-source '
+        'filings/day chart must use the StackedAreaChart primitive from '
+        'window.DF_CHARTS.'
+    )
+    assert "'other'" in origin_body, (
+        "OriginPanel does not reference an `'other'` bucket — sources beyond the "
+        'top-N must be folded into an "other" stack rather than dropped.'
+    )
+
+    # (b) Benign-rate table over sources[], stamped-vs-inferred split, actionable.
+    assert 'sources' in origin_body, (
+        'OriginPanel does not reference `sources` — the benign-rate table must be '
+        'built from origin.sources.'
+    )
+    assert 'benign_rate' in origin_body, (
+        'OriginPanel does not reference `benign_rate` in the per-source table.'
+    )
+    assert 'stamped_share' in origin_body, (
+        'OriginPanel does not reference `stamped_share` — render the stamped-vs-'
+        'inferred split.'
+    )
+    assert 'actionable' in origin_body, (
+        'OriginPanel does not reference `actionable` — render the benign/actionable '
+        'segmented bar.'
+    )
+
+    # (c) predictably_benign badge.
+    assert 'predictably_benign' in origin_body, (
+        'OriginPanel does not reference `predictably_benign` — render a badge when '
+        'a source is predictably benign.'
+    )
+
+    # (d) Per-source Sparkline fed by daily_spark.
+    assert '<C.Sparkline' in origin_body, (
+        'OriginPanel does not render <C.Sparkline — add the per-source daily_spark '
+        'column.'
+    )
+    assert 'daily_spark' in origin_body, (
+        'OriginPanel does not reference `daily_spark` — feed it to the per-source '
+        'Sparkline column.'
+    )
+
+    # (e) Rows sorted by benign COUNT: SOME .sort( call references .benign nearby
+    # (the panel may also .sort() dates/rankings for the chart — scan every
+    # occurrence rather than assuming the first one is the row sort).
+    sort_positions = [m.start() for m in re.finditer(r'\.sort\(', origin_body)]
+    assert sort_positions, (
+        'OriginPanel does not call `.sort(` — the benign-rate table rows must be '
+        'sorted DESC by benign count.'
+    )
+    assert any('.benign' in origin_body[i : i + 120] for i in sort_positions), (
+        'No `.sort(` call in OriginPanel references `.benign` nearby — rows must be '
+        'sorted by benign COUNT (volume × rate), not alphabetically or by filings.'
+    )
