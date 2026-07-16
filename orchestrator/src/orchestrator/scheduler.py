@@ -401,6 +401,7 @@ class SchedulerCallbacks:
 
     on_park_stop_trip: Callable[[str], Any] | None = None
     on_external_dep_block: Callable[..., Any] | None = None
+    on_delivered_check_block: Callable[..., Any] | None = None
     on_starvation_warn: Callable[..., Any] | None = None
     on_starvation_resolve: Callable[..., Any] | None = None
     warm_base_health_probe: Callable[..., Any] | None = None
@@ -591,7 +592,7 @@ class TickContext:
     max_id: int = 0
     external_cache: dict[str, str] = field(default_factory=dict)
     external_resolver_failed: bool = False
-    delivered_check_cache: dict[str, bool] = field(default_factory=dict)
+    delivered_check_cache: dict[str, bool] | None = field(default_factory=dict)
     overrides: dict[str, OverrideRow] = field(default_factory=dict)
     overrides_for_diff: dict[str, OverrideRow] = field(default_factory=dict)
     effective_priorities: dict[str, str] = field(default_factory=dict)
