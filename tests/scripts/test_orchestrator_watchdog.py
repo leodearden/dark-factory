@@ -2795,6 +2795,80 @@ def test_report_includes_merge_idle_and_would_defer_columns(
         )
 
 
+def test_report_extended_columns_stay_read_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """I8 guard: report(), now populating DEPLOY-AGE/MERGE-IDLE/WOULD-DEFER,
+    still performs zero mutating systemctl calls and never writes the shared
+    fleet-deploy clock file.
+
+    Pre-seeds BOTH the clock file (with a sentinel payload, captured
+    byte-for-byte) and a per-unit heartbeat under a tmp ORCH_FLEET_DIR — so
+    the new columns are actually populated from real reads, not the
+    trivially-true empty/absent path — before driving report() through its
+    real helpers with a recording fake subprocess.run. Regression lock for
+    the read-only contract, independent of the mixed-fleet acceptance test
+    (scenario 9) added later.
+    """
+    wdog = _load_watchdog()
+
+    commit_epoch = 1_800_000_000
+    now = 2_000_000_000.0
+    unit = "orchestrator-echo.service"
+    start_epoch = commit_epoch + 100  # fresh
+
+    recorded_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        recorded_calls.append(list(cmd))
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{unit} loaded active running desc\n", stderr=""
+            )
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epoch}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda u: pytest.fail(f"report() must never restart {u}")
+    )
+
+    clock_file = tmp_path / "clock.json"
+    clock_payload = '{"ts": 1783000000.0, "iso": "2026-07-16T00:00:00+00:00"}'
+    clock_file.write_text(clock_payload)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    monkeypatch.setenv("ORCH_FLEET_DIR", str(fleet_dir))
+    (fleet_dir / f"{unit}.json").write_text(
+        json.dumps(
+            {
+                "unit": unit,
+                "merge_idle": True,
+                "depth": 0,
+                "queue_empty": True,
+                "ts_epoch": now - 10,
+            }
+        )
+    )
+
+    exit_code = wdog.report()
+
+    assert exit_code == 0
+    assert recorded_calls, "report() must have driven subprocess.run for this test to mean anything"
+    _assert_zero_mutating_calls(recorded_calls)
+    assert clock_file.read_text() == clock_payload, (
+        "report() must never write the shared fleet-deploy clock file"
+    )
+
+
 # ---------------------------------------------------------------------------
 # _cli tests
 # ---------------------------------------------------------------------------
