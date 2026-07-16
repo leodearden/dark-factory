@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -755,3 +756,76 @@ class TestTriageSegments:
         entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
 
         assert 'triage_segments' not in entry['lifespan']
+
+
+# ---------------------------------------------------------------------------
+# step-13: row 11 — flow-cube marginal-reconciliation regression pin
+# ---------------------------------------------------------------------------
+
+
+class TestFlowCubeConsistency:
+    """flow_daily reconciles against lifespan.samples, tier_weekly, and sources[].
+
+    PRD boundary row 11: sum(flow_daily.n) == len(lifespan.samples) ==
+    resolved(terminal-with-valid-times)-record count; grouped by tier it
+    matches tier_weekly's per-tier totals; grouped by (source, class) it
+    matches sources[] benign/actionable counts. flow_daily and samples share
+    an identical per-record date key (date(resolved_at)) over an identical
+    population (both gate on parseable timestamp AND resolved_at), so their
+    per-date marginals match exactly — which means summing over ANY date
+    sub-window preserves the identity, not just the full aggregate. This is
+    a regression pin over the step-6/8/10 implementation, not new behavior.
+    """
+
+    def test_flow_daily_reconciles_with_samples_tier_weekly_and_sources(self, tmp_path):
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        archive = build_golden_archive(esc_dir, now)
+
+        entry, _ = _aggregate_project('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        samples = entry['lifespan']['samples']
+        flow_daily = entry['workflow']['flow_daily']
+        tier_weekly = entry['workflow']['tier_weekly']
+        sources = entry['origin']['sources']
+
+        expected_terminal_count = sum(
+            1 for esc in archive.values() if esc['status'] in ('resolved', 'dismissed')
+        )
+
+        # sum(flow_daily.n) == len(samples) == resolved(terminal-with-valid
+        # -times)-record count.
+        total_flow_n = sum(row['n'] for row in flow_daily)
+        assert total_flow_n == len(samples) == expected_terminal_count
+
+        # Per-date marginals match exactly (both keyed by date(resolved_at)
+        # over the identical population) -> summing over ANY date
+        # sub-window preserves the identity, not just in aggregate.
+        sample_date_counts = Counter(row[0] for row in samples)
+        flow_date_counts = Counter()
+        for row in flow_daily:
+            flow_date_counts[row['date']] += row['n']
+        assert sample_date_counts == flow_date_counts
+
+        # sum(flow_daily.n) grouped by tier == tier_weekly totals per tier
+        # (== samples grouped by tier too — same population/tier derivation).
+        sample_tier_counts = Counter(row[1] for row in samples)
+        flow_tier_counts: Counter = Counter()
+        for row in flow_daily:
+            flow_tier_counts[row['tier']] += row['n']
+        tier_weekly_totals: Counter = Counter()
+        for week_bucket in tier_weekly.values():
+            for tier, n in week_bucket.items():
+                tier_weekly_totals[tier] += n
+        assert flow_tier_counts == tier_weekly_totals == sample_tier_counts
+
+        # sum(flow_daily.n) grouped by (source, class) == sources[]
+        # benign/actionable counts.
+        flow_source_class_counts: Counter = Counter()
+        for row in flow_daily:
+            flow_source_class_counts[(row['source'], row['class'])] += row['n']
+        for s in sources:
+            source = s['source']
+            assert flow_source_class_counts.get((source, 'benign'), 0) == s['benign']
+            assert flow_source_class_counts.get((source, 'actionable'), 0) == s['actionable']
