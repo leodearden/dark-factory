@@ -613,3 +613,160 @@ class TestMaybeFileChronicFlakeTasks:
 
         assert result == []
         assert client.submit_calls == []
+
+
+# ── Step-13 / Step-14: non-blocking guarantee ──────────────────────────────
+
+
+class _SubmitRaisingTaskClient:
+    """search_tasks never matches; submit_task raises for one configured
+    test and records the rest — pins "one bad test must not take down the
+    whole filing pass"."""
+
+    def __init__(self, raise_for_test: str):
+        self._raise_for_test = raise_for_test
+        self.submit_calls: list[dict] = []
+
+    async def submit_task(self, arguments: dict) -> str:
+        test = arguments['metadata']['chronic_flake_test']
+        if test == self._raise_for_test:
+            raise RuntimeError(f'boom: submit_task failed for {test}')
+        self.submit_calls.append(arguments)
+        return 'ticket-ok'
+
+    async def search_tasks(self, query: str) -> list[dict]:
+        return []
+
+
+class _SearchRaisingTaskClient:
+    """search_tasks always raises; submit_task records calls — pins "a
+    search hiccup must degrade to no-match, not block filing"."""
+
+    def __init__(self):
+        self.submit_calls: list[dict] = []
+
+    async def submit_task(self, arguments: dict) -> str:
+        self.submit_calls.append(arguments)
+        return 'ticket-ok'
+
+    async def search_tasks(self, query: str) -> list[dict]:
+        raise RuntimeError('boom: search_tasks failed')
+
+
+class TestMaybeFileChronicFlakeTasksNonBlocking:
+    """Pins the task's hardest constraint: "filing failures must never fail
+    the verify/merge path." ``maybe_file_chronic_flake_tasks`` must never
+    raise, regardless of what the task_client or the ledger file does."""
+
+    NOW = datetime(2026, 7, 17, tzinfo=UTC)
+
+    def _config(self, tmp_path, **overrides):
+        from orchestrator.config import ChronicFlakeConfig
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.project_root = tmp_path
+        kwargs = {
+            'enabled': True,
+            'threshold': 3,
+            'window': 20,
+            'rate_limit_days': 7,
+            'ledger_relpath': 'data/verify-logs/flaky-ledger.jsonl',
+        }
+        kwargs.update(overrides)
+        config.chronic_flake = ChronicFlakeConfig(**kwargs)
+        return config
+
+    def _write_ledger(self, path, entries):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('\n'.join(json.dumps(e) for e in entries) + '\n')
+
+    def _chronic_entries(self, test='test_a.sh', n=3):
+        return [
+            {
+                'ts': f'2026-07-0{i}T00:00:00Z',
+                'test': test,
+                'role': 'verifier',
+                'flaky_count_window': i,
+            }
+            for i in range(1, n + 1)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_submit_task_raise_for_one_test_does_not_propagate_and_continues(self, tmp_path):
+        from orchestrator.chronic_flake import maybe_file_chronic_flake_tasks
+        ledger_path = tmp_path / 'ledger.jsonl'
+        entries = self._chronic_entries(test='test_a.sh', n=3) + self._chronic_entries(
+            test='test_c.sh', n=3
+        )
+        self._write_ledger(ledger_path, entries)
+        client = _SubmitRaisingTaskClient(raise_for_test='test_a.sh')
+
+        result = await maybe_file_chronic_flake_tasks(
+            '',
+            self._config(tmp_path),
+            client,
+            now=self.NOW,
+            ledger_path=ledger_path,
+            filings_path=tmp_path / 'filings.json',
+        )
+
+        assert result == ['test_c.sh']
+        assert [a['metadata']['chronic_flake_test'] for a in client.submit_calls] == ['test_c.sh']
+
+    @pytest.mark.asyncio
+    async def test_search_tasks_raise_is_treated_as_no_match_and_does_not_propagate(self, tmp_path):
+        from orchestrator.chronic_flake import maybe_file_chronic_flake_tasks
+        ledger_path = tmp_path / 'ledger.jsonl'
+        self._write_ledger(ledger_path, self._chronic_entries())
+        client = _SearchRaisingTaskClient()
+
+        result = await maybe_file_chronic_flake_tasks(
+            '',
+            self._config(tmp_path),
+            client,
+            now=self.NOW,
+            ledger_path=ledger_path,
+            filings_path=tmp_path / 'filings.json',
+        )
+
+        assert result == ['test_a.sh']
+        assert len(client.submit_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_unreadable_ledger_file_is_swallowed_and_returns_empty(self, tmp_path):
+        """A ledger *path* that raises on read (here: it's actually a
+        directory, portably triggering IsADirectoryError) is swallowed by
+        the outer catch-all — distinct from a malformed JSON *line*, which
+        ``read_flaky_ledger`` itself already tolerates (step-5/step-6)."""
+        from orchestrator.chronic_flake import maybe_file_chronic_flake_tasks
+        ledger_path = tmp_path / 'ledger_is_a_directory'
+        ledger_path.mkdir()
+        client = _FakeChronicFlakeTaskClient()
+
+        result = await maybe_file_chronic_flake_tasks(
+            '',
+            self._config(tmp_path),
+            client,
+            now=self.NOW,
+            ledger_path=ledger_path,
+            filings_path=tmp_path / 'filings.json',
+        )
+
+        assert result == []
+        assert client.submit_calls == []
+
+    @pytest.mark.asyncio
+    async def test_none_task_client_is_log_only_noop(self, tmp_path):
+        from orchestrator.chronic_flake import maybe_file_chronic_flake_tasks
+        ledger_path = tmp_path / 'ledger.jsonl'
+        self._write_ledger(ledger_path, self._chronic_entries())
+
+        result = await maybe_file_chronic_flake_tasks(
+            '',
+            self._config(tmp_path),
+            None,
+            now=self.NOW,
+            ledger_path=ledger_path,
+            filings_path=tmp_path / 'filings.json',
+        )
+
+        assert result == []
