@@ -85,6 +85,12 @@ async def _get_pending(server, **kwargs: Any) -> list[dict[str, Any]]:
     return tool.fn(**kwargs)
 
 
+async def _stamp_triage(server, **kwargs: Any) -> dict[str, Any]:
+    tool = await server.get_tool('stamp_triage')
+    # stamp_triage is a sync def, so tool.fn(...) returns directly
+    return tool.fn(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # TestBornAtL2: severity-gated born-at-L2 path
 # ---------------------------------------------------------------------------
@@ -401,6 +407,81 @@ class TestGetPendingCompact:
         assert len(result) == 2, f"Expected 2 L2 rows, got {len(result)}: {result}"
         assert all(r['level'] == 2 for r in result)
         assert all(set(r.keys()) == self._COMPACT_KEYS for r in result)
+
+
+# ---------------------------------------------------------------------------
+# TestStampTriageTool: stamp_triage MCP tool (triage-ack annotation, ungated)
+# ---------------------------------------------------------------------------
+
+
+class TestStampTriageTool:
+    """stamp_triage MCP tool stamps a triage-ack annotation (in-process: headers == {}).
+
+    In-process tool.fn() calls see empty headers, so triaged_by comes from the
+    passed arg here — identity-header attribution is covered separately by the
+    live-HTTP acceptance test (test_capability_guard_http.py).
+    """
+
+    def _seed_pending_l2(self, queue: EscalationQueue, esc_id: str = 'esc-t1-0001') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='t-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='pending L2 for stamp_triage tool test',
+            level=2,
+        )
+        queue.submit(esc)
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_stamps_pending_l2_full_dict(self, tmp_path: Path):
+        """(a) Stamping returns a full dict; triaged_at/triaged_by/triage_note set, status/level unchanged."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending_l2(queue)
+
+        result = await _stamp_triage(
+            server, escalation_id=esc.id,
+            triaged_by='orchestrator-escalation-watcher-auto',
+            triage_note='task-604 status==done | probe: get_task 604 -> status=done',
+        )
+
+        assert 'error' not in result, f"Unexpected error: {result}"
+        assert result['triaged_at'] is not None
+        assert result['triaged_by'] == 'orchestrator-escalation-watcher-auto'
+        assert result['triage_note'] == 'task-604 status==done | probe: get_task 604 -> status=done'
+        assert result['status'] == 'pending'
+        assert result['level'] == 2
+
+    @pytest.mark.asyncio
+    async def test_unknown_id_returns_error(self, tmp_path: Path):
+        """(b) An unknown escalation id returns an {'error': ...} dict."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _stamp_triage(
+            server, escalation_id='esc-does-not-exist',
+            triaged_by='watcher', triage_note='note',
+        )
+
+        assert 'error' in result, f"Expected error dict, got: {result}"
+
+    @pytest.mark.asyncio
+    async def test_resolved_archived_id_returns_error(self, tmp_path: Path):
+        """(c) A resolved/archived id returns an {'error': ...} dict (queue method returned None)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending_l2(queue)
+        queue.resolve(esc.id, 'Fixed')
+
+        result = await _stamp_triage(
+            server, escalation_id=esc.id,
+            triaged_by='watcher', triage_note='note',
+        )
+
+        assert 'error' in result, f"Expected error dict, got: {result}"
 
 
 # ---------------------------------------------------------------------------
