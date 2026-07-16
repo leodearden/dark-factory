@@ -14,6 +14,11 @@ fabrication. See recon_claim_verification_guard.py's module docstring.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+
+import pytest
+
 # ──────────────────────────────────────────────────────────────────────────────
 # task-2438 step-01 RED: TestExtractAttributedClaims
 # ──────────────────────────────────────────────────────────────────────────────
@@ -225,3 +230,103 @@ class TestUnverifiedClaimsInText:
         result = unverified_claims_in_text("Plain prose with no claims at all.", probe)
 
         assert result == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-2438 step-05 RED: TestMakeSourceAndHistoryProbe
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _run_git(args: list[str], cwd) -> None:
+    subprocess.run(
+        ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True,
+    )
+
+
+def _require_git() -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git is not available")
+
+
+@pytest.fixture
+def git_repo_with_history(tmp_path):
+    """A real temp git repo (git is available in the worktree;
+    orchestrator/tests/test_git_ops.py is the established real-git test
+    precedent): commit 1 adds two tracked files, one containing
+    KNOWN_LIVE_TOKEN and the other containing REMOVED_HISTORY_TOKEN;
+    commit 2 deletes the REMOVED_HISTORY_TOKEN file, so that token survives
+    only in history, not in the working tree.
+    """
+    _require_git()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run_git(["init", "-b", "main"], cwd=repo)
+    _run_git(["config", "user.email", "test@test.com"], cwd=repo)
+    _run_git(["config", "user.name", "Test"], cwd=repo)
+
+    (repo / "present.py").write_text("KNOWN_LIVE_TOKEN = 1\n", encoding="utf-8")
+    (repo / "removed.py").write_text("REMOVED_HISTORY_TOKEN = 2\n", encoding="utf-8")
+    _run_git(["add", "-A"], cwd=repo)
+    _run_git(["commit", "-m", "add present.py and removed.py"], cwd=repo)
+
+    (repo / "removed.py").unlink()
+    _run_git(["add", "-A"], cwd=repo)
+    _run_git(["commit", "-m", "delete removed.py"], cwd=repo)
+
+    return repo
+
+
+class TestMakeSourceAndHistoryProbe:
+    """Tests for make_source_and_history_probe(repo_root) — the one impure
+    git-backed adapter. Encodes the architect's exact manual refutation
+    check for the task-2433 incident: git grep (tree) then, on miss,
+    git log --all -S (history pickaxe).
+    """
+
+    def test_tree_present_token_returns_true(self, git_repo_with_history):
+        """(a) True for a token present in a tracked working-tree file."""
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            make_source_and_history_probe,
+        )
+
+        probe = make_source_and_history_probe(git_repo_with_history)
+
+        assert probe("KNOWN_LIVE_TOKEN") is True
+
+    def test_never_committed_token_returns_false(self, git_repo_with_history):
+        """(b) False for a token that was never committed — absent from tree
+        AND history."""
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            make_source_and_history_probe,
+        )
+
+        probe = make_source_and_history_probe(git_repo_with_history)
+
+        assert probe("TOTALLY_FABRICATED_TOKEN_XYZ") is False
+
+    def test_removed_from_tree_but_in_history_returns_true(self, git_repo_with_history):
+        """(c) True for a token removed from the tree but still reachable via
+        `git log --all -S` (history hit) — proves the guard does not
+        false-flag a token legitimately removed from the tree."""
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            make_source_and_history_probe,
+        )
+
+        probe = make_source_and_history_probe(git_repo_with_history)
+
+        assert probe("REMOVED_HISTORY_TOKEN") is True
+
+    def test_non_git_repo_fails_open_true(self, tmp_path):
+        """(d) fail-open True when repo_root is not a git repo / git errors."""
+        _require_git()
+        from fused_memory.middleware.recon_claim_verification_guard import (
+            make_source_and_history_probe,
+        )
+
+        not_a_repo = tmp_path / "not_a_repo"
+        not_a_repo.mkdir()
+
+        probe = make_source_and_history_probe(not_a_repo)
+
+        assert probe("ANY_TOKEN_AT_ALL") is True
