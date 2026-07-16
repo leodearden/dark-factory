@@ -567,7 +567,18 @@ def staleness_pass() -> None:
     This is an accepted trade-off (never race the event-driven coordinator)
     rather than a bug; use `--report` to inspect actual per-unit staleness
     while a burst is in progress.
+
+    Shared fleet-deploy clock (task 2396, fleet-redeploy β): checked FIRST,
+    ahead of the commit-grace gate below — a top-priority, fleet-wide
+    restraint that caps this backstop (like the event-driven coordinator) to
+    at most once per ORCH_RESTART_MIN_INTERVAL_SECS, honoring a redeploy
+    verified by EITHER tier (restart-all-orchestrators.sh is the sole on-disk
+    writer, stamped only on its verified-fresh exit-0 path).
     """
+    if _within_fleet_deploy_min_interval():
+        log("skip: <8h since last fleet deploy")
+        return
+
     commit_epoch = _newest_watched_commit_epoch()
     if commit_epoch is None:
         return  # undeterminable — fall safe, no restarts this tick
