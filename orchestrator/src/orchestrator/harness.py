@@ -318,6 +318,10 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     'mcp__escalation__get_pending_escalations',
     'mcp__escalation__resolve_issue',
     'mcp__escalation__promote_to_l2',
+    # Triage-ack annotation, ungated by level — lets the watcher stamp a
+    # pending L1/L2 it assessed (task 2555) so future rotations can skip
+    # re-deriving the same disposition every rotation.
+    'mcp__escalation__stamp_triage',
     # Fused-memory MCP: read + autonomous dispatch (scope_violation/dependency/cleanup)
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
