@@ -1254,6 +1254,19 @@ async def _write_task_count_snapshot(
     escalation. Pinned by
     ``test_add_memory_failure_after_successful_prune_returns_none``.
 
+    Enumeration-failure write-gate (task 2655; supersedes task 2646's note
+    that the write proceeds regardless of the prune's enumeration outcome):
+    if :func:`_prune_task_count_snapshots` reports
+    ``SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY == 0`` — including the silent-
+    empty-scroll case caught by its count cross-check — this function logs a
+    structured WARNING and returns ``None`` BEFORE calling ``add_memory``.
+    Writing a fresh snapshot when the prior one(s) could not be confirmed
+    enumerated/pruned is exactly what grows the byte-identical duplicate
+    pile (the recurring incident this task exists to fix); skipping is
+    self-correcting, since the next healthy cycle enumerates and prunes all
+    accumulated duplicates before writing one. Pinned by
+    ``TestWriteTaskCountSnapshotEnumerationGate``.
+
     Counts are derived by self-fetching via ``taskmaster.get_tasks`` and
     filtering with :func:`filter_task_tree` — mirroring
     ``assemble_payload``'s own self-fetch fallback idiom — rather than
@@ -1288,11 +1301,16 @@ async def _write_task_count_snapshot(
             rather than direct indexing — see the "Conditional presence"
             note on
             ``task_count_snapshot_cadence.SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY``
-            (amendment round, task 2646 review).
+            (amendment round, task 2646 review). Also read back internally
+            (task 2655) immediately after the prune call to decide the
+            enumeration-failure write-gate below — a throwaway local dict is
+            used for this when the caller passes ``None``, so the gate reads
+            correctly even when the caller doesn't want the stats.
 
     Returns:
         ``True`` on a successful write; ``None`` when *taskmaster* is
-        ``None`` or any step of the fetch/filter/write fails.
+        ``None``, the prune could not confirm a clean enumeration (task
+        2655 write-gate), or any step of the fetch/filter/write fails.
     """
     if taskmaster is None:
         return None
@@ -1314,7 +1332,27 @@ async def _write_task_count_snapshot(
             highest_task_id=tree.max_task_id,
             as_of=as_of,
         )
-        await _prune_task_count_snapshots(memory_service, project_id, run_id, stats=stats)
+        # prune_stats is ALWAYS a real dict (never None) so the write-gate
+        # below can read SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY back
+        # regardless of whether the caller wanted the observability stats
+        # (task 2655). When the caller passed a real `stats` dict (e.g.
+        # run()'s report.stats), prune_stats IS that same object, so the
+        # four prune stats still surface there unchanged.
+        prune_stats = stats if stats is not None else {}
+        await _prune_task_count_snapshots(
+            memory_service, project_id, run_id, stats=prune_stats,
+        )
+        if prune_stats.get(SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY) == 0:
+            logger.warning(
+                'reconciliation._write_task_count_snapshot: '
+                'prune enumeration failed for project_id=%s run_id=%s; '
+                'skipping this cycle\'s snapshot write to avoid growing the '
+                'duplicate pile (task 2655) -- the next healthy cycle will '
+                'prune and write normally',
+                project_id, run_id,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
+            return None
         await memory_service.add_memory(
             content=content,
             category=TASK_COUNT_SNAPSHOT_CATEGORY,
