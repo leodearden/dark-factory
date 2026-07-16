@@ -27,6 +27,8 @@ from shared.task_metadata import (
     MemoryHints,
     Milestone,
     RetryLedger,
+    RoutingDecisionMirror,
+    RoutingState,
     TaskMetadata,
     apply_migrations,
     parse_metadata,
@@ -461,6 +463,62 @@ class TestMilestone:
     def test_unknown_subfield_retained_and_reemitted(self):
         m = Milestone(mode='delayed', after_secs=604800, x_extra='keep')  # type: ignore[call-arg]
         dumped = m.model_dump()
+        assert dumped['x_extra'] == 'keep'
+
+
+class TestRoutingState:
+    """``metadata.routing`` — RoutingDecisionMirror + RoutingState (PRD γ, task 2533)."""
+
+    _MIN_DECISION = {
+        'role': 'implementer',
+        'model': 'sonnet',
+        'effort': 'high',
+        'budget_usd': 10.0,
+        'max_turns': 80,
+        'source_layer': 'config',
+    }
+
+    def test_routing_decision_mirror_constructs_with_required_fields(self):
+        d = RoutingDecisionMirror(**self._MIN_DECISION)
+        assert d.role == 'implementer'
+        assert d.model == 'sonnet'
+        assert d.effort == 'high'
+        assert d.budget_usd == 10.0
+        assert d.max_turns == 80
+        assert d.source_layer == 'config'
+
+    def test_routing_decision_mirror_defaults(self):
+        d = RoutingDecisionMirror(**self._MIN_DECISION)
+        assert d.rule_id is None
+        assert d.rejected == []
+        assert d.routing_tier == 0
+        assert d.decided_at is None
+
+    def test_routing_decision_mirror_unknown_subfield_retained_and_reemitted(self):
+        d = RoutingDecisionMirror(**self._MIN_DECISION, x_extra='keep')  # type: ignore[call-arg]
+        dumped = d.model_dump()
+        assert dumped['x_extra'] == 'keep'
+
+    def test_routing_state_defaults(self):
+        s = RoutingState()
+        assert s.latest is None
+        assert s.history == []
+        assert s.routing_tier == 0
+        assert s.simple_saturated is False
+
+    def test_routing_state_coerces_nested_latest_and_history_dicts(self):
+        s = RoutingState(
+            latest=dict(self._MIN_DECISION),  # type: ignore[arg-type]
+            history=[dict(self._MIN_DECISION), dict(self._MIN_DECISION)],  # type: ignore[list-item]
+        )
+        assert isinstance(s.latest, RoutingDecisionMirror)
+        assert s.latest.role == 'implementer'
+        assert len(s.history) == 2
+        assert all(isinstance(item, RoutingDecisionMirror) for item in s.history)
+
+    def test_routing_state_unknown_subfield_retained_and_reemitted(self):
+        s = RoutingState(x_extra='keep')  # type: ignore[call-arg]
+        dumped = s.model_dump()
         assert dumped['x_extra'] == 'keep'
 
 
