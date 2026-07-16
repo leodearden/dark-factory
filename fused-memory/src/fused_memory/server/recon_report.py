@@ -1,7 +1,7 @@
 """recon_report MCP namespace — in-process state + tool scaffold (task α/β).
 
-Provides ten tools: start_report / add_finding / set_stat / inc_stat / complete /
-delete_finding / cite_entity / cite_edge / cite_task / cite_memory.
+Provides eleven tools: start_report / add_finding / set_stat / inc_stat / complete /
+delete_finding / cite_entity / cite_edge / cite_task / cite_memory / cite_run.
 State is owned by :class:`ReconReportState`; tools are thin delegates registered
 by :func:`create_recon_report_server`.  This split lets unit tests drive the state
 directly without spinning up FastMCP.
@@ -303,6 +303,7 @@ class _Finding:
     cited_edges: list[dict] = field(default_factory=list)
     cited_tasks: list[dict] = field(default_factory=list)
     cited_memories: list[dict] = field(default_factory=list)
+    cited_runs: list[dict] = field(default_factory=list)  # task-2595
 
 
 @dataclass
@@ -422,6 +423,13 @@ _ERR_UNKNOWN_PROJECT: dict[str, str] = {
 _ERR_MEMORY_NOT_FOUND: dict[str, str] = {
     'error': 'memory_not_found',
     'error_type': 'ReconReportMemoryNotFound',
+}
+
+# task-2595: returned by cite_run when count_memories_by_metadata finds no
+# mem0 records under {'run_id': cited_run_id} — the cited run does not exist.
+_ERR_RUN_NOT_FOUND: dict[str, str] = {
+    'error': 'run_not_found',
+    'error_type': 'ReconReportRunNotFound',
 }
 
 _ERR_INVALID_UUID_SHAPE: dict[str, str] = {
@@ -927,6 +935,7 @@ class ReconReportState:
                 'cited_edges': list(f.cited_edges),
                 'cited_tasks': list(f.cited_tasks),
                 'cited_memories': list(f.cited_memories),
+                'cited_runs': list(f.cited_runs),  # task-2595
             }
             # Cross-project routing taxonomy guard (task-2453): downgrade an
             # anchor-less cross_project_routing claim before the Fix-1 check
@@ -961,7 +970,7 @@ class ReconReportState:
         for this run.  Each ``_Finding`` is projected to the same dict shape
         used by :meth:`get_assembled_report` (finding_id, severity, category,
         description, suggested_action, actionable, task_id, flag_type, and
-        copies of the four cited_* lists).
+        copies of the five cited_* lists).
 
         Unlike :meth:`get_assembled_report`, this method does **NOT** apply
         Fix-1 read-time echo suppression (task-1654), nor the task-2453
@@ -1000,6 +1009,7 @@ class ReconReportState:
                     'cited_edges': list(f.cited_edges),
                     'cited_tasks': list(f.cited_tasks),
                     'cited_memories': list(f.cited_memories),
+                    'cited_runs': list(f.cited_runs),  # task-2595
                 })
         return results
 
@@ -1416,6 +1426,94 @@ class ReconReportState:
         finding.cited_memories.append(citation)
         return citation
 
+    async def cite_run(
+        self,
+        run_id: str,
+        finding_id: str,
+        cited_run_id: str,
+    ) -> dict[str, Any]:
+        """Validate *cited_run_id* shape, confirm it exists, and record the citation.
+
+        Closes the gap named by task 2595: a run_id quoted inline in a
+        finding's free-text ``description``/``suggested_action`` was
+        previously validated by NONE of cite_entity/cite_edge/cite_task/
+        cite_memory, so an LLM re-typing a historical run_id from memory
+        (instead of copying it verbatim off a fresh tool result) could
+        silently drift by a hex group with nothing downstream catching it
+        until a future agent manually re-fetched the source record. cite_run
+        hands the caller a structured ``run_not_found`` error to self-correct
+        on mid-cycle instead.
+
+        Existence is confirmed via
+        ``memory_service.count_memories_by_metadata(project_id, {'run_id':
+        cited_run_id})`` rather than a live-run registry lookup:
+        reconciliation runs always write cycle summaries to mem0 keyed by
+        their run_id, so a >0 mem0 count is a sound existence proxy — the
+        same signal the originating incident's remediation used to
+        self-catch the bug by hand (a 0-count
+        ``get_memories_by_metadata(run_id=...)`` call). No memory_service
+        change was needed: ``count_memories_by_metadata`` already existed as
+        the exact Qdrant metadata-equality count primitive.
+
+        Caveat (reviewed task-2595 amendment): this existence check is
+        Mem0/Qdrant-only, so it can false-negative for a run that genuinely
+        existed — a run whose cycle summary predates the
+        ``metadata.run_id`` convention, or whose provenance lives only in
+        Graphiti, will also read as ``run_not_found``. Treat ``run_not_found``
+        as "not confirmed via mem0", not as infallible proof the run_id
+        never existed — it is a strong self-correction signal for the
+        common case (a mistyped/re-typed id), not a guarantee for every
+        historical run.
+
+        Returns {run_id, match_count} on success, or a structured error dict
+        (run_id_unknown / finding_unknown / invalid_uuid_shape / run_not_found
+        / service_not_configured). UUID shape is checked before any service
+        call. Appends to finding.cited_runs only on success, always (no
+        dedup) — matching cite_edge/cite_memory rather than cite_task's fold,
+        whose dedup-anchor machinery a run citation does not need.
+
+        ``cited_runs`` is deliberately EXCLUDED from
+        :func:`_citation_identities` (and therefore from Fix-1 same-run echo
+        suppression): a cited run_id is provenance for a claim, not a
+        task/entity/edge/memory identity that suppression reasons about.
+        Folding it in could silently change which findings get suppressed;
+        leaving it out keeps all existing suppression/dedup behavior
+        byte-identical.
+        """
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        resolved = self._resolve_finding(run_id, finding_id)
+        if resolved is None:
+            return _ERR_FINDING_UNKNOWN.copy()
+        finding_entry, finding = resolved
+
+        if not _UUID_RE.match(cited_run_id):
+            return _ERR_INVALID_UUID_SHAPE.copy()
+
+        if self._memory_service is None:
+            return _ERR_SERVICE_UNAVAILABLE.copy()
+
+        # Deliberately not narrowed to a specific exception type here, unlike
+        # cite_edge's `except EdgeNotFoundError` or cite_memory's `except
+        # (EdgeNotFoundError, MemoryNotFoundError)`: a transient backend/
+        # connection failure inside count_memories_by_metadata propagates as
+        # a raw ToolError to the caller instead of being swallowed into a
+        # fail-safe result. This matches cite_entity's get_entity call and
+        # cite_task's get_task call, which are equally unnarrowed — a
+        # transient hiccup should surface loudly rather than risk masquerading
+        # as a (possibly wrong) "confirmed absent" run_not_found verdict.
+        count = await self._memory_service.count_memories_by_metadata(
+            finding_entry.project_id, {'run_id': cited_run_id}
+        )
+        if count == 0:
+            return _ERR_RUN_NOT_FOUND.copy()
+
+        citation = {'run_id': cited_run_id, 'match_count': count}
+        finding.cited_runs.append(citation)
+        return citation
+
     # ------------------------------------------------------------------
     # Reaper
     # ------------------------------------------------------------------
@@ -1545,7 +1643,7 @@ This server provides the recon_report MCP namespace for the Dark Factory
 reconciliation pipeline.
 
 Tools: start_report, add_finding, set_stat, inc_stat, complete, delete_finding,
-       cite_entity, cite_edge, cite_task, cite_memory.
+       cite_entity, cite_edge, cite_task, cite_memory, cite_run.
 
 Usage pattern (per PRD §9.2):
 1. start_report — open a new report at the start of a stage run.
@@ -1567,6 +1665,10 @@ Citation tools (call after add_finding, before or after complete):
 7. cite_edge(run_id, finding_id, edge_uuid) — validate UUID and attach edge.
 8. cite_task(run_id, finding_id, project_id, task_id) — look up task and attach.
 9. cite_memory(run_id, finding_id, memory_id, store) — look up memory and attach.
+10. cite_run(run_id, finding_id, cited_run_id) — confirm a quoted run_id exists
+                  (via mem0 count) and attach it.  Copy cited_run_id verbatim
+                  from a fresh tool result's run_id/metadata.run_id field —
+                  never re-type or paraphrase it from memory.
 """
 
 
@@ -1731,6 +1833,26 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         """
         return await state.cite_memory(
             run_id=run_id, finding_id=finding_id, memory_id=memory_id, store=store
+        )
+
+    @mcp.tool()
+    async def cite_run(run_id: str, finding_id: str, cited_run_id: str) -> dict:
+        """Confirm a cited run_id exists (via mem0 count) and attach it to a finding.
+
+        PRD §9.2 (task-2595) — cite_run(run_id, finding_id, cited_run_id).
+        Returns {run_id, match_count} or a structured error dict.
+        invalid_uuid_shape when cited_run_id doesn't match the canonical UUID regex.
+        run_not_found when the UUID is valid but no mem0 records carry it as
+        their run_id (count_memories_by_metadata returns 0) — this is the
+        structural fix for run_id transcription drift: copy cited_run_id
+        verbatim from the run_id/metadata.run_id field of a fresh tool
+        result, never re-type or paraphrase it from memory. Note: this check
+        is mem0-only, so a legacy run predating the metadata.run_id
+        convention (or one whose provenance lives only in Graphiti) can also
+        surface as run_not_found even though it once existed.
+        """
+        return await state.cite_run(
+            run_id=run_id, finding_id=finding_id, cited_run_id=cited_run_id
         )
 
     return mcp
