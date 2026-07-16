@@ -2310,6 +2310,23 @@ def test_read_escalation_status_falls_back_to_archive(tmp_path: Path) -> None:
     assert sr.read_escalation_status(escalations_dir, 'esc-2303-2') == 'resolved'
 
 
+def test_read_escalation_status_multiple_archive_matches_picks_newest(tmp_path: Path) -> None:
+    """Duplicate ids across dated archive subdirs are not expected in normal
+    operation, but read_escalation_status's tie-break -- sorted matches,
+    take the last -- is an explicit, load-bearing contract and must prefer
+    the newer dated subdir.
+    """
+    escalations_dir = tmp_path / 'escalations'
+    older_dir = escalations_dir / 'archive' / '2026-07-15'
+    newer_dir = escalations_dir / 'archive' / '2026-07-16'
+    older_dir.mkdir(parents=True)
+    newer_dir.mkdir(parents=True)
+    (older_dir / 'esc-2303-2.json').write_text(json.dumps({'status': 'dismissed'}))
+    (newer_dir / 'esc-2303-2.json').write_text(json.dumps({'status': 'resolved'}))
+
+    assert sr.read_escalation_status(escalations_dir, 'esc-2303-2') == 'resolved'
+
+
 def test_read_escalation_status_unknown_id_returns_none(tmp_path: Path) -> None:
     """No file at the root and none in the archive -> None, not a raise."""
     escalations_dir = tmp_path / 'escalations'
