@@ -1381,6 +1381,190 @@ def test_staleness_grace_secs_malformed_env_falls_back(monkeypatch: pytest.Monke
 
 
 # ---------------------------------------------------------------------------
+# ORCH_RESTART_MIN_INTERVAL_SECS + shared fleet-deploy clock tests
+# (task 2396, fleet-redeploy β)
+#
+# These cover the watchdog's clock-awareness primitives in isolation:
+# ORCH_RESTART_MIN_INTERVAL_SECS (the env-mirror of
+# OrchestratorConfig.orchestrator_restart_min_interval_secs),
+# _read_last_fleet_deploy_epoch() (fail-open JSON read of the shared clock
+# file), and _within_fleet_deploy_min_interval() (the gate predicate). None of
+# these are wired into staleness_pass() yet — that wiring is covered by the
+# staleness_pass fleet-deploy clock gate tests further below.
+# ---------------------------------------------------------------------------
+
+
+def test_orch_restart_min_interval_secs_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ORCH_RESTART_MIN_INTERVAL_SECS defaults to 28800 (8h) with no env override."""
+    monkeypatch.delenv("ORCH_RESTART_MIN_INTERVAL_SECS", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 28800
+
+
+def test_orch_restart_min_interval_secs_matches_config_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The watchdog's env-mirror default must not drift from OrchestratorConfig's.
+
+    The watchdog is a stdlib-only systemd oneshot that cannot import the
+    orchestrator package at runtime, so ORCH_RESTART_MIN_INTERVAL_SECS's
+    default is a hardcoded mirror of
+    OrchestratorConfig.orchestrator_restart_min_interval_secs (28800.0, task
+    2371). This drift test — mirroring
+    tests/scripts/test_orchestrator_restart_config_drift.py — pins the two
+    together so a future config.py change doesn't silently diverge from the
+    watchdog's copy (Open-Q1).
+    """
+    from orchestrator.config import OrchestratorConfig
+
+    monkeypatch.delenv("ORCH_RESTART_MIN_INTERVAL_SECS", raising=False)
+    # Anchor ORCH_CONFIG_PATH to this worktree's own committed config so the
+    # comparison is deterministic regardless of the ambient shell env (which
+    # may point ORCH_CONFIG_PATH at a different checkout).
+    monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "orchestrator" / "config.yaml"))
+    wdog = _load_watchdog()
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == pytest.approx(
+        OrchestratorConfig().orchestrator_restart_min_interval_secs
+    )
+
+
+def test_orch_restart_min_interval_secs_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ORCH_RESTART_MIN_INTERVAL_SECS honors a valid env override.
+
+    _load_watchdog() re-execs the module, so an env var set before the call
+    is picked up at (re)import time — mirrors STALENESS_GRACE_SECS's own
+    env-override test above.
+    """
+    monkeypatch.setenv("ORCH_RESTART_MIN_INTERVAL_SECS", "60")
+    wdog = _load_watchdog()
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 60
+
+
+def test_orch_restart_min_interval_secs_malformed_env_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed ORCH_RESTART_MIN_INTERVAL_SECS env value falls back to 28800.
+
+    A typo'd env var must not crash the oneshot watchdog — fall-safe ethos,
+    mirroring STALENESS_GRACE_SECS's malformed-env test above.
+    """
+    monkeypatch.setenv("ORCH_RESTART_MIN_INTERVAL_SECS", "not-an-int")
+    wdog = _load_watchdog()
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 28800
+
+
+def test_read_last_fleet_deploy_epoch_happy_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_read_last_fleet_deploy_epoch reads the float `ts` from the clock file.
+
+    Mirrors StaleServiceRestartCoordinator._load_last_fire_wall's {ts, iso}
+    schema and fail-open semantics (orchestrator/src/orchestrator/service_restart.py).
+    """
+    wdog = _load_watchdog()
+    clock_file = tmp_path / "last_redeploy_orchestrator.json"
+    clock_file.write_text('{"ts": 1783000000.0, "iso": "2026-07-16T00:00:00+00:00"}')
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+
+    result = wdog._read_last_fleet_deploy_epoch()
+    assert result == pytest.approx(1783000000.0)
+    assert isinstance(result, float)
+
+
+def test_read_last_fleet_deploy_epoch_missing_file_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_read_last_fleet_deploy_epoch returns None when the clock file does not exist.
+
+    A fleet that has never had a verified redeploy (or a fresh checkout) must
+    not be treated as perpetually inside the min-interval window.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(tmp_path / "absent.json"))
+    assert wdog._read_last_fleet_deploy_epoch() is None
+
+
+def test_read_last_fleet_deploy_epoch_corrupt_json_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_read_last_fleet_deploy_epoch returns None (fail-open) on unparseable JSON."""
+    wdog = _load_watchdog()
+    clock_file = tmp_path / "corrupt.json"
+    clock_file.write_text("{not-json")
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+    assert wdog._read_last_fleet_deploy_epoch() is None
+
+
+def test_read_last_fleet_deploy_epoch_missing_ts_key_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_read_last_fleet_deploy_epoch returns None when the `ts` key is absent."""
+    wdog = _load_watchdog()
+    clock_file = tmp_path / "no_ts.json"
+    clock_file.write_text('{"iso": "2026-07-16T00:00:00+00:00"}')
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+    assert wdog._read_last_fleet_deploy_epoch() is None
+
+
+def test_within_fleet_deploy_min_interval_true_when_recent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fleet_deploy_min_interval is True when now - last < min_interval."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 100.0)  # 100s ago
+
+    assert wdog._within_fleet_deploy_min_interval() is True
+
+
+def test_within_fleet_deploy_min_interval_false_when_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fleet_deploy_min_interval is False once min_interval has elapsed."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 28800.0 + 1.0)
+
+    assert wdog._within_fleet_deploy_min_interval() is False
+
+
+def test_within_fleet_deploy_min_interval_false_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fleet_deploy_min_interval is False when ORCH_RESTART_MIN_INTERVAL_SECS==0.
+
+    0 disables the cap entirely — the read of the clock file must not even
+    be attempted.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(
+        wdog,
+        "_read_last_fleet_deploy_epoch",
+        lambda: pytest.fail("must not be consulted when the cap is disabled"),
+    )
+
+    assert wdog._within_fleet_deploy_min_interval() is False
+
+
+def test_within_fleet_deploy_min_interval_false_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fleet_deploy_min_interval is False when the clock is unreadable/absent.
+
+    A never-deployed fleet (or an unreadable clock file) must not block the
+    backstop indefinitely — fail toward restarting, not toward silence.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: None)
+
+    assert wdog._within_fleet_deploy_min_interval() is False
+
+
+# ---------------------------------------------------------------------------
 # staleness_pass core tests
 #
 # These tests set every restraint gate permissive (enabled, past startup
