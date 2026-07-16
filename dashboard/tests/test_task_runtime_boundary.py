@@ -93,3 +93,48 @@ def _project_root(tmp_path: Path, name: str) -> Path:
     root = tmp_path / name
     root.mkdir()
     return root
+
+
+# ---------------------------------------------------------------------------
+# B5 — Consumer join
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b5_producer_wire_entry_populates_row_via_join(dummy_client, monkeypatch, tmp_path):
+    """A decoded producer wire entry's loops/attempts/lane/phase/lane_state
+    join onto the row: proves the join consumes a REAL decoded producer
+    emission (not a hand-built TaskRuntimeEntry) end-to-end.
+    """
+    fixed = datetime(2026, 7, 16, 12, 0, 0, tzinfo=UTC)
+    entry_started = (fixed - timedelta(minutes=7)).isoformat()
+    wire = _producer_wire_dict(tasks=[
+        _producer_wire_entry(
+            42, loops=3, attempts=1, started=entry_started,
+            lane='_lane-3', phase='EXECUTE', lane_state='assigned',
+        ),
+    ])
+    snapshot = _decode(wire)
+
+    _register_fetch_tasks(monkeypatch, [_shape_task(42, 'warm task', 'in-progress')])
+    root = _project_root(tmp_path, 'warmlane')
+    config = DashboardConfig(project_root=root)
+
+    active, offline, _ = await _shape_one_project(
+        dummy_client, config, root, runtime=snapshot, now=fixed,
+    )
+
+    assert offline is False
+    assert len(active) == 1
+    row = active[0]
+    assert row['loops'] == 3
+    assert row['attempts'] == 1
+    assert row['lane'] == '_lane-3'
+    assert row['phase'] == 'EXECUTE'
+    assert row['lane_state'] == 'assigned'
+    assert row['agent'] == 'claude-task-42'
+    assert row['started'] == 7
+    assert row['runtime_offline'] is False
+    # No hand reader is consulted -- the row above is populated purely from
+    # the runtime param; no worktree-scan path exists in this module.
+    assert not hasattr(active_tasks_mod, '_scan_worktrees')
