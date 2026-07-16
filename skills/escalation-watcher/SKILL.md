@@ -85,7 +85,9 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
    an auto-unblock sub-agent (B3) is in flight — that sub-agent completing. Handle whichever arrives.
 5. Read the escalation from the watcher output — this is the wake signal; the drain in
    step 2 of the next pass is the authoritative source of what to handle
-6. Go to 1 (restart watcher → confirm up → drain → handle)
+6. Run `reap-decisions` to close any parked DecisionRecord whose escalation has since resolved
+   (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
+7. Go to 1 (restart watcher → confirm up → drain → handle)
 ```
 
 The fired escalation (step 5) is just the wake; you do not handle it inline. Looping back
@@ -175,7 +177,7 @@ watcher.
 **Process safety**: only stop watcher processes you started via background task controls. Never `pkill` by pattern — other orchestrators, the user, or other sessions may have their own watchers.
 
 **Lease heartbeat (each cycle):** each time you (re)start this watcher subprocess (Main Loop steps 1
-and 6), also touch the `watcher-<project>` lease claimed at session startup (see "Claiming the
+and 7), also touch the `watcher-<project>` lease claimed at session startup (see "Claiming the
 Watcher Lease" above):
 
 ```bash
@@ -271,6 +273,29 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
 
 This is additive at every "leave pending" / "tell the human" / "park" moment below — do the
 existing action exactly as documented, and also run `write-decision` once per parked item.
+
+### Closing parked decisions on resolve
+
+A filed DecisionRecord stays `state=open` — and therefore visible in the cockpit decision queue —
+until its escalation reaches a terminal status. The watcher that files a decision is almost never
+the one that resolves it: resolution typically happens later, via a spawned `/unblock` session, an
+L2 cascade, or the human acting directly on the dashboard. So closing a parked decision is a
+separate, recurring step, not something the `write-decision` call itself can do.
+
+Once per Main Loop cycle (see step 6 above), run:
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py reap-decisions \
+  --project <project> --escalations-dir <project_root>/data/escalations
+```
+
+This closes (`answered`/`dropped`) any `state=open`, `escalation_id`-bearing decision whose
+escalation has since resolved (`resolved` → `answered`) or been dismissed (`dismissed` →
+`dropped`) — regardless of who resolved it: this session, `/unblock`, an L2 cascade, or the human.
+It is read-only with respect to escalations (it only ever writes the decision's own state field)
+and fail-soft, exactly like `write-decision` — a registry fault is logged and swallowed, never
+raised, so it can never crash the watch loop. A decision filed with **no** `escalation_id` (e.g.
+the tasks.json-corruption park) is never auto-closed this way and needs explicit human closure.
 
 ## Merge Submissions — Bounded Submit, Then Poll
 
