@@ -409,6 +409,60 @@ class SchemaWarning(BaseModel):
 _WHOLE_METADATA_FIELD = '<metadata>'
 
 
+# Tier-A: the 34 load-bearing conventional metadata keys that real writers
+# (orchestrator, curator, DeterministicRunner, escalation flows) already
+# depend on but that are not (yet) typed TaskMetadata fields. Skipped in
+# parse_metadata's unknown-key scan below so a deliberate, documented
+# convention doesn't manufacture unknown_key census noise — extra='allow'
+# still preserves each value byte-for-value (I1). None of these collide with
+# TaskMetadata.model_fields or _SUBMODEL_REGISTRY (only 'milestone' is
+# currently registered there). gate_escalated_at / before_done_ran_at /
+# before_done_verified_at / before_done_verified_pid are the
+# DeterministicRunner's own stamps (CLAUDE.md "Deterministic task kind").
+#
+# Tier-B alias-drift keys (prd/prd_ref/prd_leaf, inv, related_task*) and
+# Tier-C ad-hoc/timestamped one-off keys are deliberately NOT included here
+# — they keep emitting unknown_key as a greppable drift signal; see
+# CLAUDE.md "Task metadata vocabulary & census" for the documented
+# consolidation convention.
+_BLESSED_METADATA_KEYS: frozenset[str] = frozenset({
+    'source',
+    'modules',
+    'spawn_context',
+    'complexity',
+    'force_full_path',
+    'branch_base_sha',
+    '_causation_id',
+    'dry_run_proposals',
+    'reblock_guard',
+    'agent_id',
+    'escalation_id',
+    'suggestion_hash',
+    'prd_path',
+    'prd_task_label',
+    'user_observable_signal',
+    'consumer_ref',
+    'substrate_confirmed',
+    'human_decomposed',
+    'grammar_confirmed',
+    'invariants',
+    'optimistic_path',
+    'capability_manifest',
+    'curator_action',
+    'curator_justification',
+    'combined_at',
+    'gate_escalated_at',
+    'before_done_ran_at',
+    'before_done_verified_at',
+    'before_done_verified_pid',
+    'origin_finding_id',
+    'spawned_from',
+    'program',
+    'program_stream',
+    'stream',
+})
+
+
 def parse_metadata(
     blob: dict | str | None,
     *,
@@ -563,7 +617,7 @@ def parse_metadata(
 
     known_fields = set(TaskMetadata.model_fields) | set(_SUBMODEL_REGISTRY)
     for key in parsed:
-        if key in known_fields or key.startswith('x_'):
+        if key in known_fields or key.startswith('x_') or key in _BLESSED_METADATA_KEYS:
             continue
         warnings.append(
             SchemaWarning(
