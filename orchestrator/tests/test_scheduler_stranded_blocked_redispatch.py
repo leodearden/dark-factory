@@ -44,11 +44,32 @@ class _FakeEscalationQueue:
         return self._by_task.get(task_id, [])
 
 
-def _make_scheduler(**config_overrides) -> Scheduler:
+def _make_scheduler(*, time_source=None, **config_overrides) -> Scheduler:
     config = OrchestratorConfig(max_per_module=1, **config_overrides)
-    scheduler = Scheduler(config, wall_time_source=lambda: FIXED_DT)
+    kwargs: dict = {'wall_time_source': lambda: FIXED_DT}
+    if time_source is not None:
+        kwargs['time_source'] = time_source
+    scheduler = Scheduler(config, **kwargs)
     scheduler.set_task_status = AsyncMock()  # type: ignore[method-assign]
     return scheduler
+
+
+def _deterministic_blocked_task(task_id: str, *, dep_id: str | None = '9') -> dict:
+    """A blocked deterministic born-at-L2 gate task (mirrors the
+    tasks-2407/2273 shape: always_escalates=True, before_done_ran_at set,
+    null claimant) — the DESIGN-GAP park-protection boundary."""
+    return {
+        'id': task_id,
+        'status': 'blocked',
+        'dependencies': [dep_id] if dep_id is not None else [],
+        'metadata': {
+            'task_kind': 'deterministic',
+            'always_escalates': True,
+            'before_done_ran_at': '2026-07-01T00:00:00+00:00',
+        },
+        'claimant_run_id': None,
+        'heartbeat_at': None,
+    }
 
 
 def _blocked_task(
@@ -170,6 +191,119 @@ class TestRedispatchStrandedBlockedCore:
         entirely dormant, even for an otherwise-genuine crash-strand."""
         scheduler = _make_scheduler(stranded_blocked_redispatch_enabled=False)
         scheduler.escalation_queue = _FakeEscalationQueue()
+
+        task = _blocked_task('T1')
+        ctx = _ctx_with_done_dep(task)
+
+        result = await scheduler._phase_redispatch_stranded_blocked(ctx)
+
+        assert result is _CONTINUE
+        scheduler.set_task_status.assert_not_awaited()
+
+
+class TestRedispatchStrandedBlockedParkProtection:
+    """Park-protection carve-outs (task 2408 step-07/08): a crash-strand and
+    a deliberate park present IDENTICALLY at the claimant layer (both
+    null/stale), so mechanism 2 needs guards beyond claimant-liveness alone.
+    """
+
+    # -- (a) DESIGN-GAP deterministic boundary --------------------------------
+
+    @pytest.mark.asyncio
+    async def test_deterministic_gate_task_not_flipped_with_empty_queue(self):
+        """A deterministic born-at-L2 gate task (tasks 2407/2273 shape) is
+        owned exclusively by the deterministic gate flow / human
+        resolve_issue — redispatching it to pending would race/duplicate
+        that flow. Unconditional exclusion, even with an empty escalation
+        queue (which would otherwise pass the generic no-open-escalation
+        gate)."""
+        scheduler = _make_scheduler()
+        scheduler.escalation_queue = _FakeEscalationQueue()
+
+        task = _deterministic_blocked_task('T1')
+        ctx = _ctx_with_done_dep(task)
+
+        result = await scheduler._phase_redispatch_stranded_blocked(ctx)
+
+        assert result is _CONTINUE
+        scheduler.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_deterministic_gate_task_not_flipped_with_open_l2(self):
+        """Companion variant: the exclusion holds regardless of escalation
+        level — even WITH an open L2 escalation present, the deterministic
+        carve-out (not the generic open-escalation gate) is what protects
+        it."""
+        scheduler = _make_scheduler()
+        scheduler.escalation_queue = _FakeEscalationQueue(
+            by_task={'T1': [{'id': 'esc-l2', 'level': 2}]}
+        )
+
+        task = _deterministic_blocked_task('T1')
+        ctx = _ctx_with_done_dep(task)
+
+        result = await scheduler._phase_redispatch_stranded_blocked(ctx)
+
+        assert result is _CONTINUE
+        scheduler.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_deterministic_control_still_flips(self):
+        """Control: an otherwise-identical NON-deterministic blocked task
+        (same null-claimant/done-dep/empty-queue shape) IS flipped — guards
+        against the deterministic exclusion being too broad."""
+        scheduler = _make_scheduler()
+        scheduler.escalation_queue = _FakeEscalationQueue()
+
+        task = _blocked_task('T1')
+        ctx = _ctx_with_done_dep(task)
+
+        result = await scheduler._phase_redispatch_stranded_blocked(ctx)
+
+        assert result is _CONTINUE
+        scheduler.set_task_status.assert_awaited_once_with('T1', 'pending')
+
+    # -- (b) actively dispatched ----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_actively_dispatched_task_not_flipped(self):
+        scheduler = _make_scheduler()
+        scheduler.escalation_queue = _FakeEscalationQueue()
+        scheduler._dispatched.add('T1')
+
+        task = _blocked_task('T1')
+        ctx = _ctx_with_done_dep(task)
+
+        result = await scheduler._phase_redispatch_stranded_blocked(ctx)
+
+        assert result is _CONTINUE
+        scheduler.set_task_status.assert_not_awaited()
+
+    # -- (c) within dispatch/requeue cooldown window --------------------------
+
+    @pytest.mark.asyncio
+    async def test_within_cooldown_window_not_flipped(self):
+        fixed_monotonic = 1_000.0
+        scheduler = _make_scheduler(time_source=lambda: fixed_monotonic)
+        scheduler.escalation_queue = _FakeEscalationQueue()
+        scheduler._requeue_until['T1'] = fixed_monotonic + 100.0
+
+        task = _blocked_task('T1')
+        ctx = _ctx_with_done_dep(task)
+
+        result = await scheduler._phase_redispatch_stranded_blocked(ctx)
+
+        assert result is _CONTINUE
+        scheduler.set_task_status.assert_not_awaited()
+
+    # -- (d) workflow just cancelled/parked (finally-block grace window) -----
+
+    @pytest.mark.asyncio
+    async def test_workflow_cancel_recent_not_flipped(self):
+        scheduler = _make_scheduler()
+        scheduler.escalation_queue = _FakeEscalationQueue()
+        scheduler.note_workflow_cancelled('T1')
+        assert scheduler.workflow_cancel_recent('T1') is True
 
         task = _blocked_task('T1')
         ctx = _ctx_with_done_dep(task)
