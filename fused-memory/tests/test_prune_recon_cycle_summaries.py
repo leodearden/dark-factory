@@ -783,7 +783,7 @@ class TestRun:
         assert result.get('aborted') is True
         assert result.get('scan_truncated') is True
         assert result.get('truncated_projects') == ['dark_factory']
-        assert result.get('possible_timeout_projects') == []
+        assert result.get('possible_undercount_projects') == []
         memory.delete_memory.assert_not_awaited()
 
         captured = capsys.readouterr()
@@ -791,14 +791,16 @@ class TestRun:
         assert 'benign' in captured.err.lower()
 
     @pytest.mark.asyncio
-    async def test_scan_truncation_flags_possible_timeout_when_scan_returns_zero(self, capsys):
-        """scroll_by_metadata returns `[]` both for a genuinely-empty pool and
-        for a swallowed Qdrant timeout (see its docstring) -- the two are
-        indistinguishable without cross-checking. When the ground truth says
-        the pool is NOT actually empty, the truncation guard must still fire
-        (the zero-scan case is never short-circuited), and the abort must
-        flag this as a probable scroll timeout rather than pointing solely at
-        --scan-limit, which would not fix a timeout."""
+    async def test_scan_truncation_flags_possible_undercount_when_scan_returns_zero(self, capsys):
+        """scroll_by_metadata returning `[]` is indistinguishable from a
+        genuinely-empty pool vs. a benign under-count/race against
+        count_by_metadata without cross-checking (a real Qdrant read-timeout
+        now raises out of scroll_by_metadata instead of returning `[]`, see
+        its docstring, so it can never reach this branch). When the ground
+        truth says the pool is NOT actually empty, the truncation guard must
+        still fire (the zero-scan case is never short-circuited), and the
+        abort must flag this as a probable under-count/race rather than
+        pointing solely at --scan-limit, which would not fix a race."""
         memory = self._make_memory([])  # scroll_by_metadata returns []
         memory.mem0.count_by_metadata = AsyncMock(return_value=42)
         args = self._args(apply=True, project_id='dark_factory')
@@ -807,11 +809,33 @@ class TestRun:
 
         assert result.get('aborted') is True
         assert result.get('scan_truncated') is True
-        assert result.get('possible_timeout_projects') == ['dark_factory']
+        assert result.get('possible_undercount_projects') == ['dark_factory']
         memory.delete_memory.assert_not_awaited()
 
         captured = capsys.readouterr()
-        assert 'timeout' in captured.err.lower()
+        assert 'under-count' in captured.err.lower() or 'race' in captured.err.lower()
+
+    @pytest.mark.asyncio
+    async def test_scroll_timeout_propagates_uncaught(self):
+        """A real Qdrant read-timeout now RAISES out of scroll_by_metadata
+        (task 2671 removed the old swallow-into-`[]` behaviour) instead of
+        returning an empty list -- this is the invariant the
+        possible_undercount_projects rename and the surrounding
+        docstrings/NOTE wording above hinge on. run() must let the
+        TimeoutError propagate uncaught rather than silently classifying the
+        pool as empty ("nothing to prune") or reaching the
+        scan_truncated/abort branch at all -- a raised TimeoutError never
+        produces a scan result to evaluate in the first place."""
+        memory = self._make_memory([])
+        memory.mem0.scroll_by_metadata = AsyncMock(
+            side_effect=TimeoutError('qdrant scroll timed out'),
+        )
+        args = self._args(apply=True, project_id='dark_factory')
+
+        with pytest.raises(TimeoutError):
+            await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        memory.delete_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_scan_skips_ground_truth_when_scroll_below_limit(self):
