@@ -252,6 +252,18 @@ guard — no re-dispatch, no churn).
 `done_provenance` (`kind='deterministic-deploy'` cross-unit;
 `kind='deterministic-deploy-scheduled'` self-restart).
 
+**`done_provenance.kind='operational-verified'`** — a related but distinct
+closure path, used for `normal`-task no-code operational asks (e.g. a
+restart/redeploy/confirm) closed out via a resolved escalation rather than a
+`DeterministicRunner` action or a code merge. Commitless like the
+`deterministic-*` kinds above, so it is likewise exempt from the
+reopen-freshness gate (that gate only inspects `merged`/`found_on_main`).
+Requires `escalation_id` (the resolving escalation id, recorded **verbatim**
+for Stage-2 audit — no live cross-service lookup) and `note`; accepted only
+from non-recon-stage callers, both on the fresh `done` transition and on the
+same-status `done`→`done` repair path — a recon stage may not self-authorize
+an operational close.
+
 **Dep convention:** deterministic deploys and gates use **normal** deps —
 including cross-project `project_id:task_id` deps. See "Cross-project task
 dependencies" above.
