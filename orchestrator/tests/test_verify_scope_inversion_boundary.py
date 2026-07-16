@@ -1080,11 +1080,35 @@ class TestRow7TrainAmortizationOneFullBreadthVerify:
 # ---------------------------------------------------------------------------
 
 
-# NOTE (RED, step-15): _row8_assert_legacy_scoped_shape (the row-8
-# legacy-golden reference) is intentionally NOT YET DEFINED here — the test
-# below references it and fails with a NameError until step-16 (GREEN)
-# defines it, mirroring TestRow2TaskRoleSignal's RED-via-_drive_producer
-# split (test_verify_scope_inversion_boundary.py step-3/step-4).
+def _row8_assert_legacy_scoped_shape(executed_mc: ModuleConfig) -> None:
+    """Assert *executed_mc* (the executed rendering of the touched module)
+    matches the BYTE-IDENTICAL-TO-LEGACY shape ``role='merge'`` +
+    ``merge_verify_breadth='scoped'`` must produce for a source-only diff
+    (R4, the rollback golden) — the legacy-golden reference row 8 pins.
+
+    pytest must be SKIPPED (``None``): a source-only diff has no
+    collectable test file to file-scope, and the R3 task-role pytest floor
+    (``TestRow2TaskRoleSignal`` above) is gated to ``role == 'task'`` only
+    (``verify_plan._derive_module_runs``'s ``elif role == 'task':`` branch)
+    — ``role == 'merge'`` always falls through to the legacy ``else:``
+    SKIPPED arm, unchanged by λ (R4). lint/pyright, in contrast, stay
+    FILE_SCOPED and non-``None``: D1/D2 file-scoping never forked on role
+    or ``merge_verify_breadth`` to begin with, so R4 has nothing to roll
+    back there.
+    """
+    assert executed_mc.test_command is None, (
+        f"expected pytest SKIPPED for a source-only diff at role='merge' + "
+        f"breadth='scoped' (the pre-λ legacy shape — no task-role floor "
+        f'leaks into merge role, R4); got {executed_mc.test_command!r}'
+    )
+    assert executed_mc.lint_command is not None, (
+        'expected lint to still run FILE_SCOPED (R4 only concerns the '
+        'pytest floor; lint/pyright file-scoping is role-independent)'
+    )
+    assert executed_mc.type_check_command is not None, (
+        'expected pyright to still run FILE_SCOPED (R4 only concerns the '
+        'pytest floor; lint/pyright file-scoping is role-independent)'
+    )
 
 
 class TestRow8ScopedBreadthMergePlanByteIdenticalLegacy:
