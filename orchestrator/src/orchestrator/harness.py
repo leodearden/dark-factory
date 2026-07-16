@@ -6826,7 +6826,16 @@ Output JSON matching the schema. Every task must appear in the output.
         - ``restart_precondition``: ``self._merge_pipeline_idle`` — even at the
           run-loop's idle quiet-window (``agents_idle=True``), a merge can
           still be queued or in-flight/verifying; this gate additionally
-          defers the fire until the merge pipeline is fully drained.
+          prefers to defer the fire until the merge pipeline is drained.
+          Under chronic fleet saturation this preference alone would starve
+          the coordinator indefinitely, so it is now a *polite-path
+          preference* rather than a hard precondition: once a pending
+          restart has been owed for ``orchestrator_restart_force_fire_after_secs``
+          (fleet-redeploy PRD task delta), ``maybe_restart`` force-fires and
+          bypasses ``agents_idle``, the debounce, AND this precondition —
+          though it never bypasses ``min_interval_secs`` below. Per-unit
+          merge-drain safety is delegated to restart-all-orchestrators.sh's
+          drain gate (task gamma) instead.
 
         ``require_idle=True`` and ``script_args=[]`` mirror the fused-memory
         coordinator (idle-only; restart-orchestrator.sh takes no positional
@@ -6894,6 +6903,7 @@ Output JSON matching the schema. Every task must appear in the output.
             restart_precondition=self._merge_pipeline_idle,
             restart_executor=_systemd_run_restart_executor,
             min_interval_secs=self.config.orchestrator_restart_min_interval_secs,
+            force_fire_after_secs=self.config.orchestrator_restart_force_fire_after_secs,
             state_path=redeploy_state_path,
             # restart-all-orchestrators.sh is the SOLE on-disk clock writer,
             # stamping only on its verified-fresh exit-0 path — the watchdog

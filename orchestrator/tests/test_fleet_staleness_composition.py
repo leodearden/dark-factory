@@ -115,6 +115,11 @@ def harness(tmp_path: Path, mock_orch_config):
     # (not a MagicMock) or the comparison raises TypeError. 0.0 disables the cap
     # so these fleet-composition fire tests aren't gated by it.
     mock_orch_config.orchestrator_restart_min_interval_secs = 0.0
+    # task 2398 added a force-fire escape gate (`_force_fire_after_secs > 0`) in
+    # maybe_restart; same requirement as above — must be a real number or the
+    # comparison raises TypeError. 0.0 disables force-fire so these
+    # fleet-composition fire tests keep exercising the polite path unchanged.
+    mock_orch_config.orchestrator_restart_force_fire_after_secs = 0.0
 
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
