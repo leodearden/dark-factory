@@ -3125,14 +3125,15 @@ async def test_on_task_done_repeat_done_echoes_current_not_stale_snapshot_proven
 
 
 # ---------------------------------------------------------------------------
-# _fetch_done_provenance snapshot-usability gate (task 2049 amendment)
+# _fetch_done_provenance always re-fetches live (task 2647)
 #
-# `_fetch_done_provenance` prefers `task_before`'s own snapshot metadata over
-# a live re-fetch when the snapshot already carries usable `done_provenance`
-# (cheap: no round-trip). It must only take that shortcut when the snapshot
-# is actually usable (`_format_outcome_echo` can format it into an echo) --
-# an empty or note/commit-less snapshot must fall through to the live
-# re-fetch instead of pinning the caller to a value that degrades to None.
+# `_fetch_done_provenance` no longer trusts `task_before`'s own snapshot
+# metadata at all -- it unconditionally re-fetches the live task via
+# `get_task`. The snapshot is captured BEFORE the current transition's
+# `done_provenance` is persisted, so it is never a reliable source: absent on
+# a first done-transition, and stale (the prior transition's value) on a
+# repeat done-transition. The live re-fetch is the only source that reliably
+# observes the just-persisted current provenance.
 
 
 @pytest.mark.asyncio
@@ -3148,14 +3149,15 @@ async def test_on_task_done_refetches_when_snapshot_provenance_unusable(
 ):
     """An unusable (empty, or note/commit-less) `task_before` snapshot
     `done_provenance` must not short-circuit `_fetch_done_provenance` -- the
-    live re-fetch must still run and its usable provenance must be preferred.
+    live re-fetch always runs (task 2647: the snapshot is never trusted,
+    usable or not) and its provenance is what gets echoed.
 
     The current production caller never populates the pre-transition
     snapshot's `done_provenance` (task_interceptor.py captures `task_before`
-    before persisting it), so this only guards a future replay/trigger caller
-    that hands in a stale-but-present empty/unusable value; previously,
-    `_format_outcome_echo` would have silently degraded that pinned value to
-    None, losing the provenance preference rather than crashing."""
+    before persisting it), and on a repeat done-transition the snapshot can
+    carry a stale-but-usable prior value instead -- so this case (an
+    unusable snapshot) is one of several shapes the snapshot can take, none
+    of which are ever consulted."""
     mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
     mock_taskmaster.get_task = AsyncMock(return_value={
         'id': '42', 'title': 'T', 'status': 'done',
@@ -3184,34 +3186,3 @@ async def test_on_task_done_refetches_when_snapshot_provenance_unusable(
     )
     metadata = calls[0].kwargs.get('metadata') or {}
     assert metadata.get('echo_used_provenance') is True
-
-
-@pytest.mark.asyncio
-async def test_on_task_done_skips_refetch_when_snapshot_provenance_usable(
-    reconciler, mock_memory_service, mock_taskmaster,
-):
-    """When `task_before`'s own metadata already carries a usable
-    `done_provenance`, `_fetch_done_provenance` still short-circuits without a
-    live re-fetch: the amendment's usability gate
-    (`_format_outcome_echo(provenance) is not None`) only widens the re-fetch
-    trigger to unusable snapshots -- it must not regress the cheap
-    already-have-it path into an unconditional re-fetch."""
-    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
-
-    await reconciler.reconcile_task(
-        task_id='42', transition='done', project_id='test-project', project_root='/tmp/test',
-        task_before={
-            'id': '42',
-            'title': 'T',
-            'status': 'in-progress',
-            'description': 'DESC text',
-            'metadata': {'done_provenance': {'note': 'Snapshot note'}},
-        },
-    )
-
-    mock_taskmaster.get_task.assert_not_called()
-
-    calls = mock_memory_service.add_memory.call_args_list
-    assert len(calls) >= 1
-    content = calls[0].kwargs.get('content')
-    assert content is not None and 'Snapshot note' in content

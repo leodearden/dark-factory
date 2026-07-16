@@ -329,34 +329,27 @@ class TargetedReconciler:
         return any(statuses.get(str(t)) in ACTIVE_TASK_STATUSES for t in batch_ids)
 
     async def _fetch_done_provenance(
-        self, task_id: str, project_root: ProjectRoot, task_before_task: dict,
+        self, task_id: str, project_root: ProjectRoot,
     ) -> dict | None:
         """Return the current-transition ``metadata.done_provenance``, or None.
 
-        Task 2049: ``task_before_task`` (already ``_extract_task``-normalized)
-        is the PRE-transition snapshot — task_interceptor.py's
-        ``_apply_status_transition`` captures it BEFORE ``done_provenance`` is
-        persisted — so on a first done-transition it never carries provenance.
-        Prefer it anyway (cheap, and correct for any caller that already has
-        it), then fall back to re-fetching the live task, which reliably
-        observes the just-persisted provenance: the persist happens inside the
-        write-lock, before the fire-and-forget ``reconcile_task`` is scheduled.
-
-        Amendment: the snapshot is only trusted when it is actually usable
-        (``_format_outcome_echo`` would produce a non-None echo from it).
-        A snapshot provenance that is present but empty/unusable (e.g. ``{}``
-        or ``{'kind': ...}`` with no ``note``/``commit``) would otherwise pin
-        the caller to it and skip the live re-fetch, even though the live task
-        may since have gained a usable value — the only production caller
-        never populates the pre-transition snapshot's ``done_provenance``, so
-        this only matters for future replay/trigger callers.
+        Task 2647: always re-fetch the live task rather than trusting the
+        ``task_before`` pre-transition snapshot. task_interceptor.py's
+        ``_apply_status_transition`` captures ``task_before`` BEFORE the
+        CURRENT transition's ``done_provenance`` is persisted, so the
+        snapshot is never a reliable source for it: on a first done-transition
+        it carries no provenance at all, and on a repeat done-transition
+        (reopen out of a terminal status does not clear a prior
+        ``done_provenance`` — task_interceptor.py:953-961) it carries the
+        PRIOR transition's now-stale value, which is nonetheless "usable" by
+        ``_format_outcome_echo``. A snapshot-first shortcut therefore either
+        falls through anyway (first transition) or echoes stale data (repeat
+        transition — the task 2394 bug: the second completion echo cited the
+        first transition's commit instead of the live one). The live
+        ``get_task`` re-fetch reliably observes the just-persisted current
+        provenance: the persist happens inside the write-lock, before the
+        fire-and-forget ``reconcile_task`` is scheduled.
         """
-        metadata = task_before_task.get('metadata') if isinstance(task_before_task, dict) else None
-        if isinstance(metadata, dict):
-            provenance = metadata.get('done_provenance')
-            if isinstance(provenance, dict) and _format_outcome_echo(provenance) is not None:
-                return provenance
-
         try:
             fresh = await self.taskmaster.get_task(task_id, project_root=project_root)
         except Exception as e:
@@ -423,7 +416,7 @@ class TargetedReconciler:
                 # verbatim reads as if the bug is still open. Fall back to the
                 # legacy description+details append when no usable provenance
                 # exists (legacy tasks / a failed provenance write).
-                provenance = await self._fetch_done_provenance(task_id, scope.project_root, task)
+                provenance = await self._fetch_done_provenance(task_id, scope.project_root)
                 outcome = _format_outcome_echo(provenance)
                 if outcome:
                     content += f" {outcome}"
