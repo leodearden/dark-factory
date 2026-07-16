@@ -46,14 +46,20 @@ from orchestrator.verify import run_scoped_verification
 # ---------------------------------------------------------------------------
 
 
-def _two_module_registry(tmp_path: Path) -> tuple[ModuleConfig, ModuleConfig, OrchestratorConfig]:
-    """A 2-module registry (modA/modB), ``merge_verify_breadth='full'``.
+def _two_module_registry(
+    tmp_path: Path, *, breadth: Literal['scoped', 'full'] = 'full',
+) -> tuple[ModuleConfig, ModuleConfig, OrchestratorConfig]:
+    """A 2-module registry (modA/modB), ``merge_verify_breadth=`` *breadth*.
 
     Mirrors a real dark_factory ``config.module_configs_or_empty`` registry —
     modB is NEVER passed to ``run_scoped_verification`` as part of the
     *module_configs* argument, only discoverable via the registry, so a test
     that observes modB execute is exercising the merge+full expansion
     (step-8), not merely echoing its own *module_configs* argument back.
+
+    *breadth* defaults to ``'full'`` (this module's usual shape, unchanged
+    for every pre-existing call site); pass ``'scoped'`` to build the SAME
+    2-module registry for a legacy-byte-identical rollback golden (R4).
     """
     mod_a = ModuleConfig(
         prefix='moda',
@@ -67,7 +73,7 @@ def _two_module_registry(tmp_path: Path) -> tuple[ModuleConfig, ModuleConfig, Or
         lint_command='uv run --directory modb ruff check src/',
         type_check_command='uv run --directory modb pyright src/',
     )
-    config = OrchestratorConfig(project_root=tmp_path, merge_verify_breadth='full')
+    config = OrchestratorConfig(project_root=tmp_path, merge_verify_breadth=breadth)
     config._module_configs = {'moda': mod_a, 'modb': mod_b}
     return mod_a, mod_b, config
 
@@ -167,4 +173,118 @@ class TestRoleBreadthExecutionGoldens:
         assert mock_run_verification.await_count == 0, (
             f'docs-only diff must execute zero commands (role={role!r}); '
             f'got {mock_run_verification.await_count} call(s)'
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-9: force_workspace x merge_verify_breadth + train routing goldens (RED, T1)
+# ---------------------------------------------------------------------------
+
+
+class TestForceWorkspaceBreadthExecutionGoldens:
+    """``force_workspace`` x ``merge_verify_breadth`` execution goldens (T1).
+
+    ``force_workspace`` bypasses ALL file-scoping (see
+    ``run_scoped_verification``'s "Workspace (train-member override)"
+    docstring paragraph) — ``merge_verify_breadth`` forks WHAT that
+    bypassed-scoping path executes, not WHETHER it executes: breadth='full'
+    replaces the single OPAQUE global ``&&``-chain with a per-module
+    full-suite fan-out across every REGISTERED module (mirroring the
+    module_configs-branch merge+full expansion ``TestRoleBreadthExecutionGoldens``
+    pins above); breadth='scoped' (the shipped default) stays byte-identical
+    to the pre-λ legacy single global call (R4).
+
+    This is the ``merge_verify_workspace=True`` routing
+    ``verify_runner.LocalRunner._run`` threads ``role='merge'`` into — the
+    production DF merge gate leaves ``merge_verify_workspace`` at its
+    default ``False`` (module-config ``role='merge'`` branch instead), so
+    this fork exercises a currently-off-by-default but supported routing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_force_workspace_merge_full_executes_every_registered_module_per_module(
+        self, tmp_path: Path,
+    ):
+        """(a) force_workspace=True + role='merge' + breadth='full': every
+        REGISTERED module executes with its OWN verbatim per-module
+        commands — the opaque global chain is replaced by a per-module
+        fan-out, NOT a single module-config-less global run_verification
+        call."""
+        mod_a, mod_b, config = _two_module_registry(tmp_path, breadth='full')
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [mod_a], force_workspace=True, role='merge',
+            )
+
+        assert result.passed
+        executed = {mc.prefix: mc for mc in _executed_module_configs(mock_run_verification)}
+        assert set(executed) == {'moda', 'modb'}, (
+            f'expected BOTH registered modules to execute per-module under '
+            f'force_workspace merge+full; got {set(executed)!r}'
+        )
+        assert executed['moda'].test_command == mod_a.test_command
+        assert executed['moda'].lint_command == mod_a.lint_command
+        assert executed['moda'].type_check_command == mod_a.type_check_command
+        assert executed['modb'].test_command == mod_b.test_command
+        assert executed['modb'].lint_command == mod_b.lint_command
+        assert executed['modb'].type_check_command == mod_b.type_check_command
+
+    @pytest.mark.asyncio
+    async def test_force_workspace_merge_scoped_stays_single_opaque_global_call(
+        self, tmp_path: Path,
+    ):
+        """(b) force_workspace=True + breadth='scoped' (the shipped
+        default): byte-identical legacy — exactly ONE global
+        run_verification call carrying NO ModuleConfig (the opaque
+        workspace command), never a per-module fan-out (R4 rollback
+        golden)."""
+        mod_a, _mod_b, config = _two_module_registry(tmp_path, breadth='scoped')
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [mod_a], force_workspace=True, role='merge',
+            )
+
+        assert result.passed
+        assert mock_run_verification.await_count == 1, (
+            f'expected exactly ONE opaque global call under breadth=scoped; '
+            f'got {mock_run_verification.await_count} call(s)'
+        )
+        assert _executed_module_configs(mock_run_verification) == [], (
+            'expected the legacy call to carry NO ModuleConfig (opaque global command)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_train_tip_shaped_call_widens_to_every_registered_module(
+        self, tmp_path: Path,
+    ):
+        """(c) Train-tip-shaped call: force_workspace=False (as when
+        merge_verify_workspace is off), role='merge', module_configs=[modA]
+        only (union of the tip's own touched modules), breadth='full' —
+        widens to ALL registered modules per-module (one broad verify of
+        the tip; boundary row 7 plan shape) via the already-green step-8
+        module_configs-branch expansion. Regression pin, not new behaviour —
+        grouped here because it completes this class's T1 "train routing"
+        coverage alongside (a)/(b)'s force_workspace fork."""
+        mod_a, mod_b, config = _two_module_registry(tmp_path, breadth='full')
+        source_path = 'moda/helpers.py'
+        full = tmp_path / source_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('def helper():\n    return 1\n')
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [mod_a], task_files=[source_path],
+                force_workspace=False, role='merge',
+            )
+
+        assert result.passed
+        executed = {mc.prefix: mc for mc in _executed_module_configs(mock_run_verification)}
+        assert set(executed) == {'moda', 'modb'}, (
+            f'expected the train-tip call to widen to every registered module; '
+            f'got {set(executed)!r}'
         )
