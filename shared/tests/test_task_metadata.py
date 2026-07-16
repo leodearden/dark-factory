@@ -917,6 +917,57 @@ class TestParseMetadataFailurePolicy:
         assert warnings[0].field == 'mystery_field'
         assert model.model_dump()['mystery_field'] == 'v'
 
+    # A representative spread of the 34 Tier-A blessed conventional keys
+    # (see _BLESSED_METADATA_KEYS), plus one genuine control key
+    # (mystery_zzz) that must still warn. RED: none of the blessed keys are
+    # skipped yet, so each one currently emits its own unknown_key warning.
+    _BLESSED_SAMPLE_BLOB = {
+        'source': 'x',
+        'modules': ['a'],
+        'spawn_context': 'y',
+        'complexity': 'simple',
+        'force_full_path': True,
+        'branch_base_sha': 'abc123',
+        '_causation_id': 'c1',
+        'agent_id': 'claude-1',
+        'escalation_id': 'esc-1',
+        'prd_path': 'plans/x.md',
+        'prd_task_label': 'T1',
+        'user_observable_signal': 'sig',
+        'consumer_ref': 'ref',
+        'invariants': ['I1'],
+        'capability_manifest': {'a': 1},
+        'curator_action': 'merge',
+        'gate_escalated_at': '2026-01-01T00:00:00+00:00',
+        'before_done_ran_at': '2026-01-01T00:00:00+00:00',
+        'before_done_verified_at': '2026-01-01T00:00:00+00:00',
+        'before_done_verified_pid': 123,
+        'origin_finding_id': 'f1',
+        'spawned_from': 'task-1',
+        'program': 'p1',
+        'program_stream': 's1',
+        'stream': 'main',
+        'mystery_zzz': 'control',
+    }
+
+    def test_blessed_conventional_keys_emit_no_unknown_key_warning(self):
+        blob = dict(self._BLESSED_SAMPLE_BLOB)
+        model, warnings = parse_metadata(blob, direction='read')
+
+        blessed_in_blob = set(blob) - {'mystery_zzz'}
+        unknown_key_warnings = [w for w in warnings if w.code == 'unknown_key']
+        offending_blessed = [w for w in unknown_key_warnings if w.field in blessed_in_blob]
+        assert offending_blessed == [], (
+            f'Expected no unknown_key warnings for blessed keys; got: {offending_blessed}'
+        )
+        assert len(unknown_key_warnings) == 1, (
+            f'Expected exactly one unknown_key warning (mystery_zzz); got: {unknown_key_warnings}'
+        )
+        assert unknown_key_warnings[0].field == 'mystery_zzz'
+
+        dumped = model.model_dump()
+        assert dumped['prd_path'] == blob['prd_path']
+
     def test_deterministic_invariant_violation_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)
