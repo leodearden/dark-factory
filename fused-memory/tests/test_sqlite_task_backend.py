@@ -694,6 +694,7 @@ async def test_set_task_status_claimant_fails_safe_when_columns_absent(tmp_path,
     finally:
         await b.close()
 
+    assert 'message' in result  # narrows SetTaskStatusResult | StatusWriteNotPersistedResult
     assert 'in-progress' in result['message']
     assert one['status'] == 'in-progress'
     assert one['claimant_run_id'] is None
@@ -1092,6 +1093,140 @@ def test_stamp_audit_metadata_is_privileged_non_protocol_seam():
         'stamp_audit_metadata must NOT be part of TaskBackendProtocol — '
         'it is a privileged seam reachable only from TaskInterceptor.'
     )
+
+
+# ── set_status_and_stamp_audit: atomic status+audit writer (task 2649) ──
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['found_on_main', 'merged'])
+async def test_set_status_and_stamp_audit_persists_status_and_metadata_atomically(
+    backend, project_root, kind,
+):
+    """The new atomic writer updates the status column AND merges audit
+    fields into metadata in a single call, preserving pre-existing
+    done_provenance (either kind) and an untouched sibling metadata key —
+    the fix for the two-commit partial-write window (task 2649)."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({'memory_hints': {'entities': ['A'], 'queries': ['q1']}}),
+    )
+    await backend.set_task_status('1', 'done', project_root=project_root)
+    await backend.stamp_audit_metadata(
+        '1', project_root,
+        {'done_provenance': {'kind': kind, 'commit': 'abc123'}},
+    )
+
+    result = await backend.set_status_and_stamp_audit(  # type: ignore[attr-defined]
+        '1', 'pending', project_root=project_root,
+        audit_fields={
+            'reopen_reason': 'regression found',
+            'reopen_from': 'done',
+            'reopen_at': '2026-07-09T00:00:00+00:00',
+        },
+    )
+
+    assert result['tasks'] == [{
+        'taskId': '1',
+        'oldStatus': 'done',
+        'newStatus': 'pending',
+    }]
+
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['status'] == 'pending'
+    assert task['metadata']['reopen_reason'] == 'regression found'
+    assert task['metadata']['reopen_from'] == 'done'
+    assert task['metadata']['reopen_at'] == '2026-07-09T00:00:00+00:00'
+    assert task['metadata']['done_provenance'] == {'kind': kind, 'commit': 'abc123'}
+    assert task['metadata']['memory_hints'] == {'entities': ['A'], 'queries': ['q1']}
+
+
+# ── set_task_status / set_status_and_stamp_audit: read-back verify ──
+# (requirement #3: newStatus must reflect an actual read-back, never a
+# fabricated echo of the requested status; a silently suppressed UPDATE
+# must surface as an explicit error instead of a false success.)
+
+
+class _RowUpdateSuppressedBackend(SqliteTaskBackend):
+    """Test double: simulates a silently suppressed status UPDATE (e.g. a
+    floor refusal or a lost commit) by making the extracted
+    ``_apply_status_row_update`` seam a no-op. The row is left completely
+    untouched, so a caller trusting the requested status instead of a
+    read-back would report a false success."""
+
+    async def _apply_status_row_update(self, conn, set_columns, set_values, tag, tid):
+        return
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_reports_explicit_error_when_write_not_persisted(tmp_path):
+    """Plain set_task_status: a suppressed UPDATE must not report success."""
+    project_root = str(tmp_path / 'proj')
+    suppressed = _RowUpdateSuppressedBackend(TaskmasterConfig(project_root=project_root))
+    await suppressed.start()
+    try:
+        await suppressed.add_task(project_root=project_root, title='x')
+        result = await suppressed.set_task_status('1', 'done', project_root=project_root)
+        task = await suppressed.get_task('1', project_root=project_root)
+    finally:
+        await suppressed.close()
+
+    assert result == {
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '1',
+        'requested_status': 'done',
+        'actual_status': 'pending',
+    }
+    assert task['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_set_status_and_stamp_audit_reports_explicit_error_when_write_not_persisted(
+    tmp_path,
+):
+    """Atomic writer: a suppressed UPDATE must not report success, and the
+    metadata merge must not land either — both-or-neither."""
+    project_root = str(tmp_path / 'proj')
+    setup = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await setup.start()
+    await setup.add_task(project_root=project_root, title='x')
+    await setup.set_task_status('1', 'done', project_root=project_root)
+    await setup.close()
+
+    suppressed = _RowUpdateSuppressedBackend(TaskmasterConfig(project_root=project_root))
+    await suppressed.start()
+    try:
+        result = await suppressed.set_status_and_stamp_audit(  # type: ignore[attr-defined]
+            '1', 'pending', project_root=project_root,
+            audit_fields={
+                'reopen_reason': 'regression found',
+                'reopen_from': 'done',
+                'reopen_at': '2026-07-09T00:00:00+00:00',
+            },
+        )
+        task = await suppressed.get_task('1', project_root=project_root)
+    finally:
+        await suppressed.close()
+
+    assert result == {
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '1',
+        'requested_status': 'pending',
+        'actual_status': 'done',
+    }
+    assert task['status'] == 'done'
+    assert 'reopen_reason' not in (task['metadata'] or {})
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_newstatus_is_grounded_in_readback(backend, project_root):
+    """Happy-path: newStatus reflects an actual read-back, not a fabricated echo."""
+    await backend.add_task(project_root=project_root, title='x')
+    result = await backend.set_task_status('1', 'done', project_root=project_root)
+    task = await backend.get_task('1', project_root=project_root)
+    assert result['tasks'][0]['newStatus'] == task['status'] == 'done'
 
 
 # ── _merge_metadata: new additive-merge semantics ─────────────────

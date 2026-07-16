@@ -44,6 +44,7 @@ from fused_memory.backends.task_backend_types import (
     GetTasksResult,
     RemoveTaskResult,
     SetTaskStatusResult,
+    StatusWriteNotPersistedResult,
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
@@ -151,6 +152,39 @@ _VALID_STATUSES: frozenset[TaskStatus] = frozenset(TaskStatus)
 # warning code defaults to fatal rather than silently under-blocking a
 # genuinely-bad write (task 2405).
 _NON_FATAL_WRITE_WARNING_CODES: frozenset[str] = frozenset({'unknown_key'})
+
+
+class _StatusWriteNotPersisted(Exception):
+    """Internal control-flow signal (task 2649).
+
+    Raised inside the ``_txn`` block by :meth:`SqliteTaskBackend.set_task_status`
+    / :meth:`SqliteTaskBackend.set_status_and_stamp_audit` when a post-write
+    read-back shows the status column did NOT actually take the requested
+    value (a silent no-op, a floor refusal, or a lost commit). Raising —
+    rather than just building the error dict inline — lets ``_txn``'s
+    ``except`` clause roll back the whole transaction first, so on the
+    atomic writer a mismatch rolls back the metadata merge too (both-or-
+    neither). Always caught by the same method that raised it and mapped to
+    :meth:`to_error_dict`; never escapes to a caller.
+    """
+
+    def __init__(self, task_id: str, requested_status: str, actual_status: str | None):
+        self.task_id = task_id
+        self.requested_status = requested_status
+        self.actual_status = actual_status
+        super().__init__(
+            f'status write not persisted for task_id={task_id!r}: '
+            f'requested {requested_status!r}, actual {actual_status!r}',
+        )
+
+    def to_error_dict(self) -> StatusWriteNotPersistedResult:
+        return {
+            'success': False,
+            'error': 'status_write_not_persisted',
+            'task_id': self.task_id,
+            'requested_status': self.requested_status,
+            'actual_status': self.actual_status,
+        }
 
 
 def _now() -> str:
@@ -1612,6 +1646,124 @@ class SqliteTaskBackend:
             rows = await cursor.fetchall()
         return [row['tag'] for row in rows]
 
+    async def _apply_status_row_update(
+        self,
+        conn: aiosqlite.Connection,
+        set_columns: list[str],
+        set_values: list[Any],
+        tag: str,
+        tid: int,
+    ) -> None:
+        """Execute the status-row ``UPDATE`` statement.
+
+        Extracted as a seam (task 2649) so tests can simulate a silently
+        suppressed write (e.g. a floor refusal or a lost commit) by
+        overriding this single method, without touching the surrounding
+        read-back verification in :meth:`set_task_status` /
+        :meth:`set_status_and_stamp_audit`. ``set_values`` holds only the
+        SET-clause values — ``tag``/``tid`` are appended here to build the
+        ``WHERE`` clause parameters.
+        """
+        await conn.execute(
+            f'UPDATE tasks SET {", ".join(set_columns)} WHERE tag = ? AND id = ?',
+            [*set_values, tag, tid],
+        )
+
+    async def _write_status_and_verify(
+        self,
+        conn: aiosqlite.Connection,
+        set_columns: list[str],
+        set_values: list[Any],
+        tag: str,
+        tid: int,
+        task_id: str,
+        status: str,
+        row_candidate_key: str | None,
+        claimant_run_id: str | None,
+        heartbeat_at: str | None,
+        project_root: str,
+        caller_name: str,
+        write_desc: str,
+    ) -> str:
+        """Shared tail for :meth:`set_task_status` / :meth:`set_status_and_stamp_audit`.
+
+        Extracted (task 2649 review remediation: reviewer_comprehensive /
+        code-duplication) so the claimant tri-state column assembly, the
+        ``sqlite3.IntegrityError`` -> :class:`DuplicateCandidateKeyError`
+        survivor-lookup collision mapping, and the post-write read-back
+        verify live in exactly one place instead of two near-identical
+        copies that would otherwise drift. Callers build their own
+        caller-specific ``set_columns``/``set_values`` (plain status-only
+        vs status+metadata) and pass them in along with a ``caller_name``/
+        ``write_desc`` pair used only for the claimant-columns-absent log
+        message, so the two callers' warning text is unchanged.
+
+        Returns the read-back persisted status on success. Raises
+        :class:`_StatusWriteNotPersisted` when the read-back does not match
+        ``status`` — always caught by the caller (inside the same ``_txn``
+        the caller opened, so a mismatch rolls back everything written so
+        far, including a metadata merge on the atomic writer) and mapped to
+        an explicit ``{'success': False, 'error': 'status_write_not_persisted',
+        ...}`` error dict.
+        """
+        if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
+            if self._claimant_columns_cache.get(project_root, False):
+                if claimant_run_id is not _UNSET:
+                    set_columns.append('claimant_run_id = ?')
+                    set_values.append(claimant_run_id)
+                if heartbeat_at is not _UNSET:
+                    set_columns.append('heartbeat_at = ?')
+                    set_values.append(heartbeat_at)
+            else:
+                logger.warning(
+                    '%s: claimant_run_id/heartbeat_at columns absent '
+                    '(pre-migration connection) — writing %s only for '
+                    'task_id=%s project_root=%s',
+                    caller_name, write_desc, task_id, project_root,
+                )
+
+        try:
+            await self._apply_status_row_update(
+                conn, set_columns, set_values, tag, tid,
+            )
+        except sqlite3.IntegrityError as exc:
+            # Only the candidate_key partial UNIQUE index is mapped to a
+            # typed collision (mirrors add_task's collision mapping); any
+            # other integrity violation is unrelated and re-raised
+            # untouched. Reachable via the narrow un-cancel path (see
+            # set_task_status's docstring). Nothing in this transaction has
+            # been written yet when this is the first write statement, so
+            # this survivor lookup sees the same state a post-rollback read
+            # would (this row's own candidate_key/status are unaffected,
+            # having never been applied).
+            if row_candidate_key is None or 'candidate_key' not in str(exc):
+                raise
+            survivor_cursor = await conn.execute(
+                "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                "AND status != 'cancelled' ORDER BY id LIMIT 1",
+                (tag, row_candidate_key),
+            )
+            survivor = await survivor_cursor.fetchone()
+            raise DuplicateCandidateKeyError(
+                existing_id=survivor['id'] if survivor is not None else None,
+                existing_status=survivor['status'] if survivor is not None else None,
+                tag=tag,
+                candidate_key=row_candidate_key,
+            ) from exc
+
+        verify_cursor = await conn.execute(
+            'SELECT status FROM tasks WHERE tag = ? AND id = ?', (tag, tid),
+        )
+        verify_row = await verify_cursor.fetchone()
+        persisted_status = verify_row['status'] if verify_row is not None else None
+        if persisted_status != status:
+            raise _StatusWriteNotPersisted(task_id, status, persisted_status)
+        # persisted_status is confirmed == status above, but it's read back as
+        # `Any` (sqlite3.Row.__getitem__) unioned with the None fallback, which
+        # pyright can't narrow through a `!=` guard — `status` is the same
+        # value with a real `str` type, so return that instead (reportReturnType).
+        return status
+
     async def set_task_status(
         self,
         task_id: str,
@@ -1621,7 +1773,7 @@ class SqliteTaskBackend:
         *,
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
-    ) -> SetTaskStatusResult:
+    ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Update ``status``, optionally stamping/clearing the claimant columns.
 
         ``claimant_run_id``/``heartbeat_at`` are tri-state (task 2182, PRD
@@ -1638,6 +1790,13 @@ class SqliteTaskBackend:
         ``(tag, candidate_key)``, and if another non-cancelled row already
         holds the same key, this UPDATE is rejected rather than silently
         reactivating a duplicate.
+
+        Post-write read-back verify (task 2649, requirement #3): ``newStatus``
+        in the returned payload is re-SELECTed from the row after the
+        ``UPDATE``, never a fabricated echo of the requested ``status``. A
+        mismatch (the write silently didn't take) returns an explicit
+        ``{'success': False, 'error': 'status_write_not_persisted', ...}``
+        error dict instead of a false success.
         """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -1648,75 +1807,208 @@ class SqliteTaskBackend:
                 f'Invalid status {status!r}. Must be one of '
                 f'{sorted(s.value for s in _VALID_STATUSES)}.',
             )
-        async with self._write_lock(project_root), self._txn(project_root) as conn:
-            cursor = await conn.execute(
-                'SELECT status, candidate_key FROM tasks WHERE tag = ? AND id = ?',
-                (tag, tid),
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                raise TaskmasterError(
-                    'TASKMASTER_TOOL_ERROR',
-                    f'No tasks found for ID(s): {task_id}',
+        try:
+            async with self._write_lock(project_root), self._txn(project_root) as conn:
+                cursor = await conn.execute(
+                    'SELECT status, candidate_key FROM tasks WHERE tag = ? AND id = ?',
+                    (tag, tid),
                 )
-            old_status = row['status']
-            row_candidate_key = row['candidate_key']
-
-            set_columns = ['status = ?', 'updated_at = ?']
-            set_values: list[Any] = [status, _now()]
-            if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
-                if self._claimant_columns_cache.get(project_root, False):
-                    if claimant_run_id is not _UNSET:
-                        set_columns.append('claimant_run_id = ?')
-                        set_values.append(claimant_run_id)
-                    if heartbeat_at is not _UNSET:
-                        set_columns.append('heartbeat_at = ?')
-                        set_values.append(heartbeat_at)
-                else:
-                    logger.warning(
-                        'set_task_status: claimant_run_id/heartbeat_at columns absent '
-                        '(pre-migration connection) — writing status only for '
-                        'task_id=%s project_root=%s',
-                        task_id, project_root,
+                row = await cursor.fetchone()
+                if row is None:
+                    raise TaskmasterError(
+                        'TASKMASTER_TOOL_ERROR',
+                        f'No tasks found for ID(s): {task_id}',
                     )
+                old_status = row['status']
+                row_candidate_key = row['candidate_key']
 
-            set_values.extend([tag, tid])
-            try:
-                await conn.execute(
-                    f'UPDATE tasks SET {", ".join(set_columns)} '
-                    'WHERE tag = ? AND id = ?',
-                    set_values,
+                set_columns = ['status = ?', 'updated_at = ?']
+                set_values: list[Any] = [status, _now()]
+                if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
+                    if self._claimant_columns_cache.get(project_root, False):
+                        if claimant_run_id is not _UNSET:
+                            set_columns.append('claimant_run_id = ?')
+                            set_values.append(claimant_run_id)
+                        if heartbeat_at is not _UNSET:
+                            set_columns.append('heartbeat_at = ?')
+                            set_values.append(heartbeat_at)
+                    else:
+                        logger.warning(
+                            'set_task_status: claimant_run_id/heartbeat_at columns absent '
+                            '(pre-migration connection) — writing status only for '
+                            'task_id=%s project_root=%s',
+                            task_id, project_root,
+                        )
+
+                try:
+                    await self._apply_status_row_update(
+                        conn, set_columns, set_values, tag, tid,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    # Only the candidate_key partial UNIQUE index is mapped to a
+                    # typed collision (mirrors add_task's collision mapping); any
+                    # other integrity violation is unrelated and re-raised
+                    # untouched. Reachable via the narrow un-cancel path (see the
+                    # docstring above). Nothing in this transaction has been
+                    # written yet — this is the first write statement — so this
+                    # survivor lookup sees the same state a post-rollback read
+                    # would (this row's own candidate_key/status are unaffected,
+                    # having never been applied).
+                    if row_candidate_key is None or 'candidate_key' not in str(exc):
+                        raise
+                    survivor_cursor = await conn.execute(
+                        "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                        "AND status != 'cancelled' ORDER BY id LIMIT 1",
+                        (tag, row_candidate_key),
+                    )
+                    survivor = await survivor_cursor.fetchone()
+                    raise DuplicateCandidateKeyError(
+                        existing_id=survivor['id'] if survivor is not None else None,
+                        existing_status=survivor['status'] if survivor is not None else None,
+                        tag=tag,
+                        candidate_key=row_candidate_key,
+                    ) from exc
+
+                verify_cursor = await conn.execute(
+                    'SELECT status FROM tasks WHERE tag = ? AND id = ?', (tag, tid),
                 )
-            except sqlite3.IntegrityError as exc:
-                # Only the candidate_key partial UNIQUE index is mapped to a
-                # typed collision (mirrors add_task's collision mapping); any
-                # other integrity violation is unrelated and re-raised
-                # untouched. Reachable via the narrow un-cancel path (see the
-                # docstring above). Nothing in this transaction has been
-                # written yet — this is the first write statement — so this
-                # survivor lookup sees the same state a post-rollback read
-                # would (this row's own candidate_key/status are unaffected,
-                # having never been applied).
-                if row_candidate_key is None or 'candidate_key' not in str(exc):
-                    raise
-                survivor_cursor = await conn.execute(
-                    "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
-                    "AND status != 'cancelled' ORDER BY id LIMIT 1",
-                    (tag, row_candidate_key),
-                )
-                survivor = await survivor_cursor.fetchone()
-                raise DuplicateCandidateKeyError(
-                    existing_id=survivor['id'] if survivor is not None else None,
-                    existing_status=survivor['status'] if survivor is not None else None,
-                    tag=tag,
-                    candidate_key=row_candidate_key,
-                ) from exc
+                verify_row = await verify_cursor.fetchone()
+                persisted_status = verify_row['status'] if verify_row is not None else None
+                if persisted_status != status:
+                    raise _StatusWriteNotPersisted(task_id, status, persisted_status)
+        except _StatusWriteNotPersisted as exc:
+            return exc.to_error_dict()
         return {
             'message': f'Successfully updated 1 task(s) to "{status}"',
             'tasks': [{
                 'taskId': task_id,
                 'oldStatus': old_status,
-                'newStatus': status,
+                'newStatus': persisted_status,
+            }],
+        }
+
+    async def set_status_and_stamp_audit(
+        self,
+        task_id: str,
+        status: str,
+        project_root: str,
+        tag: str | None = None,
+        *,
+        audit_fields: dict,
+        claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
+        heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
+    ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
+        """Atomically update ``status`` AND merge ``audit_fields`` into metadata.
+
+        The sole atomic status+audit writer (task 2649). Calling
+        ``stamp_audit_metadata`` followed by ``set_task_status`` — the
+        pre-2649 pattern — commits the audit stamp (``reopen_reason``/
+        ``reopen_from``/``reopen_at`` or ``done_provenance``) and the status
+        column as TWO separate transactions, leaving a window where an
+        observer (or a lost/rolled-back second commit) sees the audit half
+        applied but the status column unchanged. This method merges the
+        audit fields into metadata (via ``_merge_metadata(mode='merge')`` —
+        preserving every sibling key, exactly like ``stamp_audit_metadata``)
+        AND updates the status column in a SINGLE ``UPDATE`` inside ONE
+        ``_txn`` — both commit or both roll back.
+
+        Reuses the same claimant tri-state handling and IntegrityError ->
+        DuplicateCandidateKeyError collision mapping as :meth:`set_task_status`.
+
+        Post-write read-back verify (task 2649, requirement #3): ``newStatus``
+        is re-SELECTed from the row after the ``UPDATE``, never a fabricated
+        echo of the requested ``status``. A mismatch raises internally so the
+        surrounding ``_txn`` rolls back BOTH the status change and the
+        metadata merge (both-or-neither), and is mapped to an explicit
+        ``{'success': False, 'error': 'status_write_not_persisted', ...}``
+        error dict instead of a false success.
+
+        Deliberately NOT declared on :class:`TaskBackendProtocol` — mirrors
+        :meth:`stamp_audit_metadata`, kept off the 12-method contract so
+        other callers do not treat it as sanctioned public surface.
+        """
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        tid = _parse_task_id(task_id)
+        if status not in _VALID_STATUSES:
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR',
+                f'Invalid status {status!r}. Must be one of '
+                f'{sorted(s.value for s in _VALID_STATUSES)}.',
+            )
+        try:
+            async with self._write_lock(project_root), self._txn(project_root) as conn:
+                cursor = await conn.execute(
+                    'SELECT status, metadata, candidate_key FROM tasks WHERE tag = ? AND id = ?',
+                    (tag, tid),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    raise TaskmasterError(
+                        'TASKMASTER_TOOL_ERROR',
+                        f'No tasks found for ID(s): {task_id}',
+                    )
+                old_status = row['status']
+                row_candidate_key = row['candidate_key']
+                new_metadata = _merge_metadata(
+                    row['metadata'], json.dumps(audit_fields),
+                    mode='merge',
+                    project_root=project_root, tag=tag, task_id=tid,
+                )
+
+                set_columns = ['status = ?', 'metadata = ?', 'updated_at = ?']
+                set_values: list[Any] = [status, new_metadata, _now()]
+                if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
+                    if self._claimant_columns_cache.get(project_root, False):
+                        if claimant_run_id is not _UNSET:
+                            set_columns.append('claimant_run_id = ?')
+                            set_values.append(claimant_run_id)
+                        if heartbeat_at is not _UNSET:
+                            set_columns.append('heartbeat_at = ?')
+                            set_values.append(heartbeat_at)
+                    else:
+                        logger.warning(
+                            'set_status_and_stamp_audit: claimant_run_id/heartbeat_at '
+                            'columns absent (pre-migration connection) — writing '
+                            'status+metadata only for task_id=%s project_root=%s',
+                            task_id, project_root,
+                        )
+
+                try:
+                    await self._apply_status_row_update(
+                        conn, set_columns, set_values, tag, tid,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    if row_candidate_key is None or 'candidate_key' not in str(exc):
+                        raise
+                    survivor_cursor = await conn.execute(
+                        "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                        "AND status != 'cancelled' ORDER BY id LIMIT 1",
+                        (tag, row_candidate_key),
+                    )
+                    survivor = await survivor_cursor.fetchone()
+                    raise DuplicateCandidateKeyError(
+                        existing_id=survivor['id'] if survivor is not None else None,
+                        existing_status=survivor['status'] if survivor is not None else None,
+                        tag=tag,
+                        candidate_key=row_candidate_key,
+                    ) from exc
+
+                verify_cursor = await conn.execute(
+                    'SELECT status FROM tasks WHERE tag = ? AND id = ?', (tag, tid),
+                )
+                verify_row = await verify_cursor.fetchone()
+                persisted_status = verify_row['status'] if verify_row is not None else None
+                if persisted_status != status:
+                    raise _StatusWriteNotPersisted(task_id, status, persisted_status)
+        except _StatusWriteNotPersisted as exc:
+            return exc.to_error_dict()
+        return {
+            'message': f'Successfully updated 1 task(s) to "{status}"',
+            'tasks': [{
+                'taskId': task_id,
+                'oldStatus': old_status,
+                'newStatus': persisted_status,
             }],
         }
 

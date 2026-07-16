@@ -25,9 +25,12 @@ Design notes
   is NEVER an independent trigger: a live in-progress task's owner
   heartbeats periodically, so a legitimate concurrent heartbeat refresh
   coinciding with a Stage-2 write must not false-positive.
-- The guard only engages when the before-state ``has_live_claimant`` (i.e.
-  ``status == 'in-progress'`` with a present/non-blank ``claimant_run_id``);
-  otherwise the write is dormant and proceeds unguarded.
+- The guard engages when the before-state ``has_live_claimant`` (i.e.
+  ``status == 'in-progress'`` with a present/non-blank ``claimant_run_id``)
+  OR ``is_terminal_reopenable`` (i.e. ``status`` is ``done``/``cancelled`` —
+  task 2649, requirement #4: a reopen out of a terminal status that silently
+  fails to persist must self-file too); otherwise the write is dormant and
+  proceeds unguarded.
 - Filing is best-effort: a filer/after-read exception is logged and never
   breaks the underlying task write, which has already succeeded by the time
   the after-read/detect/file sequence runs.
@@ -57,7 +60,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from shared.task_statuses import TaskStatus
+from shared.task_statuses import TERMINAL, TaskStatus
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +133,20 @@ def has_live_claimant(task_data: Any) -> bool:
     return isinstance(claimant, str) and claimant.strip() != ''
 
 
+def is_terminal_reopenable(task_data: Any) -> bool:
+    """True iff *task_data*'s status is a TERMINAL status (done/cancelled).
+
+    A terminal task is the before-state of a "reopen" transition (see
+    ``task_interceptor``'s terminal-exit gate). This predicate identifies
+    the before-states whose reopen attempts the guard must also self-check
+    (task 2649, requirement #4) — the inverse-signal counterpart of
+    :func:`has_live_claimant` for the in-progress case: mutually exclusive
+    with it, since a terminal status is never ``in-progress``.
+    """
+    snapshot = extract_live_snapshot(task_data)
+    return snapshot.status in TERMINAL
+
+
 # ---------------------------------------------------------------------------
 # LifecycleResetFinding / detect_lifecycle_reset
 # ---------------------------------------------------------------------------
@@ -162,64 +179,97 @@ def detect_lifecycle_reset(
 ) -> LifecycleResetFinding | None:
     """Pure detector: compare before/after snapshots for an unexpected reset.
 
-    Returns ``None`` unless :func:`has_live_claimant` holds for *before* —
-    the guard only concerns itself with writes to a live in-progress task.
+    Returns ``None`` unless *before* is either :func:`has_live_claimant` or
+    :func:`is_terminal_reopenable` — the guard only concerns itself with
+    writes to a live in-progress task, or reopen attempts out of a terminal
+    (done/cancelled) status (task 2649, requirement #4). The two cases are
+    mutually exclusive (a terminal status is never ``in-progress``) and use
+    distinct fire conditions:
 
-    A finding fires iff ``claimant_run_id`` or ``status`` diverged
-    *unexpectedly* — i.e. the divergence is not what the write itself
-    requested:
+    1. Live-claimant before-state: a finding fires iff ``claimant_run_id`` or
+       ``status`` diverged *unexpectedly* — i.e. the divergence is not what
+       the write itself requested:
 
-    - ``claimant_run_id`` divergence is unexpected unless
-      ``requested_claimant_write`` is True (the write explicitly intended to
-      change it, e.g. a claimant clear/release).
-    - ``status`` divergence is unexpected unless the resulting status is
-      exactly ``requested_status`` (the write asked for that transition and
-      got it).
+       - ``claimant_run_id`` divergence is unexpected unless
+         ``requested_claimant_write`` is True (the write explicitly intended
+         to change it, e.g. a claimant clear/release).
+       - ``status`` divergence is unexpected unless the resulting status is
+         exactly ``requested_status`` (the write asked for that transition
+         and got it).
 
-    ``heartbeat_at`` divergence is never an independent trigger — it is
-    recorded in the resulting finding's ``diverged_fields`` only as
-    corroborating evidence, and only when the finding already fires for a
-    claimant/status reason and the heartbeat change was not itself requested
-    (``requested_heartbeat_write``).
+       ``heartbeat_at`` divergence is never an independent trigger — it is
+       recorded in the resulting finding's ``diverged_fields`` only as
+       corroborating evidence, and only when the finding already fires for a
+       claimant/status reason and the heartbeat change was not itself
+       requested (``requested_heartbeat_write``).
+
+    2. Terminal-reopenable before-state: the inverse signal — a finding
+       fires iff a reopen was requested (``requested_status`` set to
+       something other than the terminal ``before`` status) but ``after``'s
+       status is STILL the terminal ``before`` status, i.e. the reopen
+       silently failed to persist. ``diverged_fields`` is always exactly
+       ``('status',)`` in this case.
     """
-    if not has_live_claimant(before):
-        return None
+    if has_live_claimant(before):
+        before_snapshot = extract_live_snapshot(before)
+        after_snapshot = extract_live_snapshot(after)
 
-    before_snapshot = extract_live_snapshot(before)
-    after_snapshot = extract_live_snapshot(after)
+        diverged: list[str] = []
 
-    diverged: list[str] = []
+        claimant_changed = before_snapshot.claimant_run_id != after_snapshot.claimant_run_id
+        if claimant_changed and not requested_claimant_write:
+            diverged.append('claimant_run_id')
 
-    claimant_changed = before_snapshot.claimant_run_id != after_snapshot.claimant_run_id
-    if claimant_changed and not requested_claimant_write:
-        diverged.append('claimant_run_id')
+        status_changed = before_snapshot.status != after_snapshot.status
+        status_matches_request = (
+            requested_status is not None and after_snapshot.status == requested_status
+        )
+        if status_changed and not status_matches_request:
+            diverged.append('status')
 
-    status_changed = before_snapshot.status != after_snapshot.status
-    status_matches_request = (
-        requested_status is not None and after_snapshot.status == requested_status
-    )
-    if status_changed and not status_matches_request:
-        diverged.append('status')
+        if not diverged:
+            return None
 
-    if not diverged:
-        return None
+        heartbeat_changed = before_snapshot.heartbeat_at != after_snapshot.heartbeat_at
+        if heartbeat_changed and not requested_heartbeat_write:
+            diverged.append('heartbeat_at')
 
-    heartbeat_changed = before_snapshot.heartbeat_at != after_snapshot.heartbeat_at
-    if heartbeat_changed and not requested_heartbeat_write:
-        diverged.append('heartbeat_at')
+        # description is intentionally left at the dataclass default here:
+        # the only consumer (server/recon_lifecycle_filer.py's _describe)
+        # builds its own description from before/after/diverged_fields, so
+        # computing one here too would be a dead, drift-prone duplicate
+        # (task 2624 amendment).
+        return LifecycleResetFinding(
+            task_id=task_id,
+            project_id=project_id,
+            op=op,
+            before=before_snapshot,
+            after=after_snapshot,
+            diverged_fields=tuple(diverged),
+        )
 
-    # description is intentionally left at the dataclass default here: the
-    # only consumer (server/recon_lifecycle_filer.py's _describe) builds its
-    # own description from before/after/diverged_fields, so computing one
-    # here too would be a dead, drift-prone duplicate (task 2624 amendment).
-    return LifecycleResetFinding(
-        task_id=task_id,
-        project_id=project_id,
-        op=op,
-        before=before_snapshot,
-        after=after_snapshot,
-        diverged_fields=tuple(diverged),
-    )
+    if is_terminal_reopenable(before):
+        before_snapshot = extract_live_snapshot(before)
+        after_snapshot = extract_live_snapshot(after)
+
+        reopen_silently_failed = (
+            requested_status is not None
+            and requested_status != before_snapshot.status
+            and after_snapshot.status == before_snapshot.status
+        )
+        if not reopen_silently_failed:
+            return None
+
+        return LifecycleResetFinding(
+            task_id=task_id,
+            project_id=project_id,
+            op=op,
+            before=before_snapshot,
+            after=after_snapshot,
+            diverged_fields=('status',),
+        )
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +301,9 @@ async def guarded_recon_task_write(
     Resolves the before-state from *before_task* when supplied (the caller
     already read it, e.g. for ``recon_write_policy.check``), otherwise reads
     it via ``get_task(task_id, project_root, tag)``. When the before-state is
-    not a live in-progress claimant, the guard is dormant: *do_write* runs
-    and its result is returned directly, with no after-read.
+    neither a live in-progress claimant nor a terminal (done/cancelled)
+    reopen candidate, the guard is dormant: *do_write* runs and its result is
+    returned directly, with no after-read.
 
     Otherwise: *do_write* is awaited (its exceptions propagate unchanged —
     the guard never suppresses a real write failure); then, best-effort
@@ -266,7 +317,7 @@ async def guarded_recon_task_write(
         before_task if before_task is not None else await get_task(task_id, project_root, tag)
     )
 
-    if not has_live_claimant(before):
+    if not (has_live_claimant(before) or is_terminal_reopenable(before)):
         return await do_write()
 
     result = await do_write()

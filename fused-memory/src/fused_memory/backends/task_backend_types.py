@@ -35,6 +35,22 @@ class SetTaskStatusResult(TypedDict):
     tasks: list[dict]
 
 
+class StatusWriteNotPersistedResult(TypedDict):
+    """DTO for the explicit-failure path of ``set_task_status`` /
+    ``set_status_and_stamp_audit`` (task 2649).
+
+    Returned instead of a fabricated ``SetTaskStatusResult`` success when a
+    post-write read-back shows the status column did not actually take the
+    requested value (a silent no-op, a floor refusal, or a lost commit).
+    """
+
+    success: bool
+    error: str
+    task_id: str
+    requested_status: str
+    actual_status: str | None
+
+
 class RemoveTaskResult(TypedDict):
     successful: int
     failed: int
@@ -70,6 +86,7 @@ __all__ = [
     'GetTasksResult',
     'RemoveTaskResult',
     'SetTaskStatusResult',
+    'StatusWriteNotPersistedResult',
     'UpdateTaskResult',
     'ValidateDependenciesResult',
 ]

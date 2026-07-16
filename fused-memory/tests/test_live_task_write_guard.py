@@ -277,6 +277,96 @@ class TestDetectLifecycleReset:
 
 
 # ---------------------------------------------------------------------------
+# detect_lifecycle_reset — terminal (done/cancelled) reopen self-check
+# (task 2649, requirement #4): a done/cancelled before-state has no live
+# claimant, so the pre-2649 detector treated it as dormant even when a
+# requested reopen silently failed to persist. This broadens detection to
+# fire when a terminal before-state's status is UNCHANGED after a requested
+# reopen (the inverse signal from the in-progress case, which fires on an
+# unexpected CHANGE).
+# ---------------------------------------------------------------------------
+
+
+class TestDetectLifecycleResetTerminalReopen:
+    def test_done_reopen_not_persisted_fires(self):
+        """done -> requested 'pending' but after status is STILL 'done':
+        the reopen silently failed to persist — must fire."""
+        before = _flat(status='done', claimant_run_id=None)
+        after = _flat(status='done', claimant_run_id=None)
+
+        finding = _detect(
+            before, after, op='set_task_status', task_id='7', project_id='dark_factory',
+            requested_status='pending',
+        )
+
+        assert finding is not None
+        assert isinstance(finding, LifecycleResetFinding)
+        assert finding.flag_type == LIFECYCLE_RESET_FLAG_TYPE
+        assert finding.task_id == '7'
+        assert 'status' in finding.diverged_fields
+
+    def test_done_reopen_persisted_is_dormant(self):
+        """done -> requested 'pending' and after status IS 'pending': the
+        reopen took effect — benign, no finding."""
+        before = _flat(status='done', claimant_run_id=None)
+        after = _flat(status='pending', claimant_run_id=None)
+
+        finding = _detect(
+            before, after, op='set_task_status', requested_status='pending',
+        )
+
+        assert finding is None
+
+    def test_cancelled_reopen_not_persisted_fires(self):
+        """cancelled -> requested 'in-progress' but after status is STILL
+        'cancelled' — must fire."""
+        before = _flat(status='cancelled', claimant_run_id=None)
+        after = _flat(status='cancelled', claimant_run_id=None)
+
+        finding = _detect(
+            before, after, op='set_task_status', requested_status='in-progress',
+        )
+
+        assert finding is not None
+        assert 'status' in finding.diverged_fields
+
+    def test_cancelled_reopen_persisted_is_dormant(self):
+        """cancelled -> requested 'in-progress' and after status IS
+        'in-progress': the reopen took effect — benign, no finding."""
+        before = _flat(status='cancelled', claimant_run_id=None)
+        after = _flat(status='in-progress', claimant_run_id=None)
+
+        finding = _detect(
+            before, after, op='set_task_status', requested_status='in-progress',
+        )
+
+        assert finding is None
+
+    def test_terminal_before_with_no_requested_status_is_dormant(self):
+        """A terminal before-state with requested_status=None (no status
+        write requested at all) never fires — there is no reopen attempt to
+        validate against."""
+        before = _flat(status='done', claimant_run_id=None)
+        after = _flat(status='done', claimant_run_id=None)
+
+        finding = _detect(before, after, op='update_task', requested_status=None)
+
+        assert finding is None
+
+    def test_terminal_before_same_status_request_is_dormant(self):
+        """requested_status equal to before.status (a done->done repair-style
+        call, not a reopen) never fires even though after == before."""
+        before = _flat(status='done', claimant_run_id=None)
+        after = _flat(status='done', claimant_run_id=None)
+
+        finding = _detect(
+            before, after, op='set_task_status', requested_status='done',
+        )
+
+        assert finding is None
+
+
+# ---------------------------------------------------------------------------
 # guarded_recon_task_write — async wrapper (acceptance regression)
 # ---------------------------------------------------------------------------
 
@@ -426,6 +516,101 @@ class TestGuardedReconTaskWrite:
 
         assert result == SENTINEL_RESULT
         file_finding.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# guarded_recon_task_write — terminal (done/cancelled) reopen self-check
+# (task 2649, requirement #4): the pre-2649 engagement short-circuit only ran
+# the after-read/detect/file path when has_live_claimant(before) — a
+# done/cancelled reopen that silently fails to persist was invisible to the
+# guard. Broadened to ALSO engage when before is terminal.
+# ---------------------------------------------------------------------------
+
+
+class TestGuardedReconTaskWriteTerminalReopen:
+    @pytest.mark.asyncio
+    async def test_terminal_reopen_not_persisted_files_finding(self):
+        """before_task is terminal ('done'); the after-read shows status
+        UNCHANGED (the requested reopen did not persist) — file_finding is
+        awaited once with the finding."""
+        before_task = _flat(status='done', claimant_run_id=None)
+        after = _flat(status='done', claimant_run_id=None)
+        get_task = AsyncMock(return_value=after)
+        do_write = AsyncMock(return_value=SENTINEL_RESULT)
+        file_finding = AsyncMock()
+
+        result = await guard_mod.guarded_recon_task_write(
+            task_id='7',
+            project_id='dark_factory',
+            op='set_task_status',
+            get_task=get_task,
+            do_write=do_write,
+            file_finding=file_finding,
+            project_root='/project',
+            before_task=before_task,
+            requested_status='pending',
+        )
+
+        assert result == SENTINEL_RESULT
+        do_write.assert_awaited_once()
+        file_finding.assert_awaited_once()
+        assert file_finding.await_args is not None
+        finding = file_finding.await_args.args[0]
+        assert isinstance(finding, LifecycleResetFinding)
+        assert finding.flag_type == LIFECYCLE_RESET_FLAG_TYPE
+        assert 'status' in finding.diverged_fields
+
+    @pytest.mark.asyncio
+    async def test_terminal_reopen_persisted_does_not_file(self):
+        """before_task is terminal ('done'); the after-read shows the status
+        flipped to the requested value (the reopen took effect) —
+        file_finding is NOT called."""
+        before_task = _flat(status='done', claimant_run_id=None)
+        after = _flat(status='pending', claimant_run_id=None)
+        get_task = AsyncMock(return_value=after)
+        do_write = AsyncMock(return_value=SENTINEL_RESULT)
+        file_finding = AsyncMock()
+
+        result = await guard_mod.guarded_recon_task_write(
+            task_id='7',
+            project_id='dark_factory',
+            op='set_task_status',
+            get_task=get_task,
+            do_write=do_write,
+            file_finding=file_finding,
+            project_root='/project',
+            before_task=before_task,
+            requested_status='pending',
+        )
+
+        assert result == SENTINEL_RESULT
+        do_write.assert_awaited_once()
+        file_finding.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_reopen_not_persisted_files_finding(self):
+        """before_task is terminal ('cancelled'); status unchanged after the
+        write — file_finding is awaited once."""
+        before_task = _flat(status='cancelled', claimant_run_id=None)
+        after = _flat(status='cancelled', claimant_run_id=None)
+        get_task = AsyncMock(return_value=after)
+        do_write = AsyncMock(return_value=SENTINEL_RESULT)
+        file_finding = AsyncMock()
+
+        result = await guard_mod.guarded_recon_task_write(
+            task_id='7',
+            project_id='dark_factory',
+            op='set_task_status',
+            get_task=get_task,
+            do_write=do_write,
+            file_finding=file_finding,
+            project_root='/project',
+            before_task=before_task,
+            requested_status='in-progress',
+        )
+
+        assert result == SENTINEL_RESULT
+        file_finding.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

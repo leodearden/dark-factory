@@ -25,6 +25,12 @@ def taskmaster():
     tm = AsyncMock()
     tm.get_task = AsyncMock(return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'})
     tm.set_task_status = AsyncMock(return_value={'success': True})
+    # Task 2649: default for the atomic status+audit writer, mirroring
+    # set_task_status's default above — an audit-carrying transition
+    # (reopen_*/done_provenance) routes through this instead of plain
+    # set_task_status. Individual tests override this when they need to
+    # assert on the SetTaskStatusResult-shaped payload.
+    tm.set_status_and_stamp_audit = AsyncMock(return_value={'success': True})
     tm.get_tasks = AsyncMock(return_value={'tasks': []})
     tm.add_task = AsyncMock(return_value={'id': '2', 'title': 'New Task'})
     tm.update_task = AsyncMock(return_value={'success': True})
@@ -2028,7 +2034,10 @@ async def test_set_task_status_allows_done_to_blocked_with_reopen_reason(
         reopen_reason='manual re-scope',
     )
 
-    taskmaster.set_task_status.assert_called_once()
+    # reopen_reason makes this an audit-carrying write (task 2649): routed
+    # through the single atomic set_status_and_stamp_audit, not plain
+    # set_task_status.
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
     assert 'error' not in result
 
 
@@ -2223,8 +2232,9 @@ async def test_done_gate_skipped_when_verified_provenance_supplied(
 
     # Gate skipped — no done_gate_missing_files.
     assert result.get('error') != 'done_gate_missing_files'
-    # Transition succeeded.
-    taskmaster.set_task_status.assert_called_once()
+    # Transition succeeded — done_provenance makes this an audit-carrying
+    # write (task 2649), routed through the atomic set_status_and_stamp_audit.
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -2410,9 +2420,12 @@ async def test_done_provenance_resolves_short_sha_and_persists(
     )
 
     assert 'error' not in result
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    kwargs = taskmaster.stamp_audit_metadata.call_args.kwargs
-    persisted = kwargs['fields']
+    # done_provenance makes this an audit-carrying write (task 2649): routed
+    # through the single atomic set_status_and_stamp_audit, not the old
+    # separate stamp_audit_metadata call.
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    kwargs = taskmaster.set_status_and_stamp_audit.call_args.kwargs
+    persisted = kwargs['audit_fields']
     assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
     assert persisted['done_provenance']['commit_input'] == sha[:7]
@@ -2438,7 +2451,7 @@ async def test_done_provenance_commit_plus_note_both_persisted(
     )
 
     assert 'error' not in result
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
     assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
     assert persisted['done_provenance']['note'] == 'ff-merged after review'
@@ -2472,7 +2485,8 @@ async def test_done_provenance_reopen_does_not_require_provenance(
     )
 
     assert 'error' not in result, result
-    taskmaster.set_task_status.assert_called_once()
+    # reopen_reason makes this an audit-carrying write (task 2649).
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -2514,6 +2528,252 @@ async def test_done_provenance_included_in_event_payload(
     payload = events[-1].payload
     assert payload['done_provenance']['kind'] == 'merged'
     assert payload['done_provenance']['commit'] == sha
+
+
+# ── Tests for atomic audit-write routing (task 2649) ────────────────────
+#
+# An audit-carrying status change (terminal-exit reopen, or a done
+# transition with resolved provenance) must route through the SINGLE
+# atomic tm.set_status_and_stamp_audit call — never the old two-commit
+# stamp_audit_metadata + set_task_status pattern. A plain, non-audit
+# transition must still use plain set_task_status and never touch the
+# atomic writer.
+
+
+@pytest.mark.asyncio
+async def test_reopen_routes_through_atomic_audit_write(taskmaster, reconciler, event_buffer):
+    """Terminal-exit reopen routes through the single atomic
+    set_status_and_stamp_audit call, carrying reopen_reason/reopen_from/
+    reopen_at as audit_fields — NOT a separate stamp_audit_metadata call
+    followed by plain set_task_status."""
+    taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+    taskmaster.set_status_and_stamp_audit = AsyncMock(return_value={
+        'message': 'Successfully updated 1 task(s) to "pending"',
+        'tasks': [{'taskId': '1', 'oldStatus': 'done', 'newStatus': 'pending'}],
+    })
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'pending', '/project', reopen_reason='resume',
+    )
+
+    assert 'error' not in result, result
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    audit_fields = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
+    assert audit_fields['reopen_reason'] == 'resume'
+    assert audit_fields['reopen_from'] == 'done'
+    assert 'reopen_at' in audit_fields
+    taskmaster.stamp_audit_metadata.assert_not_called()
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_routes_through_atomic_audit_write(
+    taskmaster, reconciler, event_buffer, tmp_path,
+):
+    """A done transition with resolved provenance routes through the single
+    atomic set_status_and_stamp_audit call, carrying done_provenance as an
+    audit_field — NOT a separate stamp_audit_metadata call."""
+    sha = _init_git_repo(tmp_path)
+    taskmaster.set_status_and_stamp_audit = AsyncMock(return_value={
+        'message': 'Successfully updated 1 task(s) to "done"',
+        'tasks': [{'taskId': '1', 'oldStatus': 'pending', 'newStatus': 'done'}],
+    })
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={'kind': 'merged', 'commit': sha},
+    )
+
+    assert 'error' not in result, result
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    audit_fields = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
+    assert audit_fields['done_provenance']['kind'] == 'merged'
+    assert audit_fields['done_provenance']['commit'] == sha
+    taskmaster.stamp_audit_metadata.assert_not_called()
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_plain_transition_does_not_use_atomic_audit_write(
+    taskmaster, reconciler, event_buffer,
+):
+    """A transition with no reopen_reason/done_provenance still calls plain
+    set_task_status — NOT the atomic audit writer (task 2649)."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'in-progress', 'title': 'T'},
+    )
+    taskmaster.set_status_and_stamp_audit = AsyncMock(return_value={'success': True})
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'blocked', '/project')
+
+    assert 'error' not in result, result
+    taskmaster.set_task_status.assert_called_once()
+    taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+
+# ── Tests for false-success propagation guard on a non-persisted write
+#    (task 2649 step-10; review remediation: reviewer_comprehensive /
+#    robustness_false_success_propagation) ───────────────────────────────
+#
+# The backend read-back verify (steps 3/4) makes set_task_status AND
+# set_status_and_stamp_audit return an explicit {'success': False,
+# 'error': 'status_write_not_persisted', ...} dict instead of a fabricated
+# success when the status column did not actually change. The interceptor
+# must short-circuit on that error BEFORE emitting task_status_changed and
+# BEFORE firing targeted reconciliation -- neither side effect may fire for
+# a transition that never actually happened.
+
+
+@pytest.mark.asyncio
+async def test_status_write_not_persisted_short_circuits_plain_writer(
+    interceptor, taskmaster, reconciler, event_buffer,
+):
+    """Plain tm.set_task_status reporting status_write_not_persisted must
+    propagate verbatim -- no event buffered, no reconciliation fired."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'in-progress', 'title': 'T'},
+    )
+    taskmaster.set_task_status = AsyncMock(return_value={
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '1',
+        'requested_status': 'blocked',
+        'actual_status': 'in-progress',
+    })
+
+    result = await interceptor.set_task_status('1', 'blocked', '/project')
+
+    assert result.get('success') is False
+    assert result.get('error') == 'status_write_not_persisted'
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 0
+    # Let any erroneously-spawned background reconciliation task run.
+    await asyncio.sleep(0)
+    reconciler.reconcile_task.assert_not_called()
+    assert 'reconciliation' not in result
+
+
+@pytest.mark.asyncio
+async def test_status_write_not_persisted_short_circuits_atomic_writer(
+    taskmaster, reconciler, event_buffer, tmp_path,
+):
+    """Same short-circuit for the atomic set_status_and_stamp_audit writer,
+    reached via a verified done_provenance (kind='merged') on a done
+    transition -- no event buffered, no reconciliation fired.
+
+    Uses a real git repo (not a placeholder SHA) because kind='merged'
+    provenance resolution shells out to ``git rev-parse``/``merge-base``
+    against project_root -- a fake commit against a nonexistent
+    project_root would fail done_provenance validation itself, never
+    reaching the atomic writer this test targets.
+    """
+    sha = _init_git_repo(tmp_path)
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'in-progress', 'title': 'T'},
+    )
+    taskmaster.set_status_and_stamp_audit = AsyncMock(return_value={
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '1',
+        'requested_status': 'done',
+        'actual_status': 'in-progress',
+    })
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    project_root = str(tmp_path)
+    project_id = resolve_project_id(project_root)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', project_root,
+        done_provenance={'kind': 'merged', 'commit': sha},
+    )
+
+    assert result.get('success') is False
+    assert result.get('error') == 'status_write_not_persisted'
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    stats = await event_buffer.get_buffer_stats(project_id)
+    assert stats['size'] == 0
+    await asyncio.sleep(0)
+    reconciler.reconcile_task.assert_not_called()
+    assert 'reconciliation' not in result
+
+
+# ── Regression guard: composed atomic-reopen contract, end-to-end (task 2649,
+#    requirement #5) ─────────────────────────────────────────────────────
+#
+# The tests above assert call-routing against a mocked taskmaster. This
+# drives a REAL SqliteTaskBackend behind a real TaskInterceptor so the
+# atomic set_status_and_stamp_audit writer is exercised against actual
+# persistence — the original task-1175 bug was a partial write that a
+# routing-only mock assertion cannot detect.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['found_on_main', 'merged'])
+async def test_reopen_atomic_contract_persists_against_real_backend(
+    kind, tmp_path, event_buffer,
+):
+    """done->pending reopen, with a pre-existing done_provenance of either
+    kind, must persist the status column AND the reopen_*/done_provenance
+    audit metadata TOGETHER against a real backend — locking the composed
+    atomic-reopen contract against the original task-1175 partial-write.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    sha = _init_git_repo(tmp_path)
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+
+        done_provenance = {'kind': kind, 'commit': sha}
+        if kind == 'found_on_main':
+            done_provenance['note'] = 'shipped via a sibling task'
+
+        interceptor = TaskInterceptor(backend, None, event_buffer)
+        done_result = await interceptor.set_task_status(
+            '1', 'done', project_root, done_provenance=done_provenance,
+        )
+        assert 'error' not in done_result, done_result
+
+        result = await interceptor.set_task_status(
+            '1', 'pending', project_root,
+            reopen_reason='reopening: real regression remains',
+        )
+
+        # (a) grounded success — newStatus reflects an actual read-back,
+        # never a fabricated echo of the requested status.
+        assert 'error' not in result, result
+        assert result['tasks'][0]['newStatus'] == 'pending', result
+
+        # (b) an INDEPENDENT fresh backend instance (its own connection,
+        # opened cold against the same on-disk db) confirms the status
+        # column actually persisted — not merely an in-memory echo.
+        fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await fresh.start()
+        try:
+            task = await fresh.get_task('1', project_root=project_root)
+        finally:
+            await fresh.close()
+        assert task['status'] == 'pending', task
+
+        # (c) reopen_* audit fields persisted alongside the status flip.
+        md = task['metadata']
+        assert md['reopen_reason'] == 'reopening: real regression remains'
+        assert md['reopen_from'] == 'done'
+        assert 'reopen_at' in md
+
+        # (d) the pre-existing done_provenance (kind preserved) survives
+        # the reopen — the atomic writer's metadata merge does not clobber
+        # sibling keys.
+        assert md['done_provenance']['kind'] == kind
+        assert md['done_provenance']['commit'] == sha
+    finally:
+        await backend.close()
 
 
 # ── Tests for done_provenance.kind discriminator (2026-04-27 hardening) ────
@@ -2739,8 +2999,8 @@ async def test_done_provenance_found_on_main_with_on_main_commit_passes(
     )
 
     assert 'error' not in result
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
     dp = persisted['done_provenance']
     assert dp['kind'] == 'found_on_main'
     assert dp['commit'] == sha
@@ -2769,7 +3029,7 @@ async def test_done_provenance_found_on_main_short_sha_resolved(
     )
 
     assert 'error' not in result
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
     dp = persisted['done_provenance']
     assert dp['commit'] == sha  # resolved to full SHA
     assert dp['commit_input'] == sha[:7]  # original short ref preserved
@@ -2802,9 +3062,10 @@ async def test_done_provenance_accepts_deterministic_deploy_with_pid(
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
-    taskmaster.set_task_status.assert_called_once()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
+    # done_provenance makes this an audit-carrying write (task 2649): routed
+    # through the single atomic set_status_and_stamp_audit.
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy'
     assert persisted['pid'] == 4242
     assert persisted['unit'] == 'orchestrator-reify.service'
@@ -2834,9 +3095,8 @@ async def test_done_provenance_accepts_deterministic_deploy_resume_shape(
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
-    taskmaster.set_task_status.assert_called_once()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy'
     assert persisted['note'] == 'resumed after human resolution'
     assert persisted['unit'] == 'orchestrator-reify.service'
@@ -2867,12 +3127,12 @@ async def test_done_provenance_accepts_deterministic_gate(
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
-    taskmaster.set_task_status.assert_called_once()
-    # done_provenance is persisted through the privileged stamp_audit_metadata
-    # seam (task 2201 floor: update_task now rejects metadata.done_provenance).
+    # done_provenance is persisted through the single atomic
+    # set_status_and_stamp_audit call (task 2649; task 2201 floor:
+    # update_task rejects metadata.done_provenance).
     taskmaster.update_task.assert_not_called()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-gate'
     assert persisted['note'] == 'pure gate resolved'
 
@@ -2907,9 +3167,8 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled(
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
-    taskmaster.set_task_status.assert_called_once()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy-scheduled'
     assert persisted['unit'] == 'orchestrator-dark-factory.service'
     assert persisted['transient_unit'] == 'orch-redeploy-restart-1.service'
@@ -2942,9 +3201,8 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_sha
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
-    taskmaster.set_task_status.assert_called_once()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy-scheduled'
     assert persisted['note'] == 'resumed after self-restart scheduled (crash before done write)'
     assert persisted['unit'] == 'orchestrator-dark-factory.service'
@@ -4235,15 +4493,15 @@ async def test_terminal_exit_accepts_with_reopen_reason(
         reopen_reason='un-defer script',
     )
     assert result.get('success') or 'error' not in result, result
-    taskmaster.set_task_status.assert_called_once()
-    # reopen_* audit fields are persisted through the privileged
-    # stamp_audit_metadata seam, NOT update_task: a task reopened out of a
-    # terminal status may carry a metadata.done_provenance stamped when it was
-    # marked done, and update_task now UNCONDITIONALLY rejects
-    # metadata.done_provenance (task 2201 backend floor).
+    # reopen_* audit fields are persisted through the single atomic
+    # set_status_and_stamp_audit call (task 2649), NOT update_task: a task
+    # reopened out of a terminal status may carry a metadata.done_provenance
+    # stamped when it was marked done, and update_task now UNCONDITIONALLY
+    # rejects metadata.done_provenance (task 2201 backend floor).
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
     taskmaster.update_task.assert_not_called()
-    assert taskmaster.stamp_audit_metadata.called, 'reopen_reason must be persisted'
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    assert taskmaster.set_status_and_stamp_audit.called, 'reopen_reason must be persisted'
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
     assert persisted['reopen_reason'] == 'un-defer script'
     assert persisted['reopen_from'] == 'done'
     assert 'reopen_at' in persisted
@@ -4430,13 +4688,18 @@ async def test_set_task_status_csv_done_to_pending_tripping_guard_rejects_and_es
     esc_files = list(esc_dir.glob('esc-bulk-reset-*.json'))
     assert len(esc_files) >= 1, f'Expected at least 1 escalation file, found {esc_files}'
 
-    # (e) tm.set_task_status NOT called for tasks 4 and 5 (guard short-circuited)
-    called_ids = {call.args[0] for call in taskmaster.set_task_status.call_args_list}
-    assert '4' not in called_ids, 'set_task_status should not have been called for task 4'
-    assert '5' not in called_ids, 'set_task_status should not have been called for task 5'
+    # (e) tm.set_status_and_stamp_audit NOT called for tasks 4 and 5 (guard
+    # short-circuited). reopen_reason makes this an audit-carrying write
+    # (task 2649), so successful applies route through the atomic writer
+    # rather than plain set_task_status.
+    called_ids = {
+        call.args[0] for call in taskmaster.set_status_and_stamp_audit.call_args_list
+    }
+    assert '4' not in called_ids, 'set_status_and_stamp_audit should not have been called for task 4'
+    assert '5' not in called_ids, 'set_status_and_stamp_audit should not have been called for task 5'
     # Tasks 1, 2, 3 were called
     for tid in ('1', '2', '3'):
-        assert tid in called_ids, f'set_task_status should have been called for task {tid}'
+        assert tid in called_ids, f'set_status_and_stamp_audit should have been called for task {tid}'
 
 
 @pytest.mark.asyncio
@@ -6977,16 +7240,16 @@ async def test_set_task_status_with_reopen_reason_preserves_metadata(
     reconciler,
     event_buffer,
 ):
-    """Reopening a done task persists reopen_* via the privileged stamp seam.
+    """Reopening a done task persists reopen_* via the atomic audit writer.
 
     The reopen audit write is WRITE-AUTHORITY: a task reopened out of a
     terminal status may carry a metadata.done_provenance stamped when it was
     marked done, and update_task now UNCONDITIONALLY rejects
     metadata.done_provenance (task C1 floor). The interceptor therefore routes
-    the reopen_* write through the privileged stamp_audit_metadata seam,
-    passing ONLY the reopen_* fields — preservation of sibling keys
-    (files / memory_hints / done_provenance / …) is the seam's own fresh-read
-    RMW merge, exercised end-to-end against a real backend in
+    the reopen_* write through the single atomic set_status_and_stamp_audit
+    call (task 2649), passing ONLY the reopen_* fields — preservation of
+    sibling keys (files / memory_hints / done_provenance / …) is the writer's
+    own fresh-read RMW merge, exercised end-to-end against a real backend in
     test_set_task_status_reopen_from_done_preserves_provenance_real_backend.
     """
     taskmaster.get_task = AsyncMock(
@@ -7012,12 +7275,13 @@ async def test_set_task_status_with_reopen_reason_preserves_metadata(
     )
 
     assert 'error' not in result
-    # Routed through the privileged seam, NOT update_task (the pre-merged
-    # `before` blob would carry done_provenance, which update_task rejects).
+    # Routed through the single atomic set_status_and_stamp_audit call
+    # (task 2649), NOT update_task (the pre-merged `before` blob would carry
+    # done_provenance, which update_task rejects).
     taskmaster.update_task.assert_not_called()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
-    # Only the reopen_* audit fields are passed to the seam.
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
+    # Only the reopen_* audit fields are passed to the writer.
     assert persisted['reopen_reason'] == 'manual reopen'
     assert persisted['reopen_from'] == 'done'
     assert 'reopen_at' in persisted
@@ -7056,15 +7320,16 @@ async def test_set_task_status_done_with_provenance_preserves_metadata(
     )
 
     assert 'error' not in result
-    # done_provenance is persisted through the privileged stamp_audit_metadata
-    # seam (task C1 floor: update_task now rejects metadata.done_provenance).
-    # The interceptor passes ONLY the field being stamped — preservation of
-    # sibling keys (files / memory_hints / …) is the seam's own fresh-read RMW
-    # merge, exercised end-to-end in
+    # done_provenance is persisted through the single atomic
+    # set_status_and_stamp_audit call (task 2649; task C1 floor: update_task
+    # rejects metadata.done_provenance). The interceptor passes ONLY the
+    # field being stamped — preservation of sibling keys (files /
+    # memory_hints / …) is the writer's own fresh-read RMW merge, exercised
+    # end-to-end in
     # test_set_task_status_done_provenance_persists_against_real_backend.
     taskmaster.update_task.assert_not_called()
-    taskmaster.stamp_audit_metadata.assert_called_once()
-    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']
     assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
 
@@ -7543,7 +7808,8 @@ async def test_transition_gate_authorized_reopen_no_false_warning(
         )
 
     assert 'error' not in result, result
-    taskmaster.set_task_status.assert_called_once()
+    # reopen_reason makes this an audit-carrying write (task 2649).
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
     assert not any(
         'illegal_transition would-reject' in r.message for r in caplog.records
     ), f'unexpected would-reject warning on an authorized reopen: {[r.message for r in caplog.records]}'
