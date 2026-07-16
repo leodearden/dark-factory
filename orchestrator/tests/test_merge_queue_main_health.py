@@ -63,11 +63,13 @@ def _make_config(
     tmp_path: Path,
     *,
     escalate_preexisting: bool = True,
+    merge_verify_breadth: str = 'scoped',
 ) -> OrchestratorConfig:
     return OrchestratorConfig(
         project_root=tmp_path,
         max_concurrent_tasks=1,
         escalate_preexisting_main_break=escalate_preexisting,
+        merge_verify_breadth=merge_verify_breadth,
         git=GitConfig(
             main_branch='main',
             branch_prefix='task/',
@@ -1018,4 +1020,140 @@ class TestSyncPathAndSentinelPreservation:
         assert spawned == set(), (
             f'[{label}] Expected no main-health probe task to be spawned '
             f'even though handles were provided; got {spawned}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-17 (task μ, verify-scope-inversion-prd.md): _run_post_merge_verify
+# seeds the per-main-SHA failing-test-id baseline for free on the PASS path
+# (B2) — see verify.seed_main_baseline / verify._BASELINE_FAILING_IDS_CACHE.
+# ---------------------------------------------------------------------------
+
+
+class TestPostMergeVerifySeedsBaseline:
+    """A successful merge+full gate run seeds
+    verify._BASELINE_FAILING_IDS_CACHE[merge_sha] for free, so the very next
+    gate's baseline lookup (main_baseline_failing_ids) is a cache hit and
+    never pays for a probe. Seeding must NOT happen when there is no junit-
+    derived id set (scoped/degraded) or no merge_sha to key on."""
+
+    def test_passing_merge_full_verify_seeds_baseline(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        passing_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='all checks passed', failing_test_ids=[],
+        )
+
+        async def _run() -> MergeOutcome | None:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                new=AsyncMock(return_value=passing_result),
+            ):
+                return await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha='abcsha',
+                )
+
+        outcome = asyncio.run(_run())
+        assert outcome is None, f'Expected the verify-passed sentinel (None); got {outcome!r}'
+
+        from orchestrator.verify import _BASELINE_FAILING_IDS_CACHE
+        assert 'abcsha' in _BASELINE_FAILING_IDS_CACHE, (
+            f'Expected the baseline cache to be seeded for merge_sha=abcsha; '
+            f'keys={list(_BASELINE_FAILING_IDS_CACHE)!r}'
+        )
+        _, seeded_ids = _BASELINE_FAILING_IDS_CACHE['abcsha']
+        assert seeded_ids == frozenset(), (
+            f'Expected the seeded ids to be the empty frozenset (all pass); got {seeded_ids!r}'
+        )
+
+    def test_passing_verify_with_no_failing_test_ids_does_not_seed(self, tmp_path: Path) -> None:
+        """A pass under 'scoped' breadth (or any other degrade path) never
+        collects junit ids -- failing_test_ids stays None -- and must NOT
+        seed the baseline: an empty seed there would be WRONG (scoped
+        passing doesn't mean main-at-large is clean, just that the touched
+        subset passed)."""
+        config = _make_config(tmp_path, merge_verify_breadth='scoped')
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        passing_result_no_ids = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='all checks passed', failing_test_ids=None,
+        )
+
+        async def _run() -> MergeOutcome | None:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                new=AsyncMock(return_value=passing_result_no_ids),
+            ):
+                return await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha='scopedsha',
+                )
+
+        outcome = asyncio.run(_run())
+        assert outcome is None
+
+        from orchestrator.verify import _BASELINE_FAILING_IDS_CACHE
+        assert 'scopedsha' not in _BASELINE_FAILING_IDS_CACHE, (
+            f'Must NOT seed when failing_test_ids is None; keys='
+            f'{list(_BASELINE_FAILING_IDS_CACHE)!r}'
+        )
+
+    def test_passing_verify_with_empty_merge_sha_does_not_seed(self, tmp_path: Path) -> None:
+        """merge_sha='' (module-level/train callers that pass no merge_sha)
+        must not attempt to seed -- there is no future main tip to key on."""
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        passing_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='all checks passed', failing_test_ids=[],
+        )
+
+        from orchestrator.verify import _BASELINE_FAILING_IDS_CACHE
+
+        async def _run() -> MergeOutcome | None:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                new=AsyncMock(return_value=passing_result),
+            ):
+                return await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha='',
+                )
+
+        before_keys = set(_BASELINE_FAILING_IDS_CACHE)
+        outcome = asyncio.run(_run())
+        assert outcome is None
+        after_keys = set(_BASELINE_FAILING_IDS_CACHE)
+        assert after_keys == before_keys, (
+            f'Empty merge_sha must not seed anything; before={before_keys!r} '
+            f'after={after_keys!r}'
         )
