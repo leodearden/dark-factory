@@ -3357,6 +3357,33 @@ class GitOps:
             return True
         return False
 
+    async def _warm_lane_soft_pressure_defer(self, branch_name: str) -> bool:
+        """θ proactive soft-floor throttle decision (task 2443, §9.5 inv.11).
+
+        Mirrors :meth:`_warm_lane_disk_admission_blocked`'s shape, one floor
+        earlier: runs :meth:`_run_warm_lane_soft_guard` and defers (True)
+        only on rc==3 (soft pressure — above the hard floor, below the soft
+        one). Every other outcome fails open (False): 0 (healthy), 75 (hard
+        pressure — ε's job, not θ's), 127 (script absent), 2 (usage error),
+        or any other unrecognized code.
+
+        On the defer path, emits a structured WARNING journal line naming
+        *branch_name* — the user-observable B10 signal that a fresh
+        allocation was throttled as backpressure (inv.11: never an
+        escalation or fault).
+
+        Never raises.
+        """
+        rc = await self._run_warm_lane_soft_guard()
+        if rc != 3:
+            return False
+        logger.warning(
+            'θ soft-floor throttle: soft disk pressure (rc=3) for branch '
+            '%r — deferring dispatch (backpressure, inv.11)',
+            branch_name,
+        )
+        return True
+
     async def acquire_spec_lane(
         self,
         merge_commit: str,
