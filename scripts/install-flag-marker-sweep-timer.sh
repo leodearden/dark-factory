@@ -35,4 +35,10 @@ systemctl --user enable --now "$TIMER_NAME"
 echo "install-flag-marker-sweep-timer.sh: kicking immediate one-time drain via $SERVICE_NAME"
 systemctl --user start "$SERVICE_NAME"
 
+echo "install-flag-marker-sweep-timer.sh: verifying ${TIMER_NAME} is listed..."
+if ! systemctl --user list-timers --all | grep -qF "$TIMER_NAME"; then
+    echo "ERROR: ${TIMER_NAME} not found in 'systemctl --user list-timers --all' after enable" >&2
+    exit 1
+fi
+
 echo "install-flag-marker-sweep-timer.sh: ${TIMER_NAME} installed and enabled; ${SERVICE_NAME} drain kicked."
