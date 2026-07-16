@@ -27,14 +27,19 @@ Design decisions (captured in plan.json):
   invalidated as a whole the moment ANY one referenced id is now terminal —
   the snapshot as asserted no longer holds.
 - Best-effort throughout (modelled on
-  ``degenerate_task_node_sweep.sweep_degenerate_task_nodes``): a transient
-  backend error enumerating, cross-referencing, or invalidating one edge
-  must not abort the sweep for the remaining edges — it is tallied into
-  ``stats['errors']`` and the sweep continues.
+  ``degenerate_task_node_sweep.sweep_degenerate_task_nodes``): every caught
+  failure is logged and tallied into ``stats['errors']`` rather than
+  raised. ``get_all_valid_edges``/``get_statuses`` are single bulk calls the
+  rest of the cycle depends on, so a failure there ends this cycle's sweep
+  early with the stats gathered so far (self-heals next cycle). A per-edge
+  ``update_edge`` failure, by contrast, does NOT abort the loop — the
+  remaining stale edges are still attempted, exactly like the per-item
+  find/delete calls in ``sweep_degenerate_task_nodes``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import UTC, datetime
@@ -250,12 +255,23 @@ async def sweep_stale_status_snapshot_edges(
         now: Invalidation timestamp; defaults to ``datetime.now(UTC)``.
         log: Logger to use (default: this module's logger).
 
+    Best-effort (mirrors
+    ``degenerate_task_node_sweep.sweep_degenerate_task_nodes``): a transient
+    backend error enumerating (``get_all_valid_edges``), cross-referencing
+    (``get_statuses``), or invalidating (``update_edge``) is caught, logged,
+    and tallied into ``stats['errors']``. An enumeration or cross-reference
+    failure aborts the rest of this cycle's sweep (there is nothing left to
+    act on without them) and returns the stats gathered so far; a per-edge
+    ``update_edge`` failure does NOT abort the loop — the remaining stale
+    edges are still attempted. ``asyncio.CancelledError``/``KeyboardInterrupt``/
+    ``SystemExit`` are re-raised unchanged (never swallowed as best-effort).
+
     Returns:
         dict with int counts: ``scanned`` (edges enumerated after dedup),
         ``candidate_edges`` (edges selected as stale by
         ``select_stale_status_snapshot_edges``), ``invalidated`` (successful
-        update_edge calls), ``errors`` (reserved for best-effort failure
-        tallying).
+        update_edge calls), ``errors`` (caught enumerate/cross-reference/
+        invalidate failures).
 
     Empty *taskmaster*/*project_root* short-circuits to all-zero stats with
     no backend calls. When enumeration yields no candidate ids at all,
@@ -266,7 +282,18 @@ async def sweep_stale_status_snapshot_edges(
     if not taskmaster or not project_root:
         return stats
 
-    grouped = await memory_service.graphiti.get_all_valid_edges(group_id=project_id)
+    try:
+        grouped = await memory_service.graphiti.get_all_valid_edges(group_id=project_id)
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        log.exception(
+            'stale_status_snapshot_edge_sweep: get_all_valid_edges failed for group_id=%s',
+            project_id,
+        )
+        stats['errors'] += 1
+        return stats
+
     edges = flatten_dedup_edges(grouped)
     stats['scanned'] = len(edges)
 
@@ -277,22 +304,41 @@ async def sweep_stale_status_snapshot_edges(
     if not candidate_ids:
         return stats
 
-    statuses = await taskmaster.get_statuses(
-        project_root, ids=[str(i) for i in sorted(candidate_ids)],
-    )
+    try:
+        statuses = await taskmaster.get_statuses(
+            project_root, ids=[str(i) for i in sorted(candidate_ids)],
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        log.exception(
+            'stale_status_snapshot_edge_sweep: get_statuses failed for project_root=%s',
+            project_root,
+        )
+        stats['errors'] += 1
+        return stats
 
     stale = select_stale_status_snapshot_edges(edges, statuses)
     stats['candidate_edges'] = len(stale)
 
     invalidate_at = now or datetime.now(UTC)
     for edge in stale:
-        await memory_service.update_edge(
-            edge['uuid'],
-            invalid_at=invalidate_at,
-            project_id=project_id,
-            agent_id=_SWEEP_AGENT_ID,
-            causation_id=run_id,
-        )
-        stats['invalidated'] += 1
+        try:
+            await memory_service.update_edge(
+                edge['uuid'],
+                invalid_at=invalidate_at,
+                project_id=project_id,
+                agent_id=_SWEEP_AGENT_ID,
+                causation_id=run_id,
+            )
+            stats['invalidated'] += 1
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            log.exception(
+                'stale_status_snapshot_edge_sweep: update_edge failed for uuid=%s',
+                edge['uuid'],
+            )
+            stats['errors'] += 1
 
     return stats
