@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
     from shared.config_dir import TaskConfigDir
+    from shared.cost_store import CostStore
 
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.config import OrchestratorConfig
@@ -97,6 +98,7 @@ class TaskSteward:
         usage_gate: UsageGate | None = None,
         config_dir: TaskConfigDir | None = None,
         event_store: EventStore | None = None,
+        cost_store: CostStore | None = None,
     ):
         self.task_id = task_id
         self.task = task
@@ -108,6 +110,7 @@ class TaskSteward:
         self.usage_gate = usage_gate
         self._config_dir = config_dir
         self.event_store = event_store
+        self.cost_store = cost_store
 
         self._session_id: str | None = None
         self._stopped = False

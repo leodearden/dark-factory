@@ -5489,6 +5489,7 @@ Output JSON matching the schema. Every task must appear in the output.
                         usage_gate=self.usage_gate,
                         config_dir=config_dir,
                         event_store=self.event_store,
+                        cost_store=self.cost_store,
                     )
                 steward_factory = _make_steward
 
