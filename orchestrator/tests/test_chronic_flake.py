@@ -20,6 +20,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 from importlib import resources as pkg_resources
 
 import yaml
@@ -184,3 +185,98 @@ class TestParseChronicFlakyMarkers:
     def test_no_markers_returns_empty_list(self):
         from orchestrator.chronic_flake import parse_chronic_flaky_markers
         assert parse_chronic_flaky_markers('all good\nnothing to see\n') == []
+
+
+# ── Step-5 / Step-6: Flaky ledger read + chronic-test computation ─────────────
+
+
+class TestReadFlakyLedger:
+    """``read_flaky_ledger``: best-effort per-line JSON read of reify's
+    ``{ts, test, role, flaky_count_window}`` ledger rows — tolerant of blank
+    lines, malformed JSON, and non-dict rows; missing file → []."""
+
+    def test_reads_well_formed_rows_in_order_skips_blank_and_malformed(self, tmp_path):
+        from orchestrator.chronic_flake import read_flaky_ledger
+        row_a = {'ts': '2026-07-01T00:00:00Z', 'test': 'test_a.sh', 'role': 'verifier', 'flaky_count_window': 1}
+        row_b = {'ts': '2026-07-02T00:00:00Z', 'test': 'test_b.sh', 'role': 'implementer', 'flaky_count_window': 2}
+        ledger_path = tmp_path / 'flaky-ledger.jsonl'
+        ledger_path.write_text(
+            '\n'.join([
+                json.dumps(row_a),
+                '',
+                'not valid json {{{',
+                json.dumps(row_b),
+            ])
+            + '\n'
+        )
+        assert read_flaky_ledger(ledger_path) == [row_a, row_b]
+
+    def test_skips_non_dict_rows(self, tmp_path):
+        from orchestrator.chronic_flake import read_flaky_ledger
+        row_a = {'ts': '2026-07-01T00:00:00Z', 'test': 'test_a.sh', 'role': 'verifier', 'flaky_count_window': 1}
+        ledger_path = tmp_path / 'flaky-ledger.jsonl'
+        ledger_path.write_text(
+            '\n'.join([
+                json.dumps(['not', 'a', 'dict']),
+                json.dumps('just a string'),
+                json.dumps(row_a),
+            ])
+            + '\n'
+        )
+        assert read_flaky_ledger(ledger_path) == [row_a]
+
+    def test_missing_file_returns_empty_list(self, tmp_path):
+        from orchestrator.chronic_flake import read_flaky_ledger
+        assert read_flaky_ledger(tmp_path / 'does-not-exist.jsonl') == []
+
+
+class TestComputeChronicFlakes:
+    """``compute_chronic_flakes``: groups the last ``window`` ledger entries
+    by test, flags tests occurring ``>= threshold`` times as chronic."""
+
+    def _entry(self, ts, test, role, count):
+        return {'ts': ts, 'test': test, 'role': role, 'flaky_count_window': count}
+
+    def test_flags_test_at_or_above_threshold_excludes_sub_threshold(self):
+        from orchestrator.chronic_flake import compute_chronic_flakes
+        entries = [
+            self._entry('2026-07-01', 'test_a.sh', 'verifier', 1),
+            self._entry('2026-07-02', 'test_a.sh', 'verifier', 2),
+            self._entry('2026-07-03', 'test_a.sh', 'implementer', 3),
+            self._entry('2026-07-04', 'test_b.sh', 'verifier', 1),
+            self._entry('2026-07-05', 'test_b.sh', 'verifier', 2),
+        ]
+        result = compute_chronic_flakes(entries, threshold=3, window=20)
+        assert len(result) == 1
+        evidence = result[0]
+        assert evidence.test == 'test_a.sh'
+        assert evidence.count == 3
+        assert evidence.window == 20
+        assert evidence.dates == ['2026-07-01', '2026-07-02', '2026-07-03']
+        assert evidence.roles == ['implementer', 'verifier']
+
+    def test_only_last_window_entries_considered(self):
+        """A test that only appears OUTSIDE the last `window` entries must
+        not be flagged, even if it would meet threshold unwindowed."""
+        from orchestrator.chronic_flake import compute_chronic_flakes
+        older = [self._entry(f'2026-06-0{i}', 'test_c.sh', 'verifier', i) for i in range(1, 4)]
+        recent = [
+            self._entry('2026-07-01', 'test_a.sh', 'verifier', 1),
+            self._entry('2026-07-02', 'test_a.sh', 'verifier', 2),
+            self._entry('2026-07-03', 'test_a.sh', 'implementer', 3),
+        ]
+        entries = older + recent
+        result = compute_chronic_flakes(entries, threshold=3, window=len(recent))
+        assert [e.test for e in result] == ['test_a.sh']
+
+    def test_sub_threshold_test_excluded(self):
+        from orchestrator.chronic_flake import compute_chronic_flakes
+        entries = [
+            self._entry('2026-07-01', 'test_b.sh', 'verifier', 1),
+            self._entry('2026-07-02', 'test_b.sh', 'verifier', 2),
+        ]
+        assert compute_chronic_flakes(entries, threshold=3, window=20) == []
+
+    def test_empty_entries_returns_empty_list(self):
+        from orchestrator.chronic_flake import compute_chronic_flakes
+        assert compute_chronic_flakes([], threshold=3, window=20) == []
