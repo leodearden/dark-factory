@@ -1,0 +1,527 @@
+"""Tests for the stale task-status snapshot Graphiti edge sweep (task 2613).
+
+Reconciliation Stage 1 (MemoryConsolidator) has no deterministic sweep that
+invalidates VALID (invalid_at IS NULL) task-status-snapshot Graphiti edges
+once the task(s) they reference reach a terminal status (done/cancelled).
+This module adds a small deterministic post-processor: enumerate valid
+edges, cross-reference each referenced task_id's CURRENT status via a direct
+status lookup (taskmaster.get_statuses — NOT semantic search), and
+invalidate any edge whose asserted non-terminal (active/pending/in-progress)
+status now contradicts a terminal task.
+
+Covers:
+- extract_snapshot_edge_task_ids: pure lexical extractor — returns the
+  specific task ids a status-snapshot edge asserts as active/pending/
+  in-progress; returns the empty set for text with no such status marker,
+  and for pure count-only snapshots with no specific task-id (the
+  stale-by-design audit trail this sweep must never touch).
+- flatten_dedup_edges: flattens get_all_valid_edges' dict[entity_uuid,
+  list[EdgeDict]] shape and dedups by edge uuid (handles the backend's
+  double-attribution of each directed edge under both endpoint entities).
+- select_stale_status_snapshot_edges: pure decision core — selects edges
+  whose asserted status contradicts a positively-terminal current status.
+- sweep_stale_status_snapshot_edges: async orchestrator — enumerates,
+  cross-references, and invalidates, best-effort throughout.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
+    extract_snapshot_edge_task_ids,
+    flatten_dedup_edges,
+    select_stale_status_snapshot_edges,
+    sweep_stale_status_snapshot_edges,
+)
+
+
+def _make_memory_service() -> MagicMock:
+    """MagicMock memory_service with an AsyncMock .graphiti and .update_edge
+    (mirrors test_degenerate_task_node_sweep.py's _make_memory_service)."""
+    memory_service = MagicMock()
+    memory_service.graphiti = MagicMock()
+    memory_service.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+    memory_service.update_edge = AsyncMock()
+    return memory_service
+
+
+def _make_taskmaster() -> MagicMock:
+    """MagicMock taskmaster with an AsyncMock .get_statuses."""
+    taskmaster = MagicMock()
+    taskmaster.get_statuses = AsyncMock(return_value={})
+    return taskmaster
+
+
+class TestExtractSnapshotEdgeTaskIds:
+    """extract_snapshot_edge_task_ids(fact) returns the specific task ids a
+    status-snapshot edge asserts as active/pending/in-progress.
+
+    Returns the empty set both when no active/pending/in-progress status
+    marker is present at all, AND for pure count-only snapshots with no
+    specific task-id reference — the out-of-scope, stale-by-design audit
+    trail (Snapshot Discipline) that this sweep must never touch.
+    """
+
+    def test_individual_form_active_pending(self):
+        """'Task 142 is an active pending task' -> {142}."""
+        assert extract_snapshot_edge_task_ids('Task 142 is an active pending task') == {142}
+
+    def test_individual_form_in_progress(self):
+        """'Task 148 is in-progress' -> {148}."""
+        assert extract_snapshot_edge_task_ids('Task 148 is in-progress') == {148}
+
+    def test_aggregate_list_form_brackets(self):
+        """'The active pending tasks are [142, 148, 150]' -> {142, 148, 150}."""
+        result = extract_snapshot_edge_task_ids(
+            'The active pending tasks are [142, 148, 150]'
+        )
+        assert result == {142, 148, 150}
+
+    def test_aggregate_list_form_colon(self):
+        """'active/in-progress tasks: 142, 148' -> {142, 148}."""
+        result = extract_snapshot_edge_task_ids('active/in-progress tasks: 142, 148')
+        assert result == {142, 148}
+
+    def test_count_only_no_specific_id_returns_empty(self):
+        """'There are 8 tasks in progress' -> set() (out-of-scope count-only snapshot)."""
+        assert extract_snapshot_edge_task_ids('There are 8 tasks in progress') == set()
+
+    def test_count_pair_returns_empty(self):
+        """'1505 done / 148 cancelled' -> set() ('148' is a count operand, not an id)."""
+        assert extract_snapshot_edge_task_ids('1505 done / 148 cancelled') == set()
+
+    def test_status_gate_done_returns_empty(self):
+        """'Task 5 is done' -> set() (no active/pending/in-progress marker)."""
+        assert extract_snapshot_edge_task_ids('Task 5 is done') == set()
+
+    def test_status_gate_merge_commit_returns_empty(self):
+        """'Task 7 landed as merge commit' -> set() (no active/pending/in-progress marker)."""
+        assert extract_snapshot_edge_task_ids('Task 7 landed as merge commit') == set()
+
+    def test_incidental_numbers_excluded(self):
+        """Date/commit-hash digits near a valid reference must not be swept in as ids."""
+        result = extract_snapshot_edge_task_ids(
+            'Task 142 is pending as of 2026-07-14 (commit ab12cd)'
+        )
+        assert result == {142}
+
+    def test_individual_form_no_copula_in_progress(self):
+        """'Task 5 in progress' -> {5} (no linking verb).
+
+        Regression test (reviewer_comprehensive correctness-recall finding,
+        task 2613): the status-word-adjacent digit used to be stripped by
+        COUNT_QUANTITY_RE (it matches '\\d+\\s+in[-\\s]?progress') before id
+        extraction ever ran, silently dropping this id.
+        """
+        assert extract_snapshot_edge_task_ids('Task 5 in progress') == {5}
+
+    def test_individual_form_no_copula_pending(self):
+        """'Task 5 pending' -> {5} (no linking verb).
+
+        Regression test (reviewer_comprehensive correctness-recall finding,
+        task 2613): same COUNT_QUANTITY_RE false-negative class as the
+        'in progress' case above, via '\\d+\\s+pending'.
+        """
+        assert extract_snapshot_edge_task_ids('Task 5 pending') == {5}
+
+    def test_incidental_status_word_describing_something_else_excluded(self):
+        """'Task 142 landed on the active branch' -> set().
+
+        'active' describes the BRANCH, not task 142's status. Regression
+        test (reviewer_comprehensive correctness-precision finding, task
+        2613): the status marker must be anchored to its own task reference
+        rather than merely co-occurring anywhere in the fact, else this
+        genuinely-terminal fact ('landed') would be wrongly treated as an
+        active/pending snapshot of task 142.
+        """
+        result = extract_snapshot_edge_task_ids('Task 142 landed on the active branch')
+        assert result == set()
+
+
+# --------------------------------------------------------------------------- #
+# flatten_dedup_edges
+# --------------------------------------------------------------------------- #
+
+
+class TestFlattenDedupEdges:
+    """flatten_dedup_edges(grouped) flattens get_all_valid_edges' dict[entity_uuid,
+    list[EdgeDict]] shape into a flat list, deduped by edge['uuid'] — the backend
+    double-attributes each directed edge under both its source and target entity.
+    """
+
+    def test_double_attributed_edge_yields_once(self):
+        """An edge uuid appearing under two entity uuids (double-attribution) is
+        returned exactly once."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+        grouped = {
+            'entity-a': [edge],
+            'entity-b': [edge],
+        }
+
+        result = flatten_dedup_edges(grouped)
+
+        assert result == [edge], f'Expected the double-attributed edge exactly once, got {result!r}'
+
+    def test_multiple_distinct_edges_all_preserved(self):
+        """Distinct edge uuids across entities are all preserved."""
+        edge1 = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+        edge2 = {'uuid': 'edge-2', 'fact': 'Task 148 is in-progress', 'name': ''}
+        grouped = {
+            'entity-a': [edge1],
+            'entity-b': [edge2],
+        }
+
+        result = flatten_dedup_edges(grouped)
+
+        assert result == [edge1, edge2], f'Expected both distinct edges preserved, got {result!r}'
+
+    def test_empty_dict_yields_empty_list(self):
+        """An empty grouped dict yields []."""
+        assert flatten_dedup_edges({}) == []
+
+    def test_result_elements_retain_uuid_fact_name_keys(self):
+        """Flattened elements retain their original uuid/fact/name keys unmodified."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': 'orchestrator'}
+        grouped = {'entity-a': [edge]}
+
+        result = flatten_dedup_edges(grouped)
+
+        assert result[0]['uuid'] == 'edge-1'
+        assert result[0]['fact'] == 'Task 142 is an active pending task'
+        assert result[0]['name'] == 'orchestrator'
+
+
+# --------------------------------------------------------------------------- #
+# select_stale_status_snapshot_edges
+# --------------------------------------------------------------------------- #
+
+
+class TestSelectStaleStatusSnapshotEdges:
+    """select_stale_status_snapshot_edges(edges, statuses) is the pure decision
+    core: an edge is selected (stale) iff any task id it asserts as
+    active/pending/in-progress now has a positively-terminal (done/cancelled)
+    status. Unknown/missing/still-active statuses never select an edge
+    (invalidate-only-on-positively-terminal fail-safe).
+    """
+
+    def test_individual_edge_selected_when_referenced_task_done(self):
+        """'Task 142 ...' with statuses={'142': 'done'} -> selected."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+
+        result = select_stale_status_snapshot_edges([edge], {'142': 'done'})
+
+        assert result == [edge]
+
+    def test_individual_edge_not_selected_when_still_active(self):
+        """'Task 142 ...' with statuses={'142': 'in-progress'} -> not selected."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+
+        result = select_stale_status_snapshot_edges([edge], {'142': 'in-progress'})
+
+        assert result == []
+
+    def test_individual_edge_selected_when_referenced_task_cancelled(self):
+        """'Task 142 ...' with statuses={'142': 'cancelled'} -> selected."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+
+        result = select_stale_status_snapshot_edges([edge], {'142': 'cancelled'})
+
+        assert result == [edge]
+
+    def test_aggregate_edge_selected_when_one_member_terminal(self):
+        """Aggregate edge referencing [142, 148]; 142 done, 148 still pending ->
+        the whole edge is selected stale on the single terminal member."""
+        edge = {
+            'uuid': 'edge-agg',
+            'fact': 'The active pending tasks are [142, 148]',
+            'name': '',
+        }
+
+        result = select_stale_status_snapshot_edges(
+            [edge], {'142': 'done', '148': 'pending'},
+        )
+
+        assert result == [edge]
+
+    def test_count_only_edge_never_selected(self):
+        """A count-only edge (no extractable ids) is never selected regardless
+        of the statuses map contents."""
+        edge = {'uuid': 'edge-count', 'fact': 'There are 8 tasks in progress', 'name': ''}
+
+        result = select_stale_status_snapshot_edges(
+            [edge], {'142': 'done', '999': 'cancelled'},
+        )
+
+        assert result == []
+
+    def test_referenced_id_absent_from_statuses_not_selected(self):
+        """The referenced id is missing from the statuses map entirely ->
+        fail-safe: not selected (an unknown census gap never invalidates)."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+
+        result = select_stale_status_snapshot_edges([edge], {})
+
+        assert result == []
+
+    def test_referenced_id_unknown_status_not_selected(self):
+        """The referenced id resolves to the 'unknown' status sentinel ->
+        fail-safe: not selected."""
+        edge = {'uuid': 'edge-1', 'fact': 'Task 142 is an active pending task', 'name': ''}
+
+        result = select_stale_status_snapshot_edges([edge], {'142': 'unknown'})
+
+        assert result == []
+
+    def test_returned_entries_carry_edge_uuid(self):
+        """Selected entries are the original edge dicts, carrying their uuid."""
+        edge = {'uuid': 'edge-carries-uuid', 'fact': 'Task 142 is an active pending task', 'name': ''}
+
+        result = select_stale_status_snapshot_edges([edge], {'142': 'done'})
+
+        assert len(result) == 1
+        assert result[0]['uuid'] == 'edge-carries-uuid'
+
+    def test_incidental_status_word_not_selected_even_if_task_done(self):
+        """'Task 142 landed on the active branch' with statuses={'142': 'done'}
+        -> not selected.
+
+        Regression test (reviewer_comprehensive correctness-precision
+        finding, task 2613): 'active' describes the branch, not task 142, so
+        no id is extracted at all and the edge must never be treated as a
+        stale status-snapshot regardless of task 142's real status —
+        otherwise a genuinely-true terminal fact would be wrongly retired.
+        """
+        edge = {
+            'uuid': 'edge-incidental',
+            'fact': 'Task 142 landed on the active branch',
+            'name': '',
+        }
+
+        result = select_stale_status_snapshot_edges([edge], {'142': 'done'})
+
+        assert result == []
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_status_snapshot_edges — core behavior
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepStaleStatusSnapshotEdgesCore:
+    """sweep_stale_status_snapshot_edges enumerates valid edges via
+    memory_service.graphiti.get_all_valid_edges, cross-references each
+    candidate id's CURRENT status via taskmaster.get_statuses (never
+    semantic search), and invalidates only the edges
+    select_stale_status_snapshot_edges identifies as stale.
+    """
+
+    @pytest.mark.asyncio
+    async def test_happy_path_invalidates_only_the_stale_edge(self):
+        """One stale edge (references done task 142) + one healthy edge
+        (references still-pending task 999). update_edge must be awaited
+        exactly once, for the stale edge's uuid only, with invalid_at set
+        and project_id threaded through; get_statuses must be called with
+        only the two referenced candidate ids."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+
+        stale_edge = {
+            'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': '',
+        }
+        healthy_edge = {
+            'uuid': 'edge-healthy', 'fact': 'Task 999 is an active pending task', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [stale_edge, healthy_edge]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'142': 'done', '999': 'pending'})
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        memory_service.update_edge.assert_awaited_once()
+        update_call = memory_service.update_edge.await_args
+        assert update_call.args[0] == 'edge-stale', (
+            f'Expected update_edge awaited for the stale edge uuid only, got {update_call!r}'
+        )
+        assert isinstance(update_call.kwargs.get('invalid_at'), datetime), (
+            'Expected update_edge called with a datetime invalid_at'
+        )
+        assert update_call.kwargs.get('project_id') == 'test_project'
+        assert update_call.kwargs.get('agent_id') == 'recon-stage-memory_consolidator', (
+            "Expected update_edge stamped with the sweep's stable agent_id "
+            f'(reviewer_comprehensive test-coverage finding, task 2613), got {update_call!r}'
+        )
+        assert update_call.kwargs.get('causation_id') == 'run-1', (
+            'Expected update_edge threaded the reconciliation run_id as causation_id '
+            f'(reviewer_comprehensive test-coverage finding, task 2613), got {update_call!r}'
+        )
+
+        taskmaster.get_statuses.assert_awaited_once()
+        get_statuses_call = taskmaster.get_statuses.await_args
+        assert get_statuses_call.args[0] == '/tmp/reify'
+        assert set(get_statuses_call.kwargs.get('ids', [])) == {'142', '999'}, (
+            'Expected get_statuses called with only the referenced candidate ids'
+        )
+
+        assert stats == {'scanned': 2, 'candidate_edges': 1, 'invalidated': 1, 'errors': 0}, (
+            f'Expected exactly the stale edge counted+invalidated, got stats={stats!r}'
+        )
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_status_snapshot_edges — guards
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepStaleStatusSnapshotEdgesGuards:
+    """Guard behavior: an unavailable taskmaster/project_root, or an
+    enumeration with no candidate ids, must short-circuit without
+    unnecessary backend calls."""
+
+    @pytest.mark.asyncio
+    async def test_taskmaster_none_yields_all_zero_stats_with_no_calls(self):
+        """taskmaster=None -> all-zero stats; get_all_valid_edges never awaited."""
+        memory_service = _make_memory_service()
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, None, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats == {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0}
+        memory_service.graphiti.get_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_candidate_ids_skips_get_statuses(self):
+        """Enumeration returns only count-only/non-status edges (no candidate
+        ids) -> get_statuses never awaited and invalidated == 0."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        count_only_edge = {
+            'uuid': 'edge-count', 'fact': 'There are 8 tasks in progress', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [count_only_edge]},
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        taskmaster.get_statuses.assert_not_awaited()
+        assert stats['invalidated'] == 0
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_status_snapshot_edges — best-effort resilience
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepStaleStatusSnapshotEdgesBestEffort:
+    """A transient backend error enumerating, cross-referencing, or invalidating
+    one edge must not abort the sweep for the remaining edges — it is tallied
+    into stats['errors'] and the sweep continues (mirrors
+    sweep_degenerate_task_nodes's best-effort posture). asyncio.CancelledError
+    is never swallowed."""
+
+    @pytest.mark.asyncio
+    async def test_update_edge_failure_is_swallowed_and_second_update_still_attempted(self):
+        """update_edge raises for the first stale edge; the second stale edge's
+        update_edge is still attempted. Only the successful one counts as
+        invalidated, and the failure counts as an error."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+
+        stale_edge_1 = {
+            'uuid': 'edge-stale-1', 'fact': 'Task 142 is an active pending task', 'name': '',
+        }
+        stale_edge_2 = {
+            'uuid': 'edge-stale-2', 'fact': 'Task 144 is an active pending task', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [stale_edge_1, stale_edge_2]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'142': 'done', '144': 'cancelled'})
+        memory_service.update_edge = AsyncMock(
+            side_effect=[RuntimeError('lock contention'), None],
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        assert memory_service.update_edge.await_count == 2, (
+            'The second stale edge must still be attempted after the first update fails'
+        )
+        assert stats == {'scanned': 2, 'candidate_edges': 2, 'invalidated': 1, 'errors': 1}, (
+            f'Expected the failed update tallied as an error without blocking the second, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_all_valid_edges_failure_yields_all_zero_stats_without_raising(self):
+        """get_all_valid_edges raises -> sweep returns all-zero stats (errors
+        tallied) without raising and without calling get_statuses/update_edge."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            side_effect=RuntimeError('transient read timeout'),
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats == {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 1}, (
+            f'Expected all-zero stats with the failure tallied as an error, got {stats!r}'
+        )
+        taskmaster.get_statuses.assert_not_awaited()
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_failure_is_best_effort_no_op(self):
+        """get_statuses raises -> best-effort no-op: errors tallied, no
+        update_edge attempted, no raise."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        candidate_edge = {
+            'uuid': 'edge-candidate', 'fact': 'Task 142 is an active pending task', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [candidate_edge]},
+        )
+        taskmaster.get_statuses = AsyncMock(side_effect=RuntimeError('transient read timeout'))
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats == {'scanned': 1, 'candidate_edges': 0, 'invalidated': 0, 'errors': 1}, (
+            f'Expected the get_statuses failure tallied as an error with no invalidation, got {stats!r}'
+        )
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_from_update_edge_propagates(self):
+        """asyncio.CancelledError raised from update_edge must propagate — it
+        is never swallowed as a best-effort error."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        stale_edge = {
+            'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [stale_edge]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
+        memory_service.update_edge = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await sweep_stale_status_snapshot_edges(
+                memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+            )

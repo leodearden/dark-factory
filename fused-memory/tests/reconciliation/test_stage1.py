@@ -2630,6 +2630,141 @@ class TestDegenerateTaskNodeSweepGuards:
             'A raised sweep must not leave a partial/incorrect degenerate_task_nodes_swept stat'
         )
 
+
+# ---------------------------------------------------------------------------
+# task 2613 step-11 (RED) / step-12 (GREEN): stale status-snapshot edge sweep wiring
+# ---------------------------------------------------------------------------
+
+
+class TestStaleStatusSnapshotEdgeSweepWiring:
+    """MemoryConsolidator.run() must invoke sweep_stale_status_snapshot_edges
+    against self.memory/self.taskmaster/self.project_id/self.project_root, and
+    surface its stats as report.stats['stale_status_snapshot_edges_invalidated']
+    / report.stats['stale_status_snapshot_edges_scanned'].
+
+    RED until step-12 wires sweep_stale_status_snapshot_edges into run().
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_invalidates_stale_edge_and_surfaces_stats(self):
+        """One stale edge (references done task 142) + one healthy edge
+        (references still-pending task 999). run() must invalidate only the
+        stale edge (via the real sweep_stale_status_snapshot_edges orchestration,
+        exercised end-to-end through the wired backend calls) and surface both
+        stats keys."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+
+        stale_edge = {
+            'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': '',
+        }
+        healthy_edge = {
+            'uuid': 'edge-healthy', 'fact': 'Task 999 is an active pending task', 'name': '',
+        }
+        stage.memory.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [stale_edge, healthy_edge]},
+        )
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        stage.taskmaster.get_statuses = AsyncMock(
+            return_value={'142': 'done', '999': 'pending'},
+        )
+        stage.memory.update_edge = AsyncMock()
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-2613-step11a',
+            )
+
+        stage.memory.update_edge.assert_awaited_once()
+        assert stage.memory.update_edge.await_args is not None
+        update_call = stage.memory.update_edge.await_args
+        assert update_call.args[0] == 'edge-stale', (
+            f'Expected update_edge awaited for the stale edge uuid only, got {update_call!r}'
+        )
+
+        assert report.stats.get('stale_status_snapshot_edges_invalidated') == 1, (
+            f"Expected report.stats['stale_status_snapshot_edges_invalidated'] == 1; "
+            f'got stats={report.stats!r}. '
+            'RED: sweep_stale_status_snapshot_edges is not yet wired into run().'
+        )
+        assert report.stats.get('stale_status_snapshot_edges_scanned') == 2, (
+            f"Expected report.stats['stale_status_snapshot_edges_scanned'] == 2; "
+            f'got stats={report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_sweep_failure_is_swallowed_and_other_stats_remain_intact(self):
+        """sweep_stale_status_snapshot_edges raising must not blow up run() or
+        blank other stats — mirrors the degenerate-sweep backstop.
+
+        RED: the sweep call has no try/except yet, so the RuntimeError propagates
+        out of stage.run() instead of being swallowed.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+
+        incident_flag = {
+            'task_id': None,
+            'flag_type': 'count_snapshot_mismatch',
+            'description': (
+                'Snapshot edge for autopilot_video reports 634/607 but is off by 1; '
+                'should be 635/608 to match the Active Task Tree header.'
+            ),
+            'suggested_action': 'Correct the snapshot edge to 635/608.',
+        }
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[incident_flag],
+            stats={},
+        )
+        dedup_mock = AsyncMock(side_effect=lambda **kw: kw['flags'])
+        sweep_mock = AsyncMock(side_effect=RuntimeError('graphiti backend down'))
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.'
+                'sweep_stale_status_snapshot_edges',
+                new=sweep_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-2613-step11b',
+            )
+
+        assert isinstance(report, StageReport), (
+            'run() must still return a StageReport when the sweep raises. '
+            'RED: the sweep call is not yet wrapped in a best-effort try/except.'
+        )
+        assert report.stats.get('stale_count_snapshot_corrections_dropped') == 1, (
+            'The stale-snapshot-correction post-processor must still have run and set '
+            f'its stat even though the sweep raised; got stats={report.stats!r}'
+        )
+        assert 'stale_status_snapshot_edges_invalidated' not in report.stats, (
+            'A raised sweep must not leave a partial/incorrect '
+            'stale_status_snapshot_edges_invalidated stat'
+        )
+        assert 'stale_status_snapshot_edges_scanned' not in report.stats
+
+
 # ---------------------------------------------------------------------------
 # The former class TestMemoryConsolidatorCycleSummaryFallback (task 2366)
 # tested the LLM-era verify_cycle_summary_written / reconstruct_cycle_summary_stub
