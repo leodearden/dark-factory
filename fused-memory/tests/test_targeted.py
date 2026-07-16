@@ -3326,3 +3326,56 @@ async def test_on_task_done_refetches_when_snapshot_provenance_unusable(
     )
     metadata = calls[0].kwargs.get('metadata') or {}
     assert metadata.get('echo_used_provenance') is True
+
+
+# ---------------------------------------------------------------------------
+# Reopen->redone stale completion-echo deletion (task 2433)
+#
+# Repro (task 2531): a task's first done-transition wrote a completion echo
+# citing a WRONG commit; the task was reopened (done->blocked) and
+# redispatched, but the stale echo was never deleted, so it kept lingering in
+# Mem0 search alongside (and even after) a second, correctly-cited echo.
+# _on_task_blocked must delete this reconciler's own completion echoes
+# (metadata source==_ECHO_SOURCE AND transition=='done') for task_id when the
+# PRE-transition status (task_before) was 'done' -- i.e. a genuine
+# reopen-from-done, not an ordinary pending/in-progress->blocked transition.
+
+
+@pytest.mark.asyncio
+async def test_on_task_blocked_reopen_deletes_stale_completion_echo(
+    reconciler, mock_memory_service,
+):
+    """Reopen-from-done (task_before status='done') must delete the stale
+    completion echo _on_task_done wrote for the earlier done-transition, so
+    it doesn't keep lingering in Mem0 search across the reopen. Fails today
+    because _on_task_blocked never calls delete_memory."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+        {
+            'id': 'echo-stale',
+            'created_at': '2026-07-16T00:14:06',
+            'metadata': {
+                'source': 'targeted_reconciliation',
+                'task_id': '2531',
+                'transition': 'done',
+            },
+        },
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='2531', transition='blocked', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '2531', 'title': 'T', 'status': 'done'},
+    )
+
+    mock_memory_service.delete_memory.assert_awaited_once()
+    delete_kwargs = mock_memory_service.delete_memory.await_args.kwargs
+    assert delete_kwargs.get('memory_id') == 'echo-stale'
+    assert delete_kwargs.get('store') == 'mem0'
+    assert delete_kwargs.get('project_id') == 'test-project'
+
+    mock_memory_service.get_memories_by_metadata.assert_awaited()
+    query_call = mock_memory_service.get_memories_by_metadata.await_args
+    assert query_call.kwargs.get('filters', {}).get('task_id') == '2531'
+
+    deleted_actions = [a for a in result.get('actions', []) if a['type'] == 'stale_echo_deleted']
+    assert len(deleted_actions) == 1
+    assert 'echo-stale' in deleted_actions[0].get('memory_ids', [])
