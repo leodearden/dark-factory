@@ -1,4 +1,5 @@
-"""Model routing: allowlist + fail-fast validation + per-account availability probe.
+"""Model routing: allowlist + fail-fast validation + per-account availability
+probe + the layered route resolver.
 
 Task beta (Phase-1 substrate of plans/adaptive-model-routing-prd.md). This
 module is the PRD-named "allowlist home": ``DEFAULT_ALLOWED_MODELS`` is the
@@ -6,31 +7,36 @@ source of truth for ``OrchestratorConfig.routing``'s default (see
 ``config.py``'s ``RoutingConfig`` submodel and its
 ``_validate_models_in_allowlist`` cross-field validator).
 
-This module will also host the per-account model-availability probe
-(``probe_models``) and its rendered artifact format
-(``render_probe_artifact``), consumed by the ``orchestrator probe-models`` CLI
-subcommand (``orchestrator/cli.py``) — added by later steps in this task's
-plan, not yet present here.
+Task epsilon adds ``resolve_route`` -- the single layered authority for
+(model, effort, budget_usd, max_turns) at every LLM invocation, adopted by
+``orchestrator.workflow.TaskWorkflow._invoke``. See ``resolve_route``'s own
+docstring for the layer precedence.
 
 Kept import-light at module top (stdlib only) so ``config.py`` can
 ``from orchestrator.routing import DEFAULT_ALLOWED_MODELS`` with no circular
 import; heavier imports (e.g. ``shared.cli_invoke.invoke_claude_agent``) are
-deferred to inside the functions that need them.
+deferred to inside the functions that need them. ``OrchestratorConfig`` is
+imported under ``TYPE_CHECKING`` only (never at runtime) for the same
+reason -- ``config.py`` already imports FROM this module at its own top
+level, so a runtime `from orchestrator.config import OrchestratorConfig`
+here would create a circular import.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Mapping
     from pathlib import Path
 
     from shared.cli_invoke import AgentResult
     from shared.config_models import AccountConfig
+
+    from orchestrator.config import OrchestratorConfig, RoutingRule
 
 logger = logging.getLogger(__name__)
 
@@ -218,3 +224,181 @@ def render_probe_artifact(report: ProbeReport, generated_at: str) -> str:
         },
     }
     return yaml.safe_dump(payload, sort_keys=False)
+
+
+# ---------------------------------------------------------------------------
+# Route resolution (task epsilon, plans/adaptive-model-routing-prd.md)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PlanShape:
+    """Snapshot of a task's plan shape, consulted by the ``plan_min_steps``/
+    ``plan_min_modules``/``module_prefix`` RuleMatch conditions."""
+
+    step_count: int
+    module_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RoleDefaults:
+    """The ``AgentRole`` dataclass's own defaults -- the resolver's layer-4,
+    always-available base (invariant 1: Total; ``resolve_route`` never
+    raises because this layer is unconditional)."""
+
+    model: str
+    effort: str
+    budget_usd: float
+    max_turns: int
+
+
+@dataclass(frozen=True)
+class RouteInputs:
+    """Everything ``resolve_route`` needs to resolve one invocation's route.
+
+    Pure data -- the ``OrchestratorConfig`` is passed to ``resolve_route``
+    as a separate argument (not embedded here) so the same inputs can be
+    replayed against different config snapshots in tests.
+
+    ``spend_by_model`` is the trailing-24h USD spend per model that carries
+    a configured ``routing.per_model_daily_ceiling_usd`` entry -- callers
+    (``TaskWorkflow._invoke``) only populate it for ceiling'd models, so it
+    is empty ``{}`` at stock config (no ceilings configured -> no cost_store
+    read fires).
+    """
+
+    role_name: str
+    task_id: str
+    task_metadata: Mapping[str, Any]
+    plan_shape: PlanShape | None
+    routing_tier: int
+    dispatch_count: int
+    role_defaults: RoleDefaults
+    spend_by_model: Mapping[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RoutingDecision:
+    """The resolved (model, effort, budget_usd, max_turns) for one
+    invocation, plus provenance.
+
+    ``source_layer`` tracks MODEL provenance only (one of
+    ``'role_default'``, ``'config'``, ``'policy_rule'``,
+    ``'metadata_override'``) -- effort/budget_usd/max_turns are each
+    resolved field-wise from the highest layer that specifies them, but a
+    single decision carries only one source_layer axis (see
+    ``resolve_route``). ``rule_id`` is set whenever a policy rule matched
+    (independent of whether that rule went on to set ``model`` -- see
+    ``resolve_route``). ``rejected`` accumulates a namespaced reason string
+    for every layer that was skipped (fail-safe allowlist/ceiling
+    rejections, or a ladder-relative bump that could not be applied).
+    """
+
+    model: str
+    effort: str
+    budget_usd: float
+    max_turns: int
+    source_layer: str
+    rule_id: str | None
+    rejected: tuple[str, ...] = ()
+
+
+def _config_key(role_name: str) -> str:
+    """Collapse any ``reviewer*`` variant to the shared ``'reviewer'`` config key.
+
+    Mirrors the pre-epsilon inline collapse in ``workflow.py``'s ``_invoke``
+    (``if role.name.startswith('reviewer')``) so every reviewer variant
+    resolves the same ``.reviewer`` config fields (byte-equivalence,
+    invariant 3).
+    """
+    return 'reviewer' if role_name.startswith('reviewer') else role_name
+
+
+def _rule_matches(rule: RoutingRule, inputs: RouteInputs) -> bool:
+    """Return True iff *rule* matches *inputs*.
+
+    Step epsilon-4 stub: only the ``role`` condition is evaluated here --
+    the remaining closed-vocabulary conditions (``plan_min_steps``,
+    ``plan_min_modules``, ``module_prefix``, ``min_routing_tier``,
+    ``min_dispatch_count``, ``simple_saturated``, ``task_complexity``,
+    ``task_priority``) are filled in by a later step's evaluator (PRD task
+    epsilon step-6) -- until then they are silently not enforced.
+    """
+    match = rule.match
+    return match.role is None or inputs.role_name in match.role
+
+
+def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDecision:
+    """Resolve the (model, effort, budget_usd, max_turns) for one LLM
+    invocation.
+
+    Layered by precedence, highest first:
+
+    1. ``metadata_override`` -- ``inputs.task_metadata['model_overrides']
+       [inputs.role_name]``, if present (sets ``model`` only).
+    2. ``policy_rule`` -- the first rule in ``config.routing.rules`` (list
+       order) whose ``match`` conditions all hold; its ``set`` fields
+       override whichever of model/effort/budget_usd/max_turns it
+       specifies.
+    3. ``config`` -- ``config.models``/``budgets``/``max_turns``/``effort``,
+       keyed by ``_config_key(inputs.role_name)`` (the reviewer* collapse).
+    4. ``role_default`` -- ``inputs.role_defaults`` (invariant 1: Total,
+       always available, so this function never raises).
+
+    Each of effort/budget_usd/max_turns is resolved independently
+    field-by-field from the highest layer that specifies it;
+    ``source_layer`` tracks only ``model``'s provenance. Pure and
+    synchronous -- no I/O.
+    """
+    model = inputs.role_defaults.model
+    effort = inputs.role_defaults.effort
+    budget_usd = inputs.role_defaults.budget_usd
+    max_turns = inputs.role_defaults.max_turns
+    source_layer = 'role_default'
+    rule_id: str | None = None
+
+    key = _config_key(inputs.role_name)
+
+    # Layer 3: static per-role config.
+    if hasattr(config.models, key):
+        model = getattr(config.models, key)
+        source_layer = 'config'
+    if hasattr(config.budgets, key):
+        budget_usd = getattr(config.budgets, key)
+    if hasattr(config.max_turns, key):
+        max_turns = getattr(config.max_turns, key)
+    if hasattr(config.effort, key):
+        effort = getattr(config.effort, key)
+
+    # Layer 2: first matching policy rule (list order; first match wins).
+    for rule in config.routing.rules:
+        if not _rule_matches(rule, inputs):
+            continue
+        if rule.set.model is not None:
+            model = rule.set.model
+            source_layer = 'policy_rule'
+            rule_id = rule.id
+        if rule.set.effort is not None:
+            effort = rule.set.effort
+        if rule.set.budget_usd is not None:
+            budget_usd = rule.set.budget_usd
+        if rule.set.max_turns is not None:
+            max_turns = rule.set.max_turns
+        break
+
+    # Layer 1: per-task metadata override (highest precedence; model only).
+    overrides = inputs.task_metadata.get('model_overrides') if inputs.task_metadata else None
+    override_model = overrides.get(inputs.role_name) if overrides else None
+    if override_model is not None:
+        model = override_model
+        source_layer = 'metadata_override'
+
+    return RoutingDecision(
+        model=model,
+        effort=effort,
+        budget_usd=budget_usd,
+        max_turns=max_turns,
+        source_layer=source_layer,
+        rule_id=rule_id,
+        rejected=(),
+    )
