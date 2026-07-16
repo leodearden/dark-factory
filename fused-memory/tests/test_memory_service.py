@@ -8364,3 +8364,32 @@ class TestStoreFailureDiagnosticsHelper:
         )
         assert graphiti_diag['reason'] == 'timeout'
         assert graphiti_diag['error_type'] == 'TimeoutError'
+
+    @pytest.mark.asyncio
+    async def test_search_store_failed_warning_carries_structured_diagnostics(
+        self, service, caplog,
+    ):
+        """The 'search.store_failed' WARNING must carry the full structured
+        diagnostic dict as `extra` (server-log legibility), not just the old
+        {'store': ..., 'error': str(e)} pair.
+
+        RED: the current warning's extra only has {'store', 'error'} (no
+        error_type/query_len).
+        """
+        service.graphiti.search = AsyncMock(side_effect=RuntimeError('cypher boom'))
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.search(query='qshape', project_id='reify')
+
+        matching = [r for r in caplog.records if r.message == 'search.store_failed']
+        assert len(matching) == 1, (
+            f"Expected exactly 1 'search.store_failed' WARNING, got "
+            f'{len(matching)}: {[r.message for r in caplog.records]}'
+        )
+        record = matching[0]
+        assert record.error_type == 'RuntimeError', (
+            f'Expected the log record to expose error_type via extra, got '
+            f'{record.__dict__!r}'
+        )
+        assert record.store == 'graphiti'
+        assert record.query_len == len('qshape')
