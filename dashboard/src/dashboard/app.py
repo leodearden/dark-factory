@@ -59,6 +59,7 @@ from dashboard.data.costs import (
     aggregate_cost_trend,
 )
 from dashboard.data.db import DbPool
+from dashboard.data.escalation_analytics import build_escalation_analytics
 from dashboard.data.escalations import build_escalation_queues
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import TTLCache, first_success
@@ -1343,6 +1344,64 @@ async def api_escalations(request: Request) -> JSONResponse:
     return JSONResponse(redux_api.shape_escalations(queues, task_maps))
 
 
+# ---------------------------------------------------------------------------
+# Escalation-analytics TTL cache (mirrors _task_cards_cache above)
+# ---------------------------------------------------------------------------
+
+_ANALYTICS_TTL_SECONDS = 60.0
+_analytics_cache: TTLCache[dict] = TTLCache(ttl_seconds=lambda: _ANALYTICS_TTL_SECONDS)
+
+
+def _analytics_cache_clear() -> None:
+    """Clear the escalation-analytics TTL cache (test hook)."""
+    _analytics_cache.clear()
+
+
+def _analytics_project_dirs(config: DashboardConfig) -> list[tuple[str, Path, Path]]:
+    """Escalation-analytics project dirs: primary root first, then known_project_roots.
+
+    Mirrors build_escalation_queues' primary-first, de-duped root iteration
+    (label=root.name). The primary entry is built from config.escalations_dir /
+    config.runs_db (rather than hand-building `config.project_root / 'data' / ...`)
+    so a DASHBOARD_PROJECT_ROOT env override is honored automatically.
+    """
+    seen: set[Path] = {config.project_root}
+    dirs: list[tuple[str, Path, Path]] = [
+        (config.project_root.name, config.escalations_dir, config.runs_db),
+    ]
+    for root in config.known_project_roots:
+        if root not in seen:
+            seen.add(root)
+            dirs.append((
+                root.name,
+                root / 'data' / 'escalations',
+                root / 'data' / 'orchestrator' / 'runs.db',
+            ))
+    return dirs
+
+
+@app.get('/api/v2/dashboard/escalation-analytics')
+async def api_escalation_analytics(request: Request) -> JSONResponse:
+    """ESCALATION_ANALYTICS — origin/lifespan/workflow aggregates over the escalation archive.
+
+    The archive walk (potentially ~10k records across all project roots) runs
+    in a worker thread via asyncio.to_thread behind a ~60s single-flight TTL
+    cache, so a cold scan never blocks the event loop and repeated polls
+    within the TTL window are free. No clock read here — the aggregator
+    resolves `now` once internally via resolve_now (clock-discipline guard
+    scans dashboard/data/*.py + app.py; resolve_now is the sanctioned site).
+    """
+    config: DashboardConfig = request.app.state.config
+    project_dirs = _analytics_project_dirs(config)
+    key = str(project_dirs)
+
+    async def _refresh() -> dict:
+        return await asyncio.to_thread(build_escalation_analytics, project_dirs)
+
+    result = await _analytics_cache.get_or_refresh(key, _refresh)
+    return JSONResponse({'ESCALATION_ANALYTICS': result})
+
+
 # Tests import these helpers directly.
 __all__: Sequence[str] = (
     'app',
@@ -1354,4 +1413,5 @@ __all__: Sequence[str] = (
     '_burndown_dbs',
     '_task_cards_cache_clear',
     '_load_task_cards',
+    '_analytics_cache_clear',
 )
