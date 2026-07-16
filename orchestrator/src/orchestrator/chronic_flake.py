@@ -41,12 +41,22 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
 
 from shared.safe_io import load_json_or_warn
+from shared.task_statuses import TERMINAL
+
+if TYPE_CHECKING:
+    from orchestrator.config import OrchestratorConfig
 
 logger = logging.getLogger(__name__)
+
+# Default relpath (under project_root) for the persistent per-test filing
+# rate-limit ledger — sibling to the scheduler's other small persisted-state
+# JSON files under data/orchestrator/.
+_DEFAULT_FILINGS_RELPATH = Path('data') / 'orchestrator' / 'chronic_flake_filings.json'
 
 
 # ---------------------------------------------------------------------------
@@ -330,3 +340,141 @@ class FilingLedger:
             logger.warning(
                 'chronic_flake: failed to save filing ledger at %s: %s', self._path, exc,
             )
+
+
+# ---------------------------------------------------------------------------
+# maybe_file_chronic_flake_tasks: detect + dedup + file (step-11/step-12)
+# ---------------------------------------------------------------------------
+
+
+class ChronicFlakeTaskClient(Protocol):
+    """Pluggable task-filing seam so this module never talks to the
+    fused-memory MCP directly — mirrors
+    ``offline_lane.OfflineLaneTaskClient``'s cross-project scope boundary.
+    :class:`SchedulerChronicFlakeTaskClient` (step-15/step-16) is the
+    concrete adapter over a duck-typed scheduler."""
+
+    async def submit_task(self, arguments: dict) -> str:
+        """Submit a new task from a ``submit_task``-shaped argument block
+        (see :func:`build_chronic_flake_fix_task_arguments`) and return a
+        best-effort id (submit is two-phase server-side, so the id is
+        log-only — never relied on for dedup)."""
+        ...
+
+    async def search_tasks(self, query: str) -> list[dict]:
+        """Semantic search over already-filed tasks; each result carries at
+        least ``title`` and ``status`` (mirrors the fused-memory
+        ``search_tasks`` MCP tool's result shape)."""
+        ...
+
+
+def _merge_evidence_by_test(
+    verify_output: str, ledger_entries: list[dict], threshold: int, window: int,
+) -> dict[str, ChronicFlakeEvidence]:
+    """Union the ledger-computed chronic tests with the CHRONIC-FLAKY
+    markers parsed from *verify_output*, keyed by test name.
+
+    The ledger's own evidence (dates/roles/entries) is preferred when a test
+    is chronic by BOTH signals; a marker-only test (chronic per reify's own
+    determination but not — or not yet — at DF's configured threshold in the
+    ledger) falls back to a thin evidence record built from the marker's own
+    fields. Dict insertion order (ledger-chronic tests first, in
+    ``compute_chronic_flakes``' order, then marker-only tests in the order
+    they appear in *verify_output*) is what :func:`maybe_file_chronic_flake_tasks`
+    treats as "deterministic order".
+    """
+    evidence_by_test: dict[str, ChronicFlakeEvidence] = {
+        evidence.test: evidence
+        for evidence in compute_chronic_flakes(ledger_entries, threshold, window)
+    }
+    for marker in parse_chronic_flaky_markers(verify_output):
+        if marker.test in evidence_by_test:
+            continue
+        evidence_by_test[marker.test] = ChronicFlakeEvidence(
+            test=marker.test, count=marker.count, window=marker.window,
+            dates=[], roles=[], entries=[],
+        )
+    return evidence_by_test
+
+
+def _is_open_status(status: str | None) -> bool:
+    """True if *status* denotes a live, still-open task.
+
+    Mirrors the ``status in TERMINAL_STATUSES or status == 'deferred'``
+    idiom used elsewhere (e.g. ``TaskWorkflow._resolve_and_resubmit``) to
+    mean "closed" — this is the negation. ``None``/``''`` (task no longer
+    exists, or an unrecognised search-result shape) is treated as NOT open,
+    fail-safe towards filing rather than silently dedup-suppressing forever.
+    """
+    if not status:
+        return False
+    return status not in TERMINAL and status != 'deferred'
+
+
+async def _has_open_dedup_match(task_client: ChronicFlakeTaskClient, test: str) -> bool:
+    """True if a ``search_tasks`` result's title mentions *test* and that
+    task is still OPEN (the local dedup guard, layer (b) — see module
+    docstring)."""
+    results = await task_client.search_tasks(test)
+    for result in results or []:
+        if not isinstance(result, dict):
+            continue
+        if test in (result.get('title') or '') and _is_open_status(result.get('status')):
+            return True
+    return False
+
+
+async def maybe_file_chronic_flake_tasks(
+    verify_output: str,
+    config: OrchestratorConfig,
+    task_client: ChronicFlakeTaskClient | None,
+    *,
+    now: datetime | None = None,
+    ledger_path: str | Path | None = None,
+    filings_path: str | Path | None = None,
+) -> list[str]:
+    """After a verify completes, detect chronic pool-infra flakes and
+    auto-file a medium-priority De-flake fix task per test — see the module
+    docstring for the full policy. Returns the list of test names actually
+    filed this call (``[]`` when disabled, unwired, or nothing chronic/dedup
+    -eligible was found).
+
+    *ledger_path*/*filings_path* default to ``<project_root>/<ledger_relpath>``
+    and ``<project_root>/data/orchestrator/chronic_flake_filings.json``
+    respectively when not given (real callers); tests pass tmp fixtures
+    explicitly. *now* defaults to the current UTC time.
+    """
+    cfg = config.chronic_flake
+    if not cfg.enabled:
+        return []
+    if task_client is None:
+        logger.info('chronic_flake: no task_client wired; skipping (log-only no-op)')
+        return []
+
+    project_root = Path(config.project_root)
+    if ledger_path is None:
+        ledger_path = project_root / cfg.ledger_relpath
+    if filings_path is None:
+        filings_path = project_root / _DEFAULT_FILINGS_RELPATH
+    if now is None:
+        now = datetime.now(UTC)
+
+    ledger_entries = read_flaky_ledger(ledger_path)
+    evidence_by_test = _merge_evidence_by_test(verify_output, ledger_entries, cfg.threshold, cfg.window)
+    if not evidence_by_test:
+        return []
+
+    filings = FilingLedger(filings_path)
+    filed: list[str] = []
+    for test, evidence in evidence_by_test.items():
+        if not filings.should_file(test, now, cfg.rate_limit_days):
+            continue
+        if await _has_open_dedup_match(task_client, test):
+            continue
+        arguments = build_chronic_flake_fix_task_arguments(evidence, project_root)
+        await task_client.submit_task(arguments)
+        filings.record(test, now)
+        filed.append(test)
+
+    filings.save()
+    return filed
