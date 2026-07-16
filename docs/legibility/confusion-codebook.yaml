@@ -434,4 +434,17 @@ entries:
   origin_phase: unknown
   manifested_phase: unknown
   sightings: []
-candidates: []
+candidates:
+- id: cand-20260715-1
+  title: Recon remediation cycles timeout on fused-memory I/O
+  cause: 'Remediation-mode recon runs (Stage 2 task-knowledge-sync) systematically timeout when reading/writing state to fused-memory MCP across multiple tool calls (add_memory, set_stat, count_memories_by_metadata, get_task), suggesting either: (a) remediation harness doesn''t allocate sufficient time budget for I/O-heavy reconciliation, (b) remediation context launches without complete MCP connection setup, or (c) write-heavy remediation cycles trigger implicit timeout guards on the fused-memory server'
+  area: recon harness / fused-memory MCP integration
+  first_seen: '2026-07-15'
+  disposition: pending
+  sightings:
+  - date: '2026-07-15'
+    project: dark_factory
+    session: eb047ae9-e5e6-4832-8b82-17e8802e8302
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: 'tool_error: 10 across retry loops: mcp__fused-memory__get_task ×3 (turns 46, 50), mcp__recon-report__set_stat ×7 (turns 26, 29, 36, 37, 54); multiple "The operation timed out" failures spanning reads (count_memories_by_metadata turns 35, 42; get_task turns 46, 50) and writes (add_memory turn 25; set_stat turns 26, 29, 36, 37, 54); session interrupted by usage limit at turn 74'
