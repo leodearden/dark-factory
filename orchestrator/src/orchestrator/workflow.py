@@ -13,7 +13,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 
@@ -70,6 +70,7 @@ from orchestrator.git_ops import (
 from orchestrator.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
 from orchestrator.module_charter import sanitize_files_for_persist
+from orchestrator.routing import PlanShape, RoleDefaults, RouteInputs, resolve_route
 from orchestrator.scheduler import (
     SetTaskStatusRejected,
     TaskAssignment,
@@ -872,6 +873,18 @@ def _routing_inputs_digest(
     }
     basis = json.dumps(payload, sort_keys=True).encode('utf-8')
     return hashlib.sha256(basis).hexdigest()[:16]
+
+
+def _trailing_24h_window() -> tuple[str, str]:
+    """Return ``(start_iso, end_iso)`` for the trailing-24h window ending now.
+
+    Mirrors the ``cutoff_24h_iso, now_iso`` pattern used by
+    ``harness.py``'s ``_enforce_cost_ceilings``/``digest.py``'s cost-stats
+    helper — kept as its own function here (rather than inlined) so
+    ``_invoke``'s ceiling-spend lookup reads as one call.
+    """
+    now = datetime.now(UTC)
+    return (now - timedelta(hours=24)).isoformat(), now.isoformat()
 
 
 class TaskWorkflow:
@@ -7798,28 +7811,6 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         }
         self.artifacts.write_review('merge', review)
 
-    def _select_model_for_role(self, role: AgentRole, base_model: str) -> str:
-        """Override model for implementer/debugger based on task complexity."""
-        if role.name not in ('implementer', 'debugger'):
-            return base_model
-
-        # Check for Rust modules (crates/ prefix is the convention)
-        rust_modules = [m for m in self.modules if m.startswith('crates/')]
-        if len(rust_modules) < 3:
-            return base_model
-
-        # Check step count if plan is available (always true for implementer/debugger)
-        if self.plan:
-            step_count = len(self.plan.get('steps', []))
-            if step_count >= 12:
-                logger.info(
-                    'Task %s: upgrading %s to opus (%d Rust modules, %d steps)',
-                    self.task_id, role.name, len(rust_modules), step_count,
-                )
-                return 'opus'
-
-        return base_model
-
     def _build_agent_env(self, role: AgentRole) -> dict[str, str] | None:
         """Build the env_overrides dict for this agent invocation.
 
@@ -7889,6 +7880,37 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             'CLAUDE_SPAWN_PARENT_ID': parent_id,
         }
 
+    async def _ceiling_spend_by_model(self) -> dict[str, float]:
+        """Trailing-24h USD spend per model carrying a configured
+        ``routing.per_model_daily_ceiling_usd`` entry (PRD adaptive-model-
+        routing, task ε invariant 6).
+
+        Queried ONLY for ceiling'd models, and only when a cost_store is
+        wired — empty at stock config (no ceilings configured), so zero
+        cost_store reads fire and byte-equivalence (invariant 3) holds.
+        Best-effort per model: a query failure for one model is logged and
+        that model is simply omitted from the result — ``resolve_route``
+        then defaults its spend to 0.0 (fail-open; a dispatch is never
+        blocked by a cost-query hiccup, mirroring harness.py's
+        ``_enforce_cost_ceilings``).
+        """
+        ceilings = self.config.routing.per_model_daily_ceiling_usd
+        if not ceilings or not self.cost_store:
+            return {}
+        start_iso, end_iso = _trailing_24h_window()
+        spend: dict[str, float] = {}
+        for model_name in ceilings:
+            try:
+                spend[model_name] = await self.cost_store.model_cost_in_window(
+                    model_name, start_iso, end_iso,
+                )
+            except Exception:
+                logger.warning(
+                    'Task %s: failed to fetch trailing-24h spend for model %s',
+                    self.task_id, model_name, exc_info=True,
+                )
+        return spend
+
     async def _invoke(
         self,
         role: AgentRole,
@@ -7897,11 +7919,6 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         output_schema: dict | None = None,
     ) -> AgentResult:
         """Invoke an agent with role-specific configuration."""
-        # Get role-specific config overrides
-        models = self.config.models
-        budgets = self.config.budgets
-        turns = self.config.max_turns
-        effort_cfg = self.config.effort
         timeouts_cfg = self.config.timeouts
         backends_cfg = self.config.backends
 
@@ -7917,40 +7934,54 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # (review_checkpoint.py's getattr(self.config.models, 'deep_reviewer', ...)).
         role_key = role.name
 
-        model = getattr(models, role_key, role.default_model)
-        # Captured before _select_model_for_role's Rust-heuristic upgrade so
-        # the routing-decision telemetry below can detect whether that rule
-        # fired (PRD adaptive-model-routing, task γ / task 2533).
-        base_model = model
-        model = self._select_model_for_role(role, model)
-        budget = getattr(budgets, role_key, role.default_budget)
-        max_turns_val = getattr(turns, role_key, role.default_max_turns)
-        effort_val = getattr(effort_cfg, role_key, 'high')
+        # Route resolution (PRD adaptive-model-routing, task ε): the single
+        # layered authority for (model, effort, budget_usd, max_turns),
+        # resolved BEFORE role.system_prompt is used below so the decision
+        # is in scope at the prompt-build seam (invariant 9). Retires
+        # _select_model_for_role — its Rust heuristic now ships as
+        # defaults.yaml's rust-large-plan-implementer policy rule, applied
+        # identically to both implementer and debugger via the rule's own
+        # `role` match list (no more per-role rule_id string formatting).
+        routing_state = RoutingState.from_metadata(self.task.get('metadata'))
+        plan_shape = (
+            PlanShape(len(self.plan.get('steps', [])), tuple(self.modules))
+            if self.plan else None
+        )
+        task_metadata = self.task.get('metadata') or {}
+        role_defaults = RoleDefaults(
+            model=role.default_model,
+            effort='high',
+            budget_usd=role.default_budget,
+            max_turns=role.default_max_turns,
+        )
+        route_inputs = RouteInputs(
+            role_name=role.name,
+            task_id=self.task_id,
+            task_metadata=task_metadata,
+            plan_shape=plan_shape,
+            routing_tier=routing_state.routing_tier,
+            dispatch_count=int(task_metadata.get('dispatch_count', 0)),
+            role_defaults=role_defaults,
+            spend_by_model=await self._ceiling_spend_by_model(),
+        )
+        decision = resolve_route(route_inputs, self.config)
+        model = decision.model
+        budget = decision.budget_usd
+        max_turns_val = decision.max_turns
+        effort_val = decision.effort
+        source_layer = decision.source_layer
+        rule_id = decision.rule_id
+
         timeout_val = getattr(timeouts_cfg, role_key, self.config.invocation_timeout)
         backend_val = getattr(backends_cfg, role_key, 'claude')
 
-        # Use reviewer config for all reviewer variants
+        # timeout_val/backend_val are resolver-external (route resolution
+        # owns model/effort/budget_usd/max_turns only — see this task's plan
+        # design_decisions) — the reviewer* collapse stays local to _invoke
+        # for just these two fields.
         if role.name.startswith('reviewer'):
-            model = models.reviewer
-            budget = budgets.reviewer
-            max_turns_val = turns.reviewer
-            effort_val = effort_cfg.reviewer
             timeout_val = timeouts_cfg.reviewer
             backend_val = backends_cfg.reviewer
-
-        # Adaptive-model-routing telemetry (PRD γ, task 2533): pre-ε this is a
-        # coarse approximation — the only non-config resolution layer
-        # distinguishable today is the Rust-heuristic model upgrade above;
-        # task ε (RoutingDecision) replaces this with the real source layer.
-        # rule_id is derived from role.name (not hardcoded to "implementer")
-        # because _select_model_for_role applies this same heuristic to both
-        # the implementer and debugger roles — hardcoding would mislabel the
-        # debugger's upgrades with an implementer-specific rule id.
-        source_layer = 'config'
-        rule_id: str | None = None
-        if model != base_model and role.name in ('implementer', 'debugger'):
-            source_layer = 'policy_rule'
-            rule_id = f'rust-large-plan-{role.name}'
 
         # Determine sandbox modules based on role (role.sandboxed is a
         # property of the role object — see roles.py's AgentRole/W9-η).
@@ -8149,6 +8180,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             max_turns=max_turns_val,
             source_layer=source_layer,
             rule_id=rule_id,
+            rejected=list(decision.rejected),
         )
 
         if self.cost_store:
@@ -8185,6 +8217,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         max_turns: int,
         source_layer: str,
         rule_id: str | None,
+        rejected: list[str] | None = None,
     ) -> None:
         """Persist the resolved routing decision for this invocation (PRD γ).
 
@@ -8220,7 +8253,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 max_turns=max_turns,
                 source_layer=source_layer,
                 rule_id=rule_id,
-                rejected=[],
+                rejected=rejected or [],
                 routing_tier=state.routing_tier,
                 decided_at=datetime.now(UTC).isoformat(),
             )
