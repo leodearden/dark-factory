@@ -24,6 +24,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 __all__ = [
+    'KNOWN_ROLE_NAMES',
     'BeforeDone',
     'DoneProvenance',
     'ExternalDep',
@@ -37,7 +38,69 @@ __all__ = [
     'apply_migrations',
     'parse_metadata',
     'register_metadata_submodel',
+    'validate_model_overrides',
 ]
+
+
+# The shared mirror of the orchestrator's dispatchable role names (PRD
+# adaptive-model-routing task ζ, decision 9). fused-memory cannot import
+# orchestrator (layering: shared is the base package both depend on), but
+# the fused-memory submit_task/update_task guard must still shape-validate
+# metadata.model_overrides role-name keys — so this frozenset is the single
+# hand-maintained authority both sides read. It is a superset of both
+# orchestrator.agents.roles.ROLES (full dispatch role_name keys, e.g.
+# 'reviewer_comprehensive') and config.ModelsConfig's collapsed keys (e.g.
+# 'reviewer'), so every actually-dispatchable role is always pinnable.
+# orchestrator/tests carries a drift-guard test asserting
+# set(ROLES) <= KNOWN_ROLE_NAMES so this mirror can't silently diverge from
+# the real dispatch roles.
+KNOWN_ROLE_NAMES: frozenset[str] = frozenset({
+    'architect',
+    'implementer',
+    'debugger',
+    'reviewer',
+    'reviewer_comprehensive',
+    'merger',
+    'steward',
+    'triage',
+    'module_tagger',
+    'deep_reviewer',
+    'judge',
+    'simple_task',
+})
+
+
+def validate_model_overrides(value: object) -> None:
+    """Shape-validate a ``metadata.model_overrides`` value (PRD decision 9).
+
+    SHAPE only: ``value`` must be a ``dict`` whose keys are all members of
+    :data:`KNOWN_ROLE_NAMES` and whose values are all non-empty ``str``.
+    Raises ``ValueError`` (never returns a falsy sentinel) describing the
+    offending role/value on the first violation found.
+
+    Deliberately does **not** validate model strings against any allowlist
+    — that is the orchestrator resolver's fail-safe job at resolve time
+    (an override naming a model outside ``routing.allowed_models`` is
+    skipped and recorded in ``RoutingDecision.rejected``, never raised
+    here). fused-memory, the sole caller of this shape check at the
+    submit/update boundary, does not know the orchestrator's allowlist.
+    """
+    if not isinstance(value, dict):
+        raise ValueError(
+            f'model_overrides must be an object mapping role name to model, '
+            f'got {type(value).__name__}'
+        )
+    for role, model in value.items():
+        if role not in KNOWN_ROLE_NAMES:
+            raise ValueError(
+                f'model_overrides: unknown role {role!r}; valid roles are '
+                f'{sorted(KNOWN_ROLE_NAMES)}'
+            )
+        if not isinstance(model, str) or not model:
+            raise ValueError(
+                f'model_overrides: value for role {role!r} must be a non-empty '
+                f'string, got {model!r}'
+            )
 
 
 class BeforeDone(BaseModel):
