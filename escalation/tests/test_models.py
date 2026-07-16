@@ -541,3 +541,162 @@ class TestEscalationResolutionClass:
         assert restored.resolution_class is None, (
             f"Expected resolution_class=None for legacy JSON, got {restored.resolution_class!r}"
         )
+
+
+class TestEscalationTriageFields:
+    """Escalation dataclass has triage-ack marker fields: triaged_at, triaged_by, triage_note, updated_at.
+
+    These are an annotation (not a resolution) — a durable "I looked at this" marker
+    plus a "changed since I triaged it" signal, so escalation-watcher-auto rotations
+    can skip re-deriving the disposition of a still-pending item every rotation.
+    """
+
+    def _make_base_esc(self) -> Escalation:
+        return Escalation(
+            id='esc-task-400-0001',
+            task_id='400',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='scope_violation',
+            summary='test escalation for triage fields',
+        )
+
+    # --- (a) defaults ---
+
+    def test_triaged_at_default_is_none(self):
+        """Escalation constructed without triaged_at has triaged_at=None."""
+        esc = self._make_base_esc()
+        assert esc.triaged_at is None
+
+    def test_triaged_by_default_is_none(self):
+        """Escalation constructed without triaged_by has triaged_by=None."""
+        esc = self._make_base_esc()
+        assert esc.triaged_by is None
+
+    def test_triage_note_default_is_empty_string(self):
+        """Escalation constructed without triage_note has triage_note=''."""
+        esc = self._make_base_esc()
+        assert esc.triage_note == ''
+
+    def test_updated_at_default_is_none(self):
+        """Escalation constructed without updated_at has updated_at=None."""
+        esc = self._make_base_esc()
+        assert esc.updated_at is None
+
+    # --- (b) round-trip via to_dict / from_dict ---
+
+    def test_triage_fields_round_trip_via_to_dict_from_dict(self):
+        """triaged_at/triaged_by/triage_note/updated_at are preserved through to_dict()/from_dict()."""
+        esc = Escalation(
+            id='esc-task-400-0001',
+            task_id='400',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='scope_violation',
+            summary='test triage fields round-trip',
+            triaged_at='2026-07-14T00:00:00+00:00',
+            triaged_by='orchestrator-escalation-watcher-auto',
+            triage_note='task-604 status==done | probe: get_task 604 -> status=done',
+            updated_at='2026-07-14T00:00:00+00:00',
+        )
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.triaged_at == '2026-07-14T00:00:00+00:00'
+        assert restored.triaged_by == 'orchestrator-escalation-watcher-auto'
+        assert restored.triage_note == 'task-604 status==done | probe: get_task 604 -> status=done'
+        assert restored.updated_at == '2026-07-14T00:00:00+00:00'
+
+    # --- (c) round-trip via to_json / from_json ---
+
+    def test_triage_fields_round_trip_via_to_json_from_json(self):
+        """triaged_at/triaged_by/triage_note/updated_at are preserved through to_json()/from_json()."""
+        esc = Escalation(
+            id='esc-task-400-0001',
+            task_id='400',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='scope_violation',
+            summary='test triage fields json round-trip',
+            triaged_at='2026-07-14T00:00:00+00:00',
+            triaged_by='orchestrator-escalation-watcher-auto',
+            triage_note='task-604 status==done | probe: get_task 604 -> status=done',
+            updated_at='2026-07-14T00:00:00+00:00',
+        )
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.triaged_at == '2026-07-14T00:00:00+00:00'
+        assert restored.triaged_by == 'orchestrator-escalation-watcher-auto'
+        assert restored.triage_note == 'task-604 status==done | probe: get_task 604 -> status=done'
+        assert restored.updated_at == '2026-07-14T00:00:00+00:00'
+
+    # --- (d) appear in serialised JSON ---
+
+    def test_triage_fields_appear_in_to_json_output(self):
+        """triaged_at/triaged_by/triage_note/updated_at are serialised (not silently dropped) when set."""
+        esc = Escalation(
+            id='esc-task-400-0001',
+            task_id='400',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='scope_violation',
+            summary='test triage fields in json',
+            triaged_at='2026-07-14T00:00:00+00:00',
+            triaged_by='orchestrator-escalation-watcher-auto',
+            triage_note='task-604 status==done | probe: get_task 604 -> status=done',
+            updated_at='2026-07-14T00:00:00+00:00',
+        )
+        d = json.loads(esc.to_json())
+        assert 'triaged_at' in d
+        assert 'triaged_by' in d
+        assert 'triage_note' in d
+        assert 'updated_at' in d
+        assert d['triaged_at'] == '2026-07-14T00:00:00+00:00'
+        assert d['triaged_by'] == 'orchestrator-escalation-watcher-auto'
+        assert d['triage_note'] == 'task-604 status==done | probe: get_task 604 -> status=done'
+        assert d['updated_at'] == '2026-07-14T00:00:00+00:00'
+
+    # --- (e) legacy JSON backward compat ---
+
+    def test_from_dict_legacy_json_omits_triage_fields(self):
+        """from_json() on JSON without the triage fields returns their defaults (backward compat)."""
+        old_dict = {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without triage fields',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'train_state': None,
+            'resolution_action': None,
+            'resolution_class': None,
+            # NOTE: triaged_at, triaged_by, triage_note, updated_at are intentionally absent
+        }
+        old_json = json.dumps(old_dict)
+        restored = Escalation.from_json(old_json)
+        assert restored.triaged_at is None, (
+            f"Expected triaged_at=None for legacy JSON, got {restored.triaged_at!r}"
+        )
+        assert restored.triaged_by is None, (
+            f"Expected triaged_by=None for legacy JSON, got {restored.triaged_by!r}"
+        )
+        assert restored.triage_note == '', (
+            f"Expected triage_note='' for legacy JSON, got {restored.triage_note!r}"
+        )
+        assert restored.updated_at is None, (
+            f"Expected updated_at=None for legacy JSON, got {restored.updated_at!r}"
+        )
