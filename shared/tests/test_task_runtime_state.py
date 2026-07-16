@@ -89,7 +89,7 @@ class TestTaskRuntimeEntry:
                 attempts=0,
                 started=None,
                 lane=None,
-                phase='BOGUS',
+                phase='BOGUS',  # type: ignore[arg-type]
                 lane_state=None,
                 error=None,
             )
@@ -106,7 +106,7 @@ class TestTaskRuntimeEntry:
                 started=None,
                 lane='_lane-1',
                 phase=None,
-                lane_state='weird',
+                lane_state='weird',  # type: ignore[arg-type]
                 error=None,
             )
 
