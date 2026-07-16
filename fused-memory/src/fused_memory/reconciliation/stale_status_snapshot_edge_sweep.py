@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import UTC, datetime
 
 from fused_memory.reconciliation.task_filter import INACTIVE_TASK_STATUSES, TASK_REF_RE
 
@@ -203,3 +204,95 @@ def select_stale_status_snapshot_edges(edges: list[dict], statuses: dict[str, st
         if any(statuses.get(str(i)) in INACTIVE_TASK_STATUSES for i in ids):
             selected.append(edge)
     return selected
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_status_snapshot_edges — async orchestrator
+# --------------------------------------------------------------------------- #
+
+# Written to update_edge's agent_id — identifies this sweep's writes in the
+# write journal / audit trail, mirroring degenerate_task_node_sweep's
+# convention of stamping a stable, identifiable actor.
+_SWEEP_AGENT_ID = 'recon-stage-memory_consolidator'
+
+
+async def sweep_stale_status_snapshot_edges(
+    memory_service,
+    taskmaster,
+    project_id: str,
+    project_root: str,
+    *,
+    run_id: str,
+    now: datetime | None = None,
+    log: logging.Logger = logger,
+) -> dict:
+    """Enumerate valid status-snapshot edges and invalidate the stale ones.
+
+    Enumerates ALL currently-valid Graphiti edges for *project_id* via
+    ``memory_service.graphiti.get_all_valid_edges`` (a deterministic bulk
+    query — never the LLM's semantic search), extracts the specific task ids
+    each edge asserts as active/pending/in-progress, cross-references those
+    ids' CURRENT status via ``taskmaster.get_statuses`` (a direct status
+    lookup, not semantic search), and invalidates
+    (``memory_service.update_edge(..., invalid_at=...)``) every edge whose
+    asserted status is now contradicted by a terminal (done/cancelled) task.
+
+    Args:
+        memory_service: Object exposing ``.graphiti.get_all_valid_edges`` and
+            ``.update_edge``.
+        taskmaster: Object exposing ``.get_statuses``. A falsy value (e.g.
+            unavailable backend) short-circuits to all-zero stats.
+        project_id: Graphiti group_id to enumerate and invalidate within.
+        project_root: Taskmaster project root for the status lookup. A
+            falsy value short-circuits to all-zero stats.
+        run_id: Reconciliation run id, threaded through as update_edge's
+            causation_id.
+        now: Invalidation timestamp; defaults to ``datetime.now(UTC)``.
+        log: Logger to use (default: this module's logger).
+
+    Returns:
+        dict with int counts: ``scanned`` (edges enumerated after dedup),
+        ``candidate_edges`` (edges selected as stale by
+        ``select_stale_status_snapshot_edges``), ``invalidated`` (successful
+        update_edge calls), ``errors`` (reserved for best-effort failure
+        tallying).
+
+    Empty *taskmaster*/*project_root* short-circuits to all-zero stats with
+    no backend calls. When enumeration yields no candidate ids at all,
+    ``taskmaster.get_statuses`` is never called.
+    """
+    stats = {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0}
+
+    if not taskmaster or not project_root:
+        return stats
+
+    grouped = await memory_service.graphiti.get_all_valid_edges(group_id=project_id)
+    edges = flatten_dedup_edges(grouped)
+    stats['scanned'] = len(edges)
+
+    candidate_ids: set[int] = set()
+    for edge in edges:
+        candidate_ids |= extract_snapshot_edge_task_ids(edge.get('fact') or '')
+
+    if not candidate_ids:
+        return stats
+
+    statuses = await taskmaster.get_statuses(
+        project_root, ids=[str(i) for i in sorted(candidate_ids)],
+    )
+
+    stale = select_stale_status_snapshot_edges(edges, statuses)
+    stats['candidate_edges'] = len(stale)
+
+    invalidate_at = now or datetime.now(UTC)
+    for edge in stale:
+        await memory_service.update_edge(
+            edge['uuid'],
+            invalid_at=invalidate_at,
+            project_id=project_id,
+            agent_id=_SWEEP_AGENT_ID,
+            causation_id=run_id,
+        )
+        stats['invalidated'] += 1
+
+    return stats
