@@ -86,7 +86,7 @@ async def _make_branch_with_file(
 
 def _mock_verify_pass():
     """Return a mock that makes run_scoped_verification always pass."""
-    return AsyncMock(return_value=type('VR', (), {'passed': True, 'summary': ''})())
+    return AsyncMock(return_value=type('VR', (), {'passed': True, 'summary': '', 'failing_test_ids': None})())
 
 
 def _make_request(
@@ -286,7 +286,7 @@ async def test_restart_recovery_integration(
 
     async def _blocking_verify(*args, **kwargs):  # type: ignore[no-untyped-def]
         await block_event.wait()  # block indefinitely (simulates crash before done)
-        return type('VR', (), {'passed': True, 'summary': ''})()
+        return type('VR', (), {'passed': True, 'summary': '', 'failing_test_ids': None})()
 
     queue_a: asyncio.Queue[MergeRequest] = asyncio.Queue()
     worker_a = SpeculativeMergeWorker(git_ops, queue_a, merge_store=store)
