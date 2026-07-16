@@ -5,6 +5,7 @@ Covers:
 - TestCiteEdge    — cite_edge UUID shape gate, edge_not_found, happy path, finding_unknown
 - TestCiteTask    — cite_task happy path, unknown_project, task_not_found, cross-finding P5
 - TestCiteMemory  — cite_memory UUID shape gate, memory_not_found, happy paths (both stores)
+- TestCiteRun      — cite_run UUID shape gate, run_not_found, happy path, finding_unknown (task 2595)
 - TestCiteToolsViaFastMCP — tools registered, end-to-end via call_tool, P4 schema rejection
 - TestReconReportComponentsWiring — _build_recon_report_components service injection
 """
@@ -20,7 +21,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 
 class _FakeMemoryService:
-    """Lightweight async stub for MemoryService (cite_entity / cite_edge / cite_memory)."""
+    """Lightweight async stub for MemoryService (cite_entity / cite_edge / cite_memory / cite_run)."""
 
     def __init__(
         self,
@@ -30,6 +31,7 @@ class _FakeMemoryService:
         edge_raises=None,
         memory_result: dict | None = None,
         memory_raises=None,
+        count_result: int | None = None,
     ) -> None:
         # get_entity configuration
         self._entity_nodes: list[dict] = entity_nodes if entity_nodes is not None else []
@@ -42,10 +44,14 @@ class _FakeMemoryService:
         self._memory_result = memory_result
         self._memory_raises = memory_raises
 
+        # count_memories_by_metadata configuration (cite_run, task 2595)
+        self._count_result: int = count_result if count_result is not None else 0
+
         # Call tracking
         self.get_entity_calls: list[tuple[str, str]] = []
         self.get_edge_calls: list[tuple[str, str]] = []
         self.get_memory_calls: list[tuple[str, str, str]] = []
+        self.count_by_metadata_calls: list[tuple[str, dict]] = []
 
     async def get_entity(self, name: str, project_id: str) -> dict:
         self.get_entity_calls.append((name, project_id))
@@ -62,6 +68,10 @@ class _FakeMemoryService:
         if self._memory_raises is not None:
             raise self._memory_raises
         return self._memory_result  # type: ignore[return-value]
+
+    async def count_memories_by_metadata(self, project_id: str, filters: dict) -> int:
+        self.count_by_metadata_calls.append((project_id, filters))
+        return self._count_result
 
 
 class _FakeTaskInterceptor:
@@ -1675,6 +1685,146 @@ class TestCiteMemoryExceptionNarrowing:
         report = state.get_assembled_report(run_id, 'reconciler')
         assert report is not None
         assert report['flagged_items'][0]['cited_memories'] == []
+
+
+# ---------------------------------------------------------------------------
+# task-2595 step-1: TestCiteRun — RED until step-2 adds cite_run to ReconReportState
+# ---------------------------------------------------------------------------
+
+
+class TestCiteRun:
+    """Drive state.cite_run() directly (mirrors TestCiteEdge/TestCiteMemory).
+
+    cite_run closes the gap named by task 2595: a run_id quoted inline in a
+    finding's free-text description/suggested_action was previously validated
+    by NONE of the cite_entity/cite_edge/cite_task/cite_memory tools, so an
+    LLM re-typing a historical run_id from memory (instead of copying it
+    verbatim off a fresh tool result) could silently drift by a hex group
+    with nothing downstream catching it. cite_run confirms the cited run_id
+    actually exists by checking memory_service.count_memories_by_metadata
+    (the same mem0 existence signal the originating incident's remediation
+    used to self-catch the bug by hand).
+    """
+
+    _VALID_CITED_RUN_ID = '30e7dce2-42a7-437d-abe5-a2316faad40a'
+
+    def _fake(self, *, count_result=None):
+        return _FakeMemoryService(count_result=count_result)
+
+    def _state_and_finding(self, **fake_kwargs):
+        fake = self._fake(**fake_kwargs)
+        state, run_id, finding_id = _make_state_with_finding(memory_service=fake)
+        return state, run_id, finding_id, fake
+
+    @pytest.mark.asyncio
+    async def test_happy_path_returns_run_id_and_match_count(self):
+        """count_result=3 → {'run_id': <cited>, 'match_count': 3}; the fake is
+        called with ({'run_id': <cited>}) scoped to the finding's project_id."""
+        state, run_id, finding_id, fake = self._state_and_finding(count_result=3)
+
+        result = await state.cite_run(run_id, finding_id, self._VALID_CITED_RUN_ID)
+
+        assert result.get('run_id') == self._VALID_CITED_RUN_ID
+        assert result.get('match_count') == 3
+        assert fake.count_by_metadata_calls == [
+            ('dark_factory', {'run_id': self._VALID_CITED_RUN_ID})
+        ]
+
+    @pytest.mark.asyncio
+    async def test_happy_path_mutates_cited_runs(self):
+        """The returned citation must also appear in the finding's cited_runs."""
+        state, run_id, finding_id, _ = self._state_and_finding(count_result=3)
+
+        await state.cite_run(run_id, finding_id, self._VALID_CITED_RUN_ID)
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        item = report['flagged_items'][0]
+        assert item['cited_runs'] == [
+            {'run_id': self._VALID_CITED_RUN_ID, 'match_count': 3}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_run_not_found_when_count_is_zero(self):
+        """count_result=0 → {error:'run_not_found', error_type:'ReconReportRunNotFound'}."""
+        state, run_id, finding_id, _ = self._state_and_finding(count_result=0)
+
+        result = await state.cite_run(run_id, finding_id, self._VALID_CITED_RUN_ID)
+
+        assert result.get('error') == 'run_not_found'
+        assert result.get('error_type') == 'ReconReportRunNotFound'
+
+    @pytest.mark.asyncio
+    async def test_run_not_found_leaves_cited_runs_unchanged(self):
+        """run_not_found must NOT mutate cited_runs."""
+        state, run_id, finding_id, _ = self._state_and_finding(count_result=0)
+
+        await state.cite_run(run_id, finding_id, self._VALID_CITED_RUN_ID)
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        assert report['flagged_items'][0]['cited_runs'] == []
+
+    @pytest.mark.asyncio
+    async def test_invalid_uuid_shape_no_service_call(self):
+        """A malformed cited_run_id → {error:'invalid_uuid_shape'}, no service call."""
+        state, run_id, finding_id, fake = self._state_and_finding(count_result=3)
+
+        result = await state.cite_run(run_id, finding_id, 'not-a-uuid')
+
+        assert result.get('error') == 'invalid_uuid_shape'
+        assert result.get('error_type') == 'ReconReportInvalidUuid'
+        assert fake.count_by_metadata_calls == []
+
+    @pytest.mark.asyncio
+    async def test_finding_unknown_for_bogus_finding_id(self):
+        """Bogus finding_id → {error:'finding_unknown', error_type:'ReconReportFindingUnknown'}."""
+        state, run_id, _finding_id, _ = self._state_and_finding(count_result=3)
+
+        result = await state.cite_run(run_id, 'bogus-finding-id', self._VALID_CITED_RUN_ID)
+
+        assert result.get('error') == 'finding_unknown'
+        assert result.get('error_type') == 'ReconReportFindingUnknown'
+
+    @pytest.mark.asyncio
+    async def test_run_id_unknown_returned_for_bad_run(self):
+        """Passing an unregistered run_id returns run_id_unknown."""
+        state, run_id, finding_id, _ = self._state_and_finding(count_result=3)
+
+        result = await state.cite_run('no-such-run', finding_id, self._VALID_CITED_RUN_ID)
+
+        assert result.get('error') == 'run_id_unknown'
+        assert result.get('error_type') == 'ReconReportRunUnknown'
+
+    @pytest.mark.asyncio
+    async def test_service_not_configured_when_memory_service_none(self):
+        """cite_run returns service_not_configured after the UUID shape gate
+        when memory_service is None."""
+        state, run_id, finding_id = _make_state_with_finding()  # memory_service=None
+
+        result = await state.cite_run(run_id, finding_id, self._VALID_CITED_RUN_ID)
+
+        assert result.get('error') == 'service_not_configured'
+        assert result.get('error_type') == 'ReconReportServiceUnavailable'
+
+    @pytest.mark.asyncio
+    async def test_accumulation_two_citations_produce_len_two(self):
+        """Two cite_run calls with different cited_run_ids → two cited_runs
+        entries (append-always, no dedup — matches cite_edge/cite_memory)."""
+        other_run_id = '11111111-2222-3333-4444-555555555555'
+        fake = _FakeMemoryService(count_result=1)
+        state, run_id, finding_id = _make_state_with_finding(memory_service=fake)
+
+        r1 = await state.cite_run(run_id, finding_id, self._VALID_CITED_RUN_ID)
+        assert 'error' not in r1, r1
+        r2 = await state.cite_run(run_id, finding_id, other_run_id)
+        assert 'error' not in r2, r2
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        cited_runs = report['flagged_items'][0]['cited_runs']
+        assert len(cited_runs) == 2
+        assert {c['run_id'] for c in cited_runs} == {self._VALID_CITED_RUN_ID, other_run_id}
 
 
 # ---------------------------------------------------------------------------
