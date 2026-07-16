@@ -15,30 +15,17 @@ import asyncio
 import types
 from pathlib import Path
 
-from orchestrator.artifacts import TaskArtifacts
+from test_task_runtime import _init_repo, _make_task_artifacts
+
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
 from orchestrator.task_runtime import build_task_runtime_snapshot
 
-
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
-def _make_task_artifacts(worktree_base: Path, name: str, task_id: str) -> TaskArtifacts:
-    """Create <worktree_base>/<name> plus its .task-meta/<name> artifacts root."""
-    worktree = worktree_base / name
-    worktree.mkdir(parents=True, exist_ok=True)
-    meta_root = TaskArtifacts.meta_root_for(worktree_base, name)
-    ta = TaskArtifacts(worktree, meta_root)
-    ta.init(task_id, f'Task {task_id}', 'desc')
-    return ta
+# _init_repo / _make_task_artifacts are shared with test_task_runtime.py
+# (dark_factory's established cross-test-module reuse pattern — e.g.
+# test_merge_queue_dry_run_unblock.py importing from test_dry_run_unblock.py
+# — rather than duplicating the fixtures verbatim in both files).
 
 
 class TestHarnessDelegator:
