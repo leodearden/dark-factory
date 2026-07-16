@@ -93,3 +93,38 @@ def _tool_runtime_tasks(git_ops: GitOps, tmp_path: Path) -> tuple[dict[int, dict
     tool = asyncio.run(server.get_tool('get_task_runtime_state'))
     result = tool.fn()
     return {t['task_id']: t for t in result['tasks']}, result['offline']
+
+
+# ---------------------------------------------------------------------------
+# B1 — Pooled task round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestB1PooledRoundtrip:
+    def test_pooled_task_round_trips_through_the_tool(self, git_repo: Path, tmp_path: Path):
+        """A pooled, ASSIGNED lane's real .lane-state + .task-meta artifacts
+        round-trip through the real tool onto the wire.
+        """
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        assert git_ops.pool_in_use()
+        worktree_base = git_ops.worktree_base
+        lifecycle = git_ops._lane_lifecycle
+
+        lifecycle.note_assigned('_lane-3', task_id='42')
+        ta = _make_task_artifacts(worktree_base, '_lane-3', '42')
+        ta.write_plan({'steps': [{'id': 's1', 'status': 'done'}]})
+        ta.append_iteration_log({'note': 'iter-1'})
+        ta.append_iteration_log({'note': 'iter-2'})
+        ta.append_iteration_log({'note': 'iter-3'})
+        ta.write_review('reviewer-a', {'verdict': 'PASS', 'issues': []})
+
+        by_task, offline = _tool_runtime_tasks(git_ops, tmp_path)
+
+        assert offline is False
+        entry = by_task[42]
+        assert entry['loops'] == 3
+        assert entry['attempts'] == 1
+        assert entry['lane'] == '_lane-3'
+        assert entry['lane_state'] == 'assigned'
+        assert entry['has_worktree'] is True
+        assert entry['error'] is None
