@@ -1,0 +1,15 @@
+[Unit]
+Description=Nightly timer for the fused-memory stage1_flag_marker sweep (task 2693)
+
+[Timer]
+# Nightly at 03:30 local time (offset from legibility-trickle's 03:00 so the
+# two nightly maintenance jobs don't contend); Persistent=true catches up a
+# missed night (laptop asleep/offline at 03:30) on next boot/login instead of
+# silently skipping it. A small randomized delay avoids thundering-herd with
+# other timers firing at the same instant.
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
