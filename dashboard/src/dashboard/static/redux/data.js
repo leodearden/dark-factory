@@ -28,6 +28,7 @@ function endpointsFor(win) {
     '/api/v2/dashboard/curator':                      ['CURATOR_STATE'],
     '/api/v2/dashboard/scheduler':                    ['SCHEDULER'],
     '/api/v2/dashboard/escalations':                  ['ESCALATIONS'],
+    '/api/v2/dashboard/escalation-analytics':         ['ESCALATION_ANALYTICS'],
   };
 }
 
@@ -97,6 +98,15 @@ window.DF_DATA = {
       by_level: { 0: 0, 1: 0, 2: 0 },
       by_status: { pending: 0, resolved: 0, dismissed: 0 },
     },
+  },
+  // ESCALATION_ANALYTICS is an object (not a captured top-level array), so it is
+  // NOT added to STABLE_ARRAY_KEYS. applyKey replaces the reference on each poll;
+  // a future analytics tab reads through DF_DATA.ESCALATION_ANALYTICS per render.
+  ESCALATION_ANALYTICS: {
+    generated_at: null,
+    parse_failures: 0,
+    regime_markers: [],
+    per_project: [],
   },
   // SCHEDULER is read through DF_DATA.SCHEDULER per render (not captured at
   // module-load), so reference replacement on each poll is safe.
