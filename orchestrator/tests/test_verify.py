@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import logging
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -1910,6 +1911,57 @@ class TestExtractFailingTestIdsFromJunit:
         assert verify._extract_failing_test_ids_from_junit(junit_path) == [
             'tests.test_sample::test_fail',
         ]
+
+
+# ---------------------------------------------------------------------------
+# Task μ (verify-scope-inversion-prd.md) step-05: VerifyResult.failing_test_ids
+# — a plain JSON-native `list[str] | None` (mirrors the `contention` (task
+# 2306 α) and `plan` (task 2126 step-13) precedents in test_verify_runner.py's
+# TestVerifyResultContention/TestVerifyResultPlan), so it round-trips
+# losslessly through the generic codec (asdict / VerifyResult(**d)) with no
+# special-casing. None = "no junit collected" (B3 degrade signal); a `[]`
+# means "junit collected, zero failing" (see _extract_failing_test_ids_from_junit
+# above). verify_runner.py's wire codec (result_to_dict/result_to_json) is out
+# of this task's file scope, so this exercises the underlying generic
+# asdict/**d codec directly rather than going through that wrapper.
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyResultFailingTestIds:
+    """VerifyResult carries an optional `failing_test_ids` list that survives
+    the generic asdict/**d codec (RED today: the field does not exist yet).
+    """
+
+    def _make_result(self, **overrides) -> VerifyResult:
+        defaults = dict(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='all good',
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_default_failing_test_ids_is_none(self):
+        vr = self._make_result()
+        assert vr.failing_test_ids is None
+
+    def test_failing_test_ids_round_trips_via_asdict_codec(self):
+        vr = self._make_result(failing_test_ids=['a::b'])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.failing_test_ids == ['a::b']
+        assert restored == vr
+
+    def test_empty_failing_test_ids_is_preserved_not_coerced_to_none(self):
+        vr = self._make_result(failing_test_ids=[])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.failing_test_ids == []
+        assert restored.failing_test_ids is not None
 
 
 class TestExtractCauseHint:
