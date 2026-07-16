@@ -3431,3 +3431,49 @@ def test_boundary6_absent_and_stale_heartbeat_proceed_after_grace(tmp_path: path
         f"expected a restart call for {unit_stale_hb}; got calls={state_2['calls']!r}"
     )
 
+
+def test_boundary7_liveness_during_window_does_not_stamp_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Scenario 7 (I5) -- liveness during the 8h window, non-stamping: with
+    a REAL on-disk fleet-deploy clock dated ~1h ago (inside the window,
+    sentinel {ts, iso}), main() still immediately revives a port-down unit
+    (liveness is uncapped and not clock-gated) AND the clock file is left
+    byte-identical afterward -- a single wedged-unit revive must never
+    advance the fleet-wide deploy clock. Extends
+    test_main_liveness_unaffected_by_fleet_deploy_gate above (which
+    monkeypatches _within_fleet_deploy_min_interval directly) with a real
+    on-disk clock file and the file-level non-stamping assertion.
+    """
+    wdog = _load_watchdog()
+
+    now = 2_000_000_000.0
+    clock_ts = now - 3600  # ~1h ago -- inside the 8h default window
+    clock_file = tmp_path / "clock.json"
+    sentinel_payload = json.dumps({"ts": clock_ts, "iso": "2026-07-15T23:00:00+00:00"})
+    clock_file.write_text(sentinel_payload)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    # Sanity: the fleet-deploy min-interval gate IS engaged for this pair.
+    assert wdog._within_fleet_deploy_min_interval() is True
+
+    restarted: list[str] = []
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: port != 8102)  # df probe fails (down)
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main()
+
+    assert restarted == ["orchestrator-dark-factory.service"], (
+        f"main() must immediately revive a port-down unit even inside the "
+        f"fleet-deploy min-interval window; got {restarted}"
+    )
+    assert clock_file.read_text() == sentinel_payload, (
+        "main()'s per-unit liveness revive must never stamp the shared "
+        "fleet-deploy clock -- that clock records a verified FLEET-WIDE "
+        "deploy, not a single wedged-unit revive"
+    )
+
