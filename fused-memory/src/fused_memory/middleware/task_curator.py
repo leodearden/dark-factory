@@ -1002,13 +1002,18 @@ class TaskCurator:
     ) -> list[AttributedClaim]:
         """Return any of *candidate*'s attributed code-level claims that are unverified.
 
-        Advisory backstop for the task-2433 fabrication incident (see
-        ``recon_claim_verification_guard``'s module docstring): extracts specific
-        code-level tokens *candidate* attributes to a completed task/commit/ACTION
-        (e.g. "task 2372 added metadata.done_provenance_invalidated=true") and
-        verifies each against the live source tree + git history via *probe*
-        (built from ``self._cwd`` via ``make_source_and_history_probe`` when not
-        injected — tests inject a fake probe to stay git-free).
+        Advisory backstop motivated by the task-2433 Stage 2 fabrication incident
+        (see ``recon_claim_verification_guard``'s module docstring), but invoked
+        from both :meth:`curate` and :meth:`curate_batch_prepared` — i.e. it
+        applies to EVERY candidate the curator sees when the config flag is on,
+        not only Stage-2-recon-filed ones (``CandidateTask`` carries no
+        origin/source field that would let this narrow further). Extracts
+        specific code-level tokens *candidate* attributes to a completed
+        task/commit/ACTION (e.g. "task 2372 added
+        metadata.done_provenance_invalidated=true") and verifies each against
+        the live source tree + git history via *probe* (built from
+        ``self._cwd`` via ``make_source_and_history_probe`` when not injected —
+        tests inject a fake probe to stay git-free).
 
         Unlike :meth:`_maybe_premise_refuted_drop`, this hook NEVER drops the
         candidate or returns/mutates a :class:`CuratorDecision` — it only surfaces
@@ -1513,8 +1518,28 @@ class TaskCurator:
         # observational — the return value is not used for control flow here;
         # surfacing is via the recon_claim_verification.unverified WARNING
         # census logged inside _maybe_flag_unverified_claims itself.
-        for i in unique_indices:
-            await self._maybe_flag_unverified_claims(candidates[i])
+        #
+        # Build the probe ONCE for the whole batch — off the event loop, since
+        # construction resolves the git top level via a blocking subprocess
+        # call — and fan the per-candidate checks out concurrently instead of
+        # awaiting a freshly-built probe serially per candidate: a fabricated
+        # (i.e. actually-absent) token always runs the full
+        # git-grep-then-pickaxe path (up to ~10s), so a batch with several
+        # attributed tokens would otherwise serialize into tens of seconds of
+        # git work on the reconciliation path for a purely advisory check.
+        claim_probe: Callable[[str], bool] | None = None
+        if self._config.curator.recon_claim_verification_enabled and self._cwd is not None:
+            from fused_memory.middleware.recon_claim_verification_guard import (
+                make_source_and_history_probe,
+            )
+
+            claim_probe = await asyncio.to_thread(make_source_and_history_probe, self._cwd)
+        await asyncio.gather(
+            *(
+                self._maybe_flag_unverified_claims(candidates[i], probe=claim_probe)
+                for i in unique_indices
+            ),
+        )
         # ── End claim-verification backstop ─────────────────────────────────────
 
         # ── Decision cache check ───────────────────────────────────────────────

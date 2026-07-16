@@ -225,3 +225,152 @@ class TestMaybeFlagUnverifiedClaims:
         assert all(tid != loop_thread_id for tid in probe_thread_ids)
         assert len(result) == 1
         assert result[0].token == "done_provenance_invalidated"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Amendment: TestCurateBatchPreparedClaimVerificationPerformance
+#
+# Regression tests for the reviewer's performance finding: curate_batch_prepared
+# previously awaited _maybe_flag_unverified_claims SERIALLY per candidate, and
+# each call built its own probe (git-rooted, resolving the git top level) from
+# scratch. A batch with several attributed tokens — each a git-grep-then-pickaxe
+# round trip up to ~10s — could serialize into tens of seconds of git work on
+# the reconciliation path for a purely advisory check. The probe is now built
+# ONCE per batch and the per-candidate checks fan out via asyncio.gather.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+_EMPTY_POOL_SIZES = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+
+
+@pytest.mark.asyncio
+class TestCurateBatchPreparedClaimVerificationPerformance:
+    """Tests for curate_batch_prepared's claim-verification backstop block."""
+
+    async def test_probe_built_once_per_batch_not_per_candidate(self, tmp_path):
+        """The claim-verification probe is constructed ONCE for the whole
+        batch, not once per candidate — proven by patching the guard's probe
+        factory and counting invocations across a 3-candidate batch, each
+        carrying a DISTINCT attributed claim so none is pre-batch-deduped."""
+        from unittest.mock import patch
+
+        from fused_memory.middleware.task_curator import (
+            CandidateTask,
+            CuratorDecision,
+            PreparedCandidate,
+            TaskCurator,
+        )
+
+        config = _make_config(recon_claim_verification_enabled=True)
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        def _desc(n):
+            return (
+                f"This is the same site that stamps metadata.fake_stamp_{n}=true "
+                f"per task {9000 + n} ACTION #1 on task reopen."
+            )
+
+        candidates = [CandidateTask(title=f"T{n}", description=_desc(n)) for n in range(3)]
+        prepared = [
+            PreparedCandidate(
+                candidate=c, pool=[], pool_sizes=_EMPTY_POOL_SIZES, prompt_tokens=10,
+            )
+            for c in candidates
+        ]
+
+        build_calls: list[object] = []
+
+        def fake_make_probe(repo_root):
+            build_calls.append(repo_root)
+            return lambda token: False
+
+        llm_decisions = [
+            CuratorDecision(
+                action="create", justification=f"c{n}",
+                pool_sizes=_EMPTY_POOL_SIZES, latency_ms=0,
+            )
+            for n in range(3)
+        ]
+
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            return llm_decisions
+
+        with (
+            patch(
+                "fused_memory.middleware.recon_claim_verification_guard."
+                "make_source_and_history_probe",
+                side_effect=fake_make_probe,
+            ),
+            patch.object(curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch),
+        ):
+            await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root=str(tmp_path),
+            )
+
+        assert build_calls == [tmp_path]
+
+    async def test_per_candidate_checks_run_concurrently(self, tmp_path):
+        """Per-candidate claim-verification checks run CONCURRENTLY
+        (asyncio.gather), not serially awaited one at a time — proven by
+        timing a batch of candidates each behind an artificially slow
+        _maybe_flag_unverified_claims. Serial execution would take
+        N * SLEEP_SECS; concurrent execution takes roughly one SLEEP_SECS
+        regardless of N."""
+        import asyncio
+        import time
+        from unittest.mock import patch
+
+        from fused_memory.middleware.task_curator import (
+            CandidateTask,
+            CuratorDecision,
+            PreparedCandidate,
+            TaskCurator,
+        )
+
+        config = _make_config(recon_claim_verification_enabled=True)
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        sleep_secs = 0.2
+        n = 4
+        candidates = [
+            CandidateTask(title=f"T{i}", description=f"plain description {i}")
+            for i in range(n)
+        ]
+        prepared = [
+            PreparedCandidate(
+                candidate=c, pool=[], pool_sizes=_EMPTY_POOL_SIZES, prompt_tokens=10,
+            )
+            for c in candidates
+        ]
+
+        async def slow_flag(candidate, probe=None):
+            await asyncio.sleep(sleep_secs)
+            return []
+
+        llm_decisions = [
+            CuratorDecision(
+                action="create", justification=f"c{i}",
+                pool_sizes=_EMPTY_POOL_SIZES, latency_ms=0,
+            )
+            for i in range(n)
+        ]
+
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            return llm_decisions
+
+        with (
+            patch.object(curator, "_maybe_flag_unverified_claims", side_effect=slow_flag),
+            patch.object(curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch),
+        ):
+            started = time.monotonic()
+            await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root=str(tmp_path),
+            )
+            elapsed = time.monotonic() - started
+
+        # Serial awaiting would take >= n * sleep_secs (0.8s here); concurrent
+        # fan-out via asyncio.gather takes roughly one sleep_secs regardless
+        # of n. A 2x-sleep_secs threshold leaves ample margin above the
+        # concurrent case while still clearly catching a regression to serial
+        # execution.
+        assert elapsed < sleep_secs * 2
