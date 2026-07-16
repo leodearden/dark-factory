@@ -51,6 +51,34 @@ was inconclusive (unknown run window or a transient query failure) — see
 :func:`extract_snapshot_written`.
 """
 
+SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY: str = 'task_count_snapshot_prune_enumerated'
+"""Key under Stage 2's ``report.stats`` recording how many existing
+``kind='task_count_snapshot'`` Mem0 records ``_prune_task_count_snapshots``
+(in ``stages/task_knowledge_sync.py``) enumerated this cycle via
+``get_memories_by_metadata``. ``0`` both when enumeration raised and when it
+genuinely found nothing — see :data:`SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY`
+to tell those two cases apart (task 2646).
+"""
+
+SNAPSHOT_PRUNED_STAT_KEY: str = 'task_count_snapshot_pruned'
+"""Key under Stage 2's ``report.stats`` recording how many
+``kind='task_count_snapshot'`` Mem0 records ``_prune_task_count_snapshots``
+successfully deleted this cycle (excludes per-item delete failures; equal to
+the function's own ``int`` return value) — task 2646.
+"""
+
+SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY: str = 'task_count_snapshot_prune_enumeration_ok'
+"""Key under Stage 2's ``report.stats``: ``1`` unless the
+``get_memories_by_metadata`` enumeration call itself raised, in which case
+``0``.
+
+This is the crux stat that distinguishes a silent enumeration failure (0
+enumerated, 0 pruned, ``enumeration_ok=0`` — the runtime no-op fingerprint
+behind the incident that motivated task 2646) from a genuine empty result (0
+enumerated, 0 pruned, ``enumeration_ok=1``) — a distinction a single
+delete-count int cannot make.
+"""
+
 TASK_COUNT_SNAPSHOT_MISS_THRESHOLD: int = 2
 """Number of consecutive full-cycle misses before the harness escalates."""
 

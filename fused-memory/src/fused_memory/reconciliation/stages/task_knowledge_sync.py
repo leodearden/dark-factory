@@ -52,6 +52,9 @@ from fused_memory.reconciliation.summary_pool import (
     write_cycle_summary,
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
+    SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY,
+    SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY,
+    SNAPSHOT_PRUNED_STAT_KEY,
     TASK_COUNT_SNAPSHOT_CATEGORY,
     TASK_COUNT_SNAPSHOT_KIND,
     build_task_count_snapshot_content,
@@ -1036,6 +1039,7 @@ async def _prune_task_count_snapshots(
     run_id: str,
     *,
     scroll_limit: int = 1000,
+    stats: dict | None = None,
 ) -> int:
     """Delete every existing ``kind='task_count_snapshot'`` Mem0 record (task 2429).
 
@@ -1073,6 +1077,10 @@ async def _prune_task_count_snapshots(
         run_id: Current reconciliation run identifier used as ``causation_id``
             in the audit journal.
         scroll_limit: Max records to enumerate in one scroll (default 1000).
+        stats: Optional dict to populate with this cycle's runtime-observability
+            counts — see ``task_count_snapshot_cadence.SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY``
+            / ``SNAPSHOT_PRUNED_STAT_KEY`` / ``SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY``
+            (task 2646). Left untouched when ``None`` (the default).
 
     Returns:
         Number of memories successfully deleted (0 if nothing matched, or
@@ -1141,6 +1149,11 @@ async def _prune_task_count_snapshots(
             success_count, project_id,
             extra={'project_id': project_id, 'run_id': run_id},
         )
+
+    if stats is not None:
+        stats[SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY] = len(members)
+        stats[SNAPSHOT_PRUNED_STAT_KEY] = success_count
+        stats[SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY] = 1
 
     return success_count
 
