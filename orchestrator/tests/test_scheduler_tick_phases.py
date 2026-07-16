@@ -644,6 +644,15 @@ class TestTickPhaseOrderLiteral:
         # (2) cooldown_gc before BOTH candidate-dispatch loops.
         assert order.index('cooldown_gc') < order.index('select_pins')
         assert order.index('cooldown_gc') < order.index('select_scored')
+        # (2b) redispatch_stranded_blocked (task 2408, mechanism 2) runs
+        # after cooldown_gc (expired cooldowns already GC'd, status_map
+        # complete) and before build_candidates (a task flipped to pending
+        # this tick is picked up NEXT tick — the server row flips but the
+        # in-memory ctx.tasks dict still reads 'blocked' this tick — so
+        # there's no current-tick candidate-set race).
+        assert 'redispatch_stranded_blocked' in order
+        assert order.index('cooldown_gc') < order.index('redispatch_stranded_blocked')
+        assert order.index('redispatch_stranded_blocked') < order.index('build_candidates')
         # (3) external-dep policy runs exactly once per tick.
         assert order.count('external_dep_policy') == 1
         # (4) delivered-check gate (task 2580) runs exactly once per tick,
