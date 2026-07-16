@@ -232,6 +232,42 @@ class TestForceWorkspaceBreadthExecutionGoldens:
         assert executed['modb'].type_check_command == mod_b.type_check_command
 
     @pytest.mark.asyncio
+    async def test_force_workspace_merge_full_falls_back_when_no_module_has_commands(
+        self, tmp_path: Path,
+    ):
+        """Robustness regression (reviewer amendment): force_workspace=True +
+        role='merge' + breadth='full', but EVERY registered module has zero
+        configured commands (all lint/pyright/test None).
+        ``_derive_full_suite_runs`` always emits 3 (SKIPPED) runs per
+        module, so ``scoped`` is never literally empty here — every module
+        survives with all-None commands. Gathering over all-None
+        ModuleConfigs would silently report passed=True with nothing
+        actually executed, so this must fall back to the single legacy
+        global ``run_verification`` call instead — mirroring the
+        module_configs/task_files branch's ``if not scoped:`` guard
+        (loud-over-silent-degradation, not a vacuous pass)."""
+        mod_a = ModuleConfig(prefix='moda')
+        mod_b = ModuleConfig(prefix='modb')
+        config = OrchestratorConfig(project_root=tmp_path, merge_verify_breadth='full')
+        config._module_configs = {'moda': mod_a, 'modb': mod_b}
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [mod_a], force_workspace=True, role='merge',
+            )
+
+        assert result.passed
+        assert mock_run_verification.await_count == 1, (
+            f'expected exactly ONE legacy global fallback call when no registered '
+            f'module has any configured command; got '
+            f'{mock_run_verification.await_count} call(s)'
+        )
+        assert _executed_module_configs(mock_run_verification) == [], (
+            'expected the fallback call to carry NO ModuleConfig (opaque global command)'
+        )
+
+    @pytest.mark.asyncio
     async def test_force_workspace_merge_scoped_stays_single_opaque_global_call(
         self, tmp_path: Path,
     ):
