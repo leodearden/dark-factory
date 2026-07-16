@@ -783,6 +783,10 @@ class EscalationQueue:
             appended = [m for m in dict.fromkeys(new_member_ids) if m not in existing]
             if appended:
                 esc.members.extend(appended)
+                # Bump the "changed since triaged" signal — a member append is
+                # exactly the re-assess trigger the watcher's stamp-then-skip
+                # protocol keys off (updated_at > triaged_at).
+                esc.updated_at = datetime.now(UTC).isoformat()
                 self._rewrite(escalation_id, esc)
                 logger.info(
                     'add_members_to_l2: added %d new member(s) to %s (total=%d)',
