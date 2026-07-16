@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import sys
 import types
 from datetime import UTC, datetime
@@ -196,8 +197,14 @@ class _FakeGitFacts:
         self.project_root = project_root
 
 
-def _install_fake_audit_module(monkeypatch, report):
+def _install_fake_audit_module(monkeypatch, report, *, ref_calls: list[str] | None = None):
+    """Install a fake sibling audit module. When *ref_calls* is given, each
+    call's ``ref`` kwarg is appended to it — lets a test assert args.ref is
+    actually threaded into build_audit_report rather than dropped/hardcoded."""
+
     async def _fake_build_audit_report(tasks, git, ref='main'):
+        if ref_calls is not None:
+            ref_calls.append(ref)
         return report
 
     fake_mod = types.ModuleType('audit_found_on_main_provenance')
@@ -260,7 +267,11 @@ def _install_fake_backend(monkeypatch, tasks):
 class TestRunCliWiring:
     """_run() end-to-end: config load, the sibling audit import, backend
     start/close, report build, and both exit-code paths of the predicate
-    contract — exit 0 (clean) and exit 1 (offenders present)."""
+    contract — exit 0 (clean) and exit 1 (offenders present).
+
+    `since` is passed in already parsed (matching _run()'s signature: main()
+    owns parsing --since — see TestMainScopedValueErrorHandling below for
+    the regression guard on that split)."""
 
     async def test_exit_zero_when_no_fresh_flagged_tasks(self, monkeypatch):
         report = _report([_detail('9999', 'misattributed')])
@@ -275,7 +286,7 @@ class TestRunCliWiring:
         args = argparse.Namespace(
             project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
         )
-        exit_code = await _mod._run(args)
+        exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 0
         backend = backend_holder['backend']
@@ -283,7 +294,9 @@ class TestRunCliWiring:
         assert backend.closed is True
         assert backend.get_tasks_calls == ['/proj']
 
-    async def test_exit_one_when_post_since_misattributed_stamp_present(self, monkeypatch):
+    async def test_exit_one_when_post_since_misattributed_stamp_present(
+        self, monkeypatch, capsys,
+    ):
         report = _report([_detail('8888', 'misattributed', commit='d' * 40)])
         tasks = [_task('8888', AFTER_SINCE)]  # stamp is fresh
         _install_fake_audit_module(monkeypatch, report)
@@ -296,12 +309,20 @@ class TestRunCliWiring:
         args = argparse.Namespace(
             project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
         )
-        exit_code = await _mod._run(args)
+        exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 1
         backend = backend_holder['backend']
         assert backend.started is True
         assert backend.closed is True  # closed even on the non-zero exit path
+
+        # Offender summary lines print to stdout on the exit-1 path —
+        # human/log triage only; the DeterministicRunner parses the exit
+        # code, never this text (see module docstring "Contract").
+        captured = capsys.readouterr()
+        assert 'task_id=8888' in captured.out
+        assert f'commit={"d" * 40}' in captured.out
+        assert 'flag_class=misattributed' in captured.out
 
     async def test_missing_taskmaster_config_returns_1_without_creating_backend(
         self, monkeypatch,
@@ -321,28 +342,49 @@ class TestRunCliWiring:
         args = argparse.Namespace(
             project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
         )
-        exit_code = await _mod._run(args)
+        exit_code = await _mod._run(args, SINCE)
 
         assert exit_code == 1
         assert created == []
 
-    async def test_malformed_since_raises_valueerror(self, monkeypatch):
-        # parse_since(args.since) runs before any backend/report work, so a
-        # bad --since surfaces as a ValueError straight out of _run() — it
-        # is main()'s job (tested below) to catch this and map it to the
-        # distinct usage-error exit code rather than 0/1.
+    async def test_ref_argument_is_threaded_into_build_audit_report(self, monkeypatch):
+        # Regression guard: a fake build_audit_report that ignored `ref`
+        # (as the other tests' fakes do) would pass even if _run() dropped
+        # or hardcoded it. This one captures the actual kwarg it received.
+        ref_calls: list[str] = []
+        _install_fake_audit_module(monkeypatch, _report([]), ref_calls=ref_calls)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        _install_fake_backend(monkeypatch, [])
+
+        args = argparse.Namespace(
+            project_root='/proj', config=None, ref='origin/main',
+            since='2026-07-16T00:00:00Z',
+        )
+        exit_code = await _mod._run(args, SINCE)
+
+        assert exit_code == 0
+        assert ref_calls == ['origin/main']
+
+    async def test_config_arg_sets_config_path_env_var(self, monkeypatch):
+        monkeypatch.delenv('CONFIG_PATH', raising=False)
         _install_fake_audit_module(monkeypatch, _report([]))
         monkeypatch.setattr(
             'fused_memory.config.schema.FusedMemoryConfig',
             _FakeFusedMemoryConfigWithTaskmaster,
         )
+        _install_fake_backend(monkeypatch, [])
 
         args = argparse.Namespace(
-            project_root='/proj', config=None, ref='main', since='not-a-date',
+            project_root='/proj', config='/path/to/fused-memory-config.yaml',
+            ref='main', since='2026-07-16T00:00:00Z',
         )
+        exit_code = await _mod._run(args, SINCE)
 
-        with pytest.raises(ValueError):
-            await _mod._run(args)
+        assert exit_code == 0
+        assert os.environ['CONFIG_PATH'] == '/path/to/fused-memory-config.yaml'
 
 
 # ===========================================================================
@@ -371,6 +413,50 @@ class TestMainMalformedSinceExitCode:
         assert exit_code == 2
         captured = capsys.readouterr()
         assert 'not-a-date' in captured.err
+
+
+# ===========================================================================
+# main()'s ValueError->exit-2 mapping is scoped tightly around parse_since
+# only — a ValueError raised later (inside _run(), e.g. from
+# build_audit_report) must propagate uncaught, never get mislabeled as an
+# "invalid --since" usage error just because it shares the same exception
+# type. Regression guard for reviewer suggestion #1.
+# ===========================================================================
+
+class TestMainScopedValueErrorHandling:
+    def test_internal_valueerror_propagates_uncaught_not_mapped_to_exit_2(
+        self, monkeypatch,
+    ):
+        async def _raise_unrelated_valueerror(tasks, git, ref='main'):
+            raise ValueError('boom: internal failure unrelated to --since')
+
+        fake_mod = types.ModuleType('audit_found_on_main_provenance')
+        fake_mod.build_audit_report = _raise_unrelated_valueerror  # type: ignore[attr-defined]
+        fake_mod.GitFacts = _FakeGitFacts  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, 'audit_found_on_main_provenance', fake_mod)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        backend_holder = _install_fake_backend(monkeypatch, [])
+        monkeypatch.setattr(
+            sys, 'argv',
+            [
+                'check_found_on_main_spurious_rate.py',
+                '--since', '2026-07-16T00:00:00Z',  # a perfectly valid --since
+                '--project-root', '/proj',
+            ],
+        )
+
+        # Must raise the real ValueError straight out of main() — NOT
+        # return exit code 2 (which would mean it got misidentified as a
+        # malformed --since).
+        with pytest.raises(ValueError, match='boom: internal failure'):
+            _mod.main()
+
+        # The backend's try/finally close() still runs even though the
+        # exception propagates past it.
+        assert backend_holder['backend'].closed is True
 
 
 # ===========================================================================

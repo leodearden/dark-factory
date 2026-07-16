@@ -5,27 +5,40 @@ Thin, read-only wrapper around ``audit_found_on_main_provenance.py``
 (exercised live by task 2648's audit run) for use as a ``before_done``
 ``kind='predicate'`` script under the DeterministicRunner convention (see
 CLAUDE.md "Predicate exit-code contract"). It runs the existing audit, then
-considers only the ``found_on_main`` done-provenance stamps whose task
-``updatedAt`` is strictly AFTER ``--since`` — i.e. stamps written since the
-last check — and asks whether any of *those* were flagged ``misattributed``
-or ``deliverable_absent`` by the audit's classifier. Older stamps (already
-covered by a prior run, or predating the fix this predicate soaks) are not
-re-flagged on every invocation.
+considers only the ``found_on_main`` done-provenance stamps belonging to
+tasks whose ``updatedAt`` is strictly AFTER ``--since``, and asks whether
+any of *those* were flagged ``misattributed`` or ``deliverable_absent`` by
+the audit's classifier. Older stamps (already covered by a prior run, or
+predating the fix this predicate soaks) are not re-flagged on every
+invocation.
+
+Freshness caveat: ``updatedAt`` is an approximation, not a dedicated
+stamp-write timestamp — ``shared.task_metadata.DoneProvenance`` carries no
+such field for ``kind='found_on_main'``. Any subsequent write to the task
+(a re-tag, an unrelated metadata annotation, a dependency edit, ...) also
+bumps ``updatedAt``, so a task whose found_on_main stamp actually predates
+``--since`` but was touched afterwards for an unrelated reason can still
+surface here. Because this predicate re-runs on resume and escalates on
+any non-zero exit, a repeat escalation for an already-known/fixed task is
+possible and may be benign — it does not necessarily mean a fresh
+regression.
 
 Contract (exit code only — this script parses no output, per the
 DeterministicRunner predicate convention):
 
   - Exit 0: zero found_on_main stamps updated after ``--since`` were
     flagged ``misattributed``/``deliverable_absent``.
-  - Exit 1: one or more were (a genuine check failure) — OR the task
-    backend is not configured (an infra/config problem). This predicate's
-    contract is intentionally coarse: non-zero-for-any-reason means "did
-    not pass" (fail loud/closed rather than silently degrade), with no
-    separate exit code distinguishing a check failure from an infra
-    failure. A structured stdout summary is printed for the check-failure
-    case — one line per offending task (task_id, cited commit sha, flag
-    class) — for human/log triage; the DeterministicRunner itself never
-    parses it, only the exit code.
+  - Exit 1: one or more were flagged (see the freshness caveat above — a
+    repeat flag on an already-known/fixed task is possible and may be
+    benign, not necessarily a fresh regression) — OR the task backend is
+    not configured (an infra/config problem). This predicate's contract is
+    intentionally coarse: non-zero-for-any-reason means "did not pass"
+    (fail loud/closed rather than silently degrade), with no separate exit
+    code distinguishing a check failure from an infra failure. A
+    structured stdout summary is printed for the check-failure case — one
+    line per offending task (task_id, cited commit sha, flag class) — for
+    human/log triage; the DeterministicRunner itself never parses it, only
+    the exit code.
   - Exit 2: ``--since`` could not be parsed — a caller usage error, kept
     on its own code so it is never mistaken for "offenders found" (1) by
     a caller branching on exit code alone.
@@ -132,6 +145,13 @@ def find_spurious_since(
     ``updatedAt`` is conservatively excluded (timing can't be confirmed,
     so it is never silently counted as "after") rather than raising.
 
+    Freshness caveat: ``updatedAt`` over-approximates "the found_on_main
+    stamp was (re)written after *since*" — any write to the task bumps it,
+    so a task touched for an unrelated reason after *since* can still be
+    included even if its stamp itself predates *since* (see module
+    docstring "Freshness caveat"; ``done_provenance`` carries no dedicated
+    stamp-write timestamp to key off of instead).
+
     Returns records sorted by ``int(task_id)`` for deterministic output.
     """
     updated_at_by_id = {str(t.get('id', '')): t.get('updatedAt') for t in tasks}
@@ -168,7 +188,13 @@ def format_summary(offenders: list[dict[str, Any]]) -> list[str]:
 # CLI / main
 # ---------------------------------------------------------------------------
 
-async def _run(args: argparse.Namespace) -> int:
+async def _run(args: argparse.Namespace, since: datetime) -> int:
+    # `since` arrives already parsed by main() — this function never calls
+    # parse_since itself. That keeps main()'s ValueError/exit-2 usage-error
+    # mapping scoped tightly around just the parse_since(args.since) call:
+    # a ValueError raised anywhere in here (build_audit_report, git parsing,
+    # the backend, ...) is a genuine internal failure and must propagate
+    # uncaught, never be mislabeled as "invalid --since".
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
@@ -188,8 +214,6 @@ async def _run(args: argparse.Namespace) -> int:
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
-
-    since = parse_since(args.since)
 
     config = FusedMemoryConfig()
     if config.taskmaster is None:
@@ -250,18 +274,25 @@ def main() -> int:
         help='Git ref to audit commit lineage against (default: main)',
     )
     args = parser.parse_args()
+
+    # Parse --since here, in main(), BEFORE any backend/report work, and
+    # scope the ValueError catch tightly around just this call — not around
+    # the whole run. A malformed --since is a caller usage error, kept on
+    # its own exit code (2) rather than propagating as an uncaught
+    # traceback exiting 1, which would be indistinguishable from a genuine
+    # "offenders found" failure under this predicate's exit-code-only
+    # contract (see module docstring "Contract"). Deliberately NOT wrapping
+    # asyncio.run(_run(...)) in this same try/except: a ValueError raised
+    # later — e.g. from build_audit_report, git parsing, or the backend —
+    # is a genuine internal failure and must propagate as such, never get
+    # mislabeled as "invalid --since".
     try:
-        return asyncio.run(_run(args))
+        since = parse_since(args.since)
     except ValueError as exc:
-        # A malformed --since (parsed inside _run(), before any backend or
-        # report work) is a caller usage error, not a business-logic check
-        # result — keep it on its own exit code (2) rather than letting it
-        # propagate as an uncaught traceback exiting 1, which would be
-        # indistinguishable from a genuine "offenders found" failure under
-        # this predicate's exit-code-only contract (see module docstring
-        # "Contract").
         print(f'error: invalid --since {args.since!r}: {exc}', file=sys.stderr)
         return 2
+
+    return asyncio.run(_run(args, since))
 
 
 if __name__ == '__main__':
