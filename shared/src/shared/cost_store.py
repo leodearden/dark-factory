@@ -185,6 +185,36 @@ class CostStore(AsyncSqliteBase):
             return (0.0, 0.0)
         return (float(row[0]), float(row[1]))
 
+    async def model_cost_in_window(
+        self,
+        model: str,
+        start_iso: str,
+        end_iso: str,
+    ) -> float:
+        """Return total ``cost_usd`` for ``model`` completed in ``[start_iso, end_iso]``.
+
+        Uses a single SELECT so the invocations table is scanned exactly once.
+        The window is **inclusive** at both ends (SQLite ``BETWEEN``), matching
+        :meth:`cost_totals_in_window`.
+
+        Returns:
+            Total cost for ``model`` in the window; 0.0 when no rows match.
+
+        Raises:
+            RuntimeError: if the store has not been opened (via ``_require_conn()``).
+        """
+        conn = self._require_conn()
+        async with conn.execute(
+            'SELECT COALESCE(SUM(cost_usd), 0.0) '
+            'FROM invocations '
+            'WHERE model = ? AND completed_at BETWEEN ? AND ?',
+            (model, start_iso, end_iso),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return 0.0
+        return float(row[0])
+
     async def save_account_event(
         self,
         *,

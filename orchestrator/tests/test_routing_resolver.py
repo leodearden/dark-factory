@@ -1,0 +1,703 @@
+"""Tests for orchestrator.routing.resolve_route -- the layered routing
+resolver (task epsilon, plans/adaptive-model-routing-prd.md).
+
+RED phase (step-3): ``PlanShape``, ``RoleDefaults``, ``RouteInputs``,
+``RoutingDecision``, and ``resolve_route`` do not exist yet in
+``orchestrator.routing`` -- this whole module fails to import.
+
+Core layering only: precedence metadata_override > policy_rule > config >
+role_default (invariant 1: role_default is the always-available Total base).
+Fail-safe validation, ladder-relative bumps, ceilings, and the full closed
+condition vocabulary are exercised by later steps (step-5/7 RED, step-6/8
+GREEN) -- this file only locks in the four-layer precedence order itself.
+
+Fixtures are kept MODULE-LOCAL (not conftest.py) -- mirrors test_routing.py's
+documented rationale (a conftest.py edit forces verify.py's has_conftest to
+widen the merge-time scoped-test selection to the whole owning package).
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from orchestrator.config import (
+    BackendsConfig,
+    BudgetsConfig,
+    EffortConfig,
+    ModelsConfig,
+    OrchestratorConfig,
+    RoutingConfig,
+    RoutingRule,
+    RuleMatch,
+    RuleSet,
+    TurnsConfig,
+)
+from orchestrator.routing import (
+    DEFAULT_ALLOWED_MODELS,
+    PlanShape,
+    RoleDefaults,
+    RouteInputs,
+    RoutingDecision,
+    resolve_route,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_config_env(monkeypatch, tmp_path):
+    """Every OrchestratorConfig() built in this module reads ONLY the
+    package's shipped defaults.yaml -- no stray project config.yaml, no
+    ambient ORCH_CONFIG_PATH. Mirrors test_routing.py's per-test convention.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+
+def _role_defaults(
+    *, model='opus', effort='high', budget_usd=10.0, max_turns=80,
+) -> RoleDefaults:
+    return RoleDefaults(model=model, effort=effort, budget_usd=budget_usd, max_turns=max_turns)
+
+
+def _cfg_with_rules(*rules: RoutingRule) -> OrchestratorConfig:
+    """A minimal OrchestratorConfig carrying only the given policy rules."""
+    return OrchestratorConfig(routing=RoutingConfig(rules=list(rules)))
+
+
+def _inputs(
+    *,
+    role_name: str = 'implementer',
+    task_metadata: dict | None = None,
+    plan_shape: PlanShape | None = None,
+    routing_tier: int = 0,
+    dispatch_count: int = 0,
+    role_defaults: RoleDefaults | None = None,
+) -> RouteInputs:
+    """A RouteInputs with sensible defaults; role_defaults defaults to a
+    'sonnet' sentinel distinguishable from any rule's opus/haiku set.model."""
+    return RouteInputs(
+        role_name=role_name,
+        task_id='1',
+        task_metadata={} if task_metadata is None else task_metadata,
+        plan_shape=plan_shape,
+        routing_tier=routing_tier,
+        dispatch_count=dispatch_count,
+        role_defaults=role_defaults if role_defaults is not None else _role_defaults(model='sonnet'),
+    )
+
+
+class TestPlanShapeIsPureData:
+    """Sanity: PlanShape is a frozen dataclass carrying step_count + module_paths."""
+
+    def test_plan_shape_fields(self):
+        shape = PlanShape(step_count=12, module_paths=('crates/a', 'crates/b'))
+        assert shape.step_count == 12
+        assert shape.module_paths == ('crates/a', 'crates/b')
+
+
+class TestLayerPrecedenceRoleDefault:
+    """(a) invariant 1 (Total): no config field, no rules, no override ->
+    RoutingDecision built entirely from role_defaults."""
+
+    def test_unknown_role_falls_back_to_role_default(self):
+        cfg = OrchestratorConfig()
+        inputs = RouteInputs(
+            role_name='not_a_real_role',
+            task_id='1',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(
+                model='sonnet', effort='medium', budget_usd=3.0, max_turns=20,
+            ),
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert isinstance(decision, RoutingDecision)
+        assert decision.model == 'sonnet'
+        assert decision.effort == 'medium'
+        assert decision.budget_usd == 3.0
+        assert decision.max_turns == 20
+        assert decision.source_layer == 'role_default'
+        assert decision.rule_id is None
+        assert decision.rejected == ()
+
+
+class TestLayerPrecedenceConfig:
+    """(b) config.models/budgets/max_turns/effort.<role> wins over role_default."""
+
+    def test_config_layer_wins_over_role_default(self):
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='haiku'),
+            budgets=BudgetsConfig(implementer=7.0),
+            max_turns=TurnsConfig(implementer=40),
+            effort=EffortConfig(implementer='low'),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(),
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'haiku'
+        assert decision.effort == 'low'
+        assert decision.budget_usd == 7.0
+        assert decision.max_turns == 40
+        assert decision.source_layer == 'config'
+        assert decision.rule_id is None
+
+
+class TestLayerPrecedenceMetadataOverride:
+    """(c) boundary test 1: task_metadata['model_overrides'][role] wins over
+    both config and role_default when the overriding model is allowed."""
+
+    def test_metadata_override_wins(self):
+        cfg = OrchestratorConfig(models=ModelsConfig(implementer='opus'))
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={'model_overrides': {'implementer': 'haiku'}},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(),
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'haiku'
+        assert decision.source_layer == 'metadata_override'
+
+
+class TestLayerPrecedencePolicyRule:
+    """(d) a matching policy rule wins over config (but is beaten by a
+    metadata override, per (c) above -- not exercised in this test)."""
+
+    def test_matching_rule_wins_over_config(self):
+        rule = RoutingRule(
+            id='force-opus',
+            match=RuleMatch(role=['implementer']),
+            set=RuleSet(model='opus'),
+        )
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(rules=[rule]),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='sonnet'),
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'opus'
+        assert decision.source_layer == 'policy_rule'
+        assert decision.rule_id == 'force-opus'
+
+    def test_non_matching_rule_does_not_apply(self):
+        rule = RoutingRule(
+            id='force-opus',
+            match=RuleMatch(role=['debugger']),
+            set=RuleSet(model='opus'),
+        )
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(rules=[rule]),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='sonnet'),
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'sonnet'
+        assert decision.source_layer == 'config'
+        assert decision.rule_id is None
+
+
+# ---------------------------------------------------------------------------
+# step-5: closed condition-vocabulary matching (RED until step-6's evaluator)
+#
+# Each condition is exercised match vs non-match via a single policy rule
+# whose `set={model: 'opus'}` -- `rule_id is not None` <=> the rule matched.
+# role_defaults/config always resolve to 'sonnet' (never 'opus'), so 'opus'
+# in the resolved model is unambiguous proof the rule fired.
+# ---------------------------------------------------------------------------
+
+
+class TestConditionTaskComplexity:
+    """task_complexity: equality vs task_metadata['complexity']."""
+
+    def test_matches_when_equal(self):
+        rule = RoutingRule(id='r', match=RuleMatch(task_complexity='simple'), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(task_metadata={'complexity': 'simple'}), _cfg_with_rules(rule),
+        )
+        assert decision.model == 'opus'
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_different(self):
+        rule = RoutingRule(id='r', match=RuleMatch(task_complexity='simple'), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(task_metadata={'complexity': 'full'}), _cfg_with_rules(rule),
+        )
+        assert decision.model == 'sonnet'
+        assert decision.rule_id is None
+
+
+class TestConditionTaskPriority:
+    """task_priority: equality vs task_metadata['priority']."""
+
+    def test_matches_when_equal(self):
+        rule = RoutingRule(id='r', match=RuleMatch(task_priority='critical'), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(task_metadata={'priority': 'critical'}), _cfg_with_rules(rule),
+        )
+        assert decision.model == 'opus'
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_different(self):
+        rule = RoutingRule(id='r', match=RuleMatch(task_priority='critical'), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(task_metadata={'priority': 'low'}), _cfg_with_rules(rule),
+        )
+        assert decision.model == 'sonnet'
+        assert decision.rule_id is None
+
+
+class TestConditionPlanMinSteps:
+    """plan_min_steps: plan_shape.step_count >= N; None plan_shape -> no match."""
+
+    def test_matches_when_step_count_at_or_above_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(plan_min_steps=12), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(plan_shape=PlanShape(step_count=12, module_paths=())),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_step_count_below_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(plan_min_steps=12), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(plan_shape=PlanShape(step_count=11, module_paths=())),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id is None
+
+    def test_does_not_match_when_plan_shape_is_none(self):
+        rule = RoutingRule(id='r', match=RuleMatch(plan_min_steps=12), set=RuleSet(model='opus'))
+        decision = resolve_route(_inputs(plan_shape=None), _cfg_with_rules(rule))
+        assert decision.rule_id is None
+
+
+class TestConditionPlanMinModulesUnscoped:
+    """plan_min_modules alone (no module_prefix): total module count >= N."""
+
+    def test_matches_when_module_count_at_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(plan_min_modules=3), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(plan_shape=PlanShape(step_count=1, module_paths=('a', 'b', 'c'))),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_module_count_below_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(plan_min_modules=3), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(plan_shape=PlanShape(step_count=1, module_paths=('a', 'b'))),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id is None
+
+
+class TestConditionModulePrefix:
+    """module_prefix alone: >=1 module startswith prefix."""
+
+    def test_matches_when_at_least_one_module_has_prefix(self):
+        rule = RoutingRule(id='r', match=RuleMatch(module_prefix='crates/'), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(plan_shape=PlanShape(step_count=1, module_paths=('crates/a', 'lib/b'))),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_no_module_has_prefix(self):
+        rule = RoutingRule(id='r', match=RuleMatch(module_prefix='crates/'), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(plan_shape=PlanShape(step_count=1, module_paths=('lib/a', 'lib/b'))),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id is None
+
+
+class TestConditionModulePrefixScopedPlanMinModules:
+    """module_prefix + plan_min_modules together: count of PREFIX-MATCHED
+    modules >= N (not the total module count) -- reproduces the Rust
+    heuristic exactly."""
+
+    def test_three_prefixed_plus_one_other_matches_threshold_three(self):
+        rule = RoutingRule(
+            id='r',
+            match=RuleMatch(plan_min_modules=3, module_prefix='crates/'),
+            set=RuleSet(model='opus'),
+        )
+        decision = resolve_route(
+            _inputs(
+                plan_shape=PlanShape(
+                    step_count=1,
+                    module_paths=('crates/a', 'crates/b', 'crates/c', 'lib/other'),
+                ),
+            ),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id == 'r'
+
+    def test_two_prefixed_does_not_match_threshold_three(self):
+        rule = RoutingRule(
+            id='r',
+            match=RuleMatch(plan_min_modules=3, module_prefix='crates/'),
+            set=RuleSet(model='opus'),
+        )
+        decision = resolve_route(
+            _inputs(
+                plan_shape=PlanShape(
+                    step_count=1,
+                    module_paths=('crates/a', 'crates/b', 'lib/other', 'lib/another'),
+                ),
+            ),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id is None
+
+
+class TestConditionMinRoutingTier:
+    """min_routing_tier: inputs.routing_tier >= N."""
+
+    def test_matches_when_tier_at_or_above_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(min_routing_tier=1), set=RuleSet(model='opus'))
+        decision = resolve_route(_inputs(routing_tier=1), _cfg_with_rules(rule))
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_tier_below_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(min_routing_tier=1), set=RuleSet(model='opus'))
+        decision = resolve_route(_inputs(routing_tier=0), _cfg_with_rules(rule))
+        assert decision.rule_id is None
+
+
+class TestConditionMinDispatchCount:
+    """min_dispatch_count: inputs.dispatch_count >= N."""
+
+    def test_matches_when_dispatch_count_at_or_above_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(min_dispatch_count=2), set=RuleSet(model='opus'))
+        decision = resolve_route(_inputs(dispatch_count=2), _cfg_with_rules(rule))
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_dispatch_count_below_threshold(self):
+        rule = RoutingRule(id='r', match=RuleMatch(min_dispatch_count=2), set=RuleSet(model='opus'))
+        decision = resolve_route(_inputs(dispatch_count=1), _cfg_with_rules(rule))
+        assert decision.rule_id is None
+
+
+class TestConditionSimpleSaturated:
+    """simple_saturated: equality vs task_metadata['routing']['simple_saturated']
+    (mirrors shared.task_metadata.RoutingState's on-disk storage shape)."""
+
+    def test_matches_when_true_and_saturated(self):
+        rule = RoutingRule(id='r', match=RuleMatch(simple_saturated=True), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(task_metadata={'routing': {'simple_saturated': True}}),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id == 'r'
+
+    def test_does_not_match_when_true_and_not_saturated(self):
+        rule = RoutingRule(id='r', match=RuleMatch(simple_saturated=True), set=RuleSet(model='opus'))
+        decision = resolve_route(
+            _inputs(task_metadata={'routing': {'simple_saturated': False}}),
+            _cfg_with_rules(rule),
+        )
+        assert decision.rule_id is None
+
+    def test_does_not_match_when_true_and_metadata_absent(self):
+        rule = RoutingRule(id='r', match=RuleMatch(simple_saturated=True), set=RuleSet(model='opus'))
+        decision = resolve_route(_inputs(task_metadata={}), _cfg_with_rules(rule))
+        assert decision.rule_id is None
+
+
+class TestConditionsAreAnded:
+    """Two conditions on one rule must BOTH hold -- one satisfied + one not
+    is a non-match."""
+
+    def test_both_conditions_hold_matches(self):
+        rule = RoutingRule(
+            id='r',
+            match=RuleMatch(role=['implementer'], min_routing_tier=1),
+            set=RuleSet(model='opus'),
+        )
+        decision = resolve_route(
+            _inputs(role_name='implementer', routing_tier=1), _cfg_with_rules(rule),
+        )
+        assert decision.rule_id == 'r'
+
+    def test_one_condition_failing_is_a_non_match(self):
+        rule = RoutingRule(
+            id='r',
+            match=RuleMatch(role=['implementer'], min_routing_tier=1),
+            set=RuleSet(model='opus'),
+        )
+        decision = resolve_route(
+            _inputs(role_name='implementer', routing_tier=0), _cfg_with_rules(rule),
+        )
+        assert decision.rule_id is None
+
+
+class TestFirstMatchWins:
+    """When two rules both match, the FIRST in list order supplies the
+    overrides and its id is recorded -- the second is never consulted."""
+
+    def test_first_of_two_matching_rules_wins(self):
+        first = RoutingRule(id='first', match=RuleMatch(role=['implementer']), set=RuleSet(model='opus'))
+        second = RoutingRule(id='second', match=RuleMatch(role=['implementer']), set=RuleSet(model='haiku'))
+        decision = resolve_route(
+            _inputs(role_name='implementer'), _cfg_with_rules(first, second),
+        )
+        assert decision.model == 'opus'
+        assert decision.rule_id == 'first'
+
+
+# ---------------------------------------------------------------------------
+# step-7: fail-safe validation + ladder + ceiling (RED until step-8's impl)
+#
+# All three mechanics share one shape: a layer's PROPOSED model is validated
+# (allowlist membership, ladder membership for '+N', ceiling headroom)
+# before it is committed; on failure the layer is skipped (resolution keeps
+# whatever the next-lower-precedence layer already validated), a namespaced
+# "<layer>:<reason>" string is appended to `rejected`, and -- critically --
+# a policy rule's `rule_id` is still recorded on MATCH, independent of
+# whether its `set.model` went on to apply (see RoutingDecision's
+# docstring) -- so a rejected policy-rule model bump still surfaces its
+# rule_id for telemetry.
+# ---------------------------------------------------------------------------
+
+
+class TestFailSafeMetadataOverrideNotInAllowlist:
+    """(a) invariant 2 / boundary test 2: an override model absent from
+    routing.allowed_models is rejected, not raised -- resolution falls
+    through to the next-lower layer (here: config, since no rules are
+    configured)."""
+
+    def test_invalid_override_falls_through_to_config(self):
+        cfg = OrchestratorConfig(models=ModelsConfig(implementer='sonnet'))
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={'model_overrides': {'implementer': 'gpt-9'}},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='haiku'),
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'sonnet'
+        assert decision.source_layer == 'config'
+        assert 'metadata_override:model-not-in-allowlist' in decision.rejected
+
+
+class TestLadderRelativeBump:
+    """(b) invariant 5: RuleSet.model == '+N' bumps the incoming (pre-rule)
+    model N ladder steps, clamped at the ladder top; a model absent from
+    `routing.ladder` cannot be bumped from -- that layer's model set is
+    skipped (rule_id is still recorded -- the rule DID match)."""
+
+    def test_bump_one_step(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='+1'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(rules=[rule]),
+        )
+
+        decision = resolve_route(_inputs(role_name='implementer'), cfg)
+
+        assert decision.model == 'opus'
+        assert decision.source_layer == 'policy_rule'
+        assert decision.rule_id == 'r'
+        assert decision.rejected == ()
+
+    def test_bump_clamps_at_ladder_top(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='+1'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='opus'),
+            routing=RoutingConfig(rules=[rule]),
+        )
+
+        decision = resolve_route(_inputs(role_name='implementer'), cfg)
+
+        assert decision.model == 'opus'
+        assert decision.source_layer == 'policy_rule'
+        assert decision.rule_id == 'r'
+        assert decision.rejected == ()
+
+    def test_model_absent_from_ladder_cannot_be_bumped(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='+1'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='claude-fable-5'),
+            routing=RoutingConfig(
+                allowed_models=[*DEFAULT_ALLOWED_MODELS, 'claude-fable-5'],
+                rules=[rule],
+            ),
+        )
+
+        decision = resolve_route(_inputs(role_name='implementer'), cfg)
+
+        assert decision.model == 'claude-fable-5'
+        assert decision.source_layer == 'config'
+        assert decision.rule_id == 'r'
+        assert 'policy_rule:model-not-in-ladder' in decision.rejected
+
+
+class TestCeilingFallback:
+    """(c) invariant 6 / boundary test 7: a model whose trailing-24h spend
+    has exhausted its configured `per_model_daily_ceiling_usd` is rejected
+    exactly like an allowlist failure -- resolution falls back one layer,
+    dispatch proceeds with the fallback model."""
+
+    def test_exhausted_ceiling_falls_back_one_layer(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='opus'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(rules=[rule], per_model_daily_ceiling_usd={'opus': 50.0}),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='haiku'),
+            spend_by_model={'opus': 60.0},
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'sonnet'
+        assert decision.source_layer == 'config'
+        assert decision.rule_id == 'r'
+        assert 'policy_rule:model-ceiling-exhausted' in decision.rejected
+
+    def test_ceiling_not_exhausted_applies_normally(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='opus'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(rules=[rule], per_model_daily_ceiling_usd={'opus': 50.0}),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='haiku'),
+            spend_by_model={'opus': 10.0},
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'opus'
+        assert decision.source_layer == 'policy_rule'
+        assert decision.rule_id == 'r'
+        assert decision.rejected == ()
+
+
+class TestFailSafeScopedToClaudeBackend:
+    """Invariants 2/6's fail-safe validation is scoped to claude-backend
+    roles ONLY -- mirrors config.py's ``_validate_models_in_allowlist``,
+    which never checks a non-claude-backend role's configured model string
+    against the claude-centric ``routing.allowed_models`` (see
+    test_routing.py's ``TestNonClaudeBackendScopeBoundary``).
+    ``routing.allowed_models``/``per_model_daily_ceiling_usd`` are
+    claude-specific concepts the harness-backend PRD's model space never
+    participates in -- a role running on a non-claude backend
+    (``backends.<role> != 'claude'``) must resolve its configured model
+    unconditionally at every layer, exactly as the pre-epsilon getattr-based
+    resolution did (that resolution never consulted an allowlist at all).
+
+    Regression: this was originally a byte-equivalence break caught by
+    test_invoke_role_config_resolution.py's
+    TestInvokeReviewerVariantOverrideStaysGreen (task 2531/alpha) --
+    ``models.reviewer='reviewer-sentinel-model'`` + ``backends.reviewer=
+    'gemini'`` fell all the way back to role_default because layer 3's
+    fail-safe check rejected the sentinel model against the (irrelevant,
+    claude-only) allowlist.
+    """
+
+    def test_non_claude_backend_config_model_not_in_allowlist_still_resolves(self):
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(reviewer='gemini-2.5-pro'),
+            backends=BackendsConfig(reviewer='gemini'),
+        )
+
+        decision = resolve_route(_inputs(role_name='reviewer_comprehensive'), cfg)
+
+        assert decision.model == 'gemini-2.5-pro'
+        assert decision.source_layer == 'config'
+        assert decision.rejected == ()
+
+    def test_non_claude_backend_policy_rule_model_not_in_allowlist_still_resolves(self):
+        rule = RoutingRule(
+            id='r', match=RuleMatch(role=['reviewer_comprehensive']),
+            set=RuleSet(model='gemini-3-flash'),
+        )
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(reviewer='gemini-2.5-pro'),
+            backends=BackendsConfig(reviewer='gemini'),
+            routing=RoutingConfig(rules=[rule]),
+        )
+
+        decision = resolve_route(_inputs(role_name='reviewer_comprehensive'), cfg)
+
+        assert decision.model == 'gemini-3-flash'
+        assert decision.source_layer == 'policy_rule'
+        assert decision.rejected == ()
+
+    def test_non_claude_backend_metadata_override_not_in_allowlist_still_resolves(self):
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(reviewer='gemini-2.5-pro'),
+            backends=BackendsConfig(reviewer='gemini'),
+        )
+        inputs = RouteInputs(
+            role_name='reviewer_comprehensive',
+            task_id='1',
+            task_metadata={'model_overrides': {'reviewer_comprehensive': 'gemini-3-pro'}},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(),
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'gemini-3-pro'
+        assert decision.source_layer == 'metadata_override'
+        assert decision.rejected == ()

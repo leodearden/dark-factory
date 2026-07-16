@@ -13,6 +13,14 @@ RED phase (step-9): ``TaskWorkflow._record_routing_decision`` does not exist
 yet and ``_invoke`` never calls it, so no ``routing_decision`` event is
 emitted and ``scheduler.update_task`` is never awaited for a ``'routing'``
 key — all four test bodies below fail today.
+
+RED phase (step-13, task epsilon): ``_invoke`` does not yet call
+``orchestrator.routing.resolve_route`` — it still resolves model/effort/
+budget/max_turns via the pre-epsilon inline block + ``_select_model_for_role``
+(workflow.py:7801). The ``TestInvokeAdoptsResolveRoute``,
+``TestInvokeRoutingDecisionRejectedField``, ``TestInvokeCeilingSpendQuery``,
+and ``TestSelectModelForRoleRetired`` classes below fail until step-14 wires
+``resolve_route`` into ``_invoke`` and deletes ``_select_model_for_role``.
 """
 
 from __future__ import annotations
@@ -27,8 +35,9 @@ from _recording_event_store import _RecordingEventStore
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, RoutingRule, RuleMatch, RuleSet
 from orchestrator.event_store import EventType
+from orchestrator.routing import PlanShape, RoutingDecision
 from orchestrator.workflow import TaskWorkflow
 
 # Distinct, concrete values (not the role defaults) so a GREEN pass proves the
@@ -37,8 +46,26 @@ from orchestrator.workflow import TaskWorkflow
 _BUDGET_USD = 10.0
 _MAX_TURNS = 80
 
+# Transcribes defaults.yaml's `rust-large-plan-implementer` rule (step-10)
+# byte-for-byte, so tests that exercise the real (unpatched) resolve_route
+# reproduce the same policy-rule behaviour production config ships.
+_RUST_RULE = RoutingRule(
+    id='rust-large-plan-implementer',
+    match=RuleMatch(
+        role=['implementer', 'debugger'],
+        plan_min_steps=12,
+        plan_min_modules=3,
+        module_prefix='crates/',
+    ),
+    set=RuleSet(model='opus'),
+)
 
-def _make_workflow(*, event_store: _RecordingEventStore) -> TaskWorkflow:
+
+def _make_workflow(
+    *,
+    event_store: _RecordingEventStore,
+    cost_store: MagicMock | None = None,
+) -> TaskWorkflow:
     """Minimal TaskWorkflow instance for ``_invoke`` routing-decision tests.
 
     Mirrors ``test_workflow_invocation_end_truthful.py``'s ``_make_workflow``
@@ -51,6 +78,18 @@ def _make_workflow(*, event_store: _RecordingEventStore) -> TaskWorkflow:
     would blow up the ``'timeout=%.0fs'`` log-format call in ``_invoke``).
     ``scheduler.update_task`` is replaced with an ``AsyncMock`` so the
     metadata-mirror write is awaitable and assertable.
+
+    ``cfg.routing.*`` is set to real (non-MagicMock) values — task epsilon's
+    ``resolve_route`` does real membership/comparison ops
+    (``candidate not in config.routing.allowed_models``, dict ``.get()``
+    against ``per_model_daily_ceiling_usd``) that a bare MagicMock child
+    attribute cannot satisfy (``pydantic_spec`` only constrains ``cfg``'s own
+    top-level attribute names — ``cfg.routing`` itself is an unconstrained
+    MagicMock unless configured here). ``rules`` carries the real
+    ``rust-large-plan-implementer`` rule so pre-existing Rust-heuristic
+    assertions below keep passing once ``_invoke`` calls the real resolver.
+    ``per_model_daily_ceiling_usd`` defaults to ``{}`` (stock — no ceilings)
+    so no test not opting into a ceiling pays a surprise cost_store read.
     """
     assignment = MagicMock()
     assignment.task_id = '2533'
@@ -75,6 +114,11 @@ def _make_workflow(*, event_store: _RecordingEventStore) -> TaskWorkflow:
     cfg.timeouts.implementer = 1200.0
     cfg.backends.implementer = 'claude'
 
+    cfg.routing.allowed_models = ['haiku', 'sonnet', 'opus']
+    cfg.routing.ladder = ['haiku', 'sonnet', 'opus']
+    cfg.routing.per_model_daily_ceiling_usd = {}
+    cfg.routing.rules = [_RUST_RULE]
+
     wf = TaskWorkflow(
         assignment=assignment,
         config=cfg,
@@ -83,6 +127,7 @@ def _make_workflow(*, event_store: _RecordingEventStore) -> TaskWorkflow:
         briefing=MagicMock(),
         mcp=MagicMock(),
         event_store=event_store,  # type: ignore[arg-type]
+        cost_store=cost_store,  # type: ignore[arg-type]
     )
     wf.scheduler.update_task = AsyncMock(return_value=True)
     return wf
@@ -236,3 +281,136 @@ class TestInvokeRoutingDecisionGracefulDegradation:
         assert _routing_decision_entries(rec) == []
         cast(AsyncMock, wf.scheduler.update_task).assert_not_awaited()
         assert 'metadata' not in wf.task
+
+
+@pytest.mark.asyncio
+class TestInvokeAdoptsResolveRoute:
+    """``_invoke`` resolves via ``orchestrator.routing.resolve_route`` BEFORE
+    invoking, and the returned ``RoutingDecision`` feeds the invocation
+    (PRD epsilon invariant 9 — resolution-before-invocation)."""
+
+    async def test_resolve_route_called_and_feeds_the_invocation(
+        self, tmp_path: Path,
+    ) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+        wf.modules = ['crates/a', 'crates/b']
+        wf.plan = {'steps': [{}] * 7}
+
+        fake_decision = RoutingDecision(
+            model='haiku',
+            effort='low',
+            budget_usd=1.23,
+            max_turns=17,
+            source_layer='policy_rule',
+            rule_id='some-rule',
+            rejected=(),
+        )
+        with (
+            patch(
+                'orchestrator.workflow.resolve_route',
+                return_value=fake_decision,
+            ) as mock_resolve,
+            patch(
+                'orchestrator.workflow.invoke_with_cap_retry',
+                new=AsyncMock(return_value=_stub_agent_result()),
+            ) as mock_invoke,
+            patch.object(wf, '_build_agent_env', return_value=None),
+        ):
+            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+
+        mock_resolve.assert_called_once()
+        route_inputs = mock_resolve.call_args.args[0]
+        assert route_inputs.role_name == 'implementer'
+        assert route_inputs.plan_shape == PlanShape(7, ('crates/a', 'crates/b'))
+        assert route_inputs.routing_tier == 0
+        assert mock_resolve.call_args.args[1] is wf.config
+
+        assert mock_invoke.call_args.kwargs['model'] == 'haiku'
+        assert mock_invoke.call_args.kwargs['effort'] == 'low'
+        assert mock_invoke.call_args.kwargs['max_budget_usd'] == 1.23
+        assert mock_invoke.call_args.kwargs['max_turns'] == 17
+
+
+@pytest.mark.asyncio
+class TestInvokeRoutingDecisionRejectedField:
+    """The ``routing_decision`` event + ``metadata.routing`` mirror carry
+    the resolver's ``source_layer``/``rule_id``/``rejected`` verbatim."""
+
+    async def test_rejected_and_provenance_flow_through(self, tmp_path: Path) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+
+        fake_decision = RoutingDecision(
+            model='sonnet',
+            effort='high',
+            budget_usd=_BUDGET_USD,
+            max_turns=_MAX_TURNS,
+            source_layer='policy_rule',
+            rule_id='some-rule',
+            rejected=('metadata_override:model-not-in-allowlist',),
+        )
+        with (
+            patch('orchestrator.workflow.resolve_route', return_value=fake_decision),
+            patch(
+                'orchestrator.workflow.invoke_with_cap_retry',
+                new=AsyncMock(return_value=_stub_agent_result()),
+            ),
+            patch.object(wf, '_build_agent_env', return_value=None),
+        ):
+            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+
+        entries = _routing_decision_entries(rec)
+        assert len(entries) == 1
+        data = entries[0]['data']
+        assert data['source_layer'] == 'policy_rule'
+        assert data['rule_id'] == 'some-rule'
+        assert data['rejected'] == ['metadata_override:model-not-in-allowlist']
+
+        latest = wf.task['metadata']['routing']['latest']
+        assert latest['source_layer'] == 'policy_rule'
+        assert latest['rule_id'] == 'some-rule'
+        assert latest['rejected'] == ['metadata_override:model-not-in-allowlist']
+
+
+@pytest.mark.asyncio
+class TestInvokeCeilingSpendQuery:
+    """``_invoke`` queries ``cost_store.model_cost_in_window`` only for
+    models carrying a configured ``routing.per_model_daily_ceiling_usd``
+    entry (PRD epsilon invariant 6 mechanics + byte-equivalence)."""
+
+    async def test_stock_ceiling_config_fires_zero_queries(self, tmp_path: Path) -> None:
+        rec = _RecordingEventStore()
+        cost_store = MagicMock()
+        cost_store.model_cost_in_window = AsyncMock(return_value=0.0)
+        wf = _make_workflow(event_store=rec, cost_store=cost_store)
+        # _make_workflow defaults routing.per_model_daily_ceiling_usd to {} —
+        # stock config, no ceilings configured.
+
+        await _invoke_implementer(wf, tmp_path)
+
+        cost_store.model_cost_in_window.assert_not_awaited()
+
+    async def test_configured_ceiling_awaits_query_for_that_model(
+        self, tmp_path: Path,
+    ) -> None:
+        rec = _RecordingEventStore()
+        cost_store = MagicMock()
+        cost_store.model_cost_in_window = AsyncMock(return_value=0.0)
+        wf = _make_workflow(event_store=rec, cost_store=cost_store)
+        wf.config.routing.per_model_daily_ceiling_usd = {'opus': 50.0}
+
+        await _invoke_implementer(wf, tmp_path)
+
+        cost_store.model_cost_in_window.assert_awaited_once()
+        call_args = cost_store.model_cost_in_window.call_args
+        assert call_args.args[0] == 'opus'
+
+
+class TestSelectModelForRoleRetired:
+    """``_select_model_for_role`` is retired — its Rust heuristic now ships
+    as defaults.yaml's ``rust-large-plan-implementer`` policy rule, applied
+    via ``resolve_route`` (task epsilon)."""
+
+    def test_select_model_for_role_no_longer_exists(self) -> None:
+        assert not hasattr(TaskWorkflow, '_select_model_for_role')

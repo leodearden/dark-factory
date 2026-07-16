@@ -13,6 +13,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     PrivateAttr,
     ValidationError,
@@ -25,7 +26,7 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-from orchestrator.routing import DEFAULT_ALLOWED_MODELS
+from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 
 logger = logging.getLogger(__name__)
 
@@ -281,8 +282,77 @@ class BackendsConfig(BaseModel):
     simple_task: str = Field(default='claude')
 
 
+class RuleMatch(BaseModel):
+    """Closed match-condition vocabulary for a RoutingRule (task epsilon,
+    plans/adaptive-model-routing-prd.md).
+
+    Every field is optional; a rule matches iff every condition it sets is
+    satisfied (AND) — see ``orchestrator.routing.resolve_route``.
+    ``extra='forbid'`` so an unrecognized condition key (e.g. a typo) raises
+    a structured ``ValidationError`` naming the key, both at initial config
+    load and at hot-reload time (``apply_reload``'s post-apply
+    ``model_validate`` re-check) — boundary test 11.
+
+    CAVEAT -- ``task_priority`` matches only ``task_metadata['priority']``,
+    NOT the task's top-level ``priority`` field (where priority actually
+    lives in this codebase, e.g. ``self.task.get('priority')`` in
+    ``workflow.py``). A rule authored against the top-level field will
+    silently never match; populate ``metadata['priority']`` explicitly if
+    you need this condition to fire. See ``orchestrator.routing.
+    _rule_matches``'s docstring for the same note.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    role: list[str] | None = None
+    task_complexity: str | None = None
+    task_priority: str | None = None
+    plan_min_steps: int | None = None
+    plan_min_modules: int | None = None
+    module_prefix: str | None = None
+    min_routing_tier: int | None = None
+    min_dispatch_count: int | None = None
+    simple_saturated: bool | None = None
+
+
+class RuleSet(BaseModel):
+    """Closed override vocabulary a RoutingRule applies upon match (task
+    epsilon).
+
+    Every field is optional — a rule may set only a subset of (model,
+    effort, budget_usd, max_turns); any field left unset falls through to
+    the next-lower resolver layer. ``model`` may be an absolute model string
+    or a ladder-relative offset (``'+N'``, resolved against
+    ``RoutingConfig.ladder`` and clamped at its top — see
+    ``orchestrator.routing.resolve_route``). ``extra='forbid'`` mirrors
+    ``RuleMatch``.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    model: str | None = None
+    effort: str | None = None
+    budget_usd: float | None = None
+    max_turns: int | None = None
+
+
+class RoutingRule(BaseModel):
+    """One named policy rule: IF ``match`` THEN ``set`` (task epsilon).
+
+    Evaluated in list order by ``orchestrator.routing.resolve_route`` —
+    first match wins. ``id`` is carried into the resolved
+    ``RoutingDecision.rule_id`` and the ``routing_decision`` telemetry
+    event / ``metadata.routing`` mirror.
+    """
+
+    id: str
+    match: RuleMatch = Field(default_factory=RuleMatch)
+    set: RuleSet = Field(default_factory=RuleSet)
+
+
 class RoutingConfig(BaseModel):
-    """Model allowlist (task beta, plans/adaptive-model-routing-prd.md).
+    """Model allowlist + policy-rule table (tasks beta/epsilon,
+    plans/adaptive-model-routing-prd.md).
 
     ``allowed_models`` is the fail-fast admission list enforced by
     ``OrchestratorConfig._validate_models_in_allowlist`` against every
@@ -290,9 +360,22 @@ class RoutingConfig(BaseModel):
     ``unblock_auto.model``). Defaults from ``routing.DEFAULT_ALLOWED_MODELS``
     — the PRD-named "allowlist home" — so this schema and its default stay
     single-sourced.
+
+    ``ladder`` orders models weakest -> strongest for ladder-relative rule
+    bumps (``RuleSet.model == '+N'``); defaults from
+    ``routing.DEFAULT_LADDER``. ``per_model_daily_ceiling_usd`` is an
+    optional per-model trailing-24h USD spend ceiling (task epsilon
+    invariant 6) — empty by default, so the ceiling check never trips and
+    ``_invoke`` never issues the extra cost_store read at stock config.
+    ``rules`` is the ordered policy-rule table (task epsilon); empty by
+    default — the shipped default rule lives in defaults.yaml, not here, so
+    a later task can retune it without a code change.
     """
 
     allowed_models: list[str] = Field(default_factory=lambda: list(DEFAULT_ALLOWED_MODELS))
+    ladder: list[str] = Field(default_factory=lambda: list(DEFAULT_LADDER))
+    per_model_daily_ceiling_usd: dict[str, float] = Field(default_factory=dict)
+    rules: list[RoutingRule] = Field(default_factory=list)
 
 
 class UnblockAutoConfig(BaseModel):
@@ -3227,6 +3310,19 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # config's models/unblock_auto leaves fails closed with a
     # {reloaded: False, error: 'hybrid-invariant: ...'} + rollback — no
     # new reload code needed.
+    #
+    # Audited for task epsilon (resolve_route, same PRD): ladder,
+    # per_model_daily_ceiling_usd and rules — the three leaves resolve_route
+    # adds to RoutingConfig — are auto-covered by this same whole-submodel
+    # group with no RELOADABLE_FIELDS edit. The list-valued `rules` leaf in
+    # particular is safe as an _iter_leaves atomic comparison: RoutingRule
+    # (and its RuleMatch/RuleSet fields) are plain pydantic BaseModels, whose
+    # structural __eq__ makes list[RoutingRule] equality — and therefore
+    # diff_config's `live_val != fresh_val` — behave element-wise as
+    # expected, with extra='forbid' on RuleMatch/RuleSet still enforced by
+    # apply_reload's post-apply model_validate. See
+    # test_routing_reload.py (boundary test 11) for the reload-applies +
+    # fail-closed-on-unknown-key coverage.
     _submodel_leaf_paths('routing', RoutingConfig),
     {
         # Steward grace
