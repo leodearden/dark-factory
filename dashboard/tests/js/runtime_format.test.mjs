@@ -118,3 +118,11 @@ test('rtAge: zero renders as an honest "0m", not dashed', () => {
 test('rtAge: a positive age renders as "<minutes>m"', () => {
   assert.equal(rtAge(14), '14m');
 });
+
+test('rtAge: a fractional-minute value is rounded to the nearest whole minute', () => {
+  // Guards against upstream float/precision drift (the documented contract
+  // is an integer minute count, but rtAge should not render a raw decimal
+  // like "3.5m" if that contract ever slips).
+  assert.equal(rtAge(3.5), '4m');
+  assert.equal(rtAge(3.4), '3m');
+});

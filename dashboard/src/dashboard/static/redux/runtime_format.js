@@ -32,8 +32,12 @@ function rtCell(v) {
 }
 
 // ── Age formatter: null/undefined -> em-dash, else "<minutes>m" ──
+// `started` is contractually an integer minute count (task_runtime_state.py),
+// but Math.round guards the render against float/precision drift if that
+// ever changes upstream (e.g. a fractional-minute value would otherwise
+// render as "3.5m" verbatim) — a no-op for the documented integer contract.
 function rtAge(m) {
-  return m == null ? '—' : `${m}m`;
+  return m == null ? '—' : `${Math.round(m)}m`;
 }
 
 // Named RUNTIME_FORMAT_API (not the graph_layout.js boilerplate's plain
