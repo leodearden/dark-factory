@@ -103,6 +103,89 @@ async def test_on_task_done_fast_path_write(reconciler, mock_memory_service):
 
 
 @pytest.mark.asyncio
+async def test_on_task_done_fast_path_write_stamps_stage2_suppress(reconciler, mock_memory_service):
+    """The fast-path completion echo must stamp stage2_suppress=True (task 2642).
+
+    Stage 2's "Completion-Note Suppression Pre-Check" gate
+    (prompts/stage2.py) is a deterministic
+    count_memories_by_metadata(project_id, {'task_id': str(task_id),
+    'stage2_suppress': True}) count -- it ONLY recognizes memories carrying
+    that key. Without this tag, a task completed via TargetedReconciliation
+    shortly before/during a Stage 2 cycle has count==0 and Stage 2
+    re-derives a duplicate completion summary. Tagging the always-written
+    fast-path echo closes that gap with zero LLM/prompt dependency.
+    """
+    task_before = {
+        'id': '5192', 'title': 'Fix the thing', 'status': 'in-progress',
+        'description': 'Some description',
+    }
+    await reconciler.reconcile_task(
+        task_id='5192', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before=task_before,
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert metadata.get('stage2_suppress') is True, (
+        "Expected fast-path completion echo to stamp stage2_suppress=True so "
+        f"Stage 2's count gate recognizes it, got metadata: {metadata}"
+    )
+    assert metadata.get('task_id') == '5192', (
+        f'Expected exact str(task_id) match for Stage 2\'s count filter, got: {metadata}'
+    )
+    # Additive, not a replacement -- the existing fields must still be present.
+    assert metadata.get('source') == 'targeted_reconciliation'
+    assert metadata.get('transition') == 'done'
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_deferred_write_does_not_persist_stage2_suppress(
+    reconciler, mock_memory_service, mock_event_buffer,
+):
+    """A deferred fast-path echo must not make stage2_suppress visible yet.
+
+    Task 2642 amendment (reviewer_comprehensive test_coverage): when a full
+    cycle is active, _fenced_add_memory parks the write in the event buffer
+    via defer_write instead of calling memory.add_memory -- so the
+    stage2_suppress tag never reaches the memory store's queryable index
+    this cycle. Stage 2's count_memories_by_metadata gate must therefore
+    correctly stay at 0 for this task until the deferred write is later
+    flushed; it must never be fooled by a write that only exists in the
+    buffer, locking in the fail-safe behavior noted in
+    test_on_task_done_fast_path_write_stamps_stage2_suppress above.
+    """
+    mock_event_buffer.is_full_recon_active = AsyncMock(return_value=True)
+    task_before = {
+        'id': '5192', 'title': 'Fix the thing', 'status': 'in-progress',
+        'description': 'Some description',
+    }
+    result = await reconciler.reconcile_task(
+        task_id='5192', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before=task_before,
+    )
+
+    # Nothing was persisted directly to the memory store -- the write was
+    # deferred to the event buffer instead, so no stage2_suppress-tagged
+    # memory exists yet for Stage 2's count gate to find.
+    assert mock_memory_service.add_memory.call_args_list == [], (
+        'Expected no direct add_memory calls while a full cycle is active -- '
+        'the fast-path write must be deferred, not persisted.'
+    )
+    assert any(a['type'] == 'knowledge_deferred_fast' for a in result.get('actions', []))
+
+    # The deferred write DOES carry stage2_suppress (it's the same
+    # write_metadata, merely parked) -- confirming the tag itself isn't
+    # lost, only not yet visible to the deterministic count gate.
+    defer_calls = mock_event_buffer.defer_write.call_args_list
+    assert len(defer_calls) >= 1
+    deferred_metadata = defer_calls[0].kwargs.get('metadata') or {}
+    assert deferred_metadata.get('stage2_suppress') is True
+    assert deferred_metadata.get('task_id') == '5192'
+
+
+@pytest.mark.asyncio
 async def test_on_task_done_passes_causation_id(reconciler, mock_memory_service):
     """All memory calls during targeted recon pass causation_id=run_id."""
     task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
@@ -2342,6 +2425,15 @@ class TestShouldWithholdProposedResolutionAcceptsScope:
             id='plain_prior_echo',
         ),
         pytest.param(
+            {
+                'source': 'targeted_reconciliation',
+                'task_id': '5',
+                'stage2_suppress': True,
+            },
+            False,
+            id='targeted_echo_with_suppress_not_authoritative',
+        ),
+        pytest.param(
             {'source': 'stage1_flag_marker', 'task_id': '7', 'flag_type': 'x'},
             False,
             id='non_authoritative_flag_marker_source',
@@ -2377,6 +2469,15 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
     Plain prior targeted echoes (source='targeted_reconciliation', no
     supersedes, no stage2_suppress) are deliberately NOT authoritative, so a
     task's own earlier echoes never trigger suppression or oscillation.
+
+    `stage2_suppress` is authoritative only when the memory is NOT this
+    reconciler's own echo (source != _ECHO_SOURCE):
+    `targeted_echo_with_suppress_not_authoritative` below locks in that even
+    once TargetedReconciliation's own completion echo also stamps
+    `stage2_suppress` (to seed Stage 2's suppression count gate), that
+    self-echo must stay non-authoritative to this pre-check — otherwise a
+    task's own prior echo would suppress its next completion description,
+    regressing the task-1984 invariant above.
     """
     from fused_memory.reconciliation.targeted import _is_authoritative_resolution
 
@@ -2783,6 +2884,55 @@ async def test_on_task_done_fails_open_when_metadata_query_raises(
         f'Expected echo_suppressed=False on the fail-open path, '
         f'got detail: {completion_rows[0]["detail"]}'
     )
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_search_failure_does_not_abort_later_capture_steps(
+    reconciler, mock_memory_service, mock_taskmaster,
+):
+    """A search failure must not abort sparse-verification / dependent-check.
+
+    Task 2642 amendment (reviewer_comprehensive robustness_over_suppression):
+    the fast-path echo (step 0) durably stamps stage2_suppress=True BEFORE
+    this reconciler's own search (step 1). Stage 2's PRIMARY suppression
+    gate (prompts/stage2.py) treats that tag as "fully handled -- skip
+    search, completion note, AND missing_knowledge finding" for this task's
+    next Stage-2 cycle. Before this fix, an uncaught exception from
+    memory.search propagated straight out of _on_task_done, silently
+    skipping sparse-knowledge verification (step 2) and the
+    dependent-unblock check (step 3) -- so the marker would have vouched for
+    capture work that never actually ran. Fail open (treat as sparse) like
+    every other step in this method, so the run completes normally and the
+    rest of the capture pipeline still executes.
+    """
+    mock_memory_service.search = AsyncMock(side_effect=RuntimeError('qdrant down'))
+    mock_taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {'id': '1', 'status': 'done', 'dependencies': []},
+            {'id': '2', 'status': 'pending', 'title': 'Next task', 'dependencies': ['1']},
+        ]
+    })
+
+    result = await reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '1', 'title': 'Add tests', 'status': 'in-progress',
+            'description': 'Test suite',
+        },
+    )
+
+    # The run must fail open, not abort with an error, just because search raised.
+    assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+    # (a) fast-path completion echo (step 0) still landed.
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+    # (b) sparse-knowledge verification (step 2) still ran despite the search
+    #     failure -- fail-open treats unknown related-knowledge as sparse.
+    assert any(a['type'] == 'knowledge_captured' for a in result.get('actions', []))
+    # (c) dependent-unblock check (step 3) still ran.
+    unblocked = [a for a in result.get('actions', []) if a['type'] == 'dependent_unblocked']
+    assert len(unblocked) == 1
+    assert unblocked[0]['task_id'] == '2'
 
 
 @pytest.mark.asyncio
