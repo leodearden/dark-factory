@@ -14,6 +14,7 @@ introduced for the plan-files-not-touched architect-narrowing retry.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -48,6 +49,32 @@ def anti_anchor_task() -> dict:
         'title': 'Anti-anchor title',
         'description': 'Derive files independently',
         'metadata': {'files': ['orchestrator', 'shared']},
+    }
+
+
+@pytest.fixture
+def task_with_proposal() -> dict:
+    """Task fixture carrying a dry_run_proposals entry.
+
+    Shared across the prior-proposal test classes (C-A1 anti-anchor, the
+    retry/resume golden tests, and the staleness-guard tests) so the sample
+    proposal shape lives in one place.
+    """
+    return {
+        'id': '9001',
+        'title': 'Task with a prior block-time proposal',
+        'description': 'A task that was previously blocked and investigated.',
+        'metadata': {
+            'dry_run_proposals': [
+                {
+                    'proposal_text': 'Root cause is a stale cache entry; fix by invalidating on write.',
+                    'risk_label': 'medium',
+                    'files_referenced': ['orchestrator/x.py'],
+                    'timestamp': '2026-07-13T10:00:00+00:00',
+                    'investigated_at': '2026-07-13T10:00:00+00:00',
+                },
+            ],
+        },
     }
 
 
@@ -279,3 +306,259 @@ class TestAntiAnchorFirstDerivation:
             context='',
         )
         assert '**Files:** orchestrator, shared' in prompt
+
+
+@pytest.mark.asyncio
+class TestPriorProposalAntiAnchor:
+    """C-A1 for prior dry-run block-time proposals.
+
+    First-dispatch (``build_architect_prompt``, default call) must NOT
+    surface a prior block-time investigation — this is the same
+    anti-anchoring concern as ``TestAntiAnchorFirstDerivation`` above, applied
+    to ``metadata.dry_run_proposals`` instead of ``metadata.files``. The
+    re-plan path opts in explicitly via ``include_prior_proposals=True``.
+    """
+
+    async def test_first_dispatch_excludes_proposal(
+        self, briefing: BriefingAssembler, task_with_proposal: dict,
+    ):
+        prompt = await briefing.build_architect_prompt(
+            task_with_proposal, worktree=None, context='',
+        )
+        assert 'Root cause is a stale cache entry' not in prompt
+        assert 'prior block-time investigation' not in prompt
+
+    async def test_replan_includes_proposal(
+        self, briefing: BriefingAssembler, task_with_proposal: dict,
+    ):
+        prompt = await briefing.build_architect_prompt(
+            task_with_proposal,
+            worktree=None,
+            context='',
+            include_prior_proposals=True,
+        )
+        assert 'Root cause is a stale cache entry' in prompt
+        assert 'prior block-time investigation' in prompt
+
+
+@pytest.mark.asyncio
+class TestRevalidationPriorProposal:
+    """Retry golden test.
+
+    ``build_revalidation_prompt`` is itself a retry path (blast-radius
+    requeue), so it always surfaces the prior proposal — no
+    ``include_prior_proposals`` gate needed, unlike ``build_architect_prompt``.
+    """
+
+    async def test_includes_proposal_with_provenance(
+        self, briefing: BriefingAssembler, task_with_proposal: dict,
+    ):
+        prompt = await briefing.build_revalidation_prompt(
+            task_with_proposal,
+            existing_plan={'files': ['orchestrator'], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        assert 'prior block-time investigation' in prompt
+        assert (
+            'Root cause is a stale cache entry; fix by invalidating on write.'
+            in prompt
+        )
+        assert 'medium' in prompt
+        assert 'orchestrator/x.py' in prompt
+        assert '2026-07-13T10:00:00+00:00' in prompt
+
+
+@pytest.mark.asyncio
+class TestResumePriorProposal:
+    """Resume golden test.
+
+    ``build_resume_prompt`` runs after an escalation resolution — inherently
+    a retry/resume path — so it always surfaces the prior proposal. It has
+    no ``context`` override parameter, so ``_get_memory_context`` is patched
+    to avoid a real fused-memory HTTP call (mirrors test_briefing_judge.py).
+    """
+
+    async def test_includes_proposal_with_provenance(
+        self, briefing: BriefingAssembler, task_with_proposal: dict,
+    ):
+        with patch.object(
+            BriefingAssembler, '_get_memory_context', return_value='# Context\n\n_stub_',
+        ):
+            prompt = await briefing.build_resume_prompt(
+                task_with_proposal,
+                plan={},
+                escalation_summary='the issue',
+                resolution='the fix',
+                worktree=None,
+            )
+        assert 'prior block-time investigation' in prompt
+        assert (
+            'Root cause is a stale cache entry; fix by invalidating on write.'
+            in prompt
+        )
+
+
+class TestPriorProposalStaleness:
+    """Staleness guard + robustness for ``_format_prior_proposal``.
+
+    The guard omits a persisted proposal when it predates the task's last
+    confirmed block transition (``metadata.last_blocked_at``) — a re-block
+    without a fresh investigation must not resurface stale analysis. Absent
+    or unparseable timestamps fail OPEN (include) so analysis is never
+    silently lost to a formatting edge case.
+    """
+
+    # -- (a) stale: proposal predates last_blocked_at -----------------------
+
+    def test_stale_proposal_omitted_by_helper(self, briefing: BriefingAssembler):
+        task = {
+            'id': '9010',
+            'metadata': {
+                'dry_run_proposals': [
+                    {
+                        'proposal_text': 'stale analysis text',
+                        'risk_label': 'low',
+                        'files_referenced': [],
+                        'timestamp': '2026-07-13T10:00:00+00:00',
+                    },
+                ],
+                # Later than the proposal's timestamp — a re-block without a
+                # fresh investigation.
+                'last_blocked_at': '2026-07-14T00:00:00+00:00',
+            },
+        }
+        assert briefing._format_prior_proposal(task) == ''
+
+    @pytest.mark.asyncio
+    async def test_stale_proposal_omitted_from_revalidation_prompt(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {
+            'id': '9011',
+            'title': 'Stale proposal task',
+            'description': 'Demo',
+            'metadata': {
+                'dry_run_proposals': [
+                    {
+                        'proposal_text': 'stale analysis text',
+                        'risk_label': 'low',
+                        'files_referenced': [],
+                        'timestamp': '2026-07-13T10:00:00+00:00',
+                    },
+                ],
+                'last_blocked_at': '2026-07-14T00:00:00+00:00',
+            },
+        }
+        prompt = await briefing.build_revalidation_prompt(
+            task,
+            existing_plan={'files': [], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        assert 'stale analysis text' not in prompt
+
+    # -- (b) fresh: proposal postdates last_blocked_at -----------------------
+
+    def test_fresh_proposal_included(self, briefing: BriefingAssembler):
+        task = {
+            'id': '9012',
+            'metadata': {
+                'dry_run_proposals': [
+                    {
+                        'proposal_text': 'fresh analysis text',
+                        'risk_label': 'low',
+                        'files_referenced': [],
+                        'timestamp': '2026-07-15T00:00:00+00:00',
+                    },
+                ],
+                'last_blocked_at': '2026-07-14T00:00:00+00:00',
+            },
+        }
+        out = briefing._format_prior_proposal(task)
+        assert 'fresh analysis text' in out
+
+    # -- (c) last_blocked_at absent: fail open --------------------------------
+
+    def test_missing_last_blocked_at_fails_open(
+        self, briefing: BriefingAssembler, task_with_proposal: dict,
+    ):
+        assert 'last_blocked_at' not in task_with_proposal['metadata']
+        out = briefing._format_prior_proposal(task_with_proposal)
+        assert 'Root cause is a stale cache entry' in out
+
+    # -- (d) unparseable timestamps: fail open --------------------------------
+
+    def test_unparseable_proposal_timestamp_fails_open(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {
+            'id': '9013',
+            'metadata': {
+                'dry_run_proposals': [
+                    {
+                        'proposal_text': 'garbled proposal timestamp analysis',
+                        'risk_label': 'low',
+                        'files_referenced': [],
+                        'timestamp': 'not-a-timestamp',
+                    },
+                ],
+                'last_blocked_at': '2026-07-14T00:00:00+00:00',
+            },
+        }
+        out = briefing._format_prior_proposal(task)
+        assert 'garbled proposal timestamp analysis' in out
+
+    def test_unparseable_last_blocked_at_fails_open(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {
+            'id': '9014',
+            'metadata': {
+                'dry_run_proposals': [
+                    {
+                        'proposal_text': 'garbled block-stamp analysis',
+                        'risk_label': 'low',
+                        'files_referenced': [],
+                        'timestamp': '2026-07-13T10:00:00+00:00',
+                    },
+                ],
+                'last_blocked_at': 'not-a-timestamp',
+            },
+        }
+        out = briefing._format_prior_proposal(task)
+        assert 'garbled block-stamp analysis' in out
+
+    # -- (e) empty / non-dict latest proposal: no content, no crash ----------
+
+    def test_empty_proposals_list_returns_empty(self, briefing: BriefingAssembler):
+        task = {'id': '9015', 'metadata': {'dry_run_proposals': []}}
+        assert briefing._format_prior_proposal(task) == ''
+
+    def test_non_dict_latest_proposal_returns_empty(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {'id': '9016', 'metadata': {'dry_run_proposals': ['not-a-dict']}}
+        assert briefing._format_prior_proposal(task) == ''
+
+    @pytest.mark.asyncio
+    async def test_integration_prompt_builds_without_error_for_malformed_proposal(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {
+            'id': '9017',
+            'title': 'Malformed proposal task',
+            'description': 'Demo',
+            'metadata': {'dry_run_proposals': ['not-a-dict']},
+        }
+        prompt = await briefing.build_revalidation_prompt(
+            task,
+            existing_plan={'files': [], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        assert isinstance(prompt, str)
+        assert 'prior block-time investigation' not in prompt

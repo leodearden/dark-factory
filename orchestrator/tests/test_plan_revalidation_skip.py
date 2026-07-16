@@ -34,6 +34,7 @@ class _Fixture:
     get_changed_files: AsyncMock
     invoke_called: list[bool]
     event_emit: MagicMock
+    build_architect_prompt: AsyncMock
 
 
 def _make(
@@ -169,6 +170,7 @@ def _make(
         get_changed_files=get_changed_files,
         invoke_called=invoke_called,
         event_emit=event_emit,
+        build_architect_prompt=briefing.build_architect_prompt,
     )
 
 
@@ -345,3 +347,47 @@ async def test_blast_radius_granted_succeeds(tmp_path: Path):
     f.handle_blast_radius_expansion.assert_awaited_once()
     # modules updated to the plan's modules (lock_depth=2 keeps file path)
     assert set(f.wf.modules) == {'mod_b/x.py'}
+
+
+# ---------------------------------------------------------------------------
+# task 2557 step-11: include_prior_proposals wiring on the `else` (architect)
+# branch of _plan — fresh-vs-replan.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fresh_dispatch_excludes_prior_proposals(tmp_path: Path):
+    """Truly-fresh dispatch (no existing plan at all) reaches the `else`
+    branch with a falsy existing_plan — C-A1 anti-anchoring — so
+    build_architect_prompt must be awaited with include_prior_proposals
+    False (or omitted, relying on the parameter's own False default).
+    """
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    # Simulate a truly-fresh dispatch: no plan.json on disk at all.
+    (f.artifacts.root / 'plan.json').unlink()
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+
+    f.build_architect_prompt.assert_awaited_once()
+    _, kwargs = f.build_architect_prompt.call_args
+    assert kwargs.get('include_prior_proposals', False) is False
+
+
+@pytest.mark.asyncio
+async def test_replan_fallthrough_includes_prior_proposals(tmp_path: Path):
+    """A fallen-through existing plan (has steps + _session_id, but no
+    _old_plan_base to revalidate against) reaches the `else` branch with a
+    truthy existing_plan — a genuine re-plan, not a first dispatch — so
+    build_architect_prompt must be awaited with include_prior_proposals=True.
+    """
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    # Force fallthrough past the revalidation elif: no _old_plan_base means
+    # its last condition is falsy even though the plan has steps + _session_id.
+    f.wf._old_plan_base = None
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+
+    f.build_architect_prompt.assert_awaited_once()
+    _, kwargs = f.build_architect_prompt.call_args
+    assert kwargs.get('include_prior_proposals') is True

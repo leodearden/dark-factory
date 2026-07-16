@@ -165,7 +165,10 @@ class FakeScheduler:
 class FakeBriefing:
     """BriefingAssembler that returns canned prompts."""
 
-    async def build_architect_prompt(self, task: dict, worktree=None, context: str | None = None) -> str:
+    async def build_architect_prompt(
+        self, task: dict, worktree=None, context: str | None = None,
+        *, include_prior_proposals: bool = False,
+    ) -> str:
         return f'Plan task: {task.get("title", "")}'
 
     async def build_plan_completion_prompt(

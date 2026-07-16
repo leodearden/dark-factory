@@ -296,7 +296,8 @@ class _McpLike(Protocol):
 
 class _BriefingLike(Protocol):
     async def build_architect_prompt(
-        self, task: dict, worktree: Path | None = ..., context: str | None = ...
+        self, task: dict, worktree: Path | None = ..., context: str | None = ...,
+        *, include_prior_proposals: bool = ...,
     ) -> str: ...
     async def build_resume_prompt(
         self,
@@ -3130,8 +3131,22 @@ class TaskWorkflow:
             )
             revalidation = True
         else:
+            # include_prior_proposals=True only when an existing_plan fell
+            # through both the completion-pass and revalidation branches
+            # above (a genuine re-plan) — both of those branches require a
+            # truthy existing_plan, so bool(existing_plan) is False ONLY for
+            # a truly-fresh no-plan dispatch, keeping C-A1 anti-anchoring
+            # intact for first dispatch.
+            # bool(...), not `is not None`, is the correct discriminator:
+            # existing_plan is self.artifacts.read_plan() (line ~3071), which
+            # returns {} — never None — when plan.json is absent, so an
+            # `is not None` check would always be True and defeat the flag
+            # entirely. A present-but-empty {} plan carries no steps/session
+            # data to re-plan from either, so it is semantically equivalent
+            # to "no plan" and correctly falls to fresh-dispatch here too.
             prompt = await self.briefing.build_architect_prompt(
                 self.task, worktree=self.worktree,
+                include_prior_proposals=bool(existing_plan),
             )
 
         # Snapshot pre-architect open L0 ids so the post-loop check can
@@ -8865,6 +8880,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # Legitimate done — fall through; the existing post-steward
                 # flow below handles current==done by returning DONE.
             if _status_set_ok:
+                # Best-effort staleness-reference stamp (task 2557): records
+                # the confirmed block transition so BriefingAssembler can
+                # tell a stale persisted dry_run_proposals entry (from a
+                # PRIOR block cycle, re-blocked without a fresh investigation)
+                # apart from a fresh one. Awaited synchronously here, BEFORE
+                # the fire-and-forget _spawn_dry_run_unblock below appends its
+                # own later-timestamped proposal — so a fresh investigation's
+                # proposal.timestamp always lands after last_blocked_at.
+                # Default metadata_mode ('merge') preserves sibling keys
+                # (incl. dry_run_proposals). Never raises — mirrors the
+                # existing best-effort dry_run proposal-list trim in
+                # dry_run_unblock.py.
+                try:
+                    await self.scheduler.update_task(
+                        self.task_id, {'last_blocked_at': datetime.now(UTC).isoformat()},
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        '_mark_blocked: last_blocked_at stamp failed for task %s '
+                        '(best-effort, continuing): %s',
+                        self.task_id, exc,
+                    )
                 self._spawn_dry_run_unblock(
                     reason, detail or reason,
                     block_class=(disposition.block_class if disposition is not None else None),

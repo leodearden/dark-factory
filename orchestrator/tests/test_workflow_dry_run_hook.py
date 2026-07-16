@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
@@ -474,6 +475,118 @@ class TestMarkBlockedForwardsResilienceContext:
         kwargs = calls[0]
         assert kwargs.get('usage_gate') is usage_gate_sentinel
         assert kwargs.get('cost_store') is cost_store_sentinel
+
+
+# ---------------------------------------------------------------------------
+# task 2557 step-9: last_blocked_at stamp on confirmed block transition
+# ---------------------------------------------------------------------------
+
+class TestMarkBlockedStampsLastBlockedAt:
+    """_mark_blocked must stamp metadata.last_blocked_at on a confirmed,
+    non-merge_phase block transition (task 2557).
+
+    This is the staleness reference BriefingAssembler._format_prior_proposal
+    compares a persisted dry_run_proposals entry against: a re-block without
+    a fresh investigation must move last_blocked_at past the old proposal so
+    stale analysis is omitted, while a fresh investigation's later-stamped
+    proposal stays included.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mark_blocked_stamps_last_blocked_at(self, tmp_path):
+        wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='46', enabled=True)
+
+        async def _spy_dry_run(**kwargs):
+            pass
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._mark_blocked('verify exhausted', detail='All attempts failed')
+
+        await asyncio.sleep(0)  # let any background tasks register
+        pending = list(wf._background_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        # Confirmed block transition: the status write succeeded first.
+        assert 'blocked' in scheduler.statuses.get('46', [])
+
+        # last_blocked_at was stamped via scheduler.update_task, called with
+        # only (task_id, metadata) — the fake scheduler's update_task has no
+        # metadata_mode kwarg at all, so passing one explicitly would raise
+        # TypeError here, pinning that the stamp relies on the real
+        # scheduler's default ('merge') rather than overriding it.
+        stamp_calls = [
+            c for c in scheduler.update_calls
+            if isinstance(c['metadata'], dict) and 'last_blocked_at' in c['metadata']
+        ]
+        assert len(stamp_calls) == 1, f'Expected exactly 1 last_blocked_at stamp, got {stamp_calls}'
+        stamped_value = stamp_calls[0]['metadata']['last_blocked_at']
+        assert isinstance(stamped_value, str)
+        datetime.fromisoformat(stamped_value)  # must be ISO-8601 parseable
+
+
+# ---------------------------------------------------------------------------
+# Amendment (task 2557 review): produce-side ordering invariant.
+# TestMarkBlockedStampsLastBlockedAt above only proves the stamp eventually
+# happens — it would not catch a regression that reordered the stamp to
+# after _spawn_dry_run_unblock. Because run_dry_run_unblock is fire-and-
+# forget (asyncio.create_task), the background task cannot run any of its
+# own code — including its own proposal-append update_task call — until the
+# CURRENT coroutine genuinely yields (e.g. the test's `asyncio.sleep(0)`).
+# With the fake, non-yielding scheduler used here, that means a post-hoc
+# check of relative order in scheduler.update_calls would show "stamp
+# first" regardless of which statement _mark_blocked calls first — it
+# can't distinguish correct from reordered source. So this test instead
+# records the order in which the two *call sites* inside _mark_blocked
+# actually fire: the stamp's scheduler.update_task(...) await vs. the
+# self._spawn_dry_run_unblock(...) invocation. That directly pins the
+# source-level sequencing described at workflow.py's `_mark_blocked`
+# comment (search "Awaited synchronously here, BEFORE the fire-and-forget"),
+# which is what guarantees a fresh investigation's proposal timestamp lands
+# after last_blocked_at under a real (slow, potentially-concurrent)
+# scheduler in production.
+# ---------------------------------------------------------------------------
+
+class TestMarkBlockedStampPrecedesDryRunSpawn:
+    @pytest.mark.asyncio
+    async def test_last_blocked_at_stamp_precedes_dry_run_spawn(self, tmp_path):
+        wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='52', enabled=True)
+
+        call_order: list[str] = []
+
+        real_update_task = scheduler.update_task
+
+        async def _tracking_update_task(task_id, metadata, *, append=False):
+            if isinstance(metadata, dict) and 'last_blocked_at' in metadata:
+                call_order.append('stamp')
+            return await real_update_task(task_id, metadata, append=append)
+
+        scheduler.update_task = _tracking_update_task  # type: ignore[method-assign]
+
+        real_spawn = wf._spawn_dry_run_unblock
+
+        def _tracking_spawn(*args, **kwargs):
+            call_order.append('spawn')
+            return real_spawn(*args, **kwargs)
+
+        wf._spawn_dry_run_unblock = _tracking_spawn  # type: ignore[method-assign]
+
+        async def _spy_dry_run(**kwargs):
+            pass
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._mark_blocked('verify exhausted', detail='All attempts failed')
+
+        await asyncio.sleep(0)  # let any background tasks register/finish
+        pending = list(wf._background_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        assert call_order == ['stamp', 'spawn'], (
+            'Expected the last_blocked_at stamp to be awaited BEFORE '
+            '_spawn_dry_run_unblock is invoked, so a freshly-produced '
+            f'proposal always compares as non-stale; got {call_order}'
+        )
 
 
 # ---------------------------------------------------------------------------
