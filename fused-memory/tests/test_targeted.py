@@ -3054,6 +3054,77 @@ async def test_on_task_done_provenance_refetch_fails_open(
 
 
 # ---------------------------------------------------------------------------
+# Repeat same-task done-transition provenance freshness (task 2647)
+#
+# A task can transition to `done` twice within one reconciliation window
+# (e.g. reopened then re-completed). `task_before` is the PRE-transition
+# snapshot captured BEFORE the CURRENT transition's done_provenance is
+# persisted (task_interceptor.py's _apply_status_transition), and reopening
+# out of a terminal status does not clear a prior done_provenance -- so on a
+# repeat done-transition task_before's snapshot metadata carries the FIRST
+# transition's STALE done_provenance, which is nonetheless "usable" by
+# _format_outcome_echo. _fetch_done_provenance must never trust that
+# stale-but-usable snapshot value: the live re-fetch is the only source that
+# reliably observes the just-persisted CURRENT transition's provenance.
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_repeat_done_echoes_current_not_stale_snapshot_provenance(
+    reconciler, mock_memory_service, mock_taskmaster,
+):
+    """Regression test for task 2647: on a SECOND done-transition of task
+    2394 within one reconciliation window, task_before's snapshot metadata
+    carries the FIRST transition's stale-but-usable done_provenance (commit
+    f03df179...), while the live task (re-fetched via get_task) carries the
+    CURRENT transition's fresh done_provenance (commit b045a72d...). The
+    completion echo must reflect the LIVE value, and the live re-fetch must
+    actually run rather than short-circuiting on the stale snapshot."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        'id': '2394', 'title': 'Repeat-done task', 'status': 'done',
+        'metadata': {
+            'done_provenance': {
+                'kind': 'merged',
+                'commit': 'b045a72de2e02802ffd0bb37794fdf293fb0f7e2',
+            },
+        },
+    })
+
+    await reconciler.reconcile_task(
+        task_id='2394', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '2394',
+            'title': 'Repeat-done task',
+            'status': 'in-progress',
+            'metadata': {
+                'done_provenance': {
+                    'kind': 'merged',
+                    'commit': 'f03df179fb9238ebef83b960dc030daf12e9864',
+                },
+                'reopen_reason': 'reify',
+                'reopen_from': 'done',
+            },
+        },
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content') or ''
+    assert 'b045a72d' in content, (
+        f'Expected the LIVE commit to appear in the echo, got: {content!r}'
+    )
+    assert 'f03df179' not in content, (
+        f'Expected the STALE snapshot commit NOT to appear in the echo, got: {content!r}'
+    )
+
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert metadata.get('echo_used_provenance') is True
+
+    mock_taskmaster.get_task.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
 # _fetch_done_provenance snapshot-usability gate (task 2049 amendment)
 #
 # `_fetch_done_provenance` prefers `task_before`'s own snapshot metadata over
