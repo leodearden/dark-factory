@@ -2325,3 +2325,81 @@ def test_read_escalation_status_corrupt_body_returns_none(tmp_path: Path) -> Non
     (escalations_dir / 'esc-bad.json').write_text('{not valid json')
 
     assert sr.read_escalation_status(escalations_dir, 'esc-bad') is None
+
+
+def test_reap_answered_decisions_matrix(tmp_path: Path) -> None:
+    """One reap_answered_decisions call exercises the full close-on-resolve
+    matrix: resolved->ANSWERED, dismissed->DROPPED, pending/unknown->left
+    OPEN, an already-closed decision is skipped WITHOUT consulting the
+    callback, and a decision with no escalation_id is skipped WITHOUT
+    consulting the callback either.
+    """
+    sr.write_decision(
+        _make_decision(id='dec-resolved', escalation_id='esc-1', state=sr.DecisionState.OPEN),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(id='dec-dismissed', escalation_id='esc-2', state=sr.DecisionState.OPEN),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(id='dec-pending', escalation_id='esc-3', state=sr.DecisionState.OPEN),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(id='dec-unknown', escalation_id='esc-4', state=sr.DecisionState.OPEN),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(
+            id='dec-already-answered', escalation_id='esc-5', state=sr.DecisionState.ANSWERED
+        ),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(
+            id='dec-already-dropped', escalation_id='esc-6', state=sr.DecisionState.DROPPED
+        ),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(id='dec-no-escalation', escalation_id=None, state=sr.DecisionState.OPEN),
+        root=tmp_path,
+    )
+
+    # esc-4 deliberately absent from this map -> callback returns None for it.
+    # esc-5/esc-6 map to a close-worthy status too, but must never be
+    # consulted -- their decisions are already closed.
+    statuses = {
+        'esc-1': 'resolved',
+        'esc-2': 'dismissed',
+        'esc-3': 'pending',
+        'esc-5': 'resolved',
+        'esc-6': 'dismissed',
+    }
+    consulted: list[str] = []
+
+    def fake_status(decision: sr.DecisionRecord) -> str | None:
+        consulted.append(decision.id)
+        return statuses.get(decision.escalation_id)
+
+    reaped = sr.reap_answered_decisions(root=tmp_path, escalation_status=fake_status)
+
+    reaped_by_id = {r.id: (r.escalation_id, r.new_state) for r in reaped}
+    assert reaped_by_id == {
+        'dec-resolved': ('esc-1', 'answered'),
+        'dec-dismissed': ('esc-2', 'dropped'),
+    }
+    # Only the still-OPEN, escalation-bearing decisions are ever passed to
+    # the callback -- already-closed and no-escalation_id decisions are
+    # skipped before it is invoked.
+    assert set(consulted) == {'dec-resolved', 'dec-dismissed', 'dec-pending', 'dec-unknown'}
+
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-resolved'] == sr.DecisionState.ANSWERED
+    assert listed['dec-dismissed'] == sr.DecisionState.DROPPED
+    assert listed['dec-pending'] == sr.DecisionState.OPEN
+    assert listed['dec-unknown'] == sr.DecisionState.OPEN
+    assert listed['dec-already-answered'] == sr.DecisionState.ANSWERED
+    assert listed['dec-already-dropped'] == sr.DecisionState.DROPPED
+    assert listed['dec-no-escalation'] == sr.DecisionState.OPEN
