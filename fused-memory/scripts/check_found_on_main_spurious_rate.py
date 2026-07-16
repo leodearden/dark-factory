@@ -85,10 +85,16 @@ def parse_since(value: str) -> datetime:
     return dt.astimezone(UTC)
 
 
-def _parse_task_timestamp(value: str) -> datetime | None:
-    """Parse a task's ``updatedAt`` string to an aware UTC ``datetime``, or
-    ``None`` if it is missing/unparseable — never raises."""
-    if not value:
+def _parse_task_timestamp(value: Any) -> datetime | None:
+    """Parse a task's ``updatedAt`` value to an aware UTC ``datetime``, or
+    ``None`` if it is missing, non-string, or unparseable — never raises.
+
+    ``value`` comes from an untyped raw task dict (``dict[str, Any]``), so
+    it is not statically known to be a ``str`` — guard with ``isinstance``
+    rather than assuming the shape, consistent with the "never raises"
+    contract.
+    """
+    if not isinstance(value, str) or not value:
         return None
     try:
         return parse_since(value)
