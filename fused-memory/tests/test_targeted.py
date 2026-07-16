@@ -3379,3 +3379,40 @@ async def test_on_task_blocked_reopen_deletes_stale_completion_echo(
     deleted_actions = [a for a in result.get('actions', []) if a['type'] == 'stale_echo_deleted']
     assert len(deleted_actions) == 1
     assert 'echo-stale' in deleted_actions[0].get('memory_ids', [])
+
+
+@pytest.mark.asyncio
+async def test_on_task_blocked_non_reopen_does_not_delete_echo(
+    reconciler, mock_memory_service,
+):
+    """An ordinary pending/in-progress->blocked transition (NOT a
+    reopen-from-done) must skip the stale-echo sweep entirely — no extra
+    Mem0 scroll, no deletion — even when a completion echo happens to be
+    among the task's memories. Existing hint-attachment behavior must be
+    preserved. Fails against step-2's un-gated sweep, which scrolls/deletes
+    on every blocked transition regardless of the pre-transition status."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+        {
+            'id': 'echo-stale',
+            'created_at': '2026-07-16T00:14:06',
+            'metadata': {
+                'source': 'targeted_reconciliation',
+                'task_id': '7',
+                'transition': 'done',
+            },
+        },
+    ])
+    mock_memory_service.search = AsyncMock(return_value=[
+        MemoryResult(id='1', content='relevant info', source_store=SourceStore.mem0, entities=['EntityA']),
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='7', transition='blocked', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '7', 'title': 'T', 'status': 'in-progress'},
+    )
+
+    mock_memory_service.get_memories_by_metadata.assert_not_awaited()
+    mock_memory_service.delete_memory.assert_not_awaited()
+
+    hints_actions = [a for a in result.get('actions', []) if a['type'] == 'hints_attached']
+    assert len(hints_actions) == 1
