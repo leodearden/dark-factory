@@ -790,6 +790,60 @@ class EscalationQueue:
                 )
             return esc
 
+    def stamp_triage(
+        self, escalation_id: str, *, triaged_by: str | None = None, triage_note: str = '',
+    ) -> Escalation | None:
+        """Stamp a triage-ack ANNOTATION on a pending escalation.
+
+        This is deliberately NOT a resolution — it records that a watcher
+        assessed the item (so future rotations can skip re-deriving its
+        disposition) without changing ``status``, ``level``, or archiving it.
+        A {0,1}-level-capped connection that is forbidden to resolve a pending
+        L2 can still stamp triage on it (see server.stamp_triage — ungated).
+
+        **Concurrency contract (sidecar flock).**  Serialized per-id by
+        ``escalation_id_lock``, mirroring ``add_members_to_l2`` /
+        ``attach_dedupe_child``.
+
+        Loads the record directly from ``queue_dir/{escalation_id}.json``
+        (queue root only) — does NOT use ``self.get()``, which falls back to
+        the archive. This refuses archived/resolved records: annotating a
+        closed decision is meaningless, and loading via the archive fallback
+        followed by ``_rewrite`` (which always targets the queue root) would
+        resurrect an archived record into the queue root — the same Defect-2
+        class of bug that motivated task 1498's ``add_members_to_l2`` guard.
+
+        Sets ``triaged_at`` (now, UTC ISO), ``triaged_by`` (only when not
+        ``None`` — a ``None`` arg leaves any existing value untouched), and
+        ``triage_note``. Does NOT touch ``updated_at``: an annotation must not
+        masquerade as a content change (see ``add_members_to_l2`` for the one
+        mutation that does bump ``updated_at``).
+
+        Returns the updated ``Escalation``, or ``None`` when *escalation_id*
+        is not found in the queue root, fails to parse, or is not pending
+        (archived/resolved/dismissed).
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            path = self.queue_dir / f'{escalation_id}.json'
+            if not path.exists():
+                return None
+            try:
+                esc = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+                return None
+
+            if esc.status != 'pending':
+                return None
+
+            esc.triaged_at = datetime.now(UTC).isoformat()
+            if triaged_by is not None:
+                esc.triaged_by = triaged_by
+            esc.triage_note = triage_note
+            self._rewrite(escalation_id, esc)
+            logger.info('stamp_triage: stamped triage ack on %s', escalation_id)
+            return esc
+
     def attach_dedupe_child(
         self, parent_id: str, child_id: str, *, child_severity: str = 'info',
     ) -> Escalation | None:
