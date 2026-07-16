@@ -26,10 +26,11 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import yaml
-from escalation.classify import effective_benign
+from escalation.classify import classify_resolver_tier, effective_benign
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
 
+from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import parse_utc
 
 logger = logging.getLogger(__name__)
@@ -276,6 +277,139 @@ def _origin_block(records: list[tuple[Escalation, dict]], *, now: datetime) -> d
 
 
 # ---------------------------------------------------------------------------
+# Lifespan block
+# ---------------------------------------------------------------------------
+
+_BREACH_SECONDS = 6 * 3600
+
+
+def _lifespan_block(records: list[tuple[Escalation, dict]], *, now: datetime) -> dict:
+    """Lifespan aggregates over *records*: percentiles, samples, open items, promotion.
+
+    - ``percentiles_by_level``: per-``level`` (stringified) p50/p90 of
+      ``resolved_at - timestamp`` seconds, over terminal-with-valid-times
+      records.
+    - ``samples``: one ``[date, tier, level, secs]`` row per terminal-with-
+      valid-times record, ``date`` = ``date(resolved_at)`` (matches
+      ``flow_daily``'s key so the two reconcile — row 11) and ``tier`` =
+      :func:`~escalation.classify.classify_resolver_tier` of ``resolved_by``.
+    - ``open_items``: one ``{id, task_id, level, age_secs, breach_6h}`` per
+      pending record, ``age_secs`` = ``now - timestamp``,
+      ``breach_6h`` = ``age_secs > 6h``.
+    - ``l1_to_l2_promotion``: ``{count, p50_secs, p90_secs}`` computed from
+      every ``level == 2`` record's ``members`` — ``L2.timestamp -
+      member.timestamp`` per member id found in the by-id index (uses the
+      L2's OWN ``timestamp``, i.e. promotion time, not its resolution —
+      this is independent of whether the L2 itself is terminal or still
+      pending). Missing members and negative deltas are skipped with a
+      WARNING. ``p50_secs``/``p90_secs`` are ``None`` when no deltas were
+      collected. No L0->L1 metric — see design_decisions (open question 7):
+      the model has no machine-readable L0->L1 link.
+    """
+    by_id: dict[str, Escalation] = {esc.id: esc for esc, _raw in records}
+
+    secs_by_level: dict[int, list[float]] = {}
+    samples: list[list] = []
+    open_items: list[dict] = []
+    promotion_deltas: list[float] = []
+
+    for esc, _raw in records:
+        if esc.level == 2 and esc.members:
+            try:
+                l2_filed_at = parse_utc(esc.timestamp)
+            except (TypeError, ValueError):
+                logger.warning(
+                    '_lifespan_block: unparseable timestamp on L2 cluster %s: %r',
+                    esc.id, esc.timestamp,
+                )
+                l2_filed_at = None
+            if l2_filed_at is not None:
+                for member_id in esc.members:
+                    member = by_id.get(member_id)
+                    if member is None:
+                        logger.warning(
+                            '_lifespan_block: l1_to_l2_promotion member %s of %s not found '
+                            'in archive', member_id, esc.id,
+                        )
+                        continue
+                    try:
+                        member_filed_at = parse_utc(member.timestamp)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            '_lifespan_block: unparseable timestamp on member %s of %s',
+                            member_id, esc.id,
+                        )
+                        continue
+                    delta = (l2_filed_at - member_filed_at).total_seconds()
+                    if delta < 0:
+                        logger.warning(
+                            '_lifespan_block: negative l1_to_l2_promotion delta (%.1fs) for '
+                            'member %s of %s', delta, member_id, esc.id,
+                        )
+                        continue
+                    promotion_deltas.append(delta)
+
+        if esc.status == 'pending':
+            try:
+                filed_at = parse_utc(esc.timestamp)
+            except (TypeError, ValueError):
+                logger.warning(
+                    '_lifespan_block: unparseable timestamp on pending %s: %r',
+                    esc.id, esc.timestamp,
+                )
+                continue
+            age_secs = (now - filed_at).total_seconds()
+            open_items.append({
+                'id': esc.id,
+                'task_id': esc.task_id,
+                'level': esc.level,
+                'age_secs': age_secs,
+                'breach_6h': age_secs > _BREACH_SECONDS,
+            })
+            continue
+
+        if esc.status not in ('resolved', 'dismissed'):
+            continue
+
+        try:
+            filed_at = parse_utc(esc.timestamp)
+            resolved_at = parse_utc(esc.resolved_at)
+        except (TypeError, ValueError):
+            logger.warning(
+                '_lifespan_block: unparseable timestamp(s) on terminal %s (timestamp=%r, '
+                'resolved_at=%r)', esc.id, esc.timestamp, esc.resolved_at,
+            )
+            continue
+
+        secs = (resolved_at - filed_at).total_seconds()
+        tier = classify_resolver_tier(esc.resolved_by)
+        secs_by_level.setdefault(esc.level, []).append(secs)
+        samples.append([resolved_at.date().isoformat(), tier, esc.level, secs])
+
+    percentiles_by_level = {
+        str(level): {
+            'p50': percentile(sorted(secs_list), 50),
+            'p90': percentile(sorted(secs_list), 90),
+        }
+        for level, secs_list in secs_by_level.items()
+    }
+
+    promotion_deltas.sort()
+    l1_to_l2_promotion = {
+        'count': len(promotion_deltas),
+        'p50_secs': percentile(promotion_deltas, 50) if promotion_deltas else None,
+        'p90_secs': percentile(promotion_deltas, 90) if promotion_deltas else None,
+    }
+
+    return {
+        'percentiles_by_level': percentiles_by_level,
+        'l1_to_l2_promotion': l1_to_l2_promotion,
+        'samples': samples,
+        'open_items': open_items,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Per-project aggregation
 # ---------------------------------------------------------------------------
 
@@ -291,7 +425,7 @@ def _aggregate_project(
 
     Returns ``(entry, parse_failures)``. *runs_db* is accepted here (rather
     than only by the workflow block) so the per-project signature is stable
-    across steps — it is not yet read by the origin block alone; the
+    across steps — it is not yet read by the origin/lifespan blocks; the
     workflow block's ``esc_per_done_daily`` (via ``_done_by_day``) consumes
     it in a later step.
     """
@@ -299,5 +433,6 @@ def _aggregate_project(
     entry = {
         'project': project,
         'origin': _origin_block(records, now=now),
+        'lifespan': _lifespan_block(records, now=now),
     }
     return entry, parse_failures
