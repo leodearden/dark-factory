@@ -26,6 +26,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -355,3 +356,112 @@ class TestSweepStaleStatusSnapshotEdgesGuards:
 
         taskmaster.get_statuses.assert_not_awaited()
         assert stats['invalidated'] == 0
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_status_snapshot_edges — best-effort resilience
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepStaleStatusSnapshotEdgesBestEffort:
+    """A transient backend error enumerating, cross-referencing, or invalidating
+    one edge must not abort the sweep for the remaining edges — it is tallied
+    into stats['errors'] and the sweep continues (mirrors
+    sweep_degenerate_task_nodes's best-effort posture). asyncio.CancelledError
+    is never swallowed."""
+
+    @pytest.mark.asyncio
+    async def test_update_edge_failure_is_swallowed_and_second_update_still_attempted(self):
+        """update_edge raises for the first stale edge; the second stale edge's
+        update_edge is still attempted. Only the successful one counts as
+        invalidated, and the failure counts as an error."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+
+        stale_edge_1 = {
+            'uuid': 'edge-stale-1', 'fact': 'Task 142 is an active pending task', 'name': '',
+        }
+        stale_edge_2 = {
+            'uuid': 'edge-stale-2', 'fact': 'Task 144 is an active pending task', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [stale_edge_1, stale_edge_2]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'142': 'done', '144': 'cancelled'})
+        memory_service.update_edge = AsyncMock(
+            side_effect=[RuntimeError('lock contention'), None],
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        assert memory_service.update_edge.await_count == 2, (
+            'The second stale edge must still be attempted after the first update fails'
+        )
+        assert stats == {'scanned': 2, 'candidate_edges': 2, 'invalidated': 1, 'errors': 1}, (
+            f'Expected the failed update tallied as an error without blocking the second, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_all_valid_edges_failure_yields_all_zero_stats_without_raising(self):
+        """get_all_valid_edges raises -> sweep returns all-zero stats (errors
+        tallied) without raising and without calling get_statuses/update_edge."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            side_effect=RuntimeError('transient read timeout'),
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats == {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 1}, (
+            f'Expected all-zero stats with the failure tallied as an error, got {stats!r}'
+        )
+        taskmaster.get_statuses.assert_not_awaited()
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_failure_is_best_effort_no_op(self):
+        """get_statuses raises -> best-effort no-op: errors tallied, no
+        update_edge attempted, no raise."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        candidate_edge = {
+            'uuid': 'edge-candidate', 'fact': 'Task 142 is an active pending task', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [candidate_edge]},
+        )
+        taskmaster.get_statuses = AsyncMock(side_effect=RuntimeError('transient read timeout'))
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats == {'scanned': 1, 'candidate_edges': 0, 'invalidated': 0, 'errors': 1}, (
+            f'Expected the get_statuses failure tallied as an error with no invalidation, got {stats!r}'
+        )
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_from_update_edge_propagates(self):
+        """asyncio.CancelledError raised from update_edge must propagate — it
+        is never swallowed as a best-effort error."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        stale_edge = {
+            'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [stale_edge]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
+        memory_service.update_edge = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await sweep_stale_status_snapshot_edges(
+                memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+            )
