@@ -38,7 +38,12 @@ class TestHermeticMcpSessionRoutesDispatchTool:
         teardown confirms zero live McpSession round-trips.
         """
         config = OrchestratorConfig(project_root=tmp_path)
-        seeded_tasks = [{'id': '1', 'status': 'pending', 'dependencies': []}]
+        # 'metadata': {} is included explicitly so the round-trip through
+        # get_tasks's _normalize_task_metadata (scheduler.py:1920-1924) is a
+        # no-op and the returned list compares equal to the seed.
+        seeded_tasks = [
+            {'id': '1', 'status': 'pending', 'dependencies': [], 'metadata': {}},
+        ]
         scheduler = Scheduler(
             config, mcp_session=HermeticMcpSession(tasks=seeded_tasks),
         )
