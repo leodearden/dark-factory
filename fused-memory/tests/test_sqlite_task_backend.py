@@ -12,10 +12,12 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
+from shared.task_metadata import SchemaWarning
 
 from fused_memory.backends.sqlite_task_backend import (
     SqliteTaskBackend,
     _classify_residual_group,
+    _emit_schema_warning,
     _format_task_id,
     _merge_metadata,
     _parse_qualified_dep,
@@ -344,6 +346,35 @@ async def test_add_task_valid_metadata_emits_no_schema_warning(
     assert census_msgs == [], (
         f'Expected no task_metadata.schema_warning lines for valid metadata; got: {census_msgs}'
     )
+
+
+def test_emit_schema_warning_census_line_includes_code_token(caplog):
+    """The census line threads ``SchemaWarning.code`` as a class discriminator.
+
+    Exercises ``_emit_schema_warning`` directly (independent of any
+    particular add_task/update_task call site) so the format-string contract
+    is pinned on its own: exactly one WARNING record is emitted, and its
+    message carries the grep-anchor token, the task id, the new ``code=``
+    token, and the field — all as separately labeled substrings.
+    """
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        _emit_schema_warning(
+            42, SchemaWarning(field='mystery_field', code='invalid_field', message='boom'),
+        )
+
+    census_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING and 'task_metadata.schema_warning' in r.message
+    ]
+    assert len(census_msgs) == 1, (
+        f'Expected exactly one task_metadata.schema_warning census line; got '
+        f'{len(census_msgs)}: {census_msgs}'
+    )
+    combined = census_msgs[0]
+    for token in (
+        'task_metadata.schema_warning', 'task_id=42', 'code=invalid_field', 'field=mystery_field',
+    ):
+        assert token in combined, f'Expected {token!r} token in census line; got: {combined!r}'
 
 
 @pytest.mark.asyncio

@@ -323,6 +323,55 @@ kind" above. The delayed anchor waits on the same local +
 `metadata.external_deps` dependency gate described in "Cross-project task
 dependencies" above.
 
+### Task metadata vocabulary & census
+
+`parse_metadata` (`shared/src/shared/task_metadata.py`) validates every
+task's `metadata` blob on read and write and returns a list of
+`SchemaWarning`s for anything it can't reconcile; the write-boundary
+backend logs one WARNING line per warning via `_emit_schema_warning`
+(`fused-memory/src/fused_memory/backends/sqlite_task_backend.py`). This is
+the schema-drift census the enforce-gate runbooks grep.
+
+**Census line and the `code=` discriminator:**
+
+```
+task_metadata.schema_warning task_id=<id> code=<class> field=<key> error=<message>
+```
+
+The literal `task_metadata.schema_warning` token is the stable grep
+anchor — never move or rename it. `code=` is the warning's class
+discriminator (`unknown_key`, `invalid_field`, `invalid_submodel`,
+`unparseable_json`, `not_an_object`, `invalid_metadata`). Separate
+enforcement-relevant classes from routine vocabulary noise with:
+
+`grep 'task_metadata.schema_warning' | grep -v code=unknown_key`
+
+**Tier-B: canonical keys, not aliases.** These aliases are deliberately
+*not* on the blessed allowlist below, so each still emits
+`code=unknown_key` as a greppable drift signal until the caller is fixed
+to use the canonical spelling:
+
+| Canonical | Aliases to avoid |
+|---|---|
+| `prd_path` + `prd_task_label` | `prd`, `prd_ref`, `prd_leaf` |
+| `invariants` | `inv` |
+| `related_tasks` | `related_task`, `related_df_tasks`, `related_task_examples` |
+
+**Tier-C: ad-hoc keys.** One-off, timestamped, or id-suffixed annotation
+keys (e.g. `reconciliation_with_5123`) must never be filed as a bespoke
+top-level metadata key — that just adds another `code=unknown_key` census
+line. Use the `x_`-prefixed forward-compat namespace instead (e.g.
+`x_reconciliation_note`) — silently allowed, no warning — or fold the
+value into a single `annotations` field.
+
+**Promoting a convention:** a key only stops warning once it's added to
+the `_BLESSED_METADATA_KEYS` frozenset in
+`shared/src/shared/task_metadata.py` (the Tier-A load-bearing allowlist —
+an allowlist rather than typed optional fields, so `model_dump()` doesn't
+grow `None`-valued noise on every task). Add a key there only for a
+genuinely load-bearing, stable convention; Tier-B/C drift should be fixed
+by renaming to the canonical key or moving under `x_`, not by blessing it.
+
 ## Session Lifecycle
 
 ### Starting a session

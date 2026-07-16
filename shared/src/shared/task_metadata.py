@@ -270,7 +270,7 @@ class TaskMetadata(BaseModel):
 
     model_config = ConfigDict(extra='allow')
 
-    schema_version: int = 1
+    schema_version: int = 2
     task_kind: Literal['normal', 'deterministic'] = 'normal'
     always_escalates: bool = False
     before_done: BeforeDone | None = None
@@ -363,11 +363,67 @@ def _migrate_v0_to_v1(blob: dict) -> dict:
     return upgraded
 
 
+# RetryLedger fields that some legacy blobs (pre-2172 placement) still carry
+# as TOP-LEVEL metadata keys instead of nested under metadata.retry_ledger.
+_LEGACY_RETRY_LEDGER_COUNTER_KEYS = (
+    'consecutive_infra_resume_failures',
+    'last_infra_resume_iteration_count',
+)
+
+
+def _migrate_v1_to_v2(blob: dict) -> dict:
+    """v1->v2: lift legacy top-level infra-resume counters into ``retry_ledger``.
+
+    ``consecutive_infra_resume_failures`` / ``last_infra_resume_iteration_count``
+    are :class:`RetryLedger` fields, but some legacy blobs still carry them
+    as top-level metadata keys (the live orchestrator writer already nests
+    them correctly; this migration only repairs old data at parse-time).
+
+    If ``retry_ledger`` is absent, any present legacy top-level counters are
+    popped and merged into a new ``retry_ledger`` dict. If ``retry_ledger``
+    is already a dict, it is ALWAYS copied — never the same object as
+    ``blob['retry_ledger']``, even when there are no top-level counters to
+    lift — and any present counters are merged in, with an existing nested
+    value winning on key conflict. If ``retry_ledger`` is present but not a
+    dict (already-malformed data), nothing is lifted or copied — the
+    top-level counters are left as-is and the existing ``invalid_field``
+    warning path (in :func:`parse_metadata`) handles the malformed value.
+    Always stamps ``schema_version=2``. Non-mutating overall, mirroring
+    :func:`_migrate_v0_to_v1`: ``blob`` itself is never modified in place.
+    """
+    upgraded = dict(blob)
+    present = {
+        key: upgraded[key] for key in _LEGACY_RETRY_LEDGER_COUNTER_KEYS if key in upgraded
+    }
+
+    existing_ledger = upgraded.get('retry_ledger')
+    if isinstance(existing_ledger, dict):
+        # Always copy, even when `present` is empty: the returned ledger
+        # must never be the same object as the caller's nested dict, so a
+        # later in-place mutation of it can never reach back into `blob`.
+        new_ledger = dict(existing_ledger)
+        for key, value in present.items():
+            new_ledger.setdefault(key, value)
+            del upgraded[key]
+        upgraded['retry_ledger'] = new_ledger
+    elif present and existing_ledger is None:
+        new_ledger = dict(present)
+        for key in present:
+            del upgraded[key]
+        upgraded['retry_ledger'] = new_ledger
+    # else: retry_ledger is present but not a dict (malformed) -- leave
+    # everything untouched; no lift, no copy.
+
+    upgraded['schema_version'] = 2
+    return upgraded
+
+
 # Versioned migration registry, keyed by SOURCE schema_version. apply_migrations
 # chains through this until the blob's schema_version has no registered migration
 # (i.e. it is current).
 _MIGRATIONS: dict[int, Callable[[dict], dict]] = {
     0: _migrate_v0_to_v1,
+    1: _migrate_v1_to_v2,
 }
 
 
@@ -407,6 +463,60 @@ class SchemaWarning(BaseModel):
 # key: a whole-blob JSON parse failure, or a whole-model cross-field
 # invariant violation (PRD §5 `_deterministic_invariants`, `loc == ()`).
 _WHOLE_METADATA_FIELD = '<metadata>'
+
+
+# Tier-A: the 34 load-bearing conventional metadata keys that real writers
+# (orchestrator, curator, DeterministicRunner, escalation flows) already
+# depend on but that are not (yet) typed TaskMetadata fields. Skipped in
+# parse_metadata's unknown-key scan below so a deliberate, documented
+# convention doesn't manufacture unknown_key census noise — extra='allow'
+# still preserves each value byte-for-value (I1). None of these collide with
+# TaskMetadata.model_fields or _SUBMODEL_REGISTRY (only 'milestone' is
+# currently registered there). gate_escalated_at / before_done_ran_at /
+# before_done_verified_at / before_done_verified_pid are the
+# DeterministicRunner's own stamps (CLAUDE.md "Deterministic task kind").
+#
+# Tier-B alias-drift keys (prd/prd_ref/prd_leaf, inv, related_task*) and
+# Tier-C ad-hoc/timestamped one-off keys are deliberately NOT included here
+# — they keep emitting unknown_key as a greppable drift signal; see
+# CLAUDE.md "Task metadata vocabulary & census" for the documented
+# consolidation convention.
+_BLESSED_METADATA_KEYS: frozenset[str] = frozenset({
+    'source',
+    'modules',
+    'spawn_context',
+    'complexity',
+    'force_full_path',
+    'branch_base_sha',
+    '_causation_id',
+    'dry_run_proposals',
+    'reblock_guard',
+    'agent_id',
+    'escalation_id',
+    'suggestion_hash',
+    'prd_path',
+    'prd_task_label',
+    'user_observable_signal',
+    'consumer_ref',
+    'substrate_confirmed',
+    'human_decomposed',
+    'grammar_confirmed',
+    'invariants',
+    'optimistic_path',
+    'capability_manifest',
+    'curator_action',
+    'curator_justification',
+    'combined_at',
+    'gate_escalated_at',
+    'before_done_ran_at',
+    'before_done_verified_at',
+    'before_done_verified_pid',
+    'origin_finding_id',
+    'spawned_from',
+    'program',
+    'program_stream',
+    'stream',
+})
 
 
 def parse_metadata(
@@ -563,7 +673,7 @@ def parse_metadata(
 
     known_fields = set(TaskMetadata.model_fields) | set(_SUBMODEL_REGISTRY)
     for key in parsed:
-        if key in known_fields or key.startswith('x_'):
+        if key in known_fields or key.startswith('x_') or key in _BLESSED_METADATA_KEYS:
             continue
         warnings.append(
             SchemaWarning(

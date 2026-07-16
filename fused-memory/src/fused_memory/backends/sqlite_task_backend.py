@@ -830,11 +830,14 @@ def _emit_schema_warning(task_id: int, warning: SchemaWarning) -> None:
     census greps for in the fused-memory journal (PRD §1/§5) — it is
     deliberately distinct from the ``_warn_malformed_metadata_once``
     read-path token (``'malformed metadata'``) so the two censuses never
-    conflate.
+    conflate. The ``code=`` token (the warning's class discriminator, e.g.
+    ``unknown_key``/``invalid_field``/``invalid_submodel``) lets operators
+    separate enforcement-relevant classes from ``unknown_key`` noise via
+    ``grep 'task_metadata.schema_warning' | grep -v code=unknown_key``.
     """
     logger.warning(
-        'task_metadata.schema_warning task_id=%s field=%s error=%s',
-        task_id, warning.field, warning.message,
+        'task_metadata.schema_warning task_id=%s code=%s field=%s error=%s',
+        task_id, warning.code, warning.field, warning.message,
     )
 
 
