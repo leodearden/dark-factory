@@ -2911,9 +2911,27 @@ class Scheduler:
                     over_budget = True
                     break
                 used += 1
-                result = await run_delivered_check(
-                    check, project_root=self._project_root, ref=main_sha
-                )
+                try:
+                    result = await asyncio.wait_for(
+                        run_delivered_check(
+                            check, project_root=self._project_root, ref=main_sha
+                        ),
+                        timeout=self.config.delivered_checks.check_timeout_secs,
+                    )
+                except TimeoutError:
+                    # Fail-safe (task 2583, epsilon): a hung check (primarily
+                    # the timeout-less grep kind; defense-in-depth for
+                    # scripts, which also carry their own descriptor
+                    # timeout_secs) maps to ERRORED — same downstream
+                    # handling as a runner exception (row 7: left uncached,
+                    # no hold event, no streak bump, retried next sweep).
+                    logger.warning(
+                        'Delivered-check %r (dep %s) exceeded '
+                        'check_timeout_secs=%s — treating as ERRORED (fail-safe)',
+                        check.get('name'), dep_id,
+                        self.config.delivered_checks.check_timeout_secs,
+                    )
+                    result = DeliveredCheckResult.ERRORED
                 results.append((check, result))
 
             if over_budget:
