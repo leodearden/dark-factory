@@ -21,6 +21,7 @@ from pydantic import BaseModel, ValidationError
 
 import shared.task_metadata as task_metadata_module
 from shared.task_metadata import (
+    KNOWN_ROLE_NAMES,
     BeforeDone,
     DoneProvenance,
     ExternalDep,
@@ -33,6 +34,7 @@ from shared.task_metadata import (
     apply_migrations,
     parse_metadata,
     register_metadata_submodel,
+    validate_model_overrides,
 )
 
 
@@ -580,6 +582,81 @@ class TestRoutingStateTransforms:
 
     def test_from_metadata_malformed_routing_dict_returns_default_never_raises(self):
         assert RoutingState.from_metadata({'routing': {'history': 'bad'}}) == RoutingState()
+
+
+class TestModelOverridesShapeAuthority:
+    """``validate_model_overrides`` / ``KNOWN_ROLE_NAMES`` — the shared shape
+    authority for ``metadata.model_overrides`` (PRD adaptive-model-routing
+    task ζ, PRD decision 9).
+
+    SHAPE only (known role names + string values). Model *string* validation
+    against an allowlist is the orchestrator resolver's fail-safe job at
+    resolve time, not this module's — fused-memory does not know the
+    orchestrator's ``routing.allowed_models``.
+    """
+
+    def test_well_formed_override_returns_none(self):
+        assert validate_model_overrides({'implementer': 'haiku'}) is None
+
+    def test_empty_dict_is_valid(self):
+        assert validate_model_overrides({}) is None
+
+    def test_unknown_role_raises_and_names_the_role(self):
+        with pytest.raises(ValueError, match='bogus_role'):
+            validate_model_overrides({'bogus_role': 'haiku'})
+
+    def test_non_string_value_raises(self):
+        with pytest.raises(ValueError):
+            validate_model_overrides({'implementer': 123})
+
+    @pytest.mark.parametrize('value', [['implementer', 'haiku'], 'implementer'])
+    def test_non_dict_value_raises(self, value):
+        with pytest.raises(ValueError):
+            validate_model_overrides(value)
+
+    def test_known_role_names_is_frozenset_with_expected_members(self):
+        assert isinstance(KNOWN_ROLE_NAMES, frozenset)
+        for role in (
+            'architect',
+            'implementer',
+            'reviewer_comprehensive',
+            'judge',
+            'simple_task',
+        ):
+            assert role in KNOWN_ROLE_NAMES
+
+
+class TestModelOverridesField:
+    """``TaskMetadata.model_overrides`` — the typed round-tripping field
+    itself (PRD adaptive-model-routing task ζ). A plain ``dict[str, str]``
+    field mirroring ``external_deps: list[str]`` — role-name/value shape
+    validation is NOT duplicated here as a model_validator; it stays
+    single-sourced in ``validate_model_overrides``
+    (``TestModelOverridesShapeAuthority`` above) / the fused-memory guard
+    that delegates to it.
+    """
+
+    def test_default_is_empty_dict(self):
+        assert TaskMetadata().model_overrides == {}
+
+    def test_constructs_with_value(self):
+        tm = TaskMetadata(model_overrides={'implementer': 'haiku'})
+        assert tm.model_overrides == {'implementer': 'haiku'}
+
+    def test_parse_metadata_write_enforce_round_trips(self):
+        model, _ = parse_metadata(
+            {'model_overrides': {'implementer': 'haiku'}},
+            direction='write',
+            enforce=True,
+        )
+        assert model.model_dump()['model_overrides'] == {'implementer': 'haiku'}
+
+    def test_parse_metadata_read_emits_no_unknown_key_warning(self):
+        _, warnings = parse_metadata(
+            {'model_overrides': {'implementer': 'haiku'}}, direction='read'
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'model_overrides' not in unknown_key_fields
 
 
 class TestTaskMetadataFields:

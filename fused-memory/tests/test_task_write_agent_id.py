@@ -296,3 +296,81 @@ async def test_submit_task_handler_resolves_ctx_and_forwards_agent_id(
 
     task_interceptor.submit_task.assert_awaited_once()
     assert task_interceptor.submit_task.await_args.kwargs.get('agent_id') == AGENT_ID
+
+
+# ---------------------------------------------------------------------------
+# model_overrides shape guard ζ: submit_task / update_task wiring (task 2536)
+# ---------------------------------------------------------------------------
+
+
+class TestModelOverridesGuardWiring:
+    """metadata.model_overrides shape guard wired into submit_task/update_task.
+
+    Reuses this module's mcp_server/task_interceptor fixtures + _raw helper.
+    Uses a plain (non-``recon-stage-``) explicit agent_id and no ctx so the
+    execution_class guard (task 2225/eta) never fires — the model_overrides
+    guard is exercised in isolation, and its rejection must short-circuit
+    before the interceptor is ever awaited (no partial persistence).
+    """
+
+    @pytest.mark.asyncio
+    async def test_submit_task_malformed_model_overrides_rejects_and_short_circuits(
+        self, mcp_server, task_interceptor,
+    ):
+        handler = _raw(mcp_server, 'submit_task')
+
+        result = await handler(
+            project_root='/project',
+            title='x',
+            metadata={'model_overrides': {'bogus_role': 'haiku'}},
+            agent_id='claude-test',
+        )
+
+        assert result.get('error_type') == 'ValidationError'
+        task_interceptor.submit_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_submit_task_well_formed_model_overrides_awaits_interceptor(
+        self, mcp_server, task_interceptor,
+    ):
+        handler = _raw(mcp_server, 'submit_task')
+
+        await handler(
+            project_root='/project',
+            title='x',
+            metadata={'model_overrides': {'implementer': 'haiku'}},
+            agent_id='claude-test',
+        )
+
+        task_interceptor.submit_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_update_task_malformed_model_overrides_rejects_and_short_circuits(
+        self, mcp_server, task_interceptor,
+    ):
+        handler = _raw(mcp_server, 'update_task')
+
+        result = await handler(
+            id='1',
+            project_root='/project',
+            metadata={'model_overrides': {'implementer': 123}},
+            agent_id='claude-test',
+        )
+
+        assert result.get('error_type') == 'ValidationError'
+        task_interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_task_well_formed_model_overrides_awaits_interceptor(
+        self, mcp_server, task_interceptor,
+    ):
+        handler = _raw(mcp_server, 'update_task')
+
+        await handler(
+            id='1',
+            project_root='/project',
+            metadata={'model_overrides': {'implementer': 'haiku'}},
+            agent_id='claude-test',
+        )
+
+        task_interceptor.update_task.assert_awaited_once()

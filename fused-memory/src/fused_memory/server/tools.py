@@ -33,6 +33,7 @@ from fused_memory.middleware.lock_charter_guard import (
     extract_files,
     lock_charter_error,
 )
+from fused_memory.middleware.model_overrides_guard import model_overrides_error
 from fused_memory.middleware.premise_lint_guard import premise_lint_error
 from fused_memory.middleware.routing_intent_guard import (
     routing_intent_enforced,
@@ -3361,6 +3362,15 @@ def create_mcp_server(
             return _det_err
         metadata = inject_task_kind(metadata, task_kind)
 
+        # model_overrides shape guard ζ (PRD adaptive-model-routing, decision 9):
+        # reject a malformed metadata.model_overrides (unknown role name,
+        # non-string value, non-dict) before persistence. Shape only — model
+        # *string* validation against the orchestrator's allowlist is the
+        # resolver's fail-safe job at resolve time, not this boundary's.
+        _mo_err = model_overrides_error(metadata)
+        if _mo_err is not None:
+            return _mo_err
+
         # Execution-class guard η: for recon-stage callers, require + validate
         # metadata.execution_class (declaration layer, PRD §8.5), then normalise
         # so the declared class persists via the existing metadata path. This is
@@ -3810,6 +3820,13 @@ def create_mcp_server(
         _dirs = directory_locks(extract_files(metadata))
         if _dirs:
             return lock_charter_error(_dirs)
+
+        # model_overrides shape guard ζ (PRD adaptive-model-routing, decision 9):
+        # see the matching submit_task call site above for the full rationale.
+        _mo_err = model_overrides_error(metadata)
+        if _mo_err is not None:
+            return _mo_err
+
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
         return await task_interceptor.update_task(
