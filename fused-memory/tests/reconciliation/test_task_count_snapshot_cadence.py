@@ -633,6 +633,47 @@ class TestPruneSnapshotStats:
             'task_count_snapshot_prune_enumeration_ok': 1,
         }
 
+    @pytest.mark.asyncio
+    async def test_enumeration_failure_is_observably_distinct_from_empty(self):
+        """The incident fingerprint: a silent enumeration failure must be
+        distinguishable from a genuine empty result. Both return 0/leave
+        enumerated=0/pruned=0, but only the failure case sets
+        enumeration_ok=0 -- a single delete-count int cannot make this
+        distinction."""
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.side_effect = RuntimeError('mem0 down')
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 0
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 0,
+            'task_count_snapshot_pruned': 0,
+            'task_count_snapshot_prune_enumeration_ok': 0,
+        }
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_genuine_empty_enumeration_sets_enumeration_ok(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+        observed = {}
+
+        result = await _prune_task_count_snapshots(
+            memory_service, 'reify', 'run-1', stats=observed,
+        )
+
+        assert result == 0
+        assert observed == {
+            'task_count_snapshot_prune_enumerated': 0,
+            'task_count_snapshot_pruned': 0,
+            'task_count_snapshot_prune_enumeration_ok': 1,
+        }
+        memory_service.delete_memory.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # _write_task_count_snapshot (stages/task_knowledge_sync.py) -- task 2325 step-5/6
