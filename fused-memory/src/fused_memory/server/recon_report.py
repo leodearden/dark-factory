@@ -303,6 +303,7 @@ class _Finding:
     cited_edges: list[dict] = field(default_factory=list)
     cited_tasks: list[dict] = field(default_factory=list)
     cited_memories: list[dict] = field(default_factory=list)
+    cited_runs: list[dict] = field(default_factory=list)  # task-2595
 
 
 @dataclass
@@ -422,6 +423,13 @@ _ERR_UNKNOWN_PROJECT: dict[str, str] = {
 _ERR_MEMORY_NOT_FOUND: dict[str, str] = {
     'error': 'memory_not_found',
     'error_type': 'ReconReportMemoryNotFound',
+}
+
+# task-2595: returned by cite_run when count_memories_by_metadata finds no
+# mem0 records under {'run_id': cited_run_id} — the cited run does not exist.
+_ERR_RUN_NOT_FOUND: dict[str, str] = {
+    'error': 'run_not_found',
+    'error_type': 'ReconReportRunNotFound',
 }
 
 _ERR_INVALID_UUID_SHAPE: dict[str, str] = {
@@ -927,6 +935,7 @@ class ReconReportState:
                 'cited_edges': list(f.cited_edges),
                 'cited_tasks': list(f.cited_tasks),
                 'cited_memories': list(f.cited_memories),
+                'cited_runs': list(f.cited_runs),  # task-2595
             }
             # Cross-project routing taxonomy guard (task-2453): downgrade an
             # anchor-less cross_project_routing claim before the Fix-1 check
@@ -1414,6 +1423,75 @@ class ReconReportState:
 
         citation = {'memory_id': memory_id, 'store': store, 'metadata_fingerprint': fingerprint}
         finding.cited_memories.append(citation)
+        return citation
+
+    async def cite_run(
+        self,
+        run_id: str,
+        finding_id: str,
+        cited_run_id: str,
+    ) -> dict[str, Any]:
+        """Validate *cited_run_id* shape, confirm it exists, and record the citation.
+
+        Closes the gap named by task 2595: a run_id quoted inline in a
+        finding's free-text ``description``/``suggested_action`` was
+        previously validated by NONE of cite_entity/cite_edge/cite_task/
+        cite_memory, so an LLM re-typing a historical run_id from memory
+        (instead of copying it verbatim off a fresh tool result) could
+        silently drift by a hex group with nothing downstream catching it
+        until a future agent manually re-fetched the source record. cite_run
+        hands the caller a structured ``run_not_found`` error to self-correct
+        on mid-cycle instead.
+
+        Existence is confirmed via
+        ``memory_service.count_memories_by_metadata(project_id, {'run_id':
+        cited_run_id})`` rather than a live-run registry lookup:
+        reconciliation runs always write cycle summaries to mem0 keyed by
+        their run_id, so a >0 mem0 count is a sound existence proxy — the
+        same signal the originating incident's remediation used to
+        self-catch the bug by hand (a 0-count
+        ``get_memories_by_metadata(run_id=...)`` call). No memory_service
+        change was needed: ``count_memories_by_metadata`` already existed as
+        the exact Qdrant metadata-equality count primitive.
+
+        Returns {run_id, match_count} on success, or a structured error dict
+        (run_id_unknown / finding_unknown / invalid_uuid_shape / run_not_found
+        / service_not_configured). UUID shape is checked before any service
+        call. Appends to finding.cited_runs only on success, always (no
+        dedup) — matching cite_edge/cite_memory rather than cite_task's fold,
+        whose dedup-anchor machinery a run citation does not need.
+
+        ``cited_runs`` is deliberately EXCLUDED from
+        :func:`_citation_identities` (and therefore from Fix-1 same-run echo
+        suppression): a cited run_id is provenance for a claim, not a
+        task/entity/edge/memory identity that suppression reasons about.
+        Folding it in could silently change which findings get suppressed;
+        leaving it out keeps all existing suppression/dedup behavior
+        byte-identical.
+        """
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        resolved = self._resolve_finding(run_id, finding_id)
+        if resolved is None:
+            return _ERR_FINDING_UNKNOWN.copy()
+        finding_entry, finding = resolved
+
+        if not _UUID_RE.match(cited_run_id):
+            return _ERR_INVALID_UUID_SHAPE.copy()
+
+        if self._memory_service is None:
+            return _ERR_SERVICE_UNAVAILABLE.copy()
+
+        count = await self._memory_service.count_memories_by_metadata(
+            finding_entry.project_id, {'run_id': cited_run_id}
+        )
+        if count == 0:
+            return _ERR_RUN_NOT_FOUND.copy()
+
+        citation = {'run_id': cited_run_id, 'match_count': count}
+        finding.cited_runs.append(citation)
         return citation
 
     # ------------------------------------------------------------------
