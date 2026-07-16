@@ -330,6 +330,22 @@ class StaleServiceRestartCoordinator:
         silences the backstop" hole).  Default True keeps the fused-memory
         and dashboard coordinators (which pass no ``state_path`` anyway)
         byte-identical.
+
+        Caveat when False: THIS coordinator's own ``_last_fire_wall`` still
+        re-seeds from ``state_path`` at every construction — i.e. on every
+        orchestrator process restart (see ``_load_last_fire_wall``). Because
+        the script stamps that file only AFTER every unit — including this
+        one, restarted last — verifies fresh, a freshly-restarted process
+        can construct and re-seed BEFORE that post-restart stamp lands,
+        transiently seeding from the prior (stale or absent) value. Worst
+        case this relaxes this coordinator's OWN ``min_interval_secs`` cap
+        by one extra fire across that single restart — bounded, and the
+        same "a lost timestamp merely relaxes the cap once" tolerance
+        already accepted below for persist failures. Callers that need a
+        hard cross-restart rate limit should treat the watchdog's
+        independent clock gate (``ORCH_RESTART_MIN_INTERVAL_SECS`` in
+        scripts/orchestrator-watchdog.py), not this in-memory cap, as
+        authoritative.
     """
 
     def __init__(

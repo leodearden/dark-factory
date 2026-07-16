@@ -6901,6 +6901,10 @@ Output JSON matching the schema. Every task must appear in the output.
             # registration of a detached deploy that may later fail) would
             # silently silence the backstop for a full min_interval_secs
             # window (task 2396, fleet-redeploy β; closes hole I2).
+            # Caveat: this coordinator's OWN _last_fire_wall still re-seeds
+            # from state_path on every process restart, so it can transiently
+            # lag the script's post-restart stamp by one fire — see
+            # StaleServiceRestartCoordinator's stamp_clock_on_fire docstring.
             stamp_clock_on_fire=False,
         )
 
