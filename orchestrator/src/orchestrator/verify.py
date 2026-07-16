@@ -5041,6 +5041,25 @@ async def verify_failure_is_preexisting_on_main(
         if not main_sha:
             return False, ''
 
+        # Task μ (verify-scope-inversion-prd.md): when the failing result
+        # carries junit-derived failing_test_ids (merge+full breadth — see
+        # run_verification), decide via a per-main-SHA failing-test-id
+        # baseline diff instead of the (category, cause_hint) signature
+        # comparison below (B1). A baseline of None (B3 degrade — OPAQUE/
+        # non-pytest command, or the baseline probe itself failed) falls
+        # through to the existing signature-comparison path unchanged, and
+        # failing_test_ids=None (today's callers, e.g. task-verify at
+        # workflow.py) always takes that legacy path too.
+        if failing_result.failing_test_ids is not None:
+            baseline = await main_baseline_failing_ids(
+                config, module_configs, git_ops, main_sha,
+            )
+            if baseline is not None:
+                branch_ids = frozenset(failing_result.failing_test_ids)
+                wholly = is_wholly_preexisting(branch_ids, baseline)
+                return wholly, (main_sha if wholly else '')
+            # baseline is None (B3) — fall through to the legacy probe below.
+
         # Check the process-wide probe cache before paying the worktree-add cost.
         _norm_hint = _normalize(failing_result.cause_hint)
         _cache_key = (main_sha, failing_result.category or '', _norm_hint)
