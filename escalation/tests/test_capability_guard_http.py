@@ -208,6 +208,31 @@ async def _promote_over_http(
         return result.data
 
 
+async def _stamp_triage_over_http(
+    base_url: str,
+    *,
+    levels: str | None = None,
+    identity: str | None = None,
+    **stamp_kwargs: Any,
+) -> dict[str, Any]:
+    """Call ``stamp_triage`` over real HTTP, optionally with capability headers.
+
+    Mirrors ``_resolve_over_http`` / ``_promote_over_http`` — used to prove
+    ``stamp_triage`` is never gated by X-Escalation-Levels (a triage-ack
+    annotation, not a state transition) while ``triaged_by`` is still
+    server-attributed from X-Escalation-Identity when present.
+    """
+    headers: dict[str, str] = {}
+    if levels is not None:
+        headers['X-Escalation-Levels'] = levels
+    if identity is not None:
+        headers['X-Escalation-Identity'] = identity
+    transport = StreamableHttpTransport(f'{base_url}/mcp/', headers=headers)
+    async with Client(transport) as client:
+        result = await client.call_tool('stamp_triage', stamp_kwargs)
+        return result.data
+
+
 # ---------------------------------------------------------------------------
 # TestHarnessSanity: fixture plumbing only — no capability-guard behaviour yet.
 # ---------------------------------------------------------------------------
@@ -1223,4 +1248,93 @@ class TestL2AutoCloseCarveout:
         assert reread.resolved_by == 'escalation-watcher', (
             f'Expected the tool-arg resolved_by (no Identity header to override it), '
             f'got: {reread.resolved_by!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestTriageAnnotationUngated (task 2555): stamp_triage is NOT gated by the
+# connection-capability level check — a {0,1}-level-capped connection (the
+# deployed auto-watcher) can annotate a pending L2 it is still forbidden to
+# resolve. triaged_by is server-attributed from X-Escalation-Identity,
+# non-spoofable, mirroring resolve_issue's resolved_by override.
+# ---------------------------------------------------------------------------
+
+
+class TestTriageAnnotationUngated:
+    """A {0,1}-capped connection can stamp triage on a pending L2 (ungated,
+    server-attributed identity) but is still denied resolve_issue(action=
+    'resume') on that same record — proving triage is an annotation, not a
+    resolution.
+
+    Uses action='resume' (not close_only) for the deny assertion so it stays
+    robust against task 2630's narrow l2_auto_close_class close_only
+    carve-out — resume/restart/park/abandon are unconditionally
+    level_forbidden at L2 for the {0,1} cap.
+    """
+
+    @pytest.mark.asyncio
+    async def test_capped_connection_stamps_but_cannot_resolve(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        esc = _seed(queue, level=2, task_id='task-triage-ungated')
+
+        # (a) A {0,1}-capped connection successfully stamps triage on the
+        # pending L2 — the result is the record dict, not level_forbidden.
+        # triaged_by is server-attributed from the identity header, winning
+        # over a spoofed tool arg.
+        result_a = await _stamp_triage_over_http(
+            base_url, levels='0,1', identity='orchestrator-escalation-watcher-auto',
+            escalation_id=esc.id,
+            triaged_by='spoofed-by-agent',
+            triage_note='task-604 status==done | probe: get_task 604 -> status=done',
+        )
+        assert result_a.get('code') != 'level_forbidden', (
+            f'Expected the annotation to succeed (ungated), got: {result_a}'
+        )
+        assert 'error' not in result_a, f'Unexpected error: {result_a}'
+        assert result_a['id'] == esc.id
+        assert result_a['triaged_at'] is not None
+        assert result_a['triaged_by'] == 'orchestrator-escalation-watcher-auto', (
+            f'Expected the identity header to win over the spoofed tool arg, got: '
+            f"{result_a['triaged_by']!r}"
+        )
+        assert result_a['triage_note'] == (
+            'task-604 status==done | probe: get_task 604 -> status=done'
+        )
+        assert result_a['status'] == 'pending', f"Expected pending, got: {result_a['status']}"
+
+        reread_a = queue.get(esc.id)
+        assert reread_a is not None
+        assert reread_a.status == 'pending'
+        assert reread_a.triaged_at is not None
+        assert reread_a.triaged_by == 'orchestrator-escalation-watcher-auto', (
+            f'Expected the on-disk record to carry the header-attributed identity, '
+            f'got: {reread_a.triaged_by!r}'
+        )
+        assert reread_a.triage_note == (
+            'task-604 status==done | probe: get_task 604 -> status=done'
+        )
+        stamped_triaged_at = reread_a.triaged_at
+
+        # (b) The SAME capped connection is still denied a resolve (action=
+        # 'resume') on the same record — no mutation, triaged_at unchanged.
+        result_b = await _resolve_over_http(
+            base_url, levels='0,1', identity='orchestrator-escalation-watcher-auto',
+            escalation_id=esc.id, resolution='x', action='resume',
+        )
+        assert result_b.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result_b}"
+        )
+        reread_b = queue.get(esc.id)
+        assert reread_b is not None
+        assert reread_b.status == 'pending', f'Expected pending, got: {reread_b.status}'
+        assert (queue.queue_dir / f'{esc.id}.json').exists(), (
+            'Denied record must remain in the queue root (not archived)'
+        )
+        assert reread_b.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread_b.resolution_action}'
+        )
+        assert reread_b.triaged_at == stamped_triaged_at, (
+            'Expected the triage stamp from (a) unchanged by the denied resolve attempt'
         )
