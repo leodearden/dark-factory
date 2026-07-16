@@ -1048,7 +1048,14 @@ class TaskCurator:
             probe = make_source_and_history_probe(self._cwd)
 
         text = f'{candidate.title}\n{candidate.description}\n{candidate.details}'
-        unverified = unverified_claims_in_text(text, probe)
+        # Offload to a worker thread: probe (when not injected by a test) is
+        # make_source_and_history_probe's blocking git-subprocess adapter —
+        # git grep, and on a miss (always true for a fabricated token, the
+        # exact case this guard targets) a full-history `git log --all -S`
+        # pickaxe too, up to ~10s each. Running it inline here would stall
+        # the curator/reconciliation event loop for every other coroutine
+        # sharing it. unverified_claims_in_text itself stays pure/sync.
+        unverified = await asyncio.to_thread(unverified_claims_in_text, text, probe)
         for claim in unverified:
             logger.warning(
                 'recon_claim_verification.unverified token=%s attribution=%s candidate=%r',
