@@ -507,6 +507,46 @@ class TestDeliveredChecksConfig:
         budget via mcp__escalation__reload_config without a restart."""
         assert 'delivered_checks.max_checks_per_tick' in RELOADABLE_FIELDS
 
+    # --- task 2583 (epsilon) knobs: enabled / grace_cycles / check_timeout_secs -
+
+    def test_default_enabled_is_true(self):
+        """The gate is inert without metadata.delivered_checks on any dep, so
+        it defaults ON — an operator must opt OUT explicitly."""
+        config = OrchestratorConfig()
+        assert config.delivered_checks.enabled is True
+
+    def test_default_grace_cycles_is_3(self):
+        config = OrchestratorConfig()
+        assert config.delivered_checks.grace_cycles == 3
+
+    def test_grace_cycles_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            DeliveredChecksConfig(grace_cycles=0)
+
+    def test_grace_cycles_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            DeliveredChecksConfig(grace_cycles=-1)
+
+    def test_default_check_timeout_secs_is_120(self):
+        config = OrchestratorConfig()
+        assert config.delivered_checks.check_timeout_secs == 120
+
+    def test_check_timeout_secs_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            DeliveredChecksConfig(check_timeout_secs=0)
+
+    def test_check_timeout_secs_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            DeliveredChecksConfig(check_timeout_secs=-1)
+
+    def test_epsilon_knobs_are_hot_reloadable(self):
+        """Same green tier as max_checks_per_tick — no restart needed to
+        retune the grace window, flip the kill switch, or adjust the
+        per-check wall-clock timeout."""
+        assert 'delivered_checks.enabled' in RELOADABLE_FIELDS
+        assert 'delivered_checks.grace_cycles' in RELOADABLE_FIELDS
+        assert 'delivered_checks.check_timeout_secs' in RELOADABLE_FIELDS
+
 
 # ---------------------------------------------------------------------------
 # TestNoteDeliveredHold (task 2580 — step-11 RED / step-12 GREEN)
