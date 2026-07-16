@@ -1821,6 +1821,97 @@ class TestApplyCargoScopeRoutesThroughVerifyCmd:
         )
 
 
+class TestExtractFailingTestIdsFromJunit:
+    """``_extract_failing_test_ids_from_junit(path)`` parses a pytest junitxml
+    report into a sorted, de-duplicated list of stable ``classname::name`` ids
+    for failing/errored ``<testcase>``s only (task μ,
+    verify-scope-inversion-prd.md — the STRUCTURED baseline-attribution
+    signal; distinct from the stdout-regex ``_extract_failing_test_ids``
+    above, which stays untouched).  ``None`` signals "no junit collected /
+    unparseable" (B3 degrade); ``[]`` signals "junit collected, zero
+    failing".
+
+    RED today: the helper does not exist yet.
+    """
+
+    _JUNIT_XML = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuites>\n'
+        '<testsuite name="pytest" errors="1" failures="1" skipped="1" tests="4" time="0.123">\n'
+        '<testcase classname="tests.test_sample" name="test_pass" time="0.001" />\n'
+        '<testcase classname="tests.test_sample" name="test_fail" time="0.002">\n'
+        '<failure message="assert False">AssertionError: assert False</failure>\n'
+        '</testcase>\n'
+        '<testcase classname="tests.test_sample" name="test_error" time="0.001">\n'
+        '<error message="fixture broke">Exception: boom</error>\n'
+        '</testcase>\n'
+        '<testcase classname="tests.test_sample" name="test_skip" time="0.0">\n'
+        '<skipped message="skip reason" type="pytest.skip" />\n'
+        '</testcase>\n'
+        '</testsuite>\n'
+        '</testsuites>\n'
+    )
+
+    def test_returns_sorted_deduped_ids_for_failures_and_errors_only(self, tmp_path: Path):
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(self._JUNIT_XML)
+
+        ids = verify._extract_failing_test_ids_from_junit(junit_path)
+
+        assert ids == ['tests.test_sample::test_error', 'tests.test_sample::test_fail'], (
+            f'expected only the failing+errored cases, sorted+deduped; got {ids!r}'
+        )
+
+    def test_all_passing_junit_returns_empty_list(self, tmp_path: Path):
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest" tests="1">'
+            '<testcase classname="tests.test_sample" name="test_pass" time="0.001" />'
+            '</testsuite></testsuites>\n'
+        )
+
+        assert verify._extract_failing_test_ids_from_junit(junit_path) == [], (
+            'an all-passing junit report must return [] (collected, zero failing), not None'
+        )
+
+    def test_nonexistent_path_returns_none(self, tmp_path: Path):
+        assert verify._extract_failing_test_ids_from_junit(tmp_path / 'missing.xml') is None, (
+            'a nonexistent junit path must degrade to None, never raise'
+        )
+
+    def test_malformed_xml_returns_none(self, tmp_path: Path):
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text('not valid xml <<<')
+
+        assert verify._extract_failing_test_ids_from_junit(junit_path) is None, (
+            'unparseable xml must degrade to None (B3), never raise'
+        )
+
+    def test_empty_file_returns_none(self, tmp_path: Path):
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text('')
+
+        assert verify._extract_failing_test_ids_from_junit(junit_path) is None
+
+    def test_duplicate_ids_across_testsuites_are_deduplicated(self, tmp_path: Path):
+        """Two <testsuite> blocks sharing the same failing id collapse to one entry."""
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites>'
+            '<testsuite name="pytest"><testcase classname="tests.test_sample" name="test_fail">'
+            '<failure message="x">boom</failure></testcase></testsuite>'
+            '<testsuite name="pytest-rerun"><testcase classname="tests.test_sample" name="test_fail">'
+            '<failure message="x">boom</failure></testcase></testsuite>'
+            '</testsuites>\n'
+        )
+
+        assert verify._extract_failing_test_ids_from_junit(junit_path) == [
+            'tests.test_sample::test_fail',
+        ]
+
+
 class TestExtractCauseHint:
     """Tests for the ``_extract_cause_hint(output: str) -> str`` helper.
 
