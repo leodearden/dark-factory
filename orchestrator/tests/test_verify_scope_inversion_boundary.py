@@ -1012,6 +1012,18 @@ class TestRow7TrainAmortizationOneFullBreadthVerify:
             member_names=['row7_m1', 'row7_m2', 'row7_m3'],
             tip_name='row7_m3', tip_worktree=wt_3,
         )
+        # Non-empty so run_scoped_verification's module_configs branch
+        # (verify.py:4675) is even entered; merge+full then widens it
+        # wholesale to the FULL registry (config.module_configs_or_empty —
+        # all 3 modules) regardless of which subset is listed here (lambda's
+        # train-tip-shaped-call precedent,
+        # test_train_tip_shaped_call_widens_to_every_registered_module,
+        # explicitly labeled "boundary row 7 plan shape"). Left empty (the
+        # build_group_merge_request default), the call instead falls through
+        # to the no-module_configs FALLBACK path — a single synthetic
+        # '__fallback__' ModuleConfig, not a per-module fan-out (step-13's
+        # RED state).
+        req.module_configs = [mod_a]
 
         run_verification_fake = _fake_run_verification_by_module({
             mod_a.prefix: (True, []), mod_b.prefix: (True, []), mod_c.prefix: (True, []),
