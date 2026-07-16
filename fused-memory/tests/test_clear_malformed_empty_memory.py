@@ -40,6 +40,28 @@ _mod = _load_module()
 
 
 # ===========================================================================
+# Helpers
+# ===========================================================================
+
+def _make_qdrant_mock(records: list | None = None) -> AsyncMock:
+    """AsyncMock stand-in for an AsyncQdrantClient exposing retrieve/delete --
+    the raw transport clear_malformed_empty_memory reaches via
+    memory.mem0._get_async_qdrant()."""
+    client = AsyncMock()
+    client.retrieve = AsyncMock(return_value=records if records is not None else [])
+    client.delete = AsyncMock(return_value=None)
+    return client
+
+
+def _make_record(payload: dict | None = None) -> MagicMock:
+    """Build a Qdrant-retrieve-shaped record stand-in (payload only --
+    id/vector are irrelevant to this script)."""
+    record = MagicMock()
+    record.payload = payload if payload is not None else {}
+    return record
+
+
+# ===========================================================================
 # Tests: extract_content
 # ===========================================================================
 
@@ -181,3 +203,70 @@ class TestClassifyPayload:
         """An empty (but present) payload dict is 'malformed', distinct
         from a None (absent) record."""
         assert _mod.classify_payload({}) == 'malformed'
+
+
+# ===========================================================================
+# Tests: retrieve_payload
+# ===========================================================================
+
+class TestRetrievePayload:
+    """Tests for async retrieve_payload(client, collection, memory_id) -> dict | None."""
+
+    @pytest.mark.asyncio
+    async def test_calls_retrieve_with_expected_args(self):
+        """retrieve is awaited with collection_name/ids/with_payload=True/
+        with_vectors=False."""
+        client = _make_qdrant_mock([_make_record({'data': 'hello'})])
+
+        await _mod.retrieve_payload(client, 'fused_dark_factory', '028edb1f-299c-4755-9432-f5a9fde97677')
+
+        client.retrieve.assert_awaited_once_with(
+            collection_name='fused_dark_factory',
+            ids=['028edb1f-299c-4755-9432-f5a9fde97677'],
+            with_payload=True,
+            with_vectors=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_payload_dict_when_record_present(self):
+        """Returns the first returned record's payload as a dict."""
+        client = _make_qdrant_mock([_make_record({'data': 'hello', 'category': None, 'agent_id': None})])
+
+        result = await _mod.retrieve_payload(client, 'fused_dark_factory', 'some-id')
+
+        assert result == {'data': 'hello', 'category': None, 'agent_id': None}
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_retrieve_returns_empty_list(self):
+        """An empty retrieve result (record not found / already deleted)
+        returns None, not an empty dict."""
+        client = _make_qdrant_mock([])
+
+        result = await _mod.retrieve_payload(client, 'fused_dark_factory', 'absent-id')
+
+        assert result is None
+
+
+# ===========================================================================
+# Tests: delete_point
+# ===========================================================================
+
+class TestDeletePoint:
+    """Tests for async delete_point(client, collection, memory_id)."""
+
+    @pytest.mark.asyncio
+    async def test_calls_delete_exactly_once_with_collection_and_points_selector(self):
+        """delete is awaited exactly once, with collection_name=collection and
+        a points_selector carrying memory_id."""
+        from qdrant_client.http import models as qmodels
+
+        client = _make_qdrant_mock()
+
+        await _mod.delete_point(client, 'fused_dark_factory', '028edb1f-299c-4755-9432-f5a9fde97677')
+
+        client.delete.assert_awaited_once()
+        call_kwargs = client.delete.call_args.kwargs
+        assert call_kwargs.get('collection_name') == 'fused_dark_factory'
+        points_selector = call_kwargs.get('points_selector')
+        assert isinstance(points_selector, qmodels.PointIdsList)
+        assert points_selector.points == ['028edb1f-299c-4755-9432-f5a9fde97677']
