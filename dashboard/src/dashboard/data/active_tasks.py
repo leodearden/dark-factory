@@ -1,6 +1,7 @@
 """Aggregate active tasks across all known projects for the redux dashboard.
 
-Joins three sources — task tree (via fused-memory MCP), worktree artifacts,
+Joins three sources — task tree (via fused-memory MCP), per-task runtime
+state (via the orchestrator's escalation MCP, ``get_task_runtime_state``),
 and optional burst state from reconciliation — into the ``ACTIVE_TASKS``
 shape consumed by the React dashboard's tasks tab.
 
@@ -13,10 +14,20 @@ Output shape (per task) matches ``data.js`` mock fixtures:
         'description': '...',
         'details': '...',         # may be empty; many tasks have none
         'status': 'in-progress',
-        'agent': 'claude-task-19',  # or None if no worktree
-        'started': 14,              # minutes since metadata.created_at, 0 if unknown
-        'loops': 2,                 # iterations.jsonl line count
-        'attempts': 3,              # review files count
+        'agent': 'claude-task-19',  # TaskRuntimeEntry.has_worktree; None if no worktree
+        'started': 14,              # minutes since TaskRuntimeEntry.started (runtime snapshot)
+        'loops': 2,                 # TaskRuntimeEntry.loops (runtime snapshot)
+        'attempts': 3,              # TaskRuntimeEntry.attempts (runtime snapshot)
+        'lane': '_lane-7',          # TaskRuntimeEntry.lane, or None
+        'phase': 'EXECUTE',         # TaskRuntimeEntry.phase, or None
+        'lane_state': 'assigned',   # TaskRuntimeEntry.lane_state, or None
+        'runtime_offline': False,   # True iff this project's runtime snapshot is unreachable —
+                                     # loops/attempts/started/agent/lane/phase/lane_state are then
+                                     # ALL None (never a fabricated 0). A task absent from an
+                                     # online snapshot instead gets honest zeros/None with
+                                     # runtime_offline False; a per-task read failure on an online
+                                     # snapshot yields None fields with runtime_offline still False
+                                     # (honest error != offline). See _runtime_fields.
         'deps': [{'id': 'dark_factory/T-15', 'title': '...', 'done': True}, ...],
         'meta_files': ['src/...py', ...],  # taskmaster metadata.files; retained on API for
                                            # debugging/tooling — no frontend UI reads it directly
@@ -36,9 +47,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from dashboard.config import DashboardConfig
-from dashboard.data.orchestrator import _scan_worktrees
+from dashboard.data.task_runtime import fetch_task_runtime
 from dashboard.data.tasks import fetch_external_statuses, fetch_statuses, fetch_tasks
 from dashboard.data.utils import resolve_now
 
@@ -101,17 +113,6 @@ def _minutes_since(iso: str | None, *, now: datetime | None = None) -> int:
     return max(minutes, 0)
 
 
-def _attempts_from_review_summary(summary: str) -> int:
-    """Total review attempts from a 'N/M passed' string. 0 on miss/dash."""
-    if not summary or '/' not in summary:
-        return 0
-    head = summary.split('/', 1)[1].split(' ', 1)[0]
-    try:
-        return int(head)
-    except ValueError:
-        return 0
-
-
 def _coalesce_prd(metadata: dict) -> str | None:
     """Coalesce PRD provenance from *metadata* into a single normalized string.
 
@@ -136,7 +137,7 @@ def _build_task_row(
     project: str,
     task: dict,
     task_id: int,
-    wt: dict,
+    rt: dict,
     uid: str,
     *,
     prd: str | None = None,
@@ -147,6 +148,13 @@ def _build_task_row(
     status.  Callers add status-specific fields afterwards:
     active rows add ``started`` (minutes) and ``deps``; done rows add
     ``started: 0``, ``deps: []``, and ``completed`` (ISO timestamp or '').
+
+    *rt* is the runtime-fields dict produced by :func:`_runtime_fields`
+    (``agent``/``loops``/``attempts``/``lane``/``phase``/``lane_state``/
+    ``runtime_offline`` — ``started`` is handled separately by the caller,
+    since active rows use ``rt['started']`` while terminal rows hard-code
+    ``0``). Missing keys default to ``None``/``False`` so a bare ``{}`` (used
+    by direct unit tests of this function) is still valid.
 
     *prd*, if given, is used verbatim as the row's ``prd`` value instead of
     re-deriving it from *task*'s metadata via ``_coalesce_prd`` — callers
@@ -178,13 +186,66 @@ def _build_task_row(
         'description': task.get('description') or '',
         'details': task.get('details') or '',
         'status': task.get('status'),
-        'agent': f'claude-task-{task_id}' if wt else None,
-        'loops': int(wt.get('iteration_count') or 0),
-        'attempts': _attempts_from_review_summary(wt.get('review_summary') or ''),
+        'agent': rt.get('agent'),
+        'loops': rt.get('loops'),
+        'attempts': rt.get('attempts'),
+        'lane': rt.get('lane'),
+        'phase': rt.get('phase'),
+        'lane_state': rt.get('lane_state'),
+        'runtime_offline': rt.get('runtime_offline', False),
         'meta_files': meta_files,
         'train': train,
         'external_deps': external_deps,
         'prd': prd if prd is not None else _coalesce_prd(metadata),
+    }
+
+
+def _runtime_fields(
+    index: dict[int, TaskRuntimeEntry],
+    is_offline: bool,
+    task_id: int,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """Derive a task row's runtime-sourced fields from the project's runtime snapshot.
+
+    Three cases:
+
+    - *is_offline* (the project's ``get_task_runtime_state`` snapshot reported
+      ``offline=True``, or no escalation URL is configured for this project at
+      all): every field is ``None`` — never a fabricated ``0`` — and
+      ``runtime_offline`` is ``True``.
+    - *task_id* absent from *index* (the project IS online, the task just has
+      no entry in its snapshot): honest zeros (``loops``/``attempts``/
+      ``started`` are ``0``; ``agent``/``lane``/``phase``/``lane_state`` are
+      ``None``) and ``runtime_offline`` is ``False``.
+    - *task_id* present in *index*: real fields from the ``TaskRuntimeEntry``,
+      which may themselves be ``None`` on a per-task artifact read failure —
+      an honest per-task error, not an offline project, so ``runtime_offline``
+      stays ``False`` either way.
+    """
+    if is_offline:
+        return {
+            'agent': None, 'loops': None, 'attempts': None, 'started': None,
+            'lane': None, 'phase': None, 'lane_state': None,
+            'runtime_offline': True,
+        }
+    entry = index.get(task_id)
+    if entry is None:
+        return {
+            'agent': None, 'loops': 0, 'attempts': 0, 'started': 0,
+            'lane': None, 'phase': None, 'lane_state': None,
+            'runtime_offline': False,
+        }
+    return {
+        'agent': f'claude-task-{task_id}' if entry.has_worktree else None,
+        'loops': entry.loops,
+        'attempts': entry.attempts,
+        'started': _minutes_since(entry.started, now=now),
+        'lane': entry.lane,
+        'phase': entry.phase,
+        'lane_state': entry.lane_state,
+        'runtime_offline': False,
     }
 
 
@@ -216,6 +277,7 @@ async def _shape_one_project(
     max_done_per_project: int = 0,
     max_cancelled_per_project: int = 0,
     now: datetime | None = None,
+    runtime: TaskRuntimeSnapshot | None = None,
 ) -> tuple[list[dict], bool, int]:
     """Build ``(active_tasks, offline, done_count)`` for a single project root.
 
@@ -237,6 +299,13 @@ async def _shape_one_project(
     When *max_cancelled_per_project* > 0, the most-recent N cancelled tasks
     are similarly appended (same sort key, same ``completed`` field, same
     ``started: 0`` / ``deps: []`` treatment as done rows).
+
+    *runtime* is this project's ``TaskRuntimeSnapshot`` (resolved ONCE by the
+    caller — see ``collect_tasks_with_counts`` — via ``fetch_task_runtime``).
+    ``None`` (no escalation URL configured for this project) is treated
+    identically to ``runtime.offline``: every row's runtime-sourced fields
+    degrade to an honest ``None`` via :func:`_runtime_fields`, distinct from
+    the task-tree ``offline`` return value above.
     """
     project = _project_label(project_root)
     fetched = await fetch_tasks(client, config, project_root)
@@ -250,7 +319,10 @@ async def _shape_one_project(
     # for the DONE_COUNTS payload key.
     done_count = sum(1 for t in tasks if t.get('status') == 'done')
 
-    worktrees = await asyncio.to_thread(_scan_worktrees, project_root / '.worktrees')
+    is_runtime_offline = runtime is None or runtime.offline
+    runtime_index: dict[int, TaskRuntimeEntry] = (
+        {e.task_id: e for e in runtime.tasks} if runtime is not None and not runtime.offline else {}
+    )
 
     # Lookup table for dep title/status resolution within the same project.
     by_id: dict[int, dict] = {t['id']: t for t in tasks if isinstance(t.get('id'), int)}
@@ -263,13 +335,12 @@ async def _shape_one_project(
             continue
 
         task_id = task['id']
-        wt = worktrees.get(task_id) or {}
-        meta = wt.get('metadata') or {}
+        rt = _runtime_fields(runtime_index, is_runtime_offline, task_id, now=now)
 
         uid = _task_uid(project, task_id)
-        row = _build_task_row(project, task, task_id, wt, uid)
-        # active rows: started from worktree creation time; deps from task tree.
-        row['started'] = _minutes_since(meta.get('created_at'), now=now)
+        row = _build_task_row(project, task, task_id, rt, uid)
+        # active rows: started from the runtime entry; deps from task tree.
+        row['started'] = rt['started']
         row['deps'] = _resolve_deps(task, by_id, project)
         active.append(row)
 
@@ -306,8 +377,8 @@ async def _shape_one_project(
             if beyond_cap:
                 exempted_count += 1
             uid = _task_uid(project, task_id)
-            wt = worktrees.get(task_id) or {}
-            row = _build_task_row(project, task, task_id, wt, uid, prd=prd)
+            rt = _runtime_fields(runtime_index, is_runtime_offline, task_id, now=now)
+            row = _build_task_row(project, task, task_id, rt, uid, prd=prd)
             # terminal rows: no meaningful start time; deps only for live-PRD
             # members (the terminal-member exemption), else unsurfaced.
             row['started'] = 0
@@ -354,23 +425,31 @@ async def collect_tasks_with_counts(
     ``_shape_one_project`` call, so every returned row's ``started`` shares
     the same instant regardless of which project it came from.
 
+    Per-task runtime state (loops/attempts/started/agent/lane/phase/
+    lane_state) is likewise fetched ONCE here — a single concurrent fan-out
+    via :func:`dashboard.data.task_runtime.fetch_task_runtime` over
+    ``config.escalation_urls`` — and each project's snapshot is threaded into
+    its ``_shape_one_project`` call, mirroring the single-``now`` threading.
+
     Prefer this over calling ``collect_active_tasks`` and
     ``collect_done_counts`` concurrently: it halves per-project MCP
     round-trips and guarantees that DONE_COUNTS matches the same snapshot
     as the ACTIVE_TASKS rows.
     """
     effective_now = resolve_now(now)
+    runtime_by_label = await fetch_task_runtime(client, config.escalation_urls)
     all_active: list[dict] = []
     offline_projects: list[str] = []
     done_counts: dict[str, int] = {}
     for root in _all_project_roots(config):
+        label = _project_label(root)
         active, offline, done_count = await _shape_one_project(
             client, config, root,
             max_done_per_project=max_done_per_project,
             max_cancelled_per_project=max_cancelled_per_project,
             now=effective_now,
+            runtime=runtime_by_label.get(label),
         )
-        label = _project_label(root)
         if offline:
             offline_projects.append(label)
         else:
