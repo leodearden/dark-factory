@@ -2080,6 +2080,24 @@ class TestSimpleTaskDeprecatedScalarHonoring:
             f'OrchestratorConfig(); got: {[r.getMessage() for r in warning_records]}'
         )
 
+    def test_explicit_max_turns_submodel_wins_over_deprecated_scalar(self, monkeypatch, tmp_path):
+        """Symmetric with test_explicit_submodel_value_wins_over_deprecated_scalar
+        (the budgets variant): an explicitly-set max_turns.simple_task takes
+        precedence -- the deprecated scalar is ignored (no migration) when
+        the submodel field is no longer at its default."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+        config = OrchestratorConfig(
+            simple_task_max_turns=7,
+            max_turns=TurnsConfig(simple_task=99),
+        )
+
+        assert config.max_turns.simple_task == 99, (
+            'An explicitly-set max_turns.simple_task must win over the '
+            'deprecated simple_task_max_turns scalar.'
+        )
+
 
 class TestDiffConfig:
     """diff_config(live, fresh, allowlist) categorizes every differing leaf
