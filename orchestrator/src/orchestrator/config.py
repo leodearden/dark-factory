@@ -659,11 +659,24 @@ class DeliveredChecksConfig(BaseModel):
     burst of newly-terminal deps can't stall tick latency; checks deferred by
     the budget stay uncached and are retried (fail-safe wait) next tick.
 
-    Task 2580 (delta) owns only this one leaf. Task 2583 (epsilon) extends
-    this sub-model with the grace-streak escalation knobs (enabled,
-    grace_cycles, check_timeout_secs).
+    Task 2580 (delta) owns only ``max_checks_per_tick``. Task 2583 (epsilon)
+    extends this sub-model with the grace-streak escalation knobs below:
+    ``enabled`` (kill switch), ``grace_cycles`` (consecutive-FAILED-tick
+    threshold before a born-at-L2 escalation fires), and
+    ``check_timeout_secs`` (per-check wall-clock bound; a timeout maps to
+    ``DeliveredCheckResult.ERRORED``, the same fail-safe outcome as a
+    runner exception).
     """
 
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to disable the delivered-check dep-gate entirely — '
+            '_phase_delivered_check_gate short-circuits to a None cache (not '
+            'an empty dict), so _deps_satisfied takes its legacy arm-off path '
+            'and no sweep, streak, or escalation logic runs at all.'
+        ),
+    )
     max_checks_per_tick: int = Field(
         default=50,
         ge=1,
@@ -671,6 +684,28 @@ class DeliveredChecksConfig(BaseModel):
             'Maximum number of uncached (dep_task_id, main_sha) delivered-checks '
             'evaluated per scheduler tick. Must be >= 1. Checks deferred by this '
             'budget remain uncached and are retried next tick (fail-safe wait).'
+        ),
+    )
+    grace_cycles: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Consecutive ran-and-FAILED sweep ticks (per dependent, dep pair) '
+            'before a born-at-L2 dependency_capability escalation fires and the '
+            'dependent is blocked. Must be >= 1. The grace window absorbs the '
+            'merge-finalize -> scheduler-tick done->main propagation lag.'
+        ),
+    )
+    check_timeout_secs: float = Field(
+        default=120.0,
+        gt=0,
+        description=(
+            'Per-check wall-clock timeout (seconds) for each run_delivered_check '
+            'call in the sweep. Must be > 0. A check that exceeds this is treated '
+            'as DeliveredCheckResult.ERRORED (fail-safe — no streak bump, dep left '
+            'uncached, retried next tick). Primary bound for the timeout-less grep '
+            'kind; defense-in-depth for scripts, which also carry their own '
+            'descriptor timeout_secs.'
         ),
     )
 
@@ -3382,6 +3417,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # delivered-checks PRD delta) — scheduler tuning, same tier as
         # fairness.skip_threshold / starvation_watchdog.*.
         'delivered_checks.max_checks_per_tick',
+        # Delivered-check grace-streak escalation knobs (task 2583, epsilon
+        # of the same PRD) — same green tier: an operator may flip the kill
+        # switch, retune the grace window, or adjust the per-check timeout
+        # without a restart.
+        'delivered_checks.enabled',
+        'delivered_checks.grace_cycles',
+        'delivered_checks.check_timeout_secs',
     },
 )
 
