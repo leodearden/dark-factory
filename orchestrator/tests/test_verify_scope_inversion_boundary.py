@@ -273,6 +273,44 @@ async def _drive_merge_gate(
         )
 
 
+async def _drive_producer(
+    tmp_path: Path,
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    *,
+    task_files: list[str],
+    role: Literal['task', 'merge'],
+    is_merge_verify: bool = False,
+    run_verification_fake: AsyncMock | None = None,
+) -> tuple[VerifyResult, dict[str, ModuleConfig], AsyncMock]:
+    """Drive the REAL producer/plan+execution seam, ``run_scoped_verification``,
+    under an instrumented fake ``orchestrator.verify.run_verification`` —
+    never a real subprocess.
+
+    *run_verification_fake* defaults to the always-passing
+    :func:`_run_verification_spy` (test_verify_scope_kappa.py) when omitted;
+    pass an instrumented per-module fake (e.g.
+    :func:`_fake_run_verification_by_module`) for rows that need a specific
+    module to fail.
+
+    Returns ``(result, executed_by_prefix, fake)``: *executed_by_prefix* is
+    the ordered executed ``ModuleConfig``(s) keyed by
+    ``ModuleConfig.prefix`` (via :func:`_executed_module_configs`); *fake* is
+    the patched mock itself, for callers that need e.g. ``await_count``.
+    Shared by every producer-only row (2, 3, 8, 9, 10) — the row-1 producer
+    side predates this helper and stays inline (it also drives the row-1
+    consumer side against the SAME fake below, unlike these later rows).
+    """
+    fake = run_verification_fake if run_verification_fake is not None else _run_verification_spy()
+    with patch.object(verify, 'run_verification', new=fake):
+        result = await run_scoped_verification(
+            tmp_path, config, module_configs, task_files=task_files, role=role,
+            is_merge_verify=is_merge_verify,
+        )
+    executed = {mc.prefix: mc for mc in _executed_module_configs(fake)}
+    return result, executed, fake
+
+
 # ---------------------------------------------------------------------------
 # Row 1: "the hole, closed" — source-only sibling break rejected at the
 # merge gate. Builds the shared row-1 harness (instrumented fake
