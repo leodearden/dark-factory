@@ -3370,3 +3370,64 @@ def test_boundary5_force_restarts_busy_unit_after_grace(tmp_path: pathlib.Path) 
         f"expected a restart call for {unit_r}; got calls={state['calls']!r}"
     )
 
+
+def test_boundary6_absent_and_stale_heartbeat_proceed_after_grace(tmp_path: pathlib.Path) -> None:
+    """Scenario 6 (I4) -- absent/stale heartbeat proceeds after the short
+    unknown-grace: a unit with NO heartbeat file at all (absent) still
+    restarts once ORCH_DRAIN_UNKNOWN_GRACE_SECS elapses -- here 0, so
+    immediately -- a not-reporting unit must not block the fleet restart
+    forever (fail-toward-convergence, the opposite fail direction from the
+    confirmed-busy defer in test_boundary4/5 above). A second, stale-
+    heartbeat sub-case (heartbeat file present but its ts_epoch is far
+    outside the freshness window) exercises the same outcome via the other
+    "unknown" branch drain_check.classify() recognizes.
+    """
+    fleet_dir = tmp_path / "fleet"
+    unit_absent = "orchestrator-alpha.service"
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path, running_units=[unit_absent], units={unit_absent: {"scenario": "fresh"}},
+    )
+    # No heartbeat file written for unit_absent at all.
+    clock_file = tmp_path / "clock.json"
+
+    result = _boundary_run_drain_script(
+        bin_dir, state_path, fleet_dir, clock_file,
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_UNKNOWN_GRACE_SECS": "0",
+        },
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    state = _boundary_load_state(state_path)
+    assert ["--user", "restart", unit_absent] in state["calls"], (
+        f"expected a restart call for {unit_absent}; got calls={state['calls']!r}"
+    )
+
+    # --- stale-heartbeat sub-case: same outcome via the other unknown branch ---
+    fleet_dir_2 = tmp_path / "fleet2"
+    unit_stale_hb = "orchestrator-bravo.service"
+    bin_dir_2, state_path_2 = _boundary_make_fake_systemctl(
+        tmp_path / "run2",
+        running_units=[unit_stale_hb], units={unit_stale_hb: {"scenario": "fresh"}},
+    )
+    _boundary_write_heartbeat(
+        fleet_dir_2, unit_stale_hb, merge_idle=True, ts_epoch=time.time() - 99999
+    )
+    clock_file_2 = tmp_path / "clock2.json"
+
+    result_2 = _boundary_run_drain_script(
+        bin_dir_2, state_path_2, fleet_dir_2, clock_file_2,
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_UNKNOWN_GRACE_SECS": "0",
+            "ORCH_DRAIN_FRESH_WINDOW_SECS": "120",
+        },
+    )
+
+    assert result_2.returncode == 0, f"stdout={result_2.stdout!r} stderr={result_2.stderr!r}"
+    state_2 = _boundary_load_state(state_path_2)
+    assert ["--user", "restart", unit_stale_hb] in state_2["calls"], (
+        f"expected a restart call for {unit_stale_hb}; got calls={state_2['calls']!r}"
+    )
+
