@@ -1250,6 +1250,60 @@ class ReconciliationHarness:
         await self._replay_deferred_writes(ProjectId(run.project_id))
         return diag
 
+    async def _recover_predecessor_runs(self) -> None:
+        """One-shot startup pass: recover 'running' rows owned by a dead
+        predecessor instance, regardless of age (task 2711 / E6).
+
+        fm is a single-instance deployment and each process constructs a
+        fresh ``EventBuffer.instance_id`` — so at startup, any running row
+        owned by a *different* instance_id is provably a dead predecessor,
+        not a run that might still be live. This closes the gap left by the
+        age-gated ``_recover_stale_runs`` reaper (default 1800s cutoff),
+        which would otherwise leave such an orphan's lock wedging the
+        project for up to half an hour.
+
+        Ownership must be corroborated against the lock before acting
+        (never reap on age alone when the owner might be live): a run is
+        recovered only when the project's current lock holder equals the
+        run's own instance_id, and that instance_id is not this process's
+        own. A run whose owner cannot be corroborated this way — no lock,
+        lock held by a third instance, or a NULL (pre-migration)
+        instance_id — is left untouched for the existing age-based
+        backstop to handle.
+
+        Recovery always completes the run with disposition='failed' and
+        never escalates: adopting your own dead predecessor's orphan at
+        startup is expected operational-restart behaviour (mirrors the
+        dead_owner_shielded suppression rationale in _recover_stale_runs),
+        made observable via a structured log instead of an alert.
+        """
+        my_iid = self.buffer.instance_id
+        for run in await self.journal.get_running_runs():
+            if run.instance_id is None or run.instance_id == my_iid:
+                continue
+            lock_holder, lock_age = await self.buffer.get_lock_status(run.project_id)
+            if lock_holder != run.instance_id:
+                continue
+
+            diag = await self._recover_one_run(
+                run, lock_holder, lock_age,
+                disposition='failed',
+                error_type='PredecessorRunRecovery',
+                error_message=(
+                    'Run owned by dead predecessor instance, recovered at startup'
+                ),
+            )
+            logger.info(
+                'reconciliation.predecessor_run_recovered',
+                extra={
+                    'run_id': run.id,
+                    'project_id': run.project_id,
+                    'instance_id': run.instance_id,
+                    'age_seconds': diag['age_seconds'],
+                    'disposition': diag['disposition'],
+                },
+            )
+
     # ── Dead-owner suppression storm counter ─────────────────────────
 
     def _record_dead_owner_suppression(
