@@ -414,8 +414,20 @@ def _is_open_status(status: str | None) -> bool:
 async def _has_open_dedup_match(task_client: ChronicFlakeTaskClient, test: str) -> bool:
     """True if a ``search_tasks`` result's title mentions *test* and that
     task is still OPEN (the local dedup guard, layer (b) — see module
-    docstring)."""
-    results = await task_client.search_tasks(test)
+    docstring).
+
+    A ``search_tasks`` failure degrades to "no match" (fail-open towards
+    filing, never towards blocking) rather than propagating — part of the
+    non-blocking guarantee (step-13/step-14): a flaky search backend must
+    never prevent a legitimate filing.
+    """
+    try:
+        results = await task_client.search_tasks(test)
+    except Exception:
+        logger.warning(
+            'chronic_flake: search_tasks failed for %s; treating as no match', test, exc_info=True,
+        )
+        return False
     for result in results or []:
         if not isinstance(result, dict):
             continue
@@ -443,6 +455,15 @@ async def maybe_file_chronic_flake_tasks(
     and ``<project_root>/data/orchestrator/chronic_flake_filings.json``
     respectively when not given (real callers); tests pass tmp fixtures
     explicitly. *now* defaults to the current UTC time.
+
+    Non-blocking guarantee (step-13/step-14): this function never raises.
+    The whole body below the enabled/task_client gates runs under a
+    catch-all so a ledger/config surprise degrades to ``[]`` instead of
+    propagating, and each per-test filing attempt is independently
+    try/excepted so one bad test (a raising ``submit_task``) cannot stop
+    the rest from being considered — mirrors
+    ``compute_failing_test_set_fingerprint``'s fail-safe philosophy and
+    ``offline_lane``'s fail-open call-site pattern.
     """
     cfg = config.chronic_flake
     if not cfg.enabled:
@@ -451,30 +472,51 @@ async def maybe_file_chronic_flake_tasks(
         logger.info('chronic_flake: no task_client wired; skipping (log-only no-op)')
         return []
 
-    project_root = Path(config.project_root)
-    if ledger_path is None:
-        ledger_path = project_root / cfg.ledger_relpath
-    if filings_path is None:
-        filings_path = project_root / _DEFAULT_FILINGS_RELPATH
-    if now is None:
-        now = datetime.now(UTC)
+    try:
+        project_root = Path(config.project_root)
+        if ledger_path is None:
+            ledger_path = project_root / cfg.ledger_relpath
+        if filings_path is None:
+            filings_path = project_root / _DEFAULT_FILINGS_RELPATH
+        if now is None:
+            now = datetime.now(UTC)
 
-    ledger_entries = read_flaky_ledger(ledger_path)
-    evidence_by_test = _merge_evidence_by_test(verify_output, ledger_entries, cfg.threshold, cfg.window)
-    if not evidence_by_test:
+        try:
+            ledger_entries = read_flaky_ledger(ledger_path)
+        except OSError:
+            logger.warning(
+                'chronic_flake: failed to read flaky ledger at %s', ledger_path, exc_info=True,
+            )
+            ledger_entries = []
+
+        evidence_by_test = _merge_evidence_by_test(
+            verify_output, ledger_entries, cfg.threshold, cfg.window
+        )
+        if not evidence_by_test:
+            return []
+
+        filings = FilingLedger(filings_path)
+        filed: list[str] = []
+        for test, evidence in evidence_by_test.items():
+            try:
+                if not filings.should_file(test, now, cfg.rate_limit_days):
+                    continue
+                if await _has_open_dedup_match(task_client, test):
+                    continue
+                arguments = build_chronic_flake_fix_task_arguments(evidence, project_root)
+                await task_client.submit_task(arguments)
+                filings.record(test, now)
+                filed.append(test)
+            except Exception:
+                logger.warning(
+                    'chronic_flake: failed to file De-flake task for %s', test, exc_info=True,
+                )
+                continue
+
+        filings.save()
+        return filed
+    except Exception:
+        logger.warning(
+            'chronic_flake: maybe_file_chronic_flake_tasks failed unexpectedly', exc_info=True,
+        )
         return []
-
-    filings = FilingLedger(filings_path)
-    filed: list[str] = []
-    for test, evidence in evidence_by_test.items():
-        if not filings.should_file(test, now, cfg.rate_limit_days):
-            continue
-        if await _has_open_dedup_match(task_client, test):
-            continue
-        arguments = build_chronic_flake_fix_task_arguments(evidence, project_root)
-        await task_client.submit_task(arguments)
-        filings.record(test, now)
-        filed.append(test)
-
-    filings.save()
-    return filed
