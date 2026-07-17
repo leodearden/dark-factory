@@ -3879,6 +3879,74 @@ async def test_run_loop_fast_restart_releases_recent_claims(
     )
 
 
+@pytest.mark.asyncio
+async def test_run_loop_recovers_predecessor_runs_once_at_startup_before_reaper_ticks(
+    journal, event_buffer, mock_memory_service, monkeypatch,
+):
+    """run_loop() must invoke _recover_predecessor_runs() exactly once at
+    startup, before the periodic _recover_stale_runs ticks — and a raised
+    exception from it must not crash run_loop (task 2711 / E6).
+    """
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(seconds: float) -> None:
+        await real_sleep(0)
+
+    # Patch the module-local _sleep binding so many loop iterations execute
+    # within the wait_for() window below (same technique as
+    # test_main_loop_does_not_emit_drain_progress_after_idle_drain).
+    monkeypatch.setattr('fused_memory.reconciliation.harness._sleep', fast_sleep)
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    call_order = []
+
+    async def predecessor_side_effect():
+        call_order.append('predecessor')
+        # Raise on every call (there should only ever be one) to prove the
+        # startup try/except guard keeps run_loop alive.
+        raise RuntimeError('boom — simulated predecessor-recovery failure')
+
+    async def stale_runs_side_effect():
+        call_order.append('stale')
+
+    harness._recover_predecessor_runs = AsyncMock(side_effect=predecessor_side_effect)
+    harness._recover_stale_runs = AsyncMock(side_effect=stale_runs_side_effect)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+    harness.buffer.get_active_projects = AsyncMock(return_value=[])
+    # judge.initialize() does a real SQLite query; mock it to avoid timing
+    # flakiness in slow environments (freethreaded Python, heavy parallel runs).
+    if harness.judge is not None:
+        harness.judge.initialize = AsyncMock()
+
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+
+    # Startup pass ran exactly once, despite raising — not once per iteration.
+    assert harness._recover_predecessor_runs.call_count == 1, (
+        f'_recover_predecessor_runs must run exactly once at startup; '
+        f'called {harness._recover_predecessor_runs.call_count} times'
+    )
+    # The periodic reaper kept running — the startup exception did not crash
+    # run_loop (proxy for "loop kept iterating", same technique as
+    # test_main_loop_does_not_emit_drain_progress_after_idle_drain).
+    assert harness._recover_stale_runs.call_count >= 2, (
+        f'run_loop must keep iterating after a startup _recover_predecessor_runs '
+        f'failure; _recover_stale_runs only ran '
+        f'{harness._recover_stale_runs.call_count} times'
+    )
+    # Ordering: predecessor recovery happens before any reaper tick.
+    assert call_order[0] == 'predecessor', (
+        f'_recover_predecessor_runs must run before the first _recover_stale_runs '
+        f'tick; call order was: {call_order!r}'
+    )
+    assert 'stale' in call_order[1:], (
+        f'Expected at least one stale-run reaper tick after the startup pass; '
+        f'call order was: {call_order!r}'
+    )
+
+
 # ── Stale-run reaper: instance-scoped lock check ─────────────────────────────
 
 
