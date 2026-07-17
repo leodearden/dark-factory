@@ -711,6 +711,83 @@ class DeliveredChecksConfig(BaseModel):
     )
 
 
+class SpeculationProbeConfig(BaseModel):
+    """Variable-depth speculative verify placement (task 2359, sibling of
+    task 2340's depth telemetry).
+
+    Lets the EXISTING second verify slot occasionally target a DEEPER
+    already-built speculative stack (cumulative depth d, d in
+    ``probe_depths``) instead of the adjacent depth-1 stack. A passing
+    depth-d probe produces a genuine depth>=2 ``merge_verify`` record
+    (labelled via task 2340's ``depth`` field), so
+    ``scripts/analyze_speculation_depth.py`` can print a multi-point
+    P(pass|depth) curve.
+
+    ``probe_fraction=0.0`` (the default) disables the mechanism entirely:
+    :func:`orchestrator.merge_queue.select_probe_depth` always returns
+    ``None`` at fraction<=0, so dispatch falls through to the unchanged
+    ``_verify_frontier_depth()`` path -- byte-identical to pre-task-2359
+    behaviour.
+
+    ``suppress_flake_rate`` is a per-verify rolling FAIL-rate threshold (see
+    ``SpeculativeMergeWorker._recent_verify_fail_rate``): probing is
+    suppressed whenever that rate is at or above this value, so a thrashing
+    pipeline is never handed MORE speculative load.
+
+    A depth-d stack only exists to probe when the operator has separately
+    raised ``speculation_depth`` (the existing merge-ahead knob) so the
+    merger builds >= d items ahead; under the default K=2, the built stack
+    stays shallow and every probe safely no-op-falls-back to the adjacent
+    depth-1 path (see ``SpeculativeMergeWorker._available_built_depth``).
+
+    All fields are green-tier hot-tunable via RELOADABLE_FIELDS — an
+    operator may adjust the probe rate/depths/suppression threshold via
+    ``mcp__escalation__reload_config`` without a process restart.
+    """
+
+    probe_fraction: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Fraction of second-slot dispatch rounds that probe a deeper '
+            'already-built speculative stack instead of the adjacent '
+            'depth-1 stack. 0.0 (default) disables probing entirely -- '
+            'byte-identical to pre-task-2359 behaviour.'
+        ),
+    )
+    probe_depths: list[int] = Field(
+        default_factory=lambda: [2, 3, 5, 8],
+        description=(
+            'Candidate cumulative stack depths cycled through on probe '
+            'rounds, in order. Must be non-empty; every entry must be a '
+            'positive integer.'
+        ),
+    )
+    suppress_flake_rate: float = Field(
+        default=0.30,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Per-verify rolling FAIL-rate threshold (see '
+            'SpeculativeMergeWorker._recent_verify_fail_rate) at or above '
+            'which probing is suppressed for the round, so a thrashing '
+            'pipeline is never given more speculative load.'
+        ),
+    )
+
+    @field_validator('probe_depths', mode='after')
+    @classmethod
+    def _validate_probe_depths(cls, v: list[int]) -> list[int]:
+        if not v:
+            raise ValueError('probe_depths must not be empty')
+        if any(d <= 0 for d in v):
+            raise ValueError(
+                f'probe_depths entries must all be positive integers; got {v!r}'
+            )
+        return v
+
+
 class FusedMemoryConfig(BaseModel):
     """Fused-memory HTTP server connection."""
 
@@ -2862,6 +2939,11 @@ class OrchestratorConfig(BaseSettings):
     # checks PRD delta). Task 2583 (epsilon) extends this sub-model further.
     delivered_checks: DeliveredChecksConfig = Field(default_factory=DeliveredChecksConfig)
 
+    # Variable-depth speculative verify placement (task 2359, sibling of task
+    # 2340's depth telemetry). An absent stanza in orchestrator.yaml yields
+    # the disabled-by-default instance (probe_fraction=0.0, byte-identical).
+    speculation_probe: SpeculationProbeConfig = Field(default_factory=SpeculationProbeConfig)
+
     # Value/h scheduler scoring (P2/P3 — age boost, CPM weighting).
     age_alpha: float = Field(
         default=10.0,
@@ -3506,6 +3588,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # dedicated submodel, so its whole-submodel group auto-covers every
     # leaf (idiom shared with psi_admission/routing above).
     _submodel_leaf_paths('chronic_flake', ChronicFlakeConfig),
+    # Variable-depth speculative verify placement (task 2359) — a new
+    # dedicated submodel, same whole-submodel-group idiom: every probe knob
+    # (probe_fraction/probe_depths/suppress_flake_rate) is green-tier
+    # hot-reloadable with no separate RELOADABLE_FIELDS edit.
+    _submodel_leaf_paths('speculation_probe', SpeculationProbeConfig),
     {
         # Steward grace
         'steward_completion_timeout',

@@ -16,6 +16,7 @@ import collections
 import contextlib
 import dataclasses
 import logging
+import math
 import os
 import shutil
 import time
@@ -5692,6 +5693,125 @@ fallback.
 """
 
 
+# ── Variable-depth speculative verify placement (task 2359, sibling of task
+# 2340's depth telemetry) ─────────────────────────────────────────────────
+#
+# select_probe_depth() is the PURE decision core: given the operator knobs
+# (probe_fraction/probe_depths/suppress_flake_rate) and the worker's current
+# round/availability/flake-rate inputs, decide whether THIS second-slot
+# dispatch round should probe a deeper already-built speculative stack, and
+# if so, at which depth. No I/O, no clock, no RNG -- fully deterministic in
+# its inputs, mirroring the codebase's existing pure-helper testing style
+# (e.g. _verify_frontier_depth() delegating to _frozen_inflight_entries()).
+# The stateful counterpart, SpeculativeMergeWorker._probe_verify_placement,
+# owns the live round counter / rolling fail-rate window / built-depth
+# introspection and resolves the probed depth's already-built base commit.
+
+
+def select_probe_depth(
+    probe_fraction: float,
+    probe_depths: list[int],
+    round_index: int,
+    available_built_depth: int,
+    recent_fail_rate: float | None,
+    suppress_flake_rate: float,
+) -> int | None:
+    """Decide whether round *round_index* should probe a deeper stack.
+
+    Returns the probed cumulative depth ``d`` (a member of *probe_depths*),
+    or ``None`` when this round should use the normal adjacent depth-1
+    placement instead. Order of checks:
+
+      1. ``probe_fraction <= 0.0`` -> ``None`` unconditionally. This is the
+         task's byte-identical guarantee: at the default fraction (0.0),
+         every call returns ``None`` regardless of the other arguments, so
+         callers always fall through to the pre-task-2359
+         ``_verify_frontier_depth()`` path.
+      2. Flake-rate suppression: if *recent_fail_rate* is not ``None`` and
+         ``recent_fail_rate >= suppress_flake_rate`` -> ``None``
+         unconditionally. Checked immediately after the fraction<=0
+         short-circuit -- i.e. *before* the frequency gate/depth cycling
+         below -- so a suppressed round returns without advancing the
+         depth cycle (a suppressed round is not "spent"; the next
+         non-suppressed firing still resumes the cycle at the same
+         ``probe_index`` it would have reached anyway, since
+         ``probe_index`` is derived from ``round_index``, not from a
+         separate advancing counter). A ``None`` fail rate (no rolling-
+         window data yet) never suppresses.
+      3. Deterministic frequency gate: ``period = max(1, math.ceil(1 /
+         probe_fraction))``; a round only fires when ``round_index % period
+         == 0``. ``ceil`` (not ``round``) is required for the firing rate to
+         actually stay <= probe_fraction: ``1/period <= probe_fraction`` iff
+         ``period >= 1/probe_fraction``, which ``ceil`` guarantees for every
+         fraction in (0, 1]. ``round`` would violate the bound across a wide
+         mid-to-high range -- e.g. fraction=0.4 rounds ``1/0.4``=2.5 DOWN to
+         period 2 (50% firing, not 40%), and fraction=0.7 rounds ``1/0.7``
+         ~= 1.43 down to period 1 (100% firing, not 70%). No RNG/seed
+         plumbing -- reproducible in unit tests by construction.
+      4. Depth cycling: on a firing round, ``probe_index = round_index //
+         period`` selects ``probe_depths[probe_index % len(probe_depths)]``,
+         so consecutive firings advance through *probe_depths* in order
+         (wrapping).
+      5. Availability fallback: if the sampled depth ``d`` exceeds
+         *available_built_depth* (the deepest already-built speculative
+         stack), return ``None`` instead of ``d``. A probe only ever
+         targets an ALREADY-built cumulative commit -- it must never
+         trigger building or rebasing a deeper stack to satisfy itself
+         (task 1890's frozen-prefix invariant).
+
+    Pure/synchronous -- no I/O, no clock, no RNG.
+    """
+    if probe_fraction <= 0.0:
+        return None
+    if recent_fail_rate is not None and recent_fail_rate >= suppress_flake_rate:
+        return None
+    period = max(1, math.ceil(1 / probe_fraction))
+    if round_index % period != 0:
+        return None
+    probe_index = round_index // period
+    d = probe_depths[probe_index % len(probe_depths)]
+    if d > available_built_depth:
+        return None
+    return d
+
+
+@dataclasses.dataclass(frozen=True)
+class ProbePlacement:
+    """Result of a firing variable-depth speculative verify probe (task 2359).
+
+    Returned by :meth:`SpeculativeMergeWorker._probe_verify_placement` when
+    ``select_probe_depth()`` selects a deeper stack to probe this round.
+
+    KNOWN PHASE-1 LIMITATION (reviewer_comprehensive amendment, task 2359):
+    ``depth``/``base`` are ATTRIBUTION facts only -- the verify that consumes
+    this placement still runs against the dispatched item's OWN (typically
+    shallower) ``merge_wt``, never against *base*'s worktree content. So the
+    resulting ``merge_verify`` record's ``depth=d`` says "a depth-d stack
+    was already built and healthy at this dispatch's decision time", NOT
+    "this specific verify exercised d cumulative layers of diff" -- the two
+    coincide only when the dispatched item happens to itself be the depth-d
+    tip. Treat probe-sourced buckets in ``analyze_speculation_depth.py`` as
+    a depth-availability proxy, not literal per-item cumulative-diff
+    coverage, until a follow-up phase redirects dispatch itself onto the
+    deep tip (which would also realize the throughput lever described in
+    this task's plan -- landing d+1 items per passing probe).
+
+    Attributes:
+        depth: The probed cumulative stack depth (a member of
+            ``probe_depths``) -- flows into the merge_verify event's
+            ``depth`` field via task 2340's existing plumbing, OVERRIDING
+            the normal ``_verify_frontier_depth()`` label for this dispatch.
+        base: The merge_commit of the already-built item at that cumulative
+            depth (the depth-d built cumulative tip) -- the base this
+            probed verify is attributed to. A DIFFERENT commit than the
+            dispatched item's own merge_commit whenever the probe fires at
+            d > 1 (see the limitation note above).
+    """
+
+    depth: int
+    base: str
+
+
 class SpeculativeMergeWorker(_WipHaltMixin):
     """Two-coroutine speculative merge-verify pipeline.
 
@@ -5809,6 +5929,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # coverage. Mirrors the RESOURCE_AUDIT_WORKTREE_GRACE_SECS/MAX_*
     # monkeypatch convention above.
     RESOURCE_AUDIT_ESCALATION_STREAK: int = 3
+    # task 2359: bounded rolling window (count of most-recent post-merge
+    # verify outcomes) feeding _recent_verify_fail_rate() -- the flake-rate
+    # signal that suppresses variable-depth speculative probing while the
+    # pipeline is already thrashing (see select_probe_depth()). Kept as a
+    # class attribute so tests can monkeypatch it small for fast,
+    # deterministic eviction coverage. Mirrors the RESOURCE_AUDIT_*/MAX_*
+    # monkeypatch convention above.
+    RECENT_VERIFY_OUTCOME_WINDOW: int = 20
 
     def __init__(
         self,
@@ -6261,6 +6389,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # dedup'd L1 escalation (_alarm_resource_audit) fires. See
         # _check_resource_audit for the full contract.
         self._resource_audit_violation_streak: int = 0
+        # task 2359: bounded rolling window of per-verify pass/fail outcomes.
+        # Fed by _record_verify_outcome() (called from the verify-finalize
+        # path); read by _recent_verify_fail_rate() to suppress variable-
+        # depth speculative probing while the pipeline is already thrashing.
+        # Empty at construction -> _recent_verify_fail_rate() returns None
+        # (no data yet), which select_probe_depth() treats as "do not
+        # suppress" -- a freshly-started/restarted worker never suppresses
+        # on phantom flakiness.
+        self._recent_verify_outcomes: collections.deque[bool] = collections.deque(
+            maxlen=self.RECENT_VERIFY_OUTCOME_WINDOW,
+        )
+        # task 2359: monotonically increasing SECOND-SLOT dispatch round
+        # counter -- the round_index select_probe_depth() cycles its
+        # deterministic frequency/depth-cycling on. Incremented only for
+        # speculative items (see _probe_verify_placement); a non-speculative
+        # (head trust-anchor) dispatch never consumes a probe round.
+        self._probe_round_counter: int = 0
 
     # ── MQ-reliability kappa (task 2169): ItemLifecycle chokepoint helpers ──
     # register/transition/retire an item's lifecycle state + the lockstep
@@ -7357,6 +7502,195 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     f'{expected_base!r} (ε=1890 §5.3 verify-base/frozen-tip rule)'
                 )
         return violations
+
+    # task 2359: variable-depth speculative verify placement -- stateful
+    # counterpart to select_probe_depth() (the pure decision core, defined
+    # module-level above this class). These methods own the live state
+    # select_probe_depth() needs: the rolling per-verify fail-rate window
+    # and the deepest already-built speculative stack depth.
+
+    def _record_verify_outcome(self, passed: bool) -> None:
+        """Record one post-merge verify outcome into the rolling window.
+
+        Feeds :meth:`_recent_verify_fail_rate`'s flake-rate suppression
+        signal. The deque is bounded to RECENT_VERIFY_OUTCOME_WINDOW entries
+        (oldest evicted first) so the rate always reflects only the most
+        recent verifies, not a lifetime average.
+
+        Pure/synchronous.
+        """
+        self._recent_verify_outcomes.append(passed)
+
+    def _recent_verify_fail_rate(self) -> float | None:
+        """Return the rolling per-verify FAIL rate, or ``None`` if no
+        outcomes have been recorded yet.
+
+        ``None`` is deliberately NOT the same as ``0.0``:
+        select_probe_depth()'s suppression guard treats a ``None`` rate as
+        "do not suppress" (a freshly-started/restarted worker has no flake
+        signal yet), while a genuine ``0.0`` (every recent verify passed)
+        is an equally-valid "do not suppress" value reached through actual
+        data. No additional minimum-sample floor beyond "non-empty" -- a
+        single recorded outcome is enough to produce a rate once the
+        window has anything in it.
+
+        Pure/synchronous.
+        """
+        if not self._recent_verify_outcomes:
+            return None
+        n_failed = sum(1 for passed in self._recent_verify_outcomes if not passed)
+        return n_failed / len(self._recent_verify_outcomes)
+
+    def _available_built_depth(self) -> int:
+        """Return the deepest already-built speculative cumulative stack depth.
+
+        Counts frozen/verifying entries (:meth:`_frozen_inflight_entries`)
+        plus :class:`RealMergeItem` entries sitting BUILT-BUT-UNVERIFIED in
+        ``_verifier_queue`` (merged by the Merger, not yet dispatched to a
+        verify runner). These queued items extend the SAME chain one level
+        further each, since every speculative merge is built against its
+        predecessor's already-computed merge commit.
+
+        ``0`` when nothing is built (empty frontier, empty queue).
+
+        AMENDMENT (reviewer_comprehensive, task 2359): applies the EXACT
+        SAME predicate as :meth:`_built_depth_tip` to both scans --
+        ``isinstance(entry_or_item, RealMergeItem)`` AND a truthy
+        ``merge_result.merge_commit`` -- so the two methods are provably in
+        lockstep. Previously this method counted frozen entries via a bare
+        ``len(_frozen_inflight_entries())`` (no type/commit filter at all)
+        and queued entries via ``isinstance`` alone (no commit-truthiness
+        check), while :meth:`_built_depth_tip` required BOTH on both scans.
+        A frozen or queued entry that is a non-:class:`RealMergeItem`
+        passthrough, or a :class:`RealMergeItem` with an empty/``None``
+        ``merge_commit``, would inflate this method's count past what
+        :meth:`_built_depth_tip` can actually resolve -- a depth accepted by
+        ``select_probe_depth()``'s availability guard could then walk past
+        the commit-less entry and resolve to the WRONG (shallower) commit
+        instead of failing closed, silently mislabelling a probe's
+        ``merge_verify`` telemetry with an incorrect base commit. Matching
+        predicates exactly makes that divergence structurally impossible.
+
+        :class:`DecidedItem` passthroughs (conflict / already_merged /
+        etc.) and the ``None`` shutdown sentinel never extend the chain --
+        a passthrough carries no merge commit -- and are excluded via the
+        ``isinstance(..., RealMergeItem)`` check.
+
+        Read-only: scans ``_verifier_queue._queue`` (the same CPython-
+        internal-deque-snapshot idiom used by
+        :meth:`speculation_accounting_violations` / :meth:`snapshot`)
+        without draining or reordering it.
+
+        Pure/synchronous (no await).
+        """
+        depth = 0
+        for entry in self._frozen_inflight_entries():
+            if isinstance(entry.item, RealMergeItem) and entry.item.merge_result.merge_commit:
+                depth += 1
+        for vq_item in self._verifier_queue._queue:  # type: ignore[attr-defined]
+            if isinstance(vq_item, RealMergeItem) and vq_item.merge_result.merge_commit:
+                depth += 1
+        return depth
+
+    def _built_depth_tip(self, depth: int) -> str | None:
+        """Return the merge_commit of the already-built item at cumulative
+        *depth* (1-indexed: depth 1 = the shallowest built item), or
+        ``None`` if *depth* exceeds :meth:`_available_built_depth`.
+
+        Walks the identical two sources ``_available_built_depth()`` counts,
+        in the same order -- frozen/verifying entries
+        (:meth:`_frozen_inflight_entries`) first, then built-but-unverified
+        :class:`RealMergeItem`\\ s still sitting in ``_verifier_queue``
+        (read-only snapshot; never drains or reorders it) -- so any *depth*
+        accepted by ``select_probe_depth()``'s availability guard (``d <=
+        available_built_depth``) always resolves to a real commit here.
+
+        Pure/synchronous (no await); must not dequeue or reorder
+        ``_verifier_queue``.
+        """
+        remaining = depth
+        for entry in self._frozen_inflight_entries():
+            if isinstance(entry.item, RealMergeItem) and entry.item.merge_result.merge_commit:
+                remaining -= 1
+                if remaining == 0:
+                    return entry.item.merge_result.merge_commit.strip()
+        for vq_item in self._verifier_queue._queue:  # type: ignore[attr-defined]
+            if isinstance(vq_item, RealMergeItem) and vq_item.merge_result.merge_commit:
+                remaining -= 1
+                if remaining == 0:
+                    return vq_item.merge_result.merge_commit.strip()
+        return None
+
+    def _probe_verify_placement(self, item: SpeculativeItem) -> ProbePlacement | None:
+        """Decide whether THIS second-slot dispatch should probe a deeper
+        already-built speculative stack instead of the normal adjacent
+        depth-1 placement (task 2359).
+
+        Returns ``None`` for a non-speculative item -- the head trust-anchor
+        verify (against real main) is never probed -- and for a disabled
+        config (``cfg.probe_fraction <= 0.0``, the default) via an early
+        short-circuit that skips :meth:`_available_built_depth` and
+        :meth:`_recent_verify_fail_rate` entirely, so the byte-identical
+        default path never pays for either introspection scan (mirrors
+        :func:`select_probe_depth`'s own first guard, just hoisted a layer
+        up so the cost disappears too, not only the output). When probing is
+        enabled, delegates to the pure :func:`select_probe_depth` policy,
+        which may itself still return ``None`` (flake-rate suppression, an
+        off-cycle round, or a sampled depth exceeding
+        :meth:`_available_built_depth`).
+
+        *item* itself is ALWAYS the one the caller already chose to dispatch
+        (the FIFO front of ``_verifier_queue``/``_redispatch``) -- this
+        method never selects a different item to verify, only whether to
+        relabel THIS dispatch's depth/base attribution. See
+        :class:`ProbePlacement`'s docstring for the resulting label-vs-
+        actually-verified-content caveat (the returned ``base`` is usually a
+        DIFFERENT, deeper item's commit than *item*'s own).
+
+        Reads ``item.request.config.speculation_probe`` LIVE on every call
+        (never cached at worker-construction time), so a hot-reloaded config
+        change takes effect on the very next dispatch.
+
+        Increments ``self._probe_round_counter`` on every call for a
+        SPECULATIVE item WHILE PROBING IS ENABLED -- matching the counter's
+        role as the second-slot round index ``select_probe_depth()`` cycles
+        on. A non-speculative item's dispatch, and a disabled-probe dispatch
+        (``probe_fraction<=0.0``), do not consume a probe round.
+
+        Pure/synchronous (no await); does not mutate ``_verifier_queue`` or
+        ``_inflight``.
+        """
+        if not item.speculative:
+            return None
+        cfg = item.request.config.speculation_probe
+        if cfg.probe_fraction <= 0.0:
+            # Zero-cost disabled path: under stock config every speculative
+            # dispatch takes this branch, so skip the two O(n) introspection
+            # scans below rather than compute them only for
+            # select_probe_depth() to discard them on its own probe_fraction
+            # guard. Restores the "no cost, not just no effect" half of the
+            # byte-identical guarantee.
+            return None
+        round_index = self._probe_round_counter
+        self._probe_round_counter += 1
+        d = select_probe_depth(
+            cfg.probe_fraction,
+            cfg.probe_depths,
+            round_index,
+            self._available_built_depth(),
+            self._recent_verify_fail_rate(),
+            cfg.suppress_flake_rate,
+        )
+        if d is None:
+            return None
+        base = self._built_depth_tip(d)
+        if base is None:
+            # Defensive fail-open: _available_built_depth() and
+            # _built_depth_tip() must stay in lockstep so this should be
+            # unreachable, but a bookkeeping mismatch must never crash the
+            # dispatch hot path -- fall back to the unprobed placement.
+            return None
+        return ProbePlacement(depth=d, base=base)
 
     # ── MQ-invariants iota (task 1994): resource-conservation audits ────────
     #
@@ -11469,6 +11803,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         item: RealMergeItem,
         lease: Any,  # HostLease
         depth: int | None = None,
+        probe_base: str | None = None,
     ) -> InflightVerifyResult:
         """Run the verify portion for one in-flight item.
 
@@ -11501,6 +11836,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             launched.  Forwarded into _run_post_merge_verify alongside
             item.speculative.  ``None`` (default) keeps the _verify_and_advance
             shim and any other non-production caller byte-identical.
+        probe_base: Variable-depth speculative-probe override (task 2359)
+            for the ``main_sha`` dispatch-time fact fed to
+            _run_post_merge_verify's merge-skew classifier -- attributes
+            this verify to a deeper already-built cumulative tip instead of
+            item.base_sha.  Purely a classification/telemetry label: never
+            mutates ``item`` itself (so the frozen-prefix base-chain
+            invariant, which reads InflightEntry.item.base_sha directly, is
+            unaffected) and never changes what is actually verified (still
+            item.merge_wt).  ``None`` (default) keeps every existing caller
+            byte-identical -- main_sha falls back to item.base_sha exactly
+            as before this task.
+
+            KNOWN PHASE-1 LIMITATION (reviewer_comprehensive amendment):
+            because the content verified stays item.merge_wt, a firing
+            probe's ``depth`` label in the resulting merge_verify record
+            does NOT assert that d cumulative layers of diff were exercised
+            by THIS verify -- only that a depth-d stack existed and was
+            healthy-enough to reference at dispatch time.  See
+            :class:`ProbePlacement`'s docstring for the full caveat and the
+            deferred follow-up (redirecting dispatch itself onto the deep
+            tip) that would close this gap.
         """
         req = item.request
         merge_wt = item.merge_wt
@@ -11560,7 +11916,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # merged_branch_tip; None (branch tip unavailable, or the git
             # call fails) skips classification inside _run_post_merge_verify
             # and degrades to INDETERMINATE (I3, fail-open).
-            main_sha = item.base_sha
+            #
+            # task 2359: probe_base (when set by a firing variable-depth
+            # probe) OVERRIDES main_sha to the probed deeper cumulative tip
+            # -- item itself is never touched, so this is purely a
+            # classification-facts substitution.
+            main_sha = item.base_sha if probe_base is None else probe_base
             merge_base_sha = await _resolve_dispatch_time_merge_base(
                 req.config.project_root, main_sha, item.merged_branch_tip,
             )
@@ -12062,6 +12423,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 self._redispatch.appendleft(_remerged_ru)
                 return False
+
+            # task 2359: feed the rolling per-verify FAIL-rate window (a
+            # normal pass/fail verify only — DROPPED/REQUEUED/
+            # RUNNER_UNAVAILABLE sentinels already returned above and never
+            # reach here). A skip (vr.outcome is not None) counts as a
+            # non-pass for the flake-suppression heuristic.
+            if vr is not None:
+                self._record_verify_outcome(vr.outcome is None)
 
             # ── (a) FAIL / skip ──────────────────────────────────────────────
             if vr is not None and vr.outcome is not None:
@@ -12754,9 +13123,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # frozen/verifying AHEAD of this item joining the frontier (no
         # async-timing fragility from a concurrent dispatch mutating
         # self._inflight between now and when the task actually runs).
-        depth = self._verify_frontier_depth()
+        #
+        # task 2359: _probe_verify_placement() may OVERRIDE this dispatch's
+        # depth label + the "base" fed to the verify's merge-skew
+        # classification metadata, attributing it to a deeper already-built
+        # speculative stack instead of the normal adjacent depth-1
+        # placement. This NEVER mutates `item` itself (so
+        # check_frozen_prefix_invariant's base-chain check, which reads
+        # InflightEntry.item.base_sha, is completely unaffected) — only the
+        # isolated depth/probe_base facts threaded into _run_inflight_verify
+        # change. placement=None (default probe_fraction=0.0, a
+        # non-speculative item, or any of the pure policy's guards) keeps
+        # this branch byte-identical to the pre-task-2359 behaviour.
+        #
+        # KNOWN PHASE-1 LIMITATION (reviewer_comprehensive amendment): `item`
+        # dispatched here is still whatever the caller already popped off
+        # _verifier_queue/_redispatch (FIFO) — a firing placement does NOT
+        # redirect dispatch onto the deeper `placement.base` item itself, so
+        # the verify still exercises only `item`'s own (typically shallower)
+        # merge_wt. See ProbePlacement's docstring for the resulting
+        # label-vs-verified-content caveat this implies for consumers of
+        # analyze_speculation_depth.py's per-depth P(pass|depth) curve.
+        placement = self._probe_verify_placement(item)
+        depth = placement.depth if placement is not None else self._verify_frontier_depth()
+        probe_base = placement.base if placement is not None else None
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
-            self._run_inflight_verify(item, lease, depth=depth)
+            self._run_inflight_verify(item, lease, depth=depth, probe_base=probe_base)
         )
 
         return InflightEntry(
