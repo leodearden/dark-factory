@@ -17,7 +17,12 @@ Three independent early-return gates in :func:`check`:
    ``possible_scope_mismatch`` — task 2684; see
    :func:`is_terminal_annotation_clear`) OR touching only
    :data:`X_ANNOTATION_PREFIX`-prefixed forward-compat annotation keys
-   (task 2695; see :func:`is_terminal_annotation_add`). Callers should pass
+   (task 2695; see :func:`is_terminal_annotation_add`). A mandatory
+   :data:`_CAUSATION_TRACING_KEYS` co-key (currently ``_causation_id``,
+   which every recon-stage write embeds per the run's Reconciliation
+   Context block) riding alongside either kind of content is transparent
+   to both checks (task 2697; see :func:`_annotation_content_keys`) — but a
+   payload of tracing co-keys alone is still not exempt. Callers should pass
    :func:`is_terminal_annotation_exempt` — the single-parse combined form of
    the two predicates. It never loosens Gates 2/3.
 2. ``op == 'set_task_status'`` AND a live workflow is detected for the task
@@ -124,6 +129,26 @@ X_ANNOTATION_PREFIX = 'x_'
 _ANNOTATION_CLEAR_ALLOWED_KWARGS: frozenset[str] = frozenset({
     'metadata', 'metadata_mode', 'append', 'tag', 'status', 'agent_id',
 })
+
+# Frozen allowlist (task 2697) of non-load-bearing recon-stage
+# causation-tracing co-keys that are transparent to (excluded from) the
+# per-key annotation-eligibility checks in :func:`is_terminal_annotation_clear`,
+# :func:`is_terminal_annotation_add`, and :func:`is_terminal_annotation_exempt`.
+# The run's Reconciliation Context block
+# (``reconciliation/stages/base.py``) mandates ``_causation_id`` on EVERY
+# recon-stage write, so a compliant recon-stage caller's metadata payload
+# always carries it ALONGSIDE any real annotation content (a clear or an
+# x_ add) — without this allowlist, that mandatory co-key made both
+# ALL-clearable and ALL-x_ checks fail unconditionally, leaving the task
+# 2684/2695 exemptions practically unreachable. Mirrors ``_causation_id``'s
+# Tier-A blessed-key status in ``shared.task_metadata._BLESSED_METADATA_KEYS``
+# (see :class:`TestCausationTracingKeysConsistencyWithBlessedMetadata`).
+# Fail-CLOSED like its sibling allowlists: only these EXACT keys are
+# transparent to the eligibility check — every other key, including any
+# other blessed-but-load-bearing key (``branch_base_sha``, ``escalation_id``,
+# ``before_done_*`` stamps, …), still disqualifies. See
+# :func:`_annotation_content_keys`.
+_CAUSATION_TRACING_KEYS: frozenset[str] = frozenset({'_causation_id'})
 
 # ---------------------------------------------------------------------------
 # Verdict
@@ -457,34 +482,57 @@ def _pure_terminal_annotation_merge(update_kwargs: dict) -> dict | None:
     return parsed
 
 
+def _annotation_content_keys(parsed: dict) -> list[str]:
+    """Return *parsed*'s keys with :data:`_CAUSATION_TRACING_KEYS` stripped.
+
+    The real-annotation-content keys a per-key eligibility check (ALL
+    clearable / ALL x_-prefixed) should evaluate — the mandatory
+    recon-stage ``_causation_id`` tracing co-key (task 2697) is transparent
+    to that check and never itself counts as (or disqualifies) content.
+    """
+    return [key for key in parsed if key not in _CAUSATION_TRACING_KEYS]
+
+
 def is_terminal_annotation_clear(update_kwargs: dict) -> bool:
     """Is *update_kwargs* a pure, allowlisted, terminal-task annotation clear?
 
-    True iff :func:`_pure_terminal_annotation_merge` succeeds AND every
-    top-level key of the returned metadata dict is in
-    :data:`CLEARABLE_ANNOTATION_KEYS` — used to compute Gate 1's
-    ``is_annotation_clear`` bypass (task 2684) for a non-load-bearing
-    annotation-only ``update_task`` write against a terminal task. See
-    :func:`_pure_terminal_annotation_merge` for the shared (allowlisted-kwargs,
-    merge-mode, non-empty-metadata) eligibility checks.
+    True iff :func:`_pure_terminal_annotation_merge` succeeds AND, once
+    :data:`_CAUSATION_TRACING_KEYS` co-keys (e.g. the mandatory recon-stage
+    ``_causation_id`` tracing tag, task 2697) are stripped via
+    :func:`_annotation_content_keys`, there is at least one remaining
+    content key AND every one of them is in :data:`CLEARABLE_ANNOTATION_KEYS`
+    — used to compute Gate 1's ``is_annotation_clear`` bypass (task 2684)
+    for a non-load-bearing annotation-only ``update_task`` write against a
+    terminal task. See :func:`_pure_terminal_annotation_merge` for the
+    shared (allowlisted-kwargs, merge-mode, non-empty-metadata) eligibility
+    checks. A payload consisting only of tracing co-keys (e.g. a bare
+    ``{'_causation_id': ...}``) has no real annotation content and is NOT
+    exempt.
 
     A "clear" is a merge-overwrite (including to ``None``); this predicate
     has no notion of key deletion (metadata has no such primitive).
     """
     parsed = _pure_terminal_annotation_merge(update_kwargs)
-    return parsed is not None and all(key in CLEARABLE_ANNOTATION_KEYS for key in parsed)
+    if parsed is None:
+        return False
+    content = _annotation_content_keys(parsed)
+    return bool(content) and all(key in CLEARABLE_ANNOTATION_KEYS for key in content)
 
 
 def is_terminal_annotation_add(update_kwargs: dict) -> bool:
     """Is *update_kwargs* a pure, allowlisted, terminal-task x_-annotation add?
 
-    True iff :func:`_pure_terminal_annotation_merge` succeeds AND every
-    top-level key of the returned metadata dict starts with
-    :data:`X_ANNOTATION_PREFIX` (``'x_'``) — the sanctioned forward-compat
-    annotation namespace (``shared.task_metadata.parse_metadata`` silently
-    admits any ``x_``-prefixed key; see :data:`X_ANNOTATION_PREFIX`). See
+    True iff :func:`_pure_terminal_annotation_merge` succeeds AND, once
+    :data:`_CAUSATION_TRACING_KEYS` co-keys (e.g. the mandatory recon-stage
+    ``_causation_id`` tracing tag, task 2697) are stripped via
+    :func:`_annotation_content_keys`, there is at least one remaining
+    content key AND every one of them starts with :data:`X_ANNOTATION_PREFIX`
+    (``'x_'``) — the sanctioned forward-compat annotation namespace
+    (``shared.task_metadata.parse_metadata`` silently admits any
+    ``x_``-prefixed key; see :data:`X_ANNOTATION_PREFIX`). See
     :func:`_pure_terminal_annotation_merge` for the shared (allowlisted-kwargs,
-    merge-mode, non-empty-metadata) eligibility checks.
+    merge-mode, non-empty-metadata) eligibility checks. A payload consisting
+    only of tracing co-keys has no real annotation content and is NOT exempt.
 
     Widens task 2684's terminal-write exemption
     (:func:`is_terminal_annotation_clear`) to also cover ADDING (or
@@ -496,10 +544,15 @@ def is_terminal_annotation_add(update_kwargs: dict) -> bool:
     exempted by either predicate and remains rejected on a terminal task —
     real Stage-2 remediations are either a clear or an x_ add, never both in
     the same ``update_task`` call, so this is treated as a known, immaterial
-    limitation rather than composing the two allowlists.
+    limitation rather than composing the two allowlists. This limitation
+    survives stripping tracing co-keys: a mixed clearable+x_ residual still
+    satisfies neither ALL-branch.
     """
     parsed = _pure_terminal_annotation_merge(update_kwargs)
-    return parsed is not None and all(key.startswith(X_ANNOTATION_PREFIX) for key in parsed)
+    if parsed is None:
+        return False
+    content = _annotation_content_keys(parsed)
+    return bool(content) and all(key.startswith(X_ANNOTATION_PREFIX) for key in content)
 
 
 def is_terminal_annotation_exempt(update_kwargs: dict) -> bool:
@@ -513,16 +566,27 @@ def is_terminal_annotation_exempt(update_kwargs: dict) -> bool:
     a second ``json.loads``) on the SAME payload; this function parses once
     and derives both the clear and add key-checks from that single result.
 
+    Like both predicates above, evaluates its ALL-clearable / ALL-x_
+    conditions against :func:`_annotation_content_keys` (parsed) — the
+    mandatory recon-stage ``_causation_id`` tracing co-key (task 2697) is
+    transparent to the check — and requires at least one remaining content
+    key, so a tracing-only payload is NOT exempt.
+
     Behavior-identical to the two-call OR form, including the x_-only
     limitation: a metadata payload mixing a :data:`CLEARABLE_ANNOTATION_KEYS`
     key with an ``x_``-prefixed key satisfies neither ALL-clearable nor
     ALL-x_-prefixed, so it is still NOT exempt (see
-    :func:`is_terminal_annotation_add`'s docstring).
+    :func:`is_terminal_annotation_add`'s docstring) — even after tracing
+    co-keys are stripped, since only ``_causation_id`` (not the clearable or
+    x_ keys) is ever removed.
     """
     parsed = _pure_terminal_annotation_merge(update_kwargs)
     if parsed is None:
         return False
+    content = _annotation_content_keys(parsed)
+    if not content:
+        return False
     return (
-        all(key in CLEARABLE_ANNOTATION_KEYS for key in parsed)
-        or all(key.startswith(X_ANNOTATION_PREFIX) for key in parsed)
+        all(key in CLEARABLE_ANNOTATION_KEYS for key in content)
+        or all(key.startswith(X_ANNOTATION_PREFIX) for key in content)
     )
