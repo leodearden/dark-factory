@@ -165,6 +165,28 @@ class TestProvenanceConflictSinkShouldSkip:
 
         assert sink.should_skip('42') is False
 
+    def test_should_skip_prunes_memo_once_escalation_resolved(self, tmp_path):
+        """reviewer_comprehensive amendment (task 2677, resource_management):
+        self._memo was otherwise never pruned — a resolved conflict's entry
+        would linger in the dict for the rest of the process lifetime,
+        growing monotonically with the number of distinct tasks that ever
+        hit a stale-evidence conflict. should_skip must evict the memo
+        entry the moment it observes the escalation is no longer pending.
+        """
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        queue = EscalationQueue(tmp_path)
+        sink = ProvenanceConflictSink(escalation_queue=queue)
+
+        escalation_id = _record(sink)
+        assert escalation_id is not None
+        queue.resolve(escalation_id, 'operator resolved the provenance conflict')
+
+        assert sink.should_skip('42') is False
+        assert '42' not in sink._memo, (
+            'a resolved conflict must not leave a permanent memo entry behind'
+        )
+
     def test_should_skip_false_when_reopen_at_differs(self, tmp_path):
         from orchestrator.provenance_conflict import ProvenanceConflictSink
 
@@ -174,6 +196,28 @@ class TestProvenanceConflictSinkShouldSkip:
         _record(sink)
 
         assert sink.should_skip('42', reopen_at='2026-07-16T00:00:00+00:00') is False
+
+    def test_should_skip_true_when_reopen_at_differs_only_in_iso8601_formatting(
+        self, tmp_path,
+    ):
+        """reviewer_comprehensive amendment (task 2677, correctness_robustness):
+        the memo'd reopen_at (sourced from the fused-memory interceptor's
+        rejection payload) and a caller-supplied reopen_at (e.g. harness.py's
+        live metadata.get('reopen_at') read) are stamped from the same
+        underlying metadata.reopen_at field and expected to be byte-identical
+        in practice — but should_skip must not be defeated by incidental
+        ISO-8601 formatting drift between the two read paths. The fixture
+        memoizes '2026-07-15T00:00:00+00:00'; a 'Z'-suffixed spelling of the
+        identical instant must still be treated as a match.
+        """
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        queue = EscalationQueue(tmp_path)
+        sink = ProvenanceConflictSink(escalation_queue=queue)
+
+        _record(sink)
+
+        assert sink.should_skip('42', reopen_at='2026-07-15T00:00:00Z') is True
 
     def test_should_skip_false_for_unknown_task(self, tmp_path):
         from orchestrator.provenance_conflict import ProvenanceConflictSink

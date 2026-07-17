@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from escalation.dedupe import DedupeConfig, content_fingerprint_key, submit_or_dedupe
@@ -85,6 +86,49 @@ def _dedupe_config() -> DedupeConfig:
         infra_dedupe_categories=(PROVENANCE_CONFLICT_CATEGORY,),
         key_fn=content_fingerprint_key,
     )
+
+
+def _parse_reopen_at(value: object) -> datetime | None:
+    """Best-effort parse of a ``reopen_at`` value to an aware UTC datetime.
+
+    ``should_skip``'s memo comparison receives ``reopen_at`` strings from
+    two different code paths: the memo'd side originates from the
+    fused-memory interceptor's rejection payload (``StaleEvidenceRejection.
+    reopen_at``), and the caller-supplied side is typically a live
+    ``metadata.get('reopen_at')`` read (e.g. harness.py's dispatch-gate and
+    stranded-sweep call sites). Both are stamped from the same underlying
+    ``metadata.reopen_at`` field, so raw string equality is exact today —
+    but this parses both sides as a defensive guard against any future
+    ISO-8601 formatting drift between the two read paths (trailing ``Z``
+    vs. ``+00:00``, microsecond precision, …). Returns ``None`` for
+    anything not confidently parseable (non-string, empty, malformed).
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    text = value[:-1] + '+00:00' if value.endswith('Z') else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _reopen_at_matches(caller_value: object, memo_value: str) -> bool:
+    """True when *caller_value* denotes the same instant as *memo_value*.
+
+    Tries exact string equality first (the common, expected case — see
+    ``_parse_reopen_at``). Falls back to a parsed-instant comparison so
+    ``should_skip`` is not defeated by incidental ISO-8601 formatting
+    drift between the memo'd and caller-supplied ``reopen_at`` strings. An
+    unparseable *caller_value* keeps the (already negative) raw-string
+    verdict — never less safe than a plain ``==``.
+    """
+    if caller_value == memo_value:
+        return True
+    parsed_caller = _parse_reopen_at(caller_value)
+    if parsed_caller is None:
+        return False
+    return parsed_caller == _parse_reopen_at(memo_value)
 
 
 class ProvenanceConflictSink:
@@ -200,7 +244,10 @@ class ProvenanceConflictSink:
         - no rejection has been memo'd for this task, OR
         - *reopen_at* is given and differs from the memo'd value (the task
           was reopened again since the conflict was recorded — a fresh
-          write attempt is warranted), OR
+          write attempt is warranted). Compared via ``_reopen_at_matches``
+          (exact string match, with a parsed-instant fallback that guards
+          against incidental ISO-8601 formatting drift between the memo'd
+          and caller-supplied strings — see that helper), OR
         - the recorded escalation is no longer pending (an operator
           resolved the arbitration), OR
         - the memo was recorded with no escalation filed (queue unbound at
@@ -210,14 +257,27 @@ class ProvenanceConflictSink:
         Passing no ``reopen_at`` (the ``_UNKNOWN_REOPEN`` sentinel) skips
         that invalidation arm — used by callers that do not have the
         task's current metadata handy.
+
+        A memo whose escalation is no longer pending is pruned from
+        ``self._memo`` before returning False (task 2677 amendment,
+        reviewer_comprehensive resource_management) — otherwise a resolved
+        conflict's entry would linger for the rest of the process
+        lifetime, growing ``self._memo`` monotonically with the number of
+        distinct tasks that ever hit a stale-evidence conflict. A memo
+        invalidated by a *reopen_at* mismatch is left in place: it is
+        still the most recent record() write and will be overwritten (not
+        duplicated) by the next one.
         """
         memo = self._memo.get(task_id)
         if memo is None:
             return False
         memo_reopen_at, _evidence_commit, escalation_id = memo
-        if reopen_at is not _UNKNOWN_REOPEN and reopen_at != memo_reopen_at:
+        if reopen_at is not _UNKNOWN_REOPEN and not _reopen_at_matches(reopen_at, memo_reopen_at):
             return False
-        return self._escalation_pending(escalation_id)
+        if self._escalation_pending(escalation_id):
+            return True
+        del self._memo[task_id]
+        return False
 
     def _escalation_pending(self, escalation_id: str | None) -> bool:
         """True when *escalation_id* is still open (or unverifiable).
