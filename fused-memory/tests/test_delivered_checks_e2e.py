@@ -658,6 +658,43 @@ class TestManualOnlySidecar:
 _MALFORMED_PRD_PATH = 'plans/e2e-malformed-fixture-prd.md'
 
 
+def _write_malformed_sidecar(project_root: Path, *, prd_path: str, label: str) -> Path:
+    """Write a capability-manifest sidecar (α schema) whose sole capability
+    for *label* FAILS α validation — a grep-kind check missing the required
+    ``expect`` field (reusing the ``_MALFORMED_SIDECAR_YAML`` shape from
+    ``test_manifest_stamping.py``): ``commit_planning`` must fail-soft on
+    this (report an error, stamp nothing, copy no metadata) but never block
+    the batch's own status flip (PRD row 9)."""
+    sidecar_rel = re.sub(r'\.md$', '', prd_path) + '.capability-manifest.yaml'
+    sidecar_path = project_root / sidecar_rel
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    doc = {
+        'prd': prd_path,
+        'schema_version': 1,
+        'tasks': [
+            {
+                'label': label,
+                'task_id': None,
+                'title': f'Producer {label}',
+                'capabilities': [
+                    {
+                        'name': 'broken_check',
+                        'binding': 'grep for something',
+                        'verdict': 'PASS',
+                        'delivered_check': {
+                            'kind': 'grep',
+                            'pattern': 'something',
+                            # intentionally missing 'expect' -> alpha validation failure
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+    sidecar_path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding='utf-8')
+    return sidecar_path
+
+
 class TestMalformedSidecar:
     """Row 9: a sidecar present on disk but failing α validation (a grep
     capability missing the required ``expect`` field) must fail loud-but-soft
