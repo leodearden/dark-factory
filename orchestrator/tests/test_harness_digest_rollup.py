@@ -52,6 +52,7 @@ class TestHarnessDigestRollupWiring:
         # same runs.db). _make_harness_with_mocks names it 'events.db'.
         runs_db = event_store.db_path
         harness.cost_store = await _cost_store_factory(runs_db.name)
+        assert harness.cost_store is not None
         assert harness.cost_store.db_path == runs_db, (
             'cost_store and event_store must share one DB file for the '
             'rollup to see both invocations and task_results/events'
@@ -62,6 +63,7 @@ class TestHarnessDigestRollupWiring:
         # side effect) mirrors _seed_rollup_runs_db in test_digest.py.
         RunStore(runs_db)
 
+        assert harness._run_id is not None
         run_id = harness._run_id
         _insert_task_result(runs_db, run_id=run_id, task_id='t1', outcome='done')
         _insert_invocation(
