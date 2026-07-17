@@ -557,3 +557,58 @@ class TestLegacyNoSidecar:
         producer_task = await _get_task(server, project_root, producer_id)
 
         _assert_row2_legacy_response(result, producer_task)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestManualOnlySidecar — row 8: manual-only capability -> stamped id, no gate
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MANUAL_PRD_PATH = 'plans/e2e-manual-fixture-prd.md'
+
+
+class TestManualOnlySidecar:
+    """Row 8: a sidecar label whose ONLY capability is manual-kind still gets
+    its task_id stamped (it's a normal label match), but is excluded from the
+    mechanical metadata.delivered_checks copy — so once the producer is
+    done, the dependent must dispatch immediately on a pure status-only
+    gate, byte-identical to pre-manifest-stamping dispatch behaviour."""
+
+    @pytest.mark.asyncio
+    async def test_manual_only_stamps_id_with_no_gate_effect(self, backend_stack):
+        server, _interceptor, project_root = backend_stack
+
+        _write_manual_sidecar(
+            project_root, prd_path=_MANUAL_PRD_PATH, label=_PRODUCER_LABEL,
+        )
+
+        producer_id, dependent_id = await _file_planning_batch(
+            server, project_root, prd_path=_MANUAL_PRD_PATH,
+        )
+
+        result = await _commit_planning(server, project_root, [producer_id, dependent_id])
+        expected_sidecar_rel = re.sub(r'\.md$', '', _MANUAL_PRD_PATH) + '.capability-manifest.yaml'
+        assert result['manifest_stamping'] == {
+            'path': expected_sidecar_rel,
+            'stamped': [_PRODUCER_LABEL],
+            'missing_labels': [],
+            'errors': [],
+        }
+
+        producer_task = await _get_task(server, project_root, producer_id)
+        assert 'delivered_checks' not in producer_task['metadata'], (
+            f'a manual-only capability must not stamp metadata.delivered_checks; '
+            f'got {producer_task["metadata"]!r}'
+        )
+
+        harness = _build_harness(
+            project_root, server, project_root / 'escalations',
+            grace_cycles=_GRACE_CYCLES,
+        )
+        await _flip_status(server, project_root, producer_id, 'done')
+
+        result = await _run_tick(harness)
+        assert result == dependent_id, (
+            f'a manual-only producer capability must not gate dispatch — '
+            f'expected the dependent ({dependent_id!r}) to dispatch on the '
+            f'very first tick; got {result!r}'
+        )
