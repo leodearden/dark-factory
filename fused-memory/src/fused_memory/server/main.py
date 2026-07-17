@@ -1062,12 +1062,12 @@ async def run_server():
             # MCP app before it can poison the SDK's shared task group.
             shielded_app = _ASGIExceptionShield(starlette_app)
 
-            uv_config = uvicorn.Config(
+            uv_config = _build_uvicorn_config(
                 shielded_app,
                 host=config.server.host,
                 port=config.server.port,
-                log_level='info',
-                timeout_keep_alive=config.server.keepalive_timeout,
+                graceful_shutdown_timeout=config.server.graceful_shutdown_timeout,
+                keepalive_timeout=config.server.keepalive_timeout,
             )
             server = uvicorn.Server(uv_config)
 
@@ -1671,6 +1671,40 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
     tool_manager._fused_memory_safe_wrapped = True
 
 
+def _build_uvicorn_config(
+    app: Any,
+    *,
+    host: str,
+    port: int,
+    graceful_shutdown_timeout: int,
+    keepalive_timeout: int | None = None,
+) -> Any:  # uvicorn.Config
+    """Construct a uvicorn.Config with a bounded graceful-shutdown wait.
+
+    Single tested seam for both uvicorn.Config construction sites (primary
+    server and recon-report server) so timeout_graceful_shutdown is always
+    wired from ServerConfig.graceful_shutdown_timeout (survey finding D1).
+    uvicorn's own default is None (unbounded), which lets a single stuck
+    in-flight request hang server.shutdown() indefinitely and starve the
+    downstream _graceful_shutdown cleanup and force-exit watchdog.
+
+    keepalive_timeout is optional: when omitted, uvicorn's own
+    timeout_keep_alive default applies unchanged (matches the pre-existing
+    recon-report site, which never set it).
+    """
+    import uvicorn
+
+    kwargs: dict[str, Any] = {
+        'host': host,
+        'port': port,
+        'log_level': 'info',
+        'timeout_graceful_shutdown': graceful_shutdown_timeout,
+    }
+    if keepalive_timeout is not None:
+        kwargs['timeout_keep_alive'] = keepalive_timeout
+    return uvicorn.Config(app, **kwargs)
+
+
 def _build_recon_report_components(
     config: FusedMemoryConfig,
     memory_service: Any = None,
@@ -1688,8 +1722,6 @@ def _build_recon_report_components(
     Returns:
         (ReconReportState, FastMCP, uvicorn.Config)
     """
-    import uvicorn
-
     from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
     from fused_memory.server.recon_report_store import ReconReportStore
 
@@ -1730,11 +1762,11 @@ def _build_recon_report_components(
     _add_json_http_error_handler(starlette_app)
     shielded_app = _ASGIExceptionShield(starlette_app)
 
-    uv_config = uvicorn.Config(
+    uv_config = _build_uvicorn_config(
         shielded_app,
         host=config.server.host,
         port=config.server.recon_report_port,
-        log_level='info',
+        graceful_shutdown_timeout=config.server.graceful_shutdown_timeout,
     )
     return state, mcp, uv_config
 
