@@ -128,23 +128,26 @@ class ProvenanceConflictSink:
         in-process retry even before the queue is late-bound.
         """
         if self.escalation_queue is None:
-            # reviewer_comprehensive amendment (task 2677): a rejection can
-            # land here before the harness late-binds .escalation_queue (the
-            # merge worker's run loop can start before that bind happens —
-            # see plan.json design_decisions). Memoizing with escalation_id
-            # None makes _escalation_pending(None) return True forever, so
-            # should_skip will gate this task for the rest of the process
-            # lifetime with NO escalation ever filed. That is a real
-            # silent-gate risk (violates the loud-over-silent-degradation
-            # norm), so make it observable even though there is nothing
-            # else this call can do yet — a fresh rejection after the queue
-            # is bound will still file a real escalation.
+            # task 2677 amendment (reviewer_comprehensive
+            # robustness_silent_degradation): a rejection can land here
+            # before the harness late-binds .escalation_queue (the merge
+            # worker's run loop can start before that bind happens — see
+            # plan.json design_decisions). Memoizing with escalation_id=None
+            # is bounded rather than permanently silent: _escalation_pending
+            # treats a None escalation_id as "still blocking" ONLY while
+            # self.escalation_queue remains None (see below). The instant a
+            # queue is later bound, it invalidates that memo — the next
+            # should_skip caller stops skipping, retries the write, and that
+            # retry's fresh rejection reaches record() again with a queue
+            # now bound, filing a real escalation. Until the queue is bound,
+            # log at WARNING so the interim window stays observable rather
+            # than a silent no-op (loud-over-silent-degradation norm).
             logger.warning(
                 'ProvenanceConflictSink.record: no escalation_queue bound yet '
                 '— memoizing task %s (evidence %s, gate_source=%s) in-process '
-                'only; should_skip will gate this task with NO operator-visible '
-                'escalation until the queue is late-bound and a fresh '
-                'rejection re-records it',
+                'only; should_skip will gate this task until the queue is '
+                'late-bound, at which point the next attempt self-heals into '
+                'a real escalation',
                 task_id, evidence_commit, gate_source,
             )
             self._memo[task_id] = (reopen_at, evidence_commit, None)
@@ -199,7 +202,10 @@ class ProvenanceConflictSink:
           was reopened again since the conflict was recorded — a fresh
           write attempt is warranted), OR
         - the recorded escalation is no longer pending (an operator
-          resolved the arbitration).
+          resolved the arbitration), OR
+        - the memo was recorded with no escalation filed (queue unbound at
+          record() time) and a queue is now bound — see
+          ``_escalation_pending``'s handling of ``escalation_id is None``.
 
         Passing no ``reopen_at`` (the ``_UNKNOWN_REOPEN`` sentinel) skips
         that invalidation arm — used by callers that do not have the
@@ -216,12 +222,24 @@ class ProvenanceConflictSink:
     def _escalation_pending(self, escalation_id: str | None) -> bool:
         """True when *escalation_id* is still open (or unverifiable).
 
-        ``None`` (no queue was bound at record() time) is treated as "still
-        blocking" — best-effort in-memory-only mode, matching the
-        None-queue-safe contract: we cannot verify resolution without a
-        queue, so we do not prematurely allow a retry storm.
+        ``escalation_id is None`` means ``record()`` memoized before a
+        queue was bound (its no-queue branch). WHILE the queue remains
+        unbound, that is treated as "still blocking" — best-effort
+        in-memory-only mode, matching the None-queue-safe contract: we
+        cannot verify or file an escalation without a queue, so we do not
+        prematurely allow a retry storm. But the moment a queue IS bound,
+        a ``None`` escalation_id memo no longer reflects reality — treat it
+        as no-longer-pending (return False) so ``should_skip`` stops
+        gating and the next caller retries the write. That retry's fresh
+        rejection reaches ``record()`` again, now with a queue bound, and
+        files the real escalation (task 2677 amendment,
+        reviewer_comprehensive robustness_silent_degradation — previously
+        this returned True unconditionally, silently gating the task for
+        the rest of the process lifetime with no escalation ever filed).
         """
-        if escalation_id is None or self.escalation_queue is None:
+        if escalation_id is None:
+            return self.escalation_queue is None
+        if self.escalation_queue is None:
             return True
         esc = self.escalation_queue.get(escalation_id)
         return esc is not None and esc.status == 'pending'

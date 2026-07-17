@@ -96,9 +96,10 @@ class TestProvenanceConflictSinkRecord:
 
     def test_none_queue_record_logs_warning_for_visibility(self, caplog):
         """reviewer_comprehensive amendment (task 2677): recording before the
-        queue is late-bound memoizes escalation_id=None, which makes
-        should_skip gate the task forever with no escalation ever filed
-        (_escalation_pending(None) is True forever). That must not be a
+        queue is late-bound memoizes escalation_id=None, which gates
+        should_skip until a queue is bound (see
+        test_none_queue_memo_self_heals_once_queue_is_bound for the
+        self-heal once that happens). That interim window must not be a
         SILENT condition — record() logs a WARNING naming the task so the
         risk is observable even though no escalation can be filed yet.
         """
@@ -113,6 +114,31 @@ class TestProvenanceConflictSinkRecord:
         assert any('42' in r.getMessage() for r in warnings), (
             f'Expected a WARNING naming the unbound-queue task; '
             f'got: {[r.getMessage() for r in warnings]!r}'
+        )
+
+    def test_none_queue_memo_self_heals_once_queue_is_bound(self, tmp_path):
+        """reviewer_comprehensive amendment (task 2677,
+        robustness_silent_degradation): a memo recorded with no queue bound
+        must NOT gate the task forever. Once a queue is later bound (the
+        harness's late-bind-by-reference), should_skip must invalidate the
+        stale None-escalation_id memo so the next caller retries the write
+        instead of being silently gated for the rest of the process
+        lifetime with no escalation ever filed.
+        """
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        sink = ProvenanceConflictSink(escalation_queue=None)
+        _record(sink)
+        assert sink.should_skip('42') is True, (
+            'must gate while the queue remains unbound'
+        )
+
+        sink.escalation_queue = EscalationQueue(tmp_path)
+
+        assert sink.should_skip('42') is False, (
+            'a None-escalation_id memo must self-heal the instant a queue '
+            'is bound, so the next attempt retries and files a real '
+            'escalation'
         )
 
 
