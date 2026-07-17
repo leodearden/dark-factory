@@ -84,6 +84,17 @@ class ServerConfig(BaseModel):
     stateless_http: bool = Field(default=True, description='Stateless HTTP mode (no sessions)')
     json_response: bool = Field(default=False, description='JSON responses instead of SSE')
     keepalive_timeout: int = Field(default=30, description='HTTP keep-alive timeout in seconds')
+    graceful_shutdown_timeout: int = Field(
+        default=10,
+        description=(
+            'Bounds uvicorn.Server timeout_graceful_shutdown (seconds the server '
+            'waits for in-flight connections to finish before forcing shutdown). '
+            'Without this bound the wait is unbounded and _graceful_shutdown/the '
+            'force-exit watchdog become unreachable. default + _FORCE_EXIT_BUDGET '
+            '(75s) must stay under systemd TimeoutStopSec (90s) so the in-process '
+            'watchdog provably fires before systemd SIGKILLs the cgroup.'
+        ),
+    )
     thread_warn_threshold: int = Field(
         default=60,
         description=(
