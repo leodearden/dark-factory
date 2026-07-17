@@ -477,7 +477,10 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
-        cast(MagicMock, h._escalation_queue.has_open_l1).assert_called_once_with('42')
+        # has_open_l1 is also consulted by the gate's pre-existing top-of-
+        # method open-L1 veto (unrelated to this dedup check) — assert the
+        # dedup call happened (most recent call), not an exact call count.
+        cast(MagicMock, h._escalation_queue.has_open_l1).assert_called_with('42')
         cast(MagicMock, h._escalation_queue.submit).assert_called_once()
         esc = cast(MagicMock, h._escalation_queue.submit).call_args[0][0]
         assert esc.category == 'provenance_unattributed'

@@ -45,9 +45,13 @@ from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps
+from orchestrator.landing_evidence import (
+    LandingEvidenceVerdict,
+    format_unattributed_landing_detail,
+    validate_landing_evidence,
+)
 from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
-from orchestrator.landing_evidence import validate_landing_evidence
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_queue import reconcile_landed_outbox, reconcile_landed_task
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
@@ -7510,6 +7514,18 @@ Output JSON matching the schema. Every task must appear in the output.
                     branch_base_sha,
                 ) and await self.git_ops.is_ancestor(marker, branch_base_sha):
                     return False
+                # CANDIDATE mode (task 2678): the marker's subject match
+                # already attributes this landing to task_id — only the
+                # FIX 1' effect-present guard remains, closing the task-1175
+                # clobber (a reverted merge previously stamped done anyway).
+                verdict = await validate_landing_evidence(
+                    self.git_ops, task_id, branch,
+                    branch_tip_sha=None,
+                    candidate_sha=marker,
+                )
+                if not verdict.accepted:
+                    self._file_unattributed_landing_escalation(task_id, branch, verdict)
+                    return False
                 await self._mark_in_progress_done(
                     task_id, marker,
                     'reconcile: pre-dispatch check found merge marker on main',
@@ -7533,6 +7549,61 @@ Output JSON matching the schema. Every task must appear in the output.
                 return True
 
         return False
+
+    def _file_unattributed_landing_escalation(
+        self, task_id: str, branch: str, verdict: LandingEvidenceVerdict,
+    ) -> None:
+        """Best-effort, dedup-guarded L1 escalation for unattributable
+        landing evidence (task 2678, INV-5).
+
+        Filed by the already-landed re-derivation sites that found a
+        positive landing signal (a merge marker, or branch content
+        equivalent to main) but whose :func:`validate_landing_evidence`
+        verdict came back rejected — an unattributed or effect-absent
+        landing that must not be silently stamped done (the task-1175
+        clobber this task closes). Escalate-instead-of-stamp is
+        deliberately non-status-blocking: the task row is simply left
+        pending and re-evaluated next tick, and the open-L1 veto at the top
+        of :meth:`_already_landed_dispatch_gate` naturally suppresses
+        reprocessing while this L1 stays open — no separate status
+        transition is needed here.
+
+        Best-effort (a no-op when ``_escalation_queue`` is None, e.g.
+        bare-Harness unit tests) and deduped via ``has_open_l1`` so repeated
+        ticks re-observing the same unattributable evidence don't stack
+        duplicate L1s — one open escalation per task at a time.
+        """
+        if not self._escalation_queue:
+            return
+        try:
+            if self._escalation_queue.has_open_l1(task_id):
+                return
+            from escalation.models import Escalation  # noqa: PLC0415
+            summary, detail = format_unattributed_landing_detail(
+                task_id, branch, verdict,
+            )
+            esc = Escalation(
+                id=self._escalation_queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='harness-reconcile',
+                severity='blocking',
+                category='provenance_unattributed',
+                summary=summary,
+                detail=detail,
+                suggested_action='investigate_unattributed_landing_evidence',
+                level=1,
+            )
+            self._escalation_queue.submit(esc)
+            logger.warning(
+                'Filed provenance_unattributed escalation %s for task %s '
+                '(branch %s, reason %s)',
+                esc.id, task_id, branch, verdict.reason,
+            )
+        except Exception:
+            logger.warning(
+                'Failed to file unattributed-landing escalation for task %s',
+                task_id, exc_info=True,
+            )
 
     async def _stop_escalation_server(self) -> None:
         """Stop the escalation server."""
