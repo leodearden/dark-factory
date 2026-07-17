@@ -531,6 +531,7 @@ async def test_worker_created_path_emits_journal_event(
     interceptor_with_store._journal = capturing_journal
 
     mock_curator = MagicMock()
+    mock_curator.prepare_candidate = AsyncMock(return_value=None)
     mock_curator.curate = AsyncMock(
         return_value=CuratorDecision(action='create')
     )
