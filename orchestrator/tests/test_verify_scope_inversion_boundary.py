@@ -100,7 +100,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -240,8 +240,10 @@ def _fake_run_verification_by_module(
     *results* mapping and baseline seeding differ per row).
     """
     async def _fake(worktree, config, module_config=None, **kwargs):
-        prefix = module_config.prefix if module_config is not None else None
-        passed, failing_ids = results.get(prefix, (True, []))
+        if module_config is not None:
+            passed, failing_ids = results.get(module_config.prefix, (True, []))
+        else:
+            passed, failing_ids = True, []
         if passed:
             return VerifyResult(
                 passed=True, test_output='', lint_output='', type_output='',
@@ -764,10 +766,11 @@ class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
         # exists to avoid. The baseline was pre-seeded above, so
         # main_baseline_failing_ids must cache-hit on BOTH calls and never
         # fall through to git_ops.ephemeral_worktree at all.
-        assert shared_git_ops.ephemeral_worktree.call_count == 0, (
+        _ephemeral_worktree_mock = cast(AsyncMock, shared_git_ops.ephemeral_worktree)
+        assert _ephemeral_worktree_mock.call_count == 0, (
             f'expected ZERO real main-probe worktrees across both merges '
             f'against the same pre-seeded main SHA; got '
-            f'{shared_git_ops.ephemeral_worktree.call_count} call(s) — the '
+            f'{_ephemeral_worktree_mock.call_count} call(s) — the '
             f'μ B2 baseline cache should have short-circuited before ever '
             f'reaching a cold probe'
         )
