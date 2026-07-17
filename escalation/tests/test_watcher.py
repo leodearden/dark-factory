@@ -749,6 +749,80 @@ class TestTimeout:
         # last read used a positive timeout recomputed from the stable tail value
         assert mock_inotify.read.call_args.kwargs['timeout'] == 4500
 
+    def test_timeout_read_ms_unaffected_by_interloping_monotonic(
+        self, tmp_path, blocking_escalation: Escalation, capsys
+    ):
+        """Regression guard for the task-2702 "expected 4500, got 5000" flake.
+
+        Root cause: ``patch('escalation.watcher.time.monotonic', ...)``
+        patches the PROCESS-GLOBAL ``time`` module singleton (watcher.py
+        does a plain ``import time``), so under pytest-xdist an
+        execnet/pytest background thread calling ``time.monotonic()``
+        inside the patched window is served from the exact same shared,
+        position-sensitive ``itertools.chain([0.0], itertools.repeat(0.5))``
+        iterator the watcher itself consumes. Each interloping call shifts
+        which value the watcher's own calls receive: with 0 interlopers the
+        watcher's deadline-call gets 0.0 (deadline=5.0) and its loop-call
+        gets 0.5 (remaining=int((5.0-0.5)*1000)=4500); with 3 interlopers
+        those three leading values are drained first, so the watcher's
+        deadline-call gets 0.5 (deadline=5.5) and its loop-call gets 0.5
+        again (remaining=int((5.5-0.5)*1000)=5000) — exactly the observed
+        "expected 4500, got 5000" flake. A correct fix makes the read
+        timeout independent of how many interlopers ran first.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+
+        # Pre-create the escalation file so the event loop can read it.
+        esc_path = queue_dir / f'{blocking_escalation.id}.json'
+        esc_path.write_text(blocking_escalation.to_json())
+
+        mock_event = MagicMock()
+        mock_event.name = f'{blocking_escalation.id}.json'
+
+        def _run(n_interlopers):
+            # Fresh, position-sensitive iterator per run — the CURRENT
+            # (unfixed) idiom used by the flaky tests above. Step-2
+            # converts this to an order-immune constant stub.
+            monotonic_values = itertools.chain([0.0], itertools.repeat(0.5))
+
+            with (
+                patch('escalation.watcher.INotify') as MockINotify,
+                patch('escalation.watcher.sys.argv', [
+                    'watcher', '--queue-dir', str(queue_dir), '--timeout', '5',
+                ]),
+                patch('escalation.watcher._initial_scan', return_value=None),
+                patch('escalation.watcher.time.monotonic', side_effect=monotonic_values),
+            ):
+                mock_inotify = MockINotify.return_value
+                mock_inotify.read.return_value = [mock_event]
+
+                # Simulate n interloping time.monotonic() calls landing in
+                # the patched window BEFORE the watcher runs — e.g. an
+                # xdist/execnet background thread. patch() replaces the
+                # .monotonic attribute on the actual process-global `time`
+                # module object (watcher.py does a plain `import time`), so
+                # this call site and the watcher's internal calls draw from
+                # the exact same shared iterator.
+                import escalation.watcher
+
+                for _ in range(n_interlopers):
+                    escalation.watcher.time.monotonic()
+
+                from escalation.watcher import main
+
+                with pytest.raises(SystemExit) as exc_info:
+                    main()
+
+                assert exc_info.value.code == 0
+
+            capsys.readouterr()  # drain stdout between runs
+            return mock_inotify.read.call_args.kwargs['timeout']
+
+        # The read timeout must not depend on how many interlopers ran
+        # first. RED today: _run(0) == 4500 but _run(3) == 5000.
+        assert _run(0) == _run(3)
+
 
 class TestLevelFilter:
     """--level argument filters by escalation level."""
