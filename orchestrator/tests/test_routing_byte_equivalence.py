@@ -11,6 +11,14 @@ byte-equivalence sub-tests (TestByteEquivalencePerRole) already pass today
 per-role config resolution when no rule/override applies) but are locked in
 here as the single source of truth for invariant 3 going forward.
 
+Task theta (Phase 3 of the same PRD) later generalized defaults.yaml's
+single crates/-only `rust-large-plan-implementer` rule into two
+language-agnostic rules (`large-plan-steps` / `large-plan-modules`) --
+TestRustHeuristicRuleParity now guards only the regression case (a
+Rust-shaped plan still resolves opus, via the new `large-plan-steps` rule);
+see test_routing_theta_plan_shape.py for theta's own language-agnostic
+model-upgrade coverage.
+
 Fixtures are kept MODULE-LOCAL (not conftest.py) -- mirrors test_routing.py's
 documented rationale (a conftest.py edit forces verify.py's has_conftest to
 widen the merge-time scoped-test selection to the whole owning package).
@@ -117,15 +125,23 @@ class TestByteEquivalencePerRole:
 
 
 class TestRustHeuristicRuleParity:
-    """The shipped `rust-large-plan-implementer` policy rule (defaults.yaml,
-    step-10) must reproduce the pre-epsilon `_select_model_for_role` Rust
-    heuristic exactly: role in (implementer, debugger) AND >=3 'crates/'
-    modules AND step_count >= 12 -> opus; else the config model, unchanged.
+    """A plan matching the retired Rust-only shape (role in (implementer,
+    debugger) AND >=3 'crates/' modules AND step_count >= 12) still resolves
+    opus -- a regression guard for the pre-epsilon `_select_model_for_role`
+    heuristic this rule originally transcribed byte-for-byte.
 
-    Per this task's design decisions, ONE shared rule id
-    ('rust-large-plan-implementer') covers both implementer and debugger --
-    resolve_route's rule_id does not itself differentiate by role; a
-    per-role telemetry id (if any) is an _invoke-level detail.
+    Task theta (plans/adaptive-model-routing-prd.md Phase 3) replaced the
+    single crates/-prefixed `rust-large-plan-implementer` rule in
+    defaults.yaml with two language-agnostic rules, `large-plan-steps` and
+    `large-plan-modules` (see test_routing_theta_plan_shape.py). The general
+    `large-plan-steps` rule strictly subsumes the old Rust-only shape (>=3
+    crates/ modules AND >=12 steps implies >=12 steps), so a Rust-shaped
+    plan now resolves via `large-plan-steps` rather than the retired rule.
+    This class used to also carry two `does_not_fire` sub-tests
+    (two-crates-modules, eleven-steps) -- theta's language-agnostic
+    conditions make both of those inputs legitimately fire now, so they were
+    removed; see test_routing_theta_plan_shape.py's steps/modules trigger
+    coverage instead.
     """
 
     RUST_PLAN = PlanShape(
@@ -140,25 +156,7 @@ class TestRustHeuristicRuleParity:
 
         assert decision.model == 'opus'
         assert decision.source_layer == 'policy_rule'
-        assert decision.rule_id == 'rust-large-plan-implementer'
-
-    def test_does_not_fire_with_only_two_crates_modules(self):
-        cfg = OrchestratorConfig()
-        plan = PlanShape(step_count=12, module_paths=('crates/a', 'crates/b', 'lib/other'))
-
-        decision = resolve_route(_inputs_for('implementer', plan_shape=plan), cfg)
-
-        assert decision.model == cfg.models.implementer
-        assert decision.source_layer != 'policy_rule'
-
-    def test_does_not_fire_with_only_eleven_steps(self):
-        cfg = OrchestratorConfig()
-        plan = PlanShape(step_count=11, module_paths=('crates/a', 'crates/b', 'crates/c'))
-
-        decision = resolve_route(_inputs_for('debugger', plan_shape=plan), cfg)
-
-        assert decision.model == cfg.models.debugger
-        assert decision.source_layer != 'policy_rule'
+        assert decision.rule_id == 'large-plan-steps'
 
     def test_does_not_fire_for_architect(self):
         cfg = OrchestratorConfig()
