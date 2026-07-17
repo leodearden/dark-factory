@@ -4828,6 +4828,74 @@ class Scheduler:
                             )
         return _CONTINUE
 
+    async def _phase_backfill_terminal_dep_records(self, ctx: TickContext) -> object:
+        """Backfill fetched TERMINAL dep records missing from tasks_by_id.
+
+        Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``.
+        Writes: ``ctx.terminal_dep_records`` (task 2692, δ/ε follow-up).
+        Runs immediately after ``backfill_dep_status`` (so ``status_map`` is
+        already populated) and before ``delivered_check_gate`` and both
+        candidate-dispatch loops — all of which consult
+        ``ctx.terminal_dep_records`` as an additive fallback source for the
+        two delivered-check consumers (``_deps_satisfied``,
+        ``_compute_delivered_check_cache``).
+
+        Correctness crux (mirrors γ2's ``_phase_backfill_dep_status``, but
+        for RECORDS rather than statuses): the active-only ``get_tasks``
+        fetch that seeds ``ctx.tasks_by_id`` excludes DONE/CANCELLED
+        producers, so a just-completed dep carrying
+        ``metadata.delivered_checks`` is genuinely absent from
+        ``tasks_by_id`` even though ``status_map`` (backfilled above)
+        already knows it's terminal. Without this backfill, both
+        delivered-check consumers key off ``tasks_by_id.get(dep_id)`` and
+        silently skip the gate entirely (task 2692's root cause).
+
+        Gated by (``config.delivered_checks.enabled`` AND a non-empty
+        missing-id set) — zero extra cost when the gate is off or nothing
+        is missing, mirroring ``_phase_delivered_check_gate``'s own kill
+        switch. Only PENDING tasks' deps are considered, and only deps
+        whose ``status_map`` entry is TERMINAL. Fetches are issued
+        concurrently via ``asyncio.gather`` over ``self.get_task`` (the
+        lean per-id fetch primitive), which already returns ``None`` on
+        failure/absence — a dep that fails to fetch is simply left out of
+        ``ctx.terminal_dep_records``, degrading to today's (silent no-op)
+        behaviour for that one dep. The whole collection+fetch is wrapped
+        in try/except so an unexpected failure logs a WARNING and leaves
+        ``ctx.terminal_dep_records`` as-is (fail-safe), mirroring
+        ``_phase_delivered_check_gate``. Always continues.
+        """
+        if not self.config.delivered_checks.enabled:
+            return _CONTINUE
+        try:
+            needed: set[str] = set()
+            for _t in ctx.tasks:
+                if _t.get('status') != 'pending':
+                    continue
+                for _d in (_t.get('dependencies') or []):
+                    _dep_id = str(
+                        _d.get('id', _d) if isinstance(_d, dict) else _d
+                    )
+                    if not _dep_id or _dep_id in ctx.tasks_by_id:
+                        continue
+                    if ctx.status_map.get(_dep_id) not in TERMINAL_STATUSES:
+                        continue
+                    needed.add(_dep_id)
+            if not needed:
+                return _CONTINUE
+            _ordered = sorted(needed)
+            _fetched = await asyncio.gather(
+                *(self.get_task(_dep_id) for _dep_id in _ordered)
+            )
+            for _dep_id, _record in zip(_ordered, _fetched, strict=True):
+                if _record is not None:
+                    ctx.terminal_dep_records[_dep_id] = _record
+        except Exception:
+            logger.warning(
+                'acquire_next: terminal dep record backfill failed unexpectedly',
+                exc_info=True,
+            )
+        return _CONTINUE
+
     async def _phase_drain_park_eviction(self, ctx: TickContext) -> object:
         """Hygiene: drain queued operator force-evict requests.
 
