@@ -1476,6 +1476,92 @@ async def test_update_task_legacy_hints_migration_preserves_sibling_metadata(bac
     }
 
 
+# ── reserved control-flag key stripping (task 2735) ───────────────────
+#
+# The Stage-2 recon LLM conflated update_task's CALL-FLAGS (`append`,
+# `metadata_mode`) with actual metadata fields, calling
+# update_task(metadata={..., "append": True}, append=True). `_merge_metadata`
+# faithfully persists every key in the incoming payload, so the literal
+# `append` key leaked into the stored blob (task 2682). These tests cover
+# the defensive strip helpers that remove reserved control-flag key names
+# from the INCOMING metadata payload before the merge runs.
+#
+# Symbols under test do not exist yet — imported inside each test function
+# (mirroring test_sqlite_task_backend_has_no_add_subtask_method below) so
+# RED is localized to these tests rather than failing module collection.
+
+
+def test_reserved_metadata_control_keys_names_append_and_metadata_mode():
+    """`_RESERVED_METADATA_CONTROL_KEYS` names exactly the two update_task call-flags."""
+    from fused_memory.backends.sqlite_task_backend import _RESERVED_METADATA_CONTROL_KEYS
+
+    assert _RESERVED_METADATA_CONTROL_KEYS == frozenset({'append', 'metadata_mode'})
+
+
+def test_drop_reserved_control_keys_removes_append_and_metadata_mode():
+    """(a) Reserved keys are dropped; sibling keys survive; dropped-set reported."""
+    from fused_memory.backends.sqlite_task_backend import _drop_reserved_control_keys
+
+    incoming = {
+        'append': True,
+        'metadata_mode': 'additive',
+        'source': 'x',
+        'memory_hints': {'entities': ['A'], 'queries': ['q1']},
+    }
+    cleaned, dropped = _drop_reserved_control_keys(incoming)
+    assert cleaned == {
+        'source': 'x',
+        'memory_hints': {'entities': ['A'], 'queries': ['q1']},
+    }
+    assert dropped == {'append', 'metadata_mode'}
+
+
+def test_drop_reserved_control_keys_no_op_when_absent():
+    """(b) A dict without reserved keys is returned unchanged with an empty dropped-set."""
+    from fused_memory.backends.sqlite_task_backend import _drop_reserved_control_keys
+
+    incoming = {'source': 'x', 'memory_hints': {'entities': ['A'], 'queries': ['q1']}}
+    cleaned, dropped = _drop_reserved_control_keys(incoming)
+    assert cleaned == incoming
+    assert dropped == set()
+
+
+def test_strip_reserved_control_keys_strips_from_json_object_string():
+    """(c) String wrapper strips reserved keys from a JSON-object string and re-serializes."""
+    from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
+
+    incoming = json.dumps({'append': True, 'metadata_mode': 'merge', 'source': 'x'})
+    result = _strip_reserved_control_keys(incoming)
+    assert json.loads(result) == {'source': 'x'}
+
+
+def test_strip_reserved_control_keys_no_op_returns_equivalent_when_absent():
+    """(c) No reserved keys present: the (re-serialized) payload is unchanged in content."""
+    from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
+
+    incoming = json.dumps({'source': 'x'})
+    result = _strip_reserved_control_keys(incoming)
+    assert json.loads(result) == {'source': 'x'}
+
+
+def test_strip_reserved_control_keys_passthrough_on_corrupt_json():
+    """(d) Fail-safe: a corrupt/non-JSON string is returned UNCHANGED (identity-preserving),
+    matching _merge_metadata's corrupt-incoming last-write-wins fallback."""
+    from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
+
+    incoming = 'NOT_JSON'
+    assert _strip_reserved_control_keys(incoming) is incoming
+
+
+@pytest.mark.parametrize('incoming', ['[1,2]', '"s"'])
+def test_strip_reserved_control_keys_passthrough_on_non_dict_json(incoming):
+    """(d) Fail-safe: valid-but-non-dict JSON is returned UNCHANGED, matching
+    _merge_metadata's non-dict-incoming fallback (returns incoming verbatim)."""
+    from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
+
+    assert _strip_reserved_control_keys(incoming) is incoming
+
+
 @pytest.mark.asyncio
 async def test_sqlite_task_backend_has_no_add_subtask_method():
     """SqliteTaskBackend must NOT have an add_subtask method after DF-D (task 1543).
