@@ -8,7 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from orchestrator.agents.roles import AgentRole
+from orchestrator.agents.roles import (
+    _READ_ONLY_TOOLS,
+    _REVIEWER_PROMPT_HARNESS_VERSION,
+    _VERDICT_TOOLS,
+    AgentRole,
+    build_reviewer_prompt_spec,
+)
 
 # ---------------------------------------------------------------------------
 # Spec + config types
@@ -39,76 +45,45 @@ class VariantConfig:
 
 
 # ---------------------------------------------------------------------------
-# Shared prompt template (mirrors roles._reviewer_role)
+# Trial reviewer role builder — built from the SAME reviewer PromptSpec as
+# production (roles.build_reviewer_prompt_spec: frozen CONTRACT + editable
+# HEURISTICS, composed), so the trial reviewer's prompt AND verdict-tools
+# transport match the live path exactly (task 2493 trial-parity decision:
+# prompt parity forces transport parity, since the post-2484 CONTRACT tells
+# the agent to CALL submit_review_verdict rather than emit JSON/prose — an
+# output-schema-only capture would leave a prompt-parity reviewer with no
+# way to emit). Replaces the drifted, pre-2484 _REVIEWER_SYSTEM_TEMPLATE.
 # ---------------------------------------------------------------------------
 
-_REVIEWER_SYSTEM_TEMPLATE = """\
-You are a code reviewer specializing in: **{specialization}**
-
-## Your Task
-
-Review the code diff provided and produce a structured JSON review.
-
-## Output Schema
-
-You MUST output ONLY valid JSON matching this schema:
-
-```json
-{{
-  "reviewer": "{name}",
-  "verdict": "PASS or ISSUES_FOUND",
-  "issues": [
-    {{
-      "severity": "blocking or suggestion",
-      "location": "src/foo.py:42",
-      "category": "descriptive_category",
-      "description": "Clear description of the issue",
-      "suggested_fix": "How to fix it"
-    }}
-  ],
-  "summary": "One paragraph summary"
-}}
-```
-
-## Rules
-
-1. **Be specific.** Every issue must have a file location and concrete description.
-2. **Blocking means broken.** Use `blocking` ONLY for issues that will cause runtime errors,
-   data corruption, security vulnerabilities, or API contract violations **within the scope
-   of this task**. Do not block on:
-   - Design concerns that are valid but outside this task's scope
-   - Edge cases that cannot occur given the task's stated constraints
-   - Missing features that belong in a follow-up task
-   - Style, naming, or structural preferences
-3. **When in doubt, suggest.** If you're unsure whether something is blocking, it's a suggestion.
-4. **Read the codebase** to understand context before judging patterns or naming.
-5. **Output pure JSON only.** No markdown fences, no explanatory text outside the JSON.
-
-## Your Specialization: {specialization}
-"""
-
-_READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
 _JCODEMUNCH_TOOLS = ['mcp__jcodemunch__*']
 
 
-def build_trial_reviewer_role(spec: ReviewerSpec) -> AgentRole:
+def build_trial_reviewer_role(spec_in: ReviewerSpec) -> AgentRole:
     """Build an AgentRole for a trial reviewer.
 
-    Reuses the prompt template structure from roles._reviewer_role()
-    (system prompt + output schema + rules + specialization) but
-    allows model/budget/effort override per spec.
+    Builds from the same reviewer ``PromptSpec`` as production
+    (``roles.build_reviewer_prompt_spec``), so the trial reviewer's system
+    prompt and live verdict-tools transport match production exactly.
+    ``role.name`` is ``reviewer_{spec_in.name}`` (not ``trial_``-prefixed)
+    because the verdict-tools server's ``reviewer == --verdict-role``
+    identity check validates the emitted verdict's ``reviewer`` field
+    against ``role.name``, and the frozen CONTRACT instructs the agent to
+    emit ``reviewer_{name}``. Model/budget are still per-spec overridable;
+    effort is consumed directly from ``spec_in.effort`` by the trial runner
+    (AgentRole has no effort field).
     """
+    spec = build_reviewer_prompt_spec(spec_in.name, spec_in.specialization)
     return AgentRole(
-        name=f'trial_{spec.name}',
-        system_prompt=_REVIEWER_SYSTEM_TEMPLATE.format(
-            name=spec.name,
-            specialization=spec.specialization,
-        ),
-        allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS],
+        name=f'reviewer_{spec_in.name}',
+        system_prompt=spec.in_code_constant,
+        allowed_tools=[*_READ_ONLY_TOOLS, *_VERDICT_TOOLS, *_JCODEMUNCH_TOOLS],
         disallowed_tools=['Edit', 'Write'],
-        default_model=spec.model,
-        default_budget=spec.budget,
+        default_model=spec_in.model,
+        default_budget=spec_in.budget,
         default_max_turns=30,
+        mcp_families=frozenset({'verdict_tools'}),
+        prompt_spec=spec,
+        prompt_harness_version=_REVIEWER_PROMPT_HARNESS_VERSION,
     )
 
 

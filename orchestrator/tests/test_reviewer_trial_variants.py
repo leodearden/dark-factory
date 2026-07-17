@@ -166,7 +166,7 @@ class TestVariantDefinitions:
             for spec in variant.reviewers:
                 role = build_trial_reviewer_role(spec)
                 assert isinstance(role, AgentRole)
-                assert role.name.startswith('trial_')
+                assert role.name.startswith('reviewer_')
                 assert role.system_prompt
                 assert role.allowed_tools
 
