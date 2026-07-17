@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.harness import Harness
+from orchestrator.landing_evidence import LandingEvidenceVerdict
 
 
 def _build_harness(mock_orch_config) -> Harness:
@@ -289,6 +290,68 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
         assert call_args.args[0] == '42'
         assert call_args.args[1] == citation_sha
         assert call_args.args[3] == 'dispatch-gate-already-on-main'
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedDispatchGateAncestryDelegatesToHelper:
+    """The ancestry path DELEGATES to the shared validate_landing_evidence
+    helper (task 2678) instead of inlining its own FIX2 lineage + FIX1'
+    effect-present logic. RED until step-06.
+
+    The open-L1 veto, the degenerate-branch veto, and the is_ancestor(branch,
+    main) gate all still short-circuit BEFORE the helper is ever consulted —
+    only pinned indirectly here by _wired_ancestry_harness's setup; the
+    dedicated veto tests live in TestAlreadyLandedDispatchGateAncestryGuards
+    and must remain green (unchanged) after step-06's refactor.
+    """
+
+    async def test_accepted_verdict_marks_done_and_returns_true(
+        self, mock_orch_config,
+    ) -> None:
+        h = _wired_ancestry_harness(mock_orch_config)
+        branch_tip_sha = 'f' * 40  # matches _wired_ancestry_harness's resolve_branch_sha
+        verdict = LandingEvidenceVerdict(
+            accepted=True, evidence_sha='a' * 40, reason='ok', probe={},
+        )
+
+        with patch(
+            'orchestrator.harness.validate_landing_evidence',
+            AsyncMock(return_value=verdict),
+        ) as mock_validate:
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        mock_validate.assert_awaited_once()
+        call = mock_validate.await_args
+        assert call is not None
+        assert call.args[0] is h.git_ops
+        assert call.args[1] == '42'
+        assert call.args[2] == 'task/42'
+        assert call.kwargs['branch_tip_sha'] == branch_tip_sha
+
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        mark_call = cast(AsyncMock, h._mark_in_progress_done).await_args
+        assert mark_call is not None
+        assert mark_call.args[0] == '42'
+        assert mark_call.args[1] == 'a' * 40
+        assert mark_call.args[3] == 'dispatch-gate-already-on-main'
+
+    async def test_rejected_verdict_returns_false_no_mark_done(
+        self, mock_orch_config,
+    ) -> None:
+        h = _wired_ancestry_harness(mock_orch_config)
+        verdict = LandingEvidenceVerdict(
+            accepted=False, evidence_sha=None, reason='effect_absent', probe={},
+        )
+
+        with patch(
+            'orchestrator.harness.validate_landing_evidence',
+            AsyncMock(return_value=verdict),
+        ):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
 
 def _wired_marker_harness(
