@@ -990,6 +990,15 @@ class SqliteTaskBackend:
         # Per-project write serialisation (mirrors the interceptor's
         # ``_write_lock`` pattern). WAL allows concurrent readers natively.
         self._write_locks: dict[str, asyncio.Lock] = {}
+        # Per-project serialisation for the cached READ connection (task
+        # 2694). Mirrors ``_write_locks`` but guards ``_fresh_read_conn``'s
+        # logical read unit (freshness-guard rollback + query + cursor
+        # close) on the SHARED cached read connection — required so one
+        # reader's guard rollback can never run between a concurrent peer
+        # reader's execute and fetch and tear its in-flight cursor. See
+        # ``_fresh_read_conn`` and ``_get_read_connection``'s "Serialization
+        # trade-off" note.
+        self._read_locks: dict[str, asyncio.Lock] = {}
         # Cached result of `_claimant_columns_present` per project_root,
         # populated once in `_get_connection` right after `_migrate` runs.
         # Column presence is immutable for the life of a connection (the only
@@ -1188,22 +1197,38 @@ class SqliteTaskBackend:
         ``project_root`` so repeated hot-path calls don't pay a per-call
         connection-open cost.
 
-        Guardrail: the "never pinned" invariant depends on every reader
-        closing its cursor before returning — a ``SELECT`` cursor left
-        partially stepped (or abandoned mid-iteration because something
-        raised before the statement was exhausted) would keep an implicit
-        WAL read transaction open on *this* connection and re-introduce the
-        task-2388 stale-snapshot pin, this time on the cached read
-        connection. Every current caller — :meth:`_statuses_from_conn`,
+        Guardrail (belt): every current caller — :meth:`_statuses_from_conn`,
         :meth:`get_task`, :meth:`_get_tasks_internal` (including the
         :meth:`_fetch_dependencies` call it makes), and :meth:`list_tags` —
-        enforces this deterministically via ``async with conn.execute(...)
+        closes its cursor deterministically via ``async with conn.execute(...)
         as cursor:``, which closes the cursor even if ``fetchall()``/
-        ``fetchone()`` or a row-coercion step raises — so the invariant no
-        longer depends on a reader happening to fully drain the cursor by
-        convention. A future caller that queries this connection directly
-        should use the same pattern (or otherwise guarantee the cursor is
-        closed) rather than assume it's automatic.
+        ``fetchone()`` or a row-coercion step raises — so a normal read
+        never itself leaves an implicit WAL read transaction open on *this*
+        connection.
+
+        Guardrail (suspenders, task 2694): the belt above only stops a
+        normal reader from INTRODUCING a new pin — it does not defend
+        against one already left open by some other path (a leaked /
+        partially-stepped cursor, or an abandoned mid-iteration read). That
+        residual gap is exactly what task 2694 found in production (repro:
+        task 2679): task 2651 rerouted get_task/get_tasks onto this
+        connection but did not harden the connection against being pinned
+        itself, so once pinned, every subsequent read — including
+        get_task — would silently keep serving the stale snapshot
+        indefinitely. :meth:`_fresh_read_conn` closes that gap
+        deterministically: before yielding this connection it rolls back
+        any lingering transaction (``if conn.in_transaction: await
+        conn.rollback()``), so a pin can never survive past the next
+        guarded read, and it serializes access through the per-project
+        :meth:`_read_lock` so that rollback can never tear a concurrent
+        peer reader's in-flight cursor (see :meth:`_read_lock`'s
+        docstring). As of task 2694 step-2, :meth:`get_task` reads through
+        :meth:`_fresh_read_conn` and is therefore enforced this way;
+        :meth:`_get_tasks_internal`, :meth:`get_statuses_raw` (via
+        :meth:`_statuses_from_conn`), and :meth:`list_tags` still call this
+        method directly and rely on the belt alone until task 2694 step-4
+        migrates them too. A future caller should go through
+        :meth:`_fresh_read_conn` rather than call this method directly.
 
         Serialization trade-off (task 2651): this connection is now shared
         by both the "hot" status reads (:meth:`get_statuses_raw` via
@@ -1287,6 +1312,16 @@ class SqliteTaskBackend:
     def _write_lock(self, project_root: str) -> asyncio.Lock:
         return self._write_locks.setdefault(project_root, asyncio.Lock())
 
+    def _read_lock(self, project_root: str) -> asyncio.Lock:
+        """Per-project lock serialising access to the cached READ connection.
+
+        Mirrors :meth:`_write_lock`. See :meth:`_fresh_read_conn` (task
+        2694) for why the cached read connection's logical read unit must
+        be serialised through this lock rather than left to aiosqlite's
+        single-worker-thread ordering alone.
+        """
+        return self._read_locks.setdefault(project_root, asyncio.Lock())
+
     @contextlib.asynccontextmanager
     async def _txn(self, project_root: str):
         """Explicit transaction wrapper: commit on success, rollback otherwise.
@@ -1314,6 +1349,48 @@ class SqliteTaskBackend:
             raise
 
     # ── Read helpers ───────────────────────────────────────────────────
+
+    @contextlib.asynccontextmanager
+    async def _fresh_read_conn(self, project_root: str):
+        """Yield the cached read connection with any lingering pin cleared.
+
+        The read-path counterpart to :meth:`_txn`: acquires the per-project
+        :meth:`_read_lock`, fetches :meth:`_get_read_connection`'s cached
+        AUTOCOMMIT connection, and — if a read transaction was somehow left
+        open on it (a leaked / partially-stepped cursor, or an abandoned
+        mid-iteration read; see :meth:`_get_read_connection`'s Guardrail
+        note) — rolls it back *before* yielding, so no caller can ever be
+        served a stale pinned WAL snapshot (task 2694).
+
+        Every reader that shares the cached read connection
+        (:meth:`get_task`, :meth:`_get_tasks_internal`, :meth:`_statuses_from_conn`
+        via :meth:`get_statuses_raw`, and :meth:`list_tags`) must go through
+        this context manager for its ENTIRE logical read unit — guard reset
+        through cursor close — not just call :meth:`_get_read_connection`
+        directly. Two reasons:
+
+        1. **Enforces the "never pinned" invariant.** Before task 2694 this
+           invariant depended on every reader closing its cursor by
+           convention (documented but not enforced); the guard here makes a
+           leaked pin self-heal on the very next read instead of silently
+           serving stale data indefinitely.
+        2. **Correctness under concurrency.** The cached connection
+           genuinely serves concurrent readers (see
+           :meth:`_get_read_connection`'s "Serialization trade-off" note).
+           Without the read lock, one reader's guard rollback could run
+           between a peer reader's ``execute`` and ``fetch`` — both queued
+           on aiosqlite's single connection worker thread — and tear the
+           peer's in-flight cursor. Holding :meth:`_read_lock` across the
+           whole unit prevents that interleaving. Lock ordering is
+           read-lock-only (never combined with :meth:`_write_lock` or the
+           connect locks in the same call), so this cannot deadlock against
+           the write path.
+        """
+        async with self._read_lock(project_root):
+            conn = await self._get_read_connection(project_root)
+            if conn.in_transaction:
+                await conn.rollback()
+            yield conn
 
     async def _fetch_dependencies(
         self, conn: aiosqlite.Connection, tag: str,
@@ -1393,25 +1470,39 @@ class SqliteTaskBackend:
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None,
     ) -> dict:
+        """Return a single task's full row (plus its dependency ids).
+
+        Reads through :meth:`_fresh_read_conn` (task 2694): the cached read
+        connection's "never pinned" invariant is enforced for this call —
+        any lingering transaction on the connection is rolled back before
+        the read runs, and the whole read unit (guard reset through cursor
+        close, including the :meth:`_fetch_dependencies` call) is
+        serialized against concurrent cached-read-connection callers via
+        the per-project read lock. See :meth:`_fresh_read_conn` and
+        :meth:`_get_read_connection` for the full rationale.
+
+        Raises:
+            TaskNotFoundError: No task with ``task_id`` exists in ``tag``.
+        """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
-        conn = await self._get_read_connection(project_root)
 
-        async with conn.execute(
-            'SELECT * FROM tasks WHERE tag = ? AND id = ?',
-            (tag, tid),
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row is None:
-            # Definitive zero-row absence: the query executed successfully
-            # and found nothing, under this specific (project, tag) scope —
-            # distinct from a connect/execute outage raised above, before
-            # this point, by ensure_connected()/_get_connection() (task 2521
-            # RC2). TaskNotFoundError keeps this call's code/message
-            # byte-identical; only its type is more specific.
-            raise TaskNotFoundError(task_id, tag=tag)
-        deps = await self._fetch_dependencies(conn, tag)
+        async with self._fresh_read_conn(project_root) as conn:
+            async with conn.execute(
+                'SELECT * FROM tasks WHERE tag = ? AND id = ?',
+                (tag, tid),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                # Definitive zero-row absence: the query executed successfully
+                # and found nothing, under this specific (project, tag) scope —
+                # distinct from a connect/execute outage raised above, before
+                # this point, by ensure_connected()/_get_connection() (task 2521
+                # RC2). TaskNotFoundError keeps this call's code/message
+                # byte-identical; only its type is more specific.
+                raise TaskNotFoundError(task_id, tag=tag)
+            deps = await self._fetch_dependencies(conn, tag)
 
         out = _row_to_task(row, deps.get(row['id'], []), project_root=project_root)
         # get_task surfaces a single task — Taskmaster returns int id here
