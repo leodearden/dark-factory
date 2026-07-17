@@ -57,24 +57,40 @@ a bool, the sweep reverts to pending, the coalesce re-drive calls
   grep pattern), then the FIX 1' effect-present guard anchored on
   ``branch_tip_sha`` for an in-branch work-commit citation (it may be a
   stale intermediate commit — the branch's actual final state is its tip)
-  or on the citation itself for a no-ff merge commit (its diff-tree is
-  empty, so checking it is an intentional no-op). Used by the ancestry
-  path, the content-equivalence fallback, and the coalesce re-drive.
+  or on the citation itself for a no-ff merge commit. That merge-commit
+  case is NOT a no-op: task 2675 made ``commit_effect_present_in_main``
+  merge-aware, so it diffs each of the merge commit's non-first parents'
+  content against current main HEAD, correctly catching a reverted no-ff
+  merge (the task-1175 shape). Used by the ancestry path, the
+  content-equivalence fallback, and the coalesce re-drive.
 - **CANDIDATE** (``candidate_sha`` given) — attribution was already
   established by the caller (a merge-marker subject match, or a stranded-
   sweep ground-truth report): skip citation discovery and the lineage guard
   entirely, and apply ONLY the FIX 1' effect-present guard to
   ``candidate_sha``. Used by the merge-marker path and the stranded-
   in-progress sweep.
+
+Also shared here (INV-5): :func:`format_unattributed_landing_detail` renders
+a rejected verdict into a human-facing ``(summary, detail)`` pair, and
+:func:`file_unattributed_landing_escalation` is the dedup-guarded L1 filing
+boilerplate (queue-None guard, ``has_open_l1`` dedup, ``Escalation``
+construction) that both ``Harness._file_unattributed_landing_escalation``
+and ``SpeculativeMergeWorker._file_unattributed_landing_escalation``
+delegate to — the two differ only in the ``agent_role`` they pass.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from escalation.queue import EscalationQueue
+
     from orchestrator.git_ops import GitOps
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -193,9 +209,11 @@ async def validate_landing_evidence(
     # mean the effect survives at HEAD — a later commit on main may have
     # reverted exactly the paths the citation touched. Anchor on the branch
     # TIP for an in-branch work commit (it may be a stale intermediate
-    # commit); anchor on the citation itself for a no-ff merge commit (its
-    # diff-tree is empty — an intentional no-op check) or in the defensive
-    # case a DISCOVERY caller omitted branch_tip_sha despite citation_on_branch.
+    # commit); anchor on the citation itself for a no-ff merge commit (task
+    # 2675 made this a REAL check — it diffs each non-first parent's content
+    # against current main HEAD, not a no-op; see
+    # commit_effect_present_in_main) or in the defensive case a DISCOVERY
+    # caller omitted branch_tip_sha despite citation_on_branch.
     effect_check_sha = citation
     if citation_on_branch and branch_tip_sha is not None:
         effect_check_sha = branch_tip_sha
@@ -267,3 +285,76 @@ def format_unattributed_landing_detail(
         'task-citing commit); resolve this escalation once confirmed.'
     )
     return summary, detail
+
+
+def file_unattributed_landing_escalation(
+    escalation_queue: EscalationQueue | None,
+    task_id: str,
+    branch: str,
+    verdict: LandingEvidenceVerdict,
+    *,
+    agent_role: str,
+) -> None:
+    """Best-effort, dedup-guarded L1 escalation for unattributable landing
+    evidence (task 2678, INV-5; extracted in the amendment pass — review
+    finding: ``Harness._file_unattributed_landing_escalation`` and
+    ``SpeculativeMergeWorker._file_unattributed_landing_escalation`` were a
+    near-verbatim copy of this filing boilerplate, differing only in
+    ``agent_role``).
+
+    Called by every site that found a positive landing signal (a merge
+    marker, branch content equivalent to main, or an on-main coalesce
+    member) but whose :func:`validate_landing_evidence` verdict came back
+    rejected — an unattributed or effect-absent landing that must not be
+    silently stamped done (the task-1175 clobber this task closes).
+    Escalate-instead-of-stamp is deliberately non-status-blocking: the
+    caller leaves the task/member row pending (or flips it to pending) and
+    it is re-evaluated next tick; the caller's own open-L1 veto naturally
+    suppresses reprocessing while this L1 stays open — no separate status
+    transition happens here.
+
+    Best-effort (a no-op when *escalation_queue* is None, e.g. bare-harness
+    or bare-worker unit tests) and deduped via ``has_open_l1`` so repeated
+    ticks re-observing the same unattributable evidence don't stack
+    duplicate L1s — one open escalation per task at a time.
+
+    Args:
+        escalation_queue: The caller's ``EscalationQueue``, or ``None``.
+        task_id: The task (or coalesce member) id the escalation is filed for.
+        branch: The branch the evidence check ran against.
+        verdict: A rejected :class:`LandingEvidenceVerdict`.
+        agent_role: The filing caller's role, e.g. ``'harness-reconcile'``
+            or ``'orchestrator-merge-worker'`` — the only thing that
+            distinguishes the two call sites.
+    """
+    if not escalation_queue:
+        return
+    try:
+        if escalation_queue.has_open_l1(task_id):
+            return
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        summary, detail = format_unattributed_landing_detail(task_id, branch, verdict)
+        esc = Escalation(
+            id=escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role=agent_role,
+            severity='blocking',
+            category='provenance_unattributed',
+            summary=summary,
+            detail=detail,
+            suggested_action='investigate_unattributed_landing_evidence',
+            level=1,
+        )
+        escalation_queue.submit(esc)
+        logger.warning(
+            'Filed provenance_unattributed escalation %s for task %s '
+            '(branch %s, reason %s, agent_role %s)',
+            esc.id, task_id, branch, verdict.reason, agent_role,
+        )
+    except Exception:
+        logger.warning(
+            'Failed to file provenance_unattributed escalation for task %s '
+            '(branch %s) — continuing without it',
+            task_id, branch, exc_info=True,
+        )
