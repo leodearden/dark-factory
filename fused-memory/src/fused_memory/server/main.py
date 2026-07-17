@@ -326,6 +326,21 @@ def _add_json_http_error_handler(starlette_app: Any) -> None:
     starlette_app.add_exception_handler(HTTPException, _json_http_error)  # type: ignore[arg-type]
 
 
+def _is_shutdown_initiated() -> bool:
+    """Return True once operator-initiated shutdown has begun.
+
+    Reads the existing module-level :data:`_operator_stop_received` flag,
+    which is set by the SIGTERM/SIGINT handler installed in
+    :func:`_install_operator_stop_handler` (and by the pre-handler
+    KeyboardInterrupt path in :func:`main`) BEFORE any graceful-shutdown
+    draining begins. Used by :class:`_ASGIExceptionShield` to distinguish a
+    shutdown-window failure (client-disconnect/cancellation racing the
+    server going down — retryable) from an unexpected server bug
+    (not retryable).
+    """
+    return _operator_stop_received
+
+
 class _ASGIExceptionShield:
     """ASGI middleware that contains BaseException escapes from the MCP app.
 
@@ -341,16 +356,38 @@ class _ASGIExceptionShield:
     way to keep the server up when the MCP SDK's own except-Exception guard
     lets a BaseException through. KeyboardInterrupt/SystemExit are always
     re-raised so legitimate interpreter shutdown still works.
+
+    Once operator-initiated shutdown has begun (see :func:`_is_shutdown_initiated`),
+    a request failing here is very likely a client-disconnect/cancellation
+    error surfaced by the shutdown itself rather than a genuine server bug —
+    so we respond 503 with a Retry-After header instead of a bare 500.
+    Orchestrator clients treat {502,503,504} as retryable but not 500
+    (task 2705), so this turns a clean-restart race into a retryable blip
+    instead of a hard client failure.
     """
 
-    _RESPONSE_START = {
+    _RESPONSE_START_500 = {
         'type': 'http.response.start',
         'status': 500,
         'headers': [(b'content-type', b'application/json')],
     }
-    _RESPONSE_BODY = {
+    _RESPONSE_BODY_500 = {
         'type': 'http.response.body',
         'body': b'{"error":"Internal Server Error"}',
+    }
+
+    _SHUTDOWN_RETRY_AFTER_SECONDS = b'5'
+    _RESPONSE_START_503 = {
+        'type': 'http.response.start',
+        'status': 503,
+        'headers': [
+            (b'content-type', b'application/json'),
+            (b'retry-after', _SHUTDOWN_RETRY_AFTER_SECONDS),
+        ],
+    }
+    _RESPONSE_BODY_503 = {
+        'type': 'http.response.body',
+        'body': b'{"error":"Server is shutting down"}',
     }
 
     def __init__(self, app: Any) -> None:
@@ -374,14 +411,20 @@ class _ASGIExceptionShield:
         except (KeyboardInterrupt, SystemExit):
             raise
         except BaseException as exc:
+            shutting_down = _is_shutdown_initiated()
             logger.exception(
-                'MCP request failed (%s); emitting 500 and suppressing cascade',
+                'MCP request failed (%s); emitting %s and suppressing cascade',
                 type(exc).__name__,
+                503 if shutting_down else 500,
             )
             if not response_started:
                 with contextlib.suppress(Exception):
-                    await send(self._RESPONSE_START)
-                    await send(self._RESPONSE_BODY)
+                    if shutting_down:
+                        await send(self._RESPONSE_START_503)
+                        await send(self._RESPONSE_BODY_503)
+                    else:
+                        await send(self._RESPONSE_START_500)
+                        await send(self._RESPONSE_BODY_500)
             # Deliberate: do NOT re-raise. Letting CancelledError or any
             # other BaseException escape here is exactly what wedged the
             # server overnight.
