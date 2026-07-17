@@ -476,3 +476,27 @@ class TestHeadline:
 
         dependent_after_block = await _get_task(server, project_root, dependent_id)
         assert dependent_after_block['status'] == 'blocked'
+
+        # --- Headline part C (step-5): rows 6+3 -----------------------------
+        # Self-heal: commit a file containing the capability token to main
+        # (advancing the SHA -- the stale-cache prune picks up the fix), then
+        # manually re-pend the dependent via the product write path. The very
+        # next tick must dispatch the dependent with ZERO further operator
+        # action beyond the re-pend, and no NEW L2 escalation may be filed
+        # (the one from part B stays as the sole pending record).
+        _commit_capability(project_root, _MARKER_REL_PATH, _CAPABILITY_TOKEN)
+
+        await _flip_status(server, project_root, dependent_id, 'pending')
+
+        result = await _run_tick(harness)
+        assert result == dependent_id, (
+            f'expected the dependent ({dependent_id!r}) to dispatch once the '
+            f'capability landed on main and it was re-pended; got {result!r}'
+        )
+
+        post_heal_escs = _l2_for(harness, dependent_id)
+        assert len(post_heal_escs) == 1 and post_heal_escs[0].id == esc.id, (
+            f'no NEW L2 escalation may be filed on the self-heal/dispatch tick; '
+            f'expected only the part-B escalation {esc.id!r} to remain, got '
+            f'{post_heal_escs!r}'
+        )
