@@ -1772,7 +1772,7 @@ def _build_recon_report_components(
 
 
 def _make_operator_stop_callback(*servers: Any) -> Callable[[], None]:
-    """Return a callback that sets ``should_exit = True`` on every passed server.
+    """Return a callback implementing graceful-then-forced shutdown escalation.
 
     Used as the ``on_operator_stop`` argument to :func:`_install_operator_stop_handler`
     so that a SIGTERM/SIGINT signal stops **both** the primary uvicorn.Server
@@ -1783,18 +1783,33 @@ def _make_operator_stop_callback(*servers: Any) -> Callable[[], None]:
     flag was flipped — the recon_report server kept running, blocking the gather,
     and ``run_server()`` hung until SIGKILL.
 
+    Stateful second-signal escalation (survey finding D1, second gap): the 1st
+    invocation sets only ``should_exit = True`` (graceful). The 2nd and every
+    subsequent invocation additionally sets ``force_exit = True``. This mirrors
+    uvicorn's own default signal handler contract (1st SIGINT/SIGTERM graceful,
+    2nd forces immediate exit) — a contract otherwise lost here because
+    ``install_signal_handlers`` is neutered, leaving an operator with no way to
+    force-exit a wedged shutdown without this escalation.
+
     Args:
-        *servers: Zero or more server objects exposing a writable ``should_exit``
-            attribute (typically :class:`uvicorn.Server` instances, but any object
-            with the attribute works — including test fakes).
+        *servers: Zero or more server objects exposing writable ``should_exit``
+            and ``force_exit`` attributes (typically :class:`uvicorn.Server`
+            instances, but any object with the attributes works — including
+            test fakes).
 
     Returns:
-        A zero-argument callable that flips ``should_exit = True`` on each server.
+        A zero-argument callable that flips ``should_exit`` (and, from the 2nd
+        call onward, ``force_exit``) to ``True`` on each server.
     """
+    call_count = 0
 
     def _stop() -> None:
+        nonlocal call_count
+        call_count += 1
         for s in servers:
             s.should_exit = True
+            if call_count >= 2:
+                s.force_exit = True
 
     return _stop
 
