@@ -40,6 +40,7 @@ from orchestrator.workflow import (
     WorkflowState,
     _PriorImplStatus,
 )
+from orchestrator.workflow_types import StewardResolved
 
 # ---------------------------------------------------------------------------
 # Fixtures (kept local — these tests don't share runtime with test_workflow_e2e)
@@ -199,6 +200,48 @@ def _make_evrl_returner(returns: list[WorkflowOutcome]):
 
     mock = AsyncMock(side_effect=fake_evrl)
     return mock, state
+
+
+def _make_granting_steward(
+    queue: EscalationQueue, task_id: str, granted_files: list[str],
+) -> type:
+    """Return a steward class that resolves pending L0s with a structured
+    ``granted_files`` scope-expansion grant (task 2505).
+
+    Mirrors ``_workflow_helpers._make_resolving_steward`` but forwards the
+    grant through ``queue.resolve(..., granted_files=granted_files)`` so the
+    resume loop's ``_collect_granted_files``/``_set_task_scope`` consumption
+    can be exercised end-to-end via ``workflow.run()``.
+    """
+
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+            self._wip_probe = None
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:
+            self._wip_probe = probe
+
+        async def start(self) -> None:
+            pending = queue.get_by_task(task_id, status='pending', level=0)
+            assert pending, 'expected at least one pending L0 escalation to resolve'
+            for esc in pending:
+                queue.resolve(
+                    esc.id, 'Granted scope expansion',
+                    resolved_by='fake-steward', granted_files=granted_files,
+                )
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(
+                    StewardResolved(resolution_text='Granted scope expansion'),
+                )
+
+        async def stop(self) -> None:
+            pass
+
+    return _FakeSteward
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +460,61 @@ class TestStatusPreservationOnResume:
             f'Resume invocation must use IMPLEMENTER role; got {role!r}'
         )
         assert outcome == WorkflowOutcome.DONE
+
+    async def test_scope_violation_resume_with_granted_files_widens_scope(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A scope_violation L0 resolved with a structured ``granted_files``
+        grant must fold the granted file into plan.files/metadata.files/
+        locks BEFORE the implementer resumes — task 2505.
+
+        Before the fix, the resume loop never consumed ``granted_files``: the
+        grant lived only as free-text resolution prose, plan.json/
+        metadata.files/locks were never updated, and the resumed implementer's
+        briefing would not reflect the expanded scope.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        queue = EscalationQueue(tmp_path / 'queue')
+        _submit_l0(queue, task_assignment.task_id, category='scope_violation')
+        workflow, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+        )
+        # Granting steward — lock is free (FakeScheduler.blast_radius_result
+        # defaults to True), so the scope-widen must succeed.
+        workflow._steward_factory = _make_granting_steward(
+            queue, task_assignment.task_id, ['new.py'],
+        )
+        # ESCALATED first, then DONE on the post-resume re-entry.
+        evrl_mock, state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
+        workflow._invoke = invoke_mock  # type: ignore[method-assign]
+
+        outcome = (await workflow.run()).outcome
+
+        assert outcome == WorkflowOutcome.DONE
+        assert 'new.py' in workflow.plan['files'], (
+            f"granted file 'new.py' must be folded into plan.files; got "
+            f"{workflow.plan['files']!r}"
+        )
+        assert any(
+            'new.py' in (persist_files or [])
+            for _current, _needed, persist_files in scheduler.blast_radius_calls
+        ), (
+            'expected a handle_blast_radius_expansion call with persist_files '
+            f"including 'new.py'; got {scheduler.blast_radius_calls!r}"
+        )
+        assert invoke_mock.await_count >= 1, (
+            'Implementer must be resumed after the scope grant is consumed.'
+        )
+        call_args = invoke_mock.await_args_list[0]
+        role = call_args.args[0]
+        assert getattr(role, 'name', '') == 'implementer', (
+            f'Resume invocation must use IMPLEMENTER role; got {role!r}'
+        )
 
     async def test_already_on_main_short_circuit_runs_before_status_check(
         self, config, git_ops, task_assignment, tmp_path,
