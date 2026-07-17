@@ -3789,14 +3789,19 @@ class TaskInterceptor:
                     snapshot_token=recon_write_policy.extract_snapshot_token(
                         kwargs.get('metadata'),
                     ),
-                    # task 2684: same kwargs dict as the snapshot_token
+                    # task 2684/2695: same kwargs dict as the snapshot_token
                     # extraction above — a metadata-only, merge-mode write
                     # touching only CLEARABLE_ANNOTATION_KEYS (e.g.
                     # possible_scope_mismatch) bypasses Gate 1's terminal
-                    # rejection. set_task_status is unaffected (Gate 1 is
+                    # rejection, and so does one touching only x_-prefixed
+                    # forward-compat annotation keys (the sanctioned
+                    # namespace shared.task_metadata.parse_metadata already
+                    # admits silently) — see is_terminal_annotation_add.
+                    # set_task_status is unaffected (Gate 1 is
                     # update_task-only).
-                    is_annotation_clear=recon_write_policy.is_terminal_annotation_clear(
-                        kwargs,
+                    is_annotation_clear=(
+                        recon_write_policy.is_terminal_annotation_clear(kwargs)
+                        or recon_write_policy.is_terminal_annotation_add(kwargs)
                     ),
                 )
                 if verdict.is_rejection:

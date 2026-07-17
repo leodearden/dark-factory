@@ -12,10 +12,13 @@ Three independent early-return gates in :func:`check`:
 
 1. ``op == 'update_task'`` AND ``live_status`` is terminal (done/cancelled)
    AND NOT ``is_annotation_clear`` -> ``ReconTerminalWriteRejected``. The
-   ``is_annotation_clear`` bypass (task 2684) exempts a non-load-bearing,
-   metadata-only, merge-mode write touching only
-   :data:`CLEARABLE_ANNOTATION_KEYS` (e.g. ``possible_scope_mismatch``) —
-   see :func:`is_terminal_annotation_clear`. It never loosens Gates 2/3.
+   ``is_annotation_clear`` bypass exempts a non-load-bearing, metadata-only,
+   merge-mode write touching only :data:`CLEARABLE_ANNOTATION_KEYS` (e.g.
+   ``possible_scope_mismatch`` — task 2684; see
+   :func:`is_terminal_annotation_clear`) OR touching only
+   :data:`X_ANNOTATION_PREFIX`-prefixed forward-compat annotation keys
+   (task 2695; see :func:`is_terminal_annotation_add`). It never loosens
+   Gates 2/3.
 2. ``op == 'set_task_status'`` AND a live workflow is detected for the task
    -> ``ReconLiveWorkflowWriteRejected``.
 3. ``snapshot_token is not None`` AND it disagrees with ``live_status``
@@ -250,10 +253,12 @@ def check(
     ``ReconTerminalWriteRejected``. ``is_annotation_clear`` (task 2684,
     default ``False`` for full backward compatibility) is a non-load-bearing
     exemption: the caller should pass
-    ``is_terminal_annotation_clear(update_kwargs)`` so a metadata-only,
-    merge-mode write touching only :data:`CLEARABLE_ANNOTATION_KEYS` bypasses
-    this gate. It bypasses Gate 1 ONLY — Gates 2/3 still compose (e.g. a
-    stale ``snapshot_token`` still fails Gate 3).
+    ``is_terminal_annotation_clear(update_kwargs) or
+    is_terminal_annotation_add(update_kwargs)`` so a metadata-only,
+    merge-mode write touching only :data:`CLEARABLE_ANNOTATION_KEYS` (a
+    clear) OR only :data:`X_ANNOTATION_PREFIX`-prefixed keys (an add, task
+    2695) bypasses this gate. It bypasses Gate 1 ONLY — Gates 2/3 still
+    compose (e.g. a stale ``snapshot_token`` still fails Gate 3).
 
     Gate 2 (live workflow): ``op == 'set_task_status'`` AND a live workflow
     is detected for ``task_id`` -> ``ReconLiveWorkflowWriteRejected``. The
