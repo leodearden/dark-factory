@@ -80,6 +80,84 @@ function HostLoadCard({ paused }) {
   );
 }
 
+// Per-(model×role) outcome rollup — invocation count, done%/blocked%,
+// cap-hit%, $/done, plus a per-role turn-cap-saturation readout (task 2534
+// δ, boundary test 12). Mirrors orchestrator.digest.render_digest_markdown's
+// '## Per-(model×role) rollup' section so the digest and dashboard read
+// identically: '—' when a cell has no $/done yet, 'n/a' when a role has no
+// routing_decision max_turns to compare against. Rows arrive unsorted from
+// the server (aggregate_model_role_rollup merges by dict order) — sort here
+// the same way the digest does, by (model, role).
+function ModelRoleRollupPanel() {
+  const rollup = D.COSTS.by_model_role || { rows: [], turn_cap_saturation: {} };
+  const rows = [...(rollup.rows || [])].sort(
+    (a, b) => (a.model || '').localeCompare(b.model || '') || (a.role || '').localeCompare(b.role || ''),
+  );
+  const saturation = Object.entries(rollup.turn_cap_saturation || {}).sort(
+    ([a], [b]) => a.localeCompare(b),
+  );
+
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <span className="title">Model × role rollup</span>
+        <span className="meta">{rows.length} cell{rows.length === 1 ? '' : 's'}</span>
+      </div>
+      <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+        {rows.length === 0 ? (
+          <span style={{ color: 'var(--fg-3)', fontSize: 11 }}>no rollup data</span>
+        ) : (
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Role</th>
+                <th className="num">Invocations</th>
+                <th className="num">Done%</th>
+                <th className="num">Blocked%</th>
+                <th className="num">Cap-hit%</th>
+                <th className="num">$/done</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(r => (
+                <tr key={`${r.model}:${r.role}`}>
+                  <td className="mono">{r.model}</td>
+                  <td className="mono" style={{ color: 'var(--fg-1)' }}>{r.role}</td>
+                  <td className="num mono">{r.invocation_count}</td>
+                  <td className="num mono">{(r.done_rate * 100).toFixed(1)}%</td>
+                  <td className="num mono">{(r.blocked_rate * 100).toFixed(1)}%</td>
+                  <td className="num mono">{(r.cap_hit_rate * 100).toFixed(1)}%</td>
+                  <td className="num mono">{r.cost_per_done != null ? `$${r.cost_per_done.toFixed(2)}` : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+
+        <div>
+          <div style={{ fontSize: 10, color: 'var(--fg-3)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>
+            Turn-cap saturation · per role
+          </div>
+          {saturation.length === 0 ? (
+            <span style={{ color: 'var(--fg-3)', fontSize: 11 }}>no rollup data</span>
+          ) : (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14 }}>
+              {saturation.map(([role, v]) => (
+                <span key={role} style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+                  {role}: <span className="mono" style={{ color: 'var(--fg-0)' }}>
+                    {v != null ? `${(v * 100).toFixed(1)}%` : 'n/a'}
+                  </span>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function OverviewTab({ paused }) {
   const schedModules = (D.SCHEDULER && D.SCHEDULER.modules) || [];
 
@@ -297,7 +375,12 @@ function OverviewTab({ paused }) {
         </div>
       </div>
 
-      {/* Row 4: Host load card */}
+      {/* Row 4: Per-(model×role) rollup */}
+      <div className="col-span-12">
+        <ModelRoleRollupPanel />
+      </div>
+
+      {/* Row 5: Host load card */}
       <div className="col-span-12">
         <HostLoadCard paused={paused} />
       </div>

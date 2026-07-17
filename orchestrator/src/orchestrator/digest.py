@@ -37,9 +37,11 @@ from orchestrator.workflow import WorkflowOutcome
 
 logger = logging.getLogger(__name__)
 
-# Canonical 'done' outcome value sourced directly from WorkflowOutcome so that
-# any future rename is caught at import time rather than silently zeroing done counts.
+# Canonical 'done' / 'blocked' outcome values sourced directly from
+# WorkflowOutcome so that any future rename is caught at import time rather
+# than silently zeroing done/blocked counts.
 _DONE_OUTCOME: str = WorkflowOutcome.DONE.value
+_BLOCKED_OUTCOME: str = WorkflowOutcome.BLOCKED.value
 
 # ---------------------------------------------------------------------------
 # EWA math
@@ -403,6 +405,186 @@ async def cost_in_window(
 
 
 # ---------------------------------------------------------------------------
+# Model×role outcome rollup (task 2534 δ, plans/adaptive-model-routing-prd.md,
+# boundary test 12) — per-(model, role) invocation counts, done/blocked
+# rates, cap-hit rate, and $/done, joined from CostStore's `invocations`
+# table and RunStore's `task_results` table on (run_id, task_id).  Both
+# tables (plus EventStore's `events` table, used for turn-cap saturation
+# below) live in the same runs.db file — see harness.py:1373-1398 — so one
+# DB path is sufficient for the whole rollup.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelRoleRow:
+    """One (model, role) cell of the outcome rollup for a digest window."""
+
+    model: str
+    role: str
+    invocation_count: int
+    done_count: int
+    blocked_count: int
+    done_rate: float
+    blocked_rate: float
+    capped_count: int
+    cap_hit_rate: float
+    total_cost_usd: float
+    # None when the cell has zero done tasks — distinguishes "no completed
+    # tasks yet" from "$0 per done" (see design_decisions in plan.json).
+    cost_per_done: float | None
+
+
+@dataclass
+class ModelRoleRollup:
+    """Per-(model, role) outcome rollup + per-role turn-cap saturation.
+
+    turn_cap_saturation maps role -> fraction of invocation_end events with
+    turns >= that role's max_turns, or None when the role has no
+    routing_decision max_turns in the window (fail-open, never crash).
+    Populated by model_role_rollup(); empty on a missing/unreadable DB.
+    """
+
+    rows: list[ModelRoleRow] = field(default_factory=list)
+    turn_cap_saturation: dict[str, float | None] = field(default_factory=dict)
+
+
+def _compute_turn_cap_saturation(
+    conn: sqlite3.Connection,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> dict[str, float | None]:
+    """Per-role turn-cap saturation from the `events` table.
+
+    max_turns is role-constant config, not stored on invocation_end, but
+    dep 2533's routing_decision event persists it per invocation — MAX(...)
+    over the window recovers the effective per-role cap. saturation[role] =
+    fraction of that role's invocation_end events with data.turns >=
+    max_turns[role]. Roles with invocation_end rows but no routing_decision
+    max_turns in the window report None (fail-open — not 0/1, which would
+    misleadingly claim zero or total saturation for an unmeasured cap).
+
+    Only workflow roles that emit invocation_end are covered — steward/
+    triage/module_tagger go through invoke_with_cap_retry and emit none.
+    """
+    max_turns_rows = conn.execute(
+        "SELECT role, MAX(json_extract(data, '$.max_turns')) FROM events "
+        "WHERE event_type = 'routing_decision' "
+        "  AND timestamp BETWEEN ? AND ? "
+        "  AND role IS NOT NULL "
+        'GROUP BY role',
+        (window_start_iso, window_end_iso),
+    ).fetchall()
+    max_turns_by_role: dict[str, float] = {
+        role: max_turns for role, max_turns in max_turns_rows if max_turns is not None
+    }
+
+    turns_rows = conn.execute(
+        "SELECT role, json_extract(data, '$.turns') FROM events "
+        "WHERE event_type = 'invocation_end' "
+        '  AND timestamp BETWEEN ? AND ? '
+        '  AND role IS NOT NULL',
+        (window_start_iso, window_end_iso),
+    ).fetchall()
+    turns_by_role: dict[str, list[float]] = {}
+    for role, turns in turns_rows:
+        if turns is None:
+            continue
+        turns_by_role.setdefault(role, []).append(turns)
+
+    saturation: dict[str, float | None] = {}
+    for role, turns_list in turns_by_role.items():
+        max_turns = max_turns_by_role.get(role)
+        if max_turns is None:
+            saturation[role] = None
+        else:
+            hits = sum(1 for turns in turns_list if turns >= max_turns)
+            saturation[role] = hits / len(turns_list)
+
+    return saturation
+
+
+def model_role_rollup(
+    runs_db: Path,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> ModelRoleRollup:
+    """Aggregate per-(model, role) invocation outcomes for a digest window.
+
+    Uses sqlite3 directly (read-only) via the shared `_query_events_ro`
+    scaffold on `runs_db` (the same file backing EventStore/CostStore/
+    RunStore). One query LEFT JOINs `invocations` to `task_results` on
+    (run_id, task_id) so module_tagger rows (task_id IS NULL, never matched)
+    still contribute invocation_count/cost/cap-hit but count as neither done
+    nor blocked — an honest representation, not a dropped row.
+
+    Rates are derived in Python with divide-by-zero guards; cost_per_done is
+    None (not 0/inf) when a cell has zero distinct done tasks.
+
+    Fail-open: a missing/unreadable DB returns an empty ModelRoleRollup.
+    """
+    def _query(conn: sqlite3.Connection) -> ModelRoleRollup:
+        raw_rows = conn.execute(
+            'SELECT i.model, i.role, '
+            '       COUNT(*) AS invocation_count, '
+            '       SUM(i.capped) AS capped_count, '
+            '       SUM(i.cost_usd) AS total_cost_usd, '
+            '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS done_count, '
+            '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS blocked_count, '
+            '       COUNT(DISTINCT CASE WHEN tr.outcome = ? THEN i.task_id END) '
+            '           AS distinct_done_tasks '
+            'FROM invocations i '
+            'LEFT JOIN task_results tr '
+            '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
+            'WHERE i.completed_at BETWEEN ? AND ? '
+            'GROUP BY i.model, i.role',
+            (
+                _DONE_OUTCOME, _BLOCKED_OUTCOME, _DONE_OUTCOME,
+                window_start_iso, window_end_iso,
+            ),
+        ).fetchall()
+
+        rows: list[ModelRoleRow] = []
+        for (
+            model, role, invocation_count, capped_count, total_cost_usd,
+            done_count, blocked_count, distinct_done_tasks,
+        ) in raw_rows:
+            invocation_count = int(invocation_count or 0)
+            capped_count = int(capped_count or 0)
+            total_cost_usd = float(total_cost_usd or 0.0)
+            done_count = int(done_count or 0)
+            blocked_count = int(blocked_count or 0)
+            distinct_done_tasks = int(distinct_done_tasks or 0)
+
+            done_rate = (done_count / invocation_count) if invocation_count else 0.0
+            blocked_rate = (blocked_count / invocation_count) if invocation_count else 0.0
+            cap_hit_rate = (capped_count / invocation_count) if invocation_count else 0.0
+            cost_per_done = (
+                (total_cost_usd / distinct_done_tasks) if distinct_done_tasks > 0 else None
+            )
+
+            rows.append(ModelRoleRow(
+                model=model,
+                role=role,
+                invocation_count=invocation_count,
+                done_count=done_count,
+                blocked_count=blocked_count,
+                done_rate=done_rate,
+                blocked_rate=blocked_rate,
+                capped_count=capped_count,
+                cap_hit_rate=cap_hit_rate,
+                total_cost_usd=total_cost_usd,
+                cost_per_done=cost_per_done,
+            ))
+
+        turn_cap_saturation = _compute_turn_cap_saturation(
+            conn, window_start_iso, window_end_iso,
+        )
+        return ModelRoleRollup(rows=rows, turn_cap_saturation=turn_cap_saturation)
+
+    return _query_events_ro(runs_db, 'model_role_rollup', ModelRoleRollup(), _query)
+
+
+# ---------------------------------------------------------------------------
 # Digest inputs and markdown rendering
 # ---------------------------------------------------------------------------
 
@@ -427,6 +609,9 @@ class DigestInputs:
     watcher_clusters: list[str]
     # Free-text proposal summaries (or empty list for "none queued")
     dry_run_proposals: list[str]
+    # Per-(model×role) outcome rollup (task 2534 δ, boundary test 12).
+    # Defaulted so existing constructors/call sites remain valid.
+    model_role_rollup: ModelRoleRollup = field(default_factory=ModelRoleRollup)
 
 
 def render_digest_markdown(inputs: DigestInputs) -> str:
@@ -521,6 +706,33 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
             lines.append(f'- {proposal}')
     else:
         lines.append('none queued')
+    lines.append('')
+
+    # Per-(model×role) rollup (task 2534 δ, boundary test 12)
+    rollup = inputs.model_role_rollup
+    lines.append('## Per-(model×role) rollup')
+    if rollup.rows:
+        lines.append('| model | role | invocations | done% | blocked% | cap-hit% | $/done |')
+        lines.append('|-------|------|--------------|-------|----------|----------|--------|')
+        for row in sorted(rollup.rows, key=lambda r: (r.model, r.role)):
+            cost_per_done_str = (
+                f'${row.cost_per_done:.2f}' if row.cost_per_done is not None else '—'
+            )
+            lines.append(
+                f'| {row.model} | {row.role} | {row.invocation_count} | '
+                f'{row.done_rate * 100:.1f}% | {row.blocked_rate * 100:.1f}% | '
+                f'{row.cap_hit_rate * 100:.1f}% | {cost_per_done_str} |'
+            )
+    else:
+        lines.append('_none_')
+    lines.append('')
+    lines.append('### Turn-cap saturation (per role)')
+    if rollup.turn_cap_saturation:
+        for role, saturation in sorted(rollup.turn_cap_saturation.items()):
+            saturation_str = f'{saturation * 100:.1f}%' if saturation is not None else 'n/a'
+            lines.append(f'- {role}: {saturation_str}')
+    else:
+        lines.append('_none_')
     lines.append('')
 
     return '\n'.join(lines)

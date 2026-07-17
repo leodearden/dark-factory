@@ -84,6 +84,7 @@ from dashboard.data.metrics import (
     get_queue_pending_series,
     get_recon_sparks,
 )
+from dashboard.data.model_role import aggregate_model_role_rollup
 from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
     aggregate_completion_paths,
@@ -714,13 +715,14 @@ async def api_costs(request: Request) -> JSONResponse:
     days = _parse_window(request.query_params)
     dbs = await _cost_dbs(config, pool)
     now = datetime.now(UTC)  # clock-exempt: single-capture route
-    summary, by_project, by_account, by_role, trend, events = await asyncio.gather(
+    summary, by_project, by_account, by_role, trend, events, by_model_role = await asyncio.gather(
         aggregate_cost_summary(dbs, days=days, now=now),
         aggregate_cost_by_project(dbs, days=days, now=now),
         aggregate_cost_by_account(dbs, days=days, now=now),
         aggregate_cost_by_role(dbs, days=days, now=now),
         aggregate_cost_trend(dbs, days=days, now=now),
         aggregate_account_events(dbs, days=days, now=now),
+        aggregate_model_role_rollup(dbs, days=days, now=now),
         return_exceptions=True,
     )
     return JSONResponse(
@@ -731,6 +733,9 @@ async def api_costs(request: Request) -> JSONResponse:
             by_role=safe_gather_result(by_role, {}, 'costs/by_role'),
             trend=safe_gather_result(trend, {}, 'costs/trend'),
             events=safe_gather_result(events, [], 'costs/events'),
+            by_model_role=safe_gather_result(
+                by_model_role, {'rows': [], 'turn_cap_saturation': {}}, 'costs/by_model_role',
+            ),
         )
     )
 

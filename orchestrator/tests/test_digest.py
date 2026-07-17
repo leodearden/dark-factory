@@ -16,10 +16,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from shared.cost_store import _SCHEMA as _COST_SCHEMA
 from shared.cost_store import CostStore
 
 import orchestrator.digest as digest
 from orchestrator.event_store import EventStore
+from orchestrator.run_store import RunStore
 
 
 class TestUpdateEwa:
@@ -857,3 +859,324 @@ class TestWriteDigestEntry:
             assert result.path is None, "Expected path=None on write failure"
         finally:
             os.chmod(digest_dir, 0o700)  # restore so tmp_path cleanup works
+
+
+# ---------------------------------------------------------------------------
+# Model×role outcome rollup (task 2534 δ, plans/adaptive-model-routing-prd.md,
+# boundary test 12) — digest-side rollup: invocations × task_results (outcome
+# rates, cap-hit rate, $/done) plus per-role turn-cap saturation from events.
+# ---------------------------------------------------------------------------
+
+
+def _seed_rollup_runs_db(db_path: Path, run_id: str = 'run-test') -> None:
+    """Create a runs.db with events + task_results + invocations tables (schema only).
+
+    Mirrors production layout (harness.py:1373-1434): EventStore, CostStore,
+    and RunStore all share ONE runs.db file. Applies EventStore's and
+    RunStore's own schema-creation path (both sync in __init__) plus
+    CostStore's raw DDL directly (CostStore itself is async-only, so its
+    schema is applied via executescript rather than via open()).
+    """
+    store = EventStore(db_path, run_id)
+    del store  # schema created in __init__
+    run_store = RunStore(db_path)
+    del run_store  # schema created in __init__
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(_COST_SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _insert_invocation(
+    db_path: Path,
+    *,
+    run_id: str,
+    task_id: str | None,
+    model: str,
+    role: str,
+    cost_usd: float,
+    capped: bool,
+    completed_at: str,
+    project_id: str = 'p',
+    account_name: str = 'a',
+) -> None:
+    """Insert one row into the invocations table (direct SQLite — CostStore is async-only)."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, duration_ms, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (run_id, task_id, project_id, account_name, model, role,
+             cost_usd, 100, int(capped), completed_at, completed_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _insert_task_result(
+    db_path: Path,
+    *,
+    run_id: str,
+    task_id: str,
+    outcome: str,
+    project_id: str = 'p',
+    completed_at: str = '2026-05-10T00:00:00+00:00',
+) -> None:
+    """Insert one row into the task_results table."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            'INSERT INTO task_results (run_id, task_id, project_id, outcome, completed_at) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (run_id, task_id, project_id, outcome, completed_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _insert_event(
+    db_path: Path,
+    *,
+    run_id: str,
+    task_id: str | None,
+    event_type: str,
+    role: str,
+    data: dict,
+    timestamp: str,
+) -> None:
+    """Insert one row into the events table (mirrors _seed_events_db_direct above)."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            'INSERT INTO events (timestamp, run_id, task_id, event_type, role, data) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (timestamp, run_id, task_id, event_type, role, json.dumps(data)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestModelRoleRollupCore:
+    """Tests for digest.model_role_rollup(runs_db, window_start_iso, window_end_iso) — core rollup (step-1/2)."""
+
+    def test_rollup_rates_and_cost_per_done(self, tmp_path: Path) -> None:
+        """Per-(model,role) invocation_count/done/blocked rates, cap_hit_rate,
+        total_cost_usd, and cost_per_done (None when 0 done) — including
+        steward/triage rows and a NULL-task_id module_tagger row."""
+        db_path = tmp_path / 'runs.db'
+        _seed_rollup_runs_db(db_path)
+        run_id = 'run-test'
+        window_start = '2026-05-10T00:00:00+00:00'
+        window_end = '2026-05-10T23:59:59+00:00'
+
+        _insert_task_result(db_path, run_id=run_id, task_id='t1', outcome='done')
+        _insert_task_result(db_path, run_id=run_id, task_id='t2', outcome='blocked')
+        _insert_task_result(db_path, run_id=run_id, task_id='t3', outcome='done')
+
+        # (sonnet, implementer): 2 invocations across 2 tasks — t1 done, t2
+        # blocked; the t2 invocation is capped.
+        _insert_invocation(
+            db_path, run_id=run_id, task_id='t1', model='sonnet', role='implementer',
+            cost_usd=2.0, capped=False, completed_at='2026-05-10T08:00:00+00:00',
+        )
+        _insert_invocation(
+            db_path, run_id=run_id, task_id='t2', model='sonnet', role='implementer',
+            cost_usd=3.0, capped=True, completed_at='2026-05-10T09:00:00+00:00',
+        )
+
+        # (haiku, implementer): 1 done invocation.
+        _insert_invocation(
+            db_path, run_id=run_id, task_id='t3', model='haiku', role='implementer',
+            cost_usd=1.0, capped=False, completed_at='2026-05-10T10:00:00+00:00',
+        )
+
+        # steward + triage rows (dep 2461's role values) — task t4 has no
+        # task_results row, so both LEFT JOIN to a NULL outcome.
+        _insert_invocation(
+            db_path, run_id=run_id, task_id='t4', model='opus', role='steward',
+            cost_usd=0.5, capped=False, completed_at='2026-05-10T11:00:00+00:00',
+        )
+        _insert_invocation(
+            db_path, run_id=run_id, task_id='t4', model='opus', role='triage',
+            cost_usd=0.2, capped=False, completed_at='2026-05-10T11:05:00+00:00',
+        )
+
+        # module_tagger row: task_id=NULL (harness.py ~2036 threading, step-10).
+        _insert_invocation(
+            db_path, run_id=run_id, task_id=None, model='haiku', role='module_tagger',
+            cost_usd=0.1, capped=False, completed_at='2026-05-10T12:00:00+00:00',
+        )
+
+        # Out-of-window row — must be excluded from every aggregate.
+        _insert_invocation(
+            db_path, run_id=run_id, task_id='t5', model='sonnet', role='implementer',
+            cost_usd=99.0, capped=False, completed_at='2026-05-09T00:00:00+00:00',
+        )
+
+        rollup = digest.model_role_rollup(db_path, window_start, window_end)
+        by_key = {(r.model, r.role): r for r in rollup.rows}
+
+        sonnet_impl = by_key[('sonnet', 'implementer')]
+        assert sonnet_impl.invocation_count == 2
+        assert sonnet_impl.done_count == 1
+        assert sonnet_impl.blocked_count == 1
+        assert sonnet_impl.done_rate == pytest.approx(0.5)
+        assert sonnet_impl.blocked_rate == pytest.approx(0.5)
+        assert sonnet_impl.capped_count == 1
+        assert sonnet_impl.cap_hit_rate == pytest.approx(0.5)
+        # Out-of-window 99.0 row excluded — total is 2.0 + 3.0, not + 99.0.
+        assert sonnet_impl.total_cost_usd == pytest.approx(5.0)
+        assert sonnet_impl.cost_per_done == pytest.approx(5.0)  # 5.0 / 1 distinct done task
+
+        haiku_impl = by_key[('haiku', 'implementer')]
+        assert haiku_impl.invocation_count == 1
+        assert haiku_impl.done_count == 1
+        assert haiku_impl.cost_per_done == pytest.approx(1.0)
+
+        steward_row = by_key[('opus', 'steward')]
+        assert steward_row.invocation_count == 1
+        assert steward_row.done_count == 0
+        assert steward_row.blocked_count == 0
+        assert steward_row.cost_per_done is None
+
+        triage_row = by_key[('opus', 'triage')]
+        assert triage_row.invocation_count == 1
+        assert triage_row.done_count == 0
+
+        module_tagger_row = by_key[('haiku', 'module_tagger')]
+        assert module_tagger_row.invocation_count == 1
+        assert module_tagger_row.done_count == 0
+        assert module_tagger_row.blocked_count == 0
+        assert module_tagger_row.cost_per_done is None
+
+    def test_missing_db_returns_empty_rollup(self, tmp_path: Path) -> None:
+        """Non-existent DB returns an empty ModelRoleRollup (fail-open)."""
+        db_path = tmp_path / 'no-such.db'
+        rollup = digest.model_role_rollup(
+            db_path, '2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00',
+        )
+        assert rollup.rows == []
+
+
+class TestModelRoleRollupTurnCapSaturation:
+    """Tests for digest.model_role_rollup(...).turn_cap_saturation (step-3/4)."""
+
+    def test_saturation_per_role(self, tmp_path: Path) -> None:
+        """Per-role saturation = fraction of invocation_end turns >= that
+        role's MAX(routing_decision.max_turns) in the window; roles with no
+        routing_decision max_turns report None (fail-open, not 0/1)."""
+        db_path = tmp_path / 'runs.db'
+        _seed_rollup_runs_db(db_path)
+        run_id = 'run-test'
+        window_start = '2026-05-10T00:00:00+00:00'
+        window_end = '2026-05-10T23:59:59+00:00'
+
+        # simple_task: max_turns=30, invocation_end turns=30 and turns=12 -> 1/2 = 0.5
+        _insert_event(
+            db_path, run_id=run_id, task_id='t1', event_type='routing_decision',
+            role='simple_task', data={'max_turns': 30}, timestamp='2026-05-10T08:00:00+00:00',
+        )
+        _insert_event(
+            db_path, run_id=run_id, task_id='t1', event_type='invocation_end',
+            role='simple_task', data={'turns': 30}, timestamp='2026-05-10T08:01:00+00:00',
+        )
+        _insert_event(
+            db_path, run_id=run_id, task_id='t2', event_type='invocation_end',
+            role='simple_task', data={'turns': 12}, timestamp='2026-05-10T08:02:00+00:00',
+        )
+
+        # architect: max_turns=60, invocation_end turns=20 -> 0/1 = 0.0
+        _insert_event(
+            db_path, run_id=run_id, task_id='t3', event_type='routing_decision',
+            role='architect', data={'max_turns': 60}, timestamp='2026-05-10T09:00:00+00:00',
+        )
+        _insert_event(
+            db_path, run_id=run_id, task_id='t3', event_type='invocation_end',
+            role='architect', data={'turns': 20}, timestamp='2026-05-10T09:01:00+00:00',
+        )
+
+        # no_max_turns_role: invocation_end rows but no routing_decision -> None
+        _insert_event(
+            db_path, run_id=run_id, task_id='t4', event_type='invocation_end',
+            role='no_max_turns_role', data={'turns': 5}, timestamp='2026-05-10T10:00:00+00:00',
+        )
+
+        # Out-of-window invocation_end — must be excluded.
+        _insert_event(
+            db_path, run_id=run_id, task_id='t5', event_type='invocation_end',
+            role='simple_task', data={'turns': 999}, timestamp='2026-05-09T00:00:00+00:00',
+        )
+
+        rollup = digest.model_role_rollup(db_path, window_start, window_end)
+
+        assert rollup.turn_cap_saturation['simple_task'] == pytest.approx(0.5)
+        assert rollup.turn_cap_saturation['architect'] == pytest.approx(0.0)
+        assert rollup.turn_cap_saturation['no_max_turns_role'] is None
+
+
+def _make_model_role_rollup() -> digest.ModelRoleRollup:
+    """Build a concrete ModelRoleRollup for render tests (step-5)."""
+    return digest.ModelRoleRollup(
+        rows=[
+            digest.ModelRoleRow(
+                model='sonnet', role='implementer',
+                invocation_count=4, done_count=2, blocked_count=1,
+                done_rate=0.5, blocked_rate=0.25,
+                capped_count=1, cap_hit_rate=0.25,
+                total_cost_usd=8.0, cost_per_done=4.0,
+            ),
+            digest.ModelRoleRow(
+                model='opus', role='steward',
+                invocation_count=1, done_count=0, blocked_count=0,
+                done_rate=0.0, blocked_rate=0.0,
+                capped_count=0, cap_hit_rate=0.0,
+                total_cost_usd=0.5, cost_per_done=None,
+            ),
+        ],
+        turn_cap_saturation={
+            'simple_task': 0.5,
+            'architect': 0.0,
+            'no_max_turns_role': None,
+        },
+    )
+
+
+class TestRenderDigestRollupSection:
+    """Tests for the '## Per-(model×role) rollup' section of render_digest_markdown (step-5/6)."""
+
+    def test_rollup_table_renders_known_cell(self) -> None:
+        inputs = _make_digest_inputs()
+        inputs.model_role_rollup = _make_model_role_rollup()
+        md = digest.render_digest_markdown(inputs)
+        assert '## Per-(model×role) rollup' in md
+        assert re.search(
+            r'\| sonnet \| implementer \| 4 \| 50\.0% \| 25\.0% \| 25\.0% \| \$4\.00 \|', md,
+        ), md
+
+    def test_none_cost_per_done_renders_placeholder(self) -> None:
+        inputs = _make_digest_inputs()
+        inputs.model_role_rollup = _make_model_role_rollup()
+        md = digest.render_digest_markdown(inputs)
+        assert re.search(r'\| opus \| steward \| 1 \| 0\.0% \| 0\.0% \| 0\.0% \| — \|', md), md
+
+    def test_turn_cap_saturation_subsection(self) -> None:
+        inputs = _make_digest_inputs()
+        inputs.model_role_rollup = _make_model_role_rollup()
+        md = digest.render_digest_markdown(inputs)
+        assert re.search(r'- simple_task: 50\.0%', md)
+        assert re.search(r'- architect: 0\.0%', md)
+        assert re.search(r'- no_max_turns_role: n/a', md)
+
+    def test_empty_rollup_renders_none_placeholder_no_raise(self) -> None:
+        inputs = _make_digest_inputs()
+        inputs.model_role_rollup = digest.ModelRoleRollup()
+        md = digest.render_digest_markdown(inputs)  # must not raise
+        assert '## Per-(model×role) rollup' in md
+        assert '_none_' in md

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from dashboard.app import _parse_window
+from dashboard.data import redux_api
 
 # ---------------------------------------------------------------------------
 # _parse_window helper
@@ -275,13 +276,20 @@ def test_costs_returns_full_costs_block(client):
     body = resp.json()
     assert 'COSTS' in body
     costs = body['COSTS']
-    for key in ('summary', 'by_project', 'by_account', 'by_role', 'trend', 'events'):
+    for key in ('summary', 'by_project', 'by_account', 'by_role', 'trend', 'events', 'by_model_role'):
         assert key in costs, f'COSTS missing {key}'
+    # Shape, not content, per this module's docstring — the `client` fixture
+    # resolves against a real project root, which may have live runs.db data
+    # (task 2534 step-13).
+    assert isinstance(costs['by_model_role'], dict)
+    assert isinstance(costs['by_model_role']['rows'], list)
+    assert isinstance(costs['by_model_role']['turn_cap_saturation'], dict)
 
 
 def test_costs_route_threads_shared_now_to_all_aggregates(client):
-    """api_costs must capture one `now` and pass the SAME now to all six
-    route aggregates. Asserted via call-site kwargs (mirrors
+    """api_costs must capture one `now` and pass the SAME now to all seven
+    route aggregates (task 2534 step-13 added aggregate_model_role_rollup as
+    the seventh). Asserted via call-site kwargs (mirrors
     test_merge_queue_uses_24h_recent_window) because the test fixture
     carries no per-project DBs, so a shared reference timestamp is not
     observable in the JSON payload. Closes the per-DB clock-skew race at
@@ -293,6 +301,7 @@ def test_costs_route_threads_shared_now_to_all_aggregates(client):
         'aggregate_cost_by_account',
         'aggregate_cost_by_role',
         'aggregate_cost_trend',
+        'aggregate_model_role_rollup',
     )
     mocks = {name: AsyncMock(return_value={}) for name in mock_names}
     mocks['aggregate_account_events'] = AsyncMock(return_value=[])
@@ -304,6 +313,10 @@ def test_costs_route_threads_shared_now_to_all_aggregates(client):
         patch('dashboard.app.aggregate_cost_by_role', new=mocks['aggregate_cost_by_role']),
         patch('dashboard.app.aggregate_cost_trend', new=mocks['aggregate_cost_trend']),
         patch('dashboard.app.aggregate_account_events', new=mocks['aggregate_account_events']),
+        patch(
+            'dashboard.app.aggregate_model_role_rollup',
+            new=mocks['aggregate_model_role_rollup'],
+        ),
     ):
         resp = client.get('/api/v2/dashboard/costs?window=7d')
 
@@ -319,8 +332,66 @@ def test_costs_route_threads_shared_now_to_all_aggregates(client):
         nows.append(now)
 
     assert all(n == nows[0] for n in nows), (
-        f"expected all six aggregates to share one reference now, got {nows!r}"
+        f"expected all seven aggregates to share one reference now, got {nows!r}"
     )
+
+
+def test_costs_route_includes_by_model_role(client):
+    """The rollup computed by aggregate_model_role_rollup (rows +
+    turn_cap_saturation) flows through shape_costs into COSTS.by_model_role
+    (task 2534 step-13)."""
+    fake_rollup = {
+        'rows': [
+            {'model': 'sonnet', 'role': 'implementer', 'invocation_count': 4,
+             'done_count': 2, 'blocked_count': 1, 'done_rate': 0.5, 'blocked_rate': 0.25,
+             'capped_count': 1, 'cap_hit_rate': 0.25, 'total_cost_usd': 8.0, 'cost_per_done': 4.0},
+        ],
+        'turn_cap_saturation': {'simple_task': 0.5, 'architect': None},
+    }
+    with patch(
+        'dashboard.app.aggregate_model_role_rollup',
+        new=AsyncMock(return_value=fake_rollup),
+    ):
+        resp = client.get('/api/v2/dashboard/costs?window=7d')
+
+    assert resp.status_code == 200
+    by_model_role = resp.json()['COSTS']['by_model_role']
+    assert by_model_role['rows'] == fake_rollup['rows']
+    assert by_model_role['turn_cap_saturation'] == fake_rollup['turn_cap_saturation']
+
+
+def test_shape_costs_places_model_role_rollup_under_by_model_role():
+    """shape_costs(..., by_model_role=<aggregate_model_role_rollup output>)
+    places rows+turn_cap_saturation under COSTS.by_model_role without
+    altering the existing summary/by_project/by_account/by_role/trend/events
+    keys; omitting by_model_role still yields a well-formed empty block
+    (task 2534 step-13)."""
+    rollup = {
+        'rows': [
+            {'model': 'sonnet', 'role': 'implementer', 'invocation_count': 4,
+             'done_count': 2, 'blocked_count': 1, 'done_rate': 0.5, 'blocked_rate': 0.25,
+             'capped_count': 1, 'cap_hit_rate': 0.25, 'total_cost_usd': 8.0, 'cost_per_done': 4.0},
+            {'model': 'opus', 'role': 'steward', 'invocation_count': 1,
+             'done_count': 0, 'blocked_count': 0, 'done_rate': 0.0, 'blocked_rate': 0.0,
+             'capped_count': 0, 'cap_hit_rate': 0.0, 'total_cost_usd': 0.5, 'cost_per_done': None},
+        ],
+        'turn_cap_saturation': {'simple_task': 0.5, 'architect': 0.0, 'no_max_turns_role': None},
+    }
+    body = redux_api.shape_costs(
+        summary={}, by_project={}, by_account={}, by_role={}, trend={}, events=[],
+        by_model_role=rollup,
+    )
+    costs = body['COSTS']
+    for key in ('summary', 'by_project', 'by_account', 'by_role', 'trend', 'events'):
+        assert key in costs, f'COSTS missing {key}'
+
+    assert costs['by_model_role']['rows'] == rollup['rows']
+    assert costs['by_model_role']['turn_cap_saturation'] == rollup['turn_cap_saturation']
+
+    body_default = redux_api.shape_costs(
+        summary={}, by_project={}, by_account={}, by_role={}, trend={}, events=[],
+    )
+    assert body_default['COSTS']['by_model_role'] == {'rows': [], 'turn_cap_saturation': {}}
 
 
 def test_performance_returns_performance(client):
