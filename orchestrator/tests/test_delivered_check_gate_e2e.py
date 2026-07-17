@@ -374,3 +374,76 @@ class TestRealGitGrepGate:
             f'row 3: once the real `git grep` finds the token on main, the '
             f'dependent must dispatch; got {result!r}'
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Row 7 fixture constants (real script-kind runner ERROR -> fail-safe, recover)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CAP_NAME_7 = 'row7_cap'
+_SCRIPT_REL_PATH_7 = 'scripts/row7_check.sh'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestScriptRunnerErrorFailSafe — row 7: real ERRORED -> fail-safe, then recover
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestScriptRunnerErrorFailSafe:
+    """Row 7, driven through the REAL (unmocked) script-kind runner: a
+    'done' producer carries a script-kind ``metadata.delivered_checks``
+    entry whose script file is genuinely MISSING, so
+    ``orchestrator.delivered_checks.run_delivered_check`` hits a real
+    ``FileNotFoundError`` from the subprocess spawn and maps it to
+    ``DeliveredCheckResult.ERRORED`` -- never a definitive FAILED.
+
+    The gate's fail-safe contract for ERRORED is distinct from rows 4/5:
+    the dependent is withheld tick after tick with NO
+    ``delivered_check_gate_held`` event, NO ``_streak_delivered_fail``
+    bump, and NO born-at-L2 escalation -- an ERRORED check must never be
+    treated as evidence the capability is missing, only that it could not
+    be evaluated. Once the script is created as an executable exit-0 file,
+    the very next tick dispatches the dependent -- real recovery, not a
+    mock swap.
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_script_fails_safe_then_recovers(self, tmp_path: Path) -> None:
+        project_root = _init_git_repo(tmp_path)
+        session = _LocalDepMcpSession()
+        _register_producer(
+            session, 'P7', status='done',
+            checks=[_script_check(_CAP_NAME_7, _SCRIPT_REL_PATH_7)],
+        )
+        _register_dependent(session, 'D7', dep_id='P7')
+
+        harness = _build_harness(project_root, session, tmp_path / 'escalations')
+
+        # --- row 7: script missing -> real FileNotFoundError -> ERRORED;
+        # fail-safe wait across several ticks, with NONE of the withhold
+        # visibility a definitive FAILED would produce.
+        for tick in range(1, 4):
+            result = await _run_tick(harness)
+            assert result is None, (
+                f'tick {tick}: a script-kind check whose script is missing '
+                f'must withhold dispatch (fail-safe); got {result!r}'
+            )
+            assert _held_events(harness) == [], (
+                f'tick {tick}: an ERRORED check must NOT emit a '
+                f'delivered_check_gate_held event (row 7 fail-safe contract)'
+            )
+            assert harness.scheduler._streak_delivered_fail.value(('D7', 'P7')) == 0, (
+                f'tick {tick}: an ERRORED check must NOT bump _streak_delivered_fail'
+            )
+            assert _l2_for(harness, 'D7') == [], (
+                f'tick {tick}: an ERRORED check must NOT file a born-at-L2 escalation'
+            )
+
+        # --- real recovery: create the script as an executable exit-0 file ---
+        _write_exec_script(project_root, _SCRIPT_REL_PATH_7, '#!/bin/sh\nexit 0\n')
+
+        result = await _run_tick(harness)
+        assert result == 'D7', (
+            f'once the script exists and exits 0, the dependent must '
+            f'dispatch; got {result!r}'
+        )
