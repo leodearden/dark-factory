@@ -274,6 +274,21 @@ async def _get_task(server, project_root: Path, task_id: str) -> dict:
     return await _call(server, 'get_task', id=task_id, project_root=str(project_root))
 
 
+def _commit_capability(project_root: Path, rel_path: str, token: str) -> str:
+    """Land *token* into *rel_path* and commit it to branch main, advancing
+    the SHA so the delivered-check gate's stale-cache prune self-heals the
+    withheld dependent on the very next tick (PRD row 6: zero further
+    operator action beyond a manual re-pend). Returns the new main SHA.
+    """
+    target = project_root / rel_path
+    target.write_text(
+        target.read_text(encoding='utf-8') + f'{token}\n', encoding='utf-8',
+    )
+    _run_git(project_root, 'add', rel_path)
+    _run_git(project_root, 'commit', '-m', f'land capability token {token}')
+    return _run_git(project_root, 'rev-parse', 'main').stdout.strip()
+
+
 class _BackendMcpSession:
     """Delegating MCP session double: forwards every ``call_tool`` verbatim to
     the LIVE fused-memory ToolManager (the same ``server._tool_manager
