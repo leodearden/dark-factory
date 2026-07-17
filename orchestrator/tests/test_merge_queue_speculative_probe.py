@@ -38,6 +38,8 @@ from __future__ import annotations
 import asyncio
 import collections
 import math
+from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -48,7 +50,12 @@ from orchestrator.config import (
     OrchestratorConfig,
     SpeculationProbeConfig,
 )
-from orchestrator.merge_queue import SpeculativeMergeWorker
+from orchestrator.merge_queue import (
+    DecidedItem,
+    InflightEntry,
+    RealMergeItem,
+    SpeculativeMergeWorker,
+)
 
 # ---------------------------------------------------------------------------
 # step-1 RED / step-2 GREEN: SpeculationProbeConfig
@@ -440,3 +447,99 @@ class TestRecentVerifyFailRate:
         for passed in [True, True, True]:  # evicts all 3 fails
             worker._record_verify_outcome(passed)
         assert worker._recent_verify_fail_rate() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# step-11 RED / step-12 GREEN: SpeculativeMergeWorker._available_built_depth()
+# ---------------------------------------------------------------------------
+
+
+def _sentinel_entry() -> InflightEntry:
+    """Opaque, identity-only stand-in for a real ``InflightEntry``.
+
+    Copied from test_merge_queue_depth_telemetry.py's ``_sentinel_entry``
+    (per-file duplication convention): tests below only care about the
+    *count* of frozen entries, never their fields.
+    """
+    return cast(InflightEntry, object())
+
+
+def _make_spec_item(*, speculative: bool) -> RealMergeItem:
+    """Build a minimal RealMergeItem for _available_built_depth() tests.
+
+    Mirrors test_merge_queue_resource_audit.py's ``_make_spec_item``
+    (per-file duplication convention) -- the built-depth counter under test
+    reads only queue membership/isinstance, never any request/merge_result
+    field, so a near-bare MagicMock request/merge_result is enough.
+    """
+    return RealMergeItem(
+        request=MagicMock(),
+        merge_result=MagicMock(merge_commit='deadbeef01234567890a'),
+        merge_wt=Path('_merge-x'),
+        base_sha='aabbccdd00000000aaaa',
+        speculative=speculative,
+    )
+
+
+def _make_decided_item() -> DecidedItem:
+    """Build a minimal DecidedItem (a terminal passthrough -- conflict /
+    already_merged / etc -- carries no merge commit and must never count
+    toward the built-chain depth).
+    """
+    return DecidedItem(
+        request=MagicMock(),
+        immediate_outcome=MagicMock(),
+        base_sha='aabbccdd00000000aaaa',
+        speculative=False,
+    )
+
+
+class TestAvailableBuiltDepth:
+    """SpeculativeMergeWorker._available_built_depth() -- the deepest
+    already-built (merged) speculative cumulative stack depth: frozen/
+    verifying entries (_frozen_inflight_entries()) plus built-but-
+    unverified items still sitting in _verifier_queue, read without
+    draining or reordering it (task 2359).
+
+    RED until step-12 GREEN adds the method.
+    """
+
+    def test_nothing_built_returns_zero(self):
+        worker = _make_bare_worker()
+        worker._frozen_inflight_entries = lambda: []
+        assert worker._available_built_depth() == 0
+
+    def test_frozen_only_returns_frozen_count(self):
+        worker = _make_bare_worker()
+        worker._frozen_inflight_entries = lambda: [_sentinel_entry() for _ in range(3)]
+        assert worker._available_built_depth() == 3
+
+    def test_frozen_plus_queued_speculative_sums(self):
+        worker = _make_bare_worker()
+        worker._frozen_inflight_entries = lambda: [_sentinel_entry() for _ in range(3)]
+        for _ in range(2):
+            worker._verifier_queue.put_nowait(_make_spec_item(speculative=True))
+        assert worker._available_built_depth() == 5
+
+    def test_decided_passthrough_in_queue_not_counted(self):
+        """A DecidedItem (conflict/already_merged passthrough) never
+        extends the built chain -- it carries no merge commit.
+        """
+        worker = _make_bare_worker()
+        worker._frozen_inflight_entries = lambda: []
+        worker._verifier_queue.put_nowait(_make_decided_item())
+        assert worker._available_built_depth() == 0
+
+    def test_none_sentinel_in_queue_not_counted(self):
+        """The shutdown sentinel (None) must never be counted."""
+        worker = _make_bare_worker()
+        worker._frozen_inflight_entries = lambda: []
+        worker._verifier_queue.put_nowait(None)
+        assert worker._available_built_depth() == 0
+
+    def test_does_not_mutate_or_drain_the_queue(self):
+        worker = _make_bare_worker()
+        worker._frozen_inflight_entries = lambda: []
+        worker._verifier_queue.put_nowait(_make_spec_item(speculative=True))
+        worker._available_built_depth()
+        assert worker._verifier_queue.qsize() == 1
