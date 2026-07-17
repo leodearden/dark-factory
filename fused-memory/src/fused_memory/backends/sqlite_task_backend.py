@@ -1242,9 +1242,17 @@ class SqliteTaskBackend:
         ``get_statuses`` hot read that would previously have run on the
         separate write connection's thread instead. Task 2694's
         :meth:`_read_lock` makes this explicit at the ``asyncio`` level too
-        — a caller now holds the lock for its entire logical read unit, not
-        just the underlying statements — but does not add any NEW blocking
-        beyond what the shared worker thread already serialized; see the
+        — a caller now holds the lock for its entire logical read unit
+        (guard reset through cursor close), not just the underlying
+        statements. That IS a small amount of new blocking versus pre-2694:
+        previously the worker thread only serialized individual statements,
+        so a hot ``get_statuses`` execute could interleave between, e.g.,
+        ``get_task``'s tasks-row SELECT and its :meth:`_fetch_dependencies`
+        call; the lock now holds such an interleaving reader off for the
+        caller's entire read unit instead. The added contention is bounded
+        — row coercion and other post-fetch work run outside the lock — but
+        callers reasoning about hot-path latency should account for
+        whole-unit rather than per-statement serialization; see the
         :meth:`_fresh_read_conn`/:meth:`_read_lock` docstrings. This is an
         accepted trade-off, not an oversight: the freshness convergence this
         connection exists for requires get_task/get_tasks and get_statuses
