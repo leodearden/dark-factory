@@ -4104,3 +4104,91 @@ def test_liveness_pass_isolates_exception(monkeypatch: pytest.MonkeyPatch) -> No
     # Must not raise
     wdog.fused_memory_liveness_pass()
 
+
+# ---------------------------------------------------------------------------
+# Part B: _print_fused_memory_liveness() + --report wiring (B4)
+# ---------------------------------------------------------------------------
+
+
+_SS_LISTEN_8002 = _SS_HEADER + "LISTEN 0      2048       127.0.0.1:8002      0.0.0.0:*\n"
+
+
+def test_print_fused_memory_liveness_row(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """USER-SIGNAL: --report's fused-memory row names the unit + verdict, mutates nothing.
+
+    Drives _print_fused_memory_liveness() through the REAL
+    _fused_memory_liveness_verdict() -> probe_port()/probe_health() chain for
+    each of the three verdicts, faking subprocess.run (the `ss` port probe)
+    and urllib.request.urlopen (the /health fetch) rather than monkeypatching
+    the verdict function directly, so the "zero mutating calls" assertion
+    below is meaningful — mirrors test_report_mixed_fleet_returns_1_and_lists_all_units's
+    rationale for driving through real helpers instead of stubbing them.
+    restart_unit is also monkeypatched to fail the test outright if called,
+    as a direct belt-and-suspenders check that this read-only print helper
+    never mutates (I7/I8 extended to the fused-memory row).
+    """
+    wdog = _load_watchdog()
+
+    # (verdict token, `ss` stdout, /health outcome: None (unreached), an int
+    # status code, or an exception instance for urlopen to raise)
+    scenarios = [
+        ("port-down", _SS_HEADER, None),
+        ("healthy", _SS_LISTEN_8002, 200),
+        ("wedged", _SS_LISTEN_8002, TimeoutError("timed out")),
+    ]
+
+    for verdict_token, ss_stdout, health_outcome in scenarios:
+        recorded_calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):  # noqa: ANN001
+            recorded_calls.append(list(cmd))
+            assert cmd[0] == "ss", f"unexpected subprocess.run call: {cmd}"
+            return subprocess.CompletedProcess(cmd, 0, stdout=ss_stdout, stderr="")
+
+        def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            if isinstance(health_outcome, Exception):
+                raise health_outcome
+            return _FakeHealthResponse(health_outcome)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(
+            wdog, "restart_unit", lambda u: pytest.fail(f"must never restart {u}")
+        )
+
+        wdog._print_fused_memory_liveness()
+
+        captured = capsys.readouterr()
+        assert "fused-memory.service" in captured.out, (
+            f"[{verdict_token}] expected unit name in output: {captured.out!r}"
+        )
+        assert verdict_token in captured.out, (
+            f"[{verdict_token}] expected verdict token in output: {captured.out!r}"
+        )
+        _assert_zero_mutating_calls(recorded_calls)
+
+
+def test_cli_report_includes_fused_memory_row(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """_cli(["--report"]) output includes the fused-memory liveness row.
+
+    report() is stubbed to a silent no-op so only _print_fused_memory_liveness()
+    can be the source of this output; report()'s own exit code (0) must still
+    be what _cli returns, confirming the fm row is informational-only and
+    does not alter report()'s staleness-only exit-code contract.
+    """
+    wdog = _load_watchdog()
+
+    monkeypatch.setattr(wdog, "report", lambda: 0)
+    monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
+
+    exit_code = wdog._cli(["--report"])
+
+    captured = capsys.readouterr()
+    assert "fused-memory.service" in captured.out
+    assert "healthy" in captured.out
+    assert exit_code == 0, "report()'s staleness-only exit code must be unaffected by the fm row"
+
