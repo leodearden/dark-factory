@@ -448,6 +448,61 @@ class ModelRoleRollup:
     turn_cap_saturation: dict[str, float | None] = field(default_factory=dict)
 
 
+def _compute_turn_cap_saturation(
+    conn: sqlite3.Connection,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> dict[str, float | None]:
+    """Per-role turn-cap saturation from the `events` table.
+
+    max_turns is role-constant config, not stored on invocation_end, but
+    dep 2533's routing_decision event persists it per invocation — MAX(...)
+    over the window recovers the effective per-role cap. saturation[role] =
+    fraction of that role's invocation_end events with data.turns >=
+    max_turns[role]. Roles with invocation_end rows but no routing_decision
+    max_turns in the window report None (fail-open — not 0/1, which would
+    misleadingly claim zero or total saturation for an unmeasured cap).
+
+    Only workflow roles that emit invocation_end are covered — steward/
+    triage/module_tagger go through invoke_with_cap_retry and emit none.
+    """
+    max_turns_rows = conn.execute(
+        "SELECT role, MAX(json_extract(data, '$.max_turns')) FROM events "
+        "WHERE event_type = 'routing_decision' "
+        "  AND timestamp BETWEEN ? AND ? "
+        "  AND role IS NOT NULL "
+        'GROUP BY role',
+        (window_start_iso, window_end_iso),
+    ).fetchall()
+    max_turns_by_role: dict[str, float] = {
+        role: max_turns for role, max_turns in max_turns_rows if max_turns is not None
+    }
+
+    turns_rows = conn.execute(
+        "SELECT role, json_extract(data, '$.turns') FROM events "
+        "WHERE event_type = 'invocation_end' "
+        '  AND timestamp BETWEEN ? AND ? '
+        '  AND role IS NOT NULL',
+        (window_start_iso, window_end_iso),
+    ).fetchall()
+    turns_by_role: dict[str, list[float]] = {}
+    for role, turns in turns_rows:
+        if turns is None:
+            continue
+        turns_by_role.setdefault(role, []).append(turns)
+
+    saturation: dict[str, float | None] = {}
+    for role, turns_list in turns_by_role.items():
+        max_turns = max_turns_by_role.get(role)
+        if max_turns is None:
+            saturation[role] = None
+        else:
+            hits = sum(1 for turns in turns_list if turns >= max_turns)
+            saturation[role] = hits / len(turns_list)
+
+    return saturation
+
+
 def model_role_rollup(
     runs_db: Path,
     window_start_iso: str,
@@ -521,7 +576,10 @@ def model_role_rollup(
                 cost_per_done=cost_per_done,
             ))
 
-        return ModelRoleRollup(rows=rows)
+        turn_cap_saturation = _compute_turn_cap_saturation(
+            conn, window_start_iso, window_end_iso,
+        )
+        return ModelRoleRollup(rows=rows, turn_cap_saturation=turn_cap_saturation)
 
     return _query_events_ro(runs_db, 'model_role_rollup', ModelRoleRollup(), _query)
 
