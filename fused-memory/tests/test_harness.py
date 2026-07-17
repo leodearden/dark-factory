@@ -4918,6 +4918,203 @@ async def test_recover_stale_runs_restore_is_run_scoped_not_project_wide(
     )
 
 
+# ── Predecessor recovery at startup (task 2711 / E6) ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_runs_recovers_dead_predecessor_orphan(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """Primary scenario: a run started only ~120s ago — far under the
+    default stale_run_recovery_seconds (1800s) cutoff — owned by a dead
+    predecessor instance that still holds a freshly-heartbeated lock, must
+    be recovered immediately by `_recover_predecessor_runs()` rather than
+    waiting for the age-based `_recover_stale_runs()` backstop (task 2711 /
+    E6). Also proves the age-based reaper alone does NOT catch this run.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    project_id = 'test-project'
+
+    dead_pred_iid = 'dead-pred'
+    assert event_buffer.instance_id != dead_pred_iid
+
+    run = ReconciliationRun(
+        id='run-predecessor-orphan',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=120),
+        status=RunStatus.running,
+        instance_id=dead_pred_iid,
+    )
+    await journal.start_run(run)
+
+    # Dead predecessor's lock row: acquire as the live instance, then
+    # rewrite instance_id/heartbeat_at to simulate the predecessor's own
+    # lock surviving the crash — fresh heartbeat, so it is NOT swept by the
+    # stale-lock sweep (stale_lock_seconds=7200s).
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+    fresh_heartbeat = datetime.now(UTC).isoformat()
+    async with event_buffer._txn() as db:
+        await db.execute(
+            'UPDATE reconciliation_locks SET instance_id = ?, heartbeat_at = ? '
+            'WHERE project_id = ?',
+            (dead_pred_iid, fresh_heartbeat, project_id),
+        )
+
+    # Deferred write left behind by the dead predecessor.
+    await event_buffer.defer_write(project_id, 'replayed-by-predecessor-pass', 'cat', {})
+    mock_memory_service.add_memory = AsyncMock()
+
+    # Motivation check: the age-based reaper must NOT touch this run — it is
+    # far younger than the 1800s cutoff.
+    await harness._recover_stale_runs()
+    still_running = await journal.get_run('run-predecessor-orphan')
+    assert still_running is not None
+    assert still_running.status == RunStatus.running, (
+        'Age-based _recover_stale_runs must not touch a run only ~120s old — '
+        'this is exactly the gap _recover_predecessor_runs must close'
+    )
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        await harness._recover_predecessor_runs()
+
+    after = await journal.get_run('run-predecessor-orphan')
+    assert after is not None
+    assert after.status == RunStatus.failed
+    err = after.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'PredecessorRunRecovery'
+
+    # Structured log emitted for the recovered predecessor orphan.
+    recovered_records = [
+        r for r in caplog.records if r.message == 'reconciliation.predecessor_run_recovered'
+    ]
+    assert len(recovered_records) == 1, (
+        f'Expected exactly one predecessor_run_recovered log line; got: '
+        f'{[r.message for r in caplog.records]!r}'
+    )
+
+    # No escalation — recovering a dead predecessor's orphan at startup is
+    # expected operational-restart behaviour, not an integrity finding.
+    harness._escalate.assert_not_called()
+
+    # Deferred write was replayed.
+    mock_memory_service.add_memory.assert_awaited()
+
+    # The dead predecessor's lock was released.
+    lock_holder = await event_buffer.get_lock_holder_instance_id(project_id)
+    assert lock_holder is None
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_runs_skips_own_instance_run(
+    journal, event_buffer, mock_memory_service,
+):
+    """A running row owned by THIS process's own instance_id must never be
+    touched by the predecessor pass — it is not a dead predecessor, it is
+    (or may be) a legitimately live concurrent run.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    project_id = 'test-project'
+
+    run = ReconciliationRun(
+        id='run-own-instance',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=120),
+        status=RunStatus.running,
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(run)
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+
+    await harness._recover_predecessor_runs()
+
+    after = await journal.get_run('run-own-instance')
+    assert after is not None
+    assert after.status == RunStatus.running
+    assert '_error' not in after.stage_reports
+    harness._escalate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_runs_skips_when_corroboration_fails(
+    journal, event_buffer, mock_memory_service,
+):
+    """When no lock corroborates the run's claimed owner (lock_holder does
+    not equal run.instance_id — including the no-lock-at-all case), the run
+    must be left for the age-based backstop rather than reaped on age alone
+    (task requirement: never reap on age alone when the owner might be
+    live).
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    project_id = 'test-project'
+
+    run = ReconciliationRun(
+        id='run-uncorroborated',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=120),
+        status=RunStatus.running,
+        instance_id='dead-pred-uncorroborated',
+    )
+    await journal.start_run(run)
+
+    # No lock held at all for this project — lock_holder will be None,
+    # which does not corroborate 'dead-pred-uncorroborated'.
+    lock_holder = await event_buffer.get_lock_holder_instance_id(project_id)
+    assert lock_holder is None
+
+    await harness._recover_predecessor_runs()
+
+    after = await journal.get_run('run-uncorroborated')
+    assert after is not None
+    assert after.status == RunStatus.running, (
+        'Run must be left for the age-based backstop when the lock does not '
+        "corroborate the run's claimed owner"
+    )
+    harness._escalate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_runs_skips_null_instance(
+    journal, event_buffer, mock_memory_service,
+):
+    """A pre-migration run (instance_id IS NULL) is left to the age-based
+    backstop, not the predecessor pass — there is no instance identity to
+    corroborate against the lock.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    project_id = 'test-project'
+
+    run = ReconciliationRun(
+        id='run-null-instance',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=120),
+        status=RunStatus.running,
+        instance_id=None,
+    )
+    await journal.start_run(run)
+
+    await harness._recover_predecessor_runs()
+
+    after = await journal.get_run('run-null-instance')
+    assert after is not None
+    assert after.status == RunStatus.running
+    harness._escalate.assert_not_called()
+
+
 # ── Tests for AllAccountsCappedException deferral in run_full_cycle ────
 
 
