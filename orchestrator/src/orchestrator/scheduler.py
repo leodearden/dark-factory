@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
 
 from shared.locking import (
     files_to_modules,
@@ -78,6 +78,13 @@ _DISPATCH_DEFERRED_LOG_SECS: float = 180.0
 # re-evaluates an ERRORED dep on EVERY sweep (no backoff), so a fix landing
 # on main is picked up the very next tick (row 7 self-heal).
 _DELIVERED_CHECK_ERROR_LOG_THRESHOLD: int = 20
+
+# fm-read-storm escalation (task 2704, survey finding C3): consecutive
+# fm-unreadable dispatch ticks before the storm-escape L1 fires. Sized to
+# clear a routine ~15s fm restart (a handful of ticks) while still catching
+# a wedged/crash-looping fm. Module-level (not config-schema) so it can be
+# tuned here without a schema migration.
+_FM_READ_FAILURE_ESCALATION_THRESHOLD: int = 12
 
 # Sentinel distinguishing "caller omitted this claimant kwarg" (default,
 # leave the wire argument absent) from "caller explicitly passed None"
@@ -1355,6 +1362,11 @@ class Scheduler:
         'select_scored',
     )
 
+    # Synthetic task_id keying the fm-read-storm escalation's has_open_l1
+    # dedup (task 2704, survey finding C3) — mirrors
+    # Harness._SCHEDULER_PAUSE_SENTINEL ('__scheduler__').
+    _FM_READ_STORM_SENTINEL: str = '__fm_read_storm__'
+
     def __init__(
         self,
         config: OrchestratorConfig,
@@ -1463,6 +1475,13 @@ class Scheduler:
         self._overrides_initialized: bool = False
         # --- Park-eviction store (task 1871) ---
         self._park_eviction_store: ParkEvictionRequestStore | None = park_eviction_store
+        # Consecutive fm-read-failure streak (task 2704, survey finding C3).
+        # A plain scheduler-global int, NOT a StreakCounter/StreakRegistry
+        # entry: the failure is scheduler-wide (the whole task read failed),
+        # not per-task-id, and the registry GCs by task-id — a plain int
+        # reset-on-success cannot leak. Bumped by _note_fm_read_failure,
+        # zeroed by _reset_fm_read_failure_streak on any successful read.
+        self._fm_read_failure_streak: int = 0
         # --- Startup gate (task 2235, W10-α) ---
         # False until finish_startup() is called.  acquire_next() asserts
         # this — a runtime check for the "startup reconcile sweeps run
@@ -2032,11 +2051,26 @@ class Scheduler:
             key=_order_key,
         )
 
+    @overload
     async def get_tasks(
         self,
         *,
         statuses: Iterable[str] | None = None,
-    ) -> list[dict]:
+        distinguish_failure: Literal[False] = False,
+    ) -> list[dict]: ...
+    @overload
+    async def get_tasks(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+        distinguish_failure: Literal[True],
+    ) -> list[dict] | None: ...
+    async def get_tasks(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+        distinguish_failure: bool = False,
+    ) -> list[dict] | None:
         """Fetch tasks from fused-memory/taskmaster.
 
         Args:
@@ -2045,6 +2079,12 @@ class Scheduler:
                 argument is omitted and the server returns the full task tree —
                 byte-identical to the previous behaviour.  Pass
                 ``ACTIVE_TASK_STATUSES`` on hot paths to shrink the payload.
+            distinguish_failure: When True, a read FAILURE (exception or parse
+                error) returns ``None`` instead of the legacy fail-safe ``[]`` —
+                letting the caller distinguish "fm is unreadable" from "the
+                project genuinely has no tasks" (survey finding C3). Defaults
+                to False so every existing caller keeps its byte-identical
+                ``list[dict]`` contract.
         """
         try:
             arguments: dict = {'project_root': self._project_root}
@@ -2069,7 +2109,7 @@ class Scheduler:
             logger.exception(
                 'Failed to fetch tasks: %s: %s', type(e).__name__, e,
             )
-        return []
+        return None if distinguish_failure else []
 
     async def set_task_status(
         self,
@@ -4745,6 +4785,83 @@ class Scheduler:
                         },
                     )
 
+    def _note_fm_read_failure(self) -> None:
+        """Record one more consecutive fm-read-failure tick (survey C3).
+
+        Bumps ``self._fm_read_failure_streak`` and emits
+        ``park_eviction_deferred_fm_unavailable`` (cheap, append-only
+        observability — one per deferred drain) so operators can see the
+        outage window in the event store.  Once the streak crosses
+        ``_FM_READ_FAILURE_ESCALATION_THRESHOLD`` the loud storm-escape L1 is
+        filed (deduped — see ``_file_fm_read_storm_escalation``).
+        """
+        self._fm_read_failure_streak += 1
+        if self.event_store:
+            self.event_store.emit(
+                EventType.park_eviction_deferred_fm_unavailable,
+                task_id=None,
+                data={'consecutive_failures': self._fm_read_failure_streak},
+            )
+        if self._fm_read_failure_streak >= _FM_READ_FAILURE_ESCALATION_THRESHOLD:
+            self._file_fm_read_storm_escalation(self._fm_read_failure_streak)
+
+    def _reset_fm_read_failure_streak(self) -> None:
+        """Zero the fm-read-failure streak after a successful task read."""
+        self._fm_read_failure_streak = 0
+
+    def _file_fm_read_storm_escalation(self, streak: int) -> None:
+        """File a loud L1 escalation once the fm-read-failure streak persists.
+
+        Deduped by ``has_open_l1`` so a sustained outage (checked every tick
+        once past threshold) does not stack duplicate L1s — the operator
+        sees exactly one open escalation per outage episode, and a fresh one
+        re-files if a human resolves it while fm is still down.
+
+        Best-effort: a missing queue (bare-Scheduler unit tests) is a no-op;
+        any submit failure is swallowed so escalation filing never breaks
+        the dispatch tick.  Mirrors
+        ``Harness._file_scheduler_pause_escalation`` and
+        ``Scheduler.trigger_retry_cap_exhausted``'s escalation shape.
+        """
+        if self.escalation_queue is None:      # bare-Scheduler unit tests stay green
+            logger.warning(
+                'fm read has failed %d consecutive ticks but no escalation_queue '
+                'is wired — skipping storm escalation',
+                streak,
+            )
+            return
+        try:
+            if self.escalation_queue.has_open_l1(self._FM_READ_STORM_SENTINEL):
+                return                          # dedup: one open L1 at a time
+            from escalation.models import Escalation
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self._FM_READ_STORM_SENTINEL),
+                task_id=self._FM_READ_STORM_SENTINEL,
+                agent_role='orchestrator-scheduler',
+                severity='blocking',
+                category='infra_issue',
+                summary=(
+                    f'fused-memory unreadable for {streak} consecutive dispatch '
+                    f'ticks — park-eviction drain deferred each tick'
+                )[:200],
+                detail=(
+                    'Scheduler.get_tasks() has failed (exception or parse error) '
+                    f'for {streak} consecutive acquire_next ticks. The '
+                    'park-eviction drain is deferred on every failed tick to '
+                    'protect still-live task owners — draining with empty '
+                    'status/task maps would force-evict them, bypassing the D4 '
+                    'live-owner guard (survey finding C3 / df-1865).\n\n'
+                    'Resolve once fused-memory is confirmed reachable again; '
+                    'dispatch resumes automatically on the next successful read.'
+                ),
+                suggested_action='investigate_fused_memory_connectivity',
+                level=1,
+            )
+            self.escalation_queue.submit(esc)
+            logger.warning('Filed L1 fm-read-storm escalation %s', esc.id)
+        except Exception:
+            logger.warning('Failed to file fm-read-storm escalation', exc_info=True)
+
     async def _consult_landed_outbox(self, candidate_ids: list[str]) -> set[str]:
         """Consult the injected landed-outbox dispatch gate for each candidate.
 
@@ -6027,10 +6144,24 @@ class Scheduler:
             )
             return None
 
-        tasks = await self.get_tasks(statuses=ACTIVE_TASK_STATUSES)
+        tasks = await self.get_tasks(
+            statuses=ACTIVE_TASK_STATUSES, distinguish_failure=True,
+        )
+        if tasks is None:
+            # fm read FAILURE (survey finding C3) — do NOT drain.  Draining
+            # here would call _drain_park_eviction_requests({}, {}), and with
+            # empty status_map/tasks_by_id, _owner_is_live_dispatchable
+            # returns False for EVERY task_id (not in tasks_by_id), bypassing
+            # the D4 live-owner guard and force-evicting still-live owners
+            # during exactly an fm outage/restart.  Defer instead — the next
+            # successful tick will drain any still-queued requests safely.
+            self._note_fm_read_failure()
+            return None
+        self._reset_fm_read_failure_streak()
         if not tasks:
-            # Drain queued park-eviction requests even when no active tasks exist.
-            # With empty status_map/tasks_by_id, _owner_is_live_dispatchable
+            # Genuine EMPTY project (not a failure) — drain queued
+            # park-eviction requests even though no active tasks exist. With
+            # empty status_map/tasks_by_id, _owner_is_live_dispatchable
             # returns False for all task_ids (not in tasks_by_id) — all queued
             # evictions are processed.  Without this, an operator-enqueued
             # eviction for a stranded park sits in the table indefinitely until

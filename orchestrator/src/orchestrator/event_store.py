@@ -134,6 +134,11 @@ class EventType(StrEnum):
     reservation_used = 'reservation_used'
     reservation_force_evicted = 'reservation_force_evicted'
     reservation_force_evict_refused = 'reservation_force_evict_refused'
+    # Emitted once per acquire_next tick when the fused-memory task read
+    # FAILED (distinct from a genuinely empty project) and the park-eviction
+    # drain was therefore SKIPPED (fail-safe, survey finding C3).
+    # Scheduler-scoped (task_id=None). Payload: {consecutive_failures}.
+    park_eviction_deferred_fm_unavailable = 'park_eviction_deferred_fm_unavailable'
     scheduler_tier_cap_idle = 'scheduler_tier_cap_idle'
 
     # Scheduler priority overrides

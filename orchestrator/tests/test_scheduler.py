@@ -10107,6 +10107,78 @@ class TestGetTasksStatusesParam:
 
 
 # ---------------------------------------------------------------------------
+# task 2704 step-1 RED: get_tasks(distinguish_failure=True) must return None
+# on a read FAILURE, distinct from a genuine empty result (survey finding C3).
+# ---------------------------------------------------------------------------
+
+class TestGetTasksDistinguishFailure:
+    """get_tasks(distinguish_failure=True) returns None on a read FAILURE,
+    distinguishable from a genuine empty task list (survey finding C3).
+
+    Without the flag (default), the legacy fail-safe ``[]`` is preserved so
+    all 8 existing callers (scheduler.py:2016, harness.py:1967/1995/5974/8946,
+    cli.py:329, workflow.py:1470/9959) stay byte-identical.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
+
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_raise_distinguish_failure_true_returns_none(self, scheduler: Scheduler):
+        """A dispatch_tool exception with distinguish_failure=True returns None, not []."""
+        scheduler.dispatch_tool = AsyncMock(side_effect=RuntimeError('fm unreachable'))
+        assert await scheduler.get_tasks(distinguish_failure=True) is None
+
+    @pytest.mark.asyncio
+    async def test_raise_legacy_default_returns_empty_list(self, scheduler: Scheduler):
+        """Without the flag, the same exception still returns [] (legacy fail-safe)."""
+        scheduler.dispatch_tool = AsyncMock(side_effect=RuntimeError('fm unreachable'))
+        assert await scheduler.get_tasks() == []
+
+    @pytest.mark.asyncio
+    async def test_malformed_result_distinguish_failure_true_returns_none(
+        self, scheduler: Scheduler
+    ):
+        """A structured parse failure (non-list 'tasks') with the flag returns None."""
+        scheduler.dispatch_tool = AsyncMock(
+            return_value=self._envelope({'tasks': {'not': 'a-list'}})
+        )
+        assert await scheduler.get_tasks(distinguish_failure=True) is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_result_legacy_default_returns_empty_list(
+        self, scheduler: Scheduler
+    ):
+        """Without the flag, the same parse failure still returns [] (legacy fail-safe)."""
+        scheduler.dispatch_tool = AsyncMock(
+            return_value=self._envelope({'tasks': {'not': 'a-list'}})
+        )
+        assert await scheduler.get_tasks() == []
+
+    @pytest.mark.asyncio
+    async def test_genuine_empty_returns_empty_list_regardless_of_flag(
+        self, scheduler: Scheduler
+    ):
+        """A genuine empty task list is NOT a failure — [] either way."""
+        scheduler.dispatch_tool = AsyncMock(return_value=self._envelope({'tasks': []}))
+        assert await scheduler.get_tasks() == []
+        assert await scheduler.get_tasks(distinguish_failure=True) == []
+
+
+# ---------------------------------------------------------------------------
 # step-3 RED: acquire_next() calls get_tasks with ACTIVE_TASK_STATUSES
 # ---------------------------------------------------------------------------
 
@@ -11320,6 +11392,239 @@ class TestDrainFiresWithNoActiveTasks:
         ]
         assert len(force_evicted) == 1
         assert force_evicted[0][1]['task_id'] == 'dead_owner'
+
+
+# ---- fm-read failure must not drain park-evictions (task 2704, survey C3) ----
+
+class TestAcquireNextFmReadFailureFailSafe:
+    """acquire_next() must NOT drain park-evictions when get_tasks signals a
+    read FAILURE (get_tasks(distinguish_failure=True) returns None) — draining
+    with empty status_map/tasks_by_id would make _owner_is_live_dispatchable
+    return False for every id, bypassing the D4 live-owner guard and
+    force-evicting still-live owners during an fm outage/restart.
+
+    A genuine empty result ([]) is NOT a failure and still drains exactly as
+    before (TestDrainFiresWithNoActiveTasks regression baseline).
+    """
+
+    def _make_scheduler(self, tmp_path, event_store=None):
+        from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        eviction_store = ParkEvictionRequestStore(tmp_path / 'park_eviction_requests.db')
+        if event_store is None:
+            event_store = _RecordingEventStore()
+        scheduler = Scheduler(
+            config,
+            event_store=event_store,  # type: ignore[arg-type]
+            park_eviction_store=eviction_store,
+        )
+        scheduler.finish_startup()
+        return scheduler, eviction_store, event_store
+
+    @pytest.mark.asyncio
+    async def test_fm_outage_skips_drain_and_emits_deferred_event(self, tmp_path):
+        """A get_tasks failure (None) skips the drain and emits the deferred event."""
+        scheduler, store, event_store = self._make_scheduler(tmp_path)
+
+        scheduler.lock_table.install_parks('dead_owner', ['m1'], priority='low')
+        store.enqueue('dead_owner', scheduler._project_root)
+
+        scheduler.get_tasks = AsyncMock(return_value=None)
+
+        result = await scheduler.acquire_next()
+
+        assert result is None
+        # Drain was SKIPPED — the park is still present.
+        assert scheduler.lock_table.has_parks('dead_owner'), (
+            'park-eviction drain must be skipped on an fm read failure'
+        )
+        # No force-eviction event fired.
+        evicted = [e for e in event_store.events if 'reservation_force_evicted' in e[0]]
+        assert evicted == [], f'Expected no force-eviction on fm read failure; got {evicted}'
+        # Exactly one deferred event, with the streak count in its payload.
+        deferred = [
+            e for e in event_store.events
+            if 'park_eviction_deferred_fm_unavailable' in e[0]
+        ]
+        assert len(deferred) == 1
+        assert deferred[0][1]['data']['consecutive_failures'] == 1
+        assert scheduler._fm_read_failure_streak == 1
+        # The eviction request row was NOT consumed — still drainable.
+        assert store.drain(scheduler._project_root) == ['dead_owner']
+
+    @pytest.mark.asyncio
+    async def test_streak_resets_on_successful_read(self, tmp_path):
+        """A successful read (even a genuine empty) resets the failure streak."""
+        scheduler, store, event_store = self._make_scheduler(tmp_path)
+
+        scheduler.get_tasks = AsyncMock(return_value=None)
+        await scheduler.acquire_next()
+        assert scheduler._fm_read_failure_streak == 1
+
+        scheduler.get_tasks = AsyncMock(return_value=[])
+        await scheduler.acquire_next()
+        assert scheduler._fm_read_failure_streak == 0
+
+    @pytest.mark.asyncio
+    async def test_genuine_empty_still_drains(self, tmp_path):
+        """A genuine empty task list ([]) is not a failure — the drain still fires.
+
+        Regression guard mirroring
+        TestDrainFiresWithNoActiveTasks.test_drain_processes_request_when_tasks_empty.
+        """
+        scheduler, store, event_store = self._make_scheduler(tmp_path)
+
+        scheduler.lock_table.install_parks('dead_owner', ['m1'], priority='low')
+        store.enqueue('dead_owner', scheduler._project_root)
+
+        scheduler.get_tasks = AsyncMock(return_value=[])
+
+        result = await scheduler.acquire_next()
+
+        assert result is None
+        assert not scheduler.lock_table.has_parks('dead_owner')
+        evicted = [e for e in event_store.events if 'reservation_force_evicted' in e[0]]
+        assert len(evicted) == 1
+        assert evicted[0][1]['task_id'] == 'dead_owner'
+        assert store.drain(scheduler._project_root) == []
+        # No deferred event on a genuine-empty (non-failure) tick.
+        deferred = [
+            e for e in event_store.events
+            if 'park_eviction_deferred_fm_unavailable' in e[0]
+        ]
+        assert deferred == []
+        assert scheduler._fm_read_failure_streak == 0
+
+
+# ---- fm-read-storm loud escalation (task 2704 step-6) ----
+
+class TestFmReadFailureStormEscalation:
+    """A PERSISTENT fm-read-failure streak files a loud, deduped L1 escalation.
+
+    Mirrors TestSchedulerPauseEscalation (test_harness_park_stop.py) but for
+    the scheduler-filed fm-read-storm escalation: fires once the
+    consecutive-failure streak crosses _FM_READ_FAILURE_ESCALATION_THRESHOLD,
+    deduped via has_open_l1 (one open escalation per outage episode), and
+    re-fires after a human resolves it while fm is still down.
+    """
+
+    def _make_scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
+
+    @pytest.mark.asyncio
+    async def test_escalation_files_at_threshold(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.scheduler import (
+            _FM_READ_FAILURE_ESCALATION_THRESHOLD as THRESH,
+        )
+
+        scheduler = self._make_scheduler()
+        scheduler.escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        scheduler.get_tasks = AsyncMock(return_value=None)
+
+        for _ in range(THRESH):
+            await scheduler.acquire_next()
+
+        sentinel = [
+            e for e in scheduler.escalation_queue.get_pending()
+            if e.task_id == '__fm_read_storm__'
+        ]
+        assert len(sentinel) == 1, f'Expected exactly one storm escalation; got {sentinel!r}'
+        esc = sentinel[0]
+        assert esc.agent_role == 'orchestrator-scheduler', f'got {esc.agent_role!r}'
+        assert esc.category == 'infra_issue', f'got {esc.category!r}'
+        assert esc.level == 1, f'expected L1; got level={esc.level}'
+        assert esc.severity == 'blocking', f'got {esc.severity!r}'
+        assert esc.summary, 'summary must be non-empty'
+        assert 'fused-memory' in esc.summary.lower(), (
+            f'summary should name fused-memory; got {esc.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_escalation_below_threshold(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.scheduler import (
+            _FM_READ_FAILURE_ESCALATION_THRESHOLD as THRESH,
+        )
+
+        scheduler = self._make_scheduler()
+        scheduler.escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        scheduler.get_tasks = AsyncMock(return_value=None)
+
+        for _ in range(THRESH - 1):
+            await scheduler.acquire_next()
+
+        assert scheduler.escalation_queue.get_pending() == [], (
+            'No escalation should fire before the streak crosses the threshold'
+        )
+
+    @pytest.mark.asyncio
+    async def test_escalation_deduped_across_further_failures(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.scheduler import (
+            _FM_READ_FAILURE_ESCALATION_THRESHOLD as THRESH,
+        )
+
+        scheduler = self._make_scheduler()
+        scheduler.escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        scheduler.get_tasks = AsyncMock(return_value=None)
+
+        for _ in range(THRESH):
+            await scheduler.acquire_next()
+        for _ in range(5):
+            await scheduler.acquire_next()
+
+        sentinel = [
+            e for e in scheduler.escalation_queue.get_pending()
+            if e.task_id == '__fm_read_storm__'
+        ]
+        assert len(sentinel) == 1, f'has_open_l1 must dedup repeat failures; got {sentinel!r}'
+
+    @pytest.mark.asyncio
+    async def test_reescalates_after_resolve_while_still_down(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.scheduler import (
+            _FM_READ_FAILURE_ESCALATION_THRESHOLD as THRESH,
+        )
+
+        scheduler = self._make_scheduler()
+        queue = EscalationQueue(tmp_path / 'escalations')
+        scheduler.escalation_queue = queue
+        scheduler.get_tasks = AsyncMock(return_value=None)
+
+        for _ in range(THRESH):
+            await scheduler.acquire_next()
+        first = [e for e in queue.get_pending() if e.task_id == '__fm_read_storm__']
+        assert len(first) == 1
+        queue.resolve(first[0].id, 'fixed')
+
+        await scheduler.acquire_next()
+
+        second = [e for e in queue.get_pending() if e.task_id == '__fm_read_storm__']
+        assert len(second) == 1, f'Expected a fresh escalation after resolve; got {second!r}'
+        assert second[0].id != first[0].id, (
+            'Re-escalation after resolve must be a NEW escalation, not the resolved one'
+        )
+
+    @pytest.mark.asyncio
+    async def test_bare_scheduler_no_queue_is_noop(self):
+        from orchestrator.scheduler import (
+            _FM_READ_FAILURE_ESCALATION_THRESHOLD as THRESH,
+        )
+
+        scheduler = self._make_scheduler()
+        assert scheduler.escalation_queue is None
+        scheduler.get_tasks = AsyncMock(return_value=None)
+
+        for _ in range(THRESH):
+            await scheduler.acquire_next()  # must not raise
 
 
 # ---- Buried-owner restored-event at drain level (task 1871 amend-4) ----
