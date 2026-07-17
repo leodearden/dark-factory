@@ -2161,7 +2161,6 @@ class TestRedriveCoalesceMembersStaleEvidence:
         the generic except-Exception log path is not taken for m1.
         """
         from _workflow_helpers import FakeScheduler
-
         from escalation.queue import EscalationQueue
 
         from orchestrator.harness import build_train_callback_factory

@@ -5796,6 +5796,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         mcp: Any = None,
         usage_gate: Any = None,
         cost_store: Any = None,
+        provenance_conflict_sink: Any = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
@@ -5845,6 +5846,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # PRD §10 invariant 6(b): born-at-L2 shadow compare escalation queue.
         # None-safe so bare-worker/bare-harness tests stay green without wiring.
         self._escalation_queue: Any = escalation_queue
+        # Shared done_evidence_stale sink (task 2677): injected BY REFERENCE
+        # from the harness's single ProvenanceConflictSink instance so a
+        # coalesce re-drive's rejection folds into the same memo + dedupe
+        # fingerprint namespace as the dispatch gate / stranded sweep /
+        # landed-outbox reconcile sites. None-safe (mirrors
+        # _escalation_queue above) so bare-worker tests without a sink stay
+        # green — see _redrive_coalesce_members' None-guard.
+        self._provenance_conflict_sink: Any = provenance_conflict_sink
         # Opaque factory for building per-train GroupMergeRequest callbacks.
         # Built by harness.build_train_callback_factory(self.scheduler) and
         # injected here so task γ can construct GroupMergeRequests without the
@@ -9152,6 +9161,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Per-member try/except ensures one member failure never aborts the rest or
         kills the merger loop.  req.redrive_member=None is a back-compat no-op.
+
+        A ``StaleEvidenceRejection`` (task 2677) — the found_on_main
+        provenance-integrity gate refusing this member's done-write because
+        its evidence predates the task's most recent ``reopen_at`` — is
+        routed to ``self._provenance_conflict_sink`` (a dedupe-guarded,
+        born-at-L2 escalation) instead of falling into the generic
+        log-and-continue branch below, which would otherwise silently
+        swallow the rejection and re-attempt it on the next derail. Either
+        way the member is left un-flipped and the remaining members are
+        still processed.
         """
         if req.redrive_member is None:
             logger.warning(
@@ -9203,6 +9222,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         'flipped to pending for solo-merge re-dispatch',
                         req.train_id, mid,
                     )
+            except StaleEvidenceRejection as exc:
+                if self._provenance_conflict_sink is not None:
+                    self._provenance_conflict_sink.record_from_rejection(
+                        exc, gate_source='coalesce-redrive',
+                    )
+                logger.warning(
+                    'Coalesce train %s: member %s hit done_evidence_stale — '
+                    'evidence %s (%s) predates reopen_at %s; filed '
+                    'provenance_conflict escalation instead of re-driving',
+                    req.train_id, mid, exc.evidence_commit,
+                    exc.evidence_committed_at, exc.reopen_at,
+                )
             except Exception:
                 logger.exception(
                     'Coalesce train %s: re-drive failed for member %s — '

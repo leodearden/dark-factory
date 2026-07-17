@@ -6794,6 +6794,7 @@ Output JSON matching the schema. Every task must appear in the output.
             mcp=self.mcp,
             usage_gate=getattr(self, 'usage_gate', None),
             cost_store=getattr(self, 'cost_store', None),
+            provenance_conflict_sink=self._provenance_conflict_sink,
         )
         self._merge_worker_task = asyncio.create_task(
             self._merge_worker.run(), name='merge-worker',
