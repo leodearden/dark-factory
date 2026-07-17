@@ -2328,32 +2328,6 @@ class TestGetEntity:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_edges_include_temporal(self, service):
-        """Edge dicts in get_entity result include a 'temporal' key with ISO 8601 strings."""
-        from _fm_helpers import MockEdge
-
-        dt_valid = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
-        dt_invalid = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
-        mock_edge = MockEdge(
-            fact='Service A calls Service B',
-            uuid='edge-temporal-1',
-            valid_at=dt_valid,
-            invalid_at=dt_invalid,
-        )
-        service.graphiti.search_nodes = AsyncMock(return_value=[])
-        service.graphiti.search = AsyncMock(return_value=[mock_edge])
-
-        result = await service.get_entity('Service A', project_id='test')
-
-        assert len(result['edges']) == 1
-        edge = result['edges'][0]
-        assert 'temporal' in edge
-        temporal = edge['temporal']
-        assert temporal is not None
-        assert temporal['valid_at'] == '2024-03-01T10:00:00+00:00'
-        assert temporal['invalid_at'] == '2024-09-01T10:00:00+00:00'
-
-    @pytest.mark.asyncio
     async def test_edges_only_valid_at_has_null_invalid_at(self, service):
         """When edge has only valid_at, temporal['invalid_at'] is None (not 'None')."""
         from _fm_helpers import MockEdge
@@ -2375,6 +2349,44 @@ class TestGetEntity:
         assert edge['temporal'] is not None
         assert edge['temporal']['valid_at'] == '2024-03-01T10:00:00+00:00'
         assert edge['temporal']['invalid_at'] is None
+
+    # ------------------------------------------------------------------
+    # fuzzy branch drops invalidated edges (task 2726)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_branch_drops_invalidated_edges(self, service):
+        """FUZZY branch must drop invalidated edges, matching the EXACT branch.
+
+        The EXACT/topological branch excludes invalid_at-set edges at the Cypher
+        level (get_valid_edges_for_node: WHERE e.invalid_at IS NULL), and search()
+        already drops them too (task 312). Before this fix, the FUZZY/semantic
+        branch (graphiti.search) had no such filter, so a superseded edge could
+        leak through get_entity's fuzzy fallback and be silently acted on
+        (task 2726).
+        """
+        from _fm_helpers import MockEdge, MockNode
+
+        service.graphiti.search_nodes = AsyncMock(
+            return_value=[MockNode(name='Svc', uuid='n1')]
+        )
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Svc valid fact', uuid='e-valid', invalid_at=None),
+            MockEdge(
+                fact='Svc superseded fact',
+                uuid='e-invalid',
+                invalid_at=datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC),
+            ),
+        ])
+
+        result = await service.get_entity('Svc', project_id='test')
+
+        assert len(result['edges']) == 1
+        assert result['edges'][0]['uuid'] == 'e-valid'
+        assert 'e-invalid' not in {e['uuid'] for e in result['edges']}, (
+            'FUZZY branch must drop invalidated edges to match the EXACT/topological '
+            'branch (task 2726)'
+        )
 
     # ------------------------------------------------------------------
     # exact-first lookup (task-1975): get_nodes_by_exact_name precedes fuzzy search_nodes
