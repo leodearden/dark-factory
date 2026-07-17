@@ -27,7 +27,7 @@ import yaml
 from orchestrator.config import OrchestratorConfig
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
-DF_CONFIG_PATH = REPO_ROOT / "orchestrator" / "config.yaml"
+DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
 
 
 def _load_df_config() -> dict:

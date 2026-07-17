@@ -80,7 +80,7 @@ for pair in \
             if [[ "$task" == reify_* ]]; then
                 ORCH_CONFIG="/home/leo/src/reify/orchestrator.yaml"
             else
-                ORCH_CONFIG="/home/leo/src/dark-factory/orchestrator/config.yaml"
+                ORCH_CONFIG="/home/leo/src/dark-factory/dark-factory-orchestrator.yaml"
             fi
             echo "[$(date +%H:%M:%S)] START $cfg × $task (config=$ORCH_CONFIG)"
             cd /home/leo/src/dark-factory

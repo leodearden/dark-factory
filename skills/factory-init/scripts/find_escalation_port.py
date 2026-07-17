@@ -31,7 +31,10 @@ RESERVED = {
 }
 
 # Candidate config filenames, in the order projects have historically used them.
+# The canonical name is tried first so a migrated project's real config wins
+# over any legacy symlink/spelling still present alongside it.
 CONFIG_NAMES = (
+    "dark-factory-orchestrator.yaml",
     "orchestrator.yaml",
     "orchestrator-config.yaml",
     "config.yaml",

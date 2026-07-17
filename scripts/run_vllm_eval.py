@@ -284,7 +284,7 @@ def orchestrator_config_for_spec(spec: dict) -> Path | None:
     The eval CLI requires ``--config`` (or ``ORCH_CONFIG_PATH``) so it
     knows which project's ``project_root`` and ``fused_memory.project_id``
     to use. Different task families target different projects:
-        df_task_*    → /home/leo/src/dark-factory/orchestrator/config.yaml
+        df_task_*    → /home/leo/src/dark-factory/dark-factory-orchestrator.yaml
         reify_task_* → /home/leo/src/reify/orchestrator.yaml
 
     Resolves by checking known config-file names under ``spec['project_root']``.
