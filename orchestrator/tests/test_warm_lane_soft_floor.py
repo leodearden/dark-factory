@@ -352,6 +352,31 @@ class TestRunWarmLaneSoftGuard:
         assert rc == 127
         assert _read_call_log(git_repo) == []
 
+    async def test_unexpected_rc_logs_warning(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Amendment (reviewer_comprehensive test-coverage, git_ops.py:3055):
+        an exit code outside {0, 3, 75} both propagates as the return value
+        AND is logged as a WARNING — this script-contract-violation branch
+        was previously untested (mirrors the defer WARNING test's caplog
+        pattern)."""
+        await _add_disk_guard_scripts(git_repo)
+        _write_check_exits(git_repo, [2])
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            rc = await git_ops._run_warm_lane_soft_guard()
+
+        assert rc == 2
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            '_run_warm_lane_soft_guard' in t and '2' in t for t in warning_texts
+        ), (
+            'Expected an unexpected-rc WARNING from _run_warm_lane_soft_guard; '
+            f'got: {warning_texts}'
+        )
+
 
 @pytest.mark.asyncio
 class TestWarmLaneSoftPressureDefer:
@@ -367,11 +392,17 @@ class TestWarmLaneSoftPressureDefer:
 
         assert result is True, 'rc=3 (soft pressure) must defer (True)'
 
-    @pytest.mark.parametrize('stub_rc', [0, 75, 127, 2, 9])
+    @pytest.mark.parametrize('stub_rc', [0, 127, 2, 9])
     async def test_non_soft_pressure_rc_returns_false(
         self, git_repo: Path, stub_rc: int,
     ):
-        """Fail-open: healthy(0)/hard(75)/absent(127)/usage(2)/unknown(9) never defer."""
+        """Fail-open: healthy(0)/absent(127)/usage(2)/unknown(9) never defer.
+
+        rc=75 is deliberately excluded here — see
+        TestWarmLaneSoftPressureDeferHardRc75Gap below (amendment,
+        reviewer_comprehensive robustness): its fail-open-vs-defer behavior
+        now depends on warm_lane_disk_guard.
+        """
         await _add_disk_guard_scripts(git_repo)
         _write_check_exits(git_repo, [stub_rc])
         config = _make_soft_floor_config()
@@ -408,6 +439,76 @@ class TestWarmLaneSoftPressureDefer:
             'mybranch' in t and 'soft' in t.lower() and 'deferring' in t.lower()
             for t in warning_texts
         ), f'Expected a soft-floor defer WARNING naming the branch; got: {warning_texts}'
+
+
+@pytest.mark.asyncio
+class TestWarmLaneSoftPressureDeferHardRc75Gap:
+    """Amendment (reviewer_comprehensive robustness, git_ops.py:3894): closes
+    a protection gap for the soft-only configuration
+    (warm_lane_soft_floor=True, warm_lane_disk_guard=False). The soft-guard
+    script is invoked with BOTH the hard and soft thresholds, so if free
+    space/inodes are actually below the HARD floor it still returns rc=75
+    (hard pressure takes precedence over soft per the reify contract) even
+    though only the soft check ran. Previously `_warm_lane_soft_pressure_defer`
+    treated rc=75 as fail-open unconditionally, so with ε disabled NOTHING
+    deferred a fresh allocation below the hard floor — exactly the
+    ENOSPC/SIGBUS condition ε exists to prevent. Now rc=75 defers too, but
+    ONLY when warm_lane_disk_guard is disabled; when it's enabled, ε already
+    short-circuits before this method ever runs on a genuine rc=75, so this
+    method still fails open there (ε remains the sole owner of that outcome).
+    """
+
+    async def test_rc75_defers_when_disk_guard_disabled(self, git_repo: Path):
+        """Gap-closing case: soft floor alone, disk critically low (rc=75)
+        ⇒ still defers (backpressure), rather than silently allocating."""
+        await _add_disk_guard_scripts(git_repo)
+        _write_check_exits(git_repo, [75])
+        config = _make_soft_floor_config(warm_lane_disk_guard=False)
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        result = await git_ops._warm_lane_soft_pressure_defer('A')
+
+        assert result is True, (
+            'rc=75 with warm_lane_disk_guard disabled must defer — nothing '
+            'else backpressures a fresh allocation below the hard floor'
+        )
+
+    async def test_rc75_fails_open_when_disk_guard_enabled(self, git_repo: Path):
+        """When ε is independently enabled, ε remains the sole owner of
+        rc=75 — this method still fails open (byte-identical to before)."""
+        await _add_disk_guard_scripts(git_repo)
+        _write_check_exits(git_repo, [75])
+        config = _make_soft_floor_config(warm_lane_disk_guard=True)
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        result = await git_ops._warm_lane_soft_pressure_defer('A')
+
+        assert result is False, (
+            'rc=75 with warm_lane_disk_guard enabled must fail-open here — '
+            'ε (_warm_lane_disk_admission_blocked) owns that outcome and '
+            'short-circuits before this method is reached in practice'
+        )
+
+    async def test_rc75_defer_emits_warning_naming_disabled_guard(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """The gap-closing defer's WARNING is distinguishable from the
+        ordinary soft-pressure (rc=3) one — it should surface that the hard
+        floor, not the soft floor, was actually breached."""
+        await _add_disk_guard_scripts(git_repo)
+        _write_check_exits(git_repo, [75])
+        config = _make_soft_floor_config(warm_lane_disk_guard=False)
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops._warm_lane_soft_pressure_defer('gapbranch')
+
+        assert result is True
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'gapbranch' in t and 'deferring' in t.lower() and 'hard' in t.lower()
+            for t in warning_texts
+        ), f'Expected a hard-pressure gap-closing defer WARNING; got: {warning_texts}'
 
 
 @pytest.mark.asyncio
