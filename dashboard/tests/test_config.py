@@ -67,3 +67,39 @@ class TestCanonicalConfigPreferred:
         assert len(records) == 1
         assert records[0].levelno == logging.WARNING
         assert 'myproj' in records[0].getMessage()
+
+
+class TestNoUrlWarnsNamingRoot:
+    """Scope 2: a root that yields no escalation URL at all warns, naming the root."""
+
+    def test_no_config_at_all_warns_naming_root(self, tmp_path, caplog):
+        """A root with no config file of any spelling yields no entry, and warns."""
+        root = tmp_path / 'myproj'
+        root.mkdir()
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _discover_escalation_urls([root])
+
+        assert result == {}
+        records = [r for r in caplog.records if r.name == _LOGGER_NAME]
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert str(root) in records[0].getMessage()
+
+    def test_canonical_without_port_warns_naming_root(self, tmp_path, caplog):
+        """Canonical config present but missing escalation.port still yields no entry.
+
+        This isolates the no-URL warning from the legacy-fallback warning —
+        no legacy file exists here, so exactly one (the no-URL) warning fires.
+        """
+        root = tmp_path / 'myproj'
+        _write_yaml(root / 'dark-factory-orchestrator.yaml', {'escalation': {'host': '127.0.0.1'}})
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _discover_escalation_urls([root])
+
+        assert result == {}
+        records = [r for r in caplog.records if r.name == _LOGGER_NAME]
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert str(root) in records[0].getMessage()
