@@ -13,6 +13,7 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
@@ -164,6 +165,59 @@ def _make_soft_floor_config(**overrides: Any) -> GitConfig:
         warm_lane_soft_free_inodes=5_000_000,
         **overrides,
     )
+
+
+def _write_audit_stub(scripts_dir: Path) -> None:
+    """Write a warm-lane-audit.sh stub into scripts_dir.
+
+    Appends "audit <argv>" to <repo>/.test_audit_call_log, then cats
+    <repo>/.test_audit_output to stdout (if present) and exits with the
+    code in <repo>/.test_audit_exit (0 if absent). Mirrors
+    _write_disk_guard_stubs's call-log + external-fixture-file shape, one
+    script over (α, not ε/θ) — the fixture files (rather than embedding
+    output in the script text) sidestep bash string-escaping for
+    multi-line stdout.
+    """
+    audit = scripts_dir / 'warm-lane-audit.sh'
+    audit.write_text(
+        '#!/usr/bin/env bash\n'
+        'set -euo pipefail\n'
+        'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+        'ROOT="$(dirname "$DIR")"\n'
+        'echo "audit $*" >> "$ROOT/.test_audit_call_log"\n'
+        'if [ -f "$ROOT/.test_audit_output" ]; then\n'
+        '    cat "$ROOT/.test_audit_output"\n'
+        'fi\n'
+        'rc=0\n'
+        'if [ -f "$ROOT/.test_audit_exit" ]; then\n'
+        '    rc="$(cat "$ROOT/.test_audit_exit")"\n'
+        'fi\n'
+        'exit "${rc:-0}"\n'
+    )
+    audit.chmod(0o755)
+
+
+async def _add_audit_stub_script(repo: Path) -> None:
+    """Commit a stub warm-lane-audit.sh into repo/scripts/."""
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    _write_audit_stub(scripts_dir)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add audit stub script'], cwd=repo)
+
+
+def _set_audit_output(repo: Path, output: str, exit_code: int = 0) -> None:
+    """Configure the audit stub's stdout + exit code for its next invocation(s)."""
+    (repo / '.test_audit_output').write_text(output)
+    (repo / '.test_audit_exit').write_text(str(exit_code))
+
+
+def _read_audit_call_log(repo: Path) -> list[str]:
+    """Return all non-empty lines from <repo>/.test_audit_call_log."""
+    log = repo / '.test_audit_call_log'
+    if not log.exists():
+        return []
+    return [line for line in log.read_text().splitlines() if line.strip()]
 
 
 class TestWarmLaneSoftFloorConfig:
@@ -528,3 +582,105 @@ class TestWarmLaneSoftPressureException:
 
         with pytest.raises(WarmLaneSoftPressure):
             await git_ops.create_worktree('A')
+
+
+@pytest.mark.asyncio
+class TestRunWarmLaneAudit:
+    """Unit tests for GitOps._run_warm_lane_audit() (step-11, α observability).
+
+    α (task 2443, §9.5 inv.12) is OBSERVABILITY-ONLY: this wrapper's sole
+    purpose is to surface the audit's trailing HEADROOM summary line so the
+    θ defer journal line (step-14) can be enriched with pool context — it
+    never gates an admission decision. Mirrors the
+    _run_warm_lane_disk_guard/_run_warm_lane_soft_guard fail-soft shape
+    (absent script/non-zero exit/exception -> None sentinel; never raises).
+    """
+
+    async def test_returns_headroom_line(self, git_repo: Path):
+        await _add_audit_stub_script(git_repo)
+        headroom = (
+            'HEADROOM resident=1 assigned=0 free=1 reclaimable=0 leaked=0 '
+            'leak_unknown=0 divergent_gib=2 free_gib=500 budget_gib=333'
+        )
+        _set_audit_output(
+            git_repo,
+            'lane=_lane-0 role=lane assigned=FREE branch=(detached) '
+            'status=unknown recoverable=ORPHAN dirty=clean divergent_gib=2 '
+            'age_min=5 classification=PRESERVED-OK\n' + headroom + '\n',
+        )
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        result = await git_ops._run_warm_lane_audit()
+
+        assert result == headroom
+
+    async def test_absent_script_returns_none(self, git_repo: Path):
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        result = await git_ops._run_warm_lane_audit()
+
+        assert result is None
+
+    async def test_nonzero_exit_returns_none(self, git_repo: Path):
+        """A non-zero exit degrades to None even with HEADROOM-shaped stdout."""
+        await _add_audit_stub_script(git_repo)
+        _set_audit_output(
+            git_repo,
+            'HEADROOM resident=0 assigned=0 free=0 reclaimable=0 leaked=0 '
+            'leak_unknown=0 divergent_gib=0 free_gib=0 budget_gib=0\n',
+            exit_code=2,
+        )
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        result = await git_ops._run_warm_lane_audit()
+
+        assert result is None
+
+    async def test_no_headroom_line_returns_none(self, git_repo: Path):
+        await _add_audit_stub_script(git_repo)
+        _set_audit_output(git_repo, 'lane=_lane-0 role=lane assigned=FREE\n')
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        result = await git_ops._run_warm_lane_audit()
+
+        assert result is None
+
+    async def test_unexpected_exception_returns_none(self, git_repo: Path):
+        """Never raises: mirrors _run_warm_lane_disk_guard's except-Exception
+        fail-soft branch (test_git_ops.py's warm_lane_ref_is_degenerate
+        precedent uses the same patch('orchestrator.git_ops._run', ...) shape)."""
+        await _add_audit_stub_script(git_repo)
+        _set_audit_output(git_repo, 'HEADROOM resident=0\n')
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        with patch('orchestrator.git_ops._run', side_effect=RuntimeError('boom')):
+            result = await git_ops._run_warm_lane_audit()
+
+        assert result is None
+
+    async def test_read_only_invocation_no_reset_or_reclaim_subcommand(
+        self, git_repo: Path,
+    ):
+        """Read-only contract (α/inv.12): the wrapper invokes the audit with
+        no reset/reclaim subcommand or flag --- only --mount."""
+        await _add_audit_stub_script(git_repo)
+        _set_audit_output(git_repo, 'HEADROOM resident=0\n')
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        await git_ops._run_warm_lane_audit()
+
+        call_log = _read_audit_call_log(git_repo)
+        assert len(call_log) == 1, f'Expected exactly one audit invocation; got {call_log}'
+        line = call_log[0]
+        assert 'reset' not in line and 'reclaim' not in line, (
+            f'Audit invocation must be read-only (no reset/reclaim); got: {line!r}'
+        )
+        parts = line.split()
+        assert '--mount' in parts
+        assert parts[parts.index('--mount') + 1] == str(git_ops.worktree_base)
