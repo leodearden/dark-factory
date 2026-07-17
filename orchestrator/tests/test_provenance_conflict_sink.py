@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 from escalation.queue import EscalationQueue
 
 
@@ -113,6 +112,7 @@ class TestProvenanceConflictSinkShouldSkip:
         sink = ProvenanceConflictSink(escalation_queue=queue)
 
         escalation_id = _record(sink)
+        assert escalation_id is not None
         queue.resolve(escalation_id, 'operator resolved the provenance conflict')
 
         assert sink.should_skip('42') is False
@@ -154,6 +154,7 @@ class TestProvenanceConflictSinkRecordFromRejection:
         )
 
         escalation_id = sink.record_from_rejection(exc, gate_source='dispatch-gate')
+        assert escalation_id is not None
 
         esc = queue.get(escalation_id)
         assert esc is not None

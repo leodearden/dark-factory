@@ -776,7 +776,7 @@ class TestAlreadyLandedDispatchGateStaleEvidenceConflict:
         result_1 = await h._already_landed_dispatch_gate('42')
 
         assert result_1 is True, 'a contested task must not dispatch'
-        assert h.scheduler.mark_done.await_count == 1
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 1
         conflicts = [
             e for e in h._escalation_queue.get_by_task('42', status='pending')
             if e.category == 'provenance_conflict'
@@ -788,7 +788,7 @@ class TestAlreadyLandedDispatchGateStaleEvidenceConflict:
         result_2 = await h._already_landed_dispatch_gate('42')
 
         assert result_2 is True, 'must stay gated on a repeat tick'
-        assert h.scheduler.mark_done.await_count == 1, (
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 1, (
             'a repeat tick at the same reopen_at must not re-attempt the '
             'already-rejected write'
         )
@@ -821,7 +821,7 @@ class TestAlreadyLandedDispatchGateStaleEvidenceConflict:
         result_1 = await h._already_landed_dispatch_gate('42')
 
         assert result_1 is True, 'a contested task must not dispatch'
-        assert h.scheduler.mark_done.await_count == 1
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 1
         conflicts = [
             e for e in h._escalation_queue.get_by_task('42', status='pending')
             if e.category == 'provenance_conflict'
@@ -831,7 +831,7 @@ class TestAlreadyLandedDispatchGateStaleEvidenceConflict:
         result_2 = await h._already_landed_dispatch_gate('42')
 
         assert result_2 is True, 'must stay gated on a repeat tick'
-        assert h.scheduler.mark_done.await_count == 1, (
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 1, (
             'a repeat tick at the same reopen_at must not re-attempt the '
             'already-rejected write'
         )

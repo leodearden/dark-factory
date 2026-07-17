@@ -465,8 +465,10 @@ class TestReconcileLandedRowStaleEvidenceConflict:
         queue = EscalationQueue(tmp_path / 'esc')
         sink = ProvenanceConflictSink(escalation_queue=queue)
 
+        row = outbox.lookup('Z')
+        assert row is not None
         disposition = await reconcile_landed_row(
-            outbox.lookup('Z'), git_ops=git_ops_recon, scheduler=scheduler,
+            row, git_ops=git_ops_recon, scheduler=scheduler,
             outbox=outbox, main_sha='MAIN', provenance_conflict_sink=sink,
         )
 
@@ -564,9 +566,11 @@ class TestReconcileLandedRowStaleEvidenceBareBackCompat:
         scheduler = _fake_scheduler(get_status_result='in-progress')
         scheduler.mark_done = AsyncMock(side_effect=_stale_evidence_mark_done(evidence_commit='ADV'))
 
+        row = outbox.lookup('Z')
+        assert row is not None
         with pytest.raises(StaleEvidenceRejection):
             await reconcile_landed_row(
-                outbox.lookup('Z'), git_ops=git_ops_recon, scheduler=scheduler,
+                row, git_ops=git_ops_recon, scheduler=scheduler,
                 outbox=outbox, main_sha='MAIN', provenance_conflict_sink=None,
             )
 

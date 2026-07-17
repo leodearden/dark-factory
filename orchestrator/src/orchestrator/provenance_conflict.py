@@ -102,7 +102,7 @@ class ProvenanceConflictSink:
     in-process only and returns ``None`` instead of raising.
     """
 
-    def __init__(self, escalation_queue: 'EscalationQueue | None' = None) -> None:
+    def __init__(self, escalation_queue: EscalationQueue | None = None) -> None:
         self.escalation_queue = escalation_queue
         # task_id -> (reopen_at, evidence_commit, escalation_id | None)
         self._memo: dict[str, tuple[str, str, str | None]] = {}
@@ -156,7 +156,7 @@ class ProvenanceConflictSink:
         return escalation_id
 
     def record_from_rejection(
-        self, exc: 'StaleEvidenceRejection', *, gate_source: str,
+        self, exc: StaleEvidenceRejection, *, gate_source: str,
     ) -> str | None:
         """Adapt a caught ``StaleEvidenceRejection`` into ``record(...)``."""
         return self.record(
