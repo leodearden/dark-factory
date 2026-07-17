@@ -4986,6 +4986,93 @@ async def test_recover_stale_runs_restore_is_run_scoped_not_project_wide(
     )
 
 
+@pytest.mark.asyncio
+async def test_recover_stale_runs_restores_pre_upgrade_unattributed_drained_events(
+    journal, event_buffer, mock_memory_service,
+):
+    """Amendment regression (task 2711 review finding #1): events drained by
+    a pre-task-2711 process carry NULL drained_by_run_id, since only current
+    code stamps run attribution on drain. A purely exact-match run-scoped
+    restore would leave such rows stuck 'drained' forever the moment the
+    reaper switched to run-scoped restore. Recovering orphan X must also
+    sweep these NULL-attributed leftovers in X's project — while a
+    concurrent live run Y's (attributed) drained events must still survive.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    project_id = 'test-project'
+    cutoff = harness.config.stale_run_recovery_seconds
+
+    # Orphan run X — stale, owned by a dead instance.
+    run_x = ReconciliationRun(
+        id='run-orphan-X2',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id='dead-instance-X2',
+    )
+    await journal.start_run(run_x)
+    x_events = [_make_event(project_id), _make_event(project_id)]
+    for e in x_events:
+        await event_buffer.push(e)
+    await event_buffer.drain(project_id, run_id=run_x.id)
+
+    # Pre-task-2711 leftovers: drained with no run_id, simulating the old
+    # code that never stamped drained_by_run_id.
+    legacy_events = [_make_event(project_id), _make_event(project_id)]
+    for e in legacy_events:
+        await event_buffer.push(e)
+    await event_buffer.drain(project_id)
+
+    # Concurrent run Y — still running, owned by the live instance; its
+    # (attributed) drained events must survive X's recovery.
+    run_y = ReconciliationRun(
+        id='run-concurrent-Y2',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(run_y)
+    y_events = [_make_event(project_id), _make_event(project_id)]
+    for e in y_events:
+        await event_buffer.push(e)
+    await event_buffer.drain(project_id, run_id=run_y.id)
+
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+
+    await harness._recover_stale_runs()
+
+    db = event_buffer._require_db()
+
+    async def _statuses(events) -> list[str]:
+        ids = [e.id for e in events]
+        async with db.execute(
+            "SELECT status FROM event_buffer WHERE id IN ({})".format(
+                ','.join('?' for _ in ids)
+            ),
+            ids,
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [row['status'] for row in rows]
+
+    assert all(s == 'buffered' for s in await _statuses(x_events)), (
+        "X's drained events must be restored to 'buffered' by the reaper"
+    )
+    assert all(s == 'buffered' for s in await _statuses(legacy_events)), (
+        'pre-upgrade NULL-attributed drained events in the same project must '
+        'also be restored, not left stuck drained forever'
+    )
+    assert all(s == 'drained' for s in await _statuses(y_events)), (
+        "Y's attributed drained events must remain 'drained' — Y is a "
+        'concurrent live run and must not be clobbered by X\'s recovery'
+    )
+
+
 # ── Predecessor recovery at startup (task 2711 / E6) ──────────────────────────
 
 

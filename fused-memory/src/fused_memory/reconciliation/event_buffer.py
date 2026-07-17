@@ -617,7 +617,13 @@ class EventBuffer:
             rowcount = cursor.rowcount
         return rowcount
 
-    async def restore_drained(self, project_id: str, run_id: str | None = None) -> int:
+    async def restore_drained(
+        self,
+        project_id: str,
+        run_id: str | None = None,
+        *,
+        include_unattributed: bool = False,
+    ) -> int:
         """Restore drained events to 'buffered' after a failed run.
 
         When ``run_id`` is provided, only rows stamped with
@@ -626,6 +632,20 @@ class EventBuffer:
         reaper recovers a *different* orphaned run on the same project (task
         2711 / E7). When omitted (the default), behaviour is unchanged: every
         drained row for the project is restored, project-wide.
+
+        ``include_unattributed`` additionally restores rows with
+        ``drained_by_run_id IS NULL`` when ``run_id`` is set (ignored
+        otherwise — the project-wide path already covers them). This closes
+        the upgrade-boundary gap where events drained by a pre-task-2711
+        process carry no run attribution: since every current code path now
+        always stamps ``drained_by_run_id`` on drain, a NULL row can only be
+        left over from a process that no longer exists by the time a recovery
+        pass runs, so it is provably safe to fold into a *specific* run's
+        recovery without reintroducing the concurrent-run clobber the run
+        scoping was added to prevent (task 2711 amendment, reviewer finding).
+        Callers that need the exact-match-only contract (e.g. one caller's
+        ``mark_drained_run_id`` attribution racing another's) must keep the
+        default ``False``.
         """
         if run_id is None:
             async with self._txn() as db:
@@ -633,6 +653,15 @@ class EventBuffer:
                     "UPDATE event_buffer SET status = 'buffered' "
                     "WHERE project_id = ? AND status = 'drained'",
                     (project_id,),
+                )
+                count = cursor.rowcount
+        elif include_unattributed:
+            async with self._txn() as db:
+                cursor = await db.execute(
+                    "UPDATE event_buffer SET status = 'buffered' "
+                    "WHERE project_id = ? AND status = 'drained' "
+                    "AND (drained_by_run_id = ? OR drained_by_run_id IS NULL)",
+                    (project_id, run_id),
                 )
                 count = cursor.rowcount
         else:

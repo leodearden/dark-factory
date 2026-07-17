@@ -1204,9 +1204,10 @@ class ReconciliationHarness:
         logging/escalation policy on top of this shared body.
 
         The restore is run-scoped (task 2711 / E7): only events this run
-        itself drained are restored, so a concurrent live run's in-flight
-        drained events on the same project are never clobbered back to
-        'buffered'.
+        itself drained (plus any pre-task-2711, unattributed leftovers — see
+        ``restore_drained``'s ``include_unattributed``) are restored, so a
+        concurrent live run's in-flight drained events on the same project
+        are never clobbered back to 'buffered'.
 
         ``disposition`` is the terminal journal status to complete the run
         with; it defaults to (and, as of task 2711, is always) 'failed'. This
@@ -1225,7 +1226,18 @@ class ReconciliationHarness:
         await self.journal.update_run_stage_reports(run.id, run.stage_reports)
         await self.journal.complete_run(run.id, disposition)
 
-        restored = await self.buffer.restore_drained(run.project_id, run_id=run.id)
+        # include_unattributed=True additionally sweeps drained_by_run_id IS
+        # NULL rows in this project: events drained by a pre-task-2711
+        # process (before drains stamped run attribution) would otherwise
+        # never match any run_id and stay stuck 'drained' forever once a
+        # recovery pass switched to run-scoped restore. Every current drain
+        # path stamps a run_id, so a NULL row here is provably a leftover
+        # from a process that no longer exists — safe to fold into this
+        # run's recovery without resurrecting a *concurrent* run's events
+        # (those always carry non-NULL attribution under current code).
+        restored = await self.buffer.restore_drained(
+            run.project_id, run_id=run.id, include_unattributed=True,
+        )
         if restored:
             logger.info(f'Restored {restored} drained events for run {run.id}')
 

@@ -1463,3 +1463,82 @@ async def test_restore_drained_without_run_id_restores_all_project_wide(buf):
     restored = await buf.restore_drained('test-project')
     assert restored == 5
     assert (await buf.get_buffer_stats('test-project'))['size'] == 5
+
+
+@pytest.mark.asyncio
+async def test_restore_drained_include_unattributed_sweeps_null_rows_for_recovered_run(buf):
+    """include_unattributed=True additionally restores drained_by_run_id IS
+    NULL rows (pre-task-2711 leftovers, drained before drains stamped run
+    attribution) when recovering a specific run — closing the upgrade-
+    boundary gap flagged in the task 2711 amendment review — while still
+    leaving a DIFFERENT, concurrent run's attributed drained rows alone."""
+    events_orphan = [_make_event() for _ in range(2)]
+    events_legacy_null = [_make_event() for _ in range(2)]
+    events_concurrent = [_make_event() for _ in range(3)]
+
+    # The orphan run's own drained events.
+    for e in events_orphan:
+        await buf.push(e)
+    await buf.drain('test-project', run_id='orphan-run')
+
+    # Pre-task-2711 leftovers: drained with NO run_id, so drained_by_run_id
+    # is NULL — simulates events drained by the old code before this
+    # upgrade, which an exact-match run-scoped restore alone would never
+    # restore.
+    for e in events_legacy_null:
+        await buf.push(e)
+    await buf.drain('test-project')
+
+    # A different, concurrent run's drained events must survive.
+    for e in events_concurrent:
+        await buf.push(e)
+    await buf.drain('test-project', run_id='concurrent-run')
+
+    restored = await buf.restore_drained(
+        'test-project', run_id='orphan-run', include_unattributed=True,
+    )
+    assert restored == 4  # orphan's 2 + the 2 unattributed legacy rows
+
+    async def _status(event_id: str) -> str:
+        async with buf._require_db().execute(
+            'SELECT status FROM event_buffer WHERE id = ?', (event_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row['status']
+
+    for e in events_orphan:
+        assert await _status(e.id) == 'buffered'
+    for e in events_legacy_null:
+        assert await _status(e.id) == 'buffered'
+    for e in events_concurrent:
+        assert await _status(e.id) == 'drained', (
+            "a concurrent run's attributed drained events must not be restored "
+            'by a different orphan run\'s include_unattributed recovery'
+        )
+
+
+@pytest.mark.asyncio
+async def test_restore_drained_default_excludes_unattributed_rows(buf):
+    """Without include_unattributed (the default), a run-scoped restore must
+    NOT touch NULL-attributed rows — locks in the exact-match contract relied
+    on by test_mark_drained_run_id_attributes_pre_drained_events_to_a_run."""
+    events_run = [_make_event()]
+    events_null = [_make_event()]
+    for e in events_run:
+        await buf.push(e)
+    await buf.drain('test-project', run_id='R1')
+    for e in events_null:
+        await buf.push(e)
+    await buf.drain('test-project')
+
+    restored = await buf.restore_drained('test-project', run_id='R1')
+    assert restored == 1
+
+    async with buf._require_db().execute(
+        'SELECT status FROM event_buffer WHERE id = ?', (events_null[0].id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row['status'] == 'drained', (
+        'a NULL-attributed row must stay drained when include_unattributed '
+        'is not set'
+    )
