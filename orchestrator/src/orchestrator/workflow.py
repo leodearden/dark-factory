@@ -8096,6 +8096,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         env from this layer — forwarding is opt-in per role, not a hardcoded
         allow-list. Because this layer is merged last, an explicit per-role
         entry wins over the global config.env_overrides on a key collision.
+        A collision with an INFRA-provided key (jobserver/cpu_priority/
+        cpu_governance/REIFY_DEBUG_PORT) also logs a WARNING naming the role
+        and key, since silently clobbering one of those can break the cargo
+        jobserver, cpu cgroup placement, or a PATH-based tool shim for that
+        role.
         """
         merged: dict[str, str] = {}
         if role.name in ('architect', 'implementer', 'debugger'):
@@ -8108,7 +8113,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             merged.update(
                 self.config.cpu_governance.agent_env(self.worktree, os.environ.get('PATH', ''))
             )
-        merged.update(self.config.role_env_overrides.get(role.name, {}))
+        role_overrides = self.config.role_env_overrides.get(role.name, {})
+        clobbered = sorted(set(role_overrides) & set(merged))
+        if clobbered:
+            logger.warning(
+                'role_env_overrides[%r] overrides infra-provided env key(s) %s '
+                '(jobserver/cpu-governance/REIFY_DEBUG_PORT/env_overrides) -- '
+                'the per-role value wins (merged last); this may break the '
+                'cargo jobserver, cpu cgroup placement, or PATH-based tool '
+                'shims for this role',
+                role.name,
+                clobbered,
+            )
+        merged.update(role_overrides)
         return merged or None
 
     def _build_spawn_env(self, role: AgentRole) -> dict[str, str]:
