@@ -1299,3 +1299,246 @@ async def test_mark_project_dead_letter_transitions_buffered_only(buf):
     # Assert: mark_project_dead_letter on a project with no buffered rows returns 0.
     n2 = await buf.mark_project_dead_letter('know-live')
     assert n2 == 0, f'Expected 0 for already-quarantined project, got {n2}'
+
+
+# ── Run-scoped drain/restore (task 2711 E7) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_event_buffer_has_drained_by_run_id_column_and_migration_is_idempotent(
+    tmp_path,
+):
+    """(a) event_buffer table has a drained_by_run_id column after initialize(),
+    and re-running _migrate on the same DB is idempotent (no error)."""
+    buf = EventBuffer(db_path=tmp_path / 'migrate.db')
+    await buf.initialize()
+    try:
+        db = buf._require_db()
+        async with db.execute('PRAGMA table_info(event_buffer)') as cursor:
+            columns = {row['name'] async for row in cursor}
+        assert 'drained_by_run_id' in columns, (
+            f'Expected drained_by_run_id column on event_buffer; got columns={columns!r}'
+        )
+
+        # Re-running _migrate on the same (already-migrated) DB must not raise —
+        # mirrors the idempotent ALTER-TABLE pattern already used for
+        # deferred_writes.claimed_at / attempt_count.
+        await buf._migrate()
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_restore_drained_scoped_to_run_id_does_not_clobber_other_runs(buf):
+    """(b) restore_drained(project, run_id=...) restores only that run's rows,
+    leaving a concurrent run's drained rows untouched."""
+    events_r1 = [_make_event() for _ in range(2)]
+    events_r2 = [_make_event() for _ in range(3)]
+    for e in events_r1:
+        await buf.push(e)
+
+    # Drain each subset attributed to a distinct run_id. drain() drains ALL
+    # buffered events for the project in one call, so drain r1's events first
+    # (only r1's events are buffered at that point), then push r2's events and
+    # drain those separately.
+    r1_ids = {e.id for e in events_r1}
+    drained_r1 = await buf.drain('test-project', run_id='R1')
+    assert {e.id for e in drained_r1} == r1_ids
+
+    for e in events_r2:
+        await buf.push(e)
+    r2_ids = {e.id for e in events_r2}
+    drained_r2 = await buf.drain('test-project', run_id='R2')
+    assert {e.id for e in drained_r2} == r2_ids
+
+    # Restoring R1 only must restore exactly R1's 2 events and leave R2's 3
+    # events still 'drained'.
+    restored_r1 = await buf.restore_drained('test-project', run_id='R1')
+    assert restored_r1 == 2
+    assert (await buf.get_buffer_stats('test-project'))['size'] == 2
+
+    db = buf._require_db()
+    async with db.execute(
+        "SELECT status FROM event_buffer WHERE id IN ({})".format(
+            ','.join('?' for _ in r2_ids)
+        ),
+        list(r2_ids),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    assert all(row['status'] == 'drained' for row in rows), (
+        "R2's events must remain 'drained' after R1-scoped restore"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mark_drained_run_id_attributes_pre_drained_events_to_a_run(buf):
+    """mark_drained_run_id lets an already-drained (NULL-attributed) row be
+    retroactively attributed to the run about to process it — used by the
+    BacklogIterator path, which drains events via drain_by_ids() before
+    run_full_cycle mints a run_id."""
+    events = [_make_event() for _ in range(4)]
+    for e in events:
+        await buf.push(e)
+
+    # drain() with no run_id — rows land 'drained' with NULL drained_by_run_id,
+    # mirroring drain_by_ids()'s pre-existing (unattributed) behaviour.
+    drained = await buf.drain('test-project')
+    assert len(drained) == 4
+    id1, id2, id3, id4 = (e.id for e in events)
+
+    # Attribute a subset to run 'RX'.
+    updated = await buf.mark_drained_run_id('test-project', [id1, id2], 'RX')
+    assert updated == 2
+
+    # restore_drained(run_id='RX') restores exactly that subset...
+    restored_rx = await buf.restore_drained('test-project', run_id='RX')
+    assert restored_rx == 2
+
+    # ...and id3/id4 (never attributed) remain 'drained'.
+    async def _status(event_id: str) -> str:
+        async with buf._require_db().execute(
+            'SELECT status, drained_by_run_id FROM event_buffer WHERE id = ?',
+            (event_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row['status']
+
+    assert await _status(id3) == 'drained'
+    assert await _status(id4) == 'drained'
+
+    # A bogus id (no matching row) is silently ignored — no error, and the
+    # rowcount reflects only ids that actually matched a 'drained' row.
+    ignored = await buf.mark_drained_run_id('test-project', ['bogus-id-xyz'], 'RY')
+    assert ignored == 0
+
+    # Empty id list is a no-op.
+    assert await buf.mark_drained_run_id('test-project', [], 'RZ') == 0
+
+    # A currently-'buffered' (not 'drained') id is silently ignored: id1 was
+    # already restored to 'buffered' above by the restore_drained(run_id='RX')
+    # call, so attempting to (re-)attribute it now must not match.
+    assert await _status(id1) == 'buffered'
+    reattribute_buffered = await buf.mark_drained_run_id('test-project', [id1], 'RQ')
+    assert reattribute_buffered == 0, (
+        'mark_drained_run_id must not touch a row that is not currently drained'
+    )
+
+    # Attribute id3 to run 'RY' — a call naming id3 legitimately re-stamps it.
+    updated_id3 = await buf.mark_drained_run_id('test-project', [id3], 'RY')
+    assert updated_id3 == 1
+    assert await _status(id3) == 'drained'
+
+    # A DIFFERENT (non-matching, i.e. id3 not included) call for another run_id
+    # must not overwrite id3's existing 'RY' attribution.
+    await buf.mark_drained_run_id('test-project', [id4], 'RW')
+    async with buf._require_db().execute(
+        'SELECT drained_by_run_id FROM event_buffer WHERE id = ?', (id3,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row['drained_by_run_id'] == 'RY', (
+        "id3's run attribution must survive a call that does not name id3"
+    )
+
+    # And restore_drained(run_id='RY') now restores exactly id3.
+    restored_ry = await buf.restore_drained('test-project', run_id='RY')
+    assert restored_ry == 1
+    assert await _status(id4) == 'drained'
+
+
+@pytest.mark.asyncio
+async def test_restore_drained_without_run_id_restores_all_project_wide(buf):
+    """(c) Legacy backward-compat: restore_drained(project) with no run_id still
+    restores ALL remaining drained rows project-wide (guards existing callers)."""
+    events_r1 = [_make_event() for _ in range(2)]
+    events_r2 = [_make_event() for _ in range(3)]
+    for e in events_r1:
+        await buf.push(e)
+    await buf.drain('test-project', run_id='R1')
+    for e in events_r2:
+        await buf.push(e)
+    await buf.drain('test-project', run_id='R2')
+
+    assert (await buf.get_buffer_stats('test-project'))['size'] == 0
+
+    restored = await buf.restore_drained('test-project')
+    assert restored == 5
+    assert (await buf.get_buffer_stats('test-project'))['size'] == 5
+
+
+@pytest.mark.asyncio
+async def test_restore_drained_include_unattributed_sweeps_null_rows_for_recovered_run(buf):
+    """include_unattributed=True additionally restores drained_by_run_id IS
+    NULL rows (pre-task-2711 leftovers, drained before drains stamped run
+    attribution) when recovering a specific run — closing the upgrade-
+    boundary gap flagged in the task 2711 amendment review — while still
+    leaving a DIFFERENT, concurrent run's attributed drained rows alone."""
+    events_orphan = [_make_event() for _ in range(2)]
+    events_legacy_null = [_make_event() for _ in range(2)]
+    events_concurrent = [_make_event() for _ in range(3)]
+
+    # The orphan run's own drained events.
+    for e in events_orphan:
+        await buf.push(e)
+    await buf.drain('test-project', run_id='orphan-run')
+
+    # Pre-task-2711 leftovers: drained with NO run_id, so drained_by_run_id
+    # is NULL — simulates events drained by the old code before this
+    # upgrade, which an exact-match run-scoped restore alone would never
+    # restore.
+    for e in events_legacy_null:
+        await buf.push(e)
+    await buf.drain('test-project')
+
+    # A different, concurrent run's drained events must survive.
+    for e in events_concurrent:
+        await buf.push(e)
+    await buf.drain('test-project', run_id='concurrent-run')
+
+    restored = await buf.restore_drained(
+        'test-project', run_id='orphan-run', include_unattributed=True,
+    )
+    assert restored == 4  # orphan's 2 + the 2 unattributed legacy rows
+
+    async def _status(event_id: str) -> str:
+        async with buf._require_db().execute(
+            'SELECT status FROM event_buffer WHERE id = ?', (event_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row['status']
+
+    for e in events_orphan:
+        assert await _status(e.id) == 'buffered'
+    for e in events_legacy_null:
+        assert await _status(e.id) == 'buffered'
+    for e in events_concurrent:
+        assert await _status(e.id) == 'drained', (
+            "a concurrent run's attributed drained events must not be restored "
+            'by a different orphan run\'s include_unattributed recovery'
+        )
+
+
+@pytest.mark.asyncio
+async def test_restore_drained_default_excludes_unattributed_rows(buf):
+    """Without include_unattributed (the default), a run-scoped restore must
+    NOT touch NULL-attributed rows — locks in the exact-match contract relied
+    on by test_mark_drained_run_id_attributes_pre_drained_events_to_a_run."""
+    events_run = [_make_event()]
+    events_null = [_make_event()]
+    for e in events_run:
+        await buf.push(e)
+    await buf.drain('test-project', run_id='R1')
+    for e in events_null:
+        await buf.push(e)
+    await buf.drain('test-project')
+
+    restored = await buf.restore_drained('test-project', run_id='R1')
+    assert restored == 1
+
+    async with buf._require_db().execute(
+        'SELECT status FROM event_buffer WHERE id = ?', (events_null[0].id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row['status'] == 'drained', (
+        'a NULL-attributed row must stay drained when include_unattributed '
+        'is not set'
+    )

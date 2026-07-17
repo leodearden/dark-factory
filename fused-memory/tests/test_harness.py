@@ -3879,6 +3879,74 @@ async def test_run_loop_fast_restart_releases_recent_claims(
     )
 
 
+@pytest.mark.asyncio
+async def test_run_loop_recovers_predecessor_runs_once_at_startup_before_reaper_ticks(
+    journal, event_buffer, mock_memory_service, monkeypatch,
+):
+    """run_loop() must invoke _recover_predecessor_runs() exactly once at
+    startup, before the periodic _recover_stale_runs ticks — and a raised
+    exception from it must not crash run_loop (task 2711 / E6).
+    """
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(seconds: float) -> None:
+        await real_sleep(0)
+
+    # Patch the module-local _sleep binding so many loop iterations execute
+    # within the wait_for() window below (same technique as
+    # test_main_loop_does_not_emit_drain_progress_after_idle_drain).
+    monkeypatch.setattr('fused_memory.reconciliation.harness._sleep', fast_sleep)
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    call_order = []
+
+    async def predecessor_side_effect():
+        call_order.append('predecessor')
+        # Raise on every call (there should only ever be one) to prove the
+        # startup try/except guard keeps run_loop alive.
+        raise RuntimeError('boom — simulated predecessor-recovery failure')
+
+    async def stale_runs_side_effect():
+        call_order.append('stale')
+
+    harness._recover_predecessor_runs = AsyncMock(side_effect=predecessor_side_effect)
+    harness._recover_stale_runs = AsyncMock(side_effect=stale_runs_side_effect)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+    harness.buffer.get_active_projects = AsyncMock(return_value=[])
+    # judge.initialize() does a real SQLite query; mock it to avoid timing
+    # flakiness in slow environments (freethreaded Python, heavy parallel runs).
+    if harness.judge is not None:
+        harness.judge.initialize = AsyncMock()
+
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+
+    # Startup pass ran exactly once, despite raising — not once per iteration.
+    assert harness._recover_predecessor_runs.call_count == 1, (
+        f'_recover_predecessor_runs must run exactly once at startup; '
+        f'called {harness._recover_predecessor_runs.call_count} times'
+    )
+    # The periodic reaper kept running — the startup exception did not crash
+    # run_loop (proxy for "loop kept iterating", same technique as
+    # test_main_loop_does_not_emit_drain_progress_after_idle_drain).
+    assert harness._recover_stale_runs.call_count >= 2, (
+        f'run_loop must keep iterating after a startup _recover_predecessor_runs '
+        f'failure; _recover_stale_runs only ran '
+        f'{harness._recover_stale_runs.call_count} times'
+    )
+    # Ordering: predecessor recovery happens before any reaper tick.
+    assert call_order[0] == 'predecessor', (
+        f'_recover_predecessor_runs must run before the first _recover_stale_runs '
+        f'tick; call order was: {call_order!r}'
+    )
+    assert 'stale' in call_order[1:], (
+        f'Expected at least one stale-run reaper tick after the startup pass; '
+        f'call order was: {call_order!r}'
+    )
+
+
 # ── Stale-run reaper: instance-scoped lock check ─────────────────────────────
 
 
@@ -4811,6 +4879,395 @@ async def test_recover_stale_runs_emits_diagnostics(
     assert any('handed_off' in line for line in warning_lines), (
         f'WARNING log must mention disposition; got: {warning_lines!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_runs_restore_is_run_scoped_not_project_wide(
+    journal, event_buffer, mock_memory_service,
+):
+    """E7 regression: the reaper's restore must be run-scoped, not project-wide.
+
+    Seed drained events attributed to an orphan run X (about to be reaped by
+    the age-based reaper) AND drained events attributed to a concurrent,
+    still-running run Y on the SAME project. Recovering X must restore only
+    X's drained events back to 'buffered'; Y's drained events — mid-processing
+    by a still-live cycle — must NOT be clobbered (RCA §2,
+    plans/recon-stale-recovery-rca.md; task 2711 / E7).
+
+    Also asserts the existing reaper contract is preserved: X's status
+    becomes 'failed' with error_type='StaleRunRecovery'.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    project_id = 'test-project'
+    cutoff = harness.config.stale_run_recovery_seconds
+
+    # Orphan run X — started long enough ago to be stale, owned by a dead
+    # instance. Its drained events are the ones the reaper should restore.
+    run_x = ReconciliationRun(
+        id='run-orphan-X',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id='dead-instance-X',
+    )
+    await journal.start_run(run_x)
+    x_events = [_make_event(project_id), _make_event(project_id)]
+    for e in x_events:
+        await event_buffer.push(e)
+    drained_x = await event_buffer.drain(project_id, run_id=run_x.id)
+    assert {e.id for e in drained_x} == {e.id for e in x_events}
+
+    # Concurrent run Y — still running (recent started_at, so the age-based
+    # reaper never touches it), owned by the current live instance. Its
+    # drained events must survive X's recovery untouched.
+    run_y = ReconciliationRun(
+        id='run-concurrent-Y',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(run_y)
+    y_events = [_make_event(project_id), _make_event(project_id)]
+    for e in y_events:
+        await event_buffer.push(e)
+    drained_y = await event_buffer.drain(project_id, run_id=run_y.id)
+    assert {e.id for e in drained_y} == {e.id for e in y_events}
+
+    # The live instance (Y's owner) currently holds the project lock — X's
+    # dead instance does not, so X is a classic handed-off orphan.
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+    assert event_buffer.instance_id != 'dead-instance-X'
+
+    await harness._recover_stale_runs()
+
+    # Existing reaper contract: X is reaped to 'failed' / StaleRunRecovery.
+    after_x = await journal.get_run('run-orphan-X')
+    assert after_x is not None
+    assert after_x.status == RunStatus.failed
+    err = after_x.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'StaleRunRecovery'
+
+    # X's drained events were restored to 'buffered'.
+    db = event_buffer._require_db()
+    x_ids = [e.id for e in x_events]
+    async with db.execute(
+        "SELECT status FROM event_buffer WHERE id IN ({})".format(
+            ','.join('?' for _ in x_ids)
+        ),
+        x_ids,
+    ) as cursor:
+        x_rows = await cursor.fetchall()
+    assert all(row['status'] == 'buffered' for row in x_rows), (
+        f"X's drained events must be restored to 'buffered' by the reaper; "
+        f'got statuses: {[row["status"] for row in x_rows]!r}'
+    )
+
+    # Y's drained events must remain 'drained' — Y is a concurrent live run
+    # and must not be clobbered by X's recovery.
+    y_ids = [e.id for e in y_events]
+    async with db.execute(
+        "SELECT status FROM event_buffer WHERE id IN ({})".format(
+            ','.join('?' for _ in y_ids)
+        ),
+        y_ids,
+    ) as cursor:
+        y_rows = await cursor.fetchall()
+    assert all(row['status'] == 'drained' for row in y_rows), (
+        f"Y's drained events must remain 'drained' after X's run-scoped "
+        f'recovery (Y is a concurrent live run, not the orphan being '
+        f'recovered); got statuses: {[row["status"] for row in y_rows]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_runs_restores_pre_upgrade_unattributed_drained_events(
+    journal, event_buffer, mock_memory_service,
+):
+    """Amendment regression (task 2711 review finding #1): events drained by
+    a pre-task-2711 process carry NULL drained_by_run_id, since only current
+    code stamps run attribution on drain. A purely exact-match run-scoped
+    restore would leave such rows stuck 'drained' forever the moment the
+    reaper switched to run-scoped restore. Recovering orphan X must also
+    sweep these NULL-attributed leftovers in X's project — while a
+    concurrent live run Y's (attributed) drained events must still survive.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    project_id = 'test-project'
+    cutoff = harness.config.stale_run_recovery_seconds
+
+    # Orphan run X — stale, owned by a dead instance.
+    run_x = ReconciliationRun(
+        id='run-orphan-X2',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id='dead-instance-X2',
+    )
+    await journal.start_run(run_x)
+    x_events = [_make_event(project_id), _make_event(project_id)]
+    for e in x_events:
+        await event_buffer.push(e)
+    await event_buffer.drain(project_id, run_id=run_x.id)
+
+    # Pre-task-2711 leftovers: drained with no run_id, simulating the old
+    # code that never stamped drained_by_run_id.
+    legacy_events = [_make_event(project_id), _make_event(project_id)]
+    for e in legacy_events:
+        await event_buffer.push(e)
+    await event_buffer.drain(project_id)
+
+    # Concurrent run Y — still running, owned by the live instance; its
+    # (attributed) drained events must survive X's recovery.
+    run_y = ReconciliationRun(
+        id='run-concurrent-Y2',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(run_y)
+    y_events = [_make_event(project_id), _make_event(project_id)]
+    for e in y_events:
+        await event_buffer.push(e)
+    await event_buffer.drain(project_id, run_id=run_y.id)
+
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+
+    await harness._recover_stale_runs()
+
+    db = event_buffer._require_db()
+
+    async def _statuses(events) -> list[str]:
+        ids = [e.id for e in events]
+        async with db.execute(
+            "SELECT status FROM event_buffer WHERE id IN ({})".format(
+                ','.join('?' for _ in ids)
+            ),
+            ids,
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [row['status'] for row in rows]
+
+    assert all(s == 'buffered' for s in await _statuses(x_events)), (
+        "X's drained events must be restored to 'buffered' by the reaper"
+    )
+    assert all(s == 'buffered' for s in await _statuses(legacy_events)), (
+        'pre-upgrade NULL-attributed drained events in the same project must '
+        'also be restored, not left stuck drained forever'
+    )
+    assert all(s == 'drained' for s in await _statuses(y_events)), (
+        "Y's attributed drained events must remain 'drained' — Y is a "
+        'concurrent live run and must not be clobbered by X\'s recovery'
+    )
+
+
+# ── Predecessor recovery at startup (task 2711 / E6) ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_runs_recovers_dead_predecessor_orphan(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """Primary scenario: a run started only ~120s ago — far under the
+    default stale_run_recovery_seconds (1800s) cutoff — owned by a dead
+    predecessor instance that still holds a freshly-heartbeated lock, must
+    be recovered immediately by `_recover_predecessor_runs()` rather than
+    waiting for the age-based `_recover_stale_runs()` backstop (task 2711 /
+    E6). Also proves the age-based reaper alone does NOT catch this run.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    project_id = 'test-project'
+
+    dead_pred_iid = 'dead-pred'
+    assert event_buffer.instance_id != dead_pred_iid
+
+    run = ReconciliationRun(
+        id='run-predecessor-orphan',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=120),
+        status=RunStatus.running,
+        instance_id=dead_pred_iid,
+    )
+    await journal.start_run(run)
+
+    # Dead predecessor's lock row: acquire as the live instance, then
+    # rewrite instance_id/heartbeat_at to simulate the predecessor's own
+    # lock surviving the crash — fresh heartbeat, so it is NOT swept by the
+    # stale-lock sweep (stale_lock_seconds=7200s).
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+    fresh_heartbeat = datetime.now(UTC).isoformat()
+    async with event_buffer._txn() as db:
+        await db.execute(
+            'UPDATE reconciliation_locks SET instance_id = ?, heartbeat_at = ? '
+            'WHERE project_id = ?',
+            (dead_pred_iid, fresh_heartbeat, project_id),
+        )
+
+    # Deferred write left behind by the dead predecessor.
+    await event_buffer.defer_write(project_id, 'replayed-by-predecessor-pass', 'cat', {})
+    mock_memory_service.add_memory = AsyncMock()
+
+    # Motivation check: the age-based reaper must NOT touch this run — it is
+    # far younger than the 1800s cutoff.
+    await harness._recover_stale_runs()
+    still_running = await journal.get_run('run-predecessor-orphan')
+    assert still_running is not None
+    assert still_running.status == RunStatus.running, (
+        'Age-based _recover_stale_runs must not touch a run only ~120s old — '
+        'this is exactly the gap _recover_predecessor_runs must close'
+    )
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        await harness._recover_predecessor_runs()
+
+    after = await journal.get_run('run-predecessor-orphan')
+    assert after is not None
+    assert after.status == RunStatus.failed
+    err = after.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'PredecessorRunRecovery'
+
+    # Structured log emitted for the recovered predecessor orphan.
+    recovered_records = [
+        r for r in caplog.records if r.message == 'reconciliation.predecessor_run_recovered'
+    ]
+    assert len(recovered_records) == 1, (
+        f'Expected exactly one predecessor_run_recovered log line; got: '
+        f'{[r.message for r in caplog.records]!r}'
+    )
+
+    # No escalation — recovering a dead predecessor's orphan at startup is
+    # expected operational-restart behaviour, not an integrity finding.
+    harness._escalate.assert_not_called()
+
+    # Deferred write was replayed.
+    mock_memory_service.add_memory.assert_awaited()
+
+    # The dead predecessor's lock was released.
+    lock_holder = await event_buffer.get_lock_holder_instance_id(project_id)
+    assert lock_holder is None
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_runs_skips_own_instance_run(
+    journal, event_buffer, mock_memory_service,
+):
+    """A running row owned by THIS process's own instance_id must never be
+    touched by the predecessor pass — it is not a dead predecessor, it is
+    (or may be) a legitimately live concurrent run.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    project_id = 'test-project'
+
+    run = ReconciliationRun(
+        id='run-own-instance',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=120),
+        status=RunStatus.running,
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(run)
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+
+    await harness._recover_predecessor_runs()
+
+    after = await journal.get_run('run-own-instance')
+    assert after is not None
+    assert after.status == RunStatus.running
+    assert '_error' not in after.stage_reports
+    harness._escalate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_runs_skips_when_corroboration_fails(
+    journal, event_buffer, mock_memory_service,
+):
+    """When no lock corroborates the run's claimed owner (lock_holder does
+    not equal run.instance_id — including the no-lock-at-all case), the run
+    must be left for the age-based backstop rather than reaped on age alone
+    (task requirement: never reap on age alone when the owner might be
+    live).
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    project_id = 'test-project'
+
+    run = ReconciliationRun(
+        id='run-uncorroborated',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=120),
+        status=RunStatus.running,
+        instance_id='dead-pred-uncorroborated',
+    )
+    await journal.start_run(run)
+
+    # No lock held at all for this project — lock_holder will be None,
+    # which does not corroborate 'dead-pred-uncorroborated'.
+    lock_holder = await event_buffer.get_lock_holder_instance_id(project_id)
+    assert lock_holder is None
+
+    await harness._recover_predecessor_runs()
+
+    after = await journal.get_run('run-uncorroborated')
+    assert after is not None
+    assert after.status == RunStatus.running, (
+        'Run must be left for the age-based backstop when the lock does not '
+        "corroborate the run's claimed owner"
+    )
+    harness._escalate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_runs_skips_null_instance(
+    journal, event_buffer, mock_memory_service,
+):
+    """A pre-migration run (instance_id IS NULL) is left to the age-based
+    backstop, not the predecessor pass — there is no instance identity to
+    corroborate against the lock.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    project_id = 'test-project'
+
+    run = ReconciliationRun(
+        id='run-null-instance',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=120),
+        status=RunStatus.running,
+        instance_id=None,
+    )
+    await journal.start_run(run)
+
+    await harness._recover_predecessor_runs()
+
+    after = await journal.get_run('run-null-instance')
+    assert after is not None
+    assert after.status == RunStatus.running
+    harness._escalate.assert_not_called()
 
 
 # ── Tests for AllAccountsCappedException deferral in run_full_cycle ────
@@ -11185,4 +11642,60 @@ async def test_perpetually_fresh_thread_escalates_within_bounded_cycles(
         f'Expected the perpetually-fresh-but-unresolved thread to escalate '
         f'within {_INTEGRITY_FINDING_RECURRENCE_THRESHOLD} cycles; '
         f'got pending: {[e.summary for e in pending]}'
+    )
+
+
+# ── Task 2711 E7: run_full_cycle attributes drained events to its run_id ──
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_attributes_drained_events_to_run_id(
+    journal, event_buffer, mock_memory_service,
+):
+    """run_full_cycle must stamp drained_by_run_id on the events it drains,
+    in both the self-drain path and the iterator-fed (pre-drained events=)
+    path, so a later run-scoped restore_drained can target exactly this
+    run's events (task 2711 / E7)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    for stage in harness.stages:
+        _mock_stage_run(stage)
+
+    # (a) Full-drain path: run_full_cycle drains the buffer itself via
+    # buffer.drain(project_id, run_id=run_id) and must stamp
+    # drained_by_run_id=run.id on the 2 events it drains.
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+
+    run_a = await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+    restored_a = await event_buffer.restore_drained('test-project', run_id=run_a.id)
+    assert restored_a == 2, (
+        f'Expected run_full_cycle to stamp drained_by_run_id={run_a.id!r} on the '
+        f'2 events it drained via buffer.drain(); restore_drained(run_id=run_a.id) '
+        f'restored {restored_a}'
+    )
+    # Drain them back out (no run_id — mirrors an untracked legacy drain) so
+    # the next scenario starts from an empty 'buffered' set.
+    await event_buffer.drain('test-project')
+
+    # (b) Iterator-fed path: events pre-drained by the caller (mirroring
+    # BacklogIterator.run's drain_by_ids call, which drains BEFORE
+    # run_full_cycle mints a run_id) must be attributed via
+    # buffer.mark_drained_run_id(project_id, event_ids, run_id).
+    original_mark = event_buffer.mark_drained_run_id
+    harness.buffer.mark_drained_run_id = AsyncMock(side_effect=original_mark)
+
+    pre_drained = [_make_event(), _make_event()]
+    for e in pre_drained:
+        await event_buffer.push(e)
+    # Pre-drain with no run_id, exactly like drain_by_ids leaves them before
+    # run_full_cycle has a run_id to attribute them with.
+    await event_buffer.drain('test-project')
+
+    run_b = await harness.run_full_cycle(
+        'test-project', 'backlog_chunk:1:2', events=pre_drained,
+    )
+
+    harness.buffer.mark_drained_run_id.assert_awaited_once_with(
+        'test-project', [e.id for e in pre_drained], run_b.id,
     )

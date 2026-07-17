@@ -638,31 +638,24 @@ class ReconciliationJournal:
             (cutoff_dt.isoformat(),),
         ) as cursor:
             rows = await cursor.fetchall()
-        runs = []
-        for row in rows:
-            reports_raw = json.loads(row['stage_reports'] or '{}')
-            stage_reports: dict[str, StageReport | dict] = {}
-            for k, v in reports_raw.items():
-                if isinstance(v, dict) and 'stage' in v:
-                    stage_reports[k] = StageReport(**v)
-                else:
-                    stage_reports[k] = v
-            runs.append(
-                ReconciliationRun(
-                    id=row['id'],
-                    project_id=row['project_id'],
-                    run_type=row['run_type'],
-                    trigger_reason=row['trigger_reason'],
-                    started_at=datetime.fromisoformat(row['started_at']),
-                    completed_at=_parse_dt(row['completed_at']),
-                    events_processed=row['events_processed'],
-                    stage_reports=stage_reports,
-                    status=row['status'],
-                    triggered_by=row['triggered_by'],
-                    instance_id=row['instance_id'],
-                )
-            )
-        return runs
+        return [_row_to_run(row) for row in rows]
+
+    async def get_running_runs(self) -> list[ReconciliationRun]:
+        """Return every run still marked 'running', with no age filter.
+
+        Used by the startup predecessor-recovery pass (task 2711 / E6), which
+        must consider a run owned by a dead predecessor instance regardless of
+        how recently it started — unlike ``get_stale_runs``, which only
+        returns runs older than the age-based cutoff. Preferred over calling
+        ``get_stale_runs(0.0)`` to avoid a fragile ``started_at < now``
+        boundary and to read clearly at the call site.
+        """
+        db = self._require_db()
+        async with db.execute(
+            "SELECT * FROM runs WHERE status = 'running'"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [_row_to_run(row) for row in rows]
 
     # ── Chunk boundaries ─────────────────────────────────────────────
 
@@ -833,3 +826,33 @@ def _fmt_dt(val: datetime | None) -> str | None:
     if val is None:
         return None
     return val.isoformat()
+
+
+def _row_to_run(row: aiosqlite.Row) -> ReconciliationRun:
+    """Map a single ``runs`` table row to a ``ReconciliationRun``.
+
+    Shared by ``get_stale_runs`` and ``get_running_runs`` (task 2711
+    amendment) — the two queries differ only in their WHERE clause, so the
+    row→model mapping (including ``stage_reports`` parsing) lives in exactly
+    one place and can't drift between them.
+    """
+    reports_raw = json.loads(row['stage_reports'] or '{}')
+    stage_reports: dict[str, StageReport | dict] = {}
+    for k, v in reports_raw.items():
+        if isinstance(v, dict) and 'stage' in v:
+            stage_reports[k] = StageReport(**v)
+        else:
+            stage_reports[k] = v
+    return ReconciliationRun(
+        id=row['id'],
+        project_id=row['project_id'],
+        run_type=row['run_type'],
+        trigger_reason=row['trigger_reason'],
+        started_at=datetime.fromisoformat(row['started_at']),
+        completed_at=_parse_dt(row['completed_at']),
+        events_processed=row['events_processed'],
+        stage_reports=stage_reports,
+        status=row['status'],
+        triggered_by=row['triggered_by'],
+        instance_id=row['instance_id'],
+    )

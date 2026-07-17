@@ -1,7 +1,7 @@
 """Tests for reconciliation journal (SQLite persistence)."""
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
@@ -150,6 +150,55 @@ async def test_recent_runs(journal):
 
     runs = await journal.get_recent_runs('test-project', limit=10)
     assert len(runs) == 3
+
+
+@pytest.mark.asyncio
+async def test_get_running_runs_returns_all_running_regardless_of_age(journal):
+    """get_running_runs() returns every status='running' row with no age filter,
+    excludes completed runs, and maps instance_id through faithfully."""
+    recent_running = ReconciliationRun(
+        id=str(uuid.uuid4()),
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+        instance_id='instance-recent',
+    )
+    old_running = ReconciliationRun(
+        id=str(uuid.uuid4()),
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=999999),
+        status=RunStatus.running,
+        instance_id='instance-old',
+    )
+    completed = ReconciliationRun(
+        id=str(uuid.uuid4()),
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+        instance_id='instance-completed',
+    )
+    await journal.start_run(recent_running)
+    await journal.start_run(old_running)
+    await journal.start_run(completed)
+    await journal.complete_run(completed.id, 'completed')
+
+    running = await journal.get_running_runs()
+    running_ids = {r.id for r in running}
+
+    assert running_ids == {recent_running.id, old_running.id}, (
+        f'Expected exactly the two running runs; got ids={running_ids!r}'
+    )
+    assert completed.id not in running_ids
+
+    by_id = {r.id: r for r in running}
+    assert by_id[recent_running.id].instance_id == 'instance-recent'
+    assert by_id[old_running.id].instance_id == 'instance-old'
 
 
 @pytest.mark.asyncio
