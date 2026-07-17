@@ -7627,10 +7627,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         depth-1 placement (task 2359).
 
         Returns ``None`` for a non-speculative item -- the head trust-anchor
-        verify (against real main) is never probed -- and whenever the pure
-        :func:`select_probe_depth` policy returns ``None`` (default
-        ``probe_fraction=0.0`` is byte-identical; also ``None`` on flake-rate
-        suppression, an off-cycle round, or when the sampled depth exceeds
+        verify (against real main) is never probed -- and for a disabled
+        config (``cfg.probe_fraction <= 0.0``, the default) via an early
+        short-circuit that skips :meth:`_available_built_depth` and
+        :meth:`_recent_verify_fail_rate` entirely, so the byte-identical
+        default path never pays for either introspection scan (mirrors
+        :func:`select_probe_depth`'s own first guard, just hoisted a layer
+        up so the cost disappears too, not only the output). When probing is
+        enabled, delegates to the pure :func:`select_probe_depth` policy,
+        which may itself still return ``None`` (flake-rate suppression, an
+        off-cycle round, or a sampled depth exceeding
         :meth:`_available_built_depth`).
 
         *item* itself is ALWAYS the one the caller already chose to dispatch
@@ -7646,9 +7652,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         change takes effect on the very next dispatch.
 
         Increments ``self._probe_round_counter`` on every call for a
-        SPECULATIVE item only -- matching the counter's role as the
-        second-slot round index ``select_probe_depth()`` cycles on; a
-        non-speculative item's dispatch does not consume a probe round.
+        SPECULATIVE item WHILE PROBING IS ENABLED -- matching the counter's
+        role as the second-slot round index ``select_probe_depth()`` cycles
+        on. A non-speculative item's dispatch, and a disabled-probe dispatch
+        (``probe_fraction<=0.0``), do not consume a probe round.
 
         Pure/synchronous (no await); does not mutate ``_verifier_queue`` or
         ``_inflight``.
@@ -7656,6 +7663,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if not item.speculative:
             return None
         cfg = item.request.config.speculation_probe
+        if cfg.probe_fraction <= 0.0:
+            # Zero-cost disabled path: under stock config every speculative
+            # dispatch takes this branch, so skip the two O(n) introspection
+            # scans below rather than compute them only for
+            # select_probe_depth() to discard them on its own probe_fraction
+            # guard. Restores the "no cost, not just no effect" half of the
+            # byte-identical guarantee.
+            return None
         round_index = self._probe_round_counter
         self._probe_round_counter += 1
         d = select_probe_depth(

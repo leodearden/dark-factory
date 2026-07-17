@@ -816,6 +816,28 @@ class TestProbeVerifyPlacement:
 
         assert result is None
 
+    def test_disabled_config_skips_expensive_introspection(self):
+        """probe_fraction<=0.0 short-circuits BEFORE computing
+        _available_built_depth()/_recent_verify_fail_rate() -- the
+        byte-identical default path must cost nothing beyond the
+        item.speculative/cfg.probe_fraction reads (reviewer_comprehensive
+        amendment: these two O(n) introspection scans were previously
+        computed on every speculative dispatch even though
+        select_probe_depth() discarded them via its own probe_fraction
+        guard -- byte-identical OUTPUT but not cost).
+        """
+        worker = _make_bare_worker()
+        worker._available_built_depth = MagicMock(return_value=0)  # type: ignore[method-assign]
+        worker._recent_verify_fail_rate = MagicMock(return_value=None)  # type: ignore[method-assign]
+        config = _make_probe_config(probe_fraction=0.0)
+        item = _make_probe_item(speculative=True, config=config)
+
+        result = worker._probe_verify_placement(item)
+
+        assert result is None
+        worker._available_built_depth.assert_not_called()
+        worker._recent_verify_fail_rate.assert_not_called()
+
     def test_probe_fires_returns_depth_and_built_tip_base(self):
         """probe_fraction=1.0, probe_depths=[2], a built stack of depth 2,
         and a low recent fail rate -> a placement at depth 2 whose base is
