@@ -451,3 +451,44 @@ class TestResetHoldsLaneLock:
             if lock_held:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 os.close(lock_fd)
+
+    async def test_reset_raises_runtime_error_when_lane_lock_held_past_timeout(
+        self, real_git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Fail-CLOSED: when a foreign holder keeps <lane_dir>.lock held past
+        the bounded wait, reset_persistent_merge_worktree must RAISE
+        RuntimeError rather than mutate the tree unprotected — this is the
+        central safety guarantee step-4 adds (a live reify/DF holder must
+        block the mutation, never be silently ignored).
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        # Small enough the test doesn't wait the real 30s default, but long
+        # enough it can't be satisfied by anything other than a genuine
+        # timeout of the bounded wait.
+        monkeypatch.setattr(git_ops_mod, '_SEED_WARM_LANE_LOCK_WAIT_SECS', 1)
+
+        merge_commit_a = await _get_merge_commit(real_git_ops, 'reset-lock-b1', 'rlb1.py')
+        await real_git_ops.reset_persistent_merge_worktree(merge_commit_a)  # create-once
+        merge_commit_b = await _get_merge_commit(real_git_ops, 'reset-lock-b2', 'rlb2.py')
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with pytest.raises(RuntimeError, match='Timed out'):
+                await real_git_ops.reset_persistent_merge_worktree(merge_commit_b)
+
+            _, head_sha, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=real_git_ops.persistent_merge_worktree_path,
+            )
+            assert head_sha.strip() == merge_commit_a.strip(), (
+                'a foreign holder that never releases <lane_dir>.lock must '
+                'block the reset entirely — the tree must be left '
+                'untouched, never mutated unprotected'
+            )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
