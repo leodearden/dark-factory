@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -128,7 +129,11 @@ async def _run_single_reviewer(
     *meta_root* is injectable so tests can observe/pre-seed the verdict
     artifact path; production leaves it unset and gets a fresh temp dir per
     invocation (the trial has no real task worktree/.task root to anchor
-    TaskArtifacts to).
+    TaskArtifacts to). That auto-created temp dir is owned by this call —
+    unlike production's TaskWorkflow, the trial harness has no
+    worktree/.task-meta lifecycle to reclaim it later — so it is removed in
+    a ``finally`` block; an injected *meta_root* is left untouched for the
+    caller to inspect.
 
     Returns (reviewer_name, review_dict_or_None, cost_usd).
 
@@ -147,96 +152,101 @@ async def _run_single_reviewer(
     role = build_trial_reviewer_role(spec)
     prompt = _build_reviewer_prompt(diff.diff_text)
     cwd = diff.cwd or _DEFAULT_CWD
+    owns_root = meta_root is None
     root = meta_root if meta_root is not None else Path(tempfile.mkdtemp(prefix='reviewer_trial_'))
-    artifacts = TaskArtifacts(cwd, meta_root=root)
-    mcp_config = {
-        'mcpServers': {
-            'verdict-tools': verdict_tools_mcp_server(
-                _ORCH_PROJECT_DIR, cwd, role.name,
-                python_executable=sys.executable, meta_root=root,
-            ),
-        },
-    }
+    try:
+        artifacts = TaskArtifacts(cwd, meta_root=root)
+        mcp_config = {
+            'mcpServers': {
+                'verdict-tools': verdict_tools_mcp_server(
+                    _ORCH_PROJECT_DIR, cwd, role.name,
+                    python_executable=sys.executable, meta_root=root,
+                ),
+            },
+        }
 
-    if spec.oauth_token_env:
-        oauth_token = os.environ.get(spec.oauth_token_env)
-        if oauth_token is None:
-            raise RuntimeError(
-                f'Reviewer {spec.name!r} sets oauth_token_env={spec.oauth_token_env!r} '
-                f'but that environment variable is not set. Refusing to dispatch with a '
-                f'silently-missing oauth token.'
-            )
-    else:
-        oauth_token = None
+        if spec.oauth_token_env:
+            oauth_token = os.environ.get(spec.oauth_token_env)
+            if oauth_token is None:
+                raise RuntimeError(
+                    f'Reviewer {spec.name!r} sets oauth_token_env={spec.oauth_token_env!r} '
+                    f'but that environment variable is not set. Refusing to dispatch with a '
+                    f'silently-missing oauth token.'
+                )
+        else:
+            oauth_token = None
 
-    for attempt in range(1, max_retries + 1):
-        # I-FRESH: never consume a stale verdict from a prior attempt/run on
-        # this same meta_root (mirrors workflow._run_reviewer's pre-spawn
-        # clear_verdict).
-        artifacts.clear_verdict(role.name)
-        try:
-            result = await invoke_agent(
-                prompt=prompt,
-                system_prompt=role.system_prompt,
-                cwd=cwd,
-                model=role.default_model,
-                max_turns=role.default_max_turns,
-                max_budget_usd=role.default_budget,
-                allowed_tools=role.allowed_tools,
-                disallowed_tools=role.disallowed_tools,
-                mcp_config=mcp_config,
-                effort=spec.effort,
-                backend=spec.backend,
-                env_overrides=spec.env_overrides,
-                oauth_token=oauth_token,
-                prices=prices,
-            )
-        except Exception as exc:
+        for attempt in range(1, max_retries + 1):
+            # I-FRESH: never consume a stale verdict from a prior attempt/run on
+            # this same meta_root (mirrors workflow._run_reviewer's pre-spawn
+            # clear_verdict).
+            artifacts.clear_verdict(role.name)
+            try:
+                result = await invoke_agent(
+                    prompt=prompt,
+                    system_prompt=role.system_prompt,
+                    cwd=cwd,
+                    model=role.default_model,
+                    max_turns=role.default_max_turns,
+                    max_budget_usd=role.default_budget,
+                    allowed_tools=role.allowed_tools,
+                    disallowed_tools=role.disallowed_tools,
+                    mcp_config=mcp_config,
+                    effort=spec.effort,
+                    backend=spec.backend,
+                    env_overrides=spec.env_overrides,
+                    oauth_token=oauth_token,
+                    prices=prices,
+                )
+            except Exception as exc:
+                if attempt < max_retries:
+                    logger.warning(
+                        'Reviewer %s attempt %d failed: %s, retrying',
+                        spec.name, attempt, exc,
+                    )
+                    continue
+                logger.error('Reviewer %s failed after %d attempts: %s', spec.name, max_retries, exc)
+                return spec.name, None, 0.0
+
+            cost = result.cost_usd
+
+            # Read the reviewer's structured verdict instead of the
+            # structured_output/json.loads cascade (task 2493, mirrors task
+            # 2484's production change). A dict envelope with a dict 'verdict'
+            # payload carrying verdict∈{PASS,ISSUES_FOUND} is trusted only when
+            # the invocation itself also reported success — an invocation
+            # failure is untrusted even if it happened to write a verdict
+            # before failing.
+            envelope = artifacts.read_verdict(role.name)
+            payload = envelope.get('verdict') if isinstance(envelope, dict) else None
+            if result.success and isinstance(payload, dict) and payload.get('verdict') in {'PASS', 'ISSUES_FOUND'}:
+                return spec.name, payload, cost
+
             if attempt < max_retries:
                 logger.warning(
-                    'Reviewer %s attempt %d failed: %s, retrying',
-                    spec.name, attempt, exc,
+                    'Reviewer %s attempt %d: no/invalid verdict (result.success=%s), retrying',
+                    spec.name, attempt, result.success,
                 )
                 continue
-            logger.error('Reviewer %s failed after %d attempts: %s', spec.name, max_retries, exc)
-            return spec.name, None, 0.0
-
-        cost = result.cost_usd
-
-        # Read the reviewer's structured verdict instead of the
-        # structured_output/json.loads cascade (task 2493, mirrors task
-        # 2484's production change). A dict envelope with a dict 'verdict'
-        # payload carrying verdict∈{PASS,ISSUES_FOUND} is trusted only when
-        # the invocation itself also reported success — an invocation
-        # failure is untrusted even if it happened to write a verdict
-        # before failing.
-        envelope = artifacts.read_verdict(role.name)
-        payload = envelope.get('verdict') if isinstance(envelope, dict) else None
-        if result.success and isinstance(payload, dict) and payload.get('verdict') in {'PASS', 'ISSUES_FOUND'}:
-            return spec.name, payload, cost
-
-        if attempt < max_retries:
             logger.warning(
-                'Reviewer %s attempt %d: no/invalid verdict (result.success=%s), retrying',
-                spec.name, attempt, result.success,
+                'Reviewer %s: no/invalid verdict after %d attempts (result.success=%s)',
+                spec.name, max_retries, result.success,
             )
-            continue
-        logger.warning(
-            'Reviewer %s: no/invalid verdict after %d attempts (result.success=%s)',
-            spec.name, max_retries, result.success,
-        )
-        return spec.name, {
-            'reviewer': role.name,
-            'verdict': 'ERROR',
-            'issues': [],
-            'summary': (
-                f'Reviewer emitted no/invalid verdict after {max_retries} '
-                f'attempt(s) (result.success={result.success}).'
-            ),
-        }, cost
+            return spec.name, {
+                'reviewer': role.name,
+                'verdict': 'ERROR',
+                'issues': [],
+                'summary': (
+                    f'Reviewer emitted no/invalid verdict after {max_retries} '
+                    f'attempt(s) (result.success={result.success}).'
+                ),
+            }, cost
 
-    # Unreachable, but satisfy type checker
-    return spec.name, None, 0.0
+        # Unreachable, but satisfy type checker
+        return spec.name, None, 0.0
+    finally:
+        if owns_root:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 async def run_panel(
