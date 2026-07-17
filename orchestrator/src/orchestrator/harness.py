@@ -47,7 +47,7 @@ from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_
 from orchestrator.git_ops import GitOps
 from orchestrator.landing_evidence import (
     LandingEvidenceVerdict,
-    format_unattributed_landing_detail,
+    file_unattributed_landing_escalation,
     validate_landing_evidence,
 )
 from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME
@@ -3611,6 +3611,25 @@ Output JSON matching the schema. Every task must appear in the output.
                         tid, mid_run=mid_run, metadata=metadata, status=status,
                     )
                 return None
+
+            # BranchState docstring invariant (task_ground_truth.py): sha is
+            # always populated for ON_MAIN / GONE_WITH_MERGE_MARKER — the
+            # only variants that reach MARK_DONE_WITH_PROVENANCE. Guard it
+            # explicitly (review finding, task 2678 amendment): passing
+            # candidate_sha=None below would silently switch
+            # validate_landing_evidence from CANDIDATE to DISCOVERY mode
+            # instead of failing loudly on the violated invariant — a
+            # materially different code path (citation discovery + lineage
+            # against `branch`) than the effect-only check this call site
+            # intends. The one known way to reach sha=None is a TOCTOU in
+            # the git-archaeology fallback (_resolve_branch_state: the
+            # branch ref is deleted between the is_ancestor and
+            # resolve_branch_sha calls) — practically near-unreachable, so
+            # fail loud rather than silently degrade (project norm).
+            assert report.branch_state.sha is not None, (
+                f'BranchState invariant violated for task {tid}: kind='
+                f'{report.branch_state.kind!r} carries no sha'
+            )
 
             on_main = report.branch_state.kind == BranchStateKind.ON_MAIN
 
@@ -7514,6 +7533,16 @@ Output JSON matching the schema. Every task must appear in the output.
                 pattern_template=self.git_ops.config.commit_citation_pattern,
             )
             if not verdict.accepted:
+                # No escalation here, deliberately — unlike the marker and
+                # content-equivalence paths below (design decision, task
+                # 2678). This branch is LIVE: a reject (no citation, a
+                # lineage mismatch, or a task-1175-shape effect-absent
+                # revert) self-heals by re-dispatch on the next tick with no
+                # human involved, and this gate is re-run on the order of
+                # every dispatch tick — escalating here would be noise, not
+                # signal. This silent-False shape also predates task 2678
+                # (it returned False here before the helper extraction too),
+                # so this is not a newly-introduced silent failure.
                 return False
             await self._mark_in_progress_done(
                 task_id, verdict.evidence_sha,
@@ -7600,38 +7629,18 @@ Output JSON matching the schema. Every task must appear in the output.
         bare-Harness unit tests) and deduped via ``has_open_l1`` so repeated
         ticks re-observing the same unattributable evidence don't stack
         duplicate L1s — one open escalation per task at a time.
+
+        Delegates the actual filing (queue-None guard, dedup, ``Escalation``
+        construction, submit/log/except shape) to the shared
+        :func:`~orchestrator.landing_evidence.file_unattributed_landing_escalation`
+        (task 2678 amendment, INV-5) — this method now only supplies
+        ``agent_role``, the one thing that distinguishes it from
+        ``SpeculativeMergeWorker``'s equivalent method.
         """
-        if not self._escalation_queue:
-            return
-        try:
-            if self._escalation_queue.has_open_l1(task_id):
-                return
-            from escalation.models import Escalation  # noqa: PLC0415
-            summary, detail = format_unattributed_landing_detail(
-                task_id, branch, verdict,
-            )
-            esc = Escalation(
-                id=self._escalation_queue.make_id(task_id),
-                task_id=task_id,
-                agent_role='harness-reconcile',
-                severity='blocking',
-                category='provenance_unattributed',
-                summary=summary,
-                detail=detail,
-                suggested_action='investigate_unattributed_landing_evidence',
-                level=1,
-            )
-            self._escalation_queue.submit(esc)
-            logger.warning(
-                'Filed provenance_unattributed escalation %s for task %s '
-                '(branch %s, reason %s)',
-                esc.id, task_id, branch, verdict.reason,
-            )
-        except Exception:
-            logger.warning(
-                'Failed to file unattributed-landing escalation for task %s',
-                task_id, exc_info=True,
-            )
+        file_unattributed_landing_escalation(
+            self._escalation_queue, task_id, branch, verdict,
+            agent_role='harness-reconcile',
+        )
 
     async def _stop_escalation_server(self) -> None:
         """Stop the escalation server."""

@@ -39,7 +39,7 @@ from orchestrator.git_ops import (
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.landing_evidence import (
     LandingEvidenceVerdict,
-    format_unattributed_landing_detail,
+    file_unattributed_landing_escalation,
     validate_landing_evidence,
 )
 from orchestrator.merge_disposition import (
@@ -9164,53 +9164,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """Best-effort, dedup-guarded L1 escalation for unattributable
         coalesce re-drive landing evidence (task 2678, INV-5).
 
-        Mirrors ``Harness._file_unattributed_landing_escalation`` exactly
-        (shared ``format_unattributed_landing_detail`` rendering, same
-        category/dedup shape) — filed when
-        :meth:`_redrive_coalesce_members` finds a member's branch already
-        an ancestor of main but :func:`validate_landing_evidence` rejects
-        the landing evidence (no citation, a lineage mismatch, or an
-        effect-absent reverted merge). Non-status-blocking: the member is
-        simply flipped to pending by the caller, not held in any blocked
-        state, and re-evaluated by its next solo-merge dispatch.
+        Filed when :meth:`_redrive_coalesce_members` finds a member's
+        branch already an ancestor of main but
+        :func:`validate_landing_evidence` rejects the landing evidence (no
+        citation, a lineage mismatch, or an effect-absent reverted merge).
+        Non-status-blocking: the member is simply flipped to pending by the
+        caller, not held in any blocked state, and re-evaluated by its next
+        solo-merge dispatch.
 
         Best-effort (a no-op when ``_escalation_queue`` is None, e.g. bare-
         worker unit tests) and deduped via ``has_open_l1`` so repeated
         coalesce derails re-observing the same unattributable evidence
         don't stack duplicate L1s.
+
+        Delegates the actual filing (queue-None guard, dedup, ``Escalation``
+        construction, submit/log/except shape) to the shared
+        :func:`~orchestrator.landing_evidence.file_unattributed_landing_escalation`
+        (task 2678 amendment, INV-5) — this method now only supplies
+        ``agent_role``, the one thing that distinguishes it from
+        ``Harness``'s equivalent method.
         """
-        if not self._escalation_queue:
-            return
-        try:
-            if self._escalation_queue.has_open_l1(task_id):
-                return
-            from escalation.models import Escalation  # noqa: PLC0415
-            summary, detail = format_unattributed_landing_detail(
-                task_id, branch, verdict,
-            )
-            esc = Escalation(
-                id=self._escalation_queue.make_id(task_id),
-                task_id=task_id,
-                agent_role='orchestrator-merge-worker',
-                severity='blocking',
-                category='provenance_unattributed',
-                summary=summary,
-                detail=detail,
-                suggested_action='investigate_unattributed_landing_evidence',
-                level=1,
-            )
-            self._escalation_queue.submit(esc)
-            logger.warning(
-                'Filed provenance_unattributed escalation %s for coalesce '
-                'member %s (branch %s, reason %s)',
-                esc.id, task_id, branch, verdict.reason,
-            )
-        except Exception:
-            logger.warning(
-                'Failed to file provenance_unattributed escalation for '
-                'coalesce member %s (branch %s) — continuing without it',
-                task_id, branch, exc_info=True,
-            )
+        file_unattributed_landing_escalation(
+            self._escalation_queue, task_id, branch, verdict,
+            agent_role='orchestrator-merge-worker',
+        )
 
     def _default_coalesce_exclusion_reason(self, req: MergeRequest) -> str | None:
         """Built-in merge-ready predicate (δ/1720 confidence gate).
