@@ -1655,7 +1655,9 @@ class TestCollectSnapshotInsertFailureIsolation:
         # Exactly one WARNING naming extra_b
         warning_records = [
             r for r in caplog.records
-            if r.levelno == logging.WARNING and (
+            if r.levelno == logging.WARNING
+            and r.name == 'dashboard.data.burndown'
+            and (
                 'insert_multi_b' in r.getMessage() or extra_b_id in r.getMessage()
             )
         ]
