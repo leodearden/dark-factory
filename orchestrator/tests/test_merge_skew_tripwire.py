@@ -297,3 +297,66 @@ class TestEmitTripwire:
         )
         update_task.assert_not_awaited()
         get_branch_diff.assert_not_awaited()
+
+    async def test_oracle_positive_one_escalation_names_only_overlapping(
+        self, tmp_path: Path,
+    ) -> None:
+        """Boundary row 5: oracle-positive landing with one overlapping and one
+        non-overlapping in-flight task → exactly one escalation naming only the
+        overlapping task, and a metadata note attached only to that task.
+        """
+        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+
+        script = _write_oracle_script(tmp_path, exit_code=0)  # load-bearing
+        fake_eq = _FakeEscalationQueue()
+        update_task = AsyncMock(return_value=True)
+
+        branch_diffs = {
+            'task/101': ['src/a.py', 'unrelated_101.py'],  # overlaps landing's src/a.py
+            'task/202': ['unrelated_202.py'],  # no overlap
+        }
+
+        async def get_branch_diff(branch: str) -> list[str] | None:
+            return branch_diffs.get(branch)
+
+        landing_sha = 'a' * 40
+        await emit_pipeline_landing_tripwire(
+            project_root=tmp_path,
+            oracle_cmd=['bash', str(script)],
+            escalation_queue=fake_eq,
+            landing_sha=landing_sha,
+            landing_task_id='999',
+            landing_changed_files=['src/a.py'],
+            inflight=[('101', 'task/101'), ('202', 'task/202')],
+            get_branch_diff=get_branch_diff,
+            update_task=update_task,
+        )
+
+        assert len(fake_eq.submitted) == 1, (
+            f'expected exactly one escalation; got {fake_eq.submitted!r}'
+        )
+        esc = fake_eq.submitted[0]
+        assert esc.severity == 'info'
+        assert esc.level == 0
+        assert esc.category == 'risk_identified'
+        assert landing_sha[:12] in esc.summary or landing_sha[:12] in esc.detail, (
+            f'expected landing sha in summary/detail; got summary={esc.summary!r} '
+            f'detail={esc.detail!r}'
+        )
+        assert '101' in esc.summary or '101' in esc.detail, (
+            'expected overlapping task_id 101 named in summary/detail'
+        )
+        assert '202' not in esc.summary and '202' not in esc.detail, (
+            'non-overlapping task_id 202 must NOT appear in the escalation'
+        )
+
+        update_task.assert_awaited_once()
+        call = update_task.await_args
+        assert call.args[0] == '101', (
+            f'update_task must be called for the overlapping task only; got {call.args[0]!r}'
+        )
+        note = call.args[1]
+        assert 'merge_skew_tripwire' in note
+        assert note['merge_skew_tripwire']['landing_sha'] == landing_sha
+        assert note['merge_skew_tripwire']['overlap_files'] == ['src/a.py']
+        assert call.kwargs.get('metadata_mode') == 'merge'
