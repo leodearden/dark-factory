@@ -214,3 +214,75 @@ class TestSelectProbeDepthFrequencyAndCycling:
         # (period=10 at fraction=0.1, so firings land at round_index
         # 0,10,20,... -- probe_index advances by 1 each firing).
         assert fired[:4] == probe_depths
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED / step-6 GREEN: availability fallback (d > available_built_depth)
+# ---------------------------------------------------------------------------
+
+
+class TestSelectProbeDepthAvailabilityFallback:
+    """A probe never fires against a stack shallower than the sampled depth
+    -- select_probe_depth() falls back to None (the caller's normal
+    _verify_frontier_depth() path) rather than building/rebasing anything to
+    satisfy the probe.
+
+    probe_fraction=1.0 makes every round a probe round (period=1), isolating
+    the availability guard from the frequency/cycling behaviour covered by
+    TestSelectProbeDepthFrequencyAndCycling above.
+
+    RED until step-6 GREEN adds the ``d > available_built_depth`` guard.
+    """
+
+    def test_insufficient_built_depth_falls_back_to_none(self):
+        from orchestrator.merge_queue import select_probe_depth
+
+        result = select_probe_depth(
+            probe_fraction=1.0,
+            probe_depths=[8],
+            round_index=0,
+            available_built_depth=3,
+            recent_fail_rate=None,
+            suppress_flake_rate=0.30,
+        )
+        assert result is None
+
+    def test_exactly_sufficient_built_depth_returns_sampled_depth(self):
+        from orchestrator.merge_queue import select_probe_depth
+
+        result = select_probe_depth(
+            probe_fraction=1.0,
+            probe_depths=[8],
+            round_index=0,
+            available_built_depth=8,
+            recent_fail_rate=None,
+            suppress_flake_rate=0.30,
+        )
+        assert result == 8
+
+    def test_more_than_sufficient_built_depth_returns_sampled_depth(self):
+        from orchestrator.merge_queue import select_probe_depth
+
+        result = select_probe_depth(
+            probe_fraction=1.0,
+            probe_depths=[8],
+            round_index=0,
+            available_built_depth=9,
+            recent_fail_rate=None,
+            suppress_flake_rate=0.30,
+        )
+        assert result == 8
+
+    @pytest.mark.parametrize('available_built_depth', [0, 1, 2, 7])
+    def test_various_insufficient_depths_fall_back_to_none(self, available_built_depth):
+        from orchestrator.merge_queue import select_probe_depth
+
+        result = select_probe_depth(
+            probe_fraction=1.0,
+            probe_depths=[8],
+            round_index=0,
+            available_built_depth=available_built_depth,
+            recent_fail_rate=None,
+            suppress_flake_rate=0.30,
+        )
+        assert result is None
