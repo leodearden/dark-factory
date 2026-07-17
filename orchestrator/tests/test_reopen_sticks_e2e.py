@@ -187,7 +187,7 @@ async def _build_rig(tmp_path: Path, event_buffer: EventBuffer) -> _Rig:
     queue = EscalationQueue(tmp_path / 'escalations')
     sink = ProvenanceConflictSink(escalation_queue=queue)
 
-    return _Rig(
+    rig = _Rig(
         repo=repo,
         project_root=project_root,
         backend=backend,
@@ -195,6 +195,17 @@ async def _build_rig(tmp_path: Path, event_buffer: EventBuffer) -> _Rig:
         sink=sink,
         queue=queue,
     )
+    # Pin the assumption _read_fresh's fresh-backend-connection check depends
+    # on: OrchestratorConfig.project_root must resolve to the SAME tree as
+    # the git repo used for evidence commits. If config path resolution ever
+    # diverges (symlink, trailing slash, normalization change), git
+    # committer-date lookups and backend reads would silently target
+    # different trees instead of failing loudly.
+    assert Path(rig.project_root).resolve() == repo.resolve(), (
+        'OrchestratorConfig(project_root=repo).project_root must resolve '
+        'identically to the git repo used for evidence commits/reads'
+    )
+    return rig
 
 
 async def _gate_tick(
