@@ -2464,6 +2464,25 @@ class TaskWorkflow:
                     if thrash_outcome is not None:
                         return thrash_outcome
 
+                    # Fold any steward-granted scope expansion (task 2505)
+                    # into plan.files/metadata.files/locks BEFORE resuming
+                    # the implementer — otherwise the grant lives only as
+                    # free-text resolution prose and the resumed
+                    # implementer's briefing/_task_files never reflect the
+                    # expanded scope. granted_files is read from resolved
+                    # escalation records, not the joined `resolution` string.
+                    granted = self._collect_granted_files()
+                    if granted:
+                        current_files = self.plan.get('files', [])
+                        new_files = current_files + [
+                            f for f in granted if f not in current_files
+                        ]
+                        if (
+                            set(files_to_modules(new_files, self.config.lock_depth))
+                            != set(self.modules)
+                        ):
+                            await self._set_task_scope(new_files)
+
                     # Resume with resolution context
                     logger.info(f'Task {self.task_id}: resuming after escalation resolution')
                     resume_prompt = await self.briefing.build_resume_prompt(
@@ -4421,6 +4440,32 @@ class TaskWorkflow:
             )
 
         return None
+
+    def _collect_granted_files(self) -> list[str]:
+        """Union ``granted_files`` across every resolved escalation for this
+        task (task 2505) — the steward's structured scope-expansion grant
+        stamped via ``resolve_issue(..., granted_files=[...])`` when
+        resolving a ``scope_violation`` L0 with ``action='resume'``.
+
+        Order-preserving de-duplication across ALL resolved records (not
+        just the most recently resolved one), so a grant from an earlier
+        resolution in this task's history is never dropped on a later
+        resume-loop re-entry. Returns ``[]`` when no ``escalation_queue`` is
+        wired (eval mode) — the caller's union with ``plan.files`` is then a
+        no-op.
+        """
+        if not self.escalation_queue:
+            return []
+        seen: set[str] = set()
+        granted: list[str] = []
+        for esc in self.escalation_queue.get_by_task(self.task_id):
+            if esc.status != 'resolved':
+                continue
+            for f in esc.granted_files:
+                if f not in seen:
+                    seen.add(f)
+                    granted.append(f)
+        return granted
 
     async def _check_merge_outcome_thrash(
         self,
