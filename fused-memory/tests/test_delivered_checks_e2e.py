@@ -49,6 +49,10 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 import yaml
+from escalation.queue import EscalationQueue
+from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventType
+from orchestrator.harness import Harness
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
@@ -56,13 +60,6 @@ from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import create_mcp_server
-
-from escalation.queue import EscalationQueue
-
-from orchestrator.config import OrchestratorConfig
-from orchestrator.event_store import EventType
-from orchestrator.harness import Harness
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Import-resolution smoke test (prerequisite pre-1)

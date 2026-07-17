@@ -46,7 +46,6 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Import-resolution smoke test (prerequisite pre-1)
 # ─────────────────────────────────────────────────────────────────────────────
