@@ -660,6 +660,44 @@ class TestSeparateTokenValueFlagBinding:
         tokens = shlex.split(rendered)
         assert tokens[tokens.index('-k') + 1] == 'foo'
 
+    @pytest.mark.parametrize('flag', ['-k', '-m', '-p', '-o', '-n'])
+    def test_trailing_value_flag_falls_back_to_bare_flag(self, flag):
+        """A listed value flag with no following token (e.g. the expression
+
+        omitted from `pytest tests/ -k`) must not index past the end of
+        `rest` — _split_pytest_args's `i + 1 < n` guard falls it back to the
+        bare-flag classification rather than raising IndexError (see
+        _split_pytest_args's docstring). This is the one input shape the fix
+        does NOT fully protect against a later base_flags append corrupting
+        the command (e.g. a subsequent apply_pytest_numprocesses would still
+        render `pytest -k -n 16`, where pytest's -k would swallow -n) — that
+        is malformed input the fix does not claim to guard against.
+        """
+        cmd = parse_config_command(f'pytest tests/ {flag}')
+        assert flag in cmd.base_flags
+        assert cmd.targets == ('tests/',)
+
+    @pytest.mark.parametrize(
+        'token',
+        [
+            '--maxfail=2',
+            '-n=4',
+            '--override-ini=addopts=',
+        ],
+    )
+    def test_attached_value_form_does_not_consume_following_token(self, token):
+        """A single-token `--flag=value` form is a distinct grammar branch
+
+        from a separate-token value flag: it is NOT a member of
+        _PYTEST_VALUE_FLAGS (which lists only separate-token value flags),
+        so it correctly falls to the `tok.startswith('-')` bare-flag arm and
+        must not consume the following token as though it were a bound
+        value-flag pair.
+        """
+        cmd = parse_config_command(f'pytest {token} tests/')
+        assert cmd.base_flags == (token,)
+        assert cmd.targets == ('tests/',)
+
 
 class TestGovernCpu:
     """govern_cpu(exec_path) wraps the whole rendered command as an outer
