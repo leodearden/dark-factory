@@ -4813,6 +4813,111 @@ async def test_recover_stale_runs_emits_diagnostics(
     )
 
 
+@pytest.mark.asyncio
+async def test_recover_stale_runs_restore_is_run_scoped_not_project_wide(
+    journal, event_buffer, mock_memory_service,
+):
+    """E7 regression: the reaper's restore must be run-scoped, not project-wide.
+
+    Seed drained events attributed to an orphan run X (about to be reaped by
+    the age-based reaper) AND drained events attributed to a concurrent,
+    still-running run Y on the SAME project. Recovering X must restore only
+    X's drained events back to 'buffered'; Y's drained events — mid-processing
+    by a still-live cycle — must NOT be clobbered (RCA §2,
+    plans/recon-stale-recovery-rca.md; task 2711 / E7).
+
+    Also asserts the existing reaper contract is preserved: X's status
+    becomes 'failed' with error_type='StaleRunRecovery'.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    project_id = 'test-project'
+    cutoff = harness.config.stale_run_recovery_seconds
+
+    # Orphan run X — started long enough ago to be stale, owned by a dead
+    # instance. Its drained events are the ones the reaper should restore.
+    run_x = ReconciliationRun(
+        id='run-orphan-X',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id='dead-instance-X',
+    )
+    await journal.start_run(run_x)
+    x_events = [_make_event(project_id), _make_event(project_id)]
+    for e in x_events:
+        await event_buffer.push(e)
+    drained_x = await event_buffer.drain(project_id, run_id=run_x.id)
+    assert {e.id for e in drained_x} == {e.id for e in x_events}
+
+    # Concurrent run Y — still running (recent started_at, so the age-based
+    # reaper never touches it), owned by the current live instance. Its
+    # drained events must survive X's recovery untouched.
+    run_y = ReconciliationRun(
+        id='run-concurrent-Y',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(run_y)
+    y_events = [_make_event(project_id), _make_event(project_id)]
+    for e in y_events:
+        await event_buffer.push(e)
+    drained_y = await event_buffer.drain(project_id, run_id=run_y.id)
+    assert {e.id for e in drained_y} == {e.id for e in y_events}
+
+    # The live instance (Y's owner) currently holds the project lock — X's
+    # dead instance does not, so X is a classic handed-off orphan.
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+    assert event_buffer.instance_id != 'dead-instance-X'
+
+    await harness._recover_stale_runs()
+
+    # Existing reaper contract: X is reaped to 'failed' / StaleRunRecovery.
+    after_x = await journal.get_run('run-orphan-X')
+    assert after_x is not None
+    assert after_x.status == RunStatus.failed
+    err = after_x.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'StaleRunRecovery'
+
+    # X's drained events were restored to 'buffered'.
+    db = event_buffer._require_db()
+    x_ids = [e.id for e in x_events]
+    async with db.execute(
+        "SELECT status FROM event_buffer WHERE id IN ({})".format(
+            ','.join('?' for _ in x_ids)
+        ),
+        x_ids,
+    ) as cursor:
+        x_rows = await cursor.fetchall()
+    assert all(row['status'] == 'buffered' for row in x_rows), (
+        f"X's drained events must be restored to 'buffered' by the reaper; "
+        f'got statuses: {[row["status"] for row in x_rows]!r}'
+    )
+
+    # Y's drained events must remain 'drained' — Y is a concurrent live run
+    # and must not be clobbered by X's recovery.
+    y_ids = [e.id for e in y_events]
+    async with db.execute(
+        "SELECT status FROM event_buffer WHERE id IN ({})".format(
+            ','.join('?' for _ in y_ids)
+        ),
+        y_ids,
+    ) as cursor:
+        y_rows = await cursor.fetchall()
+    assert all(row['status'] == 'drained' for row in y_rows), (
+        f"Y's drained events must remain 'drained' after X's run-scoped "
+        f'recovery (Y is a concurrent live run, not the orphan being '
+        f'recovered); got statuses: {[row["status"] for row in y_rows]!r}'
+    )
+
+
 # ── Tests for AllAccountsCappedException deferral in run_full_cycle ────
 
 
