@@ -2098,6 +2098,191 @@ class TestCrossUnitWritebackResilience:
 
 
 # ---------------------------------------------------------------------------
+# Task 2706: writeback consumes the shared orchestrator.fm_retry schedule
+# (RED until step-8 replaces writeback_max_attempts/writeback_backoff_base
+# with the writeback_backoffs seam)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestWritebackBackoffsSeam:
+    """DeterministicRunner's writeback retry loop consumes the shared
+    ``orchestrator.fm_retry`` schedule (task 2706) via a new
+    ``writeback_backoffs: list[float] | None`` constructor param, replacing
+    the old ``writeback_max_attempts``/``writeback_backoff_base`` pair.
+    ``None`` (the default) resolves to ``fm_retry_backoffs()`` once, at
+    construction time.
+    """
+
+    async def test_injected_writeback_backoffs_bounds_attempts_and_sleeps(
+        self, tmp_path: Path,
+    ):
+        """An injected fixed-length schedule bounds both the verified-stamp
+        attempt count and the sleeper await count: writeback_backoffs=[0.0]*4
+        -> attempts=len+1=5, sleeps=4 (new seam — fails today: the
+        constructor has no writeback_backoffs kwarg)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2706', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        # The verified-stamp write never lands (persistently severed connection).
+        scheduler.update_task = AsyncMock(
+            side_effect=lambda _task_id, metadata, **_kwargs:
+                'before_done_verified_at' not in metadata
+        )
+        sleeper = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            writeback_backoffs=[0.0] * 4,
+            sleeper=sleeper,
+        )
+        outcome = await runner.run(assignment)
+
+        verified_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and 'before_done_verified_at' in c.args[1]
+        ]
+        assert len(verified_calls) == 5, (
+            f'writeback_backoffs=[0.0]*4 -> attempts=len+1=5; got '
+            f'{len(verified_calls)}'
+        )
+        assert sleeper.await_count == 4, (
+            f'writeback_backoffs=[0.0]*4 -> 4 between-attempt sleeps; got '
+            f'{sleeper.await_count}'
+        )
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            'a verified-stamp that never lands must still exhaust the budget '
+            'and block, never hang or silently succeed'
+        )
+
+    async def test_default_construction_survives_outage_via_shared_fm_retry_schedule(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """ACCEPTANCE — the task's user-observable signal: DEFAULT
+        construction (no writeback_backoffs override) must consume the
+        shared orchestrator.fm_retry schedule and survive a connection
+        outage shorter than the default budget, with NO spurious
+        infra_issue escalation (fails today: fm_retry_backoffs is not
+        imported into deterministic_runner, so it cannot be patched)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2706', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        # Connection severed for the verified-stamp write's first K=3
+        # attempts, recovered on the 4th — K is less than the patched
+        # schedule's attempt count (7), so a DEFAULT-constructed runner must
+        # outlast it.
+        verified_call_returns: list[bool] = []
+
+        def _update_task_side_effect(_task_id, metadata, **_kwargs):
+            if 'before_done_verified_at' in metadata:
+                result = len(verified_call_returns) >= 3
+                verified_call_returns.append(result)
+                return result
+            return True
+
+        scheduler.update_task = AsyncMock(side_effect=_update_task_side_effect)
+
+        # Patch the shared schedule (long enough to outlast the simulated
+        # outage) instead of injecting writeback_backoffs — this exercises
+        # the DEFAULT `None -> fm_retry_backoffs()` seam end to end.
+        monkeypatch.setattr(
+            'orchestrator.deterministic_runner.fm_retry_backoffs',
+            lambda *a, **kw: [0.0] * 6,
+        )
+        sleeper = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            sleeper=sleeper,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE, (
+            'a connection outage shorter than the default writeback window '
+            'must converge to done, not strand the task'
+        )
+        scheduler.set_task_status.assert_awaited_once()
+        done_call = scheduler.set_task_status.call_args
+        assert done_call.args[0] == '2706'
+        assert done_call.args[1] == 'done'
+        assert queue.get_by_task('2706') == [], (
+            'No escalation should be filed when the writeback recovers '
+            'within the shared fm_retry budget'
+        )
+
+    async def test_persistent_severed_connection_still_escalates_under_new_seam(
+        self, tmp_path: Path,
+    ):
+        """Loud path preserved: a persistent (never-recovering) connection
+        loss still files the durable infra_issue L2 escalation and returns
+        BLOCKED under the new writeback_backoffs seam (fails today:
+        writeback_backoffs kwarg absent)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2706', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        def _update_task_side_effect(_task_id, metadata, **_kwargs):
+            # Connection never recovers in-window for the verified stamp.
+            return 'before_done_verified_at' not in metadata
+
+        scheduler.update_task = AsyncMock(side_effect=_update_task_side_effect)
+        sleeper = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            writeback_backoffs=[0.0] * 2,
+            sleeper=sleeper,
+        )
+        outcome = await runner.run(assignment)
+
+        pending = queue.get_by_task('2706')
+        assert pending, (
+            'Budget exhaustion must file a durable escalation, not leave '
+            'the queue empty'
+        )
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'infra_issue'
+        assert 'severed' in esc.detail.lower() or 'connection' in esc.detail.lower(), (
+            f'Detail must explain the self-severed-connection/writeback-'
+            f'stranding cause: {esc.detail!r}'
+        )
+        assert outcome == WorkflowOutcome.BLOCKED
+
+
+# ---------------------------------------------------------------------------
 # Default seam: _default_run_script env merge
 # ---------------------------------------------------------------------------
 
