@@ -649,3 +649,55 @@ class TestManualOnlySidecar:
             f'expected the dependent ({dependent_id!r}) to dispatch on the '
             f'very first tick; got {result!r}'
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestMalformedSidecar — row 9: alpha-invalid sidecar -> fail-soft loud, flip proceeds
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MALFORMED_PRD_PATH = 'plans/e2e-malformed-fixture-prd.md'
+
+
+class TestMalformedSidecar:
+    """Row 9: a sidecar present on disk but failing α validation (a grep
+    capability missing the required ``expect`` field) must fail loud-but-soft
+    — commit_planning still flips the batch to pending (never stranded on a
+    docs artifact) and reports the validation error naming the offending
+    field, but stamps nothing to disk and copies no metadata."""
+
+    @pytest.mark.asyncio
+    async def test_malformed_sidecar_fails_soft_and_flip_proceeds(self, backend_stack):
+        server, _interceptor, project_root = backend_stack
+
+        sidecar_path = _write_malformed_sidecar(
+            project_root, prd_path=_MALFORMED_PRD_PATH, label=_PRODUCER_LABEL,
+        )
+        before = sidecar_path.read_text(encoding='utf-8')
+
+        producer_id, dependent_id = await _file_planning_batch(
+            server, project_root, prd_path=_MALFORMED_PRD_PATH,
+        )
+
+        result = await _commit_planning(server, project_root, [producer_id, dependent_id])
+
+        manifest_stamping = result['manifest_stamping']
+        assert manifest_stamping['stamped'] == [], manifest_stamping
+        errors = manifest_stamping['errors']
+        assert len(errors) == 1, errors
+        assert 'expect' in errors[0], errors
+
+        after = sidecar_path.read_text(encoding='utf-8')
+        assert after == before, (
+            'a malformed sidecar must be byte-identical on disk — no partial '
+            'task_id stamp'
+        )
+
+        producer_task = await _get_task(server, project_root, producer_id)
+        assert producer_task['status'] == 'pending', (
+            f"the batch flip must proceed even though the sidecar is "
+            f"malformed; got status {producer_task['status']!r}"
+        )
+        assert 'delivered_checks' not in producer_task['metadata'], (
+            f"a malformed capability must not stamp metadata.delivered_checks; "
+            f"got {producer_task['metadata']!r}"
+        )
