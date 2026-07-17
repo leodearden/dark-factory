@@ -35,7 +35,7 @@ from _recording_event_store import _RecordingEventStore
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
-from orchestrator.config import OrchestratorConfig, RoutingRule, RuleMatch, RuleSet
+from orchestrator.config import OrchestratorConfig, PriceEntry, RoutingRule, RuleMatch, RuleSet
 from orchestrator.event_store import EventType
 from orchestrator.routing import PlanShape, RoutingDecision
 from orchestrator.workflow import TaskWorkflow
@@ -330,6 +330,34 @@ class TestInvokeAdoptsResolveRoute:
         assert mock_invoke.call_args.kwargs['effort'] == 'low'
         assert mock_invoke.call_args.kwargs['max_budget_usd'] == 1.23
         assert mock_invoke.call_args.kwargs['max_turns'] == 17
+
+
+@pytest.mark.asyncio
+class TestInvokeThreadsConfigPrices:
+    """Defect (c) — ``_invoke`` threads ``config.prices`` into the
+    invocation so the operator-tunable/hot-reloadable price table reaches
+    the codex/gemini/pi cost estimators (claude ignores ``prices`` — it
+    reports native cost; see orchestrator.agents.invoke._estimate_cost).
+    ``prices`` rides the same **invoke_kwargs forwarding path already
+    proven for ``backend`` (task 2457) — it is not an explicit
+    ``invoke_with_cap_retry`` param.
+    """
+
+    async def test_prices_forwarded_to_invoke_with_cap_retry(self, tmp_path: Path) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+        wf.config.prices = {'gpt-5.4': PriceEntry(input_per_1m=1.0, output_per_1m=2.0)}
+
+        with (
+            patch(
+                'orchestrator.workflow.invoke_with_cap_retry',
+                new=AsyncMock(return_value=_stub_agent_result()),
+            ) as mock_invoke,
+            patch.object(wf, '_build_agent_env', return_value=None),
+        ):
+            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+
+        assert mock_invoke.call_args.kwargs.get('prices') is wf.config.prices
 
 
 @pytest.mark.asyncio
