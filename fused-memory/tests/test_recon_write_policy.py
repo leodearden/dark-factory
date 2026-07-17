@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from shared.task_metadata import parse_metadata
 
 from fused_memory.middleware import recon_write_policy
 from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -702,6 +703,42 @@ class TestIsTerminalAnnotationAdd:
 
     def test_metadata_unparseable_string_is_false(self):
         assert recon_write_policy.is_terminal_annotation_add({'metadata': 'not json'}) is False
+
+
+# ---------------------------------------------------------------------------
+# X_ANNOTATION_PREFIX <-> shared.task_metadata.parse_metadata consistency
+# (robustness amendment, task 2695)
+# ---------------------------------------------------------------------------
+
+
+class TestXAnnotationPrefixConsistencyWithParseMetadata:
+    """Guards the hand-maintained literal-mirror documented on
+    :data:`recon_write_policy.X_ANNOTATION_PREFIX`.
+
+    ``X_ANNOTATION_PREFIX`` mirrors the bare ``'x_'`` literal in
+    ``shared.task_metadata.parse_metadata`` (the forward-compat namespace
+    ``parse_metadata`` admits silently, with no schema warning) BY HAND —
+    there is no shared constant tying the two together. Nothing else
+    enforces they stay in sync, so a future change to either literal (e.g.
+    a different prefix, or a case rule) would otherwise silently diverge:
+    the recon exemption would then accept a key ``parse_metadata`` warns
+    about, or reject one it silently admits. These tests fail loudly
+    instead.
+    """
+
+    def test_x_annotation_prefix_key_is_admitted_by_parse_metadata_without_warning(self):
+        key = f'{recon_write_policy.X_ANNOTATION_PREFIX}consistency_probe'
+        _model, warnings = parse_metadata({key: 'v'}, direction='read')
+        assert key not in {w.field for w in warnings}
+
+    def test_non_x_prefixed_unknown_key_still_warns(self):
+        """Contrast check: an unknown key NOT under X_ANNOTATION_PREFIX still
+        trips parse_metadata's unknown_key warning — proving the positive
+        assertion above is a meaningful signal (parse_metadata does warn on
+        unrecognised keys in general), not a vacuous pass."""
+        key = 'not_forward_compat_probe'
+        _model, warnings = parse_metadata({key: 'v'}, direction='read')
+        assert any(w.field == key and w.code == 'unknown_key' for w in warnings)
 
 
 # ---------------------------------------------------------------------------
