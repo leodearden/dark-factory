@@ -25,6 +25,7 @@ from pydantic_settings import (
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+from shared.task_metadata import KNOWN_ROLE_NAMES
 
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 
@@ -2975,6 +2976,14 @@ class OrchestratorConfig(BaseSettings):
     # Environment overrides forwarded to agent invocations
     env_overrides: dict[str, str] = Field(default_factory=dict)
 
+    # Per-role OPT-IN endpoint-env map (e.g. ANTHROPIC_BASE_URL /
+    # ANTHROPIC_AUTH_TOKEN), keyed on role.name. Empty by default. A role
+    # absent from this map receives NO endpoint env from it — forwarding is
+    # opt-in per role, not a global broadcast, so pointing (say) the judge at
+    # an alternate Claude-compatible endpoint requires explicitly naming
+    # 'judge' here. See _build_agent_env (workflow.py).
+    role_env_overrides: dict[str, dict[str, str]] = Field(default_factory=dict)
+
     # Project
     project_root: Path = Field(default=Path('.'))
 
@@ -3021,6 +3030,43 @@ class OrchestratorConfig(BaseSettings):
             "verify_admission_pytest_n must be '', 'auto', 'logical', or a "
             f"positive-integer string (pytest-xdist's accepted -n values); got {v!r}"
         )
+
+    @field_validator('role_env_overrides', mode='after')
+    @classmethod
+    def _warn_unknown_role_env_overrides_keys(
+        cls, v: dict[str, dict[str, str]]
+    ) -> dict[str, dict[str, str]]:
+        """WARN (never reject) on a role_env_overrides key outside KNOWN_ROLE_NAMES.
+
+        Mirrors shared.task_metadata.validate_model_overrides's role-name check
+        (task 2460 amendment) but warns instead of raising: unlike
+        metadata.model_overrides (an agent-authored task-metadata write, shape-
+        rejected at the fused-memory submit/update boundary), role_env_overrides
+        is a restart-only operator YAML surface -- a typo here should be loud in
+        the logs (the project's loud-over-silent-degradation norm) without
+        taking down orchestrator startup over one mis-keyed role. A key outside
+        KNOWN_ROLE_NAMES (e.g. 'judg', 'implementor') is silently never read by
+        _build_agent_env's ``role_env_overrides.get(role.name, {})`` lookup --
+        this makes that silent no-op visible at config load/reload.
+
+        CAVEAT: KNOWN_ROLE_NAMES is a superset that also includes collapsed
+        config-only keys ('reviewer', 'triage', 'module_tagger') which pass
+        this check but are still inert here -- exactly as documented for
+        metadata.model_overrides -- because _build_agent_env keys strictly on
+        the full dispatch role.name (e.g. 'reviewer_comprehensive'), never the
+        collapsed key. This validator only catches keys that are not even a
+        recognized role name at all.
+        """
+        for role_name in v:
+            if role_name not in KNOWN_ROLE_NAMES:
+                logger.warning(
+                    'role_env_overrides: unrecognized role %r (known roles: %s) -- '
+                    'this entry is silently never read by _build_agent_env; check '
+                    'for a typo',
+                    role_name,
+                    sorted(KNOWN_ROLE_NAMES),
+                )
+        return v
 
     @model_validator(mode='after')
     def _default_verify_admission_slots_dir(self) -> 'OrchestratorConfig':

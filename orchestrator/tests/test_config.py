@@ -2614,3 +2614,113 @@ class TestPricesReloadDisposition:
         assert 'prices' in report['applied']
         assert 'prices' not in report['restart_required']
         assert live.prices['o4-mini'].input_per_1m == 9.99
+
+
+# ---------------------------------------------------------------------------
+# Task 2460 step-1: role_env_overrides — per-role opt-in endpoint-env map
+# ---------------------------------------------------------------------------
+
+
+class TestRoleEnvOverridesConfig:
+    """OrchestratorConfig.role_env_overrides — per-role opt-in endpoint-env map.
+
+    Widens agent env forwarding from the architect/implementer/debugger-only
+    allow-list to a per-role OPT-IN map: a role receives an endpoint env
+    (ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN) iff it is named as a key here.
+    Defaults to {} so an absent role (e.g. judge) gets no endpoint env.
+    """
+
+    def test_defaults_to_empty(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.role_env_overrides == {}
+
+    def test_nested_per_role_map_round_trips(self):
+        role_map = {
+            'judge': {
+                'ANTHROPIC_BASE_URL': 'https://api.z.ai/api/anthropic',
+                'ANTHROPIC_AUTH_TOKEN': 'tok',
+            },
+        }
+        config = OrchestratorConfig(role_env_overrides=role_map)
+        assert config.role_env_overrides == role_map
+
+    def test_unknown_role_key_warns_but_does_not_raise(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        """A typo'd role name (e.g. 'judg') warns loudly instead of silently
+        never being read by _build_agent_env -- construction still succeeds
+        (amendment: robustness_silent_misconfig)."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            config = OrchestratorConfig(
+                role_env_overrides={
+                    'judg': {'ANTHROPIC_BASE_URL': 'https://api.z.ai/api/anthropic'},
+                }
+            )
+
+        assert config.role_env_overrides == {
+            'judg': {'ANTHROPIC_BASE_URL': 'https://api.z.ai/api/anthropic'},
+        }
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("'judg'" in r.getMessage() for r in warnings), (
+            f"Expected a WARNING naming the unrecognized role 'judg'; "
+            f"got: {[r.getMessage() for r in warnings]}"
+        )
+
+    def test_known_role_key_does_not_warn(self, caplog: pytest.LogCaptureFixture):
+        """A correctly-spelled, known role name (e.g. 'judge') never warns."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            OrchestratorConfig(
+                role_env_overrides={
+                    'judge': {'ANTHROPIC_BASE_URL': 'https://api.z.ai/api/anthropic'},
+                }
+            )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warnings, (
+            f"Expected no WARNING for a known role; got: {[r.getMessage() for r in warnings]}"
+        )
+
+    def test_values_support_env_var_interpolation(self, monkeypatch, tmp_path):
+        """role_env_overrides values support "${VAR}" interpolation, expanded
+        by YamlSettingsSource._expand_env_vars over the merged YAML -- the
+        defaults.yaml example's "${Z_AI_API_KEY}" is not a dead literal
+        (amendment: robustness_documentation_correctness). Config is NOT
+        loaded via a bare yaml.safe_load with no interpolation, contrary to
+        a naive read of the two yaml.safe_load call sites -- the settings
+        source expands "${VAR}"/"${VAR:default}" over the fully-merged dict,
+        recursing into nested per-role maps."""
+        monkeypatch.setenv('DF_TEST_ROLE_ENV_SECRET', 'sk-secret-value')
+        config_path = tmp_path / 'orchestrator.yaml'
+        config_path.write_text(
+            yaml.dump({
+                'role_env_overrides': {
+                    'judge': {'ANTHROPIC_AUTH_TOKEN': '${DF_TEST_ROLE_ENV_SECRET}'},
+                },
+            })
+        )
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+
+        config = OrchestratorConfig()
+
+        assert config.role_env_overrides['judge']['ANTHROPIC_AUTH_TOKEN'] == 'sk-secret-value'
+
+    def test_unset_env_var_reference_fails_loud_at_load(self, monkeypatch, tmp_path):
+        """An "${VAR}" reference to an unset env var (no ":default") fails
+        loudly at config construction rather than silently forwarding an
+        empty auth token -- empty-string expansion coerces to None, which
+        this dict[str, str] field rejects with a pydantic ValidationError."""
+        monkeypatch.delenv('DF_TEST_ROLE_ENV_UNSET', raising=False)
+        config_path = tmp_path / 'orchestrator.yaml'
+        config_path.write_text(
+            yaml.dump({
+                'role_env_overrides': {
+                    'judge': {'ANTHROPIC_AUTH_TOKEN': '${DF_TEST_ROLE_ENV_UNSET}'},
+                },
+            })
+        )
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+
+        with pytest.raises(ValidationError):
+            OrchestratorConfig()

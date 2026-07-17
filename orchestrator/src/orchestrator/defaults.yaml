@@ -439,6 +439,43 @@ unblock_auto:
   b3_merge_cap_per_24h: 6
   b3_proposal_keep_last: 5
 
+# Per-role OPT-IN endpoint-env map (task 2460). Keys are role names (e.g.
+# architect, implementer, debugger, judge, merger, steward, reviewer,
+# deep_reviewer, simple_task); values are env maps forwarded to that role's
+# agent invocation — typically ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN,
+# to point the role at an official Anthropic-format endpoint (e.g. Z.AI
+# api.z.ai/api/anthropic, Kimi kimi-for-coding, MiniMax, DeepSeek
+# api.deepseek.com/anthropic). A role NOT listed here receives NO endpoint
+# env from this map — forwarding is opt-in per role, not a global broadcast.
+# In particular the judge is safe by omission: naming it here re-exposes the
+# vLLM ServerDisconnectedError burn (commit 3cd380a079) unless the target
+# endpoint is confirmed to handle the judge's tool-use pattern.
+#
+# Restart-only: like the global env_overrides above, this field is NOT in
+# RELOADABLE_FIELDS -- a change here takes effect only on orchestrator
+# restart, not via mcp__escalation__reload_config.
+#
+# Secrets: "${VAR}" / "${VAR:default}" IS expanded here -- the config loader
+# (YamlSettingsSource._expand_env_vars, config.py) walks the fully-merged
+# defaults+project YAML, including nested per-role maps like this one, and
+# substitutes from the orchestrator process's own environment. Prefer
+# "${VAR}" over a literal secret so no token is ever committed to this file.
+# If the referenced var is unset and no ":default" is given, config load
+# fails loudly with a pydantic ValidationError (empty-string expansion
+# coerces to None, which this dict[str, str] field rejects) rather than
+# silently forwarding an empty auth token.
+#
+# Unrecognized role-name keys (typos) log a WARNING at config load/reload
+# instead of being silently never read -- see
+# OrchestratorConfig._warn_unknown_role_env_overrides_keys.
+#
+# Example (commented out):
+# role_env_overrides:
+#   judge:
+#     ANTHROPIC_BASE_URL: "https://api.z.ai/api/anthropic"
+#     ANTHROPIC_AUTH_TOKEN: "${Z_AI_API_KEY}"
+role_env_overrides: {}
+
 # Usage cap handling — multi-account failover
 usage_cap:
   enabled: true

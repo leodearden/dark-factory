@@ -8086,18 +8086,46 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         - scripts/agent-bin prepended to PATH so the agent's ad-hoc ``cargo …``
           (Bash tool) hits the PSI shim instead of the system cargo (DF-2).
           PATH propagates to the agent and its cargo children (not popped).
-        Other roles (merger, judge, reviewer) receive None.
+
+        Every role additionally gets config.role_env_overrides.get(role.name, {})
+        merged in LAST (task 2460): a per-role OPT-IN endpoint-env map (e.g.
+        ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN) so an operator can point a
+        SPECIFIC role at an alternate Claude-compatible endpoint with no
+        harness change. role_env_overrides defaults to {}, so a role absent
+        from it (e.g. merger, judge, reviewer by default) receives no endpoint
+        env from this layer — forwarding is opt-in per role, not a hardcoded
+        allow-list. Because this layer is merged last, an explicit per-role
+        entry wins over the global config.env_overrides on a key collision.
+        A collision with an INFRA-provided key (jobserver/cpu_priority/
+        cpu_governance/REIFY_DEBUG_PORT) also logs a WARNING naming the role
+        and key, since silently clobbering one of those can break the cargo
+        jobserver, cpu cgroup placement, or a PATH-based tool shim for that
+        role.
         """
-        if role.name not in ('architect', 'implementer', 'debugger'):
-            return None
         merged: dict[str, str] = {}
-        if role.name in ('implementer', 'debugger'):
-            merged.update(self.config.env_overrides or {})
-            if self._reify_debug_port is not None:
-                merged['REIFY_DEBUG_PORT'] = str(self._reify_debug_port)
-        merged.update(self.config.jobserver.agent_env())
-        merged.update(self.config.cpu_priority.agent_env())
-        merged.update(self.config.cpu_governance.agent_env(self.worktree, os.environ.get('PATH', '')))
+        if role.name in ('architect', 'implementer', 'debugger'):
+            if role.name in ('implementer', 'debugger'):
+                merged.update(self.config.env_overrides or {})
+                if self._reify_debug_port is not None:
+                    merged['REIFY_DEBUG_PORT'] = str(self._reify_debug_port)
+            merged.update(self.config.jobserver.agent_env())
+            merged.update(self.config.cpu_priority.agent_env())
+            merged.update(
+                self.config.cpu_governance.agent_env(self.worktree, os.environ.get('PATH', ''))
+            )
+        role_overrides = self.config.role_env_overrides.get(role.name, {})
+        clobbered = sorted(set(role_overrides) & set(merged))
+        if clobbered:
+            logger.warning(
+                'role_env_overrides[%r] overrides infra-provided env key(s) %s '
+                '(jobserver/cpu-governance/REIFY_DEBUG_PORT/env_overrides) -- '
+                'the per-role value wins (merged last); this may break the '
+                'cargo jobserver, cpu cgroup placement, or PATH-based tool '
+                'shims for this role',
+                role.name,
+                clobbered,
+            )
+        merged.update(role_overrides)
         return merged or None
 
     def _build_spawn_env(self, role: AgentRole) -> dict[str, str]:
@@ -8360,11 +8388,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 absolute_cap_secs=self.config.invocation_timeout,
                 session_id=session_id_val,
                 resume_session_id=resume_session_id,
-                # Judge always hits Claude API — propagating ANTHROPIC_BASE_URL
-                # routes it through vLLM where max_model_len causes
-                # ServerDisconnectedError after 2 tool-use rounds (3cd380a079).
-                # Cap hits on Claude API are handled by UsageGate account failover
-                # (wired in runner.py for eval mode).
+                # Judge is safe by OMISSION from config.role_env_overrides (the
+                # per-role OPT-IN endpoint-env map, task 2460) — _build_agent_env
+                # no longer gates roles by a hardcoded allow-list, so the judge
+                # simply must not be named there.  Opting it in would propagate
+                # ANTHROPIC_BASE_URL and route it through vLLM, where
+                # max_model_len causes ServerDisconnectedError after 2 tool-use
+                # rounds (3cd380a079) — do not add 'judge' to role_env_overrides
+                # unless that endpoint is confirmed to handle its tool-use
+                # pattern.  Cap hits on Claude API are handled by UsageGate
+                # account failover (wired in runner.py for eval mode).
                 env_overrides=self._build_agent_env(role),
                 # Spawn-identity env for the SessionStart hook (task 2512) —
                 # independent of env_overrides (which is None for
