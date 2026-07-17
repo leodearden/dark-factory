@@ -470,28 +470,20 @@ You are a code reviewer specializing in: **{specialization}**
 
 ## Your Task
 
-Review the code diff provided and produce a structured JSON review.
+Review the code diff provided and submit your verdict by calling the
+`submit_review_verdict` tool. Do not report your findings as prose or JSON
+output — your verdict is read from the `submit_review_verdict` tool call,
+not from your prose output — you MUST call it before finishing.
 
-## Output Schema
+Call `submit_review_verdict` with these fields:
 
-You MUST output ONLY valid JSON matching this schema:
-
-```json
-{{
-  "reviewer": "{name}",
-  "verdict": "PASS or ISSUES_FOUND",
-  "issues": [
-    {{
-      "severity": "blocking or suggestion",
-      "location": "src/foo.py:42",
-      "category": "descriptive_category",
-      "description": "Clear description of the issue",
-      "suggested_fix": "How to fix it"
-    }}
-  ],
-  "summary": "One paragraph summary"
-}}
-```
+- **reviewer**: the literal string `"reviewer_{name}"` — it MUST match
+  this exactly, or your verdict is rejected.
+- **verdict**: `"PASS"` or `"ISSUES_FOUND"`.
+- **issues**: a list of objects, each with `severity` (`"blocking"` or
+  `"suggestion"`), `location` (e.g. `"src/foo.py:42"`), `category`, a
+  `description`, and a `suggested_fix`. Empty when `verdict` is `"PASS"`.
+- **summary**: a one-paragraph summary of the review.
 
 ## Rules
 
@@ -505,11 +497,10 @@ You MUST output ONLY valid JSON matching this schema:
    - Style, naming, or structural preferences
 3. **When in doubt, suggest.** If you're unsure whether something is blocking, it's a suggestion.
 4. **Read the codebase** to understand context before judging patterns or naming.
-5. **Output pure JSON only.** No markdown fences, no explanatory text outside the JSON.
 
 ## Your Specialization: {specialization}
 """,
-        allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
+        allowed_tools=[*_READ_ONLY_TOOLS, *_VERDICT_TOOLS],
         disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
         default_model='sonnet',
         default_budget=2.0,
