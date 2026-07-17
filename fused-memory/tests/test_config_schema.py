@@ -977,3 +977,44 @@ class TestTaskStatusConfig:
         # deployed Γ-flip and tripwires an accidental revert. The pure MODEL
         # default (False) is covered by test_defaults_to_log_mode above.
         assert FusedMemoryConfig().task_status.enforce_transitions is True
+
+
+class TestReconciliationRejectStaleDoneEvidence:
+    """Task 2680 (PRD task gamma): ``reconciliation.reject_stale_done_evidence``
+    shipped default flips ``'warn'`` -> ``'enforce'``.
+
+    The reopen-freshness gate (task 2674, PRD task alpha) rejects a
+    done-write citing PRE-reopen evidence on a task whose
+    ``metadata.reopen_at`` is set (task-1175 clobber shape) only when this
+    knob is ``'enforce'``; in ``'warn'`` mode the same write proceeds and
+    only logs a ``task_status.done_evidence_stale_warn`` census line. Task
+    alpha shipped ``'warn'`` gated on task beta (the orchestrator consumer,
+    ``ProvenanceConflictSink`` + ``StaleEvidenceRejection``) landing first;
+    beta is done (task 2677), so gamma flips the shipped default here. The
+    committed ``fused-memory/config/config.yaml`` does not pin this key, so
+    the schema default IS the effective shipped default -- both the bare
+    model and ``FusedMemoryConfig()`` (which loads that committed config)
+    must agree. See ``reject_stale_done_evidence``'s Field description in
+    schema.py for the full mode contract.
+    """
+
+    def test_defaults_to_enforce_mode(self):
+        assert ReconciliationConfig().reject_stale_done_evidence == 'enforce'
+
+    def test_fused_memory_config_loads_enforce_default(self):
+        # The committed config.yaml does not pin reconciliation.
+        # reject_stale_done_evidence, so FusedMemoryConfig() (which loads
+        # that committed config) surfaces the schema default here -- this
+        # is the interceptor's actual access path
+        # (``cfg.reconciliation.reject_stale_done_evidence`` in
+        # ``_reject_stale_done_evidence_mode``), not just the bare model
+        # covered by test_defaults_to_enforce_mode above.
+        assert FusedMemoryConfig().reconciliation.reject_stale_done_evidence == 'enforce'
+
+    def test_override_opts_out_to_warn_mode(self):
+        cfg = ReconciliationConfig(reject_stale_done_evidence='warn')
+        assert cfg.reject_stale_done_evidence == 'warn'
+
+    def test_invalid_value_rejected(self):
+        with pytest.raises(ValidationError, match='reject_stale_done_evidence'):
+            ReconciliationConfig(reject_stale_done_evidence='sometimes')
