@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -512,7 +513,7 @@ async def test_worker_tm_add_task_failure_marks_ticket_failed(
 
 @pytest.mark.asyncio
 async def test_worker_created_path_emits_journal_event(
-    interceptor_with_store, ticket_store, taskmaster, event_buffer,
+    interceptor_with_store, ticket_store, taskmaster, event_buffer, caplog,
 ):
     """Regression-pin: on create success, exactly one EventType.task_created
     event is journalled with the task_id in its payload.
@@ -539,6 +540,8 @@ async def test_worker_created_path_emits_journal_event(
     with patch.object(
         type(interceptor_with_store), '_get_curator',
         new=AsyncMock(return_value=mock_curator),
+    ), caplog.at_level(
+        logging.ERROR, logger='fused_memory.middleware.task_interceptor',
     ):
         result = await interceptor_with_store.submit_task(
             project_root='/project',
@@ -566,6 +569,21 @@ async def test_worker_created_path_emits_journal_event(
     )
     assert payload.get('operation') == 'add_task', (
         f'task_created event payload must have operation=add_task: {payload}'
+    )
+
+    # The curator mock must fully cover every awaited curator method
+    # _prepare_ticket calls: an incomplete mock (prepare_candidate left as
+    # a non-awaitable MagicMock) makes _prepare_ticket swallow a TypeError
+    # and log it here. That swallowed error is the deterministic,
+    # order-independent signal for the incomplete-mock regression this
+    # test exists to pin.
+    prepare_candidate_errors = [
+        r for r in caplog.records if 'prepare_candidate failed' in r.getMessage()
+    ]
+    assert not prepare_candidate_errors, (
+        f'curator.prepare_candidate must be awaitable and must not raise; '
+        f'got swallowed ERROR records: '
+        f'{[r.getMessage() for r in prepare_candidate_errors]}'
     )
 
 
