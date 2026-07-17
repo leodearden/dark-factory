@@ -214,19 +214,26 @@ routing:
     # implies >=12 steps), so a Rust-shaped plan still upgrades via this
     # rule -- see test_routing_byte_equivalence.py's regression guard and
     # test_routing_theta_plan_shape.py for the full language-agnostic
-    # coverage. One shared rule id per rule covers both roles.
+    # coverage. One shared rule id per rule covers both roles. Both rules'
+    # `set` also raises max_turns to 120 (~50% headroom over the 80-turn
+    # implementer cap) for both implementer and debugger -- the survey
+    # motivating this task found the sonnet implementer hits its 80-turn
+    # cap on 9.2% of runs, and large plans (this rule's population) are
+    # exactly where that cap pressure concentrates.
     - id: large-plan-steps
       match:
         role: [implementer, debugger]
         plan_min_steps: 12
       set:
         model: opus
+        max_turns: 120
     - id: large-plan-modules
       match:
         role: [implementer, debugger]
         plan_min_modules: 3
       set:
         model: opus
+        max_turns: 120
 
 # Models per role
 models:
