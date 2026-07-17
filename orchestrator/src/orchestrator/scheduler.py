@@ -4048,6 +4048,7 @@ class Scheduler:
         external_status_cache: dict[str, str] | None = None,
         external_resolver_failed: bool = False,
         delivered_check_cache: dict[str, bool] | None = None,
+        terminal_dep_records: dict[str, dict] | None = None,
     ) -> tuple[bool, str | None]:
         """Check whether *task* passes all eligibility gates for dispatch.
 
@@ -4080,6 +4081,14 @@ class Scheduler:
         byte-identical to the pre-delivered-check implementation.  The
         ``_park_gc`` call site does NOT pass this param either (same scope
         containment as the external cache).
+
+        *terminal_dep_records* is forwarded to :meth:`_deps_satisfied` as the
+        additive fallback source for a TERMINAL dep missing from
+        *tasks_by_id* (task 2692, δ/ε follow-up — the active-only
+        ``get_tasks`` fetch excludes done/cancelled producers). When ``None``
+        (the default), the fallback is inert — byte-identical to before this
+        param existed. The ``_park_gc`` call site does NOT pass this param
+        either (same scope containment as the external cache).
 
         Returns ``(True, signal_label)`` when all gates pass.
         Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
@@ -4123,6 +4132,7 @@ class Scheduler:
             external_status_cache=external_status_cache,
             external_resolver_failed=external_resolver_failed,
             delivered_check_cache=delivered_check_cache,
+            terminal_dep_records=terminal_dep_records,
         ):
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
