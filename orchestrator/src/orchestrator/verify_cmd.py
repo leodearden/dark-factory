@@ -83,6 +83,21 @@ class VerifyCmd:
 # RECOGNISED-BUT-UNSTRUCTURABLE discussion).
 _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 
+# Genuinely value-taking pytest flags that consume a SEPARATE following
+# token (as opposed to a boolean flag, or a `--flag=value` single token).
+# Used by _split_pytest_args to bind a value flag to its value as an
+# adjacent pair inside base_flags at parse time, so a later base_flags
+# append (apply_pytest_numprocesses, serial_pytest, with_junitxml) can never
+# be inserted between the flag and its value (task 2727). This set must
+# stay CLOSED to only value-taking flags — listing a boolean flag (e.g.
+# -x/-s/-v/-q/-l) here would make the walk swallow the following target
+# token, a silent, worse failure than the stranded-value bug this fixes.
+_PYTEST_VALUE_FLAGS = frozenset({
+    '-k', '-m', '-p', '-o', '-c', '-n', '-W',
+    '--maxfail', '--tb', '--rootdir', '--override-ini',
+    '--deselect', '--ignore', '--ignore-glob',
+})
+
 # Canonical head phrase rendered for each structured ToolKind. CARGO_TEST/
 # CARGO_CLIPPY intentionally exclude this — cargo's rest-tokens are carried
 # unsplit in `targets` (see _parse_single_segment) since cargo's flag grammar
@@ -96,6 +111,37 @@ _TOOL_HEAD: dict[ToolKind, str] = {
     ToolKind.CARGO_CLIPPY: 'cargo clippy',
     ToolKind.NPX: 'npx',
 }
+
+
+def _split_pytest_args(rest: list[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split pytest's remaining tokens into ``(base_flags, targets)``.
+
+    Walks *rest* left-to-right: a token that is a known separate-token value
+    flag (``_PYTEST_VALUE_FLAGS``) is emitted into ``base_flags`` together
+    with its following token (the value), and the walk advances past both —
+    binding the pair contiguously so a later ``base_flags`` append can never
+    land between a flag and its value. Any other dash-prefixed token is
+    classified as a bare flag; everything else is a target. A listed value
+    flag with no following token (malformed/truncated input) falls back to
+    the bare-flag classification rather than indexing past the end.
+    """
+    base_flags: list[str] = []
+    targets: list[str] = []
+    i = 0
+    n = len(rest)
+    while i < n:
+        tok = rest[i]
+        if tok in _PYTEST_VALUE_FLAGS and i + 1 < n:
+            base_flags.append(tok)
+            base_flags.append(rest[i + 1])
+            i += 2
+        elif tok.startswith('-'):
+            base_flags.append(tok)
+            i += 1
+        else:
+            targets.append(tok)
+            i += 1
+    return tuple(base_flags), tuple(targets)
 
 
 def parse_config_command(raw: str) -> VerifyCmd:
@@ -224,6 +270,15 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
         # positionally instead of guessing a flags/targets split.
         base_flags: tuple[str, ...] = ()
         targets: tuple[str, ...] = tuple(rest)
+    elif tool is ToolKind.PYTEST:
+        # Pytest is the only tool whose base_flags-appending mutators
+        # (apply_pytest_numprocesses, serial_pytest, with_junitxml) run
+        # after parse, so it's the only tool where a naive dash-prefix
+        # split's stranded value could later be split from its flag by an
+        # inserted append. RUFF/PYRIGHT/NPX keep the naive split below —
+        # their coincidental round-trip holds since nothing is ever
+        # inserted between their base_flags and targets.
+        base_flags, targets = _split_pytest_args(rest)
     else:
         base_flags = tuple(t for t in rest if t.startswith('-'))
         targets = tuple(t for t in rest if not t.startswith('-'))
@@ -523,11 +578,13 @@ def _is_serial_forced(cmd: VerifyCmd) -> bool:
 
     ``no:xdist`` is checked across both ``base_flags`` and ``targets``: a
     freshly ``serial_pytest``-ed structured command carries the ``-p
-    no:xdist`` pair in ``base_flags``, but once that rendered string is
-    re-parsed at the injection site (verify.py's recovery re-runs render then
-    feed the command back through ``parse_config_command``) the bare
-    ``no:xdist`` value token lands in ``targets`` — so both must be consulted
-    to detect a round-tripped serial command.
+    no:xdist`` pair in ``base_flags``, and since ``_parse_single_segment``
+    binds a separate-token value flag like ``-p`` to its following value at
+    parse time (task 2727), re-parsing that rendered string at the injection
+    site (verify.py's recovery re-runs render then feeds the command back
+    through ``parse_config_command``) keeps ``no:xdist`` in ``base_flags``
+    too — the ``targets`` check is now defensive-only (guards a
+    hand-constructed or pre-fix-shaped ``VerifyCmd``) but harmless to keep.
     """
     if cmd.raw is not None:
         return 'no:xdist' in cmd.raw
