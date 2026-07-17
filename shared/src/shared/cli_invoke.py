@@ -120,7 +120,11 @@ CAP_HIT_RESUME_PROMPT = (
 # Kept separate from CAP_HIT_RESUME_PROMPT because the cause differs
 # (orchestrator restart, not a usage-cap interrupt) and the agent message
 # should stay a plain "continue" rather than mentioning usage limits.
-CRASH_RECOVERY_RESUME_PROMPT = 'continue'
+CRASH_RECOVERY_RESUME_PROMPT = (
+    'You were interrupted by an orchestrator restart. '
+    'Re-check plan.json and current git/worktree state, '
+    'then continue where you left off.'
+)
 
 # The NON_CAP_CLI_ERROR_MARKERS table and its _is_non_cap_cli_error scanner
 # that used to live here have moved to shared.invocation_outcome (task
