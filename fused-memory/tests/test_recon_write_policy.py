@@ -706,6 +706,54 @@ class TestIsTerminalAnnotationAdd:
 
 
 # ---------------------------------------------------------------------------
+# is_terminal_annotation_exempt — single-parse combined form
+# (efficiency amendment, task 2695)
+# ---------------------------------------------------------------------------
+
+
+class TestIsTerminalAnnotationExempt:
+    """Parity checks against the ``is_terminal_annotation_clear(...) or
+    is_terminal_annotation_add(...)`` two-call form it replaces at the
+    Gate 1 call site — not a full re-run of every case in
+    TestIsTerminalAnnotationClear/TestIsTerminalAnnotationAdd, since this
+    function delegates to the exact same :func:`_pure_terminal_annotation_merge`
+    + per-key checks those suites already cover."""
+
+    def test_clear_only_payload_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {'metadata': {'possible_scope_mismatch': None}},
+        ) is True
+
+    def test_add_only_payload_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {'metadata': {'x_foo': 1}},
+        ) is True
+
+    def test_mixed_clearable_and_x_keys_is_false(self):
+        """Parity with the x_-only limitation documented on
+        is_terminal_annotation_add: neither predicate's ALL-keys condition
+        holds for a mixed payload, so the combined form is also False —
+        this is the one case a naive "each key is clearable-or-x_" helper
+        would get wrong (see review discussion, task 2695 amendment)."""
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {'metadata': {'possible_scope_mismatch': None, 'x_foo': 1}},
+        ) is False
+
+    def test_neither_clearable_nor_x_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {'metadata': {'arbitrary': 1}},
+        ) is False
+
+    def test_disqualifying_kwarg_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {'metadata': {'x_foo': 1}, 'title': 'x'},
+        ) is False
+
+    def test_metadata_absent_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_exempt({}) is False
+
+
+# ---------------------------------------------------------------------------
 # X_ANNOTATION_PREFIX <-> shared.task_metadata.parse_metadata consistency
 # (robustness amendment, task 2695)
 # ---------------------------------------------------------------------------

@@ -3796,13 +3796,13 @@ class TaskInterceptor:
                     # rejection, and so does one touching only x_-prefixed
                     # forward-compat annotation keys (the sanctioned
                     # namespace shared.task_metadata.parse_metadata already
-                    # admits silently) — see is_terminal_annotation_add.
-                    # set_task_status is unaffected (Gate 1 is
+                    # admits silently). is_terminal_annotation_exempt is the
+                    # single-parse combined form of is_terminal_annotation_clear
+                    # or is_terminal_annotation_add (efficiency amendment,
+                    # task 2695 — avoids re-coercing the same metadata payload
+                    # twice). set_task_status is unaffected (Gate 1 is
                     # update_task-only).
-                    is_annotation_clear=(
-                        recon_write_policy.is_terminal_annotation_clear(kwargs)
-                        or recon_write_policy.is_terminal_annotation_add(kwargs)
-                    ),
+                    is_annotation_clear=recon_write_policy.is_terminal_annotation_exempt(kwargs),
                 )
                 if verdict.is_rejection:
                     return verdict.to_error_dict()

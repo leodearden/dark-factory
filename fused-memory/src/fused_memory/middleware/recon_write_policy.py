@@ -17,8 +17,9 @@ Three independent early-return gates in :func:`check`:
    ``possible_scope_mismatch`` — task 2684; see
    :func:`is_terminal_annotation_clear`) OR touching only
    :data:`X_ANNOTATION_PREFIX`-prefixed forward-compat annotation keys
-   (task 2695; see :func:`is_terminal_annotation_add`). It never loosens
-   Gates 2/3.
+   (task 2695; see :func:`is_terminal_annotation_add`). Callers should pass
+   :func:`is_terminal_annotation_exempt` — the single-parse combined form of
+   the two predicates. It never loosens Gates 2/3.
 2. ``op == 'set_task_status'`` AND a live workflow is detected for the task
    -> ``ReconLiveWorkflowWriteRejected``.
 3. ``snapshot_token is not None`` AND it disagrees with ``live_status``
@@ -253,8 +254,10 @@ def check(
     ``ReconTerminalWriteRejected``. ``is_annotation_clear`` (task 2684,
     default ``False`` for full backward compatibility) is a non-load-bearing
     exemption: the caller should pass
+    ``is_terminal_annotation_exempt(update_kwargs)`` (equivalently,
     ``is_terminal_annotation_clear(update_kwargs) or
-    is_terminal_annotation_add(update_kwargs)`` so a metadata-only,
+    is_terminal_annotation_add(update_kwargs)``, but parsing the metadata
+    payload only once — task 2695 efficiency amendment) so a metadata-only,
     merge-mode write touching only :data:`CLEARABLE_ANNOTATION_KEYS` (a
     clear) OR only :data:`X_ANNOTATION_PREFIX`-prefixed keys (an add, task
     2695) bypasses this gate. It bypasses Gate 1 ONLY — Gates 2/3 still
@@ -497,3 +500,29 @@ def is_terminal_annotation_add(update_kwargs: dict) -> bool:
     """
     parsed = _pure_terminal_annotation_merge(update_kwargs)
     return parsed is not None and all(key.startswith(X_ANNOTATION_PREFIX) for key in parsed)
+
+
+def is_terminal_annotation_exempt(update_kwargs: dict) -> bool:
+    """Is *update_kwargs* exempt from Gate 1's terminal-write rejection?
+
+    Equivalent to ``is_terminal_annotation_clear(update_kwargs) or
+    is_terminal_annotation_add(update_kwargs)`` — this is the combined form
+    :func:`check`'s ``is_annotation_clear`` argument wants (efficiency
+    amendment, task 2695). Calling the two predicates separately each runs
+    :func:`_pure_terminal_annotation_merge` (and, for JSON-string metadata,
+    a second ``json.loads``) on the SAME payload; this function parses once
+    and derives both the clear and add key-checks from that single result.
+
+    Behavior-identical to the two-call OR form, including the x_-only
+    limitation: a metadata payload mixing a :data:`CLEARABLE_ANNOTATION_KEYS`
+    key with an ``x_``-prefixed key satisfies neither ALL-clearable nor
+    ALL-x_-prefixed, so it is still NOT exempt (see
+    :func:`is_terminal_annotation_add`'s docstring).
+    """
+    parsed = _pure_terminal_annotation_merge(update_kwargs)
+    if parsed is None:
+        return False
+    return (
+        all(key in CLEARABLE_ANNOTATION_KEYS for key in parsed)
+        or all(key.startswith(X_ANNOTATION_PREFIX) for key in parsed)
+    )
