@@ -47,6 +47,7 @@ from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_
 from orchestrator.git_ops import GitOps
 from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.landing_evidence import validate_landing_evidence
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_queue import reconcile_landed_outbox, reconcile_landed_task
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
@@ -7480,71 +7481,20 @@ Output JSON matching the schema. Every task must appear in the output.
         ):
             if await self._branch_is_degenerate(branch, metadata):
                 return False
-            citation = await self.git_ops.find_task_citation_commit(
-                task_id, pattern_template=self.git_ops.config.commit_citation_pattern,
+            # Delegates FIX 2 citation-lineage + FIX 1' effect-present to the
+            # shared helper (task 2678, INV-5) — see
+            # orchestrator.landing_evidence's module docstring for the full
+            # DISCOVERY-mode contract (citation discovery, both-direction
+            # lineage guard, branch-tip-or-citation effect anchor).
+            verdict = await validate_landing_evidence(
+                self.git_ops, task_id, branch,
+                branch_tip_sha=branch_tip_sha,
+                pattern_template=self.git_ops.config.commit_citation_pattern,
             )
-            if citation is None:
-                return False
-            # FIX 2 citation-lineage guard (task 2500): the grep-found
-            # citation must be tied to THIS task's own branch, not merely
-            # match the citation grep pattern. Two shapes legitimately
-            # qualify:
-            #   (a) a WORK commit ON the branch — an ancestor of its tip:
-            #       is_ancestor(citation, branch) is True; or
-            #   (b) THIS branch's OWN no-ff merge commit — the
-            #       ``^Merge task/{tid} into`` subject that
-            #       git_ops.DEFAULT_COMMIT_CITATION_PATTERN deliberately
-            #       matches. find_task_citation_commit returns the MOST
-            #       RECENT match on main, which after a no-ff landing is
-            #       that merge commit; a merge commit is a DESCENDANT of
-            #       the branch tip (the tip is one of its parents), so
-            #       is_ancestor(citation, branch) is False for it while
-            #       is_ancestor(branch, citation) is True. This shape is
-            #       a genuine landing (esc-2500-2: prior orchestrator run
-            #       that merged but crashed before delete/mark-done, or a
-            #       manual `git merge --no-ff task/{tid}`) and must NOT be
-            #       rejected — doing so regressed the pre-diff behavior and
-            #       re-dispatched the task as duplicate work.
-            # An unrelated task's commit that merely matched the grep (e.g.
-            # another task's merge commit — the task 2624 incident shape)
-            # is NEITHER: is_ancestor is False in BOTH directions, so it is
-            # rejected here before any provenance is fabricated.
-            citation_on_branch = await self.git_ops.is_ancestor(citation, branch)
-            if not citation_on_branch and not await self.git_ops.is_ancestor(
-                branch, citation,
-            ):
-                return False
-            # FIX 1 effect-present guard (task 2500): the citation may be a
-            # real, in-lineage work commit that a LATER commit on main
-            # changed — ancestry alone doesn't mean the effect survives at
-            # HEAD. Reject the flip unless the landing's effect still
-            # matches main (or the checked commit is a merge/empty commit,
-            # where path-based revert detection is inapplicable).
-            #
-            # Which sha to check depends on the citation shape established
-            # above (review finding, task 2500 amendment):
-            #   (a) citation_on_branch True — an in-branch WORK commit that
-            #       may be an INTERMEDIATE commit, not the branch's final
-            #       state. A later commit on this SAME branch (still part
-            #       of this landing, since the whole branch is an ancestor
-            #       of main) can legitimately re-touch the citation's paths
-            #       again on the way to the branch's final content —
-            #       checking the citation's own stale snapshot against main
-            #       would false-reject a genuine multi-commit landing.
-            #       Anchor on the branch TIP instead — the actual final
-            #       state this landing put on main.
-            #   (b) citation_on_branch False — shape (b) from above (this
-            #       branch's own no-ff merge commit): keep checking the
-            #       citation directly. Its diff-tree is empty, so the check
-            #       is an intentional no-op (see
-            #       commit_effect_present_in_main's empty-touched-set
-            #       contract) — using branch_tip_sha here would needlessly
-            #       turn a deliberate no-op into a real (redundant) check.
-            effect_check_sha = branch_tip_sha if citation_on_branch else citation
-            if not await self.git_ops.commit_effect_present_in_main(effect_check_sha):
+            if not verdict.accepted:
                 return False
             await self._mark_in_progress_done(
-                task_id, citation,
+                task_id, verdict.evidence_sha,
                 'reconcile: pre-dispatch check found branch already on main',
                 'dispatch-gate-already-on-main',
             )
