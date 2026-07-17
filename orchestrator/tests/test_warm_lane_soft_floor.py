@@ -684,3 +684,92 @@ class TestRunWarmLaneAudit:
         parts = line.split()
         assert '--mount' in parts
         assert parts[parts.index('--mount') + 1] == str(git_ops.worktree_base)
+
+
+@pytest.mark.asyncio
+class TestB10SoftFloorCapstone:
+    """B10 end-to-end capstone (step-13): PRD contract §9.5 boundary test B10.
+
+    Stubs ALL warm-lane scripts (seed + disk-guard + audit) and drives
+    create_worktree() top-to-bottom for a FRESH branch with the hard floor
+    healthy (ε ``check`` => 0) but the soft floor pressured (θ
+    ``check --soft`` => 3): no new divergent lane is allocated, the hard
+    floor is never reached, and the θ defer WARNING journal line is
+    enriched with the α HEADROOM detail.
+    """
+
+    async def test_b10_soft_pressure_defers_without_reaching_hard_floor(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        from orchestrator.git_ops import WarmLaneSoftPressure
+        from orchestrator.warm_lane_pool import LaneState
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+
+        await _add_all_warm_lane_scripts(git_repo)
+        await _add_audit_stub_script(git_repo)
+        headroom = (
+            'HEADROOM resident=1 assigned=1 free=0 reclaimable=0 leaked=0 '
+            'leak_unknown=0 divergent_gib=3 free_gib=777 budget_gib=518'
+        )
+        _set_audit_output(
+            git_repo,
+            'lane=_lane-0 role=lane assigned=ASSIGNED branch=task/NEW '
+            'status=non-terminal recoverable=ORPHAN dirty=clean '
+            'divergent_gib=3 age_min=1 classification=LIVE\n' + headroom + '\n',
+        )
+        # First 'check' (ε hard floor, no --soft) => 0 (healthy, never
+        # reaches exit-75/reclaim). Second 'check --soft' (θ soft floor)
+        # => 3 (soft pressure, between the floors).
+        _write_check_exits(git_repo, [0, 3])
+        config = _make_soft_floor_config(warm_lane_disk_guard=True)
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+            pytest.raises(WarmLaneSoftPressure) as exc_info,
+        ):
+            await git_ops.create_worktree('NEW')
+
+        # (b) no new divergent lane allocated: pool lane stays FREE, no lane dir.
+        assert git_ops.warm_lane_pool is not None
+        lane_dir = git_ops.worktree_base / '_lane-0'
+        assert git_ops.warm_lane_pool.state(lane_dir) == LaneState.FREE, (
+            'Lane-0 must stay FREE — soft-floor defer must not acquire a lane'
+        )
+        assert not lane_dir.exists(), (
+            'No lane dir may be created on the soft-floor defer path'
+        )
+
+        # (c) hard floor never reached: exactly one ε check (rc=0, healthy,
+        # no reclaim) and one θ check --soft (rc=3); no exit-75/reclaim path.
+        check_lines = [
+            line for line in _read_call_log(git_repo) if line.split()[0] == 'check'
+        ]
+        reclaim_lines = [
+            line for line in _read_call_log(git_repo) if line.split()[0] == 'reclaim'
+        ]
+        assert len(check_lines) == 2, f'Expected 2 check invocations; got {check_lines}'
+        assert '--soft' not in check_lines[0], (
+            f'First check must be the ε hard-floor check (no --soft); got {check_lines[0]!r}'
+        )
+        assert '--soft' in check_lines[1], (
+            f'Second check must be the θ soft-floor check; got {check_lines[1]!r}'
+        )
+        assert reclaim_lines == [], (
+            f'Hard floor was healthy (rc=0) — GC reclaim must never run; got {reclaim_lines}'
+        )
+
+        # (d) the θ defer WARNING journal line names the branch, mentions
+        # soft/deferring, AND is enriched verbatim with the α HEADROOM line.
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'NEW' in t and 'soft' in t.lower() and 'deferring' in t.lower()
+            and headroom in t
+            for t in warning_texts
+        ), f'Expected an α-enriched θ defer WARNING; got: {warning_texts}'
+
+        # disposition -> outcome contract: REQUEUE (backpressure), not exit-75,
+        # and never counts against the requeue cap (inv.11).
+        disp = classify_failure(exc_info.value)
+        assert disp.requeue_kind is RequeueKind.REQUEUE
+        assert disp.counts_against_requeue_cap is False
