@@ -103,3 +103,53 @@ class TestNoUrlWarnsNamingRoot:
         assert len(records) == 1
         assert records[0].levelno == logging.WARNING
         assert str(root) in records[0].getMessage()
+
+    def test_portless_canonical_is_authoritative_over_valid_legacy(self, tmp_path, caplog):
+        """A portless canonical config is NOT masked by a valid legacy config.
+
+        The canonical file existing at all makes it authoritative: it must
+        not silently fall through to a legacy spelling's port just because
+        the canonical config itself is misconfigured. This asserts the
+        no-URL warning (naming the root) fires instead of the legacy-
+        fallback warning (naming the project) and the legacy port is
+        ignored entirely.
+        """
+        root = tmp_path / 'myproj'
+        _write_yaml(root / 'dark-factory-orchestrator.yaml', {'escalation': {'host': '127.0.0.1'}})
+        _write_yaml(root / 'orchestrator.yaml', {'escalation': {'port': 9202}})
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _discover_escalation_urls([root])
+
+        assert result == {}
+        records = [r for r in caplog.records if r.name == _LOGGER_NAME]
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert str(root) in records[0].getMessage()
+        assert 'please migrate' not in records[0].getMessage()
+
+
+class TestMultiRootDiscovery:
+    """A single call spans multiple roots with independent outcomes."""
+
+    def test_mixed_resolved_and_unresolved_roots(self, tmp_path, caplog):
+        """One resolvable root and one unresolvable root in the same call.
+
+        The resolvable root's URL is returned; the unresolvable root is
+        simply absent from the result dict, with exactly one no-URL
+        warning — naming only the unresolvable root, not the resolvable one.
+        """
+        good_root = tmp_path / 'goodproj'
+        _write_yaml(good_root / 'dark-factory-orchestrator.yaml', {'escalation': {'port': 9101}})
+        bad_root = tmp_path / 'badproj'
+        bad_root.mkdir()
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _discover_escalation_urls([good_root, bad_root])
+
+        assert result == {'goodproj': 'http://127.0.0.1:9101/mcp'}
+        records = [r for r in caplog.records if r.name == _LOGGER_NAME]
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert str(bad_root) in records[0].getMessage()
+        assert str(good_root) not in records[0].getMessage()

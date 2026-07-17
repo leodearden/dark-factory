@@ -61,14 +61,20 @@ def _read_escalation_url(yaml_path: Path) -> str | None:
 def _discover_root_escalation_url(root: Path) -> str | None:
     """Resolve *root*'s escalation MCP URL, preferring the canonical config name.
 
-    Tries ``_CANONICAL_CONFIG_NAME`` first; if absent, falls back to each of
+    If ``_CANONICAL_CONFIG_NAME`` exists on disk, it is authoritative: its
+    resolved URL (or None, if it exists but has no ``escalation.port``) is
+    returned without ever consulting legacy spellings. A present-but-
+    misconfigured canonical config must not be silently masked by a stale
+    legacy file's port — that would report a "please migrate" nudge instead
+    of the real problem (a broken canonical config). Only when the canonical
+    file is absent entirely does resolution fall back to each of
     ``_LEGACY_CONFIG_NAMES`` in order, logging a WARNING naming the project
     (``root.name``) when a legacy spelling is what resolved it — a nudge to
     migrate. Returns None if no candidate yields a URL.
     """
-    canonical_url = _read_escalation_url(root / _CANONICAL_CONFIG_NAME)
-    if canonical_url is not None:
-        return canonical_url
+    canonical_path = root / _CANONICAL_CONFIG_NAME
+    if canonical_path.is_file():
+        return _read_escalation_url(canonical_path)
     for legacy_name in _LEGACY_CONFIG_NAMES:
         legacy_url = _read_escalation_url(root / legacy_name)
         if legacy_url is not None:
