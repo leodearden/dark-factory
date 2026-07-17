@@ -36,6 +36,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
+from shared.prompt_artifact import PromptArtifactStore, default_artifacts_root
 from shared.task_claimant import compose_claimant_run_id
 from shared.task_metadata import RetryLedger, RoutingDecisionMirror, RoutingState
 from shared.task_statuses import TaskStatus
@@ -966,6 +967,7 @@ class TaskWorkflow:
         resume_session_id: dict | None = None,
         *,
         run_id: str | None = None,
+        prompt_store: PromptArtifactStore | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -981,6 +983,11 @@ class TaskWorkflow:
         self.merge_inflight_registry = merge_inflight_registry
         self.event_store = event_store
         self.cost_store = cost_store
+        # Prompt-artifact loader (shared/prompt_artifact.py, task 2492/2493):
+        # None until injected (tests) or lazily built on first use in
+        # _resolve_role_system_prompt (production — mirrors TaskCurator's
+        # _prompt_store / _resolve_curator_prompt).
+        self._prompt_store = prompt_store
 
         self.machine = WorkflowStateMachine(WorkflowState.PLAN)
         self._phase_cost_at_entry: float = 0.0
@@ -9180,6 +9187,39 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 )
         return spend
 
+    def _resolve_role_system_prompt(self, role: AgentRole, model: str) -> str:
+        """Resolve *role*'s system prompt, applying a live artifact override when opted in.
+
+        Roles with ``prompt_spec is None`` (every role but the reviewer(s),
+        today) return ``role.system_prompt`` verbatim — the loader is never
+        consulted. Roles that opt in (``prompt_spec`` + ``prompt_harness_version``
+        set — see roles.py's ``build_reviewer_prompt_spec``) resolve through
+        :class:`~shared.prompt_artifact.PromptArtifactStore`, keyed on *model*
+        (the router-resolved ``executor_model`` — P-4 of PRD
+        tier1-prompt-optimization) so a pinned artifact is per-model.
+
+        Lazily builds ``self._prompt_store`` from :func:`default_artifacts_root`
+        when no store was injected. :meth:`PromptArtifactStore.resolve` never
+        raises — an absent or unverifiable pin falls back to
+        ``role.prompt_spec.in_code_constant`` — so this call is always
+        fail-safe (mirrors ``TaskCurator._resolve_curator_prompt``).
+        """
+        if role.prompt_spec is None:
+            return role.system_prompt
+        if self._prompt_store is None:
+            root = default_artifacts_root()
+            logger.info(
+                'Task %s [%s]: no prompt_store injected; lazily resolved artifacts '
+                'root to %s (set DARK_FACTORY_PROMPT_ARTIFACTS to override)',
+                self.task_id, role.name, root,
+            )
+            self._prompt_store = PromptArtifactStore(root)
+        return self._prompt_store.resolve(
+            role.prompt_spec,
+            executor_model=model,
+            harness_version=role.prompt_harness_version,
+        ).text
+
     async def _invoke(
         self,
         role: AgentRole,
@@ -9357,7 +9397,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 config_dir=self._config_dir,
                 invoke_fn=invoke_agent,
                 prompt=prompt,
-                system_prompt=role.system_prompt,
+                system_prompt=self._resolve_role_system_prompt(role, model),
                 cwd=cwd,
                 model=model,
                 max_turns=max_turns_val,
