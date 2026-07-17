@@ -38,6 +38,7 @@ from orchestrator.config import (
 )
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.mcp_lifecycle import mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideStore
@@ -58,11 +59,10 @@ if TYPE_CHECKING:
 _INF_SKIP_THRESHOLD: int = 1000
 _GEOMETRIC_SKIP_EMIT_COUNTS: frozenset[int] = frozenset({1, 10, 100, 1000, 10000})
 
-# set_task_status transient-failure retry parameters.  Three attempts with
-# 1.5s, 3s gaps lets the taskmaster child finish a typical reconnect window
-# (~2-4s observed) before giving up.
-_TRANSIENT_RETRIES: int = 3
-_TRANSIENT_BACKOFF_BASE: float = 1.5
+# set_task_status transient-failure retry attempt count and backoff schedule
+# come from the shared orchestrator.fm_retry.fm_retry_backoffs() (task 2706)
+# so this loop spans fm's own restart window instead of a too-small,
+# independently-guessed budget — see orchestrator/src/orchestrator/fm_retry.py.
 
 # Dispatch-admission gate (task 2328, DA3) rate-limit window for the
 # "deferring heavy dispatch" and "PSI unreadable" WARNING logs.  Mirrors
@@ -2139,8 +2139,9 @@ class Scheduler:
         tool wrapper returns ``{'error': 'TimeoutError(...)', 'error_type':
         'TimeoutError'}`` (or similar).  Without this loop the workflow
         would treat the call as successful and proceed, leaving the task
-        stranded in-progress.  Retry up to ``_TRANSIENT_RETRIES`` times
-        with exponential back-off; raise on persistent transient failure
+        stranded in-progress.  Retry using the shared
+        ``orchestrator.fm_retry.fm_retry_backoffs()`` schedule; raise on
+        persistent transient failure
         so callers (notably ``handle_blast_radius_expansion``) can decide
         whether to release locks.
 
@@ -2183,8 +2184,10 @@ class Scheduler:
             )
             return
 
+        backoffs = fm_retry_backoffs()
+        attempts = len(backoffs) + 1
         last_rejection: str | None = None
-        for attempt in range(_TRANSIENT_RETRIES):
+        for attempt in range(attempts):
             try:
                 response = await self.dispatch_tool(
                     'set_task_status', arguments, timeout=15,
@@ -2192,12 +2195,12 @@ class Scheduler:
             except Exception as e:
                 logger.exception(
                     'set_task_status(%s, %s) raised on attempt %d/%d: %s: %s',
-                    task_id, status, attempt + 1, _TRANSIENT_RETRIES,
+                    task_id, status, attempt + 1, attempts,
                     type(e).__name__, e,
                 )
                 last_rejection = f'{type(e).__name__}: {e}'
-                if attempt + 1 < _TRANSIENT_RETRIES:
-                    await asyncio.sleep(_TRANSIENT_BACKOFF_BASE * (2 ** attempt))
+                if attempt < len(backoffs):
+                    await asyncio.sleep(backoffs[attempt])
                 continue
 
             rejection = extract_rejection(response)
@@ -2295,14 +2298,14 @@ class Scheduler:
             logger.info(
                 'set_task_status(%s, %s) transient rejection '
                 '(attempt %d/%d): %s — retrying',
-                task_id, status, attempt + 1, _TRANSIENT_RETRIES, rejection,
+                task_id, status, attempt + 1, attempts, rejection,
             )
-            if attempt + 1 < _TRANSIENT_RETRIES:
-                await asyncio.sleep(_TRANSIENT_BACKOFF_BASE * (2 ** attempt))
+            if attempt < len(backoffs):
+                await asyncio.sleep(backoffs[attempt])
 
         raise RuntimeError(
             f'set_task_status({task_id}, {status}) failed after '
-            f'{_TRANSIENT_RETRIES} transient retries: {last_rejection}'
+            f'{attempts} transient retries: {last_rejection}'
         )
 
     async def set_task_claimant(

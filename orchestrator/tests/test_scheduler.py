@@ -3375,14 +3375,18 @@ class TestSetTaskStatusForwarding:
 
         Fix 3: previously the scheduler logged + returned silently on any
         ``dispatch_tool`` exception, which left tasks stranded in-progress
-        when the fused-memory backend was reconnecting.  We now retry
-        ``_TRANSIENT_RETRIES`` times and raise so callers can decide
-        whether to release locks (handle_blast_radius_expansion) or fall
-        through to the workflow's exception handler (workflow.run).
+        when the fused-memory backend was reconnecting.  We now retry using
+        the shared ``orchestrator.fm_retry.fm_retry_backoffs()`` schedule
+        and raise so callers can decide whether to release locks
+        (handle_blast_radius_expansion) or fall through to the workflow's
+        exception handler (workflow.run).
         """
         import logging as _logging
-        # Tighten retry timing to keep the test fast.
-        monkeypatch.setattr('orchestrator.scheduler._TRANSIENT_BACKOFF_BASE', 0.0)
+        # Fixed 2-element schedule -> 3 attempts, to keep the test fast and
+        # match the old budget's assertions.
+        monkeypatch.setattr(
+            'orchestrator.scheduler.fm_retry_backoffs', lambda *a, **kw: [0.0, 0.0],
+        )
         mock = AsyncMock(side_effect=OSError(2, 'No such file'))
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
         with caplog.at_level(_logging.ERROR, logger='orchestrator.scheduler'), pytest.raises(RuntimeError, match='3 transient retries'):
