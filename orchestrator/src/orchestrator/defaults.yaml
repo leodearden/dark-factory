@@ -198,16 +198,33 @@ routing:
   ladder: [haiku, sonnet, opus]
   per_model_daily_ceiling_usd: {}
   rules:
-    # Transcribes the pre-epsilon _select_model_for_role Rust heuristic
-    # byte-for-byte: implementer/debugger on a plan with >=3 'crates/'
-    # modules and >=12 steps upgrades to opus. One shared rule id covers
-    # both roles -- see test_routing_byte_equivalence.py.
-    - id: rust-large-plan-implementer
+    # Task theta (Phase 3): language-agnostic large-plan upgrade for
+    # implementer/debugger, replacing the retired crates/-only
+    # rust-large-plan-implementer rule. The desired condition is
+    # "plan_min_steps>=12 OR plan_min_modules>=3", but a single rule's
+    # `match` conditions are ANDed (see resolve_route._rule_matches) --
+    # there is no rule-internal OR -- so the OR is expressed as TWO
+    # single-condition rules whose first-match-wins union covers both
+    # triggers. Neither rule sets `module_prefix`, so plan_min_modules
+    # counts ALL module_paths regardless of language (the resolver's
+    # prefix-less `elif` branch) -- large plans in any language upgrade,
+    # not just Rust/`crates/` ones. large-plan-steps is listed first
+    # because ">=12 steps" is the headline signal; it also strictly
+    # subsumes the old Rust shape (>=3 crates/ modules AND >=12 steps
+    # implies >=12 steps), so a Rust-shaped plan still upgrades via this
+    # rule -- see test_routing_byte_equivalence.py's regression guard and
+    # test_routing_theta_plan_shape.py for the full language-agnostic
+    # coverage. One shared rule id per rule covers both roles.
+    - id: large-plan-steps
       match:
         role: [implementer, debugger]
         plan_min_steps: 12
+      set:
+        model: opus
+    - id: large-plan-modules
+      match:
+        role: [implementer, debugger]
         plan_min_modules: 3
-        module_prefix: "crates/"
       set:
         model: opus
 
