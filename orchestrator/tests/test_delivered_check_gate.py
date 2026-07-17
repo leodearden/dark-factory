@@ -29,6 +29,7 @@ from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, Orches
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.event_store import EventType
 from orchestrator.scheduler import (
+    _CONTINUE,
     Scheduler,
     SchedulerCallbacks,
     TickContext,
@@ -378,6 +379,114 @@ class TestDepsSatisfiedDeliveredGate:
             is True
         )
 
+    # --- terminal_dep_records fallback (task 2692 — step-3 RED / step-4 GREEN)
+    #
+    # The active-only get_tasks fetch that seeds tasks_by_id excludes
+    # DONE/CANCELLED producers, so a just-completed dep carrying
+    # metadata.delivered_checks is genuinely ABSENT from tasks_by_id (not
+    # smuggled in like the fixtures above). terminal_dep_records is the
+    # dedicated fallback the scheduler backfills for exactly this case.
+
+    def test_terminal_dep_records_fallback_consulted_when_absent_from_tasks_by_id_cached_false(
+        self, scheduler: Scheduler
+    ):
+        """Dep genuinely absent from tasks_by_id (active-only fetch excluded
+        it) but present in terminal_dep_records — cache=False must still
+        withhold, exactly as if the record had been found in tasks_by_id."""
+        task = self._dependent()
+        dep = self._dep(status='done')
+        status_map = {'20': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, {},
+                delivered_check_cache={'20': False},
+                terminal_dep_records={'20': dep},
+            )
+            is False
+        )
+
+    def test_terminal_dep_records_fallback_consulted_when_absent_from_tasks_by_id_cached_true(
+        self, scheduler: Scheduler
+    ):
+        task = self._dependent()
+        dep = self._dep(status='done')
+        status_map = {'20': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, {},
+                delivered_check_cache={'20': True},
+                terminal_dep_records={'20': dep},
+            )
+            is True
+        )
+
+    def test_terminal_dep_records_fallback_absent_from_cache_not_satisfied(
+        self, scheduler: Scheduler
+    ):
+        """Dep absent from BOTH tasks_by_id and the cache, but present in
+        terminal_dep_records — fail-safe wait (not satisfied), mirroring
+        test_done_dep_checks_absent_from_cache_not_satisfied above."""
+        task = self._dependent()
+        dep = self._dep(status='done')
+        status_map = {'20': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, {},
+                delivered_check_cache={},
+                terminal_dep_records={'20': dep},
+            )
+            is False
+        )
+
+    def test_terminal_dep_records_unset_byte_identical(self, scheduler: Scheduler):
+        """terminal_dep_records omitted (default None): a dep absent from
+        tasks_by_id is simply skipped by the arm — byte-identical to
+        legacy behaviour (no fallback source is consulted at all)."""
+        task = self._dependent()
+        status_map = {'20': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, {}, delivered_check_cache={'20': False}
+            )
+            is True
+        )
+
+    def test_terminal_dep_records_explicit_none_byte_identical(self, scheduler: Scheduler):
+        """Passing terminal_dep_records=None explicitly is identical to
+        omitting it — the fallback stays inert."""
+        task = self._dependent()
+        status_map = {'20': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, {},
+                delivered_check_cache={'20': False},
+                terminal_dep_records=None,
+            )
+            is True
+        )
+
+    def test_terminal_dep_records_fallback_not_consulted_when_dep_already_in_tasks_by_id(
+        self, scheduler: Scheduler
+    ):
+        """When the dep record IS already present in tasks_by_id,
+        terminal_dep_records must never be consulted — tasks_by_id wins.
+        Proven behaviourally: tasks_by_id's record carries checks (so the
+        arm applies and cache=False blocks); terminal_dep_records carries a
+        record for the SAME id with NO checks, which would make the arm a
+        silent no-op (returns True) if it were consulted instead."""
+        task = self._dependent()
+        dep_in_tasks_by_id = self._dep(status='done', with_checks=True)
+        dep_in_terminal_records = self._dep(status='done', with_checks=False)
+        status_map = {'20': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, {'20': dep_in_tasks_by_id},
+                delivered_check_cache={'20': False},
+                terminal_dep_records={'20': dep_in_terminal_records},
+            )
+            is False
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestEligibilityForwardsDeliveredCache (task 2580 — step-7 RED / step-8 GREEN)
@@ -454,6 +563,59 @@ class TestEligibilityForwardsDeliveredCache:
 
         assert result == (True, None)
 
+    # --- terminal_dep_records forwarding (task 2692 — step-5 RED / step-6 GREEN)
+    #
+    # The dep is genuinely absent from tasks_by_id here (unlike the fixtures
+    # above, which smuggle it in directly) — mirroring the real active-only
+    # get_tasks fetch that excludes a done/cancelled producer.
+
+    def test_ineligible_when_terminal_dep_records_fallback_maps_dep_to_false(
+        self, scheduler: Scheduler
+    ):
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'10': task}
+
+        result = scheduler._eligible_for_dispatch(
+            task, '10', status_map, tasks_by_id,
+            delivered_check_cache={'20': False},
+            terminal_dep_records={'20': dep},
+        )
+
+        assert result == (False, None)
+
+    def test_eligible_when_terminal_dep_records_fallback_maps_dep_to_true(
+        self, scheduler: Scheduler
+    ):
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'10': task}
+
+        result = scheduler._eligible_for_dispatch(
+            task, '10', status_map, tasks_by_id,
+            delivered_check_cache={'20': True},
+            terminal_dep_records={'20': dep},
+        )
+
+        assert result == (True, None)
+
+    def test_terminal_dep_records_default_unset_byte_identical(self, scheduler: Scheduler):
+        """Without terminal_dep_records, a dep absent from tasks_by_id is
+        simply skipped by the delivered-check arm — eligible purely off
+        status, byte-identical to legacy behaviour."""
+        task = self._dependent()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'10': task}
+
+        result = scheduler._eligible_for_dispatch(
+            task, '10', status_map, tasks_by_id,
+            delivered_check_cache={'20': False},
+        )
+
+        assert result == (True, None)
+
 
 # ---------------------------------------------------------------------------
 # TestTickContextField (task 2580 — step-7 RED / step-8 GREEN)
@@ -491,6 +653,211 @@ class TestTickContextField:
             tasks=[], status_map={}, tasks_by_id={}, delivered_check_cache=None,
         )
         assert ctx.delivered_check_cache is None
+
+
+# ---------------------------------------------------------------------------
+# TestTerminalDepRecordsField (task 2692 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalDepRecordsField:
+    """``TickContext`` must carry a ``terminal_dep_records`` field defaulting
+    to an empty dict, mirroring ``external_cache`` / ``delivered_check_cache``.
+
+    Populated by ``_phase_backfill_terminal_dep_records`` with fetched
+    TERMINAL dep records that are missing from ``tasks_by_id`` (the
+    active-only ``get_tasks`` fetch excludes done/cancelled producers) —
+    see task 2692's root-cause analysis. Consulted ONLY by the two
+    delivered-check consumers (``_deps_satisfied``,
+    ``_compute_delivered_check_cache``) as a purely additive fallback —
+    never merged into ``tasks_by_id`` itself.
+    """
+
+    def test_terminal_dep_records_field_defaults_empty_dict(self):
+        ctx = TickContext(tasks=[], status_map={}, tasks_by_id={})
+        assert ctx.terminal_dep_records == {}
+
+    def test_terminal_dep_records_field_accepts_constructor_kwarg(self):
+        ctx = TickContext(
+            tasks=[], status_map={}, tasks_by_id={},
+            terminal_dep_records={'20': {'id': '20', 'status': 'done'}},
+        )
+        assert ctx.terminal_dep_records == {'20': {'id': '20', 'status': 'done'}}
+
+    def test_terminal_dep_records_default_not_shared_across_instances(self):
+        """Default factory must not share a mutable default across instances."""
+        ctx1 = TickContext(tasks=[], status_map={}, tasks_by_id={})
+        ctx2 = TickContext(tasks=[], status_map={}, tasks_by_id={})
+        ctx1.terminal_dep_records['x'] = {'id': 'x'}
+        assert ctx2.terminal_dep_records == {}
+
+
+# ---------------------------------------------------------------------------
+# TestPhaseBackfillTerminalDepRecords (task 2692 — step-9 RED / step-10 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestPhaseBackfillTerminalDepRecords:
+    """``Scheduler._phase_backfill_terminal_dep_records`` — the new per-tick
+    phase that fetches TERMINAL dep records missing from ``ctx.tasks_by_id``
+    (the active-only ``get_tasks`` fetch excludes done/cancelled producers)
+    into the dedicated ``ctx.terminal_dep_records`` fallback, via the lean
+    per-id ``get_task`` primitive. Only PENDING tasks' deps are considered,
+    and only deps whose ``status_map`` entry is TERMINAL — everything else
+    must never trigger a fetch (cost containment: the common case pays zero
+    extra cost).
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
+
+    def _dependent(
+        self, task_id: str = '10', dep_id: str = '20', status: str = 'pending'
+    ) -> dict:
+        return {
+            'id': task_id,
+            'status': status,
+            'dependencies': [{'id': dep_id}],
+            'metadata': {},
+        }
+
+    # --- (a) missing terminal dep -> fetched and recorded ------------------
+
+    @pytest.mark.asyncio
+    async def test_missing_terminal_dep_is_fetched_and_recorded(self, scheduler: Scheduler):
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent],
+            status_map={'20': 'done'},
+            tasks_by_id={'10': dependent},  # dep '20' genuinely absent
+        )
+        fetched = {'id': '20', 'status': 'done', 'metadata': {'delivered_checks': []}}
+        scheduler.get_task = AsyncMock(return_value=fetched)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records == {'20': fetched}
+
+    # --- (b) kill switch: delivered_checks.enabled=False -> no fetch -------
+
+    @pytest.mark.asyncio
+    async def test_disabled_kill_switch_skips_fetch(self, scheduler: Scheduler):
+        scheduler.config.delivered_checks.enabled = False
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent], status_map={'20': 'done'}, tasks_by_id={'10': dependent}
+        )
+        scheduler.get_task = AsyncMock(return_value={'id': '20'})
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_not_awaited()
+        assert ctx.terminal_dep_records == {}
+
+    # --- (c) dep already in tasks_by_id -> not "missing", no fetch ---------
+
+    @pytest.mark.asyncio
+    async def test_dep_already_in_tasks_by_id_not_fetched(self, scheduler: Scheduler):
+        dependent = self._dependent()
+        dep = {'id': '20', 'status': 'done', 'metadata': {}}
+        ctx = TickContext(
+            tasks=[dependent],
+            status_map={'20': 'done'},
+            tasks_by_id={'10': dependent, '20': dep},
+        )
+        scheduler.get_task = AsyncMock(return_value={'id': '20', 'should': 'not-be-used'})
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_not_awaited()
+        assert ctx.terminal_dep_records == {}
+
+    # --- (d) no PENDING task references the missing dep -> no fetch --------
+
+    @pytest.mark.asyncio
+    async def test_non_pending_task_missing_terminal_dep_not_fetched(self, scheduler: Scheduler):
+        """Only PENDING tasks' deps are considered — an in-progress task
+        referencing a missing terminal dep must not trigger a fetch."""
+        task = self._dependent(status='in-progress')
+        ctx = TickContext(
+            tasks=[task], status_map={'20': 'done'}, tasks_by_id={'10': task}
+        )
+        scheduler.get_task = AsyncMock(return_value={'id': '20'})
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_not_awaited()
+        assert ctx.terminal_dep_records == {}
+
+    # --- (e) NON-terminal missing dep -> not fetched ------------------------
+
+    @pytest.mark.asyncio
+    async def test_non_terminal_missing_dep_not_fetched(self, scheduler: Scheduler):
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent],
+            status_map={'20': 'pending'},  # missing from tasks_by_id but NOT terminal
+            tasks_by_id={'10': dependent},
+        )
+        scheduler.get_task = AsyncMock(return_value={'id': '20'})
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_not_awaited()
+        assert ctx.terminal_dep_records == {}
+
+    # --- (f) get_task returns None -> dep absent from records, no crash ----
+
+    @pytest.mark.asyncio
+    async def test_get_task_returns_none_dep_absent_no_crash(self, scheduler: Scheduler):
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent], status_map={'20': 'done'}, tasks_by_id={'10': dependent}
+        )
+        scheduler.get_task = AsyncMock(return_value=None)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records == {}
+
+    # --- (g) multiple missing terminal deps -> all fetched, keyed by id ----
+
+    @pytest.mark.asyncio
+    async def test_multiple_missing_terminal_deps_all_fetched(self, scheduler: Scheduler):
+        task_a = self._dependent(task_id='10', dep_id='20')
+        task_b = self._dependent(task_id='11', dep_id='21')
+        ctx = TickContext(
+            tasks=[task_a, task_b],
+            status_map={'20': 'done', '21': 'cancelled'},
+            tasks_by_id={'10': task_a, '11': task_b},
+        )
+        records = {
+            '20': {'id': '20', 'status': 'done', 'metadata': {}},
+            '21': {'id': '21', 'status': 'cancelled', 'metadata': {}},
+        }
+
+        async def _fake_get_task(task_id):
+            return records[task_id]
+
+        scheduler.get_task = AsyncMock(side_effect=_fake_get_task)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        assert scheduler.get_task.await_count == 2
+        assert ctx.terminal_dep_records == records
 
 
 # ---------------------------------------------------------------------------
@@ -1269,6 +1636,73 @@ class TestComputeDeliveredCheckCache:
         assert scheduler._streak_delivered_hold.value('10') == 0
         assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
 
+    # --- terminal_dep_records fallback (task 2692 — step-7 RED / step-8 GREEN)
+    #
+    # Mirrors TestDepsSatisfiedDeliveredGate's terminal_dep_records tests: a
+    # dep genuinely absent from tasks_by_id (the active-only get_tasks fetch
+    # excluded it) but present in terminal_dep_records must still be swept —
+    # checked_deps collects it, the runner evaluates its checks, and the
+    # projection reflects the real outcome.
+
+    @pytest.mark.asyncio
+    async def test_terminal_dep_records_fallback_dep_delivered_projects_true(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        fake_resolve, sha_calls = self._fake_sha('sha1')
+        scheduler._resolve_main_sha = fake_resolve
+        fake_runner, runner_calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'10': task}  # dep genuinely absent — active-only fetch excluded it
+
+        result = await scheduler._compute_delivered_check_cache(
+            [task], status_map, tasks_by_id, terminal_dep_records={'20': dep}
+        )
+
+        assert result == {'20': True}
+        assert sha_calls['n'] == 1
+        assert runner_calls == ['cap-one']
+
+    @pytest.mark.asyncio
+    async def test_terminal_dep_records_fallback_dep_failed_projects_false(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, runner_calls = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'10': task}
+
+        result = await scheduler._compute_delivered_check_cache(
+            [task], status_map, tasks_by_id, terminal_dep_records={'20': dep}
+        )
+
+        assert result == {'20': False}
+        assert runner_calls == ['cap-one']
+
+    @pytest.mark.asyncio
+    async def test_without_terminal_dep_records_dep_absent_from_both_returns_empty(
+        self, scheduler: Scheduler
+    ):
+        """terminal_dep_records omitted (default None): a dep absent from
+        tasks_by_id is simply skipped by the collection loop — byte-identical
+        no-op, exactly like
+        test_no_checked_deps_returns_empty_and_never_resolves_sha."""
+        fake_resolve, sha_calls = self._fake_sha('sha1')
+        scheduler._resolve_main_sha = fake_resolve
+        task = self._dependent()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert result == {}
+        assert sha_calls['n'] == 0
+
 
 # ---------------------------------------------------------------------------
 # TestDeliveredCheckGraceEscalation (task 2583 — step-9 RED / step-10 GREEN)
@@ -1685,3 +2119,170 @@ class TestAcquireNextDeliveredGate:
         assert second is not None and second.task_id == '10', (
             f'Runner recovered → should dispatch; got {second!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestAcquireNextDeliveredGateRealFilteredFetch (task 2692 — step-11 RED / step-12 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestAcquireNextDeliveredGateRealFilteredFetch:
+    """The regression the delta/epsilon follow-up (task 2692) exists to
+    close: ``TestAcquireNextDeliveredGate`` above drives the gate via
+    ``scheduler.get_tasks = AsyncMock(return_value=[dep, dependent])`` —
+    this SMUGGLES the done dep past the real ``ACTIVE_TASK_STATUSES``
+    filter, so it lands in ``tasks_by_id`` regardless of whether the
+    backfill plumbing (``ctx.terminal_dep_records``) actually works.
+
+    These tests instead drive ``acquire_next()`` through a STATUS-HONORING
+    ``get_tasks`` fake that filters its return by the ``statuses=`` kwarg —
+    exactly like the real fused-memory tool. The active fetch then yields
+    ONLY the pending dependent; the done dep is genuinely excluded. Its
+    status arrives via a mocked ``get_statuses`` (the existing
+    ``backfill_dep_status`` phase) and its record via a mocked ``get_task``
+    (the new ``backfill_terminal_dep_records`` phase) — exactly the two
+    real fetches production takes. On baseline (before step-12 wires the
+    new phase into ``_TICK_PHASE_ORDER`` and threads
+    ``terminal_dep_records`` through both consumers) the FAILED-check test
+    below FAILS: the dependent dispatches anyway because the gate is a
+    silent no-op through this path.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=2)
+        scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+        scheduler.finish_startup()
+        return scheduler
+
+    _CHECKS = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+
+    def _dep(self, dep_id: str = '20', status: str = 'done') -> dict:
+        return {
+            'id': dep_id,
+            'status': status,
+            'dependencies': [],
+            'metadata': {'delivered_checks': self._CHECKS},
+        }
+
+    def _dependent(self, tid: str = '10', dep_id: str = '20') -> dict:
+        return {
+            'id': tid,
+            'title': f'Task {tid}',
+            'status': 'pending',
+            'dependencies': [{'id': dep_id}],
+            'metadata': {'files': ['backend']},
+        }
+
+    def _status_honoring_get_tasks(self, *records: dict):
+        """A ``get_tasks`` fake that honors the ``statuses=`` filter kwarg —
+        unlike a plain ``AsyncMock(return_value=...)``, which returns every
+        record regardless of the filter and so smuggles terminal deps past
+        the real active-only fetch."""
+
+        async def _gt(*, statuses=None):
+            xs = list(records)
+            return xs if statuses is None else [t for t in xs if t['status'] in statuses]
+
+        return _gt
+
+    def _held_events(self, scheduler: Scheduler) -> list[tuple[str, dict]]:
+        _event_store = scheduler.event_store
+        assert _event_store is not None
+        return [
+            (evt, data)
+            for evt, data in _event_store.events  # type: ignore[attr-defined]
+            if evt == str(EventType.delivered_check_gate_held)
+        ]
+
+    def _fake_sha(self, sha: str = 'sha1'):
+        async def _resolve():
+            return sha
+
+        return _resolve
+
+    def _fake_runner(self, outcome):
+        """Fake ``run_delivered_check`` returning (or raising) *outcome* for
+        every check it's invoked with."""
+
+        async def _fake(check, *, project_root, ref='main'):
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        return _fake
+
+    # --- (1) phase-order invariant ------------------------------------------
+
+    def test_backfill_terminal_dep_records_placed_between_dep_status_and_gate(self):
+        order = Scheduler._TICK_PHASE_ORDER
+
+        assert 'backfill_terminal_dep_records' in order
+        idx_dep_status = order.index('backfill_dep_status')
+        idx_terminal = order.index('backfill_terminal_dep_records')
+        idx_gate = order.index('delivered_check_gate')
+        idx_build = order.index('build_candidates')
+        idx_pins = order.index('select_pins')
+
+        assert idx_dep_status < idx_terminal < idx_gate
+        assert idx_terminal < idx_build
+        assert idx_terminal < idx_pins
+
+    # --- (2) FAILED withhold: the exact gap δ/ε left ------------------------
+
+    @pytest.mark.asyncio
+    async def test_failed_check_on_genuinely_excluded_dep_withholds(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        dep = self._dep()
+        dependent = self._dependent()
+        scheduler.get_tasks = self._status_honoring_get_tasks(dep, dependent)
+        scheduler.get_statuses = AsyncMock(return_value=({'20': 'done'}, None))
+        scheduler.get_task = AsyncMock(return_value=dep)
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner(DeliveredCheckResult.FAILED),
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, (
+            f'A FAILED delivered check on a dep genuinely excluded from the '
+            f'active-only fetch must still withhold its dependent — the '
+            f'gate must not be a silent no-op through the real dispatch '
+            f'path; got {result!r}'
+        )
+        assert scheduler._streak_delivered_hold.value('10') == 1
+        held = self._held_events(scheduler)
+        assert len(held) == 1
+        _evt, data = held[0]
+        assert data['task_id'] == '10'
+        assert data['data']['detail'] == {
+            'name': 'cap-one', 'dep_id': '20', 'main_sha': 'sha1', 'kind': 'grep',
+        }
+
+    # --- (3) DELIVERED transparency -----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_delivered_check_on_genuinely_excluded_dep_dispatches(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        dep = self._dep()
+        dependent = self._dependent()
+        scheduler.get_tasks = self._status_honoring_get_tasks(dep, dependent)
+        scheduler.get_statuses = AsyncMock(return_value=({'20': 'done'}, None))
+        scheduler.get_task = AsyncMock(return_value=dep)
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner(DeliveredCheckResult.DELIVERED),
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None and result.task_id == '10', (
+            f'A DELIVERED check must dispatch — the gate must stay '
+            f'transparent when the check actually passes; got {result!r}'
+        )
+        assert self._held_events(scheduler) == []
