@@ -516,6 +516,52 @@ class TestStatusPreservationOnResume:
             f'Resume invocation must use IMPLEMENTER role; got {role!r}'
         )
 
+    async def test_scope_violation_resume_granted_files_lock_conflict_requeues(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A granted scope expansion whose lock is held by a sibling task
+        must REQUEUE rather than resume the implementer under a foreign
+        lock — task 2505.
+
+        Before the fix, ``_set_task_scope``'s ``False`` return (lock
+        conflict) was never checked in the resume loop, so the implementer
+        would still be resumed even though the scheduler had already
+        requeued the task to pending on its own conflicting-lock branch.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        queue = EscalationQueue(tmp_path / 'queue')
+        _submit_l0(queue, task_assignment.task_id, category='scope_violation')
+        workflow, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+        )
+        # Sibling holds the additional lock the grant needs.
+        scheduler.blast_radius_result = False
+        workflow._steward_factory = _make_granting_steward(
+            queue, task_assignment.task_id, ['new.py'],
+        )
+        evrl_mock, state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
+        workflow._invoke = invoke_mock  # type: ignore[method-assign]
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.REQUEUED, (
+            f'Expected REQUEUED on a scope-grant lock conflict, got '
+            f'{report.outcome!r}'
+        )
+        assert state['count'] == 1, (
+            '_execute_verify_review_loop must be entered exactly once — no '
+            'resume re-entry once the scope grant hits a lock conflict.'
+        )
+        assert invoke_mock.await_count == 0, (
+            'Implementer must NOT be resumed while the granted file lock '
+            'is held by a sibling task.'
+        )
+
     async def test_already_on_main_short_circuit_runs_before_status_check(
         self, config, git_ops, task_assignment, tmp_path,
     ):
