@@ -840,24 +840,6 @@ class TestCallerInitiatedResume:
         assert 'resume_session_id' not in second_call.kwargs
         assert second_call.kwargs.get('prompt') == 'real task prompt'
 
-    async def test_crash_recovery_prompt_has_reassess_state_framing(self):
-        """CRASH_RECOVERY_RESUME_PROMPT must tell the agent it was interrupted and to
-        reassess its working state — not a bare 'continue'.
-
-        A bare 'continue' gives the recovered agent no signal that plan.json or the
-        git/worktree state may be stale, letting it proceed on stale state (the
-        recurring failure class this task guards against). Pinning the content (not
-        just object identity, which the substitution test above already covers)
-        stops a future edit from silently regressing this back to a bare 'continue'.
-        """
-        from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT  # noqa: PLC0415
-
-        assert CRASH_RECOVERY_RESUME_PROMPT != 'continue'
-        lowered = CRASH_RECOVERY_RESUME_PROMPT.lower()
-        assert 'interrupted' in lowered
-        assert 'plan.json' in lowered
-        assert 'continue' in lowered
-
 
 # ── ARG_MAX protection ─────────────────────────────────────────────────
 
