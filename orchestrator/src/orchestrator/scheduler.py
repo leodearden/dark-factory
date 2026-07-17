@@ -1288,6 +1288,7 @@ class Scheduler:
     # tests/test_scheduler_tick_phases.py.
     _TICK_PHASE_ORDER: tuple[str, ...] = (
         'backfill_dep_status',
+        'backfill_terminal_dep_records',
         'drain_park_eviction',
         'park_gc',
         'stale_sweep',
@@ -5217,7 +5218,8 @@ class Scheduler:
         _pending_tasks = [t for t in ctx.tasks if t.get('status') == 'pending']
         try:
             cache = await self._compute_delivered_check_cache(
-                _pending_tasks, ctx.status_map, ctx.tasks_by_id
+                _pending_tasks, ctx.status_map, ctx.tasks_by_id,
+                terminal_dep_records=ctx.terminal_dep_records,
             )
         except Exception:
             logger.warning(
@@ -5441,6 +5443,7 @@ class Scheduler:
                 external_status_cache=ctx.external_cache,
                 external_resolver_failed=ctx.external_resolver_failed,
                 delivered_check_cache=ctx.delivered_check_cache,
+                terminal_dep_records=ctx.terminal_dep_records,
             )
             if not eligible:
                 continue
@@ -5641,6 +5644,7 @@ class Scheduler:
                     external_status_cache=ctx.external_cache,
                     external_resolver_failed=ctx.external_resolver_failed,
                     delivered_check_cache=ctx.delivered_check_cache,
+                    terminal_dep_records=ctx.terminal_dep_records,
                 )
                 if not eligible:
                     continue
