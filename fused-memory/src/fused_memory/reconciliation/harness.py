@@ -1663,6 +1663,16 @@ class ReconciliationHarness:
         except Exception as e:
             logger.warning(f'release_stale_claims at startup failed: {e}')
 
+        # One-shot: adopt any dead predecessor instance's orphaned 'running'
+        # rows immediately, regardless of age (task 2711 / E6) — before the
+        # age-gated _recover_stale_runs reaper gets its first tick. Guarded
+        # like release_stale_claims above so a recovery hiccup can't crash
+        # harness startup.
+        try:
+            await self._recover_predecessor_runs()
+        except Exception as e:
+            logger.warning(f'_recover_predecessor_runs at startup failed: {e}')
+
         loop_count = 0
         try:
             while True:
