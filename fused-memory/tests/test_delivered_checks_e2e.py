@@ -274,6 +274,96 @@ async def _get_task(server, project_root: Path, task_id: str) -> dict:
     return await _call(server, 'get_task', id=task_id, project_root=str(project_root))
 
 
+class _BackendMcpSession:
+    """Delegating MCP session double: forwards every ``call_tool`` verbatim to
+    the LIVE fused-memory ToolManager (the same ``server._tool_manager
+    .call_tool`` surface ``_call`` above uses), wrapping the raw dict result
+    in the JSON-RPC text-content envelope the scheduler's
+    ``dispatch_tool``/``parse_tool_result`` expects (mirrors
+    ``TwoProjectMcpSession._envelope`` in
+    ``orchestrator/tests/test_cross_project_dispatch_integration.py``).
+
+    Unlike that reference double's in-memory task list, this forwards to the
+    SAME live backend ``commit_planning`` just stamped -- a true closed loop:
+    the scheduler's ``get_tasks``/``get_task``/``get_statuses``/
+    ``set_task_status`` calls all read/write the real SqliteTaskBackend via
+    the real TaskInterceptor, so flip-done and manual re-pend go through the
+    product's own write path exactly like a human operator would.
+    """
+
+    def __init__(self, server) -> None:
+        self._server = server
+        self._request_id = 0
+
+    async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> dict:
+        raw = await self._server._tool_manager.call_tool(name, arguments)
+        self._request_id += 1
+        return {
+            'jsonrpc': '2.0',
+            'id': self._request_id,
+            'result': {'content': [{'type': 'text', 'text': json.dumps(raw)}]},
+        }
+
+
+def _build_harness(
+    project_root: Path, server, escalation_dir: Path, *, grace_cycles: int,
+) -> Harness:
+    """Build a real orchestrator Harness/Scheduler delegating onto the SAME
+    live backend the fused-memory server call site drives, plus a real
+    EscalationQueue -- so the born-at-L2 grace-streak escalation
+    (``Harness._block_and_escalate_delivered_check``) is genuinely filed and
+    read back. Mirrors ``build_harness()`` in
+    test_cross_project_dispatch_integration.py.
+    """
+    config = OrchestratorConfig(project_root=project_root)
+    config.delivered_checks.grace_cycles = grace_cycles
+    harness = Harness(config)
+    # Inject the delegating session into the scheduler dispatch seam.
+    harness.scheduler._mcp_session = _BackendMcpSession(server)
+    # Wire a real EscalationQueue so escalations can be filed and read back.
+    harness._escalation_queue = EscalationQueue(escalation_dir)
+    # run_tick() drives harness.scheduler.acquire_next() directly, bypassing
+    # harness.run()'s startup sweeps -- satisfy the startup gate (task 2235)
+    # the same way those sweeps would.
+    harness.scheduler.finish_startup()
+    return harness
+
+
+async def _run_tick(harness: Harness) -> str | None:
+    """Run one acquire_next() tick; return the dispatched task_id or None.
+
+    Dispatch is OBSERVED through the returned TaskAssignment -- never by
+    reading task storage. This matches the task's "dispatch path" requirement.
+    """
+    assignment = await harness.scheduler.acquire_next()
+    return assignment.task_id if assignment is not None else None
+
+
+async def _flip_status(server, project_root: Path, task_id: str, status: str) -> dict:
+    """Flip a task's status via the product's own set_task_status MCP tool
+    (the same write path a human operator's manual re-pend would use)."""
+    return await _call(
+        server, 'set_task_status',
+        id=task_id, status=status, project_root=str(project_root),
+    )
+
+
+def _l2_for(harness: Harness, task_id: str) -> list:
+    """Return pending born-at-L2 delivered-check escalations for *task_id*.
+
+    Scoped exactly like ``Harness._block_and_escalate_delivered_check``'s own
+    dedupe read (``level=2``, ``agent_role='orchestrator-scheduler'``) so an
+    unrelated open L2 for the same task never masks (or is masked by) this
+    check.
+    """
+    queue = harness._escalation_queue
+    if queue is None:
+        return []
+    return queue.get_by_task(
+        task_id, status='pending', level=2, agent_role='orchestrator-scheduler',
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TestHeadline — rows 1, 4, 5, 6, 3: stamp -> withhold -> escalate -> heal -> dispatch
 # ─────────────────────────────────────────────────────────────────────────────
