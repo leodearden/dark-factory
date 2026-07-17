@@ -215,11 +215,18 @@ routing:
     # rule -- see test_routing_byte_equivalence.py's regression guard and
     # test_routing_theta_plan_shape.py for the full language-agnostic
     # coverage. One shared rule id per rule covers both roles. Both rules'
-    # `set` also raises max_turns to 120 (~50% headroom over the 80-turn
-    # implementer cap) for both implementer and debugger -- the survey
-    # motivating this task found the sonnet implementer hits its 80-turn
-    # cap on 9.2% of runs, and large plans (this rule's population) are
-    # exactly where that cap pressure concentrates.
+    # `set` also raises max_turns to 120 for BOTH matched roles,
+    # deliberately -- headroom differs by role because their baseline
+    # `max_turns` differs: implementer 80->120 is ~50% headroom (the
+    # survey motivating this task found the sonnet implementer hits its
+    # 80-turn cap on 9.2% of runs, and large plans -- this rule's
+    # population -- are exactly where that cap pressure concentrates);
+    # debugger 50->120 is a larger ~140% jump, applied on the same
+    # rationale extended to debugger now that large-plan debugger runs
+    # also resolve to opus (see plan.json's max_turns design decision) --
+    # there is no debugger-specific cap-pressure figure from the survey,
+    # so the larger relative jump is a deliberate choice to share one
+    # 120-turn ceiling across both roles rather than a measured need.
     - id: large-plan-steps
       match:
         role: [implementer, debugger]
