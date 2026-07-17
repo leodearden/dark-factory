@@ -581,6 +581,130 @@ class TestIsTerminalAnnotationClear:
 
 
 # ---------------------------------------------------------------------------
+# is_terminal_annotation_add
+# ---------------------------------------------------------------------------
+
+
+class TestIsTerminalAnnotationAdd:
+    # -- positive: exemption applies ---------------------------------------
+
+    def test_single_x_key_default_mode_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1}},
+        ) is True
+
+    def test_incident_two_key_payload_is_true(self):
+        """The exact incident payload: ADD of x_refile_superseded_by /
+        x_reopen_abandoned_reason to done task 1175."""
+        assert recon_write_policy.is_terminal_annotation_add(
+            {
+                'metadata': {
+                    'x_refile_superseded_by': 'task-2431',
+                    'x_reopen_abandoned_reason': 'superseded',
+                },
+            },
+        ) is True
+
+    def test_x_key_via_json_string_metadata_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': '{"x_foo": {"a": 1}}'},
+        ) is True
+
+    def test_explicit_merge_mode_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {
+                'metadata': {'x_foo': 1},
+                'metadata_mode': 'merge',
+            },
+        ) is True
+
+    def test_tag_present_is_still_true(self):
+        """`tag` selects the tag-scoped row (addressing); it is never itself
+        written, so it is not a content mutation."""
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1}, 'tag': 'master'},
+        ) is True
+
+    # -- negative: task-content fields disqualify ---------------------------
+
+    def test_title_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1}, 'title': 'x'},
+        ) is False
+
+    # -- negative: unrecognized kwargs fail closed (robustness amendment) ---
+
+    def test_unrecognized_future_kwarg_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1}, 'owner': 'alice'},
+        ) is False
+
+    # -- negative: non-x_ metadata keys --------------------------------------
+
+    def test_mixed_with_load_bearing_files_key_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1, 'files': ['a/b.py']}},
+        ) is False
+
+    def test_mixed_with_done_provenance_key_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1, 'done_provenance': {'kind': 'merged'}}},
+        ) is False
+
+    def test_possible_scope_mismatch_alone_is_false(self):
+        """Clearable but non-x_ — the add predicate is x_-only. Clearing
+        possible_scope_mismatch is is_terminal_annotation_clear's job."""
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'possible_scope_mismatch': None}},
+        ) is False
+
+    def test_arbitrary_non_x_key_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'arbitrary': 1}},
+        ) is False
+
+    # -- negative: non-merge modes -------------------------------------------
+
+    def test_metadata_mode_replace_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {
+                'metadata': {'x_foo': 1},
+                'metadata_mode': 'replace',
+            },
+        ) is False
+
+    def test_append_true_additive_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1}, 'append': True},
+        ) is False
+
+    def test_append_false_replace_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1}, 'append': False},
+        ) is False
+
+    # -- negative: absent / empty / unparseable metadata ---------------------
+
+    def test_metadata_absent_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add({}) is False
+
+    def test_metadata_none_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add({'metadata': None}) is False
+
+    def test_metadata_empty_dict_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add({'metadata': {}}) is False
+
+    def test_metadata_non_dict_int_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add({'metadata': 42}) is False
+
+    def test_metadata_json_list_string_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add({'metadata': '[1,2]'}) is False
+
+    def test_metadata_unparseable_string_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add({'metadata': 'not json'}) is False
+
+
+# ---------------------------------------------------------------------------
 # Interceptor boundary fixtures (mirrors test_task_write_agent_id.py)
 # ---------------------------------------------------------------------------
 
