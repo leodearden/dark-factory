@@ -195,6 +195,37 @@ class TestValidateLandingEvidenceDiscoveryMode:
         assert verdict.probe['effect_check_sha'] == branch_tip_sha
         assert verdict.probe['reason'] == 'ok'
 
+    async def test_citation_on_branch_with_no_branch_tip_falls_back_to_citation(
+        self,
+    ) -> None:
+        """(g) Defensive branch: citation_on_branch True but branch_tip_sha
+        is None (a DISCOVERY caller omitted it despite the citation being an
+        in-branch work commit) -> the guard ``citation_on_branch and
+        branch_tip_sha is not None`` does not hold, so effect_check_sha
+        falls back to the citation itself rather than passing None through
+        to commit_effect_present_in_main. Pins the one branch where the
+        helper's guard diverges from the original harness inline shape
+        (``branch_tip_sha if citation_on_branch else citation``), which
+        would have passed None straight through (review finding, task 2678
+        amendment).
+        """
+        branch = 'task/42'
+        citation_sha = 'a' * 40
+        git_ops = _git_ops(
+            citation=citation_sha,
+            is_ancestor_map={(citation_sha, branch): True},
+            effect_present=True,
+        )
+
+        verdict = await validate_landing_evidence(
+            git_ops, '42', branch, branch_tip_sha=None,
+        )
+
+        assert verdict.accepted is True
+        assert verdict.evidence_sha == citation_sha
+        git_ops.commit_effect_present_in_main.assert_awaited_once_with(citation_sha)
+        assert verdict.probe['effect_check_sha'] == citation_sha
+
 
 @pytest.mark.asyncio
 class TestValidateLandingEvidenceCandidateMode:
