@@ -35,6 +35,8 @@ path.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 from pydantic import ValidationError
 
@@ -136,3 +138,79 @@ class TestSpeculationProbeConfigReloadDisposition:
             f'speculation_probe.{leaf!r} is expected to be green-tier reloadable '
             f'but is missing from RELOADABLE_FIELDS'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED / step-4 GREEN: select_probe_depth() core policy
+# ---------------------------------------------------------------------------
+
+
+class TestSelectProbeDepthByteIdenticalAtZero:
+    """probe_fraction<=0.0 -> None unconditionally (byte-identical guarantee).
+
+    Availability/suppression args are deliberately varied/inert-favorable
+    (huge available_built_depth, None fail rate) to prove the fraction<=0
+    short-circuit alone is what drives the None result.
+
+    RED until step-4 GREEN adds select_probe_depth().
+    """
+
+    @pytest.mark.parametrize('round_index', list(range(21)))
+    def test_zero_fraction_always_none(self, round_index):
+        from orchestrator.merge_queue import select_probe_depth
+
+        result = select_probe_depth(
+            probe_fraction=0.0,
+            probe_depths=[2, 3, 5, 8],
+            round_index=round_index,
+            available_built_depth=99,
+            recent_fail_rate=None,
+            suppress_flake_rate=0.30,
+        )
+        assert result is None
+
+
+class TestSelectProbeDepthFrequencyAndCycling:
+    """probe_fraction=0.1 fires <= ceil(fraction * N) times over N rounds and
+    cycles through probe_depths in order (full coverage of all depths).
+
+    Availability/suppression guards are kept inert here (huge
+    available_built_depth, None recent_fail_rate) so only the
+    frequency/cycling behaviour is exercised.
+
+    RED until step-4 GREEN adds select_probe_depth().
+    """
+
+    def test_frequency_bounded_and_depths_cycle_in_order(self):
+        from orchestrator.merge_queue import select_probe_depth
+
+        probe_depths = [2, 3, 5, 8]
+        n_rounds = 100
+        results = [
+            select_probe_depth(
+                probe_fraction=0.1,
+                probe_depths=probe_depths,
+                round_index=i,
+                available_built_depth=99,
+                recent_fail_rate=None,
+                suppress_flake_rate=0.30,
+            )
+            for i in range(n_rounds)
+        ]
+        fired = [d for d in results if d is not None]
+
+        # Frequency bound: probe_fraction is an upper bound on firing rate.
+        assert len(fired) <= math.ceil(n_rounds * 0.1)
+        assert len(fired) > 0, 'expected at least one probe round to fire'
+
+        # Every non-None result is a genuine probe_depths member.
+        assert all(d in probe_depths for d in fired)
+
+        # Cycling coverage: consecutive probes advance through probe_depths
+        # in order, so with >= len(probe_depths) firings every depth appears.
+        assert set(fired) == set(probe_depths)
+
+        # Order check: the first 4 firings visit probe_depths in sequence
+        # (period=10 at fraction=0.1, so firings land at round_index
+        # 0,10,20,... -- probe_index advances by 1 each firing).
+        assert fired[:4] == probe_depths
