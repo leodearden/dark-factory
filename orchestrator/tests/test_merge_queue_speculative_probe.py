@@ -35,7 +35,10 @@ path.
 
 from __future__ import annotations
 
+import asyncio
+import collections
 import math
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
@@ -45,6 +48,7 @@ from orchestrator.config import (
     OrchestratorConfig,
     SpeculationProbeConfig,
 )
+from orchestrator.merge_queue import SpeculativeMergeWorker
 
 # ---------------------------------------------------------------------------
 # step-1 RED / step-2 GREEN: SpeculationProbeConfig
@@ -364,3 +368,75 @@ class TestSelectProbeDepthFlakeSuppression:
             suppress_flake_rate=0.30,
         )
         assert result == 2
+
+
+# ---------------------------------------------------------------------------
+# step-9 RED / step-10 GREEN: SpeculativeMergeWorker rolling per-verify FAIL
+# rate (_record_verify_outcome / _recent_verify_fail_rate)
+# ---------------------------------------------------------------------------
+
+
+def _make_bare_worker() -> SpeculativeMergeWorker:
+    """Build a bare SpeculativeMergeWorker for pure unit tests.
+
+    Copied from test_merge_queue_depth_telemetry.py's ``_make_bare_worker``
+    (per-file duplication convention -- see that module's docstring). No
+    event loop or real git_ops required.
+    """
+    return SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
+
+
+class TestRecentVerifyFailRate:
+    """SpeculativeMergeWorker._record_verify_outcome() /
+    _recent_verify_fail_rate() -- the rolling per-verify FAIL-rate window
+    feeding select_probe_depth()'s suppression guard (step-7/8 above).
+
+    RED until step-10 GREEN adds the bounded deque + these two methods.
+    """
+
+    def test_no_outcomes_recorded_returns_none(self):
+        """A freshly-started worker has no flake signal yet -- None, not
+        0.0 (select_probe_depth() treats a None rate as "do not suppress").
+        """
+        worker = _make_bare_worker()
+        assert worker._recent_verify_fail_rate() is None
+
+    def test_all_pass_returns_zero(self):
+        worker = _make_bare_worker()
+        for _ in range(5):
+            worker._record_verify_outcome(True)
+        assert worker._recent_verify_fail_rate() == 0.0
+
+    def test_all_fail_returns_one(self):
+        worker = _make_bare_worker()
+        for _ in range(4):
+            worker._record_verify_outcome(False)
+        assert worker._recent_verify_fail_rate() == 1.0
+
+    def test_mixed_outcomes_returns_fails_over_total(self):
+        worker = _make_bare_worker()
+        for passed in [True, True, False, True, False]:  # 2 fail / 5 total
+            worker._record_verify_outcome(passed)
+        assert worker._recent_verify_fail_rate() == pytest.approx(2 / 5)
+
+    def test_window_is_bounded_to_class_constant(self):
+        worker = _make_bare_worker()
+        assert (
+            worker._recent_verify_outcomes.maxlen
+            == SpeculativeMergeWorker.RECENT_VERIFY_OUTCOME_WINDOW
+        )
+
+    def test_window_bounded_oldest_evicted(self):
+        """Recording beyond the window bound evicts the oldest outcomes --
+        the rate reflects only the most recent ones (not a lifetime
+        average), so a worker's flake signal tracks CURRENT thrash, not
+        ancient history.
+        """
+        worker = _make_bare_worker()
+        worker._recent_verify_outcomes = collections.deque(maxlen=3)
+        for passed in [False, False, False]:  # would-be rate 1.0
+            worker._record_verify_outcome(passed)
+        assert worker._recent_verify_fail_rate() == 1.0
+        for passed in [True, True, True]:  # evicts all 3 fails
+            worker._record_verify_outcome(passed)
+        assert worker._recent_verify_fail_rate() == 0.0
