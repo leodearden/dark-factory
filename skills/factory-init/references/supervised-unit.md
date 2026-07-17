@@ -13,7 +13,7 @@ An orchestrator started against a task tree with **no `pending` task** exits wit
 
 ## Layer 1 — the unit (makes it always-on)
 
-Concrete file (not templated — the `scripts/orchestrator-*.service` files are `cp`'d verbatim by `setup-host.sh`, not `sed`-rendered). Model on `scripts/orchestrator-reify.service` / `orchestrator-autopilot-video.service`. Placeholders: `<NAME>` = the project's hyphenated name (e.g. `my-solar-challenge`), `<DESC>` a human label, `<DF>` = dark-factory root, `<CONFIG>` = `<target>/orchestrator.yaml`.
+Concrete file (not templated — the `scripts/orchestrator-*.service` files are `cp`'d verbatim by `setup-host.sh`, not `sed`-rendered). Model on `scripts/orchestrator-reify.service` / `orchestrator-autopilot-video.service`. Placeholders: `<NAME>` = the project's hyphenated name (e.g. `my-solar-challenge`), `<DESC>` a human label, `<DF>` = dark-factory root, `<CONFIG>` = `<target>/dark-factory-orchestrator.yaml`.
 
 ```ini
 [Unit]

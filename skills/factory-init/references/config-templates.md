@@ -9,7 +9,7 @@ Placeholders:
 
 ---
 
-## orchestrator.yaml
+## dark-factory-orchestrator.yaml
 
 Modelled on the existing project configs (reify, dark-factory). Only `project_root`, `fused_memory.project_id`, the verify commands, and `escalation.port` are strictly required; the rest are sensible, explicit defaults worth writing so the file is self-documenting.
 
@@ -45,7 +45,7 @@ git:
   worktree_dir: ".worktrees"
 ```
 
-Add concurrency / model overrides (`max_concurrent_tasks`, `lock_depth`, `max_turns`, …) only if the project needs them — the package defaults cover most cases. The three existing configs (`reify/orchestrator.yaml`, `dark-factory/orchestrator/config.yaml`, `autopilot-video/orchestrator-config.yaml`) are worked examples.
+Add concurrency / model overrides (`max_concurrent_tasks`, `lock_depth`, `max_turns`, …) only if the project needs them — the package defaults cover most cases. The three existing configs (`reify/dark-factory-orchestrator.yaml`, `dark-factory/dark-factory-orchestrator.yaml`, `autopilot-video/dark-factory-orchestrator.yaml`) are worked examples.
 
 ### Verify-command cookbook
 
@@ -94,8 +94,8 @@ Add `playwright` (copy the stdio block from `dark-factory/.mcp.json`) only if th
 # the dark-factory orchestrator targets this project.
 #
 # Without direnv installed, this file is inert — pass
-# --config <TARGET>/orchestrator.yaml explicitly instead.
-export ORCH_CONFIG_PATH="<TARGET>/orchestrator.yaml"
+# --config <TARGET>/dark-factory-orchestrator.yaml explicitly instead.
+export ORCH_CONFIG_PATH="<TARGET>/dark-factory-orchestrator.yaml"
 ```
 
 Always the absolute path. After writing, if direnv is installed, `cd <TARGET> && direnv allow`. **Never** set `ORCH_CONFIG_PATH` globally in `~/.bashrc` — that re-introduces the silent cross-project bug. Per-directory (direnv) or per-invocation (`--config`) only.
@@ -134,7 +134,7 @@ This project is a dark-factory orchestrator target.
   `project_root: "<TARGET>"` — never edit task state directly.
 - Write-tag memory operations with `project_id: "<PROJECT_ID>"` and a
   descriptive `agent_id`.
-- Config: `orchestrator.yaml` (+ `.mcp.json`, `.envrc`) at the repo root.
+- Config: `dark-factory-orchestrator.yaml` (+ `.mcp.json`, `.envrc`) at the repo root.
 ```
 
 ---

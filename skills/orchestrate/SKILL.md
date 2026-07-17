@@ -41,7 +41,8 @@ echo "${ORCH_CONFIG_PATH:-unset}"
 If unset, find the config file in the target project. Filenames vary across projects (no auto-discovery — every project chose its own name); check all common locations:
 
 ```bash
-ls "$TARGET_PROJECT"/orchestrator.yaml \
+ls "$TARGET_PROJECT"/dark-factory-orchestrator.yaml \
+   "$TARGET_PROJECT"/orchestrator.yaml \
    "$TARGET_PROJECT"/orchestrator-config.yaml \
    "$TARGET_PROJECT"/config.yaml \
    "$TARGET_PROJECT"/orchestrator/config.yaml 2>/dev/null
@@ -51,7 +52,7 @@ Known locations for the three current projects:
 
 | Project | TARGET_CONFIG |
 |---------|---------------|
-| dark-factory | `/home/leo/src/dark-factory/orchestrator/config.yaml` |
+| dark-factory | `/home/leo/src/dark-factory/dark-factory-orchestrator.yaml` |
 | reify | `/home/leo/src/reify/orchestrator.yaml` |
 | autopilot-video | `/home/leo/src/autopilot-video/orchestrator-config.yaml` |
 

@@ -14,6 +14,15 @@ top-level dirs: `dashboard/` — web UI for task/escalation state;
 in-flight/past work; `docs/` — reference docs (see `docs/legibility/` for
 the confusion codebook).
 
+Every project targeted by Dark Factory — this repo included — must expose
+its top-level orchestrator config at
+`<project_root>/dark-factory-orchestrator.yaml`. That is the canonical,
+required filename: it's what the dashboard's escalation-URL discovery
+(`_discover_escalation_urls`) keys on. Legacy spellings (`orchestrator.yaml`,
+`orchestrator-config.yaml`, `orchestrator/config.yaml`) are honored only as
+a discovery fallback for not-yet-migrated projects, not a supported choice
+for new ones.
+
 ## Prerequisites
 
 ```bash

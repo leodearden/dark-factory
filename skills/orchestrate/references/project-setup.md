@@ -26,15 +26,15 @@ Both forms behave identically. When both are set, `--config` wins. If neither is
 
 | Project | Config file | `project_id` | `project_root` |
 |---------|------------|--------------|----------------|
-| dark-factory | `/home/leo/src/dark-factory/orchestrator/config.yaml` | `dark_factory` | `/home/leo/src/dark-factory` |
+| dark-factory | `/home/leo/src/dark-factory/dark-factory-orchestrator.yaml` | `dark_factory` | `/home/leo/src/dark-factory` |
 | reify | `/home/leo/src/reify/orchestrator.yaml` | `reify` | `/home/leo/src/reify` |
 | autopilot-video | `/home/leo/src/autopilot-video/orchestrator-config.yaml` | `autopilot_video` | `/home/leo/src/autopilot-video` |
 
-Note the inconsistent filenames — each project chose its own. There is no convention enforced; the `--config` flag (or `ORCH_CONFIG_PATH`) names the file explicitly so the inconsistency doesn't matter operationally.
+`dark-factory-orchestrator.yaml` (used above by dark-factory) is now the canonical, required top-level config filename for any orchestrator-targeted project — it's the name the dashboard's escalation-URL discovery keys on, and any new project should use it (see "Setting up a new project" below). reify and autopilot-video above still show their historical filenames; that's fine for the orchestrator *binary*, since the `--config` flag (or `ORCH_CONFIG_PATH`) always names the file explicitly — but a non-canonical name is only picked up by dashboard discovery's legacy fallback (which logs a nudge warning) instead of directly.
 
 ## Setting up a new project
 
-1. **Pick a config filename.** Anything works — `orchestrator.yaml`, `orchestrator-config.yaml`, `config.yaml`, etc. — since the orchestrator never auto-discovers it, the name has no constraint. Convention: `orchestrator.yaml` at the repo root.
+1. **Name the config file `dark-factory-orchestrator.yaml`, at the repo root.** This is the canonical, required filename — it's what the dashboard's escalation-URL discovery keys on. The orchestrator binary itself never auto-discovers the file (`--config`/`ORCH_CONFIG_PATH` always name it explicitly), but only the canonical name is picked up by dashboard discovery without a legacy-fallback warning.
 
 2. **Write the minimum required keys**:
    ```yaml
@@ -60,7 +60,7 @@ Note the inconsistent filenames — each project chose its own. There is no conv
    ```bash
    cd /home/leo/src/dark-factory
    uv run --project orchestrator orchestrator status \
-       --config /absolute/path/to/your/project/orchestrator.yaml
+       --config /absolute/path/to/your/project/dark-factory-orchestrator.yaml
    ```
    Expect to see the project's task tree (or "No tasks found." for a freshly-seeded project).
 

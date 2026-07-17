@@ -17,7 +17,7 @@ Hold this end-state in mind; every stage moves toward it:
 2. The target is a git repo (the orchestrator branches task worktrees from `main` — no repo, no worktrees).
 3. A canonical `project_id` is chosen — lowercase, **no hyphens** — and pinned where the directory name would otherwise disagree with it.
 4. A unique escalation port is chosen and recorded.
-5. The target repo contains `orchestrator.yaml`, `.mcp.json`, `.envrc`, a `.gitignore` covering orchestrator scratch dirs, a `.jcodemunch.jsonc` indexer config, a `.claude/settings.json` with the `BASH_MAX_TIMEOUT_MS` env (escalation-watcher waits need it), and (where needed) a `CLAUDE.md` project_id pin.
+5. The target repo contains `dark-factory-orchestrator.yaml`, `.mcp.json`, `.envrc`, a `.gitignore` covering orchestrator scratch dirs, a `.jcodemunch.jsonc` indexer config, a `.claude/settings.json` with the `BASH_MAX_TIMEOUT_MS` env (escalation-watcher waits need it), and (where needed) a `CLAUDE.md` project_id pin.
 6. The project root is registered in `DASHBOARD_KNOWN_PROJECT_ROOTS` (reconciliation, restarted + verified — **before any task is queued**) and added to the `jcodemunch-watcher` `--repos` list (re-indexed).
 7. The right next step is launched: existing code → `/spawn /review-briefing` then `/spawn /review` then *offer* `/spawn /prd`; greenfield → a goals discussion, then `/spawn /prd` run 1–5× serially to queue the first task batch.
 
@@ -66,9 +66,9 @@ It reads the known project roots (from the live fused-memory unit and `/home/leo
 
 Exact templates, the verify-command cookbook, and merge-don't-clobber guidance live in **`references/config-templates.md`** — read it before writing. In brief, create/merge in the target repo:
 
-- **`orchestrator.yaml`** — `project_root`, `fused_memory{project_id, url: http://127.0.0.1:8002}`, `escalation{queue_dir: data/escalations, port: <chosen>}`, a `git` block, and `test_command`/`lint_command`/`type_check_command` matched to the detected stack. Detect the stack from the repo (pyproject → pytest/mypy/ruff; Cargo.toml → cargo; package.json → npm/eslint/tsc) and **confirm the commands with the user** — especially when a linter or type-checker isn't configured. Prefer a documented no-op (`"true"`) over a command that will always fail, and say why in a comment.
-- **`.mcp.json`** — `fused-memory` → `8002`, `escalation` → the chosen port. The escalation URL **must** match `orchestrator.yaml` so interactive sessions and the orchestrator share one server. Add `playwright` if the project has a browser surface.
-- **`.envrc`** — `export ORCH_CONFIG_PATH="<absolute path to orchestrator.yaml>"`. direnv may not be installed (don't auto-install — offer it); without direnv this file is inert and the orchestrator needs `--config` explicitly.
+- **`dark-factory-orchestrator.yaml`** — `project_root`, `fused_memory{project_id, url: http://127.0.0.1:8002}`, `escalation{queue_dir: data/escalations, port: <chosen>}`, a `git` block, and `test_command`/`lint_command`/`type_check_command` matched to the detected stack. Detect the stack from the repo (pyproject → pytest/mypy/ruff; Cargo.toml → cargo; package.json → npm/eslint/tsc) and **confirm the commands with the user** — especially when a linter or type-checker isn't configured. Prefer a documented no-op (`"true"`) over a command that will always fail, and say why in a comment.
+- **`.mcp.json`** — `fused-memory` → `8002`, `escalation` → the chosen port. The escalation URL **must** match `dark-factory-orchestrator.yaml` so interactive sessions and the orchestrator share one server. Add `playwright` if the project has a browser surface.
+- **`.envrc`** — `export ORCH_CONFIG_PATH="<absolute path to dark-factory-orchestrator.yaml>"`. direnv may not be installed (don't auto-install — offer it); without direnv this file is inert and the orchestrator needs `--config` explicitly.
 - **`.gitignore`** — ensure `.worktrees/`, `.task/`, `.taskmaster/`, `data/escalations/`, `data/queue/`, and `data/reconciliation/` are ignored. `.task/` is critical: if it ever lands on `main` it contaminates every future worktree. `data/queue/` and `data/reconciliation/` hold the managed fused-memory server's runtime SQLite state (write_queue.db, reconciliation.db, tickets.db); if tracked, that state dirties the tree on every write, tripping the startup dirty-tree-guard and poisoning warm-lane GC (task 2439). Merge into any existing `.gitignore` rather than overwriting.
 - **`CLAUDE.md`** — if a project_id pin is needed (hyphenated dir), add it plus the dark-factory routing conventions (route all task ops through fused-memory MCP with `project_root=<target>`; write-tag with `project_id=<id>`). Merge into an existing `CLAUDE.md`, never clobber it.
 - **`.jcodemunch.jsonc`** — the per-project code-indexer config (languages, ignore patterns) so the orchestrator's agents get structured code retrieval over this repo. Detect the language(s) from the repo. **Crucial:** add the project's own heavy dirs to `extra_ignore_patterns` — especially a non-dotfile virtualenv like `venv/`, which the *global* ignore list (`~/.code-index/config.jsonc`, which only knows `.venv/`) won't catch, so the indexer would otherwise crawl thousands of installed library files.
@@ -78,7 +78,7 @@ Exact templates, the verify-command cookbook, and merge-don't-clobber guidance l
 **Validate before registering.** From the dark-factory repo, run a status check against the new config:
 
 ```bash
-cd <dark-factory> && uv run --project orchestrator orchestrator status --config <target>/orchestrator.yaml
+cd <dark-factory> && uv run --project orchestrator orchestrator status --config <target>/dark-factory-orchestrator.yaml
 ```
 
 Expect "No tasks found." (or an empty tree) — *not* a config error. This confirms the YAML parses and satisfies the loader before you touch the shared service.
@@ -124,11 +124,11 @@ Decide whether the repo already has substantive source (real modules under `src/
 
 Only if the user wants the project in the **always-on autonomous workload** — a deliberate commitment (it spends budget and changes code without a human in the loop). Full procedure in **`references/supervised-unit.md`**. Three layers:
 
-1. **The unit** — `orchestrator-<name>.service` (modelled on `scripts/orchestrator-reify.service`): `WorkingDirectory=<dark-factory>`, `ExecStartPre` waits for port 8002, `ExecStart=… orchestrator run --config <target>/orchestrator.yaml`, `Wants=fused-memory`, `Restart=on-failure`, StartLimit guard. `enable --now` makes it run.
+1. **The unit** — `orchestrator-<name>.service` (modelled on `scripts/orchestrator-reify.service`): `WorkingDirectory=<dark-factory>`, `ExecStartPre` waits for port 8002, `ExecStart=… orchestrator run --config <target>/dark-factory-orchestrator.yaml`, `Wants=fused-memory`, `Restart=on-failure`, StartLimit guard. `enable --now` makes it run.
 2. **Persistence** — copy the unit into `<dark-factory>/scripts/` and add `cp` + `enable` lines to `setup-host.sh` so a host re-provision keeps it. Commit both.
 3. **Watchdog** (optional) — add `(<escalation_port>, unit)` to `WATCHED` in `orchestrator-watchdog.py` *and* update its drift test. Skippable: `autopilot-video` runs without it, relying on `Restart=on-failure`.
 
-⚠️ **Timing is load-bearing:** only `enable --now` (and only add to the watchdog) **after the project has `pending` tasks**. An orchestrator started against an empty/all-done tree exits "No pending tasks found"; under the watchdog that becomes a 60s crash-loop. Confirm `orchestrator status --config <target>/orchestrator.yaml` shows ≥1 `pending` first. The watchdog skips disabled units, so installing-but-leaving-disabled before queueing is the safe fallback.
+⚠️ **Timing is load-bearing:** only `enable --now` (and only add to the watchdog) **after the project has `pending` tasks**. An orchestrator started against an empty/all-done tree exits "No pending tasks found"; under the watchdog that becomes a 60s crash-loop. Confirm `orchestrator status --config <target>/dark-factory-orchestrator.yaml` shows ≥1 `pending` first. The watchdog skips disabled units, so installing-but-leaving-disabled before queueing is the safe fallback.
 
 ## Offer anything else
 
