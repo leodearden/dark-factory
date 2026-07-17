@@ -595,7 +595,10 @@ def test_normal_warm_path_reuses_fixed_worktree_twice_no_escalation(tmp_path, mo
 
     leaked_ephemeral = sorted(
         p.name for p in worktree_base.iterdir()
-        if p.name.startswith('_merge-') and p.name != '_merge-verify'
+        # An ephemeral leak is a _merge-<uuid> *directory*; the shared
+        # <lane_dir>.lock flock sibling (<worktree_base>/_merge-verify.lock,
+        # task 2685) is a regular file and is expected -- require is_dir().
+        if p.is_dir() and p.name.startswith('_merge-') and p.name != '_merge-verify'
     )
     assert leaked_ephemeral == [], (
         f'ephemeral _merge-<uuid> dir(s) leaked (warm path should never '
@@ -1020,7 +1023,10 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
 
         leaked_ephemeral = sorted(
             p.name for p in worktree_base.iterdir()
-            if p.name.startswith('_merge-') and p.name != '_merge-verify'
+            # An ephemeral leak is a _merge-<uuid> *directory*; the shared
+            # <lane_dir>.lock flock sibling (<worktree_base>/_merge-verify.lock,
+            # task 2685) is a regular file and is expected -- require is_dir().
+            if p.is_dir() and p.name.startswith('_merge-') and p.name != '_merge-verify'
         )
         assert leaked_ephemeral == [], (
             f'waiter must never create an ephemeral _merge-<uuid> dir on '

@@ -148,6 +148,14 @@ def make_flock_contention_result(
     merge-verify worktree.  Returned instead of ever falling back to an
     ephemeral worktree (PRD Invariant 5).
 
+    This is the HOST cli.py verify-merge span's OWN lock
+    (``verify_cancel.merge_verify_lock_path``), intentionally distinct
+    from the local in-process consumer's shared ``<lane_dir>.lock``
+    (``verify_cancel.lane_lock_path``, taken by ``GitOps.merge_verify_lease``
+    and ``GitOps.reset_persistent_merge_worktree`` — task 2685): the laptop
+    persistent-worktree deployment this span guards has no reify CoW
+    warm-lane pool to converge with, so ``.merge_verify.lock`` stays as is.
+
     The ``contention`` field is a plain JSON-native dict (not a nested
     dataclass) so it round-trips losslessly through the generic
     ``result_to_dict``/``result_from_dict`` codec — task beta parses it back
@@ -161,8 +169,8 @@ def make_flock_contention_result(
         lint_output='',
         type_output='',
         summary=(
-            'flock contention on .merge_verify.lock; another verify holds '
-            'the persistent worktree lock'
+            'flock contention on the host .merge_verify.lock verify span; '
+            'another verify holds the persistent worktree lock'
         ),
         timed_out=False,
         category=FLOCK_CONTENTION_CATEGORY,

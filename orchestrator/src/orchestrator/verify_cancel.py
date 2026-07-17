@@ -370,6 +370,23 @@ def merge_verify_lock_path(worktree_base: Path) -> Path:
     return worktree_base / MERGE_VERIFY_LOCK_FILENAME
 
 
+def lane_lock_path(lane_dir: Path) -> Path:
+    """Return the canonical ``<lane_dir>.lock`` path for a warm-lane directory.
+
+    ``lane_dir.with_name(lane_dir.name + '.lock')`` — a sibling of *lane_dir*
+    itself (same parent dir, ``.lock`` appended to the basename), NOT a file
+    inside it. This is the SHARED lock path convention taken by reify's
+    ``seed-warm-lane.sh`` / ``thin-warm-lane.sh`` / ``warm-lane-gc.sh`` (via
+    ``flock(1)``) and by DF's own :meth:`GitOps._seed_warm_lane` (via
+    ``flock(1)`` subprocess) — centralized here so every caller, including
+    :meth:`GitOps.merge_verify_lease` and
+    :meth:`GitOps.reset_persistent_merge_worktree`, provably computes the
+    identical path for a given lane directory. ``flock(2)``/``flock(1)`` are
+    interoperable on the same inode regardless of caller.
+    """
+    return lane_dir.with_name(lane_dir.name + '.lock')
+
+
 def acquire_merge_verify_flock(
     path: Path,
     timeout_secs: float,

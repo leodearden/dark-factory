@@ -1720,21 +1720,25 @@ async def _run_post_merge_verify(
     # is `merge_verify_cold_command_timeout_secs` (config default 7200 s)
     # if set, falling back to `verify_cold_command_timeout_secs` then warm.
     #
-    # Merge-verify lease (task 2315, BUG 1): record the SAME
-    # ``.merge_verify.lock`` + holder-pgid lease the host verify-merge CLI
-    # already records (cli.py:444-512) around this dispatch span — but ONLY
-    # for a LOCAL in-process verify (runner is None) on the persistent warm
-    # lane (``git.persistent_merge_worktree`` on AND *merge_wt* resolves to
-    # ``persistent_merge_worktree_path``). Every other combination (remote
-    # runner, ephemeral worktree, knob off) leaves the AsyncExitStack empty
-    # — no lease recorded, byte-identical to before. Holding this lease lets
-    # :meth:`GitOps.reset_persistent_merge_worktree` and
-    # :meth:`GitOps._run_warm_lane_gc_reclaim` detect the in-flight verify
-    # and avoid clobbering/reclaiming the worktree out from under it. Known
-    # limitation: there is a small residual window between
-    # ``reset_persistent_merge_worktree`` returning *merge_wt* (above the
-    # caller of this function) and the lease being acquired here, during
-    # which the worktree is unprotected.
+    # Merge-verify lease (task 2315, BUG 1; lock path converged onto the
+    # shared ``<lane_dir>.lock`` in task 2685): record the holder-pgid
+    # lease and hold the SAME ``<lane_dir>.lock`` that reify's
+    # seed-warm-lane.sh / thin-warm-lane.sh / warm-lane-gc.sh and DF's own
+    # ``_seed_warm_lane`` take (see ``GitOps.merge_verify_lease``) — but
+    # ONLY for a LOCAL in-process verify (runner is None) on the persistent
+    # warm lane (``git.persistent_merge_worktree`` on AND *merge_wt*
+    # resolves to ``persistent_merge_worktree_path``). Every other
+    # combination (remote runner, ephemeral worktree, knob off) leaves the
+    # AsyncExitStack empty — no lease recorded, byte-identical to before.
+    # Holding this lease lets :meth:`GitOps.reset_persistent_merge_worktree`
+    # and :meth:`GitOps._run_warm_lane_gc_reclaim` detect the in-flight
+    # verify and avoid clobbering/reclaiming the worktree out from under
+    # it. The residual window between ``reset_persistent_merge_worktree``
+    # returning *merge_wt* (above the caller of this function) and the
+    # lease being acquired here is now closed (task 2685, step-4):
+    # ``reset_persistent_merge_worktree`` itself holds the same
+    # ``<lane_dir>.lock`` across its own tree mutation, so a reify/DF actor
+    # is excluded across both spans, not just this one.
     async with contextlib.AsyncExitStack() as stack:
         if (
             runner is None
