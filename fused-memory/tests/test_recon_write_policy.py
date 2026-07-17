@@ -849,6 +849,17 @@ class TestIsTerminalAnnotationExempt:
             },
         ) is False
 
+    def test_add_plus_causation_id_via_json_string_metadata_is_true(self):
+        """JSON-string metadata (the _coerce_metadata_dict string-coercion
+        path recon-stage writes can also arrive via) carrying an x_ key plus
+        _causation_id must still be exempt — _annotation_content_keys strips
+        tracing co-keys from the already-parsed dict, after string
+        coercion, so the stripping applies identically regardless of
+        whether metadata arrived as a dict or a JSON string."""
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {'metadata': '{"x_foo": 1, "_causation_id": "run-1"}'},
+        ) is True
+
 
 # ---------------------------------------------------------------------------
 # X_ANNOTATION_PREFIX <-> shared.task_metadata.parse_metadata consistency
@@ -990,6 +1001,31 @@ class TestInterceptorUpdateTaskAnnotationClearBoundary:
         result = await interceptor.update_task(
             '1', '/project',
             metadata={'possible_scope_mismatch': None},
+            agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+        assert 'error_type' not in result
+
+    @pytest.mark.asyncio
+    async def test_recon_stage_clear_with_causation_id_on_done_task_proceeds(
+        self, interceptor, taskmaster,
+    ):
+        """Symmetric clear-path fix (task 2697): the mandatory recon-stage
+        _causation_id tracing co-key (reconciliation/stages/base.py's
+        Reconciliation Context block) riding alongside a clear of
+        possible_scope_mismatch must proceed, not be rejected — the
+        interceptor-boundary counterpart to
+        test_recon_stage_x_annotation_add_with_causation_id_on_done_task_proceeds
+        below, for the clear path rather than the add path."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={
+                'possible_scope_mismatch': None,
+                '_causation_id': '06f2658a-474a-476c-9cf3-232d76e9ffb9',
+            },
             agent_id=AGENT_ID,
         )
 
