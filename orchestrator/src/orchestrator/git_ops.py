@@ -69,6 +69,7 @@ from orchestrator.lane_lifecycle import (
 )
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
+    lane_lock_path,
     merge_verify_lock_path,
     read_lock_holder_pgid,
     release_merge_verify_flock,
@@ -2755,7 +2756,7 @@ class GitOps:
             # note — so a live-but-wedged holder fails closed with a
             # distinct, diagnosable rc instead of stalling this hot path
             # forever.
-            lane_lock = lane_dir.with_name(lane_dir.name + '.lock')
+            lane_lock = lane_lock_path(lane_dir)
             lane_lock_flock = (
                 [
                     'flock', '-x',
