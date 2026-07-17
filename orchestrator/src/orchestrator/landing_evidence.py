@@ -160,6 +160,17 @@ async def validate_landing_evidence(
             accepted=True, evidence_sha=evidence_sha, reason='ok', probe=dict(probe),
         )
 
+    if candidate_sha is not None:
+        # CANDIDATE mode: attribution is already established by the caller
+        # (a merge-marker subject match, or a stranded-sweep ground-truth
+        # report) — skip discovery and the FIX 2 lineage guard entirely and
+        # apply ONLY the FIX 1' effect-present guard to candidate_sha.
+        probe['citation'] = candidate_sha
+        probe['effect_check_sha'] = candidate_sha
+        if not await git_ops.commit_effect_present_in_main(candidate_sha):
+            return _reject('effect_absent')
+        return _accept(candidate_sha)
+
     citation = await git_ops.find_task_citation_commit(
         task_id, pattern_template=pattern_template,
     )
@@ -183,10 +194,76 @@ async def validate_landing_evidence(
     # reverted exactly the paths the citation touched. Anchor on the branch
     # TIP for an in-branch work commit (it may be a stale intermediate
     # commit); anchor on the citation itself for a no-ff merge commit (its
-    # diff-tree is empty — an intentional no-op check).
-    effect_check_sha = branch_tip_sha if citation_on_branch else citation
+    # diff-tree is empty — an intentional no-op check) or in the defensive
+    # case a DISCOVERY caller omitted branch_tip_sha despite citation_on_branch.
+    effect_check_sha = citation
+    if citation_on_branch and branch_tip_sha is not None:
+        effect_check_sha = branch_tip_sha
     probe['effect_check_sha'] = effect_check_sha
     if not await git_ops.commit_effect_present_in_main(effect_check_sha):
         return _reject('effect_absent')
 
     return _accept(citation)
+
+
+_REASON_EXPLANATIONS: dict[str, str] = {
+    'no_citation': (
+        'No commit on main cites this task (find_task_citation_commit found '
+        'nothing) — there is no positive evidence to attribute a landing to.'
+    ),
+    'lineage_mismatch': (
+        'The discovered citation is not reachable from the branch in either '
+        'direction (FIX 2, task 2500/2675) — it is most likely an unrelated '
+        "task's commit that merely matched the citation pattern, not "
+        'genuine evidence that this task landed.'
+    ),
+    'effect_absent': (
+        "The evidence commit's own effect is not present at current main "
+        'HEAD (FIX 1\', task 2500/2675) — a later commit on main reverted '
+        'exactly the paths it touched, so the ancestry is real but stale.'
+    ),
+}
+
+
+def format_unattributed_landing_detail(
+    task_id: str, branch: str, verdict: LandingEvidenceVerdict,
+) -> tuple[str, str]:
+    """Render a rejected :class:`LandingEvidenceVerdict` as (summary, detail).
+
+    Shared (INV-5) across every escalating call site — the harness
+    ``_file_unattributed_landing_escalation`` helper and the merge_queue
+    coalesce re-drive escalation — so the human-facing message is
+    single-sourced rather than five independently-drifting inline f-strings.
+
+    Args:
+        task_id: The task id the escalation is filed for.
+        branch: The branch the evidence check ran against.
+        verdict: A rejected verdict (``accepted`` False); the reason and
+            probe are rendered into the detail text regardless of value,
+            but this is intended to be called only on rejection.
+
+    Returns:
+        A ``(summary, detail)`` tuple — ``summary`` is a one-line, ``[:200]``-
+        safe string suitable for ``Escalation.summary``; ``detail`` is a
+        multi-line block for ``Escalation.detail``.
+    """
+    explanation = _REASON_EXPLANATIONS.get(
+        verdict.reason, f'Unrecognized reason code: {verdict.reason}',
+    )
+    summary = (
+        f'Task {task_id}: landing evidence on branch {branch!r} could not '
+        f'be attributed ({verdict.reason})'
+    )[:200]
+    detail = (
+        f'validate_landing_evidence rejected the landing evidence for task '
+        f'{task_id} on branch {branch!r}.\n\n'
+        f'reason: {verdict.reason}\n'
+        f'{explanation}\n\n'
+        f'probe: {verdict.probe}\n\n'
+        'The task was NOT marked done and remains pending — it will be '
+        're-evaluated on the next dispatch tick. If this landing is '
+        'genuine, investigate why attribution/effect-present failed (e.g. '
+        'a reverted merge, an unattributed commit, or a missing '
+        'task-citing commit); resolve this escalation once confirmed.'
+    )
+    return summary, detail
