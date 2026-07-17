@@ -140,3 +140,34 @@ orchestrator_restart_watch_prefixes:
   - "orchestrator/pyproject.toml"
   - "orchestrator/uv.lock"
   - "escalation/pyproject.toml"
+
+# Verify-scope inversion — σ capstone (plans/verify-scope-inversion-prd.md).
+# Flips the broad merge-role verify gate on and enables merge-train formation
+# now that ξ (boundary suite) is green and 2501 (per-project verify-slot
+# scoping) has landed the contention headroom this needs on the shared host.
+#
+# merge_verify_breadth: "full" makes merge-role verify run every REGISTERED
+# module's full suite instead of only the touched modules (Resolved decision
+# 5 in the PRD) — the λ knob, defaulting to "scoped" in defaults.yaml.
+#
+# merge_train_former_enabled / merge_train_coalesce_enabled /
+# merge_train_max_members: turn on the train former + retroactive
+# queue-coalescing pass at N=3 (Resolved decision 6). The train
+# former/coalescer is DF code (tasks 1704-1708), production-proven in reify
+# since 2026-06-10 (GO-N3 precedent: s(3)=0.962, coupling-failure 0/104) —
+# amortizes the now-broader gate's cost across up to 3 members per train,
+# same per-tip correctness gate as a single merge.
+#
+# ACTIVATION NOTE: like the U2 restart-on-merge flip above, these four knobs
+# are restart-only — NOT in the config hot-reload allowlist
+# (RELOADABLE_FIELDS, orchestrator/src/orchestrator/config.py) — so this edit
+# is inert in the running daemon until the next orchestrator restart. Unlike
+# most restart-only edits, this one is NOT auto-covered by the U2 coordinator
+# either: orchestrator/config.yaml itself is not listed in
+# orchestrator_restart_watch_prefixes above (config.yaml:122-127), so a merge
+# of this file alone does not auto-fire a fleet restart. Activation is the
+# separate τ deterministic-deploy capstone task.
+merge_verify_breadth: "full"
+merge_train_former_enabled: true
+merge_train_coalesce_enabled: true
+merge_train_max_members: 3
