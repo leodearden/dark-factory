@@ -3107,6 +3107,57 @@ class GitOps:
             )
             return 127
 
+    async def _run_warm_lane_audit(self) -> str | None:
+        """Invoke ``<project_root>/scripts/warm-lane-audit.sh --mount <worktree_base>``.
+
+        α (task 2443, §9.5 inv.12): OBSERVABILITY-ONLY. This wrapper never
+        gates an admission decision — it exists solely to enrich the θ
+        soft-floor defer journal line
+        (:meth:`_warm_lane_soft_pressure_defer`) with pool headroom context.
+        Mirrors the :meth:`warm_lane_ref_is_degenerate`/
+        :meth:`_run_thin_warm_lane` fail-soft wrapper pattern: absent
+        script, non-zero exit, or any exception all degrade to ``None``;
+        never raises.
+
+        **Read-only (A1)**: invoked with ONLY ``--mount`` — no reset/reclaim
+        subcommand or flag. reify's ``warm-lane-audit.sh`` is read-only by
+        its own contract (never mutates a lane); this wrapper does not add
+        any mutating flag on top of that.
+
+        Returns:
+            The trailing ``HEADROOM ...`` summary line from the script's
+            default table-format stdout, or ``None`` if the script is
+            absent, exits non-zero, its stdout carries no line beginning
+            ``HEADROOM``, or an unexpected exception occurred.
+        """
+        try:
+            script = self.project_root / 'scripts' / 'warm-lane-audit.sh'
+            if not script.exists():
+                logger.debug(
+                    '_run_warm_lane_audit: script absent at %s — no-op', script,
+                )
+                return None
+            cmd = [str(script), '--mount', str(self.worktree_base)]
+            rc, out, err = await _run(cmd, cwd=self.project_root)
+            if rc != 0:
+                logger.debug(
+                    '_run_warm_lane_audit: script exited %d (stderr=%r) — no headroom',
+                    rc, err,
+                )
+                return None
+            for line in out.splitlines():
+                if line.startswith('HEADROOM'):
+                    return line
+            logger.debug(
+                '_run_warm_lane_audit: no HEADROOM line in stdout (stdout=%r)', out,
+            )
+            return None
+        except Exception:
+            logger.warning(
+                '_run_warm_lane_audit: unexpected error', exc_info=True,
+            )
+            return None
+
     async def _run_warm_lane_gc_reclaim(self) -> int:
         """Invoke ``<project_root>/scripts/warm-lane-gc.sh reclaim``.
 
