@@ -11740,6 +11740,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         item: RealMergeItem,
         lease: Any,  # HostLease
         depth: int | None = None,
+        probe_base: str | None = None,
     ) -> InflightVerifyResult:
         """Run the verify portion for one in-flight item.
 
@@ -11772,6 +11773,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             launched.  Forwarded into _run_post_merge_verify alongside
             item.speculative.  ``None`` (default) keeps the _verify_and_advance
             shim and any other non-production caller byte-identical.
+        probe_base: Variable-depth speculative-probe override (task 2359)
+            for the ``main_sha`` dispatch-time fact fed to
+            _run_post_merge_verify's merge-skew classifier -- attributes
+            this verify to a deeper already-built cumulative tip instead of
+            item.base_sha.  Purely a classification/telemetry label: never
+            mutates ``item`` itself (so the frozen-prefix base-chain
+            invariant, which reads InflightEntry.item.base_sha directly, is
+            unaffected) and never changes what is actually verified (still
+            item.merge_wt).  ``None`` (default) keeps every existing caller
+            byte-identical -- main_sha falls back to item.base_sha exactly
+            as before this task.
         """
         req = item.request
         merge_wt = item.merge_wt
@@ -11831,7 +11843,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # merged_branch_tip; None (branch tip unavailable, or the git
             # call fails) skips classification inside _run_post_merge_verify
             # and degrades to INDETERMINATE (I3, fail-open).
-            main_sha = item.base_sha
+            #
+            # task 2359: probe_base (when set by a firing variable-depth
+            # probe) OVERRIDES main_sha to the probed deeper cumulative tip
+            # -- item itself is never touched, so this is purely a
+            # classification-facts substitution.
+            main_sha = item.base_sha if probe_base is None else probe_base
             merge_base_sha = await _resolve_dispatch_time_merge_base(
                 req.config.project_root, main_sha, item.merged_branch_tip,
             )
@@ -12333,6 +12350,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 self._redispatch.appendleft(_remerged_ru)
                 return False
+
+            # task 2359: feed the rolling per-verify FAIL-rate window (a
+            # normal pass/fail verify only — DROPPED/REQUEUED/
+            # RUNNER_UNAVAILABLE sentinels already returned above and never
+            # reach here). A skip (vr.outcome is not None) counts as a
+            # non-pass for the flake-suppression heuristic.
+            if vr is not None:
+                self._record_verify_outcome(vr.outcome is None)
 
             # ── (a) FAIL / skip ──────────────────────────────────────────────
             if vr is not None and vr.outcome is not None:
@@ -13025,9 +13050,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # frozen/verifying AHEAD of this item joining the frontier (no
         # async-timing fragility from a concurrent dispatch mutating
         # self._inflight between now and when the task actually runs).
-        depth = self._verify_frontier_depth()
+        #
+        # task 2359: _probe_verify_placement() may OVERRIDE this dispatch's
+        # depth label + the "base" fed to the verify's merge-skew
+        # classification metadata, attributing it to a deeper already-built
+        # speculative stack instead of the normal adjacent depth-1
+        # placement. This NEVER mutates `item` itself (so
+        # check_frozen_prefix_invariant's base-chain check, which reads
+        # InflightEntry.item.base_sha, is completely unaffected) — only the
+        # isolated depth/probe_base facts threaded into _run_inflight_verify
+        # change. placement=None (default probe_fraction=0.0, a
+        # non-speculative item, or any of the pure policy's guards) keeps
+        # this branch byte-identical to the pre-task-2359 behaviour.
+        placement = self._probe_verify_placement(item)
+        depth = placement.depth if placement is not None else self._verify_frontier_depth()
+        probe_base = placement.base if placement is not None else None
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
-            self._run_inflight_verify(item, lease, depth=depth)
+            self._run_inflight_verify(item, lease, depth=depth, probe_base=probe_base)
         )
 
         return InflightEntry(
