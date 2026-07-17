@@ -7457,9 +7457,13 @@ Output JSON matching the schema. Every task must appear in the output.
         ancestors of main (squashed/rebased/manually-applied) by comparing
         the branch's actual changed files against main
         (:meth:`~orchestrator.git_ops.GitOps.branch_content_in_main`).  It
-        anchors on the citation commit when one is present on main, falling
-        back to main HEAD when a content-equivalent landing carries no
-        task-citing commit.  **Accepted risk**: this path can false-positive
+        delegates to :func:`~orchestrator.landing_evidence.validate_landing_evidence`
+        (DISCOVERY mode, task 2678) to discover and attribute the citation
+        commit and anchors on it; a content-equivalent landing that carries
+        no task-citing commit (or whose citation's effect is no longer
+        present at main HEAD) is no longer silently anchored on main HEAD —
+        it escalates instead via ``_file_unattributed_landing_escalation``.
+        **Accepted risk**: this path can false-positive
         on a branch whose completed-so-far files coincidentally match
         main's independent content while the rest of the task's scope is
         still unfinished — the primitive only sees the branch's own diff
@@ -7535,18 +7539,28 @@ Output JSON matching the schema. Every task must appear in the output.
             return False
 
         if await self.git_ops.branch_content_in_main(branch):
-            citation = await self.git_ops.find_task_citation_commit(
-                task_id, pattern_template=self.git_ops.config.commit_citation_pattern,
+            # DISCOVERY mode (task 2678): delegates citation discovery + FIX 2
+            # lineage + FIX 1' effect-present to the shared helper, exactly
+            # like the ancestry path above. The prior silent
+            # ``citation or get_main_sha()`` fallback fabricated an anchor
+            # from main HEAD whenever no citation was found; that is now a
+            # rejected verdict ('no_citation') that escalates instead of
+            # stamping done.
+            verdict = await validate_landing_evidence(
+                self.git_ops, task_id, branch,
+                branch_tip_sha=branch_tip_sha,
+                pattern_template=self.git_ops.config.commit_citation_pattern,
             )
-            anchor = citation or await self.git_ops.get_main_sha()
-            if anchor:
-                await self._mark_in_progress_done(
-                    task_id, anchor,
-                    'reconcile: pre-dispatch check found content-equivalent '
-                    'landing on main (squash/rebase/manual)',
-                    'dispatch-gate-content-equivalent',
-                )
-                return True
+            if not verdict.accepted:
+                self._file_unattributed_landing_escalation(task_id, branch, verdict)
+                return False
+            await self._mark_in_progress_done(
+                task_id, verdict.evidence_sha,
+                'reconcile: pre-dispatch check found content-equivalent '
+                'landing on main (squash/rebase/manual)',
+                'dispatch-gate-content-equivalent',
+            )
+            return True
 
         return False
 
