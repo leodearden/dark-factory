@@ -3114,6 +3114,12 @@ class TaskWorkflow:
 
         self._enter_phase(WorkflowState.MERGE)
 
+        # Tripwire (task 2505): plan.files must equal metadata.files by
+        # construction (the scope-reconciliation choke point keeps them in
+        # lockstep) — a divergence here means some path bypassed it. Purely
+        # observational: logs + escalates, never blocks the merge.
+        await self._check_scope_invariant()
+
         # Defense-in-depth: any blocking L0 escalation, or any
         # born-at-L2 (critical/urgent), or any level≥2 escalation
         # created during execute/verify/review (e.g. plan-overwrite
@@ -10488,6 +10494,82 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 f'Expected _session_id={self.session_id} but plan.json contains '
                 f'{foreign_session}. A duplicate workflow may have overwritten plan.json.'
             )
+        logger.error(f'Task {self.task_id}: {summary}')
+
+        if not self.escalation_queue:
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+            detail=detail,
+            suggested_action='investigate_and_retry',
+            worktree=str(self.worktree) if self.worktree else None,
+            workflow_state=self.state.value,
+        )
+        self.escalation_queue.submit(esc)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=self.task_id, phase=self.state.value,
+                data={'escalation_id': esc.id, 'category': esc.category,
+                      'severity': esc.severity, 'summary': summary[:200]},
+            )
+
+    async def _check_scope_invariant(self) -> None:
+        """Tripwire (task 2505): warn + escalate if ``plan.files`` diverges
+        from ``metadata.files`` at MERGE entry.
+
+        The scope-reconciliation choke point (``_reconcile_scope_locks`` /
+        ``_set_task_scope``) is meant to keep ``plan.files`` and
+        ``metadata.files`` in lockstep on every path that changes either.
+        This surfaces a divergence loudly (the project's
+        loud-over-silent-degradation norm) rather than letting scope drift
+        ship silently into a merge.
+
+        Fail-safe: an unreadable task (``self.scheduler.get_task`` returns
+        ``None`` — e.g. a transient backend hiccup) is treated as "cannot
+        check" and skipped, not "divergent" — a read failure must not wedge
+        an otherwise-valid merge or false-escalate.
+        """
+        fresh_task = await self.scheduler.get_task(self.task_id)
+        if fresh_task is None:
+            return
+        plan_files = set(sanitize_files_for_persist(self.plan.get('files', [])))
+        metadata_files = set((fresh_task.get('metadata') or {}).get('files') or [])
+        if plan_files == metadata_files:
+            return
+        logger.warning(
+            'Task %s: plan.files/metadata.files divergence detected at '
+            'MERGE entry — plan.files=%s, metadata.files=%s',
+            self.task_id, sorted(plan_files), sorted(metadata_files),
+        )
+        self._escalate_scope_invariant_violation(
+            sorted(plan_files), sorted(metadata_files),
+        )
+
+    def _escalate_scope_invariant_violation(
+        self, plan_files: list[str], metadata_files: list[str],
+    ) -> None:
+        """Submit an ``infra_issue`` escalation for a plan.files/metadata.files
+        divergence caught by :meth:`_check_scope_invariant` (task 2505).
+        Mirrors :meth:`_escalate_plan_overwrite`'s submission shape.
+        """
+        summary = (
+            f'plan.files/metadata.files divergence detected for task {self.task_id}'
+        )
+        detail = (
+            f'plan.files={plan_files} but metadata.files={metadata_files}. '
+            f'The scope-reconciliation choke point (_reconcile_scope_locks/'
+            f'_set_task_scope) should keep these in lockstep on every path '
+            f'that changes either.'
+        )
         logger.error(f'Task {self.task_id}: {summary}')
 
         if not self.escalation_queue:
