@@ -522,6 +522,21 @@ class TestHeadline:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _assert_row2_legacy_response(result: dict, producer_task: dict) -> None:
+    """Row-2 assertion helper: a legacy batch (no PRD/sidecar involvement)
+    must produce a byte-identical ``commit_planning`` response -- no
+    ``manifest_stamping`` key -- and the producer must not have gained
+    ``metadata.delivered_checks``."""
+    assert 'manifest_stamping' not in result, (
+        f"a batch with no PRD metadata must produce a byte-identical "
+        f"legacy response (no 'manifest_stamping' key); got {result!r}"
+    )
+    assert 'delivered_checks' not in producer_task['metadata'], (
+        f"a legacy batch must not stamp metadata.delivered_checks; got "
+        f"{producer_task['metadata']!r}"
+    )
+
+
 class TestLegacyNoSidecar:
     """Row 2: a legacy planning batch with no PRD metadata (and therefore no
     sidecar on disk at all) must produce a byte-identical legacy
