@@ -38,10 +38,6 @@ _FROZEN_CONTRACT_TOKENS = (
     '**summary**',
 )
 
-# A distinctive, stable substring of REVIEWER_COMPREHENSIVE's specialization
-# text (roles.py), used to confirm the specialization survives in HEURISTICS.
-_SPECIALIZATION_LANDMARK = 'Comprehensive code review covering ALL of the following areas'
-
 
 def _provenance_kwargs(**overrides: Any) -> dict[str, Any]:
     # dict[str, Any] is intentional: ArtifactProvenance's fields have
@@ -91,18 +87,21 @@ class TestReviewerPromptSplit:
         for landmark in ('Blocking means broken', 'When in doubt'):
             assert landmark not in contract, f'{landmark!r} leaked into contract'
 
-    def test_heuristics_hold_rules_and_specialization(self):
+    def test_baseline_heuristics_is_nonempty_editable_prose(self):
+        """Structural check only (task 2493 amendment).
+
+        ``baseline_heuristics`` is the optimizable half of the split — a
+        pinned artifact is explicitly allowed to replace its wording (see
+        ``test_pinned_malicious_heuristics_cannot_override_contract_prefix``
+        below) — so this deliberately does NOT pin exact rule/specialization
+        phrases from it; that would ossify the very text the feature exists
+        to let an optimizer change, and would fail on a benign reword with
+        no behavioral regression. It only guards against a degenerate
+        empty/blank heuristics half.
+        """
         spec = REVIEWER_COMPREHENSIVE.prompt_spec
         assert spec is not None  # premise: the reviewer role opts in
-        heuristics = spec.baseline_heuristics
-        for landmark in (
-            'Be specific',
-            'Blocking means broken',
-            'When in doubt, suggest',
-            'Read the codebase',
-            _SPECIALIZATION_LANDMARK,
-        ):
-            assert landmark in heuristics, f'{landmark!r} missing from heuristics'
+        assert spec.baseline_heuristics.strip()
 
     def test_heuristics_exclude_machine_contract_tokens(self):
         spec = REVIEWER_COMPREHENSIVE.prompt_spec
@@ -110,25 +109,25 @@ class TestReviewerPromptSplit:
         heuristics = spec.baseline_heuristics
         assert 'submit_review_verdict' not in heuristics
 
-    # -- (b) content-preservation superset: no instruction lost across the split --
+    # -- (b) content-preservation superset: the frozen contract survives assembly --
 
-    def test_in_code_constant_preserves_every_substantive_instruction(self):
+    def test_in_code_constant_preserves_contract_tokens(self):
+        """The composed ``in_code_constant`` (contract + separator +
+        heuristics) still carries every frozen CONTRACT token.
+
+        Task 2493 amendment: this previously also pinned exact HEURISTICS
+        prose (rule/specialization phrases). That half of the split is
+        deliberately editable — pinning its wording here would ossify the
+        very text a prompt optimizer is meant to be free to rewrite, for no
+        behavioral guarantee (``test_baseline_heuristics_is_nonempty_editable_prose``
+        above already covers the structural half of that concern). Only the
+        machine-CONTRACT tokens are asserted.
+        """
         spec = REVIEWER_COMPREHENSIVE.prompt_spec
         assert spec is not None  # premise: the reviewer role opts in
         constant = spec.in_code_constant
-        for phrase in (
-            'submit_review_verdict',
-            '**reviewer**',
-            '**verdict**',
-            '**issues**',
-            '**summary**',
-            'Be specific',
-            'Blocking means broken',
-            'When in doubt, suggest',
-            'Read the codebase',
-            _SPECIALIZATION_LANDMARK,
-        ):
-            assert phrase in constant, f'{phrase!r} missing from in_code_constant'
+        for token in _FROZEN_CONTRACT_TOKENS:
+            assert token in constant, f'{token!r} missing from in_code_constant'
 
     # -- (c) CONTRACT-immutability boundary test (G5 two-way) --
 
