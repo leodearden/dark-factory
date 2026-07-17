@@ -1708,14 +1708,13 @@ class GitOps:
         is defense-in-depth on top of it for the DF-side teardown/GC
         actors.
         """
-        fd = acquire_merge_verify_flock(
-            lane_lock_path(self.persistent_merge_worktree_path), _MERGE_VERIFY_FLOCK_WAIT_SECS,
-        )
+        lock_path = lane_lock_path(self.persistent_merge_worktree_path)
+        fd = acquire_merge_verify_flock(lock_path, _MERGE_VERIFY_FLOCK_WAIT_SECS)
         if fd is None:
             logger.warning(
                 'merge_verify_lease: flock contended (bounded wait timed '
                 'out) at %s — proceeding WITHOUT recording a lease',
-                self.worktree_base,
+                lock_path,
             )
             yield
             return
@@ -7079,6 +7078,20 @@ class GitOps:
         gap a reseed could previously race through. The bounded-wait
         acquire runs off the event loop (:func:`asyncio.to_thread`) so a
         contended wait never stalls other in-process coroutines.
+
+        Cancellation caveat: :func:`asyncio.to_thread` cannot stop the
+        worker thread mid-wait — if this coroutine is cancelled while the
+        thread is still polling for the flock, the ``await`` raises
+        ``CancelledError`` immediately, but the thread keeps running to
+        completion. If it goes on to acquire the flock, the returned fd is
+        never seen by this (already-cancelled) coroutine, so
+        :func:`release_merge_verify_flock` never runs for it and the lane
+        lock stays held until process exit. This window requires
+        cancellation to race the acquire and is bounded by
+        ``_SEED_WARM_LANE_LOCK_WAIT_SECS``, so it is treated as an accepted,
+        documented edge case here rather than guarded — a shielded-cleanup
+        fix would add async-ownership complexity out of proportion to this
+        task's scope.
         """
         warm_path = self.persistent_merge_worktree_path
 
@@ -7087,6 +7100,9 @@ class GitOps:
             raise MergeVerifyLeaseHeld(warm_path, holder_pgid)
 
         lock_path = lane_lock_path(warm_path)
+        # See the cancellation caveat in this method's docstring: cancelling
+        # this await cannot stop the to_thread worker, so a fd acquired
+        # after cancellation has already propagated is discarded unreleased.
         fd = await asyncio.to_thread(
             acquire_merge_verify_flock, lock_path, _SEED_WARM_LANE_LOCK_WAIT_SECS,
         )
