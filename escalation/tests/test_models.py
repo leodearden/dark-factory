@@ -840,3 +840,130 @@ class TestEscalationEvidence:
         assert restored.evidence == [], (
             f"Expected evidence=[] for legacy JSON, got {restored.evidence!r}"
         )
+
+
+class TestEscalationGrantedFiles:
+    """Escalation dataclass has a granted_files field (task 2505 steward scope-grant channel).
+
+    granted_files is the steward's structured scope-expansion grant (file-level,
+    project-relative paths), consumed by the orchestrator resume path — distinct
+    from the free-text `resolution` rationale string.
+    """
+
+    def _make_base_esc(self) -> Escalation:
+        return Escalation(
+            id='esc-task-500-0001',
+            task_id='500',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='test escalation for granted_files',
+        )
+
+    # --- (a) default is [] (not None) ---
+
+    def test_granted_files_defaults_to_empty_list(self):
+        """Escalation constructed without granted_files has granted_files=[] (not None)."""
+        esc = self._make_base_esc()
+        assert esc.granted_files == []
+
+    def test_default_granted_files_is_mutable_and_independent(self):
+        """Two Escalation instances do not share the same granted_files list (default_factory)."""
+        esc1 = self._make_base_esc()
+        esc2 = self._make_base_esc()
+        esc1.granted_files.append('a/b.py')
+        assert esc2.granted_files == [], (
+            'Default granted_files lists must be independent (field uses default_factory)'
+        )
+
+    # --- (b) round-trip via to_dict / from_dict ---
+
+    def test_granted_files_round_trip_via_to_dict_from_dict(self):
+        """granted_files=['a/b.py'] is preserved through to_dict() / from_dict()."""
+        esc = Escalation(
+            id='esc-task-500-0001',
+            task_id='500',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='test granted_files round-trip',
+            granted_files=['a/b.py'],
+        )
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.granted_files == ['a/b.py']
+
+    # --- (c) round-trip via to_json / from_json ---
+
+    def test_granted_files_round_trip_via_to_json_from_json(self):
+        """granted_files=['a/b.py'] is preserved through to_json() / from_json()."""
+        esc = Escalation(
+            id='esc-task-500-0001',
+            task_id='500',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='test granted_files json round-trip',
+            granted_files=['a/b.py'],
+        )
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.granted_files == ['a/b.py']
+
+    # --- (d) appears in serialised JSON ---
+
+    def test_granted_files_appears_in_to_json_output(self):
+        """granted_files is serialised (not silently dropped) when set."""
+        esc = Escalation(
+            id='esc-task-500-0001',
+            task_id='500',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='test granted_files in json',
+            granted_files=['crate/Cargo.toml'],
+        )
+        d = json.loads(esc.to_json())
+        assert 'granted_files' in d
+        assert d['granted_files'] == ['crate/Cargo.toml']
+
+    # --- (e) legacy JSON backward compat (zero-migration) ---
+
+    def test_from_dict_legacy_json_omits_granted_files(self):
+        """from_json() on JSON without granted_files key returns granted_files=[] (backward compat)."""
+        old_dict = {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without granted_files',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'train_state': None,
+            'resolution_action': None,
+            'resolution_class': None,
+            'triaged_at': None,
+            'triaged_by': None,
+            'triage_note': '',
+            'updated_at': None,
+            # NOTE: granted_files is intentionally absent
+        }
+        old_json = json.dumps(old_dict)
+        restored = Escalation.from_json(old_json)
+        assert restored.granted_files == [], (
+            f"Expected granted_files=[] for legacy JSON, got {restored.granted_files!r}"
+        )
