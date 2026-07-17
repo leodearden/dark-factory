@@ -33,12 +33,13 @@ exclusively through ``acquire_next()``'s returned ``TaskAssignment`` / None
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
 
 import pytest
-
+from _recording_event_store import _RecordingEventStore
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
@@ -67,6 +68,254 @@ def test_imports_resolve_without_fused_memory():
 _CAP_NAME_34 = 'row34_cap'
 _CAP_TOKEN_34 = 'ROW34_CAPABILITY_TOKEN_V1'
 _MARKER_REL_PATH_34 = 'src/row34_marker.py'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rig helpers (backend-free: no fused_memory import)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _run_git(project_root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ['git', '-C', str(project_root), *args],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def _init_git_repo(root: Path, *, marker_rel_path: str | None = None) -> Path:
+    """Initialize a real git repo at *root* on branch main with an initial
+    commit, so ``main`` resolves before any row-specific fixture files are
+    added — the delivered-check gate's git runner
+    (``Scheduler._resolve_main_sha`` / ``run_delivered_check``) shells out
+    against *root*, so a missing/unresolvable ``main`` would silently
+    fail-safe the whole sweep to an empty cache (no held event, no streak
+    — indistinguishable from "nothing checked").
+
+    When *marker_rel_path* is given, the initial commit ALSO seeds that
+    path with placeholder content (no capability token yet). This keeps a
+    later grep-kind check's "token absent" state a clean no-match
+    (``git grep`` rc==1 -> FAILED, the row-4 withhold) rather than a
+    pathspec-not-found error (rc>=2 -> ERRORED, row 7's fail-safe wait) —
+    mirrors ``fused-memory/tests/test_delivered_checks_e2e.py``'s
+    ``_init_git_repo``. Omit for script-kind fixtures (row 7), which
+    intentionally want the real ERRORED path from a genuinely missing
+    script.
+    """
+    subprocess.run(
+        ['git', 'init', '-b', 'main', str(root)],
+        check=True, capture_output=True, text=True,
+    )
+    _run_git(root, 'config', 'user.email', 'e2e-test@example.com')
+    _run_git(root, 'config', 'user.name', 'E2E Test')
+    seeded_rel = marker_rel_path or 'README.md'
+    seeded = root / seeded_rel
+    seeded.parent.mkdir(parents=True, exist_ok=True)
+    seeded.write_text(
+        '# marker file -- capability token lands here later\n'
+        if marker_rel_path else '# e2e fixture repo\n',
+        encoding='utf-8',
+    )
+    _run_git(root, 'add', seeded_rel)
+    _run_git(root, 'commit', '-m', 'initial commit')
+    return root
+
+
+def _commit_marker(project_root: Path, rel_path: str, token: str) -> str:
+    """Append *token* to the marker file at *rel_path* (seeded by
+    ``_init_git_repo``) and commit it to branch main, advancing the SHA so
+    the delivered-check gate's stale-cache prune self-heals the withheld
+    dependent on the very next tick. Returns the new main SHA.
+    """
+    target = project_root / rel_path
+    target.write_text(
+        target.read_text(encoding='utf-8') + f'{token}\n', encoding='utf-8',
+    )
+    _run_git(project_root, 'add', rel_path)
+    _run_git(project_root, 'commit', '-m', f'land capability token {token}')
+    return _run_git(project_root, 'rev-parse', 'main').stdout.strip()
+
+
+def _grep_check(name: str, token: str, paths: list[str]) -> dict:
+    """Build a grep-kind ``delivered_checks`` entry — the same shape
+    gamma's ``commit_planning`` stamps from a capability-manifest sidecar
+    (``fused-memory/tests/test_manifest_stamping.py``)."""
+    return {'name': name, 'kind': 'grep', 'pattern': token, 'expect': 'present', 'paths': paths}
+
+
+class _LocalDepMcpSession:
+    """Backend-free MCP session double serving a SINGLE project's local-dep
+    task list (no fused_memory import — orchestrator/pyproject.toml has no
+    path to it). Modelled on ``TwoProjectMcpSession``
+    (test_cross_project_dispatch_integration.py) for the JSON-RPC envelope
+    shape and call_tool signature, but simplified to local (not external)
+    deps.
+
+    Supports the four tools ``acquire_next``'s tick pipeline actually
+    issues against a project_root with terminal local deps carrying
+    ``metadata.delivered_checks``:
+
+    - ``get_tasks``: honours the server-side ``statuses`` filter exactly
+      like the real backend, so a 'done'/'cancelled' producer is excluded
+      from the ACTIVE-only fetch — forcing the real
+      ``_phase_backfill_terminal_dep_records`` / ``get_task`` fallback to
+      run, exactly as it would against a live backend.
+    - ``get_task``: unfiltered single-task fetch by id (the backfill
+      fallback's primitive).
+    - ``get_statuses``: unfiltered ``{id: status}`` projection (the
+      dep-status backfill primitive).
+    - ``set_task_status``: mutates the matching task dict in place.
+    """
+
+    def __init__(self) -> None:
+        self.tasks: list[dict] = []
+        self._request_id = 0
+
+    def _next_id(self) -> int:
+        self._request_id += 1
+        return self._request_id
+
+    def _envelope(self, text: str) -> dict:
+        return {
+            'jsonrpc': '2.0',
+            'id': self._next_id(),
+            'result': {'content': [{'type': 'text', 'text': text}]},
+        }
+
+    async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> dict:
+        if name == 'get_tasks':
+            statuses = arguments.get('statuses')
+            tasks = self.tasks
+            if statuses is not None:
+                allowed = set(statuses)
+                tasks = [t for t in tasks if t.get('status') in allowed]
+            return self._envelope(json.dumps({'tasks': tasks}))
+
+        if name == 'get_task':
+            task_id = str(arguments['id'])
+            task = next((t for t in self.tasks if str(t.get('id')) == task_id), None)
+            return self._envelope(json.dumps({'data': task}))
+
+        if name == 'get_statuses':
+            ids = arguments.get('ids')
+            tasks = self.tasks
+            if ids is not None:
+                id_set = {str(i) for i in ids}
+                tasks = [t for t in tasks if str(t.get('id')) in id_set]
+            statuses = {str(t['id']): t['status'] for t in tasks}
+            return self._envelope(json.dumps({'statuses': statuses}))
+
+        if name == 'set_task_status':
+            task_id = str(arguments['id'])
+            status = arguments['status']
+            for t in self.tasks:
+                if str(t.get('id')) == task_id:
+                    t['status'] = status
+                    break
+            return self._envelope(json.dumps({'id': task_id, 'status': status}))
+
+        raise NotImplementedError(
+            f'_LocalDepMcpSession: unknown tool {name!r} — add a branch in '
+            'call_tool if this tool is needed by the test'
+        )
+
+
+def _register_producer(
+    session: _LocalDepMcpSession, task_id: str, *, status: str, checks: list[dict],
+) -> dict:
+    """Append a producer task carrying ``metadata.delivered_checks`` to the
+    session's in-memory task list. *status* is 'done' or 'cancelled' —
+    both TERMINAL statuses the delivered-check gate treats identically
+    (the gate trusts main, not the status label)."""
+    task: dict = {
+        'id': task_id,
+        'title': f'Producer task {task_id}',
+        'status': status,
+        'dependencies': [],
+        'metadata': {
+            'files': [f'local_dep/producer_{task_id}.py'],
+            'delivered_checks': checks,
+        },
+    }
+    session.tasks.append(task)
+    return task
+
+
+def _register_dependent(session: _LocalDepMcpSession, task_id: str, *, dep_id: str) -> dict:
+    """Append a pending dependent task with a single LOCAL dependency on
+    *dep_id* to the session's in-memory task list. ``metadata.files`` is a
+    unique plain file path so ``ModuleLockTable.try_acquire`` succeeds."""
+    task: dict = {
+        'id': task_id,
+        'title': f'Dependent task {task_id}',
+        'status': 'pending',
+        'dependencies': [{'id': dep_id}],
+        'metadata': {'files': [f'local_dep/dependent_{task_id}.py']},
+    }
+    session.tasks.append(task)
+    return task
+
+
+def _build_harness(
+    project_root: Path, session: _LocalDepMcpSession, escalation_dir: Path,
+) -> Harness:
+    """Build a real orchestrator Harness/Scheduler wired to *session* (the
+    dispatch seam) plus a real EscalationQueue — so the born-at-L2
+    grace-streak escalation (``Harness._block_and_escalate_delivered_check``)
+    is genuinely filed and read back — and a recording EventStore so the
+    hold-visibility event (``EventType.delivered_check_gate_held``) is
+    observable. Mirrors ``build_harness()`` in
+    test_cross_project_dispatch_integration.py.
+    """
+    config = OrchestratorConfig(project_root=project_root)
+    harness = Harness(config)
+    harness.scheduler._mcp_session = session
+    harness.scheduler.event_store = _RecordingEventStore()  # type: ignore[assignment]
+    harness._escalation_queue = EscalationQueue(escalation_dir)
+    # run_tick() drives harness.scheduler.acquire_next() directly, bypassing
+    # harness.run()'s startup sweeps — satisfy the startup gate (task 2235)
+    # the same way those sweeps would.
+    harness.scheduler.finish_startup()
+    return harness
+
+
+async def _run_tick(harness: Harness) -> str | None:
+    """Run one acquire_next() tick; return the dispatched task_id or None.
+
+    Dispatch is OBSERVED through the returned TaskAssignment — never by
+    reading task storage. This matches the task's "dispatch path"
+    requirement.
+    """
+    assignment = await harness.scheduler.acquire_next()
+    return assignment.task_id if assignment is not None else None
+
+
+def _held_events(harness: Harness) -> list[tuple[str, dict]]:
+    """Return recorded ``delivered_check_gate_held`` events from *harness*'s
+    injected recording EventStore (secondary corroboration of a withhold —
+    the primary signal is ``_run_tick`` returning None)."""
+    store = harness.scheduler.event_store
+    if store is None:
+        return []
+    return [
+        (evt, data) for evt, data in store.events  # type: ignore[attr-defined]
+        if evt == str(EventType.delivered_check_gate_held)
+    ]
+
+
+def _l2_for(harness: Harness, task_id: str) -> list:
+    """Return pending born-at-L2 delivered-check escalations for *task_id*.
+
+    Scoped exactly like ``Harness._block_and_escalate_delivered_check``'s
+    own dedupe read (``level=2``, ``agent_role='orchestrator-scheduler'``)
+    so an unrelated open L2 for the same task never masks (or is masked
+    by) this check.
+    """
+    queue = harness._escalation_queue
+    if queue is None:
+        return []
+    return queue.get_by_task(
+        task_id, status='pending', level=2, agent_role='orchestrator-scheduler',
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
