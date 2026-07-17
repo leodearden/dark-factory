@@ -161,3 +161,36 @@ class TestRustPlanRegression:
         assert decision.model == 'opus'
         assert decision.source_layer == 'policy_rule'
         assert decision.rule_id == 'large-plan-steps'
+
+
+class TestLargePlanMaxTurnsHeadroom:
+    """(a)/(b) A large plan (either the steps or modules trigger) also
+    raises max_turns to 120 for implementer/debugger -- shared headroom in
+    the same rule's `set`, on top of the model upgrade. (c) A small plan
+    (neither trigger) keeps the plain config max_turns (implementer 80,
+    debugger 50)."""
+
+    @pytest.mark.parametrize('role_name', ['implementer', 'debugger'])
+    def test_steps_trigger_raises_max_turns(self, role_name):
+        cfg = OrchestratorConfig()
+
+        decision = resolve_route(_inputs_for(role_name, plan_shape=STEPS_TRIGGER_PLAN), cfg)
+
+        assert decision.max_turns == 120
+
+    @pytest.mark.parametrize('role_name', ['implementer', 'debugger'])
+    def test_modules_trigger_raises_max_turns(self, role_name):
+        cfg = OrchestratorConfig()
+
+        decision = resolve_route(_inputs_for(role_name, plan_shape=MODULES_TRIGGER_PLAN), cfg)
+
+        assert decision.max_turns == 120
+
+    def test_small_plan_keeps_config_max_turns(self):
+        cfg = OrchestratorConfig()
+
+        implementer_decision = resolve_route(_inputs_for('implementer', plan_shape=SMALL_PLAN), cfg)
+        debugger_decision = resolve_route(_inputs_for('debugger', plan_shape=SMALL_PLAN), cfg)
+
+        assert implementer_decision.max_turns == cfg.max_turns.implementer == 80
+        assert debugger_decision.max_turns == cfg.max_turns.debugger == 50
