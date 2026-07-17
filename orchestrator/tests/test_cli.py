@@ -1792,6 +1792,45 @@ def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Task 2733 step-1/2 — _wait_pgid_gone: bounded poll-for-ESRCH helper (leg c)
+# ---------------------------------------------------------------------------
+#
+# De-flakes the pgid-liveness assertion above: SIGKILL delivery + reaping is
+# asynchronous, so a one-shot os.killpg(pgid, 0) immediately after child.wait()
+# can observe a not-yet-reaped group member.  _wait_pgid_gone asserts the real
+# contract (eventual group death) via a bounded poll instead.
+
+
+def test_wait_pgid_gone_returns_for_dead_group():
+    """A pgid with no live processes (ESRCH) returns without raising.
+
+    Uses the same well-above-pid_max idiom as NONEXISTENT_PID above: no
+    process/group can plausibly exist at this pgid, so os.killpg(pgid, 0)
+    inside _wait_pgid_gone raises ProcessLookupError/ESRCH on the first poll
+    and the helper returns cleanly.
+    """
+    NONEXISTENT_PID = 2 ** 22  # well above /proc/sys/kernel/pid_max on most systems
+
+    _wait_pgid_gone(NONEXISTENT_PID, timeout=1.0, interval=0.05)
+
+
+def test_wait_pgid_gone_raises_for_live_group():
+    """A still-live process group causes _wait_pgid_gone to raise after the deadline."""
+    import sys
+
+    child = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(30)'],
+        start_new_session=True,
+    )
+    try:
+        with pytest.raises(AssertionError, match='still alive'):
+            _wait_pgid_gone(child.pid, timeout=1.0, interval=0.05)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
 # Task 2308 step-11 — verify-merge watchdog wiring: start_stdin_watchdog spawn
 # ---------------------------------------------------------------------------
 
