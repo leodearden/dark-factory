@@ -665,13 +665,15 @@ class TestSetTaskScope:
         workflow, scheduler = await self._build(
             config, git_ops, task_assignment, tmp_path,
         )
+        artifacts = workflow.artifacts
+        assert artifacts is not None
 
         result = await workflow._set_task_scope(['lib.py', 'new.py'])
 
         assert result is True
-        on_disk = workflow.artifacts.read_plan()
+        on_disk = artifacts.read_plan()
         assert on_disk['files'] == ['lib.py', 'new.py']
-        assert workflow.artifacts.validate_plan_owner(workflow.session_id) is True
+        assert artifacts.validate_plan_owner(workflow.session_id) is True
         assert len(scheduler.blast_radius_calls) == 1, (
             'exactly one handle_blast_radius_expansion call expected'
         )
@@ -687,6 +689,8 @@ class TestSetTaskScope:
         workflow, scheduler = await self._build(
             config, git_ops, task_assignment, tmp_path,
         )
+        artifacts = workflow.artifacts
+        assert artifacts is not None
         original_modules = list(workflow.modules)
         scheduler.blast_radius_result = False
 
@@ -697,7 +701,7 @@ class TestSetTaskScope:
             'self.modules must stay unchanged on a lock conflict — the '
             'scheduler already requeued the task holding the ORIGINAL lock.'
         )
-        on_disk = workflow.artifacts.read_plan()
+        on_disk = artifacts.read_plan()
         assert on_disk['files'] == ['lib.py', 'new.py'], (
             'plan.json must still be widened on conflict — the scheduler '
             'persists metadata.files=new_files on its requeue branch too, '

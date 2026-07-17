@@ -2478,35 +2478,37 @@ class TaskWorkflow:
                             f for f in granted if f not in current_files
                         ]
                         new_modules = files_to_modules(new_files, self.config.lock_depth)
-                        if set(new_modules) != set(self.modules):
-                            if not await self._set_task_scope(new_files):
-                                # Lock conflict: the scheduler already
-                                # requeued the task to pending and persisted
-                                # metadata.files=new_files on its own (plan.json
-                                # was widened to match by _set_task_scope
-                                # before the conflict was detected). Do NOT
-                                # resume the implementer under a lock a
-                                # sibling task still holds — requeue and let
-                                # this task redispatch once the lock frees.
-                                additional = sorted(
-                                    set(new_modules) - set(self.modules)
-                                )
-                                block_detail = (
-                                    f'Scope grant blocked: additional locks '
-                                    f'{additional} unavailable (held by other '
-                                    f'tasks). Held modules: '
-                                    f'{sorted(self.modules)}; granted files: '
-                                    f'{sorted(granted)}.'
-                                )
-                                self._terminal_report = TerminalReport(
-                                    outcome=WorkflowOutcome.REQUEUED,
-                                    reason='scope_grant_lock_conflict',
-                                    phase=self.machine.state,
-                                    detail=block_detail,
-                                    category=None,
-                                    blocked_from_phase=self.machine.state,
-                                )
-                                return WorkflowOutcome.REQUEUED
+                        if (
+                            set(new_modules) != set(self.modules)
+                            and not await self._set_task_scope(new_files)
+                        ):
+                            # Lock conflict: the scheduler already
+                            # requeued the task to pending and persisted
+                            # metadata.files=new_files on its own (plan.json
+                            # was widened to match by _set_task_scope
+                            # before the conflict was detected). Do NOT
+                            # resume the implementer under a lock a
+                            # sibling task still holds — requeue and let
+                            # this task redispatch once the lock frees.
+                            additional = sorted(
+                                set(new_modules) - set(self.modules)
+                            )
+                            block_detail = (
+                                f'Scope grant blocked: additional locks '
+                                f'{additional} unavailable (held by other '
+                                f'tasks). Held modules: '
+                                f'{sorted(self.modules)}; granted files: '
+                                f'{sorted(granted)}.'
+                            )
+                            self._terminal_report = TerminalReport(
+                                outcome=WorkflowOutcome.REQUEUED,
+                                reason='scope_grant_lock_conflict',
+                                phase=self.machine.state,
+                                detail=block_detail,
+                                category=None,
+                                blocked_from_phase=self.machine.state,
+                            )
+                            return WorkflowOutcome.REQUEUED
 
                     # Resume with resolution context
                     logger.info(f'Task {self.task_id}: resuming after escalation resolution')
@@ -3785,31 +3787,33 @@ class TaskWorkflow:
             f'from {len(plan_files)} files: {plan_modules}'
         )
 
-        if set(plan_modules) != set(self.modules):
-            if not await self._reconcile_scope_locks(plan_files):
-                # Annotate the requeue so the per-task retry-cap report can
-                # name *why* — without this, three blast-radius requeues in a
-                # row produce a cap-exhaust report with phase/reason='unknown'.
-                additional = sorted(set(plan_modules) - set(self.modules))
-                block_detail = (
-                    f'Plan expansion blocked: additional locks {additional} '
-                    f'unavailable (held by other tasks). '
-                    f'Held modules: {sorted(self.modules)}; '
-                    f'plan modules: {sorted(plan_modules)}.'
-                )
-                self._terminal_report = TerminalReport(
-                    outcome=WorkflowOutcome.REQUEUED,
-                    reason='plan_blast_radius_lock_conflict',
-                    phase=self.machine.state, detail=block_detail,
-                    category=None,
-                    # No BLOCKED transition on this path — blocked_from_phase
-                    # mirrors the current (working) phase, preserving the
-                    # harness's retry-cap block_phase='plan' (REVIEW-CYCLE-1).
-                    blocked_from_phase=self.machine.state,
-                )
-                return WorkflowOutcome.REQUEUED
-            # self.modules/_module_configs already updated by
-            # _reconcile_scope_locks on success.
+        if (
+            set(plan_modules) != set(self.modules)
+            and not await self._reconcile_scope_locks(plan_files)
+        ):
+            # Annotate the requeue so the per-task retry-cap report can
+            # name *why* — without this, three blast-radius requeues in a
+            # row produce a cap-exhaust report with phase/reason='unknown'.
+            additional = sorted(set(plan_modules) - set(self.modules))
+            block_detail = (
+                f'Plan expansion blocked: additional locks {additional} '
+                f'unavailable (held by other tasks). '
+                f'Held modules: {sorted(self.modules)}; '
+                f'plan modules: {sorted(plan_modules)}.'
+            )
+            self._terminal_report = TerminalReport(
+                outcome=WorkflowOutcome.REQUEUED,
+                reason='plan_blast_radius_lock_conflict',
+                phase=self.machine.state, detail=block_detail,
+                category=None,
+                # No BLOCKED transition on this path — blocked_from_phase
+                # mirrors the current (working) phase, preserving the
+                # harness's retry-cap block_phase='plan' (REVIEW-CYCLE-1).
+                blocked_from_phase=self.machine.state,
+            )
+            return WorkflowOutcome.REQUEUED
+        # self.modules/_module_configs already updated by
+        # _reconcile_scope_locks on success (no-op if scope unchanged).
 
         # Write plan decisions to memory
         await self._write_decisions_to_memory()
@@ -3902,16 +3906,18 @@ class TaskWorkflow:
         # already handles the requeue case.
         plan_files = plan.get('files', [])
         plan_modules = files_to_modules(plan_files, self.config.lock_depth)
-        if set(plan_modules) != set(self.modules):
-            if not await self._reconcile_scope_locks(plan_files):
-                logger.info(
-                    'Task %s: revalidation skip declined — blast-radius '
-                    'expansion denied',
-                    self.task_id,
-                )
-                return None
-            # self.modules/_module_configs already updated by
-            # _reconcile_scope_locks on success.
+        if (
+            set(plan_modules) != set(self.modules)
+            and not await self._reconcile_scope_locks(plan_files)
+        ):
+            logger.info(
+                'Task %s: revalidation skip declined — blast-radius '
+                'expansion denied',
+                self.task_id,
+            )
+            return None
+        # self.modules/_module_configs already updated by
+        # _reconcile_scope_locks on success (no-op if scope unchanged).
 
         # Bump revalidation stamp + base commit (mirrors confirm_plan).
         try:

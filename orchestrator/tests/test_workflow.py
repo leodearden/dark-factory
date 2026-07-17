@@ -453,6 +453,11 @@ def _make_run_wf(
 
     # Merge-path stubs (train members never reach these; non-train do)
     wf._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
+    # task 2505: _run_merge_phase now awaits scheduler.get_task for the
+    # plan.files/metadata.files invariant tripwire before the merge queue
+    # submission — stub it so the plain MagicMock scheduler is awaitable.
+    # None is the tripwire's own fail-safe "can't check, skip" input.
+    wf.scheduler.get_task = AsyncMock(return_value=None)
     wf.git_ops.get_main_sha = AsyncMock(return_value='deadbeef00')
     wf.git_ops.is_ancestor = AsyncMock(return_value=False)  # not already merged
     wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
