@@ -5735,10 +5735,17 @@ def select_probe_depth(
          so consecutive firings advance through *probe_depths* in order
          (wrapping).
 
-    *available_built_depth*, *recent_fail_rate*, and *suppress_flake_rate*
-    are accepted now (fixing the function's signature/call sites) but not
-    yet consulted -- the availability fallback and flake-rate suppression
-    guards are added on top of this core in a later step.
+      4. Availability fallback: if the sampled depth ``d`` exceeds
+         *available_built_depth* (the deepest already-built speculative
+         stack), return ``None`` instead of ``d``. A probe only ever
+         targets an ALREADY-built cumulative commit -- it must never
+         trigger building or rebasing a deeper stack to satisfy itself
+         (task 1890's frozen-prefix invariant).
+
+    *recent_fail_rate* and *suppress_flake_rate* are accepted now (fixing
+    the function's signature/call sites) but not yet consulted -- the
+    flake-rate suppression guard is added on top of this core in a later
+    step.
 
     Pure/synchronous -- no I/O, no clock, no RNG.
     """
@@ -5748,7 +5755,10 @@ def select_probe_depth(
     if round_index % period != 0:
         return None
     probe_index = round_index // period
-    return probe_depths[probe_index % len(probe_depths)]
+    d = probe_depths[probe_index % len(probe_depths)]
+    if d > available_built_depth:
+        return None
+    return d
 
 
 class SpeculativeMergeWorker(_WipHaltMixin):
