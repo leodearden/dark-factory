@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 # ─── Step 1 ─────────────────────────────────────────────────────────────────
 
+@pytest.mark.usefixtures("code_default_config")
 class TestConfigAndEventType:
     """step-1 (RED): new config knob and EventType member exist with correct defaults."""
 

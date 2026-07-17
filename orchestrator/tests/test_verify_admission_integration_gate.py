@@ -379,6 +379,7 @@ class TestGlobalCap:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestMergeNeverBlocks:
     """PRD Boundary-test sketch scenario 2: a merge-role verify's test leg
     runs immediately — no acquire, no wait — even while the sole task slot

@@ -148,6 +148,7 @@ class TestVerifyAdmissionAcquireWiring:
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_merge_role_acquires_uniformly_but_run_cmd_still_invoked(self, tmp_path):
         events: list = []
 
@@ -353,6 +354,7 @@ class TestNicePrefixIntegration:
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_merge_role_wraps_test_leg_with_its_own_nice_tier(self, tmp_path):
         captured_cmds: list[str] = []
 

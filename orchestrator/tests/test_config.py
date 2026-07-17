@@ -1111,6 +1111,7 @@ class TestMergeVerifyStormGuardFields:
         assert config.verify_use_cgroup_scope is True
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestMergeVerifyBreadthConfig:
     """merge_verify_breadth (λ): restart-only knob gating the broad merge gate.
 
@@ -1170,6 +1171,7 @@ class TestMergeVerifyBreadthConfig:
         assert loaded.merge_verify_breadth == 'scoped'
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestTrainFormerConfigFields:
     """Defaults and constraint for the β train-former config knobs."""
 
