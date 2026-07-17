@@ -3324,6 +3324,60 @@ class TaskWorkflow:
 
         await asyncio.gather(*(_sync(p) for p in sorted(prefixes)))
 
+    async def _reconcile_scope_locks(self, plan_files: list[str]) -> bool:
+        """Shared blast-radius-expansion + ``self.modules``/``_module_configs``
+        sync — the scope-reconciliation choke point (task 2505) used by every
+        path that (re)establishes plan.files against the scheduler's file-lock
+        set: ``_plan()``, ``_apply_revalidation_skip()``, ``_run_simple_task()``,
+        and ``_set_task_scope()``.
+
+        Derives the module set from *plan_files*; if it already matches
+        ``self.modules`` this is a no-op (returns True without touching the
+        scheduler). Otherwise asks the scheduler to expand/reconcile the lock
+        via ``handle_blast_radius_expansion`` (``persist_files=plan_files`` —
+        this call persists ``metadata.files=plan_files`` on BOTH its success
+        and lock-conflict/requeue branches). On success, updates
+        ``self.modules``/``self._module_configs`` and returns True. On a lock
+        conflict, ``self.modules`` is left UNCHANGED (the scheduler has
+        already persisted ``metadata.files=plan_files`` and requeued the task
+        to pending on its own) and this returns False — callers decide what
+        "not expanded" means for their own flow (REQUEUED report,
+        decline-and-fall-through-to-architect, or silent no-op).
+        """
+        new_modules = files_to_modules(plan_files, self.config.lock_depth)
+        if set(new_modules) == set(self.modules):
+            return True
+        expanded = await self.scheduler.handle_blast_radius_expansion(
+            self.task_id, self.modules, new_modules,
+            persist_files=plan_files,
+        )
+        if not expanded:
+            return False
+        # Persistence of the tightened lock set is centralized in
+        # handle_blast_radius_expansion (success branch) — not here.
+        self.modules = new_modules
+        self._module_configs = self._resolve_module_configs()
+        return True
+
+    async def _set_task_scope(self, new_files: list[str]) -> bool:
+        """Orchestrator-side single choke point for widening a task's file
+        scope OUTSIDE the architect/plan-boundary flow (task 2505) — used by
+        the resume-path scope-grant consumer to fold a steward's
+        ``granted_files`` into plan.files without re-invoking the architect.
+
+        Writes plan.json first (``self.plan['files'] = new_files`` +
+        ``artifacts.set_plan_files`` — preserves ownership/provenance), then
+        reconciles the scheduler's locks/metadata.files via
+        ``_reconcile_scope_locks``. On a lock conflict, plan.json is already
+        widened (matching metadata.files, which ``handle_blast_radius_expansion``
+        persists on both branches) but ``self.modules`` is left unchanged and
+        this returns False so the caller does NOT resume under a foreign lock.
+        """
+        assert self.artifacts is not None
+        self.plan['files'] = new_files
+        self.artifacts.set_plan_files(new_files, self.session_id)
+        return await self._reconcile_scope_locks(new_files)
+
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
         assert self.worktree is not None and self.artifacts is not None
@@ -3682,11 +3736,7 @@ class TaskWorkflow:
         )
 
         if set(plan_modules) != set(self.modules):
-            expanded = await self.scheduler.handle_blast_radius_expansion(
-                self.task_id, self.modules, plan_modules,
-                persist_files=plan_files,
-            )
-            if not expanded:
+            if not await self._reconcile_scope_locks(plan_files):
                 # Annotate the requeue so the per-task retry-cap report can
                 # name *why* — without this, three blast-radius requeues in a
                 # row produce a cap-exhaust report with phase/reason='unknown'.
@@ -3708,10 +3758,8 @@ class TaskWorkflow:
                     blocked_from_phase=self.machine.state,
                 )
                 return WorkflowOutcome.REQUEUED
-            # Persistence of the tightened lock set is centralized in
-            # handle_blast_radius_expansion (success branch) — not here.
-            self.modules = plan_modules
-            self._module_configs = self._resolve_module_configs()
+            # self.modules/_module_configs already updated by
+            # _reconcile_scope_locks on success.
 
         # Write plan decisions to memory
         await self._write_decisions_to_memory()
@@ -3805,21 +3853,15 @@ class TaskWorkflow:
         plan_files = plan.get('files', [])
         plan_modules = files_to_modules(plan_files, self.config.lock_depth)
         if set(plan_modules) != set(self.modules):
-            expanded = await self.scheduler.handle_blast_radius_expansion(
-                self.task_id, self.modules, plan_modules,
-                persist_files=plan_files,
-            )
-            if not expanded:
+            if not await self._reconcile_scope_locks(plan_files):
                 logger.info(
                     'Task %s: revalidation skip declined — blast-radius '
                     'expansion denied',
                     self.task_id,
                 )
                 return None
-            # Persistence of the tightened lock set is centralized in
-            # handle_blast_radius_expansion (success branch) — not here.
-            self.modules = plan_modules
-            self._module_configs = self._resolve_module_configs()
+            # self.modules/_module_configs already updated by
+            # _reconcile_scope_locks on success.
 
         # Bump revalidation stamp + base commit (mirrors confirm_plan).
         try:
@@ -3968,15 +4010,10 @@ class TaskWorkflow:
         if plan_files:
             plan_modules = files_to_modules(plan_files, self.config.lock_depth)
             if set(plan_modules) != set(self.modules):
-                expanded = await self.scheduler.handle_blast_radius_expansion(
-                    self.task_id, self.modules, plan_modules,
-                    persist_files=plan_files,
-                )
-                if expanded:
-                    # Persistence of the tightened lock set is centralized in
-                    # handle_blast_radius_expansion (success branch) — not here.
-                    self.modules = plan_modules
-                    self._module_configs = self._resolve_module_configs()
+                # Silent no-op on lock conflict (same as before this was
+                # extracted into _reconcile_scope_locks): SIMPLE_TASK doesn't
+                # fail out here, it just doesn't re-tighten the lock.
+                await self._reconcile_scope_locks(plan_files)
 
         await self._stamp_optimistic_path('simple_task')
 
