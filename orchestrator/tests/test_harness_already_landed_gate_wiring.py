@@ -364,6 +364,11 @@ def _wired_marker_harness(
     called with two DIFFERENT argument pairs in this path: once for
     ``(branch, main_branch)`` (must be False to reach the marker path) and
     once for ``(marker_sha, branch_base_sha)`` (the stale-marker check).
+
+    ``commit_effect_present_in_main`` defaults to True (a healthy marker
+    landing) and ``_escalation_queue`` is a wired MagicMock with
+    ``has_open_l1`` defaulting False — callers flip either to exercise the
+    CANDIDATE-mode reject-and-escalate path (task 2678).
     """
     h = _build_harness(mock_orch_config)
     h.git_ops = MagicMock()
@@ -382,21 +387,27 @@ def _wired_marker_harness(
     h.git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
     h.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
     h.git_ops.find_task_citation_commit = AsyncMock(return_value=None)
+    h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)
 
     h.scheduler.get_task = AsyncMock(
         return_value={'id': '42', 'metadata': {'branch_base_sha': branch_base_sha}},
     )
     h._branch_is_degenerate = AsyncMock(return_value=False)
     h._mark_in_progress_done = AsyncMock()
-    h._escalation_queue = None
+    h._escalation_queue = MagicMock()
+    h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+    h._escalation_queue.make_id = MagicMock(return_value='esc-42-1')
     return h
 
 
 @pytest.mark.asyncio
 class TestAlreadyLandedDispatchGateMarkerPath:
-    """Branch-deleted merge-marker path (RED until step-8).
+    """Branch-deleted merge-marker path (RED until step-8 for the
+    effect-absent/escalation sub-case; the flip and stale-marker sub-cases
+    are already green from step-8's predecessor and are extended here with
+    escalation-queue assertions).
 
-    resolve_branch_sha(branch) is None in both sub-cases (the branch ref is
+    resolve_branch_sha(branch) is None in all sub-cases (the branch ref is
     gone), so the ancestry path never engages — only the marker path can
     produce a result.
     """
@@ -405,8 +416,9 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         self, mock_orch_config,
     ) -> None:
         """A merge marker on main, not an ancestor of branch_base_sha (i.e.
-        it postdates this incarnation's creation point) -> flips to done,
-        anchored on the marker sha.
+        it postdates this incarnation's creation point), with its effect
+        PRESENT at main HEAD (the CANDIDATE-mode helper accepts) -> flips
+        to done, anchored on the marker sha, with no escalation filed.
 
         Also pins the citation-laziness fix (task 2313 review): the marker
         path doesn't consume a citation, so find_task_citation_commit must
@@ -431,11 +443,56 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         assert call_args.args[1] == marker_sha
         assert call_args.args[3] == 'dispatch-gate-marker-found'
         cast(AsyncMock, h.git_ops.find_task_citation_commit).assert_not_called()
+        cast(MagicMock, h._escalation_queue.submit).assert_not_called()
+
+    async def test_marker_found_not_stale_effect_absent_escalates_no_mark_done(
+        self, mock_orch_config,
+    ) -> None:
+        """The task-1175 shape: a merge marker on main, not stale, but its
+        effect has been REVERTED at current main HEAD
+        (commit_effect_present_in_main False) — a later commit on main
+        undid exactly the paths the marker's landing touched. The
+        CANDIDATE-mode FIX 1' guard (task 2678, closing the 1175 clobber in
+        this path) must reject it: no _mark_in_progress_done call, the gate
+        returns False, and exactly one dedup-guarded 'provenance_unattributed'
+        L1 escalation is filed carrying the branch, the marker sha, and the
+        'effect_absent' reason. has_open_l1('42') is consulted for dedup
+        before the escalation is filed.
+
+        RED: the marker path has no effect check / escalation yet, so it
+        would flip to done regardless of commit_effect_present_in_main.
+        """
+        marker_sha = 'b' * 40
+        branch_base_sha = 'e' * 40
+        h = _wired_marker_harness(
+            mock_orch_config,
+            marker_sha=marker_sha,
+            branch_base_sha=branch_base_sha,
+            marker_is_ancestor_of_base=False,
+        )
+        h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+        cast(MagicMock, h._escalation_queue.has_open_l1).assert_called_once_with('42')
+        cast(MagicMock, h._escalation_queue.submit).assert_called_once()
+        esc = cast(MagicMock, h._escalation_queue.submit).call_args[0][0]
+        assert esc.category == 'provenance_unattributed'
+        assert esc.task_id == '42'
+        assert 'task/42' in esc.detail
+        assert marker_sha in esc.detail
+        assert 'effect_absent' in esc.detail
 
     async def test_stale_marker_vetoes_flip(self, mock_orch_config) -> None:
         """A marker that IS an ancestor of branch_base_sha predates this
         incarnation (branch was deleted + re-created under the same task
-        id) -> vetoes the flip, no _mark_in_progress_done call.
+        id) -> vetoes the flip, no _mark_in_progress_done call, and no
+        escalation (this veto predates the incarnation entirely — it is
+        not an unattributed-landing signal, so it must not be treated as
+        one).
         """
         marker_sha = 'b' * 40
         branch_base_sha = 'e' * 40
@@ -450,6 +507,7 @@ class TestAlreadyLandedDispatchGateMarkerPath:
 
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        cast(MagicMock, h._escalation_queue.submit).assert_not_called()
 
 
 def _wired_content_harness(
