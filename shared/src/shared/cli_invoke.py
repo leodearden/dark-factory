@@ -791,8 +791,8 @@ async def invoke_with_cap_retry(
     (e.g. the steward's per-escalation continuation prompt).  Defaults to
     ``False``, which preserves the crash-recovery contract used by
     ``workflow._invoke``: a crash-recovered session already holds the full
-    task context, so the short ``'continue'`` placeholder is sufficient and
-    the real prompt is kept only as ``original_prompt`` for fresh-fallback.
+    task context, so the short crash-recovery continuation prompt is sufficient
+    and the real prompt is kept only as ``original_prompt`` for fresh-fallback.
 
     The ``session_lost`` argument is currently always ``True`` — every wired
     call site is an unresumable cap retry.  It is kept as an explicit
@@ -824,7 +824,8 @@ async def invoke_with_cap_retry(
     # existing non-cap-hit resume-failure branch (below) then correctly restores
     # `original_prompt` (the real task prompt) for any subsequent fresh invocation.
     # `resume_delivers_prompt` opts a live-continuation caller (the steward) out of
-    # this swap: its resumed session must receive the real prompt, not 'continue'.
+    # this swap: its resumed session must receive the real prompt, not the short
+    # crash-recovery continuation prompt.
     if invoke_kwargs.get('resume_session_id'):
         if not original_prompt:
             raise TypeError(
