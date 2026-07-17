@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from shared.task_metadata import parse_metadata
+from shared.task_metadata import _BLESSED_METADATA_KEYS, parse_metadata
 
 from fused_memory.middleware import recon_write_policy
 from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -451,6 +451,28 @@ class TestIsTerminalAnnotationClear:
             },
         ) is True
 
+    # -- causation-id tracing co-key tolerance (task 2697) -------------------
+
+    def test_clear_plus_causation_id_is_true(self):
+        """Symmetric clear-path fix: the mandatory recon-stage _causation_id
+        tracing co-key (reconciliation/stages/base.py's Reconciliation
+        Context block) must be transparent to the all-clearable check."""
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {
+                'metadata': {
+                    'possible_scope_mismatch': None,
+                    '_causation_id': 'run-1',
+                },
+            },
+        ) is True
+
+    def test_causation_id_alone_is_false(self):
+        """A bare tracing co-key with no real annotation content is a pure
+        trace no-op and must stay rejected on a terminal task."""
+        assert recon_write_policy.is_terminal_annotation_clear(
+            {'metadata': {'_causation_id': 'run-1'}},
+        ) is False
+
     # -- negative: task-content fields disqualify ---------------------------
 
     def test_title_present_is_false(self):
@@ -626,6 +648,43 @@ class TestIsTerminalAnnotationAdd:
             {'metadata': {'x_foo': 1}, 'tag': 'master'},
         ) is True
 
+    # -- causation-id tracing co-key tolerance (task 2697) -------------------
+
+    def test_x_keys_plus_causation_id_is_true(self):
+        """The exact incident payload plus the mandatory recon-stage
+        _causation_id tracing co-key (reconciliation/stages/base.py's
+        Reconciliation Context block) — _causation_id must be transparent
+        to the all-x_ check."""
+        assert recon_write_policy.is_terminal_annotation_add(
+            {
+                'metadata': {
+                    'x_refile_superseded_by': '2673',
+                    'x_reopen_abandoned_reason': 'superseded',
+                    '_causation_id': '06f2658a-474a-476c-9cf3-232d76e9ffb9',
+                },
+            },
+        ) is True
+
+    def test_causation_id_alone_is_false(self):
+        """A bare tracing co-key with no real annotation content is a pure
+        trace no-op and must stay rejected on a terminal task."""
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'_causation_id': 'run-1'}},
+        ) is False
+
+    def test_x_keys_plus_causation_id_plus_files_is_false(self):
+        """Causation-id tracing tolerance must not open the door to other
+        load-bearing keys riding alongside it."""
+        assert recon_write_policy.is_terminal_annotation_add(
+            {
+                'metadata': {
+                    'x_foo': 1,
+                    '_causation_id': 'run-1',
+                    'files': ['a/b.py'],
+                },
+            },
+        ) is False
+
     # -- negative: task-content fields disqualify ---------------------------
 
     def test_title_present_is_false(self):
@@ -752,6 +811,44 @@ class TestIsTerminalAnnotationExempt:
     def test_metadata_absent_is_false(self):
         assert recon_write_policy.is_terminal_annotation_exempt({}) is False
 
+    # -- causation-id tracing co-key tolerance (task 2697) -------------------
+
+    def test_add_plus_causation_id_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {'metadata': {'x_foo': 1, '_causation_id': 'run-1'}},
+        ) is True
+
+    def test_clear_plus_causation_id_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {
+                'metadata': {
+                    'possible_scope_mismatch': None,
+                    '_causation_id': 'run-1',
+                },
+            },
+        ) is True
+
+    def test_causation_id_alone_is_false(self):
+        """A bare tracing co-key with no real annotation content is a pure
+        trace no-op and must stay rejected on a terminal task."""
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {'metadata': {'_causation_id': 'run-1'}},
+        ) is False
+
+    def test_mixed_clearable_and_x_and_causation_id_is_false(self):
+        """The x_-only-OR-clear-only limitation survives stripping only the
+        tracing key: a mixed clearable+x_ residual still satisfies neither
+        ALL-branch."""
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {
+                'metadata': {
+                    'possible_scope_mismatch': None,
+                    'x_foo': 1,
+                    '_causation_id': 'run-1',
+                },
+            },
+        ) is False
+
 
 # ---------------------------------------------------------------------------
 # X_ANNOTATION_PREFIX <-> shared.task_metadata.parse_metadata consistency
@@ -787,6 +884,28 @@ class TestXAnnotationPrefixConsistencyWithParseMetadata:
         key = 'not_forward_compat_probe'
         _model, warnings = parse_metadata({key: 'v'}, direction='read')
         assert any(w.field == key and w.code == 'unknown_key' for w in warnings)
+
+
+# ---------------------------------------------------------------------------
+# _CAUSATION_TRACING_KEYS <-> shared.task_metadata consistency (task 2697)
+# ---------------------------------------------------------------------------
+
+
+class TestCausationTracingKeysConsistencyWithBlessedMetadata:
+    """Guards :data:`recon_write_policy._CAUSATION_TRACING_KEYS` against
+    silently drifting from ``shared.task_metadata._BLESSED_METADATA_KEYS`` —
+    a future rename of the blessed causation key would otherwise silently
+    break the recon-stage tolerance this task adds (the predicates would
+    resume treating ``_causation_id`` as disqualifying load-bearing content)
+    without any test failing to say so.
+    """
+
+    def test_causation_tracing_keys_is_subset_of_blessed_metadata_keys(self):
+        assert recon_write_policy._CAUSATION_TRACING_KEYS <= _BLESSED_METADATA_KEYS
+
+    def test_causation_id_is_admitted_by_parse_metadata_without_warning(self):
+        _model, warnings = parse_metadata({'_causation_id': 'v'}, direction='read')
+        assert '_causation_id' not in {w.field for w in warnings}
 
 
 # ---------------------------------------------------------------------------
@@ -960,6 +1079,51 @@ class TestInterceptorUpdateTaskXAnnotationAddBoundary:
 
         taskmaster.update_task.assert_awaited_once()
         assert 'error_type' not in result
+
+    @pytest.mark.asyncio
+    async def test_recon_stage_x_annotation_add_with_causation_id_on_done_task_proceeds(
+        self, interceptor, taskmaster,
+    ):
+        """Exact incident reproduction (run 06f2658a): the x_ add payload
+        plus the mandatory recon-stage _causation_id tracing co-key that
+        every recon-stage write embeds (reconciliation/stages/base.py's
+        Reconciliation Context block) must proceed, not be rejected."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={
+                'x_refile_superseded_by': '2673',
+                'x_reopen_abandoned_reason': 'superseded',
+                '_causation_id': '06f2658a-474a-476c-9cf3-232d76e9ffb9',
+            },
+            agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+        assert 'error_type' not in result
+
+    @pytest.mark.asyncio
+    async def test_x_add_with_causation_id_and_load_bearing_key_still_rejects(
+        self, interceptor, taskmaster,
+    ):
+        """Causation-id tracing tolerance must not open the door to other
+        load-bearing keys riding alongside it."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={
+                'x_refile_superseded_by': '2673',
+                'x_reopen_abandoned_reason': 'superseded',
+                '_causation_id': '06f2658a-474a-476c-9cf3-232d76e9ffb9',
+                'files': ['a/b.py'],
+            },
+            agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_x_add_with_title_present_still_rejects(self, interceptor, taskmaster):
