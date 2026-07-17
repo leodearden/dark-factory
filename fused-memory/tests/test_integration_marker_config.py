@@ -19,6 +19,17 @@ RED before task 2736 step-2 lands: fused-memory/pyproject.toml registers no
 `integration` marker and has no `-m 'not integration'` deselection, so the
 integration-marked probe is collected by default (assertion (a) fails) and an
 unknown-mark warning appears (assertion (c) fails).
+
+A second guard below, modeled on
+cockpit/tests/test_root_config_smoke_deselection.py, collects the REAL
+test_recon_dedup_premise.py module (not a throwaway probe) and asserts on the
+specific test function names: the real-embedder test must be deselected by
+default while its hermetic sibling remains collected, and the real-embedder
+test must become selectable again under `-m integration`.
+
+RED after task 2736 step-2 (before step-4): the real-embedder test is still
+tagged only with skipif (not @pytest.mark.integration), so it is collected by
+default and that guard's default-run assertion fails.
 """
 
 from __future__ import annotations
@@ -36,6 +47,10 @@ import pytest
 TESTS_DIR = Path(__file__).resolve().parent
 FUSED_MEMORY_DIR = TESTS_DIR.parent
 FUSED_MEMORY_PYPROJECT = FUSED_MEMORY_DIR / 'pyproject.toml'
+
+REAL_TEST_MODULE = TESTS_DIR / 'test_recon_dedup_premise.py'
+REAL_EMBEDDER_TEST_NAME = 'test_identical_writes_land_with_real_openai_embeddings'
+HERMETIC_SIBLING_TEST_NAME = 'test_identical_infer_false_writes_all_land_distinct'
 
 _PROBE_SRC = textwrap.dedent(
     """\
@@ -130,3 +145,61 @@ class TestIntegrationMarkerDeselection:
         assert 'test_plain' not in output, (
             f'Expected the plain test to be deselected under -m integration. Output:\n{output}'
         )
+
+
+@pytest.mark.timeout(120)
+def test_real_embedder_test_gated_by_default_and_selectable_via_marker() -> None:
+    """The real-OpenAI-embedder test must be gated; its hermetic sibling must not be.
+
+    Modeled on cockpit/tests/test_root_config_smoke_deselection.py: collects
+    the REAL fused-memory/tests/test_recon_dedup_premise.py module (not a
+    throwaway probe) under fused-memory's actual pyproject.toml, and asserts
+    on the specific test FUNCTION names collected -- ground truth of what
+    pytest would actually run, regardless of how the marker is applied.
+
+    Collecting the real module imports mem0/qdrant_client, so this gets
+    generous timeout headroom over the file's own default 60s cap.
+    """
+
+    def _collect_real(*extra_args: str) -> str:
+        result = subprocess.run(
+            [
+                sys.executable,
+                '-m',
+                'pytest',
+                '--collect-only',
+                '-q',
+                '-p',
+                'no:cacheprovider',
+                '-n0',
+                '-c',
+                str(FUSED_MEMORY_PYPROJECT),
+                *extra_args,
+                str(REAL_TEST_MODULE),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            cwd=str(FUSED_MEMORY_DIR),
+        )
+        return result.stdout + result.stderr
+
+    # (a) DEFAULT run: real-embedder test deselected, hermetic sibling still collected.
+    default_output = _collect_real()
+    assert REAL_EMBEDDER_TEST_NAME not in default_output, (
+        f'{REAL_EMBEDDER_TEST_NAME} was collected by default -- it must be marked '
+        f"@pytest.mark.integration (task 2736 step-4) so the repo's "
+        f"-m 'not integration' addopts deselects it. Output:\n{default_output}"
+    )
+    assert HERMETIC_SIBLING_TEST_NAME in default_output, (
+        f'expected the hermetic sibling {HERMETIC_SIBLING_TEST_NAME} to remain '
+        f'collected by default (it already covers the dedup premise without a '
+        f'live OpenAI call). Output:\n{default_output}'
+    )
+
+    # (b) `-m integration` override: real-embedder test becomes selectable (opt-in, not deleted).
+    override_output = _collect_real('-m', 'integration')
+    assert REAL_EMBEDDER_TEST_NAME in override_output, (
+        f'expected {REAL_EMBEDDER_TEST_NAME} to be collected under -m integration '
+        f'(it must remain selectable as an explicit opt-in). Output:\n{override_output}'
+    )
