@@ -1,0 +1,173 @@
+# Dark Factory — project-specific orchestrator overrides.
+# Core defaults are in the orchestrator package (defaults.yaml).
+
+max_concurrent_tasks: 24
+
+# Verification commands (dark-factory multi-subproject layout)
+# test_command fans out per-subproject so each runs in its own venv with its
+# own pyproject.toml (per-test timeout, -n auto, -m 'not integration', …).
+# Bare ``pytest`` at the worktree root collects every subproject's tests/ into
+# one process and only honours the root pyproject.toml — slow + cross-process
+# state pollution. With Fix 1's docs-only short-circuit + per-subproject
+# fan-out for non-prefixed source, this command rarely fires; when it does
+# (root conftest.py changes), the fan-out keeps it safe.
+# task 2361: worker-kill de-flake + coverage. Every segment appends
+# --timeout=300 (CLI overrides each subproject's pyproject.toml timeout=60):
+# orchestrator/fused-memory run pytest-xdist with a 60s per-test timeout, and
+# under host CPU oversubscription a starved xdist worker crosses that ceiling,
+# gets os._exit()'d by pytest-timeout's thread method, and
+# --max-worker-restart=0 turns that into a false-failing per-test "node down"
+# on whatever test happens to be running. A uniform ``-n`` cap was rejected:
+# shared/escalation/dashboard declare no pytest-xdist, so ``-n`` would error
+# with "unrecognized arguments" on those segments. A 6th segment now also runs
+# the repo-root tests/scripts/ suite (not a workspace member, so never covered
+# by the 5 subprojects' own tests/ dirs) via ``--project shared``, mirroring
+# scripts/orchestrator.yaml, so a task scoped only to tests/scripts/ is no
+# longer gated on unrelated subprojects while its own tests never run.
+# task 2368: sampler is a workspace member with its own tests/ and is now
+# fanned out the same as the other 5 subprojects (hard ``cd ../sampler``,
+# sampler is present on main). cockpit (introduced by the un-merged Fleet
+# Cockpit batch 2291-2303) is NOT yet present on main, so its segment is
+# wrapped in a ``[ -d cockpit ] || exit 0`` presence guard rather than a hard
+# ``cd ../cockpit`` — a hard cd would return non-zero and abort this entire
+# &&-chain (used by both this fallback AND merge-queue verify) while cockpit
+# is absent. The guard subshell keeps the outer cwd at repo root (it runs
+# after the preceding ``cd ..``) so the trailing tests/scripts/ segment still
+# resolves, and does not mask real cockpit test failures once the directory
+# exists.
+# NOTE: any pytest segment added to this chain in the future must also carry
+# --timeout>60 — enforced by
+# tests/scripts/test_fallback_verify_config.py::test_fallback_verify_raises_per_test_timeout.
+test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ --timeout=300"
+# ``uv run`` prefix is load-bearing: ruff is not on PATH at the worktree root
+# (only inside each member venv). Without it the fallback scoper (which narrows
+# this to a single touched file for root-level changes) emits a bare ``ruff
+# check <file>`` that exits 127 (command not found). ``uv run ruff`` resolves
+# the workspace venv from root in both the full and scoped forms.
+# bare-MagicMock config gate — whole-repo scope on this rare module_config-less
+# fallback path (per-module orchestrator.yaml lint_commands carry the per-package
+# scope; also runs in merge-queue verify; see hooks/project-checks).
+lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests"
+type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright"
+
+# Verification timeouts — dark-factory is Python-only (no cargo builds), so the
+# package defaults (1800s warm / 5400s cold, sized for reify's big Rust builds)
+# are much too loose. Full warm verify here is ~2 min; cold adds uv sync across
+# 6 subprojects (~3 min). Tight timeouts surface hangs (e.g. asyncio-sleep
+# loops in a misconfigured mock) on the first verify that touches the module,
+# not 8 days later at a post-completion full review.
+verify_command_timeout_secs: 1800
+verify_cold_command_timeout_secs: 3600
+
+# TEMPORARY manual override (watcher, 2026-07-13) to break the cross-project
+# verify-admission-slot contention with reify while task 2501 (per-project
+# slots-dir default) lands. Without this, verify_admission_slots_dir defaults to
+# the host-global /tmp/df-verify-slots-<uid>, which reify's long cargo verifies
+# monopolize — stalling dark_factory's whole verify/merge pipeline. This gives
+# dark_factory its own slot dir. REMOVE once 2501 is on main + the orch has
+# restarted onto it (2501's code default derives a per-project path itself;
+# invariant I3 preserves this explicit override until then).
+verify_admission_slots_dir: "/tmp/df-verify-slots-1000-dark_factory"
+
+# Fused memory HTTP server — port 8002
+# Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
+fused_memory:
+  url: "http://localhost:8002"
+  project_id: "dark_factory"
+  config_path: "fused-memory/config/config.yaml"
+  server_command: []
+
+# Escalation — port 8102 (matches .mcp.json so interactive sessions share the server)
+escalation:
+  queue_dir: "data/escalations"
+  port: 8102
+
+# Per-role turn budgets. Raising the architect budget is a direct response to
+# silent max_turns exits on large-scope tasks: the architect now has headroom
+# to verify premises and produce a plan without the CLI truncating mid-tool-call.
+max_turns:
+  architect: 120
+
+# Trailing-24h spend ceiling. Default $200 was a backstop from before the
+# multi-account failover landed — with Anthropic's per-account caps as the
+# real spend governor, the orch-level dollar guard just trips during normal
+# operation. Raised to effectively-disabled. The watcher ceiling
+# (watcher_daily_cost_ceiling_usd, default $50) was tripping on the L1
+# auto-watcher's normal ~$50/24h Opus burn (esc-__scheduler__-4, 2026-07-14 —
+# 28 opus invocations = $50.34), pausing dispatch. Raised to $150 to give
+# ~3 days of headroom while keeping an early-warning guard well below the
+# orch-wide net.
+orch_daily_cost_ceiling_usd: 10000.0
+watcher_daily_cost_ceiling_usd: 150.0
+
+# Usage cap / multi-account failover
+usage_cap:
+  enabled: true
+  accounts_file: "${USAGE_ACCOUNTS_FILE:/home/leo/src/dark-factory/config/usage-accounts.yaml}"
+
+# Project root (absolute path)
+project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"
+
+# Post-merge staleness hook — U2 restart-on-merge for the orchestrator fleet
+# itself. Flips the (previously dormant, enabled=False-by-default) coordinator
+# on for dark-factory's own daemon. All six orchestrator-*.service units are
+# restarted via scripts/restart-all-orchestrators.sh, which enumerates running
+# units, verifies a fresh ActiveEnterTimestampMonotonic per unit, and defers
+# SELF_UNIT=orchestrator-dark-factory.service to last so a same-cgroup caller
+# doesn't get killed before the other units are restarted.
+#
+# See orchestrator/src/orchestrator/config.py (orchestrator_restart_* field
+# docstrings) and orchestrator/src/orchestrator/service_restart.py for the
+# coordinator's debounce / agents-idle / merge-drain-precondition policy.
+# Per plans/orchestrator-fleet-staleness-prd.md task γ.
+#
+# ACTIVATION NOTE: this flip is inert in the running daemon until the next
+# orchestrator restart — these knobs are not in the config hot-reload
+# allowlist. Activation is a separate deterministic capstone task.
+#
+# WATCH-PREFIX CONVENTION: every entry below must be a full, existing path
+# (directory or file) relative to the repo root — enforced by
+# tests/scripts/test_orchestrator_restart_config_drift.py. This is stricter
+# than the runtime matcher (service_restart.diff_touches_watched_paths does
+# plain boundary-safe string-prefix matching against changed file paths with
+# no filesystem check), chosen deliberately so a typo'd prefix fails CI
+# instead of silently never matching a changed file at fire time.
+orchestrator_restart_on_merge_enabled: true
+orchestrator_restart_script: "scripts/restart-all-orchestrators.sh"
+orchestrator_restart_watch_prefixes:
+  - "orchestrator/src/"
+  - "escalation/src/"
+  - "orchestrator/pyproject.toml"
+  - "orchestrator/uv.lock"
+  - "escalation/pyproject.toml"
+
+# Verify-scope inversion — σ capstone (plans/verify-scope-inversion-prd.md).
+# Flips the broad merge-role verify gate on and enables merge-train formation
+# now that ξ (boundary suite) is green and 2501 (per-project verify-slot
+# scoping) has landed the contention headroom this needs on the shared host.
+#
+# merge_verify_breadth: "full" makes merge-role verify run every REGISTERED
+# module's full suite instead of only the touched modules (Resolved decision
+# 5 in the PRD) — the λ knob, defaulting to "scoped" in defaults.yaml.
+#
+# merge_train_former_enabled / merge_train_coalesce_enabled /
+# merge_train_max_members: turn on the train former + retroactive
+# queue-coalescing pass at N=3 (Resolved decision 6). The train
+# former/coalescer is DF code (tasks 1704-1708), production-proven in reify
+# since 2026-06-10 (GO-N3 precedent: s(3)=0.962, coupling-failure 0/104) —
+# amortizes the now-broader gate's cost across up to 3 members per train,
+# same per-tip correctness gate as a single merge.
+#
+# ACTIVATION NOTE: like the U2 restart-on-merge flip above, these four knobs
+# are restart-only — NOT in the config hot-reload allowlist
+# (RELOADABLE_FIELDS, orchestrator/src/orchestrator/config.py) — so this edit
+# is inert in the running daemon until the next orchestrator restart. Unlike
+# most restart-only edits, this one is NOT auto-covered by the U2 coordinator
+# either: orchestrator/config.yaml itself is not listed in
+# orchestrator_restart_watch_prefixes above (config.yaml:122-127), so a merge
+# of this file alone does not auto-fire a fleet restart. Activation is the
+# separate τ deterministic-deploy capstone task.
+merge_verify_breadth: "full"
+merge_train_former_enabled: true
+merge_train_coalesce_enabled: true
+merge_train_max_members: 3
