@@ -5885,6 +5885,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # coverage. Mirrors the RESOURCE_AUDIT_WORKTREE_GRACE_SECS/MAX_*
     # monkeypatch convention above.
     RESOURCE_AUDIT_ESCALATION_STREAK: int = 3
+    # task 2359: bounded rolling window (count of most-recent post-merge
+    # verify outcomes) feeding _recent_verify_fail_rate() -- the flake-rate
+    # signal that suppresses variable-depth speculative probing while the
+    # pipeline is already thrashing (see select_probe_depth()). Kept as a
+    # class attribute so tests can monkeypatch it small for fast,
+    # deterministic eviction coverage. Mirrors the RESOURCE_AUDIT_*/MAX_*
+    # monkeypatch convention above.
+    RECENT_VERIFY_OUTCOME_WINDOW: int = 20
 
     def __init__(
         self,
@@ -6337,6 +6345,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # dedup'd L1 escalation (_alarm_resource_audit) fires. See
         # _check_resource_audit for the full contract.
         self._resource_audit_violation_streak: int = 0
+        # task 2359: bounded rolling window of per-verify pass/fail outcomes.
+        # Fed by _record_verify_outcome() (called from the verify-finalize
+        # path); read by _recent_verify_fail_rate() to suppress variable-
+        # depth speculative probing while the pipeline is already thrashing.
+        # Empty at construction -> _recent_verify_fail_rate() returns None
+        # (no data yet), which select_probe_depth() treats as "do not
+        # suppress" -- a freshly-started/restarted worker never suppresses
+        # on phantom flakiness.
+        self._recent_verify_outcomes: collections.deque[bool] = collections.deque(
+            maxlen=self.RECENT_VERIFY_OUTCOME_WINDOW,
+        )
 
     # ── MQ-reliability kappa (task 2169): ItemLifecycle chokepoint helpers ──
     # register/transition/retire an item's lifecycle state + the lockstep
@@ -7433,6 +7452,44 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     f'{expected_base!r} (ε=1890 §5.3 verify-base/frozen-tip rule)'
                 )
         return violations
+
+    # task 2359: variable-depth speculative verify placement -- stateful
+    # counterpart to select_probe_depth() (the pure decision core, defined
+    # module-level above this class). These methods own the live state
+    # select_probe_depth() needs: the rolling per-verify fail-rate window
+    # and the deepest already-built speculative stack depth.
+
+    def _record_verify_outcome(self, passed: bool) -> None:
+        """Record one post-merge verify outcome into the rolling window.
+
+        Feeds :meth:`_recent_verify_fail_rate`'s flake-rate suppression
+        signal. The deque is bounded to RECENT_VERIFY_OUTCOME_WINDOW entries
+        (oldest evicted first) so the rate always reflects only the most
+        recent verifies, not a lifetime average.
+
+        Pure/synchronous.
+        """
+        self._recent_verify_outcomes.append(passed)
+
+    def _recent_verify_fail_rate(self) -> float | None:
+        """Return the rolling per-verify FAIL rate, or ``None`` if no
+        outcomes have been recorded yet.
+
+        ``None`` is deliberately NOT the same as ``0.0``:
+        select_probe_depth()'s suppression guard treats a ``None`` rate as
+        "do not suppress" (a freshly-started/restarted worker has no flake
+        signal yet), while a genuine ``0.0`` (every recent verify passed)
+        is an equally-valid "do not suppress" value reached through actual
+        data. No additional minimum-sample floor beyond "non-empty" -- a
+        single recorded outcome is enough to produce a rate once the
+        window has anything in it.
+
+        Pure/synchronous.
+        """
+        if not self._recent_verify_outcomes:
+            return None
+        n_failed = sum(1 for passed in self._recent_verify_outcomes if not passed)
+        return n_failed / len(self._recent_verify_outcomes)
 
     # ── MQ-invariants iota (task 1994): resource-conservation audits ────────
     #
