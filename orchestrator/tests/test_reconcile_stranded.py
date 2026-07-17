@@ -298,6 +298,14 @@ class TestReconcileOneStrandedGroundTruthMarkDone:
 # so it still classifies MARK_DONE_WITH_PROVENANCE; the sweep-side
 # effect-present refinement (mirroring the existing degenerate-branch
 # refinement) is the only place this blind spot gets caught.
+#
+# task 2678 extends this refinement to the GONE_WITH_MERGE_MARKER sub-case
+# too (routed through validate_landing_evidence in CANDIDATE mode on
+# report.branch_state.sha, applied uniformly to both sub-cases): previously
+# the inline check here was gated on ``on_main``, so a branch-deleted merge
+# marker whose effect had been reverted at current main HEAD skipped the
+# guard entirely and was stamped done unconditionally — the task-1175
+# clobber shape, reproduced inside this sweep.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -332,6 +340,97 @@ class TestReconcileOneStrandedEffectPresentGuard:
             tid, 'pending',
         )
         assert result == 1
+
+    async def test_marker_effect_present_marks_done_and_effect_check_consulted(
+        self, harness: Harness,
+    ):
+        """Branch-deleted merge-marker evidence (GONE_WITH_MERGE_MARKER)
+        whose effect IS present at current main HEAD still marks done —
+        exactly like before task 2678 — but now commit_effect_present_in_main
+        is actually CONSULTED for this sub-case (previously it was gated on
+        ``on_main`` and never reached the marker sha at all)."""
+        tid = '9011'
+        marker_sha = 'c3' * 20
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'in-progress', 'metadata': {}},
+        )
+        # Git-fallback marker sub-case: is_ancestor(branch, main) False
+        # (fixture default), resolve_branch_sha None (branch ref gone),
+        # find_merge_marker returns the marker sha.
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)  # type: ignore[attr-defined]
+        # commit_effect_present_in_main defaults True (fixture) — a healthy
+        # marker landing.
+
+        result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={
+                'kind': 'found_on_main',
+                'commit': marker_sha,
+                'note': ANY,
+            },
+        )
+        harness.git_ops.commit_effect_present_in_main.assert_awaited_once_with(  # type: ignore[attr-defined]
+            marker_sha,
+        )
+        assert result == 1
+
+    async def test_marker_effect_absent_in_progress_reverts_instead_of_marking_done(
+        self, harness: Harness,
+    ):
+        """The task-1175 shape reproduced inside the sweep: a branch-deleted
+        merge marker on main whose effect was reverted at current main HEAD
+        (commit_effect_present_in_main False) must NOT be marked done. An
+        in-progress task with no live claimant reverts to pending instead —
+        symmetric with the ON_MAIN effect-absent case above."""
+        tid = '9012'
+        marker_sha = 'c4' * 20
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'in-progress', 'metadata': {}},
+        )
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)  # type: ignore[attr-defined]
+        harness.git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)  # type: ignore[attr-defined]
+
+        result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.git_ops.commit_effect_present_in_main.assert_awaited_once_with(  # type: ignore[attr-defined]
+            marker_sha,
+        )
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'pending',
+        )
+        assert result == 1
+
+    async def test_marker_effect_absent_blocked_leaves_task_untouched(
+        self, harness: Harness,
+    ):
+        """Same task-1175 shape but for a stranded 'blocked' task reaching
+        MARK_DONE_WITH_PROVENANCE via the R4 sweep-side upgrade: blocked
+        discipline forbids a silent blocked->pending revert (mirrors
+        TestReconcileOneStrandedDegenerateBranchParity's blocked-degenerate
+        case), so an effect-absent marker must resolve to no action at all
+        rather than a phantom mark_done."""
+        tid = '9013'
+        marker_sha = 'c5' * 20
+        harness.scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'blocked', 'metadata': {}},
+        )
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)  # type: ignore[attr-defined]
+        harness.git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)  # type: ignore[attr-defined]
+
+        result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 0
 
 
 # ---------------------------------------------------------------------------
