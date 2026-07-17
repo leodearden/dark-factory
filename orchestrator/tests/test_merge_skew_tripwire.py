@@ -137,3 +137,88 @@ exit 0
             tmp_path, [str(script)], ['src/a.py'],
         )
         assert result is False
+
+
+class TestComputeTripwireOverlap:
+    """Unit tests for the pure ``compute_tripwire_overlap(landing_changed_files,
+    inflight_diffs)``.
+
+    ``inflight_diffs`` is a list of ``(task_id, branch, branch_changed_files)``
+    tuples. Encodes the boundary-row-5 core: an in-flight task whose branch
+    diff shares ≥1 file with the landing set is named in the result; a
+    non-overlapping task is silently absent (not a zero-overlap hit).
+    """
+
+    def test_overlapping_task_yields_hit_with_sorted_overlap_files(self) -> None:
+        from orchestrator.merge_skew_tripwire import TripwireHit, compute_tripwire_overlap
+
+        landing_changed_files = ['src/a.py', 'src/b.py', 'src/c.py']
+        inflight_diffs = [
+            ('101', 'task/101', ['src/c.py', 'src/a.py', 'unrelated.py']),
+        ]
+
+        hits = compute_tripwire_overlap(landing_changed_files, inflight_diffs)
+
+        assert hits == [
+            TripwireHit(task_id='101', branch='task/101', overlap_files=('src/a.py', 'src/c.py')),
+        ]
+
+    def test_non_overlapping_task_yields_no_hit(self) -> None:
+        from orchestrator.merge_skew_tripwire import compute_tripwire_overlap
+
+        landing_changed_files = ['src/a.py']
+        inflight_diffs = [
+            ('202', 'task/202', ['unrelated1.py', 'unrelated2.py']),
+        ]
+
+        hits = compute_tripwire_overlap(landing_changed_files, inflight_diffs)
+
+        assert hits == []
+
+    def test_mixed_overlapping_and_non_overlapping(self) -> None:
+        from orchestrator.merge_skew_tripwire import TripwireHit, compute_tripwire_overlap
+
+        landing_changed_files = ['src/a.py']
+        inflight_diffs = [
+            ('101', 'task/101', ['src/a.py']),
+            ('202', 'task/202', ['unrelated.py']),
+        ]
+
+        hits = compute_tripwire_overlap(landing_changed_files, inflight_diffs)
+
+        assert hits == [
+            TripwireHit(task_id='101', branch='task/101', overlap_files=('src/a.py',)),
+        ]
+        assert not any(h.task_id == '202' for h in hits), (
+            f'non-overlapping task 202 must be absent from hits; got {hits!r}'
+        )
+
+    def test_empty_landing_set_yields_no_hits(self) -> None:
+        from orchestrator.merge_skew_tripwire import compute_tripwire_overlap
+
+        hits = compute_tripwire_overlap([], [('101', 'task/101', ['src/a.py'])])
+
+        assert hits == []
+
+    def test_empty_inflight_diffs_yields_no_hits(self) -> None:
+        from orchestrator.merge_skew_tripwire import compute_tripwire_overlap
+
+        hits = compute_tripwire_overlap(['src/a.py'], [])
+
+        assert hits == []
+
+    def test_ordering_is_deterministic_and_matches_input_order(self) -> None:
+        from orchestrator.merge_skew_tripwire import compute_tripwire_overlap
+
+        landing_changed_files = ['src/a.py', 'src/b.py']
+        inflight_diffs = [
+            ('301', 'task/301', ['src/b.py']),
+            ('101', 'task/101', ['src/a.py']),
+            ('202', 'task/202', ['src/a.py', 'src/b.py']),
+        ]
+
+        hits = compute_tripwire_overlap(landing_changed_files, inflight_diffs)
+
+        assert [h.task_id for h in hits] == ['301', '101', '202'], (
+            'hits must preserve inflight_diffs input order, not be resorted'
+        )
