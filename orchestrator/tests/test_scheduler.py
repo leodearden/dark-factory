@@ -11394,6 +11394,108 @@ class TestDrainFiresWithNoActiveTasks:
         assert force_evicted[0][1]['task_id'] == 'dead_owner'
 
 
+# ---- fm-read failure must not drain park-evictions (task 2704, survey C3) ----
+
+class TestAcquireNextFmReadFailureFailSafe:
+    """acquire_next() must NOT drain park-evictions when get_tasks signals a
+    read FAILURE (get_tasks(distinguish_failure=True) returns None) — draining
+    with empty status_map/tasks_by_id would make _owner_is_live_dispatchable
+    return False for every id, bypassing the D4 live-owner guard and
+    force-evicting still-live owners during an fm outage/restart.
+
+    A genuine empty result ([]) is NOT a failure and still drains exactly as
+    before (TestDrainFiresWithNoActiveTasks regression baseline).
+    """
+
+    def _make_scheduler(self, tmp_path, event_store=None):
+        from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        eviction_store = ParkEvictionRequestStore(tmp_path / 'park_eviction_requests.db')
+        if event_store is None:
+            event_store = _RecordingEventStore()
+        scheduler = Scheduler(
+            config,
+            event_store=event_store,  # type: ignore[arg-type]
+            park_eviction_store=eviction_store,
+        )
+        scheduler.finish_startup()
+        return scheduler, eviction_store, event_store
+
+    @pytest.mark.asyncio
+    async def test_fm_outage_skips_drain_and_emits_deferred_event(self, tmp_path):
+        """A get_tasks failure (None) skips the drain and emits the deferred event."""
+        scheduler, store, event_store = self._make_scheduler(tmp_path)
+
+        scheduler.lock_table.install_parks('dead_owner', ['m1'], priority='low')
+        store.enqueue('dead_owner', scheduler._project_root)
+
+        scheduler.get_tasks = AsyncMock(return_value=None)
+
+        result = await scheduler.acquire_next()
+
+        assert result is None
+        # Drain was SKIPPED — the park is still present.
+        assert scheduler.lock_table.has_parks('dead_owner'), (
+            'park-eviction drain must be skipped on an fm read failure'
+        )
+        # No force-eviction event fired.
+        evicted = [e for e in event_store.events if 'reservation_force_evicted' in e[0]]
+        assert evicted == [], f'Expected no force-eviction on fm read failure; got {evicted}'
+        # Exactly one deferred event, with the streak count in its payload.
+        deferred = [
+            e for e in event_store.events
+            if 'park_eviction_deferred_fm_unavailable' in e[0]
+        ]
+        assert len(deferred) == 1
+        assert deferred[0][1]['data']['consecutive_failures'] == 1
+        assert scheduler._fm_read_failure_streak == 1
+        # The eviction request row was NOT consumed — still drainable.
+        assert store.drain(scheduler._project_root) == ['dead_owner']
+
+    @pytest.mark.asyncio
+    async def test_streak_resets_on_successful_read(self, tmp_path):
+        """A successful read (even a genuine empty) resets the failure streak."""
+        scheduler, store, event_store = self._make_scheduler(tmp_path)
+
+        scheduler.get_tasks = AsyncMock(return_value=None)
+        await scheduler.acquire_next()
+        assert scheduler._fm_read_failure_streak == 1
+
+        scheduler.get_tasks = AsyncMock(return_value=[])
+        await scheduler.acquire_next()
+        assert scheduler._fm_read_failure_streak == 0
+
+    @pytest.mark.asyncio
+    async def test_genuine_empty_still_drains(self, tmp_path):
+        """A genuine empty task list ([]) is not a failure — the drain still fires.
+
+        Regression guard mirroring
+        TestDrainFiresWithNoActiveTasks.test_drain_processes_request_when_tasks_empty.
+        """
+        scheduler, store, event_store = self._make_scheduler(tmp_path)
+
+        scheduler.lock_table.install_parks('dead_owner', ['m1'], priority='low')
+        store.enqueue('dead_owner', scheduler._project_root)
+
+        scheduler.get_tasks = AsyncMock(return_value=[])
+
+        result = await scheduler.acquire_next()
+
+        assert result is None
+        assert not scheduler.lock_table.has_parks('dead_owner')
+        evicted = [e for e in event_store.events if 'reservation_force_evicted' in e[0]]
+        assert len(evicted) == 1
+        assert evicted[0][1]['task_id'] == 'dead_owner'
+        assert store.drain(scheduler._project_root) == []
+        # No deferred event on a genuine-empty (non-failure) tick.
+        deferred = [
+            e for e in event_store.events
+            if 'park_eviction_deferred_fm_unavailable' in e[0]
+        ]
+        assert deferred == []
+        assert scheduler._fm_read_failure_streak == 0
+
+
 # ---- Buried-owner restored-event at drain level (task 1871 amend-4) ----
 
 class TestDrainBuriedOwnerRestoredEvents:
