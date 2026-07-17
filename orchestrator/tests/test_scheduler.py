@@ -3406,7 +3406,11 @@ class TestSetTaskStatusForwarding:
     ):
         """A TimeoutError-shaped rejection retries; later success returns clean."""
         import logging as _logging
-        monkeypatch.setattr('orchestrator.scheduler._TRANSIENT_BACKOFF_BASE', 0.0)
+        # Fixed 2-element schedule -> 3 attempts, to keep the test fast and
+        # match the old budget's assertions.
+        monkeypatch.setattr(
+            'orchestrator.scheduler.fm_retry_backoffs', lambda *a, **kw: [0.0, 0.0],
+        )
         # Two transient rejections, then success.
         transient = {
             'result': {'structuredContent': {
@@ -3433,7 +3437,11 @@ class TestSetTaskStatusForwarding:
         self, scheduler: Scheduler, monkeypatch
     ):
         """Persistent transient rejection raises RuntimeError after the cap."""
-        monkeypatch.setattr('orchestrator.scheduler._TRANSIENT_BACKOFF_BASE', 0.0)
+        # Fixed 2-element schedule -> 3 attempts, to keep the test fast and
+        # match the old budget's assertions.
+        monkeypatch.setattr(
+            'orchestrator.scheduler.fm_retry_backoffs', lambda *a, **kw: [0.0, 0.0],
+        )
         transient = {
             'result': {'structuredContent': {
                 'error': "TimeoutError('ensure_connected timed out')",
@@ -3452,7 +3460,12 @@ class TestSetTaskStatusForwarding:
     ):
         """Phantom-done gate (non-transient) raises DoneGateRejection — no retry."""
         from orchestrator.scheduler import DoneGateRejection
-        monkeypatch.setattr('orchestrator.scheduler._TRANSIENT_BACKOFF_BASE', 0.0)
+        # Fixed 2-element schedule -> 3 attempts; irrelevant here since a
+        # non-transient rejection never retries, but kept consistent with
+        # the other tests in this class.
+        monkeypatch.setattr(
+            'orchestrator.scheduler.fm_retry_backoffs', lambda *a, **kw: [0.0, 0.0],
+        )
         rejection = {
             'result': {'structuredContent': {
                 'success': False, 'error': 'done_gate_missing_files',
@@ -10027,8 +10040,10 @@ class TestSuppressBlockedWrite:
       1. ``self._suppress_blocked_write: Callable[[str], bool] | None = None`` in __init__
          alongside the existing _on_park_stop_trip / _on_external_dep_block declarations.
       2. A guard at the TOP of ``set_task_status`` — BEFORE the
-         ``for attempt in range(_TRANSIENT_RETRIES)`` retry loop — that returns
-         early when ``status == 'blocked'`` and the predicate flags that task_id.
+         transient-failure retry loop (sized off the shared
+         ``orchestrator.fm_retry.fm_retry_backoffs()`` schedule, task 2706) —
+         that returns early when ``status == 'blocked'`` and the predicate
+         flags that task_id.
          (Inserting it at the post-write success branch :1190 would still let the
          write reach fused-memory, defeating C3.2 — see plan design decision 7.)
     """
