@@ -1463,6 +1463,13 @@ class Scheduler:
         self._overrides_initialized: bool = False
         # --- Park-eviction store (task 1871) ---
         self._park_eviction_store: ParkEvictionRequestStore | None = park_eviction_store
+        # Consecutive fm-read-failure streak (task 2704, survey finding C3).
+        # A plain scheduler-global int, NOT a StreakCounter/StreakRegistry
+        # entry: the failure is scheduler-wide (the whole task read failed),
+        # not per-task-id, and the registry GCs by task-id — a plain int
+        # reset-on-success cannot leak. Bumped by _note_fm_read_failure,
+        # zeroed by _reset_fm_read_failure_streak on any successful read.
+        self._fm_read_failure_streak: int = 0
         # --- Startup gate (task 2235, W10-α) ---
         # False until finish_startup() is called.  acquire_next() asserts
         # this — a runtime check for the "startup reconcile sweeps run
@@ -4766,6 +4773,28 @@ class Scheduler:
                         },
                     )
 
+    def _note_fm_read_failure(self) -> None:
+        """Record one more consecutive fm-read-failure tick (survey C3).
+
+        Bumps ``self._fm_read_failure_streak`` and emits
+        ``park_eviction_deferred_fm_unavailable`` (cheap, append-only
+        observability — one per deferred drain) so operators can see the
+        outage window in the event store.  Escalation on a persistent streak
+        is layered on top by ``_file_fm_read_storm_escalation`` (task 2704
+        step-6) — this method only counts and emits.
+        """
+        self._fm_read_failure_streak += 1
+        if self.event_store:
+            self.event_store.emit(
+                EventType.park_eviction_deferred_fm_unavailable,
+                task_id=None,
+                data={'consecutive_failures': self._fm_read_failure_streak},
+            )
+
+    def _reset_fm_read_failure_streak(self) -> None:
+        """Zero the fm-read-failure streak after a successful task read."""
+        self._fm_read_failure_streak = 0
+
     async def _consult_landed_outbox(self, candidate_ids: list[str]) -> set[str]:
         """Consult the injected landed-outbox dispatch gate for each candidate.
 
@@ -6048,10 +6077,24 @@ class Scheduler:
             )
             return None
 
-        tasks = await self.get_tasks(statuses=ACTIVE_TASK_STATUSES)
+        tasks = await self.get_tasks(
+            statuses=ACTIVE_TASK_STATUSES, distinguish_failure=True,
+        )
+        if tasks is None:
+            # fm read FAILURE (survey finding C3) — do NOT drain.  Draining
+            # here would call _drain_park_eviction_requests({}, {}), and with
+            # empty status_map/tasks_by_id, _owner_is_live_dispatchable
+            # returns False for EVERY task_id (not in tasks_by_id), bypassing
+            # the D4 live-owner guard and force-evicting still-live owners
+            # during exactly an fm outage/restart.  Defer instead — the next
+            # successful tick will drain any still-queued requests safely.
+            self._note_fm_read_failure()
+            return None
+        self._reset_fm_read_failure_streak()
         if not tasks:
-            # Drain queued park-eviction requests even when no active tasks exist.
-            # With empty status_map/tasks_by_id, _owner_is_live_dispatchable
+            # Genuine EMPTY project (not a failure) — drain queued
+            # park-eviction requests even though no active tasks exist. With
+            # empty status_map/tasks_by_id, _owner_is_live_dispatchable
             # returns False for all task_ids (not in tasks_by_id) — all queued
             # evictions are processed.  Without this, an operator-enqueued
             # eviction for a stranded park sits in the table indefinitely until
