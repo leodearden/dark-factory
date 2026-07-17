@@ -2178,9 +2178,15 @@ class TestAcquireNextDeliveredGateRealFilteredFetch:
         """A ``get_tasks`` fake that honors the ``statuses=`` filter kwarg —
         unlike a plain ``AsyncMock(return_value=...)``, which returns every
         record regardless of the filter and so smuggles terminal deps past
-        the real active-only fetch."""
+        the real active-only fetch.
 
-        async def _gt(*, statuses=None):
+        Accepts (and ignores) ``distinguish_failure`` for signature
+        compatibility with the real ``Scheduler.get_tasks`` overloads —
+        ``acquire_next`` now calls with ``distinguish_failure=True``, and
+        this fake never simulates a read failure, so the flag never changes
+        its (always-successful) behaviour."""
+
+        async def _gt(*, statuses=None, distinguish_failure=False):
             xs = list(records)
             return xs if statuses is None else [t for t in xs if t['status'] in statuses]
 
