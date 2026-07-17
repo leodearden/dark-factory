@@ -11186,3 +11186,59 @@ async def test_perpetually_fresh_thread_escalates_within_bounded_cycles(
         f'within {_INTEGRITY_FINDING_RECURRENCE_THRESHOLD} cycles; '
         f'got pending: {[e.summary for e in pending]}'
     )
+
+
+# ── Task 2711 E7: run_full_cycle attributes drained events to its run_id ──
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_attributes_drained_events_to_run_id(
+    journal, event_buffer, mock_memory_service,
+):
+    """run_full_cycle must stamp drained_by_run_id on the events it drains,
+    in both the self-drain path and the iterator-fed (pre-drained events=)
+    path, so a later run-scoped restore_drained can target exactly this
+    run's events (task 2711 / E7)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    for stage in harness.stages:
+        _mock_stage_run(stage)
+
+    # (a) Full-drain path: run_full_cycle drains the buffer itself via
+    # buffer.drain(project_id, run_id=run_id) and must stamp
+    # drained_by_run_id=run.id on the 2 events it drains.
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+
+    run_a = await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+    restored_a = await event_buffer.restore_drained('test-project', run_id=run_a.id)
+    assert restored_a == 2, (
+        f'Expected run_full_cycle to stamp drained_by_run_id={run_a.id!r} on the '
+        f'2 events it drained via buffer.drain(); restore_drained(run_id=run_a.id) '
+        f'restored {restored_a}'
+    )
+    # Drain them back out (no run_id — mirrors an untracked legacy drain) so
+    # the next scenario starts from an empty 'buffered' set.
+    await event_buffer.drain('test-project')
+
+    # (b) Iterator-fed path: events pre-drained by the caller (mirroring
+    # BacklogIterator.run's drain_by_ids call, which drains BEFORE
+    # run_full_cycle mints a run_id) must be attributed via
+    # buffer.mark_drained_run_id(project_id, event_ids, run_id).
+    original_mark = event_buffer.mark_drained_run_id
+    harness.buffer.mark_drained_run_id = AsyncMock(side_effect=original_mark)
+
+    pre_drained = [_make_event(), _make_event()]
+    for e in pre_drained:
+        await event_buffer.push(e)
+    # Pre-drain with no run_id, exactly like drain_by_ids leaves them before
+    # run_full_cycle has a run_id to attribute them with.
+    await event_buffer.drain('test-project')
+
+    run_b = await harness.run_full_cycle(
+        'test-project', 'backlog_chunk:1:2', events=pre_drained,
+    )
+
+    harness.buffer.mark_drained_run_id.assert_awaited_once_with(
+        'test-project', [e.id for e in pre_drained], run_b.id,
+    )
