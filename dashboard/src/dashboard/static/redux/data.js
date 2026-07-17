@@ -76,6 +76,9 @@ window.DF_DATA = {
     by_role: [],
     trend: { labels: [], values: [] },
     events: [],
+    // Per-(model×role) outcome rollup (task 2534 δ): invocation/done/blocked
+    // counts+rates, cap-hit rate, $/done, plus per-role turn-cap saturation.
+    by_model_role: { rows: [], turn_cap_saturation: {} },
   },
   BURNDOWN: { labels: [], done: [], in_progress: [], blocked: [], pending: [], forecast_low: null, forecast_high: null },
   BURNDOWN_BY_PROJECT: {},

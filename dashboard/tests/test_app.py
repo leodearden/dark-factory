@@ -278,9 +278,12 @@ def test_costs_returns_full_costs_block(client):
     costs = body['COSTS']
     for key in ('summary', 'by_project', 'by_account', 'by_role', 'trend', 'events', 'by_model_role'):
         assert key in costs, f'COSTS missing {key}'
-    # No per-project DBs in the temp fixture -> empty-but-well-formed rollup
+    # Shape, not content, per this module's docstring — the `client` fixture
+    # resolves against a real project root, which may have live runs.db data
     # (task 2534 step-13).
-    assert costs['by_model_role'] == {'rows': [], 'turn_cap_saturation': {}}
+    assert isinstance(costs['by_model_role'], dict)
+    assert isinstance(costs['by_model_role']['rows'], list)
+    assert isinstance(costs['by_model_role']['turn_cap_saturation'], dict)
 
 
 def test_costs_route_threads_shared_now_to_all_aggregates(client):

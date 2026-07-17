@@ -475,6 +475,29 @@ def _sum_models(models: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     return acc
 
 
+def _shape_model_role_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Round one aggregate_model_role_rollup() row for the wire.
+
+    ``cost_per_done`` stays ``None`` (not 0.0) when the cell has zero done
+    tasks — distinguishes "no completed tasks yet" from "$0 per done" (same
+    contract as the digest-side ``ModelRoleRow``).
+    """
+    cost_per_done = row.get('cost_per_done')
+    return {
+        'model': row.get('model'),
+        'role': row.get('role'),
+        'invocation_count': int(row.get('invocation_count') or 0),
+        'done_count': int(row.get('done_count') or 0),
+        'blocked_count': int(row.get('blocked_count') or 0),
+        'done_rate': round(float(row.get('done_rate') or 0.0), 4),
+        'blocked_rate': round(float(row.get('blocked_rate') or 0.0), 4),
+        'capped_count': int(row.get('capped_count') or 0),
+        'cap_hit_rate': round(float(row.get('cap_hit_rate') or 0.0), 4),
+        'total_cost_usd': round(float(row.get('total_cost_usd') or 0.0), 4),
+        'cost_per_done': round(float(cost_per_done), 4) if cost_per_done is not None else None,
+    }
+
+
 def shape_costs(
     *,
     summary: Mapping[str, Mapping[str, Any]],
@@ -483,6 +506,7 @@ def shape_costs(
     by_role: Mapping[str, Mapping[str, Mapping[str, float]]],
     trend: Mapping[str, Iterable[Mapping[str, Any]]],
     events: Iterable[Mapping[str, Any]],
+    by_model_role: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Reduce per-project aggregator output to the flat ``COSTS`` shape.
 
@@ -491,6 +515,14 @@ def shape_costs(
     ``summary`` and ``trend`` sum across projects; ``by_project``,
     ``by_account``, and ``by_role`` become sorted lists ready for chart
     rendering.
+
+    ``by_model_role`` is the (already cross-DB-merged)
+    ``aggregate_model_role_rollup()`` output — ``{'rows': [...],
+    'turn_cap_saturation': {...}}`` — threaded through mostly as-is (values
+    rounded for the wire) since the merge already happened upstream. ``None``
+    (the default — no per-project DBs, or the caller predates task 2534)
+    renders as the empty-but-well-formed ``{'rows': [], 'turn_cap_saturation':
+    {}}`` block.
     """
     # ── summary ──
     total = sum(float(p.get('total_spend') or 0.0) for p in summary.values())
@@ -620,6 +652,16 @@ def shape_costs(
         'delta_hint': delta_hint,
     }
 
+    # ── by_model_role ── (already merged across DBs upstream; round for the wire)
+    rollup = by_model_role or {}
+    by_model_role_block = {
+        'rows': [_shape_model_role_row(row) for row in (rollup.get('rows') or [])],
+        'turn_cap_saturation': {
+            role: (round(float(value), 4) if value is not None else None)
+            for role, value in (rollup.get('turn_cap_saturation') or {}).items()
+        },
+    }
+
     return {'COSTS': {
         'summary': summary_block,
         'by_project': by_project_list,
@@ -627,6 +669,7 @@ def shape_costs(
         'by_role': by_role_list,
         'trend': trend_block,
         'events': events_list,
+        'by_model_role': by_model_role_block,
     }}
 
 
