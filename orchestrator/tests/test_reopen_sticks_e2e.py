@@ -54,15 +54,14 @@ import pytest_asyncio
 pytest.importorskip('fused_memory')
 
 from escalation.queue import EscalationQueue
-
-from orchestrator.config import OrchestratorConfig
-from orchestrator.provenance_conflict import ProvenanceConflictSink, stale_evidence_fingerprint
-from orchestrator.scheduler import Scheduler, StaleEvidenceRejection
-
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.event_buffer import EventBuffer
+
+from orchestrator.config import OrchestratorConfig
+from orchestrator.provenance_conflict import ProvenanceConflictSink, stale_evidence_fingerprint
+from orchestrator.scheduler import Scheduler, StaleEvidenceRejection
 
 pytestmark = pytest.mark.asyncio
 

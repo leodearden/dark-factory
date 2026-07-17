@@ -969,13 +969,22 @@ class TestTaskStatusConfig:
     def test_override_enables_enforce_mode(self):
         assert TaskStatusConfig(enforce_transitions=True).enforce_transitions is True
 
-    def test_fused_memory_config_loads_enforce_flip_from_yaml(self):
+    def test_fused_memory_config_loads_enforce_flip_from_yaml(self, monkeypatch):
         # The committed config.yaml enables enforce-mode: task 2216 flipped
         # task_status.enforce_transitions -> true on 2026-07-14 (operator gate
         # esc-2216-1) after the Gamma soak proved the transition table clean.
         # FusedMemoryConfig() loads that committed config, so this pins the
         # deployed Γ-flip and tripwires an accidental revert. The pure MODEL
         # default (False) is covered by test_defaults_to_log_mode above.
+        #
+        # Pin CONFIG_PATH explicitly (mirrors TestConfigYamlReconciliationFlags
+        # below): the ambient CONFIG_PATH-unset default resolves
+        # 'config/config.yaml' relative to the process CWD, not this package,
+        # so a caller running pytest from a different CWD (e.g. the repo root)
+        # would silently miss the real file and fall through to the pure model
+        # default instead of exercising the committed YAML.
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
         assert FusedMemoryConfig().task_status.enforce_transitions is True
 
 
@@ -1001,7 +1010,7 @@ class TestReconciliationRejectStaleDoneEvidence:
     def test_defaults_to_enforce_mode(self):
         assert ReconciliationConfig().reject_stale_done_evidence == 'enforce'
 
-    def test_fused_memory_config_loads_enforce_default(self):
+    def test_fused_memory_config_loads_enforce_default(self, monkeypatch):
         # The committed config.yaml does not pin reconciliation.
         # reject_stale_done_evidence, so FusedMemoryConfig() (which loads
         # that committed config) surfaces the schema default here -- this
@@ -1009,6 +1018,15 @@ class TestReconciliationRejectStaleDoneEvidence:
         # (``cfg.reconciliation.reject_stale_done_evidence`` in
         # ``_reject_stale_done_evidence_mode``), not just the bare model
         # covered by test_defaults_to_enforce_mode above.
+        #
+        # Pin CONFIG_PATH explicitly (mirrors TestConfigYamlReconciliationFlags
+        # below): the ambient CONFIG_PATH-unset default resolves
+        # 'config/config.yaml' relative to the process CWD, not this package.
+        # Without this, the test would pass vacuously from a different CWD
+        # (schema default == fallback-on-missing-file default) without ever
+        # actually loading the committed YAML it claims to exercise.
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
         assert FusedMemoryConfig().reconciliation.reject_stale_done_evidence == 'enforce'
 
     def test_override_opts_out_to_warn_mode(self):
@@ -1017,4 +1035,4 @@ class TestReconciliationRejectStaleDoneEvidence:
 
     def test_invalid_value_rejected(self):
         with pytest.raises(ValidationError, match='reject_stale_done_evidence'):
-            ReconciliationConfig(reject_stale_done_evidence='sometimes')
+            ReconciliationConfig(reject_stale_done_evidence='sometimes')  # type: ignore[arg-type]
