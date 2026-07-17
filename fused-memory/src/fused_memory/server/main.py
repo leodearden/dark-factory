@@ -73,6 +73,15 @@ _CLEANUP_STEP_TIMEOUT = 5.0
 # +harness_cancel(25)+memory_close(5)+journal_close(5) = 55s; +20s headroom = 75.
 _FORCE_EXIT_BUDGET = 75.0
 
+# Mirrors TimeoutStopSec=90 in the committed systemd unit template
+# (scripts/fused-memory.service.template). Invariant (survey finding D1):
+# ServerConfig.graceful_shutdown_timeout + _FORCE_EXIT_BUDGET must stay under
+# this value so the in-process force-exit watchdog provably fires before
+# systemd SIGKILLs the cgroup — preserving exit-code control (exit 0 for
+# operator stop; see _operator_stop_received). Enforced by
+# TestShutdownBudgetArithmetic in tests/test_server_shutdown.py.
+_SYSTEMD_TIMEOUT_STOP_SECS = 90.0
+
 # systemd watchdog heartbeat interval. The dedicated OS thread
 # (_watchdog_thread_loop, task 1731 root-cause fix) pings every
 # _WATCHDOG_INTERVAL independent of asyncio loop scheduling, so a
