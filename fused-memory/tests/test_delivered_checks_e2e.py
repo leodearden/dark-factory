@@ -515,3 +515,30 @@ class TestHeadline:
             f'expected only the part-B escalation {esc.id!r} to remain, got '
             f'{post_heal_escs!r}'
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestLegacyNoSidecar — row 2: no PRD/sidecar involvement -> byte-identical
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestLegacyNoSidecar:
+    """Row 2: a legacy planning batch with no PRD metadata (and therefore no
+    sidecar on disk at all) must produce a byte-identical legacy
+    ``commit_planning`` response — no ``manifest_stamping`` key — and must
+    not stamp ``metadata.delivered_checks`` onto the producer."""
+
+    @pytest.mark.asyncio
+    async def test_legacy_batch_no_sidecar_byte_identical(self, backend_stack):
+        server, _interceptor, project_root = backend_stack
+
+        # No _write_sidecar call at all, and prd_path=None files a batch with
+        # no metadata.prd_path/prd_task_label on either task (PRD row 2).
+        producer_id, dependent_id = await _file_planning_batch(
+            server, project_root, prd_path=None,
+        )
+
+        result = await _commit_planning(server, project_root, [producer_id, dependent_id])
+        producer_task = await _get_task(server, project_root, producer_id)
+
+        _assert_row2_legacy_response(result, producer_task)
