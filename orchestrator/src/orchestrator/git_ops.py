@@ -70,7 +70,6 @@ from orchestrator.lane_lifecycle import (
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
     lane_lock_path,
-    merge_verify_lock_path,
     read_lock_holder_pgid,
     release_merge_verify_flock,
     remove_lock_holder_pgid,
@@ -1675,7 +1674,8 @@ class GitOps:
     @contextlib.asynccontextmanager
     async def merge_verify_lease(self):
         """Async context manager recording the merge-verify lease for the
-        duration of a span (task 2315, BUG 1).
+        duration of a span (task 2315, BUG 1; lock path converged onto the
+        shared ``<lane_dir>.lock`` in task 2685).
 
         Mirrors the host verify-merge CLI's acquire -> write-holder-pgid ->
         finally-release-and-clear span (``cli.py:444-512``) so that
@@ -1683,9 +1683,22 @@ class GitOps:
         :meth:`_run_warm_lane_gc_reclaim` can consult the SAME lease
         (:meth:`_merge_verify_lease_active`) regardless of whether the
         in-flight verify is dispatched locally (in-process, via this ctx
-        mgr) or remotely (via the CLI, which already records it). No new
-        lock is introduced — this reuses the existing
-        ``.merge_verify.lock`` flock + holder-pgid rendezvous (task 2306).
+        mgr) or remotely (via the CLI, which already records it).
+
+        Holds the SHARED ``<lane_dir>.lock``
+        (:func:`~orchestrator.verify_cancel.lane_lock_path` of
+        :attr:`persistent_merge_worktree_path`, i.e.
+        ``<worktree_base>/_merge-verify.lock`` for the singleton persistent
+        merge lane) — the SAME lock reify's ``seed-warm-lane.sh`` /
+        ``thin-warm-lane.sh`` / ``warm-lane-gc.sh`` and DF's own
+        :meth:`_seed_warm_lane` take (task 2685; reify PRD
+        ``warm-lane-pool-cow-seeding.md`` §9.3/§9.5 inv.11), NOT the
+        divergent ``.merge_verify.lock`` (task 2306's original lock, which
+        remains solely for the laptop host verify-merge span — see
+        ``verify_cancel.merge_verify_lock_path``). Converging onto one lock
+        is what makes a reify/DF reseed, thin, or gc of the lane mutually
+        exclude with a live local verify — the flock holder-pgid rendezvous
+        below is unchanged.
 
         On a contended flock (the bounded wait in
         :func:`acquire_merge_verify_flock` times out), yields WITHOUT
@@ -1696,7 +1709,7 @@ class GitOps:
         actors.
         """
         fd = acquire_merge_verify_flock(
-            merge_verify_lock_path(self.worktree_base), _MERGE_VERIFY_FLOCK_WAIT_SECS,
+            lane_lock_path(self.persistent_merge_worktree_path), _MERGE_VERIFY_FLOCK_WAIT_SECS,
         )
         if fd is None:
             logger.warning(
