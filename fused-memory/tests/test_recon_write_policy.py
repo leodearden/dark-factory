@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from shared.task_metadata import parse_metadata
 
 from fused_memory.middleware import recon_write_policy
 from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -581,6 +582,214 @@ class TestIsTerminalAnnotationClear:
 
 
 # ---------------------------------------------------------------------------
+# is_terminal_annotation_add
+# ---------------------------------------------------------------------------
+
+
+class TestIsTerminalAnnotationAdd:
+    # -- positive: exemption applies ---------------------------------------
+
+    def test_single_x_key_default_mode_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1}},
+        ) is True
+
+    def test_incident_two_key_payload_is_true(self):
+        """The exact incident payload: ADD of x_refile_superseded_by /
+        x_reopen_abandoned_reason to done task 1175."""
+        assert recon_write_policy.is_terminal_annotation_add(
+            {
+                'metadata': {
+                    'x_refile_superseded_by': 'task-2431',
+                    'x_reopen_abandoned_reason': 'superseded',
+                },
+            },
+        ) is True
+
+    def test_x_key_via_json_string_metadata_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': '{"x_foo": {"a": 1}}'},
+        ) is True
+
+    def test_explicit_merge_mode_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {
+                'metadata': {'x_foo': 1},
+                'metadata_mode': 'merge',
+            },
+        ) is True
+
+    def test_tag_present_is_still_true(self):
+        """`tag` selects the tag-scoped row (addressing); it is never itself
+        written, so it is not a content mutation."""
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1}, 'tag': 'master'},
+        ) is True
+
+    # -- negative: task-content fields disqualify ---------------------------
+
+    def test_title_present_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1}, 'title': 'x'},
+        ) is False
+
+    # -- negative: unrecognized kwargs fail closed (robustness amendment) ---
+
+    def test_unrecognized_future_kwarg_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1}, 'owner': 'alice'},
+        ) is False
+
+    # -- negative: non-x_ metadata keys --------------------------------------
+
+    def test_mixed_with_load_bearing_files_key_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1, 'files': ['a/b.py']}},
+        ) is False
+
+    def test_mixed_with_done_provenance_key_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1, 'done_provenance': {'kind': 'merged'}}},
+        ) is False
+
+    def test_possible_scope_mismatch_alone_is_false(self):
+        """Clearable but non-x_ — the add predicate is x_-only. Clearing
+        possible_scope_mismatch is is_terminal_annotation_clear's job."""
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'possible_scope_mismatch': None}},
+        ) is False
+
+    def test_arbitrary_non_x_key_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'arbitrary': 1}},
+        ) is False
+
+    # -- negative: non-merge modes -------------------------------------------
+
+    def test_metadata_mode_replace_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {
+                'metadata': {'x_foo': 1},
+                'metadata_mode': 'replace',
+            },
+        ) is False
+
+    def test_append_true_additive_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1}, 'append': True},
+        ) is False
+
+    def test_append_false_replace_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add(
+            {'metadata': {'x_foo': 1}, 'append': False},
+        ) is False
+
+    # -- negative: absent / empty / unparseable metadata ---------------------
+
+    def test_metadata_absent_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add({}) is False
+
+    def test_metadata_none_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add({'metadata': None}) is False
+
+    def test_metadata_empty_dict_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add({'metadata': {}}) is False
+
+    def test_metadata_non_dict_int_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add({'metadata': 42}) is False
+
+    def test_metadata_json_list_string_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add({'metadata': '[1,2]'}) is False
+
+    def test_metadata_unparseable_string_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_add({'metadata': 'not json'}) is False
+
+
+# ---------------------------------------------------------------------------
+# is_terminal_annotation_exempt — single-parse combined form
+# (efficiency amendment, task 2695)
+# ---------------------------------------------------------------------------
+
+
+class TestIsTerminalAnnotationExempt:
+    """Parity checks against the ``is_terminal_annotation_clear(...) or
+    is_terminal_annotation_add(...)`` two-call form it replaces at the
+    Gate 1 call site — not a full re-run of every case in
+    TestIsTerminalAnnotationClear/TestIsTerminalAnnotationAdd, since this
+    function delegates to the exact same :func:`_pure_terminal_annotation_merge`
+    + per-key checks those suites already cover."""
+
+    def test_clear_only_payload_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {'metadata': {'possible_scope_mismatch': None}},
+        ) is True
+
+    def test_add_only_payload_is_true(self):
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {'metadata': {'x_foo': 1}},
+        ) is True
+
+    def test_mixed_clearable_and_x_keys_is_false(self):
+        """Parity with the x_-only limitation documented on
+        is_terminal_annotation_add: neither predicate's ALL-keys condition
+        holds for a mixed payload, so the combined form is also False —
+        this is the one case a naive "each key is clearable-or-x_" helper
+        would get wrong (see review discussion, task 2695 amendment)."""
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {'metadata': {'possible_scope_mismatch': None, 'x_foo': 1}},
+        ) is False
+
+    def test_neither_clearable_nor_x_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {'metadata': {'arbitrary': 1}},
+        ) is False
+
+    def test_disqualifying_kwarg_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_exempt(
+            {'metadata': {'x_foo': 1}, 'title': 'x'},
+        ) is False
+
+    def test_metadata_absent_is_false(self):
+        assert recon_write_policy.is_terminal_annotation_exempt({}) is False
+
+
+# ---------------------------------------------------------------------------
+# X_ANNOTATION_PREFIX <-> shared.task_metadata.parse_metadata consistency
+# (robustness amendment, task 2695)
+# ---------------------------------------------------------------------------
+
+
+class TestXAnnotationPrefixConsistencyWithParseMetadata:
+    """Guards the hand-maintained literal-mirror documented on
+    :data:`recon_write_policy.X_ANNOTATION_PREFIX`.
+
+    ``X_ANNOTATION_PREFIX`` mirrors the bare ``'x_'`` literal in
+    ``shared.task_metadata.parse_metadata`` (the forward-compat namespace
+    ``parse_metadata`` admits silently, with no schema warning) BY HAND —
+    there is no shared constant tying the two together. Nothing else
+    enforces they stay in sync, so a future change to either literal (e.g.
+    a different prefix, or a case rule) would otherwise silently diverge:
+    the recon exemption would then accept a key ``parse_metadata`` warns
+    about, or reject one it silently admits. These tests fail loudly
+    instead.
+    """
+
+    def test_x_annotation_prefix_key_is_admitted_by_parse_metadata_without_warning(self):
+        key = f'{recon_write_policy.X_ANNOTATION_PREFIX}consistency_probe'
+        _model, warnings = parse_metadata({key: 'v'}, direction='read')
+        assert key not in {w.field for w in warnings}
+
+    def test_non_x_prefixed_unknown_key_still_warns(self):
+        """Contrast check: an unknown key NOT under X_ANNOTATION_PREFIX still
+        trips parse_metadata's unknown_key warning — proving the positive
+        assertion above is a meaningful signal (parse_metadata does warn on
+        unrecognised keys in general), not a vacuous pass."""
+        key = 'not_forward_compat_probe'
+        _model, warnings = parse_metadata({key: 'v'}, direction='read')
+        assert any(w.field == key and w.code == 'unknown_key' for w in warnings)
+
+
+# ---------------------------------------------------------------------------
 # Interceptor boundary fixtures (mirrors test_task_write_agent_id.py)
 # ---------------------------------------------------------------------------
 
@@ -720,6 +929,78 @@ class TestInterceptorUpdateTaskAnnotationClearBoundary:
         await interceptor.update_task(
             '1', '/project',
             metadata={'possible_scope_mismatch': None},
+            agent_id=None,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# P1c — interceptor.update_task terminal-x_-annotation-add exemption boundary
+# ---------------------------------------------------------------------------
+
+
+class TestInterceptorUpdateTaskXAnnotationAddBoundary:
+    @pytest.mark.asyncio
+    async def test_recon_stage_x_annotation_add_on_done_task_proceeds(
+        self, interceptor, taskmaster,
+    ):
+        """The exact incident payload: ADD of x_refile_superseded_by /
+        x_reopen_abandoned_reason to done task 1175."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={
+                'x_refile_superseded_by': 'task-2431',
+                'x_reopen_abandoned_reason': 'superseded',
+            },
+            agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+        assert 'error_type' not in result
+
+    @pytest.mark.asyncio
+    async def test_x_add_with_title_present_still_rejects(self, interceptor, taskmaster):
+        """A content field alongside the x_ metadata key disqualifies the
+        exemption — this is a content mutation, not a pure add."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={'x_foo': 1},
+            title='x',
+            agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_x_add_mixed_with_load_bearing_metadata_key_still_rejects(
+        self, interceptor, taskmaster,
+    ):
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={'x_foo': 1, 'files': ['a/b.py']},
+            agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_recon_agent_id_x_add_proceeds_unchanged(self, interceptor, taskmaster):
+        """Recon-scoping negative: unaffected by this change either way —
+        this write was never gated regardless of the exemption."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        await interceptor.update_task(
+            '1', '/project',
+            metadata={'x_foo': 1},
             agent_id=None,
         )
 
