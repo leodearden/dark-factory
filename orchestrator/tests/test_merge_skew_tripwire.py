@@ -352,6 +352,7 @@ class TestEmitTripwire:
 
         update_task.assert_awaited_once()
         call = update_task.await_args
+        assert call is not None
         assert call.args[0] == '101', (
             f'update_task must be called for the overlapping task only; got {call.args[0]!r}'
         )
@@ -463,7 +464,9 @@ class TestEmitTripwire:
         )
         assert '202' in esc.summary or '202' in esc.detail
         update_task.assert_awaited_once()
-        assert update_task.await_args.args[0] == '202'
+        call = update_task.await_args
+        assert call is not None
+        assert call.args[0] == '202'
 
     async def test_update_task_raising_is_swallowed_escalation_still_submitted(
         self, tmp_path: Path,

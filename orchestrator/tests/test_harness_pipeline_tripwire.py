@@ -72,7 +72,7 @@ def harness(tmp_path: Path, mock_orch_config):
     h.scheduler.update_task = AsyncMock(return_value=True)
     h.event_store = MagicMock()
     h.git_ops.get_merge_diff_files = AsyncMock(return_value=([], None))
-    h._escalation_queue = _FakeEscalationQueue()
+    h._escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
     return h
 
 
@@ -118,16 +118,17 @@ class TestMaybePipelineLandingTripwire:
             '999', 'base-sha', landing_sha, ['src/a.py'],
         )
 
-        assert len(harness._escalation_queue.submitted) == 1, (
-            f'expected exactly one escalation; got {harness._escalation_queue.submitted!r}'
+        fake_eq: _FakeEscalationQueue = harness._escalation_queue  # type: ignore[assignment]
+        assert len(fake_eq.submitted) == 1, (
+            f'expected exactly one escalation; got {fake_eq.submitted!r}'
         )
-        esc = harness._escalation_queue.submitted[0]
+        esc = fake_eq.submitted[0]
         assert esc.severity == 'info'
         assert '101' in esc.summary or '101' in esc.detail
         assert '202' not in esc.summary and '202' not in esc.detail
 
-        harness.scheduler.update_task.assert_awaited_once()
-        call = harness.scheduler.update_task.await_args
+        harness.scheduler.update_task.assert_awaited_once()  # type: ignore[attr-defined]
+        call = harness.scheduler.update_task.await_args  # type: ignore[attr-defined]
         assert call.args[0] == '101', (
             f'update_task must be called for the overlapping task only; got {call.args[0]!r}'
         )
@@ -144,9 +145,10 @@ class TestMaybePipelineLandingTripwire:
             '999', 'base-sha', 'f' * 40, ['src/a.py'],
         )
 
-        assert harness._escalation_queue.submitted == []
-        harness.scheduler.get_tasks.assert_not_awaited()
-        harness.scheduler.update_task.assert_not_awaited()
+        fake_eq: _FakeEscalationQueue = harness._escalation_queue  # type: ignore[assignment]
+        assert fake_eq.submitted == []
+        harness.scheduler.get_tasks.assert_not_awaited()  # type: ignore[attr-defined]
+        harness.scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
 
     async def test_note_merge_all_invokes_tripwire_and_raise_does_not_block_coordinators(
         self, harness: Harness,
