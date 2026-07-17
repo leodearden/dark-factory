@@ -702,6 +702,149 @@ class TestAlreadyLandedDispatchGateGetMainShaFallbackGrepGuard:
         )
 
 
+# ---------------------------------------------------------------------------
+# task 2677 step-7/step-8 — a done_evidence_stale rejection surfacing from
+# _mark_in_progress_done's scheduler.mark_done call must gate the dispatch
+# (the contested task must never dispatch) on the tick it is first observed,
+# and a later tick at the SAME reopen_at must NOT re-attempt the doomed
+# write nor file a duplicate escalation. Unlike every other test in this
+# file, _mark_in_progress_done is NOT replaced by a bare AsyncMock here —
+# these tests exercise the real StaleEvidenceRejection catch (step-6) plus
+# the gate's own should_skip pre-check (step-8), so scheduler.mark_done
+# itself is the stale-rejecting double and _mark_in_progress_done runs for
+# real.
+# ---------------------------------------------------------------------------
+
+_STALE_REOPEN_AT = '2026-07-15T00:00:00+00:00'
+
+
+def _wire_stale_evidence_mark_done(h: Harness, *, evidence_commit: str) -> None:
+    """Replace scheduler.mark_done with one that always rejects as stale.
+
+    Mirrors test_reconcile_stranded.py's identically-named helper (kept
+    local rather than imported since that module is a test file, not a
+    shared fixture library).
+    """
+    from orchestrator.scheduler import StaleEvidenceRejection
+
+    async def _stale_reject(tid, *, kind, sha, note=None):  # noqa: ARG001
+        raise StaleEvidenceRejection(
+            task_id=tid,
+            evidence_commit=evidence_commit,
+            evidence_committed_at='2026-07-10T00:00:00+00:00',
+            reopen_at=_STALE_REOPEN_AT,
+            agent_id='claude-recon-x',
+            raw="success=False payload={'error': 'done_evidence_stale'}",
+        )
+    h.scheduler.mark_done = AsyncMock(side_effect=_stale_reject)
+
+
+def _let_mark_in_progress_done_run_for_real(h: Harness, tmp_path) -> None:
+    """Undo the blanket ``h._mark_in_progress_done = AsyncMock()`` the
+    ``_wired_*_harness`` builders apply, and give ``_resolve_task_worktree``
+    a real (nonexistent) tmp path so the worktree-cleanup branch is a clean
+    no-op (``worktree_path.exists()`` is False) rather than tripping over
+    ``h.git_ops``'s auto-mocked ``warm_lane_pool``/``cleanup_worktree``.
+    """
+    del h._mark_in_progress_done
+    h.git_ops.warm_lane_pool = None
+    h.git_ops.worktree_base = tmp_path / 'worktrees'
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedDispatchGateStaleEvidenceConflict:
+    """RED until step-8 adds the should_skip pre-check to the gate."""
+
+    async def test_ancestry_path_gates_and_does_not_reattempt(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        h = _wired_ancestry_harness(mock_orch_config)
+        _let_mark_in_progress_done_run_for_real(h, tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'reopen_at': _STALE_REOPEN_AT}},
+        )
+        _wire_stale_evidence_mark_done(h, evidence_commit='a' * 40)
+
+        result_1 = await h._already_landed_dispatch_gate('42')
+
+        assert result_1 is True, 'a contested task must not dispatch'
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 1
+        conflicts = [
+            e for e in h._escalation_queue.get_by_task('42', status='pending')
+            if e.category == 'provenance_conflict'
+        ]
+        assert len(conflicts) == 1, f'expected exactly one pending L2, got {len(conflicts)}'
+        assert conflicts[0].level == 2
+        assert conflicts[0].severity == 'urgent'
+
+        result_2 = await h._already_landed_dispatch_gate('42')
+
+        assert result_2 is True, 'must stay gated on a repeat tick'
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 1, (
+            'a repeat tick at the same reopen_at must not re-attempt the '
+            'already-rejected write'
+        )
+        conflicts_after = [
+            e for e in h._escalation_queue.get_by_task('42', status='pending')
+            if e.category == 'provenance_conflict'
+        ]
+        assert len(conflicts_after) == 1, 'must not file a duplicate escalation'
+
+    async def test_content_equivalence_path_gates_and_does_not_reattempt(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        # A citation is required for task 2678's DISCOVERY-mode gate to accept
+        # the landing and proceed to the done-write — only then can the
+        # stale-evidence rejection this test exercises fire from mark_done.
+        h = _wired_content_harness(
+            mock_orch_config, citation_sha='c' * 40, content_in_main=True,
+        )
+        _let_mark_in_progress_done_run_for_real(h, tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'reopen_at': _STALE_REOPEN_AT}},
+        )
+        _wire_stale_evidence_mark_done(h, evidence_commit='c' * 40)
+
+        result_1 = await h._already_landed_dispatch_gate('42')
+
+        assert result_1 is True, 'a contested task must not dispatch'
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 1
+        conflicts = [
+            e for e in h._escalation_queue.get_by_task('42', status='pending')
+            if e.category == 'provenance_conflict'
+        ]
+        assert len(conflicts) == 1, f'expected exactly one pending L2, got {len(conflicts)}'
+
+        result_2 = await h._already_landed_dispatch_gate('42')
+
+        assert result_2 is True, 'must stay gated on a repeat tick'
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 1, (
+            'a repeat tick at the same reopen_at must not re-attempt the '
+            'already-rejected write'
+        )
+        conflicts_after = [
+            e for e in h._escalation_queue.get_by_task('42', status='pending')
+            if e.category == 'provenance_conflict'
+        ]
+        assert len(conflicts_after) == 1, 'must not file a duplicate escalation'
+
+
 def _wired_absent_branch_harness(mock_orch_config) -> Harness:
     """Bare harness with resolve_branch_sha -> None (branch ref does not
     exist, e.g. a fresh task never dispatched).  is_ancestor and

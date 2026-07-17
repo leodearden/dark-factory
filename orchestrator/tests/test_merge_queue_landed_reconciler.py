@@ -29,11 +29,19 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from escalation.queue import EscalationQueue
 
 from orchestrator.git_ops import AdvanceOutcome
 from orchestrator.harness import Harness
 from orchestrator.landed_outbox import LandedOutbox, LandedRow
-from orchestrator.merge_queue import _journal_landed_then_advance, reconcile_landed_outbox
+from orchestrator.merge_queue import (
+    _journal_landed_then_advance,
+    reconcile_landed_outbox,
+    reconcile_landed_row,
+    reconcile_landed_task,
+)
+from orchestrator.provenance_conflict import ProvenanceConflictSink
+from orchestrator.scheduler import StaleEvidenceRejection
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -233,6 +241,7 @@ class TestReconcileLandedOutboxRobustness:
             'marked_done': 0,
             'already_done_pruned': 0,
             'skipped': 0,
+            'stale_conflict': 0,
             'errors': 0,
         }
         scheduler.get_status.assert_not_called()
@@ -375,7 +384,8 @@ class TestHarnessReconcileLandedOutboxWiring:
 
         When a merge worker with a bound LandedOutbox is present, the
         harness delegates to the module-level reconcile_landed_outbox with
-        the worker's outbox plus the harness's own git_ops/scheduler.
+        the worker's outbox plus the harness's own git_ops/scheduler, and
+        (task 2677) the harness's shared ProvenanceConflictSink.
         """
         h = _build_harness(mock_orch_config)
         worker = MagicMock()
@@ -384,7 +394,7 @@ class TestHarnessReconcileLandedOutboxWiring:
 
         empty_report = {
             'pruned_not_landed': 0, 'marked_done': 0,
-            'already_done_pruned': 0, 'skipped': 0, 'errors': 0,
+            'already_done_pruned': 0, 'skipped': 0, 'stale_conflict': 0, 'errors': 0,
         }
         with patch(
             'orchestrator.harness.reconcile_landed_outbox',
@@ -394,4 +404,195 @@ class TestHarnessReconcileLandedOutboxWiring:
 
         mock_reconcile.assert_awaited_once_with(
             worker._landed_outbox, h.git_ops, h.scheduler,
+            provenance_conflict_sink=h._provenance_conflict_sink,
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2677 step-9 — RC-2 done_evidence_stale: 'stale_conflict' disposition
+#
+# NOT to be confused with this file's own pre-existing "step-9" label above
+# (Harness startup wiring) — that refers to task 2155/2156's step numbering.
+# This section is task 2677's step-9: the found_on_main provenance-integrity
+# gate (task 2674) can refuse RC-2's ``scheduler.mark_done`` with a
+# ``StaleEvidenceRejection`` when the row's ``advanced_sha`` predates a later
+# ``reopen_at``. That must route to the shared ``ProvenanceConflictSink``
+# (a dedupe-guarded, born-at-L2 escalation) rather than propagate up to
+# ``reconcile_landed_outbox``'s fail-open per-row ``try/except`` — which
+# would silently retry (and re-reject) the same write on every future scan.
+# ---------------------------------------------------------------------------
+
+
+def _stale_evidence_mark_done(
+    *, evidence_commit: str = 'ADV', reopen_at: str = '2026-07-15T00:00:00+00:00',
+):
+    """AsyncMock side_effect: scheduler.mark_done always rejects as stale.
+
+    Mirrors test_reconcile_stranded.py's ``_wire_stale_evidence_mark_done``
+    — same ``StaleEvidenceRejection`` shape, factored as a bare side_effect
+    callable so each test assigns it directly onto its own fake scheduler's
+    ``mark_done``.
+    """
+    async def _reject(task_id, *, kind, sha, note=None):  # noqa: ARG001
+        raise StaleEvidenceRejection(
+            task_id=task_id,
+            evidence_commit=evidence_commit,
+            evidence_committed_at='2026-07-10T00:00:00+00:00',
+            reopen_at=reopen_at,
+            agent_id='claude-recon-x',
+            raw="success=False payload={'error': 'done_evidence_stale'}",
+        )
+    return _reject
+
+
+@pytest.mark.asyncio
+class TestReconcileLandedRowStaleEvidenceConflict:
+    """RC-2 branch, wired sink: 'stale_conflict' disposition (task 2677)."""
+
+    async def test_returns_stale_conflict_row_left_unconsumed_one_l2_filed(
+        self, tmp_path: Path,
+    ) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        outbox.record(LandedRow(
+            task_id='Z', branch_tip_sha='tip', advanced_sha='ADV', landed_at=1.0,
+        ))
+
+        git_ops_recon = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = _fake_scheduler(get_status_result='in-progress')
+        scheduler.mark_done = AsyncMock(side_effect=_stale_evidence_mark_done(evidence_commit='ADV'))
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        sink = ProvenanceConflictSink(escalation_queue=queue)
+
+        row = outbox.lookup('Z')
+        assert row is not None
+        disposition = await reconcile_landed_row(
+            row, git_ops=git_ops_recon, scheduler=scheduler,
+            outbox=outbox, main_sha='MAIN', provenance_conflict_sink=sink,
+        )
+
+        assert disposition == 'stale_conflict', f'expected stale_conflict, got {disposition!r}'
+        assert outbox.lookup('Z') is not None, (
+            'row must be LEFT unconsumed on a stale-evidence rejection — it '
+            'is not a genuine RC-1/RC-3 prune and the task is not done'
+        )
+
+        pending = queue.get_by_task('Z', status='pending')
+        conflicts = [e for e in pending if e.category == 'provenance_conflict']
+        assert len(conflicts) == 1, f'expected exactly one pending L2, got {len(conflicts)}'
+        assert conflicts[0].level == 2
+        assert conflicts[0].severity == 'urgent'
+
+    async def test_repeat_call_still_exactly_one_pending_record(
+        self, tmp_path: Path,
+    ) -> None:
+        """A repeat RC-2 pass at the same evidence must fold via dedupe_count
+        or short-circuit via should_skip — either mechanism is acceptable;
+        only the outcome (still exactly one pending record) is pinned here,
+        mirroring test_reconcile_stranded.py's identical repeat-call test."""
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        outbox.record(LandedRow(
+            task_id='Z', branch_tip_sha='tip', advanced_sha='ADV', landed_at=1.0,
+        ))
+
+        git_ops_recon = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = _fake_scheduler(get_status_result='in-progress')
+        scheduler.mark_done = AsyncMock(side_effect=_stale_evidence_mark_done(evidence_commit='ADV'))
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        sink = ProvenanceConflictSink(escalation_queue=queue)
+
+        for _ in range(2):
+            row = outbox.lookup('Z')
+            assert row is not None, 'row must still be present to re-drive the RC-2 branch'
+            disposition = await reconcile_landed_row(
+                row, git_ops=git_ops_recon, scheduler=scheduler,
+                outbox=outbox, main_sha='MAIN', provenance_conflict_sink=sink,
+            )
+            assert disposition == 'stale_conflict'
+
+        pending = queue.get_by_task('Z', status='pending')
+        conflicts = [e for e in pending if e.category == 'provenance_conflict']
+        assert len(conflicts) == 1, (
+            f'a repeat rejection at the same evidence must fold or '
+            f'short-circuit, not file a second pending record, got {len(conflicts)}'
+        )
+
+    async def test_reconcile_landed_task_maps_stale_conflict_to_gated(
+        self, tmp_path: Path,
+    ) -> None:
+        """reconcile_landed_task must report gated=True (task not dispatched)
+        on a stale_conflict disposition — a contested task must never
+        dispatch while under arbitration, exactly like every other
+        non-'pruned_not_landed' disposition."""
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        outbox.record(LandedRow(
+            task_id='Z', branch_tip_sha='tip', advanced_sha='ADV', landed_at=1.0,
+        ))
+
+        git_ops_recon = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = _fake_scheduler(get_status_result='in-progress')
+        scheduler.mark_done = AsyncMock(side_effect=_stale_evidence_mark_done(evidence_commit='ADV'))
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        sink = ProvenanceConflictSink(escalation_queue=queue)
+
+        gated = await reconcile_landed_task(
+            'Z', git_ops=git_ops_recon, scheduler=scheduler, outbox=outbox,
+            provenance_conflict_sink=sink,
+        )
+
+        assert gated is True, 'a stale_conflict disposition must gate dispatch (not marked_done, not dispatchable)'
+
+
+@pytest.mark.asyncio
+class TestReconcileLandedRowStaleEvidenceBareBackCompat:
+    """provenance_conflict_sink=None (or omitted) preserves today's
+    propagate-and-tally-as-'errors' behavior for bare (sink-less) callers."""
+
+    async def test_none_sink_propagates_stale_evidence_rejection(
+        self, tmp_path: Path,
+    ) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        outbox.record(LandedRow(
+            task_id='Z', branch_tip_sha='tip', advanced_sha='ADV', landed_at=1.0,
+        ))
+
+        git_ops_recon = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = _fake_scheduler(get_status_result='in-progress')
+        scheduler.mark_done = AsyncMock(side_effect=_stale_evidence_mark_done(evidence_commit='ADV'))
+
+        row = outbox.lookup('Z')
+        assert row is not None
+        with pytest.raises(StaleEvidenceRejection):
+            await reconcile_landed_row(
+                row, git_ops=git_ops_recon, scheduler=scheduler,
+                outbox=outbox, main_sha='MAIN', provenance_conflict_sink=None,
+            )
+
+        assert outbox.lookup('Z') is not None, (
+            'row must be left unconsumed when the rejection propagates'
+        )
+
+    async def test_reconcile_landed_outbox_tallies_stale_evidence_as_errors(
+        self, tmp_path: Path,
+    ) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        outbox.record(LandedRow(
+            task_id='Z', branch_tip_sha='tip', advanced_sha='ADV', landed_at=1.0,
+        ))
+
+        git_ops_recon = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = _fake_scheduler(get_status_result='in-progress')
+        scheduler.mark_done = AsyncMock(side_effect=_stale_evidence_mark_done(evidence_commit='ADV'))
+
+        report = await reconcile_landed_outbox(outbox, git_ops_recon, scheduler)
+
+        assert report['errors'] == 1
+        assert report['marked_done'] == 0
+        assert outbox.lookup('Z') is not None, 'row must be left unconsumed for retry'

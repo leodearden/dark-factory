@@ -708,7 +708,10 @@ This task holds locks for the following modules:
 
 # Action
 
-Review the diff according to your specialization. Explore the codebase as needed for context. Output your review as pure JSON.
+1. Review the diff according to your specialization. Explore the codebase as needed for context.
+2. Call `submit_review_verdict(reviewer="{reviewer_type}", verdict=..., issues=..., summary=...)` with your findings.
+
+Your verdict is read from the `submit_review_verdict` tool call, not from your prose output — you MUST call it before finishing.
 """
 
     async def build_completion_judge_prompt(

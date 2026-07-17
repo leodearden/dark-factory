@@ -3521,6 +3521,42 @@ class TestSetTaskStatusForwarding:
         assert excinfo.value.error_code == 'done_provenance_required'
 
     @pytest.mark.asyncio
+    async def test_stale_evidence_rejection_raises_structured(
+        self, scheduler: Scheduler, monkeypatch,
+    ):
+        """fused-memory's done_evidence_stale raises StaleEvidenceRejection.
+
+        Carries the structured fields (evidence_commit/evidence_committed_at/
+        reopen_at/agent_id) verbatim so callers (the provenance-conflict sink)
+        consume observation-not-prose. Non-transient — must not retry.
+        """
+        from orchestrator.scheduler import StaleEvidenceRejection
+        rejection_response = {
+            'result': {'structuredContent': {
+                'success': False,
+                'error': 'done_evidence_stale',
+                'task_id': '42',
+                'evidence_commit': 'abc',
+                'evidence_committed_at': '2026-07-10T00:00:00+00:00',
+                'reopen_at': '2026-07-15T00:00:00+00:00',
+                'agent_id': 'claude-recon-x',
+            }},
+        }
+        mock = AsyncMock(return_value=rejection_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+        with pytest.raises(StaleEvidenceRejection) as excinfo:
+            await scheduler.set_task_status('42', 'done', done_provenance={
+                'kind': 'merged', 'commit': 'abc',
+            })
+        assert mock.await_count == 1, 'non-transient rejection must not retry'
+        assert excinfo.value.error_code == 'done_evidence_stale'
+        assert excinfo.value.task_id == '42'
+        assert excinfo.value.evidence_commit == 'abc'
+        assert excinfo.value.evidence_committed_at == '2026-07-10T00:00:00+00:00'
+        assert excinfo.value.reopen_at == '2026-07-15T00:00:00+00:00'
+        assert excinfo.value.agent_id == 'claude-recon-x'
+
+    @pytest.mark.asyncio
     async def test_unknown_non_transient_rejection_raises_base(
         self, scheduler: Scheduler, monkeypatch,
     ):

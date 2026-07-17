@@ -68,7 +68,8 @@ class TestHarnessLandedDispatchGateWiring:
         When a merge worker with a bound LandedOutbox is present, the
         harness delegates to the module-level reconcile_landed_task with
         the task_id plus the harness's own git_ops/scheduler and the
-        worker's outbox, and returns its result verbatim.
+        worker's outbox, and returns its result verbatim. Also threads the
+        harness's shared ProvenanceConflictSink (task 2677).
         """
         h = _build_harness(mock_orch_config)
         worker = MagicMock()
@@ -85,6 +86,7 @@ class TestHarnessLandedDispatchGateWiring:
         mock_reconcile.assert_awaited_once_with(
             'Z', git_ops=h.git_ops, scheduler=h.scheduler,
             outbox=worker._landed_outbox,
+            provenance_conflict_sink=h._provenance_conflict_sink,
         )
 
 

@@ -2654,6 +2654,123 @@ async def test_rejection_escalates_immediately_no_counter_threshold(harness: Har
 
 
 # ---------------------------------------------------------------------------
+# task 2677 step-5/step-6 — done_evidence_stale must never be treated as
+# marked_done, must not file the generic L1 reconcile_persistent_rejection
+# (that path is for OTHER SetTaskStatusRejected subclasses), must not
+# release the warm lane (the task is NOT done), and must file exactly one
+# born-at-L2 provenance_conflict escalation via the shared
+# ProvenanceConflictSink — folding (not duplicating) on a same-reopen_at
+# repeat.
+# ---------------------------------------------------------------------------
+
+def _wire_stale_evidence_mark_done(harness: Harness, *, evidence_commit: str = 'deadbeef'):
+    """Replace scheduler.mark_done with one that always rejects as stale.
+
+    Mirrors the existing ``_always_reject`` / ``_flaky_mark_done`` helpers
+    above but raises the new ``StaleEvidenceRejection`` subclass.
+    """
+    from orchestrator.scheduler import StaleEvidenceRejection
+
+    async def _stale_reject(tid, *, kind, sha, note=None):  # noqa: ARG001
+        raise StaleEvidenceRejection(
+            task_id=tid,
+            evidence_commit=evidence_commit,
+            evidence_committed_at='2026-07-10T00:00:00+00:00',
+            reopen_at='2026-07-15T00:00:00+00:00',
+            agent_id='claude-recon-x',
+            raw="success=False payload={'error': 'done_evidence_stale'}",
+        )
+    harness.scheduler.mark_done = AsyncMock(side_effect=_stale_reject)  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestReconcileOneStrandedStaleEvidenceConflict:
+    async def test_returns_stale_conflict_not_marked_done(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """_reconcile_one_stranded must report the honest 'stale_conflict'
+        disposition — not the misleading 'marked_done' — and must not
+        release the warm lane, since the task is not actually done."""
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        tid = '9101'
+        advanced_sha = 'c3' * 20
+        _bind_landed_row(tmp_path, task_id=tid, advanced_sha=advanced_sha)
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={
+                'status': 'in-progress',
+                'metadata': {'reopen_at': '2026-07-15T00:00:00+00:00'},
+            },
+        )
+        harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        harness._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=harness._escalation_queue,
+        )
+        harness.git_ops.release_lane_for_terminal_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value=False,
+        )
+        _wire_stale_evidence_mark_done(harness, evidence_commit=advanced_sha)
+
+        outcome = await harness._reconcile_one_stranded(tid, 'in-progress', mid_run=False)
+
+        assert outcome == 'stale_conflict', f'expected stale_conflict, got {outcome!r}'
+        harness.git_ops.release_lane_for_terminal_task.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_sweep_files_one_l2_not_an_l1_and_dedupes_on_repeat(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """The full sweep (_reconcile_stranded_in_progress) must route a
+        stale-evidence rejection to exactly one pending L2
+        provenance_conflict — never the generic L1
+        reconcile_persistent_rejection — and a second sweep at the same
+        reopen_at must not create a second pending record (should_skip
+        short-circuit or dedupe_count fold — either mechanism is
+        acceptable; only the outcome is pinned)."""
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        tid = '9102'
+        advanced_sha = 'd4' * 20
+        _bind_landed_row(tmp_path, task_id=tid, advanced_sha=advanced_sha)
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={
+                'status': 'in-progress',
+                'metadata': {'reopen_at': '2026-07-15T00:00:00+00:00'},
+            },
+        )
+        harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        harness._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=harness._escalation_queue,
+        )
+        harness.git_ops.release_lane_for_terminal_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value=False,
+        )
+        _wire_stale_evidence_mark_done(harness, evidence_commit=advanced_sha)
+
+        await harness._reconcile_stranded_in_progress()
+
+        pending = harness._escalation_queue.get_by_task(tid, status='pending')
+        assert not any(e.category == 'reconcile_persistent_rejection' for e in pending), (
+            'a stale-evidence rejection must not be escalated as a generic '
+            'persistence-layer rejection (wrong escalation category)'
+        )
+        conflicts = [e for e in pending if e.category == 'provenance_conflict']
+        assert len(conflicts) == 1, f'expected exactly one pending L2, got {len(conflicts)}'
+        assert conflicts[0].level == 2
+        assert conflicts[0].severity == 'urgent'
+
+        # Second full sweep, unchanged reopen_at.
+        await harness._reconcile_stranded_in_progress()
+        pending_after = harness._escalation_queue.get_by_task(tid, status='pending')
+        conflicts_after = [e for e in pending_after if e.category == 'provenance_conflict']
+        assert len(conflicts_after) == 1, (
+            f'expected still exactly one pending L2 after a second sweep, '
+            f'got {len(conflicts_after)}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # R3: mid_run alive owner_pid (this run's harness PID) → fall through (Stage 3)
 # ---------------------------------------------------------------------------
 
