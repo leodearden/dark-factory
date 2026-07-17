@@ -3921,3 +3921,40 @@ def test_probe_health_false_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
     assert wdog.probe_health() is False
 
+
+# ---------------------------------------------------------------------------
+# Part B: _fused_memory_liveness_verdict() (B2)
+# ---------------------------------------------------------------------------
+
+
+def test_liveness_verdict_port_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_fused_memory_liveness_verdict returns 'port-down' when probe_port is False."""
+    wdog = _load_watchdog()
+
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: False)
+    monkeypatch.setattr(
+        wdog, "probe_health", lambda: pytest.fail("probe_health must not run when port is down")
+    )
+
+    assert wdog._fused_memory_liveness_verdict() == "port-down"
+
+
+def test_liveness_verdict_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_fused_memory_liveness_verdict returns 'healthy' when port is up and health succeeds."""
+    wdog = _load_watchdog()
+
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
+    monkeypatch.setattr(wdog, "probe_health", lambda: True)
+
+    assert wdog._fused_memory_liveness_verdict() == "healthy"
+
+
+def test_liveness_verdict_wedged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_fused_memory_liveness_verdict returns 'wedged' when port is up but health fails."""
+    wdog = _load_watchdog()
+
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
+    monkeypatch.setattr(wdog, "probe_health", lambda: False)
+
+    assert wdog._fused_memory_liveness_verdict() == "wedged"
+
