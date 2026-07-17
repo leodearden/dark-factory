@@ -282,7 +282,11 @@ def _register_dependent(session: _LocalDepMcpSession, task_id: str, *, dep_id: s
 
 
 def _build_harness(
-    project_root: Path, session: _LocalDepMcpSession, escalation_dir: Path,
+    project_root: Path,
+    session: _LocalDepMcpSession,
+    escalation_dir: Path,
+    *,
+    grace_cycles: int | None = None,
 ) -> Harness:
     """Build a real orchestrator Harness/Scheduler wired to *session* (the
     dispatch seam) plus a real EscalationQueue — so the born-at-L2
@@ -291,8 +295,17 @@ def _build_harness(
     hold-visibility event (``EventType.delivered_check_gate_held``) is
     observable. Mirrors ``build_harness()`` in
     test_cross_project_dispatch_integration.py.
+
+    *grace_cycles*, when given, is set explicitly on
+    ``config.delivered_checks.grace_cycles`` before the Harness is built —
+    for tick-count determinism in tests that walk the withhold->grace->L2
+    arc (row 10). Omitted (the default) leaves ``DeliveredChecksConfig``'s
+    own default in place, byte-identical to before this parameter existed
+    — rows 3/4/7 never reach grace_cycles regardless of its value.
     """
     config = OrchestratorConfig(project_root=project_root)
+    if grace_cycles is not None:
+        config.delivered_checks.grace_cycles = grace_cycles
     harness = Harness(config)
     harness.scheduler._mcp_session = session
     harness.scheduler.event_store = _RecordingEventStore()  # type: ignore[assignment]
@@ -313,6 +326,15 @@ async def _run_tick(harness: Harness) -> str | None:
     """
     assignment = await harness.scheduler.acquire_next()
     return assignment.task_id if assignment is not None else None
+
+
+async def _flip_status(session: _LocalDepMcpSession, task_id: str, status: str) -> None:
+    """Flip *task_id*'s status via the session's own ``set_task_status``
+    tool — the same seam ``Scheduler.set_task_status`` calls through —
+    rather than mutating ``session.tasks`` directly, so a manual re-pend
+    goes through the same dispatch-facing write path a real operator
+    action would use."""
+    await session.call_tool('set_task_status', {'id': task_id, 'status': status})
 
 
 def _held_events(harness: Harness) -> list[tuple[str, dict]]:
