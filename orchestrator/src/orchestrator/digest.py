@@ -609,6 +609,9 @@ class DigestInputs:
     watcher_clusters: list[str]
     # Free-text proposal summaries (or empty list for "none queued")
     dry_run_proposals: list[str]
+    # Per-(model×role) outcome rollup (task 2534 δ, boundary test 12).
+    # Defaulted so existing constructors/call sites remain valid.
+    model_role_rollup: ModelRoleRollup = field(default_factory=ModelRoleRollup)
 
 
 def render_digest_markdown(inputs: DigestInputs) -> str:
@@ -703,6 +706,33 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
             lines.append(f'- {proposal}')
     else:
         lines.append('none queued')
+    lines.append('')
+
+    # Per-(model×role) rollup (task 2534 δ, boundary test 12)
+    rollup = inputs.model_role_rollup
+    lines.append('## Per-(model×role) rollup')
+    if rollup.rows:
+        lines.append('| model | role | invocations | done% | blocked% | cap-hit% | $/done |')
+        lines.append('|-------|------|--------------|-------|----------|----------|--------|')
+        for row in sorted(rollup.rows, key=lambda r: (r.model, r.role)):
+            cost_per_done_str = (
+                f'${row.cost_per_done:.2f}' if row.cost_per_done is not None else '—'
+            )
+            lines.append(
+                f'| {row.model} | {row.role} | {row.invocation_count} | '
+                f'{row.done_rate * 100:.1f}% | {row.blocked_rate * 100:.1f}% | '
+                f'{row.cap_hit_rate * 100:.1f}% | {cost_per_done_str} |'
+            )
+    else:
+        lines.append('_none_')
+    lines.append('')
+    lines.append('### Turn-cap saturation (per role)')
+    if rollup.turn_cap_saturation:
+        for role, saturation in sorted(rollup.turn_cap_saturation.items()):
+            saturation_str = f'{saturation * 100:.1f}%' if saturation is not None else 'n/a'
+            lines.append(f'- {role}: {saturation_str}')
+    else:
+        lines.append('_none_')
     lines.append('')
 
     return '\n'.join(lines)
