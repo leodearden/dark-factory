@@ -4471,6 +4471,63 @@ async def test_cached_read_conn_reads_serialize_on_read_lock(backend, project_ro
 
 
 @pytest.mark.asyncio
+async def test_get_tasks_tree_fresh_when_cached_read_connection_pinned(
+    backend, project_root,
+):
+    """get_tasks (the full-tree read) must reflect the latest committed
+    status even when the cached READ connection itself has a read
+    transaction pinned open (task 2694).
+
+    Companion to
+    ``test_get_task_fresh_and_read_conn_unpinned_when_cached_read_connection_pinned``,
+    covering the full-tree read surface (``get_tasks``/
+    ``_get_tasks_internal``), which task 2694 step-2's ``get_task`` reroute
+    does not itself touch — ``_get_tasks_internal`` still calls
+    ``_get_read_connection`` directly and is not yet routed through
+    ``_fresh_read_conn``, so this must fail until step-4 migrates it too.
+    """
+    await _pin_cached_read_connection_then_commit_out_of_band(backend, project_root)
+
+    result = await backend.get_tasks(project_root)
+    by_id = {t['id']: t for t in result['tasks']}
+
+    assert by_id['1']['status'] == 'cancelled', (
+        f"get_tasks tree must reflect the fresh committed status despite "
+        f"the pinned cached read connection, got {by_id['1']['status']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_fresh_when_cached_read_connection_pinned(
+    backend, project_root,
+):
+    """get_statuses (bulk and scoped) must reflect the latest committed
+    status even when the cached READ connection itself has a read
+    transaction pinned open (task 2694).
+
+    Companion to
+    ``test_get_task_fresh_and_read_conn_unpinned_when_cached_read_connection_pinned``,
+    covering the ``get_statuses``/``get_statuses_raw`` surface — as of task
+    2694 step-2, ``get_statuses_raw`` still calls ``_get_read_connection``
+    directly and is not yet routed through ``_fresh_read_conn``, so this
+    must fail until step-4 migrates it too.
+    """
+    await _pin_cached_read_connection_then_commit_out_of_band(backend, project_root)
+
+    bulk = await backend.get_statuses(project_root)
+    assert bulk['1'] == 'cancelled', (
+        f"Expected the bulk get_statuses to see fresh 'cancelled' despite "
+        f"the pinned cached read connection, got: {bulk}"
+    )
+
+    scoped = await backend.get_statuses(project_root, ids=['1'])
+    assert scoped['1'] == 'cancelled', (
+        f"Expected the scoped get_statuses to see fresh 'cancelled' despite "
+        f"the pinned cached read connection, got: {scoped}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_close_drains_cached_read_connections(backend, project_root):
     """close() must drain the cached read connections opened by
     :meth:`~SqliteTaskBackend._get_read_connection` (task 2455), not just
