@@ -4481,10 +4481,11 @@ async def test_get_tasks_tree_fresh_when_cached_read_connection_pinned(
     Companion to
     ``test_get_task_fresh_and_read_conn_unpinned_when_cached_read_connection_pinned``,
     covering the full-tree read surface (``get_tasks``/
-    ``_get_tasks_internal``), which task 2694 step-2's ``get_task`` reroute
-    does not itself touch — ``_get_tasks_internal`` still calls
-    ``_get_read_connection`` directly and is not yet routed through
-    ``_fresh_read_conn``, so this must fail until step-4 migrates it too.
+    ``_get_tasks_internal``): as of task 2694 step-4, ``_get_tasks_internal``
+    reads through ``_fresh_read_conn``, which rolls back any lingering pin
+    before serving the tasks-row SELECT and the ``_fetch_dependencies``
+    call, so the returned tree reflects the fresh committed status rather
+    than the stale pinned snapshot.
     """
     await _pin_cached_read_connection_then_commit_out_of_band(backend, project_root)
 
@@ -4507,10 +4508,11 @@ async def test_get_statuses_fresh_when_cached_read_connection_pinned(
 
     Companion to
     ``test_get_task_fresh_and_read_conn_unpinned_when_cached_read_connection_pinned``,
-    covering the ``get_statuses``/``get_statuses_raw`` surface — as of task
-    2694 step-2, ``get_statuses_raw`` still calls ``_get_read_connection``
-    directly and is not yet routed through ``_fresh_read_conn``, so this
-    must fail until step-4 migrates it too.
+    covering the ``get_statuses``/``get_statuses_raw`` surface: as of task
+    2694 step-4, ``get_statuses_raw`` reads through ``_fresh_read_conn``
+    (via ``_statuses_from_conn``), which rolls back any lingering pin
+    before serving the read, so both the bulk and scoped queries see the
+    fresh committed status rather than the stale pinned snapshot.
     """
     await _pin_cached_read_connection_then_commit_out_of_band(backend, project_root)
 
