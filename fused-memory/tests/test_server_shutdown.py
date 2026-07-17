@@ -835,7 +835,7 @@ class TestShutdownBudgetArithmetic:
             / "fused-memory.service.template"
         )
         parsed_timeout_stop_sec = _parse_timeout_stop_sec(unit_file)
-        assert main_mod._SYSTEMD_TIMEOUT_STOP_SECS == parsed_timeout_stop_sec, (
+        assert parsed_timeout_stop_sec == main_mod._SYSTEMD_TIMEOUT_STOP_SECS, (
             f"_SYSTEMD_TIMEOUT_STOP_SECS ({main_mod._SYSTEMD_TIMEOUT_STOP_SECS}) no "
             f"longer matches TimeoutStopSec={parsed_timeout_stop_sec} in {unit_file}. "
             "Update the constant in fused_memory/server/main.py so the "
