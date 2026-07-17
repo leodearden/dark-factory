@@ -2614,3 +2614,34 @@ class TestPricesReloadDisposition:
         assert 'prices' in report['applied']
         assert 'prices' not in report['restart_required']
         assert live.prices['o4-mini'].input_per_1m == 9.99
+
+
+# ---------------------------------------------------------------------------
+# Task 2460 step-1: role_env_overrides — per-role opt-in endpoint-env map
+# ---------------------------------------------------------------------------
+
+
+class TestRoleEnvOverridesConfig:
+    """OrchestratorConfig.role_env_overrides — per-role opt-in endpoint-env map.
+
+    Widens agent env forwarding from the architect/implementer/debugger-only
+    allow-list to a per-role OPT-IN map: a role receives an endpoint env
+    (ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN) iff it is named as a key here.
+    Defaults to {} so an absent role (e.g. judge) gets no endpoint env.
+    """
+
+    def test_defaults_to_empty(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.role_env_overrides == {}
+
+    def test_nested_per_role_map_round_trips(self):
+        role_map = {
+            'judge': {
+                'ANTHROPIC_BASE_URL': 'https://api.z.ai/api/anthropic',
+                'ANTHROPIC_AUTH_TOKEN': 'tok',
+            },
+        }
+        config = OrchestratorConfig(role_env_overrides=role_map)
+        assert config.role_env_overrides == role_map
