@@ -340,7 +340,11 @@ async def _invoke_codex(
     with the pi backend (PRD open-Q3). Do not read cap enforcement into the
     mere presence of these params.
     """
-    logger.info(
+    # debug (not info): this fires on every codex invocation, and codex is a
+    # per-task-workflow backend that can be invoked many times — an
+    # unconditional INFO line here would be hot-path log noise rather than
+    # an event worth recording each time.
+    logger.debug(
         'codex backend: requested max_turns=%r max_budget_usd=%r are NOT '
         'natively enforced by codex-cli (no --max-turns/budget flag); only '
         'the wall-clock watchdog (timeout_seconds=%r) is enforced',
