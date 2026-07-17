@@ -154,6 +154,11 @@ async def test_happy_path_stamps_file_and_copies_mechanical_checks(tmp_path):
     assert reloaded['tasks'][0]['label'] == 'alpha'
     assert reloaded['tasks'][0]['task_id'] == 101
 
+    # The atomic temp+rename write leaves no stray .tmp file behind on the
+    # success path either.
+    leftovers = [p for p in plans_dir.iterdir() if p.name.endswith('.tmp')]
+    assert leftovers == []
+
     task_interceptor.update_task.assert_called_once()
     call = task_interceptor.update_task.call_args
     assert call.args[0] == '101'
@@ -289,3 +294,59 @@ async def test_missing_label_and_manual_only(tmp_path):
     task_interceptor.update_task.assert_called_once()
     call = task_interceptor.update_task.call_args
     assert call.args[0] == '301'
+
+
+@pytest.mark.asyncio
+async def test_write_failure_mid_stamp_leaves_original_sidecar_intact(tmp_path, monkeypatch):
+    """A write/replace *exception* between temp-write and os.replace (e.g. a
+    disk error — the path where the ``finally`` unlink runs, unlike a hard
+    process kill) must never corrupt the tracked sidecar: os.replace is
+    atomic, so the original file is left byte-identical and parseable, and
+    no stray .tmp file lingers on disk for this exception path."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'foo-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_HAPPY_PATH_SIDECAR_YAML, encoding='utf-8')
+
+    def _boom(*args, **kwargs):
+        raise OSError('simulated crash between temp-write and replace')
+
+    monkeypatch.setattr(
+        'fused_memory.server.manifest_stamping.os.replace',
+        _boom,
+    )
+
+    task_interceptor = AsyncMock()
+    ids = ['101']
+    tasks_data = [
+        {
+            'id': '101',
+            'metadata': {
+                'prd_path': 'plans/foo-prd.md',
+                'prd_task_label': 'alpha',
+                'files': ['src/foo.py'],
+            },
+        },
+    ]
+
+    report = await stamp_capability_manifests(
+        project_root=str(tmp_path),
+        ids=ids,
+        tasks_data=tasks_data,
+        task_interceptor=task_interceptor,
+    )
+
+    assert report is not None
+    assert report['stamped'] == []
+    assert len(report['errors']) == 1
+    assert 'failed to stamp/write' in report['errors'][0]
+
+    # Original sidecar is untouched and still parseable.
+    assert sidecar_path.read_text(encoding='utf-8') == _HAPPY_PATH_SIDECAR_YAML
+    yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+
+    # No stray temp file left behind in the sidecar's directory.
+    leftovers = [p for p in plans_dir.iterdir() if p.name.endswith('.tmp')]
+    assert leftovers == []
+
+    task_interceptor.update_task.assert_not_called()

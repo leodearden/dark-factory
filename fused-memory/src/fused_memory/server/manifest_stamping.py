@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -244,10 +245,30 @@ async def _stamp_capability_manifests_impl(
                 entry['task_id'] = int(label_to_task_id[label])
                 stamped_labels.append(label)
         if stamped_labels:
-            sidecar_abs.write_text(
-                yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
-                encoding='utf-8',
+            # Write-to-temp + os.replace (mirrors curator_escalator.py's
+            # _write): a crash mid-write never leaves a torn, unparseable
+            # tracked sidecar — os.replace is atomic, so the file is either
+            # the old contents or the fully-written new ones. Unique
+            # per-write temp filename (pid + id(raw)) so concurrent writers
+            # can never share a temp path. ``finally`` cleans up the temp
+            # file on a write/replace *exception* (e.g. the os.replace
+            # failure the test below simulates); it does NOT run on a hard
+            # process kill between the write and the replace, so a
+            # uniquely-named ``.tmp`` sibling can still linger on disk in
+            # that case. That litter is harmless — sidecar discovery (step 2
+            # above) matches only the exact derived rel path, never a
+            # ``.tmp`` suffix — but it's real, not just theoretical.
+            tmp_path = sidecar_abs.parent / (
+                f'{sidecar_abs.name}.{os.getpid()}.{id(raw)}.tmp'
             )
+            try:
+                tmp_path.write_text(
+                    yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                    encoding='utf-8',
+                )
+                os.replace(tmp_path, sidecar_abs)
+            finally:
+                tmp_path.unlink(missing_ok=True)
     except Exception as exc:
         logger.warning(
             'stamp_capability_manifests: failed to stamp/write %s', sidecar_rel, exc_info=True,
