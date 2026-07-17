@@ -88,12 +88,22 @@ def _discover_escalation_urls(roots: list[Path]) -> dict[str, str]:
 
     Keyed by project basename — the same key the Merge UI uses. Prefers the
     canonical ``dark-factory-orchestrator.yaml`` name, falling back to legacy
-    spellings (see ``_discover_root_escalation_url``).
+    spellings (see ``_discover_root_escalation_url``). A root that yields no
+    URL at all — no config found under any spelling, or a config found with
+    no ``escalation.port`` — logs a WARNING naming the root, rather than
+    degrading silently.
     """
     out: dict[str, str] = {}
     for root in roots:
         url = _discover_root_escalation_url(root)
         if url is None:
+            logger.warning(
+                'No escalation URL discovered for project root %s '
+                '(checked %s and legacy spellings %s)',
+                root,
+                _CANONICAL_CONFIG_NAME,
+                _LEGACY_CONFIG_NAMES,
+            )
             continue
         out[root.name] = url
     return out
