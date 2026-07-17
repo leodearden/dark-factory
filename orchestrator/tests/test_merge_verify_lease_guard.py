@@ -369,3 +369,85 @@ class TestMergeVerifyLeaseHoldsLaneLock:
             'seed-warm-lane.sh must never have run — reseed and the live '
             'verify must mutually exclude on the one <lane_dir>.lock'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2685, step-3 — reset_persistent_merge_worktree must ALSO hold
+# <lane_dir>.lock across its own tree mutation, closing the residual window
+# between reset_persistent_merge_worktree returning and merge_verify_lease()
+# being acquired by the caller (merge_queue.py's post-reset gap). Without
+# this, a reify/DF reseed racing in during that window could still clobber
+# the tree between reset and the lease being taken.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestResetHoldsLaneLock:
+    """reset_persistent_merge_worktree acquires <lane_dir>.lock across its
+    tree-mutating body (task 2685, step-3).
+
+    Mirrors test_git_ops.py::TestSeedWarmLaneTakesLaneLock.
+    test_seed_blocks_until_lane_lock_released's block-then-release pattern:
+    an external holder of <lane_dir>.lock must genuinely block the reset
+    (not be ignored), and the reset must proceed once the lock is released.
+    """
+
+    async def test_reset_blocks_until_lane_lock_released(
+        self, real_git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        # Comfortably longer than the ~0.3s external hold below, but far
+        # short of the real 30s default so a regression that never
+        # acquires (and so never blocks at all) still fails fast rather
+        # than via this test hanging for 30s.
+        monkeypatch.setattr(git_ops_mod, '_SEED_WARM_LANE_LOCK_WAIT_SECS', 5)
+
+        merge_commit_a = await _get_merge_commit(real_git_ops, 'reset-lock-a1', 'rla1.py')
+        await real_git_ops.reset_persistent_merge_worktree(merge_commit_a)  # create-once
+        merge_commit_b = await _get_merge_commit(real_git_ops, 'reset-lock-a2', 'rla2.py')
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_held = True
+
+        task = asyncio.create_task(
+            real_git_ops.reset_persistent_merge_worktree(merge_commit_b)
+        )
+        try:
+            await asyncio.sleep(0.3)
+
+            assert not task.done(), (
+                'reset_persistent_merge_worktree must block acquiring '
+                '<lane_dir>.lock while an external holder (a reify/DF '
+                'actor) holds it'
+            )
+            _, head_sha, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=real_git_ops.persistent_merge_worktree_path,
+            )
+            assert head_sha.strip() == merge_commit_a.strip(), (
+                'HEAD must not have advanced yet — the reset is still '
+                'waiting to acquire <lane_dir>.lock'
+            )
+
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+            lock_held = False
+
+            warm_path = await asyncio.wait_for(task, 10)
+
+            assert warm_path == real_git_ops.persistent_merge_worktree_path
+            _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=warm_path)
+            assert head_sha.strip() == merge_commit_b.strip(), (
+                'reset must proceed and advance HEAD once the lane lock '
+                'is released'
+            )
+        finally:
+            if not task.done():
+                task.cancel()
+            if lock_held:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
