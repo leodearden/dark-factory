@@ -7491,6 +7491,40 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         n_failed = sum(1 for passed in self._recent_verify_outcomes if not passed)
         return n_failed / len(self._recent_verify_outcomes)
 
+    def _available_built_depth(self) -> int:
+        """Return the deepest already-built speculative cumulative stack depth.
+
+        = ``len(_frozen_inflight_entries())`` (already frozen/verifying --
+        each entry one level of the cumulative stack) + the count of
+        :class:`RealMergeItem` entries sitting BUILT-BUT-UNVERIFIED in
+        ``_verifier_queue`` (merged by the Merger, not yet dispatched to a
+        verify runner). These queued items extend the SAME chain one level
+        further each, since every speculative merge is built against its
+        predecessor's already-computed merge commit -- exactly mirroring
+        how :meth:`_verify_frontier_depth` counts frozen entries without
+        filtering on ``.speculative`` (the first entry in a chain may
+        itself be the non-speculative head).
+
+        ``0`` when nothing is built (empty frontier, empty queue).
+
+        :class:`DecidedItem` passthroughs (conflict / already_merged /
+        etc.) and the ``None`` shutdown sentinel never extend the chain --
+        a passthrough carries no merge commit -- and are excluded via the
+        ``isinstance(..., RealMergeItem)`` check.
+
+        Read-only: scans ``_verifier_queue._queue`` (the same CPython-
+        internal-deque-snapshot idiom used by
+        :meth:`speculation_accounting_violations` / :meth:`snapshot`)
+        without draining or reordering it.
+
+        Pure/synchronous (no await).
+        """
+        depth = len(self._frozen_inflight_entries())
+        for vq_item in self._verifier_queue._queue:  # type: ignore[attr-defined]
+            if isinstance(vq_item, RealMergeItem):
+                depth += 1
+        return depth
+
     # ── MQ-invariants iota (task 1994): resource-conservation audits ────────
     #
     # Two pure, fail-safe audit methods mirroring the two_layer_invariants
