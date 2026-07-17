@@ -82,6 +82,28 @@ class TestServerConfigThreadWarnThreshold:
             ServerConfig(thread_warn_threshold='not-an-int')  # type: ignore[arg-type]
 
 
+class TestServerConfigGracefulShutdownTimeout:
+    """Tests for ServerConfig.graceful_shutdown_timeout field (survey finding D1).
+
+    Bounds uvicorn's internal timeout_graceful_shutdown wait so
+    _shutdown_with_watchdog's force-exit timer is always reached within the
+    systemd TimeoutStopSec budget.  See main._SYSTEMD_TIMEOUT_STOP_SECS.
+    """
+
+    def test_default_is_10(self):
+        config = ServerConfig()
+        assert config.graceful_shutdown_timeout == 10
+
+    def test_explicit_override_accepted(self):
+        config = ServerConfig(graceful_shutdown_timeout=8)
+        assert config.graceful_shutdown_timeout == 8
+
+    def test_value_is_a_positive_int(self):
+        config = ServerConfig()
+        assert isinstance(config.graceful_shutdown_timeout, int)
+        assert config.graceful_shutdown_timeout > 0
+
+
 class TestLLMConfigProvider:
     """Tests for LLMConfig.provider Literal validation."""
 
