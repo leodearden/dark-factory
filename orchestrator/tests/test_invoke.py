@@ -450,6 +450,29 @@ class TestCodexNoAgentsMdWorktreeLeak:
 
 
 @pytest.mark.asyncio
+class TestInvokeAgentForwardsMaxTurnsToCodex:
+    """Defect (b): invoke_agent must forward max_turns to the codex path for
+    dispatcher-signature uniformity/observability, even though codex-cli has
+    no native turn cap (the wall-clock watchdog via timeout_seconds is the
+    sole enforced ceiling — see _invoke_codex's docstring).
+    """
+
+    async def test_max_turns_and_timeout_seconds_forwarded(self, tmp_path):
+        dummy_result = AgentResult(success=True, output='')
+        with patch('orchestrator.agents.invoke._invoke_codex',
+                   new_callable=AsyncMock, return_value=dummy_result) as mock_invoke_codex:
+            await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path,
+                backend='codex', model='gpt-5.4', max_turns=42,
+                max_budget_usd=3.0, timeout_seconds=99.0,
+            )
+
+        mock_invoke_codex.assert_awaited_once()
+        assert mock_invoke_codex.call_args.kwargs.get('max_turns') == 42
+        assert mock_invoke_codex.call_args.kwargs.get('timeout_seconds') == 99.0
+
+
+@pytest.mark.asyncio
 class TestGeminiCallerPropagatesTimedOut:
     """_invoke_gemini must propagate timed_out=True from subprocess result."""
 
