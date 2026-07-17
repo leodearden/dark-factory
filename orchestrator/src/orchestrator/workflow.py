@@ -5320,6 +5320,11 @@ class TaskWorkflow:
             task_id=self.task_id,
         )
 
+        # I-FRESH: never consume a stale verdict from a prior invocation on
+        # this same worktree (mirrors the merger/reviewer pre-spawn clear,
+        # workflow.py:_resolve_and_resubmit / _run_reviewer).
+        self.artifacts.clear_verdict('judge')
+
         pre_cost = self.metrics.total_cost_usd
         try:
             result = await self._invoke(
