@@ -167,6 +167,7 @@ class StubInvoke:
         startup_grace_secs: float = 120.0,
         working_idle_secs: float | None = None,
         absolute_cap_secs: float | None = None,
+        prices: dict[str, Any] | None = None,
     ) -> AgentResult:
         self.calls.append({'model': model})
         return AgentResult(success=True, output='OK')

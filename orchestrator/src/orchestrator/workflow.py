@@ -8375,6 +8375,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 sandbox_modules=sandbox_modules,
                 effort=effort_val,
                 backend=backend_val,
+                # Rides the same **invoke_kwargs forwarding path as backend=
+                # above (task 2457) straight to invoke_agent(prices=...) ->
+                # the codex/gemini/pi cost estimators (claude ignores it —
+                # reports native cost). See OrchestratorConfig.prices.
+                prices=self.config.prices,
                 timeout_seconds=timeout_val,
                 startup_grace_secs=timeouts_cfg.startup_grace_secs,
                 # Working-regime progress extension (task 2360 fix #1): once the

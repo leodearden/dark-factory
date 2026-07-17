@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -393,6 +394,83 @@ class TestCodexCallerPropagatesTimedOut:
                 timeout_seconds=30.0,
             )
         assert agent.timed_out is True
+
+
+@pytest.mark.asyncio
+class TestCodexNoAgentsMdWorktreeLeak:
+    """Defect (a): _invoke_codex must not leave an AGENTS.md file
+    stage-eligible in the worktree — the file must never be written at all.
+    Instructions (system_prompt + prompt) must instead be delivered via
+    stdin, mirroring the claude backend's ARG_MAX-avoidance stdin piping.
+    """
+
+    async def test_no_agents_md_and_instructions_delivered_via_stdin(self, tmp_path):
+        """No AGENTS.md is ever written (so none is ever stage-eligible for
+        the single-implementer-commit path's `git add -A -- . :!.claude`,
+        git_ops.py:5320), and both system_prompt and prompt reach the
+        subprocess exclusively via stdin_data.
+        """
+        subprocess.run(['git', 'init'], cwd=tmp_path, check=True, capture_output=True)
+
+        captured: dict = {}
+
+        async def fake_run_subprocess_local(
+            cmd, cwd, env, backend, model, max_budget_usd, timeout_seconds,
+            stdin_data=None,
+        ):
+            # AT subprocess-call time (before any finally-block cleanup runs):
+            # record whether AGENTS.md exists, and mirror GitOps.commit's
+            # real staging command to see what a commit right now would pick up.
+            captured['agents_md_exists'] = (cwd / 'AGENTS.md').exists()
+            subprocess.run(
+                ['git', 'add', '-A', '--', '.', ':!.claude'],
+                cwd=cwd, check=True, capture_output=True,
+            )
+            staged = subprocess.run(
+                ['git', 'diff', '--cached', '--name-only'],
+                cwd=cwd, check=True, capture_output=True, text=True,
+            )
+            captured['staged_names'] = staged.stdout.splitlines()
+            captured['stdin_data'] = stdin_data
+            return _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=1)
+
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   side_effect=fake_run_subprocess_local):
+            await _invoke_codex(
+                prompt='S3NT_USER', system_prompt='S3NT_SYS', cwd=tmp_path,
+                model='gpt-5.4', max_budget_usd=1.0,
+                mcp_config=None, sandbox_modules=None, effort=None,
+            )
+
+        assert captured['agents_md_exists'] is False
+        assert 'AGENTS.md' not in captured['staged_names']
+        # Exact composed payload — pins ordering (system_prompt before
+        # prompt) and the '\n\n' separator, not just that both substrings
+        # appear somewhere in the blob.
+        assert captured['stdin_data'] == b'S3NT_SYS\n\nS3NT_USER'
+
+
+@pytest.mark.asyncio
+class TestInvokeAgentForwardsMaxTurnsToCodex:
+    """Defect (b): invoke_agent must forward max_turns to the codex path for
+    dispatcher-signature uniformity/observability, even though codex-cli has
+    no native turn cap (the wall-clock watchdog via timeout_seconds is the
+    sole enforced ceiling — see _invoke_codex's docstring).
+    """
+
+    async def test_max_turns_and_timeout_seconds_forwarded(self, tmp_path):
+        dummy_result = AgentResult(success=True, output='')
+        with patch('orchestrator.agents.invoke._invoke_codex',
+                   new_callable=AsyncMock, return_value=dummy_result) as mock_invoke_codex:
+            await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path,
+                backend='codex', model='gpt-5.4', max_turns=42,
+                max_budget_usd=3.0, timeout_seconds=99.0,
+            )
+
+        mock_invoke_codex.assert_awaited_once()
+        assert mock_invoke_codex.call_args.kwargs.get('max_turns') == 42
+        assert mock_invoke_codex.call_args.kwargs.get('timeout_seconds') == 99.0
 
 
 @pytest.mark.asyncio
