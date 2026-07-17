@@ -1692,8 +1692,7 @@ class TestCrossUnitWritebackResilience:
             escalation_queue=queue,
             unit_inspector=unit_inspector,
             script_runner=script_runner,
-            writeback_max_attempts=5,
-            writeback_backoff_base=0.01,
+            writeback_backoffs=[0.01] * 4,
             sleeper=sleeper,
         )
         outcome = await runner.run(assignment)
@@ -1753,8 +1752,7 @@ class TestCrossUnitWritebackResilience:
             escalation_queue=queue,
             unit_inspector=unit_inspector,
             script_runner=script_runner,
-            writeback_max_attempts=5,
-            writeback_backoff_base=0.01,
+            writeback_backoffs=[0.01] * 4,
             sleeper=sleeper,
         )
         outcome = await runner.run(assignment)
@@ -1797,14 +1795,14 @@ class TestCrossUnitWritebackResilience:
 
         scheduler.update_task = AsyncMock(side_effect=_update_task_side_effect)
         sleeper = AsyncMock()
+        backoffs = [0.01] * 2
 
         runner = DeterministicRunner(
             scheduler=scheduler,
             escalation_queue=queue,
             unit_inspector=unit_inspector,
             script_runner=script_runner,
-            writeback_max_attempts=3,
-            writeback_backoff_base=0.01,
+            writeback_backoffs=backoffs,
             sleeper=sleeper,
         )
         outcome = await runner.run(assignment)
@@ -1839,12 +1837,12 @@ class TestCrossUnitWritebackResilience:
             c for c in scheduler.update_task.call_args_list
             if len(c.args) > 1 and 'before_done_verified_at' in c.args[1]
         ]
-        assert len(verified_calls) == 3, (
-            f'Expected exactly writeback_max_attempts (3) verified-stamp attempts; '
-            f'got {len(verified_calls)}'
+        assert len(verified_calls) == len(backoffs) + 1, (
+            f'Expected exactly len(backoffs)+1 ({len(backoffs) + 1}) verified-stamp '
+            f'attempts; got {len(verified_calls)}'
         )
-        assert sleeper.await_count == 2, (
-            f'Expected exactly writeback_max_attempts-1 (2) sleeps; got {sleeper.await_count}'
+        assert sleeper.await_count == len(backoffs), (
+            f'Expected exactly len(backoffs) ({len(backoffs)}) sleeps; got {sleeper.await_count}'
         )
 
         # (e) the deploy script is never re-run.
@@ -1892,8 +1890,7 @@ class TestCrossUnitWritebackResilience:
             escalation_queue=queue,
             unit_inspector=unit_inspector,
             script_runner=script_runner,
-            writeback_max_attempts=3,
-            writeback_backoff_base=0.01,
+            writeback_backoffs=[0.01] * 2,
             sleeper=sleeper,
         )
         outcome = await runner.run(assignment)
@@ -1936,7 +1933,7 @@ class TestCrossUnitWritebackResilience:
         script_runner = AsyncMock(return_value=(0, 'ok'))
 
         # The verified stamp fails for the first 2 attempts and lands only on
-        # the 3rd/last attempt (writeback_max_attempts=3 below).
+        # the 3rd/last attempt (writeback_backoffs=[0.01]*2 below -> attempts=3).
         verified_attempts: list[bool] = []
 
         def _update_task_side_effect(_task_id, metadata, **_kwargs):
@@ -1965,8 +1962,7 @@ class TestCrossUnitWritebackResilience:
             escalation_queue=queue,
             unit_inspector=unit_inspector,
             script_runner=script_runner,
-            writeback_max_attempts=3,
-            writeback_backoff_base=0.01,
+            writeback_backoffs=[0.01] * 2,
             sleeper=sleeper,
         )
         outcome = await runner.run(assignment)

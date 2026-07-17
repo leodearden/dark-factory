@@ -257,6 +257,7 @@ from orchestrator.deploy_state import (
     VerifyBaseline,
     enforce_transition,
 )
+from orchestrator.fm_retry import FM_RESTART_RETRY_WINDOW_SECS, fm_retry_backoffs
 from orchestrator.proc_supervision import (
     EscalationSpec,
     FreshPidVerify,
@@ -282,16 +283,11 @@ logger = logging.getLogger(__name__)
 # it for the duration of a `--drain` restart.  `McpSession._raw_call`
 # (mcp_lifecycle.py) opens a fresh httpx.AsyncClient and re-inits the session
 # on any transient failure, so the NEXT call auto-reconnects — a successful
-# write IS the reconnection proof.  These constants size the post-deploy
-# verify+writeback retry budget to patiently outlast such a restart instead
-# of the much shorter Scheduler._TRANSIENT_RETRIES budget (sized for a plain
-# API hiccup, not a service restart).
-#
-# 6 attempts / base 2.0s exponential backoff -> 5 sleeps summing to
-# 2.0 * (2**5 - 1) = 62s of patient retrying before giving up — bounded (no
-# infinite loop) while comfortably exceeding a typical `--drain` restart.
-_WRITEBACK_MAX_ATTEMPTS: int = 6
-_WRITEBACK_BACKOFF_BASE: float = 2.0
+# write IS the reconnection proof.  The post-deploy verify+writeback retry
+# budget (``DeterministicRunner._writeback_backoffs``) sizes off the shared
+# ``orchestrator.fm_retry.fm_retry_backoffs()`` schedule (task 2706) instead
+# of an independently-guessed budget, so it patiently outlasts such a
+# restart — see orchestrator/src/orchestrator/fm_retry.py.
 
 # Task 2090: bound the reap after a whole-process-group SIGKILL on a
 # before_done subprocess timeout.  A process stuck in an uninterruptible
@@ -390,10 +386,12 @@ class DeterministicRunner:
             that runs the deploy script to completion.  Defaults to
             ``_default_run_script`` (awaited create_subprocess_exec).
             Injected in tests to avoid spawning real processes.
-        writeback_max_attempts: Bound on the post-deploy verify+writeback
-            retry loop (task 2066).  Defaults to ``_WRITEBACK_MAX_ATTEMPTS``.
-        writeback_backoff_base: Exponential backoff base (seconds) for the
-            writeback retry loop.  Defaults to ``_WRITEBACK_BACKOFF_BASE``.
+        writeback_backoffs: Bound + pacing for the post-deploy verify+writeback
+            retry loop (task 2066), as a list of between-attempt sleep
+            seconds (``attempts = len(writeback_backoffs) + 1``).  Defaults
+            to ``None``, which resolves to the shared
+            ``orchestrator.fm_retry.fm_retry_backoffs()`` schedule (task
+            2706) once, at construction time.
         sleeper: Optional async callable ``(seconds: float) -> None`` used to
             pace writeback retries.  Defaults to ``asyncio.sleep``.  Injected
             in tests so retries don't actually sleep.
@@ -420,8 +418,7 @@ class DeterministicRunner:
         script_runner=None,
         own_unit_resolver=None,
         restart_scheduler=None,
-        writeback_max_attempts=_WRITEBACK_MAX_ATTEMPTS,
-        writeback_backoff_base=_WRITEBACK_BACKOFF_BASE,
+        writeback_backoffs: list[float] | None = None,
         sleeper=None,
         reap_grace_secs=_REAP_GRACE_SECS,
         run_timeout_grace_secs=_RUN_TIMEOUT_GRACE_SECS,
@@ -433,8 +430,10 @@ class DeterministicRunner:
         self._script_runner = script_runner
         self._own_unit_resolver = own_unit_resolver
         self._restart_scheduler = restart_scheduler
-        self._writeback_max_attempts = writeback_max_attempts
-        self._writeback_backoff_base = writeback_backoff_base
+        self._writeback_backoffs = (
+            writeback_backoffs if writeback_backoffs is not None
+            else fm_retry_backoffs(FM_RESTART_RETRY_WINDOW_SECS)
+        )
         self._sleeper = sleeper or asyncio.sleep
         self._reap_grace_secs = reap_grace_secs
         self._run_timeout_grace_secs = run_timeout_grace_secs
@@ -1127,10 +1126,11 @@ class DeterministicRunner:
         stamp (treating a ``False`` return from ``update_task`` as transient)
         until it lands, then retries the ``done`` write (catching a transient/
         ``RuntimeError`` from ``set_task_status``'s own exhausted retry) —
-        both within the SAME bounded, paced ``_writeback_max_attempts``/
-        ``_writeback_backoff_base`` budget, without re-stamping and without
-        re-running the deploy script (I1 once-only — this helper only
-        persists an already-completed deploy's outcome).
+        both within the SAME bounded, paced ``_writeback_backoffs`` budget
+        (task 2706, sized off the shared ``orchestrator.fm_retry`` schedule),
+        without re-stamping and without re-running the deploy script (I1
+        once-only — this helper only persists an already-completed deploy's
+        outcome).
 
         ζ DS-1: the verified-stamp write also atomically carries
         ``deploy_state.phase=='verified'`` — folded into the SAME write
@@ -1188,8 +1188,10 @@ class DeterministicRunner:
             )
             deploy_state_payload = {}
 
+        backoffs = self._writeback_backoffs
+        attempts = len(backoffs) + 1
         stamped = False
-        for attempt in range(self._writeback_max_attempts):
+        for attempt in range(attempts):
             if not stamped:
                 stamped = bool(await self.scheduler.update_task(
                     task_id,
@@ -1207,23 +1209,23 @@ class DeterministicRunner:
                         'DeterministicRunner: task %s verified-stamp writeback failed '
                         '(attempt %d/%d) — connection may be severed by the deploy; '
                         'retrying',
-                        task_id, attempt + 1, self._writeback_max_attempts,
+                        task_id, attempt + 1, attempts,
                     )
-                    if attempt + 1 < self._writeback_max_attempts:
-                        await self._sleeper(self._writeback_backoff_base * (2 ** attempt))
+                    if attempt < len(backoffs):
+                        await self._sleeper(backoffs[attempt])
                     continue
 
             # Shared-budget design (task 2066 amendment): the verified-stamp
             # write above and the done-write below intentionally draw from
-            # the SAME `_writeback_max_attempts` budget and `attempt` counter
-            # rather than each getting its own sub-budget.  If the stamp only
-            # lands on the final iteration, the done-write gets exactly one
-            # remaining try before the loop falls through to the
+            # the SAME `_writeback_backoffs`-derived budget and `attempt`
+            # counter rather than each getting its own sub-budget.  If the
+            # stamp only lands on the final iteration, the done-write gets
+            # exactly one remaining try before the loop falls through to the
             # budget-exhausted escalation path below — there is no dedicated
             # done-write retry allowance.  This keeps the overall ceiling
-            # simple (the ~62s default bounds BOTH writes together) at the
-            # cost of a possibly-single done-write attempt in the worst case;
-            # see
+            # simple (the shared orchestrator.fm_retry window bounds BOTH
+            # writes together, task 2706) at the cost of a possibly-single
+            # done-write attempt in the worst case; see
             # test_stamp_lands_on_final_attempt_then_done_write_fails_still_escalates
             # for the regression guard covering this exact edge.
             logger.info(
@@ -1245,18 +1247,19 @@ class DeterministicRunner:
                 return WorkflowOutcome.DONE
             except Exception as exc:
                 # set_task_status already exhausted its own transient retry
-                # budget (Scheduler._TRANSIENT_RETRIES) before raising — the
-                # connection may still be severed.  Retry the done-write
-                # within the SAME writeback budget rather than letting this
-                # propagate out of run() (stamped stays True — no re-stamp).
+                # budget (the shared orchestrator.fm_retry schedule, task
+                # 2706) before raising — the connection may still be
+                # severed.  Retry the done-write within the SAME writeback
+                # budget rather than letting this propagate out of run()
+                # (stamped stays True — no re-stamp).
                 logger.warning(
                     'DeterministicRunner: task %s done-write failed (attempt %d/%d): '
                     '%s: %s — connection may still be severed; retrying',
-                    task_id, attempt + 1, self._writeback_max_attempts,
+                    task_id, attempt + 1, attempts,
                     type(exc).__name__, exc,
                 )
-                if attempt + 1 < self._writeback_max_attempts:
-                    await self._sleeper(self._writeback_backoff_base * (2 ** attempt))
+                if attempt < len(backoffs):
+                    await self._sleeper(backoffs[attempt])
                 continue
 
         # Budget exhausted — fused-memory never recovered in-window.  File a
@@ -1279,7 +1282,7 @@ class DeterministicRunner:
             "orchestrator's own fused-memory/MCP connection was severed by "
             'the deploy (e.g. the deploy restarted the service backing that '
             'connection) and the verify+writeback could not be persisted '
-            f'within the reconnect budget ({self._writeback_max_attempts} '
+            f'within the reconnect budget ({attempts} '
             'attempts). before_done_ran_at is already stamped (I1 — the '
             'deploy is NOT re-run). Resolve this escalation to unblock the '
             'task: if the verified stamp landed before the connection was '
