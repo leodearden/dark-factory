@@ -34,6 +34,8 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 # (port, systemd unit name) pairs to watch.  Port values match each
 # orchestrator's configured escalation.port (guarded by the drift test in
@@ -66,6 +68,26 @@ STARTUP_GRACE_SECS = 120
 # _enumerate_running_units excludes it explicitly so the exclusion does not
 # rely on systemd oneshot SUB-state semantics.
 WATCHDOG_UNIT_NAME = "orchestrator-watchdog.service"
+
+# fused-memory liveness (task 2713, ξ of the fm-restart survey). fused-memory
+# is the single shared MCP server all 7 orchestrators depend on — it is
+# deliberately NOT added to WATCHED/main()'s loop (both are pinned by
+# exact-equality drift tests). It needs a richer probe than a bare port
+# check: the in-process systemd watchdog thread pings WATCHDOG=1 from a
+# dedicated OS thread unconditionally (task 1731), so a wedged asyncio loop
+# still looks "healthy" to systemd forever — only an HTTP /health fetch can
+# catch that. See fused_memory_liveness_pass() / probe_health() below.
+FUSED_MEMORY_UNIT = "fused-memory.service"
+# Port value matches fused-memory/config/config.yaml's server.port (guarded
+# by the drift test in tests/scripts/test_orchestrator_watchdog.py).
+FUSED_MEMORY_PORT = 8002
+FUSED_MEMORY_HEALTH_URL = f"http://127.0.0.1:{FUSED_MEMORY_PORT}/health"
+# /health (fused_memory/server/tools.py:701) runs two sequential backing-store
+# probes (FalkorDB, Qdrant), each wrapped in asyncio.timeout(5), so a
+# degraded-but-alive server can take ~10s to return its 503. 15s clears that
+# ~10s worst case with margin, so only a genuinely wedged loop (no response
+# at all) times out here.
+FUSED_MEMORY_HEALTH_TIMEOUT_SECS = 15
 
 # Working directory shared by every orchestrator-*.service unit; the repo the
 # staleness pass diffs against.
@@ -240,6 +262,42 @@ def probe_port(port: int) -> bool:
             except ValueError:
                 continue
     return False
+
+
+def probe_health(
+    url: str = FUSED_MEMORY_HEALTH_URL, timeout: float = FUSED_MEMORY_HEALTH_TIMEOUT_SECS
+) -> bool:
+    """Return True iff *url* returns ANY HTTP response within *timeout* seconds.
+
+    Deliberately inverted fail-direction vs. probe_port(): probe_port defaults
+    to True (assume healthy) on a tooling failure so a flaky `ss` invocation
+    never triggers a restart. probe_health instead treats an HTTP response —
+    including an error status such as 503 (surfaced by urlopen as
+    urllib.error.HTTPError) — as the positive/alive signal, and returns False
+    only when NO response is received at all (connection-refused, DNS
+    failure, or a timeout).
+
+    This asymmetry is intentional: fused-memory's /health returns 503 when a
+    backing store (FalkorDB/Qdrant) is degraded, but a 503 still means the
+    asyncio event loop IS serving requests — restarting the process would not
+    fix a down store, would flap the single shared instance all 7
+    orchestrators depend on, and would cancel expensive in-flight
+    reconciliation work for nothing. The wedge this probe must actually catch
+    (task 1731: an OS thread pings systemd's WATCHDOG=1 unconditionally, so a
+    hung asyncio loop never trips systemd's own watchdog) manifests as no
+    HTTP response at all within the timeout — that is the only case that
+    should return False here.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout):
+            return True
+    except urllib.error.HTTPError:
+        # The server responded (even with an error status) — the loop is
+        # alive. A degraded backing store is not something a restart fixes.
+        return True
+    except Exception as exc:  # noqa: BLE001 -- any other failure means no response
+        log(f"probe_health({url!r}) got no response ({type(exc).__name__}: {exc})")
+        return False
 
 
 def restart_unit(unit: str) -> None:
