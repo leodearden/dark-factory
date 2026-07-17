@@ -439,6 +439,25 @@ unblock_auto:
   b3_merge_cap_per_24h: 6
   b3_proposal_keep_last: 5
 
+# Per-role OPT-IN endpoint-env map (task 2460). Keys are role names (e.g.
+# architect, implementer, debugger, judge, merger, steward, reviewer,
+# deep_reviewer, simple_task); values are env maps forwarded to that role's
+# agent invocation — typically ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN,
+# to point the role at an official Anthropic-format endpoint (e.g. Z.AI
+# api.z.ai/api/anthropic, Kimi kimi-for-coding, MiniMax, DeepSeek
+# api.deepseek.com/anthropic). A role NOT listed here receives NO endpoint
+# env from this map — forwarding is opt-in per role, not a global broadcast.
+# In particular the judge is safe by omission: naming it here re-exposes the
+# vLLM ServerDisconnectedError burn (commit 3cd380a079) unless the target
+# endpoint is confirmed to handle the judge's tool-use pattern.
+#
+# Example (commented out):
+# role_env_overrides:
+#   judge:
+#     ANTHROPIC_BASE_URL: "https://api.z.ai/api/anthropic"
+#     ANTHROPIC_AUTH_TOKEN: "${Z_AI_API_KEY}"
+role_env_overrides: {}
+
 # Usage cap handling — multi-account failover
 usage_cap:
   enabled: true
