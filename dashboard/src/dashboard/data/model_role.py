@@ -211,8 +211,16 @@ async def get_model_role_rollup(
         }
 
     Numerically identical (same columns, same rate formulas) to
-    :func:`orchestrator.digest.model_role_rollup` given the same runs.db
-    and window — a shared-contract cross-check test asserts this.
+    :func:`orchestrator.digest.model_role_rollup` given the same runs.db and
+    a window where every row falls at or before ``now`` — the shared-contract
+    cross-check test asserts this using fixture rows timestamped that way.
+    The window BOUND itself is not identical: this module uses an open-ended
+    rolling ``days``-lookback (``completed_at``/``timestamp >= since``, no
+    upper bound — matching the ``dashboard.data.costs`` convention), whereas
+    digest uses a closed ``[window_start, window_end]`` bound. A future-dated
+    or clock-skewed row would be included here but excluded on the digest
+    side; if strict parity is ever required, add an explicit ``< now`` upper
+    bound to this module's queries.
 
     Fail-open: ``db is None`` or any query error returns the empty rollup.
     """
@@ -236,7 +244,12 @@ async def aggregate_model_role_rollup(
     the merged totals (not averaged across DBs). Turn-cap saturation is
     merged by summing each role's raw hit/total counts across DBs before
     dividing — an average-of-ratios would misweight a DB with few
-    invocations equally against one with many.
+    invocations equally against one with many. A DB whose per-role entry has
+    no routing_decision max_turns in-window (``has_max_turns=False``) is
+    excluded from that role's merge entirely, not just discounted — its
+    invocation_end rows carry no valid pass/fail signal, so folding their
+    count into the denominator would silently deflate the merged ratio
+    whenever another DB does have the role's cap (task 2534 amendment).
 
     A ``None`` or offline DB is skipped (contributes nothing) rather than
     failing the whole aggregate — mirrors ``aggregate_cost_by_role``.
@@ -270,9 +283,20 @@ async def aggregate_model_role_rollup(
             ms = merged_saturation.setdefault(
                 role, {'hits': 0, 'total': 0, 'has_max_turns': False},
             )
+            if not entry['has_max_turns']:
+                # This DB has no routing_decision max_turns for the role
+                # in-window, so its invocation_end rows carry no valid
+                # pass/fail signal against a real cap — do not fold their
+                # (zero-credit) count into the merged denominator, or a DB
+                # that only saw orphan invocation_end rows would silently
+                # deflate the fleet-wide ratio. The role still gets a `None`
+                # saturation if NO db ever contributes a real max_turns
+                # (via the `setdefault` above + `_finalize_saturation`'s
+                # `has_max_turns` check) — fail-open, never a false 0%.
+                continue
             ms['hits'] += entry['hits']
             ms['total'] += entry['total']
-            ms['has_max_turns'] = ms['has_max_turns'] or entry['has_max_turns']
+            ms['has_max_turns'] = True
 
     return {
         'rows': [_finalize_cell(c) for c in merged_cells.values()],

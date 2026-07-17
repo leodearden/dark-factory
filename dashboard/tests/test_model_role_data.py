@@ -346,6 +346,70 @@ class TestAggregateModelRoleRollup:
         assert result['turn_cap_saturation']['simple_task'] == pytest.approx(4 / 6)
 
     @pytest.mark.asyncio
+    async def test_turn_cap_saturation_excludes_db_lacking_max_turns_from_denominator(
+        self, tmp_path,
+    ) -> None:
+        """Regression test (task 2534 amendment): a DB whose invocation_end
+        rows for a role have NO routing_decision max_turns in-window must not
+        dilute the merged denominator with zero-credit rows, even though
+        another DB does have that role's cap in-window.
+
+        DB A: simple_task max_turns=10 known, 2/2 invocation_end rows hit ->
+        1.0 on its own. DB B: simple_task invocation_end rows present but NO
+        routing_decision for simple_task at all -> has_max_turns=False, so
+        its 3 rows carry no valid pass/fail signal. The buggy merge (summing
+        every DB's raw total regardless of has_max_turns) would compute
+        2 hits / (2 + 3) total = 0.4; the correct merge excludes DB B's
+        orphan rows entirely, leaving 2/2 = 1.0.
+        """
+        db_a = tmp_path / 'sat_a.db'
+        conn = sqlite3.connect(str(db_a))
+        try:
+            conn.executescript(MODEL_ROLE_SCHEMA)
+            conn.execute(
+                "INSERT INTO events (timestamp, run_id, task_id, event_type, role, data) "
+                "VALUES (?, 'run-a', 'ta1', 'routing_decision', 'simple_task', ?)",
+                ('2026-05-10T08:00:00+00:00', json.dumps({'max_turns': 10})),
+            )
+            conn.executemany(
+                "INSERT INTO events (timestamp, run_id, task_id, event_type, role, data) "
+                "VALUES (?, 'run-a', 'ta1', 'invocation_end', 'simple_task', ?)",
+                [
+                    ('2026-05-10T08:01:00+00:00', json.dumps({'turns': 10})),  # hit
+                    ('2026-05-10T08:02:00+00:00', json.dumps({'turns': 10})),  # hit
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        db_b = tmp_path / 'sat_b.db'
+        conn = sqlite3.connect(str(db_b))
+        try:
+            conn.executescript(MODEL_ROLE_SCHEMA)
+            # No routing_decision event for simple_task in this DB at all —
+            # these invocation_end rows are orphans with no known cap.
+            conn.executemany(
+                "INSERT INTO events (timestamp, run_id, task_id, event_type, role, data) "
+                "VALUES (?, 'run-b', 'tb1', 'invocation_end', 'simple_task', ?)",
+                [
+                    ('2026-05-10T09:01:00+00:00', json.dumps({'turns': 1})),
+                    ('2026-05-10T09:02:00+00:00', json.dumps({'turns': 1})),
+                    ('2026-05-10T09:03:00+00:00', json.dumps({'turns': 1})),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        async with aiosqlite.connect(str(db_a)) as a, aiosqlite.connect(str(db_b)) as b:
+            a.row_factory = aiosqlite.Row
+            b.row_factory = aiosqlite.Row
+            result = await aggregate_model_role_rollup([a, b], days=DAYS, now=NOW)
+
+        assert result['turn_cap_saturation']['simple_task'] == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
     async def test_none_db_is_skipped(self, two_model_role_conns) -> None:
         with_none = await aggregate_model_role_rollup(
             [*two_model_role_conns, None], days=DAYS, now=NOW,
