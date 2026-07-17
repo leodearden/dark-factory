@@ -3910,6 +3910,12 @@ async def reconcile_landed_row(
       ``should_skip`` pre-check guards the ``mark_done`` attempt itself so a
       repeat pass at an unchanged ``reopen_at`` short-circuits straight to
       ``'stale_conflict'`` without re-attempting the already-rejected write.
+      Unlike the harness's dispatch-gate and stranded-sweep call sites, this
+      pre-check does NOT pass ``reopen_at`` (see the inline comment above the
+      call) — a ``LandedRow`` carries no task metadata, so this site cannot
+      self-heal via ``should_skip``'s reopen_at-change invalidation arm; it
+      relies solely on the escalation-resolved arm (an operator resolving the
+      ``provenance_conflict`` escalation). Known limitation, not a bug.
     """
     if not await git_ops.is_ancestor(row.advanced_sha, main_sha):
         outbox.consume(row.task_id)
@@ -3921,6 +3927,14 @@ async def reconcile_landed_row(
     if status in WORKFLOW_PRESERVE_STATUSES:
         outbox.consume(row.task_id)
         return 'already_done_pruned'
+    # task 2677 amendment (reviewer_comprehensive #2): intentionally omits
+    # reopen_at here, unlike the harness's dispatch-gate and stranded-sweep
+    # should_skip call sites — a LandedRow (task_id/branch_tip_sha/
+    # advanced_sha/landed_at) carries no task metadata, and fetching it would
+    # require an extra scheduler round-trip this module-level function does
+    # not otherwise make. This site therefore cannot self-heal on a fresh
+    # reopen_at; it only re-attempts once the provenance_conflict escalation
+    # is resolved. See the docstring above for the full rationale.
     if (
         provenance_conflict_sink is not None
         and provenance_conflict_sink.should_skip(row.task_id)
@@ -9170,7 +9184,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         log-and-continue branch below, which would otherwise silently
         swallow the rejection and re-attempt it on the next derail. Either
         way the member is left un-flipped and the remaining members are
-        still processed.
+        still processed. A ``should_skip`` pre-check (reviewer_comprehensive
+        amendment) guards the ``on_main`` re-drive attempt itself, so once a
+        member is memoized as a provenance conflict a later derail skips
+        straight past it instead of re-attempting the already-rejected
+        write — only the escalation's ``dedupe_count`` folded on repeat
+        derails before this pre-check existed. Like
+        :func:`reconcile_landed_row`, this call omits ``reopen_at`` (no
+        cheap task-metadata access from this worker) so it self-heals only
+        via the escalation-resolved invalidation arm.
         """
         if req.redrive_member is None:
             logger.warning(
@@ -9193,6 +9215,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     branch, self._git_ops.config.main_branch,
                 )
                 if on_main:
+                    # reviewer_comprehensive amendment (task 2677): without
+                    # this pre-check, a member memoized as a provenance
+                    # conflict would have its doomed done-write re-attempted
+                    # on EVERY subsequent derail — only the escalation (via
+                    # dedupe_count) was deduped, not the write itself. Skip
+                    # straight to the next member instead.
+                    if (
+                        self._provenance_conflict_sink is not None
+                        and self._provenance_conflict_sink.should_skip(mid)
+                    ):
+                        logger.info(
+                            'Coalesce train %s: member %s already memoized '
+                            'as a provenance conflict — skipping re-drive '
+                            'attempt this derail',
+                            req.train_id, mid,
+                        )
+                        continue
                     branch_tip = await self._git_ops.resolve_branch_sha(branch)
                     verdict = await validate_landing_evidence(
                         self._git_ops, mid, branch,

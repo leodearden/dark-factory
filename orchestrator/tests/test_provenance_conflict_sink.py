@@ -9,6 +9,7 @@ plans/found-on-main-provenance-integrity-prd.md §Contract + §R5.
 from __future__ import annotations
 
 import json
+import logging
 
 from escalation.queue import EscalationQueue
 
@@ -92,6 +93,27 @@ class TestProvenanceConflictSinkRecord:
         result = _record(sink)
 
         assert result is None
+
+    def test_none_queue_record_logs_warning_for_visibility(self, caplog):
+        """reviewer_comprehensive amendment (task 2677): recording before the
+        queue is late-bound memoizes escalation_id=None, which makes
+        should_skip gate the task forever with no escalation ever filed
+        (_escalation_pending(None) is True forever). That must not be a
+        SILENT condition — record() logs a WARNING naming the task so the
+        risk is observable even though no escalation can be filed yet.
+        """
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        sink = ProvenanceConflictSink(escalation_queue=None)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.provenance_conflict'):
+            _record(sink, task_id='42', evidence_commit='abc')
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('42' in r.getMessage() for r in warnings), (
+            f'Expected a WARNING naming the unbound-queue task; '
+            f'got: {[r.getMessage() for r in warnings]!r}'
+        )
 
 
 class TestProvenanceConflictSinkShouldSkip:

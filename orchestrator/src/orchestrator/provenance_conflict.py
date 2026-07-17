@@ -20,6 +20,7 @@ plan.json design_decisions).
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING, Any
 
 from escalation.dedupe import DedupeConfig, content_fingerprint_key, submit_or_dedupe
@@ -31,6 +32,8 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
     from orchestrator.scheduler import StaleEvidenceRejection
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     'PROVENANCE_CONFLICT_AGENT_ROLE',
@@ -125,6 +128,25 @@ class ProvenanceConflictSink:
         in-process retry even before the queue is late-bound.
         """
         if self.escalation_queue is None:
+            # reviewer_comprehensive amendment (task 2677): a rejection can
+            # land here before the harness late-binds .escalation_queue (the
+            # merge worker's run loop can start before that bind happens —
+            # see plan.json design_decisions). Memoizing with escalation_id
+            # None makes _escalation_pending(None) return True forever, so
+            # should_skip will gate this task for the rest of the process
+            # lifetime with NO escalation ever filed. That is a real
+            # silent-gate risk (violates the loud-over-silent-degradation
+            # norm), so make it observable even though there is nothing
+            # else this call can do yet — a fresh rejection after the queue
+            # is bound will still file a real escalation.
+            logger.warning(
+                'ProvenanceConflictSink.record: no escalation_queue bound yet '
+                '— memoizing task %s (evidence %s, gate_source=%s) in-process '
+                'only; should_skip will gate this task with NO operator-visible '
+                'escalation until the queue is late-bound and a fresh '
+                'rejection re-records it',
+                task_id, evidence_commit, gate_source,
+            )
             self._memo[task_id] = (reopen_at, evidence_commit, None)
             return None
 
