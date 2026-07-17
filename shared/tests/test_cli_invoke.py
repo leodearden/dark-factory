@@ -4209,15 +4209,25 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
                 ['fake'], cwd=tmp_path, env={}, model='opus',
                 timeout_seconds=0.05, startup_grace_secs=0.02,
                 session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=2.0, absolute_cap_secs=0.3,
+                working_idle_secs=10.0, absolute_cap_secs=0.3,
             )
             wall = _time.monotonic() - t0
 
         assert result.timed_out is True
         terminate_pg_mock.assert_called_once()
-        # absolute_cap_secs=0.3 « idle_bound=max(2.0, 0.05)=2.0 — only the cap can fire.
+        # absolute_cap_secs=0.3 « idle_bound=max(10.0, 0.05)=10.0 — only the cap can fire.
         assert wall >= 0.2, f'Expected cap-kill at ~0.3s, killed too early at {wall:.3f}s'
-        assert wall < 1.5, f'Expected cap-kill at ~0.3s, not at the 2.0s idle bound ({wall:.3f}s)'
+        # Discriminates the correct ~0.3s cap-kill from the WRONG 10.0s idle bound. The
+        # cap-kill itself fires at ~0.3s (see the "Working-regime absolute cap reached"
+        # log); wall additionally captures the post-kill teardown (an UNMOCKED
+        # snapshot_process_group /proc walk + comm_task cancellation + event-loop
+        # scheduling), which under parallel verify/host load has been observed to drift
+        # to ~2.0s (task 2723). 4.0s keeps full discriminating power against the 10.0s
+        # wrong ceiling while tolerating that teardown latency — mirrors the same
+        # load-drift de-flake applied to the sibling UNREADABLE-DEGRADE test (e) below
+        # (commit fda97df621af), widened further here since 2.0s of observed drift
+        # already ate the old idle_bound=2.0s/wall<1.5s margin outright.
+        assert wall < 4.0, f'Expected cap-kill at ~0.3s, not at the 10.0s idle bound ({wall:.3f}s)'
 
     async def test_unreadable_transcript_degrades_to_old_ceiling_even_with_extension_params_set(self, tmp_path):
         """(e) UNREADABLE-DEGRADE: count_transcript_turns always returns None (B7
