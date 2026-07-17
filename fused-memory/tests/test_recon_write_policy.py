@@ -851,6 +851,78 @@ class TestInterceptorUpdateTaskAnnotationClearBoundary:
 
 
 # ---------------------------------------------------------------------------
+# P1c — interceptor.update_task terminal-x_-annotation-add exemption boundary
+# ---------------------------------------------------------------------------
+
+
+class TestInterceptorUpdateTaskXAnnotationAddBoundary:
+    @pytest.mark.asyncio
+    async def test_recon_stage_x_annotation_add_on_done_task_proceeds(
+        self, interceptor, taskmaster,
+    ):
+        """The exact incident payload: ADD of x_refile_superseded_by /
+        x_reopen_abandoned_reason to done task 1175."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={
+                'x_refile_superseded_by': 'task-2431',
+                'x_reopen_abandoned_reason': 'superseded',
+            },
+            agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+        assert 'error_type' not in result
+
+    @pytest.mark.asyncio
+    async def test_x_add_with_title_present_still_rejects(self, interceptor, taskmaster):
+        """A content field alongside the x_ metadata key disqualifies the
+        exemption — this is a content mutation, not a pure add."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={'x_foo': 1},
+            title='x',
+            agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_x_add_mixed_with_load_bearing_metadata_key_still_rejects(
+        self, interceptor, taskmaster,
+    ):
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project',
+            metadata={'x_foo': 1, 'files': ['a/b.py']},
+            agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_recon_agent_id_x_add_proceeds_unchanged(self, interceptor, taskmaster):
+        """Recon-scoping negative: unaffected by this change either way —
+        this write was never gated regardless of the exemption."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        await interceptor.update_task(
+            '1', '/project',
+            metadata={'x_foo': 1},
+            agent_id=None,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # P2 — interceptor.set_task_status live-workflow boundary
 # ---------------------------------------------------------------------------
 
