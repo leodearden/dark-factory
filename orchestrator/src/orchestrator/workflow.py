@@ -6242,56 +6242,34 @@ class TaskWorkflow:
         return self.artifacts.aggregate_reviews()
 
     async def _run_reviewer(self, role: AgentRole, diff: str) -> dict:
-        """Run a single reviewer and parse its JSON output."""
-        assert self.worktree is not None
+        """Run a single reviewer and read its verdict artifact."""
+        assert self.worktree is not None and self.artifacts is not None
         prompt = await self.briefing.build_reviewer_prompt(role.name, diff)
 
-        # Use structured output for reviewers
-        review_schema = {
-            'type': 'object',
-            'properties': {
-                'reviewer': {'type': 'string'},
-                'verdict': {'type': 'string', 'enum': ['PASS', 'ISSUES_FOUND']},
-                'issues': {
-                    'type': 'array',
-                    'items': {
-                        'type': 'object',
-                        'properties': {
-                            'severity': {'type': 'string', 'enum': ['blocking', 'suggestion']},
-                            'location': {'type': 'string'},
-                            'category': {'type': 'string'},
-                            'description': {'type': 'string'},
-                            'suggested_fix': {'type': 'string'},
-                        },
-                        'required': ['severity', 'location', 'category', 'description'],
-                    },
-                },
-                'summary': {'type': 'string'},
-            },
-            'required': ['reviewer', 'verdict', 'issues', 'summary'],
-        }
+        # I-FRESH: never consume a stale verdict from a prior invocation on
+        # this same worktree (mirrors _resolve_and_resubmit's pre-spawn
+        # clear, workflow.py:7073-7075).
+        self.artifacts.clear_verdict(role.name)
+        result = await self._invoke(role, prompt, self.worktree)
 
-        result = await self._invoke(
-            role, prompt, self.worktree, output_schema=review_schema
-        )
-
-        if result.structured_output:
-            return result.structured_output
-
-        # Try parsing output as JSON
-        try:
-            return json.loads(result.output)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                f'Reviewer {role.name} produced unparseable output '
-                f'(success={result.success}): {result.output[:200]}'
-            )
+        # Read the reviewer's structured verdict instead of the
+        # structured_output/json.loads cascade (task 2484 / PRD task δ).
+        # Defensive extraction mirrors the merger's read_verdict handling
+        # in _resolve_and_resubmit (workflow.py:7108-7110): only a dict
+        # envelope with a dict 'verdict' payload carrying
+        # verdict∈{PASS,ISSUES_FOUND} is trusted; anything else (absent,
+        # cleared, malformed) degrades to the role's existing worst-case
+        # ERROR disposition (I-FAIL-SAFE).
+        envelope = self.artifacts.read_verdict(role.name)
+        payload = envelope.get('verdict') if isinstance(envelope, dict) else None
+        if not isinstance(payload, dict) or payload.get('verdict') not in {'PASS', 'ISSUES_FOUND'}:
             return {
                 'reviewer': role.name,
                 'verdict': 'ERROR',
                 'issues': [],
-                'summary': f'Reviewer error: {result.output[:200]}',
+                'summary': f'Reviewer emitted no/invalid verdict: {result.output[:200]}',
             }
+        return payload
 
     def _suggestions_in_scope(self, suggestions: list[dict]) -> list[dict]:
         """Filter suggestions to those whose location falls within a module

@@ -32,6 +32,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.mcp.verdict_tools import _envelope
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow
@@ -662,7 +663,21 @@ class AgentStub:
         elif role == 'debugger':
             return await self._debugger(cwd)
         elif role.startswith('reviewer'):
-            return self._reviewer(role, output_schema)
+            result = self._reviewer(role, output_schema)
+            if result.structured_output is not None:
+                # Mirror the real submit_review_verdict tool call: write the
+                # verdict envelope to the .task-meta META_ROOT the workflow's
+                # self.artifacts reads from (task 2484 / PRD task δ) — NOT
+                # TaskArtifacts(cwd) (the legacy .task root), or the write
+                # would land where _run_reviewer never reads. Same pattern as
+                # the _architect stub below.
+                rev_artifacts = TaskArtifacts(
+                    cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
+                )
+                rev_artifacts.write_verdict(
+                    role, _envelope(role, session_id or 'sid', result.structured_output)
+                )
+            return result
         elif role == 'merger':
             return self._merger()
         elif role == 'judge':
