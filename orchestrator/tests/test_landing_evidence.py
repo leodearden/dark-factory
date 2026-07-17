@@ -42,8 +42,8 @@ def _git_ops(*, citation, is_ancestor_map, effect_present) -> MagicMock:
     async def _is_ancestor(a, b):
         try:
             return is_ancestor_map[(a, b)]
-        except KeyError:
-            raise AssertionError(f'unexpected is_ancestor call: {a!r}, {b!r}')
+        except KeyError as err:
+            raise AssertionError(f'unexpected is_ancestor call: {a!r}, {b!r}') from err
 
     git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
     git_ops.commit_effect_present_in_main = AsyncMock(return_value=effect_present)

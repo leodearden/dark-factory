@@ -446,7 +446,7 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         assert call_args.args[1] == marker_sha
         assert call_args.args[3] == 'dispatch-gate-marker-found'
         cast(AsyncMock, h.git_ops.find_task_citation_commit).assert_not_called()
-        cast(MagicMock, h._escalation_queue.submit).assert_not_called()
+        cast(MagicMock, h._escalation_queue).submit.assert_not_called()
 
     async def test_marker_found_not_stale_effect_absent_escalates_no_mark_done(
         self, mock_orch_config,
@@ -483,9 +483,9 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         # has_open_l1 is also consulted by the gate's pre-existing top-of-
         # method open-L1 veto (unrelated to this dedup check) — assert the
         # dedup call happened (most recent call), not an exact call count.
-        cast(MagicMock, h._escalation_queue.has_open_l1).assert_called_with('42')
-        cast(MagicMock, h._escalation_queue.submit).assert_called_once()
-        esc = cast(MagicMock, h._escalation_queue.submit).call_args[0][0]
+        cast(MagicMock, h._escalation_queue).has_open_l1.assert_called_with('42')
+        cast(MagicMock, h._escalation_queue).submit.assert_called_once()
+        esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
         assert esc.category == 'provenance_unattributed'
         assert esc.task_id == '42'
         assert 'task/42' in esc.detail
@@ -513,7 +513,7 @@ class TestAlreadyLandedDispatchGateMarkerPath:
 
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
-        cast(MagicMock, h._escalation_queue.submit).assert_not_called()
+        cast(MagicMock, h._escalation_queue).submit.assert_not_called()
 
 
 def _wired_content_harness(
@@ -605,8 +605,8 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
         cast(AsyncMock, h.git_ops.get_main_sha).assert_not_called()
 
-        cast(MagicMock, h._escalation_queue.submit).assert_called_once()
-        esc = cast(MagicMock, h._escalation_queue.submit).call_args[0][0]
+        cast(MagicMock, h._escalation_queue).submit.assert_called_once()
+        esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
         assert esc.category == 'provenance_unattributed'
         assert esc.task_id == '42'
         assert 'task/42' in esc.detail
@@ -636,7 +636,7 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         assert call_args.args[0] == '42'
         assert call_args.args[1] == citation_sha
         assert call_args.args[3] == 'dispatch-gate-content-equivalent'
-        cast(MagicMock, h._escalation_queue.submit).assert_not_called()
+        cast(MagicMock, h._escalation_queue).submit.assert_not_called()
 
     async def test_content_equivalent_with_citation_and_effect_absent_escalates(
         self, mock_orch_config,
@@ -660,8 +660,8 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
-        cast(MagicMock, h._escalation_queue.submit).assert_called_once()
-        esc = cast(MagicMock, h._escalation_queue.submit).call_args[0][0]
+        cast(MagicMock, h._escalation_queue).submit.assert_called_once()
+        esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
         assert esc.category == 'provenance_unattributed'
         assert esc.task_id == '42'
         assert 'effect_absent' in esc.detail
@@ -683,7 +683,7 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
 
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
-        cast(MagicMock, h._escalation_queue.submit).assert_not_called()
+        cast(MagicMock, h._escalation_queue).submit.assert_not_called()
 
 
 class TestAlreadyLandedDispatchGateGetMainShaFallbackGrepGuard:

@@ -235,8 +235,8 @@ class TestAlreadyLandedGateRealGitBoundaries:
 
         assert result is False
         cast(AsyncMock, h.scheduler.mark_done).assert_not_awaited()
-        cast(MagicMock, h._escalation_queue.submit).assert_called_once()
-        esc = cast(MagicMock, h._escalation_queue.submit).call_args[0][0]
+        cast(MagicMock, h._escalation_queue).submit.assert_called_once()
+        esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
         assert esc.category == 'provenance_unattributed'
         assert esc.task_id == task_id
         assert branch in esc.detail
@@ -266,7 +266,7 @@ class TestAlreadyLandedGateRealGitBoundaries:
         assert call.args[0] == task_id
         assert call.kwargs['kind'] == 'found_on_main'
         assert call.kwargs['sha'] == marker_sha
-        cast(MagicMock, h._escalation_queue.submit).assert_not_called()
+        cast(MagicMock, h._escalation_queue).submit.assert_not_called()
 
     async def test_content_equivalent_no_citation_escalates_no_mark_done(
         self, mock_orch_config, git_repo,
@@ -288,8 +288,8 @@ class TestAlreadyLandedGateRealGitBoundaries:
 
         assert result is False
         cast(AsyncMock, h.scheduler.mark_done).assert_not_awaited()
-        cast(MagicMock, h._escalation_queue.submit).assert_called_once()
-        esc = cast(MagicMock, h._escalation_queue.submit).call_args[0][0]
+        cast(MagicMock, h._escalation_queue).submit.assert_called_once()
+        esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
         assert esc.category == 'provenance_unattributed'
         assert esc.task_id == task_id
         assert branch in esc.detail
