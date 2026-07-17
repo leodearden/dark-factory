@@ -768,3 +768,25 @@ class TestShutdownWithWatchdog:
             assert captured['sqlite_watchdog'] is sqlite_watchdog
         finally:
             main_mod._cancel_force_exit()
+
+
+class TestShutdownBudgetArithmetic:
+    """Survey finding D1: the bounded uvicorn graceful-shutdown wait is serialized
+    BEFORE _shutdown_with_watchdog arms _FORCE_EXIT_BUDGET, so worst-case shutdown
+    is approximately graceful_shutdown_timeout + _FORCE_EXIT_BUDGET.  This must stay
+    under systemd's TimeoutStopSec so the in-process force-exit watchdog provably
+    fires before systemd SIGKILLs the cgroup (preserving exit-code control: exit 0
+    for operator stop).
+    """
+
+    def test_default_budget_stays_under_systemd_timeout_stop_sec(self):
+        import fused_memory.server.main as main_mod
+        from fused_memory.config.schema import ServerConfig
+
+        default_timeout = ServerConfig().graceful_shutdown_timeout
+        assert default_timeout + main_mod._FORCE_EXIT_BUDGET < main_mod._SYSTEMD_TIMEOUT_STOP_SECS
+
+    def test_systemd_timeout_stop_secs_matches_unit_file(self):
+        import fused_memory.server.main as main_mod
+
+        assert main_mod._SYSTEMD_TIMEOUT_STOP_SECS == 90.0
