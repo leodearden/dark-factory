@@ -1,0 +1,125 @@
+prd: plans/agent-transcript-archival-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 2728
+  title: Transcript archiver primitive + producer hook in _invoke finally
+  capabilities:
+  - name: archiver-primitive-exists
+    binding: capability→substrate (wired) — session id workflow.py:8348-8352, config
+      dir config_dir.py:34-37/.path, data/orchestrator/ dir
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def archive_task_transcripts
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: producer-hook-in-invoke-finally
+    binding: capability→producer (wired) — grep:orchestrator/workflow.py:8421-8423
+      clear_agent_session finally hook point
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: archive_task_transcripts
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+  - name: credential-safe-only-projects-jsonl
+    binding: rejection-mechanism — built+bound by α; E4 asserts .credentials.json
+      never archived
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: credential exclusion is judged by α's E4 boundary test, not a grep
+  - name: archive-failure-soft-and-loud
+    binding: rejection-mechanism / storm-escape (INV-4) — built by α; E7 asserts task
+      completes + structured failure fact logged/counted
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: fail-soft + loud-counter is a test property (E7), not mechanically greppable
+- label: β
+  task_id: 2729
+  title: Idempotent archival backstop at the cleanup_worktree chokepoint
+  capabilities:
+  - name: backstop-at-cleanup-worktree-chokepoint
+    binding: capability→producer (wired) — grep:orchestrator/git_ops.py:8738 cleanup_worktree;
+      reuses α's helper
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: archive_task_transcripts
+      paths:
+      - orchestrator/src/orchestrator/git_ops.py
+      expect: present
+  - name: backstop-idempotent-skip-already-archived
+    binding: rejection-mechanism — α's helper skips on current size/mtime; E3 asserts
+      already-archived is byte-unchanged
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: idempotency is a test property (E3), not a grep
+- label: γ
+  task_id: 2730
+  title: Legibility multi-root gz-aware enumerate + set agent_transcript_roots ON
+  capabilities:
+  - name: enumerate-generalized-to-root-list-gz-aware
+    binding: capability→substrate (wired) — grep:scripts/legibility/inventory.py:43,188
+      enumerate_sessions/iter_project_dirs already root-parameterized
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: agent_transcript_roots
+      paths:
+      - scripts/legibility/
+      expect: present
+  - name: archive-root-shipped-on-in-legibility-yaml
+    binding: capability→producer (delivered by γ) — the census reads the fleet corpus
+      with no operator flip (Leo's ask)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: agent_transcript_roots:\s*\[?\s*data/orchestrator/agent-transcripts
+      paths:
+      - docs/legibility/legibility.yaml
+      expect: present
+  - name: cwd-filter-admits-worktree-cwds
+    binding: capability→substrate (wired) — grep:scripts/legibility/inventory.py:67-77
+      is_member admits .worktrees descendants
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: existing behaviour; parity is asserted by γ's knob-unset test
+- label: δ
+  task_id: 2731
+  title: Retention GC sweep over the transcript archive (age/count cap, loud)
+  capabilities:
+  - name: gc-prunes-archive-by-cap
+    binding: capability→producer (wired) — prunes α's data/orchestrator/agent-transcripts
+      layout; config home config.py OrchestratorConfig
+    verdict: PASS
+    delivered_check:
+      kind: script
+      script: scripts/gc_agent_transcripts.py
+      args:
+      - --check
+      timeout_secs: 60
+  - name: gc-loud-logging
+    binding: storm-escape (INV-4) — built by δ; E8 asserts each dropped dir + summary
+      logged
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: loud-logging is a test property (E8), not a grep
+- label: ε
+  task_id: 2732
+  title: End-to-end transcript-archival boundary gate (B+H, E1–E8)
+  capabilities:
+  - name: boundary-matrix-green-e2e
+    binding: DAG-direction — all legs produced upstream (α archiver, β backstop, γ
+      mining, δ GC)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the task IS the check suite; its signal is the CI-green boundary matrix
