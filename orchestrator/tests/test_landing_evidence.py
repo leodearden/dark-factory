@@ -10,6 +10,8 @@ independently-drifting inline blocks.
 Covers:
   step-01 (RED)  DISCOVERY mode (candidate_sha=None): citation discovery +
                  FIX2 lineage (both directions) + FIX1' effect-present.
+  step-03 (RED)  CANDIDATE mode (candidate_sha given): effect-present only,
+                 no citation discovery.
 
 Mirrors test_harness_already_landed_gate_wiring.py's ``_wired_ancestry_harness``
 git_ops shape (find_task_citation_commit / is_ancestor / commit_effect_present_in_main
@@ -192,3 +194,73 @@ class TestValidateLandingEvidenceDiscoveryMode:
         assert verdict.probe['citation'] == citation_sha
         assert verdict.probe['effect_check_sha'] == branch_tip_sha
         assert verdict.probe['reason'] == 'ok'
+
+
+@pytest.mark.asyncio
+class TestValidateLandingEvidenceCandidateMode:
+    """CANDIDATE mode (candidate_sha given): a pre-attributed sha (marker
+    subject / ground-truth report) skips citation discovery and the FIX2
+    lineage guard entirely — only the FIX1' effect-present guard applies.
+    """
+
+    async def test_effect_present_accepted_skips_discovery(self) -> None:
+        """(a) commit_effect_present_in_main(candidate)=True -> accepted,
+        evidence_sha==candidate, reason=='ok', and find_task_citation_commit
+        + is_ancestor are NOT called — attribution was already established
+        by the caller (find_merge_marker subject / ground-truth report).
+        """
+        candidate_sha = 'b' * 40
+        git_ops = _git_ops(
+            citation='should-not-be-used',
+            is_ancestor_map={},
+            effect_present=True,
+        )
+
+        verdict = await validate_landing_evidence(
+            git_ops, '42', 'task/42',
+            branch_tip_sha=None,
+            candidate_sha=candidate_sha,
+        )
+
+        assert verdict.accepted is True
+        assert verdict.evidence_sha == candidate_sha
+        assert verdict.reason == 'ok'
+        git_ops.find_task_citation_commit.assert_not_called()
+        git_ops.is_ancestor.assert_not_called()
+        git_ops.commit_effect_present_in_main.assert_awaited_once_with(candidate_sha)
+
+    async def test_effect_absent_rejected(self) -> None:
+        """(b) commit_effect_present_in_main(candidate)=False -> rejected,
+        reason=='effect_absent', evidence_sha is None.
+        """
+        candidate_sha = 'b' * 40
+        git_ops = _git_ops(citation=None, is_ancestor_map={}, effect_present=False)
+
+        verdict = await validate_landing_evidence(
+            git_ops, '42', 'task/42',
+            branch_tip_sha=None,
+            candidate_sha=candidate_sha,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.evidence_sha is None
+
+    async def test_probe_records_candidate_as_evidence_and_effect_check_sha(
+        self,
+    ) -> None:
+        """(c) verdict.probe records the candidate as both 'citation' and
+        'effect_check_sha' (candidate mode has no separately-discovered
+        citation — the candidate IS the evidence under test).
+        """
+        candidate_sha = 'b' * 40
+        git_ops = _git_ops(citation=None, is_ancestor_map={}, effect_present=True)
+
+        verdict = await validate_landing_evidence(
+            git_ops, '42', 'task/42',
+            branch_tip_sha=None,
+            candidate_sha=candidate_sha,
+        )
+
+        assert verdict.probe['citation'] == candidate_sha
+        assert verdict.probe['effect_check_sha'] == candidate_sha
