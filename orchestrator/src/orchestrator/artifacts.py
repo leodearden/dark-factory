@@ -945,6 +945,36 @@ class TaskArtifacts:
             )
             return False
 
+    def set_plan_files(self, files: list[str], session_id: str) -> None:
+        """Widen plan.json's ``files`` list in place — the orchestrator-side
+        mechanical union used by the resume-path scope-grant consumer
+        (``TaskWorkflow._set_task_scope``) instead of re-invoking the
+        architect for a known file-set append.
+
+        Preserves every other plan field (steps, analysis, design_decisions,
+        provenance) untouched — only ``files`` is replaced.
+
+        Ownership: if *session_id* does not already own the plan (neither
+        ``_session_id`` nor ``_revalidated_by_session`` matches), stamps
+        ``_session_id`` = *session_id* and backfills ``_created_at`` (via
+        setdefault, never clobbering an existing value) so that
+        ``validate_plan_owner(session_id)`` is True afterward — this write
+        must never trip ``_escalate_plan_overwrite``. When *session_id*
+        already owns the plan via ``_revalidated_by_session``, provenance is
+        left untouched: the original planner's ``_session_id`` is preserved
+        for audit rather than being promoted.
+        """
+        plan = self.read_plan()
+        plan['files'] = files
+        already_owner = (
+            plan.get('_session_id') == session_id
+            or plan.get('_revalidated_by_session') == session_id
+        )
+        if not already_owner:
+            plan['_session_id'] = session_id
+            plan.setdefault('_created_at', datetime.now(UTC).isoformat())
+        self._write_json(self.root / 'plan.json', plan)
+
     # ──────────────────────────────────────────────────────────────────
     # Agent-session sidecar — marker for "an agent subprocess is in flight".
     #
