@@ -5692,6 +5692,65 @@ fallback.
 """
 
 
+# ── Variable-depth speculative verify placement (task 2359, sibling of task
+# 2340's depth telemetry) ─────────────────────────────────────────────────
+#
+# select_probe_depth() is the PURE decision core: given the operator knobs
+# (probe_fraction/probe_depths/suppress_flake_rate) and the worker's current
+# round/availability/flake-rate inputs, decide whether THIS second-slot
+# dispatch round should probe a deeper already-built speculative stack, and
+# if so, at which depth. No I/O, no clock, no RNG -- fully deterministic in
+# its inputs, mirroring the codebase's existing pure-helper testing style
+# (e.g. _verify_frontier_depth() delegating to _frozen_inflight_entries()).
+# The stateful counterpart, SpeculativeMergeWorker._probe_verify_placement,
+# owns the live round counter / rolling fail-rate window / built-depth
+# introspection and resolves the probed depth's already-built base commit.
+
+
+def select_probe_depth(
+    probe_fraction: float,
+    probe_depths: list[int],
+    round_index: int,
+    available_built_depth: int,
+    recent_fail_rate: float | None,
+    suppress_flake_rate: float,
+) -> int | None:
+    """Decide whether round *round_index* should probe a deeper stack.
+
+    Returns the probed cumulative depth ``d`` (a member of *probe_depths*),
+    or ``None`` when this round should use the normal adjacent depth-1
+    placement instead. Order of checks:
+
+      1. ``probe_fraction <= 0.0`` -> ``None`` unconditionally. This is the
+         task's byte-identical guarantee: at the default fraction (0.0),
+         every call returns ``None`` regardless of the other arguments, so
+         callers always fall through to the pre-task-2359
+         ``_verify_frontier_depth()`` path.
+      2. Deterministic frequency gate: ``period = max(1, round(1 /
+         probe_fraction))``; a round only fires when ``round_index % period
+         == 0``. This bounds the firing rate at <= probe_fraction with no
+         RNG/seed plumbing -- reproducible in unit tests by construction.
+      3. Depth cycling: on a firing round, ``probe_index = round_index //
+         period`` selects ``probe_depths[probe_index % len(probe_depths)]``,
+         so consecutive firings advance through *probe_depths* in order
+         (wrapping).
+
+    *available_built_depth*, *recent_fail_rate*, and *suppress_flake_rate*
+    are accepted now (fixing the function's signature/call sites) but not
+    yet consulted -- the availability fallback and flake-rate suppression
+    guards are added on top of this core in a later step.
+
+    Pure/synchronous -- no I/O, no clock, no RNG.
+    """
+    if probe_fraction <= 0.0:
+        return None
+    period = max(1, round(1 / probe_fraction))
+    if round_index % period != 0:
+        return None
+    probe_index = round_index // period
+    return probe_depths[probe_index % len(probe_depths)]
+
+
 class SpeculativeMergeWorker(_WipHaltMixin):
     """Two-coroutine speculative merge-verify pipeline.
 
