@@ -17,10 +17,25 @@ real config/scheduler/git_ops/escalation_queue.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class TripwireHit:
+    """One in-flight task whose branch diff overlaps a load-bearing landing.
+
+    ``overlap_files`` is the sorted intersection of this task's own branch
+    diff with the landing's changed files — the files whose landed edits
+    this task's branch must PORT (not merely rebase over).
+    """
+
+    task_id: str
+    branch: str
+    overlap_files: tuple[str, ...]
 
 
 async def _run_load_bearing_oracle(
@@ -62,3 +77,31 @@ async def _run_load_bearing_oracle(
             project_root, exc_info=True,
         )
         return False
+
+
+def compute_tripwire_overlap(
+    landing_changed_files: list[str],
+    inflight_diffs: list[tuple[str, str, list[str]]],
+) -> list[TripwireHit]:
+    """Return a :class:`TripwireHit` for each in-flight task whose branch
+    diff overlaps *landing_changed_files*.
+
+    *inflight_diffs* is ``[(task_id, branch, branch_changed_files), ...]``.
+    A task with ZERO overlap is silently absent from the result (not a
+    zero-``overlap_files`` hit) — Open Q2's resolution: the landing's own
+    changed files ARE the concrete load-bearing set the oracle just
+    flagged, so intersecting each branch's diff against them yields exactly
+    the files whose landed edits that branch must port.
+
+    Deterministic: preserves *inflight_diffs* input order; each hit's
+    ``overlap_files`` is sorted independently.
+    """
+    landing_set = set(landing_changed_files)
+    if not landing_set:
+        return []
+    hits: list[TripwireHit] = []
+    for task_id, branch, branch_changed_files in inflight_diffs:
+        overlap = tuple(sorted(set(branch_changed_files) & landing_set))
+        if overlap:
+            hits.append(TripwireHit(task_id=task_id, branch=branch, overlap_files=overlap))
+    return hits
