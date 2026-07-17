@@ -13,8 +13,6 @@ from _orch_helpers import pydantic_spec
 from orchestrator.config import OrchestratorConfig
 from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.mcp_lifecycle import (
-    _MCP_BACKOFF_BASE,
-    _MCP_MAX_RETRIES,
     McpLifecycle,
     McpSession,
 )
@@ -69,9 +67,14 @@ class TestRawCallRetry:
             httpx.ConnectError('Connection refused'),
             ok,
         ]
+        fixed = [1.0, 2.0]
 
         with (
             patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls,
+            patch(
+                'orchestrator.mcp_lifecycle.fm_retry_backoffs',
+                return_value=fixed,
+            ),
             patch('asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
         ):
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
@@ -82,10 +85,10 @@ class TestRawCallRetry:
         assert mock_client.post.call_count == 3
         # Session ID should be cleared on retry then set from response
         assert session._session_id == 'new-session'
-        # Backoff: sleep(1), sleep(2)
+        # Backoff: sleep(fixed[0]), sleep(fixed[1]) — from the shared schedule
         assert mock_sleep.call_count == 2
-        assert mock_sleep.call_args_list[0].args[0] == pytest.approx(_MCP_BACKOFF_BASE * 1)
-        assert mock_sleep.call_args_list[1].args[0] == pytest.approx(_MCP_BACKOFF_BASE * 2)
+        assert mock_sleep.call_args_list[0].args[0] == pytest.approx(fixed[0])
+        assert mock_sleep.call_args_list[1].args[0] == pytest.approx(fixed[1])
 
     @pytest.mark.asyncio
     async def test_retries_on_503(self):
@@ -130,9 +133,14 @@ class TestRawCallRetry:
 
         mock_client = AsyncMock()
         mock_client.post.side_effect = httpx.ConnectError('Connection refused')
+        fixed = [0.01, 0.01]
 
         with (
             patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls,
+            patch(
+                'orchestrator.mcp_lifecycle.fm_retry_backoffs',
+                return_value=fixed,
+            ),
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
@@ -143,7 +151,7 @@ class TestRawCallRetry:
             with pytest.raises(RuntimeError) as excinfo:
                 await session._raw_call('tools/call', {'name': 't', 'arguments': {}})
 
-        assert mock_client.post.call_count == _MCP_MAX_RETRIES
+        assert mock_client.post.call_count == len(fixed) + 1
         assert 'ConnectError' in str(excinfo.value)
         assert isinstance(excinfo.value.__cause__, httpx.ConnectError)
 
@@ -246,9 +254,14 @@ class TestRawCallRetry:
         mock_client.post.side_effect = FileNotFoundError(
             2, 'No such file or directory',
         )
+        fixed = [0.01, 0.01]
 
         with (
             patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls,
+            patch(
+                'orchestrator.mcp_lifecycle.fm_retry_backoffs',
+                return_value=fixed,
+            ),
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
@@ -258,7 +271,7 @@ class TestRawCallRetry:
                     'tools/call', {'name': 't', 'arguments': {}},
                 )
 
-        assert mock_client.post.call_count == _MCP_MAX_RETRIES
+        assert mock_client.post.call_count == len(fixed) + 1
         assert 'FileNotFoundError' in str(excinfo.value)
         assert isinstance(excinfo.value.__cause__, FileNotFoundError)
 
@@ -270,9 +283,14 @@ class TestRawCallRetry:
         session = McpSession('http://localhost:8002')
         mock_client = AsyncMock()
         mock_client.post.side_effect = httpx.ReadTimeout('')
+        fixed = [0.01, 0.01]
 
         with (
             patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls,
+            patch(
+                'orchestrator.mcp_lifecycle.fm_retry_backoffs',
+                return_value=fixed,
+            ),
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
@@ -282,7 +300,7 @@ class TestRawCallRetry:
                     'tools/call', {'name': 't', 'arguments': {}},
                 )
 
-        assert mock_client.post.call_count == _MCP_MAX_RETRIES
+        assert mock_client.post.call_count == len(fixed) + 1
         # The wrapped message must contain the type name so that downstream
         # loggers produce something useful even when str(exc) is empty.
         assert 'ReadTimeout' in str(excinfo.value)
