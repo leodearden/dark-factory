@@ -1756,6 +1756,8 @@ class ReconciliationHarness:
         logger.info(f'Project reconciliation loop started for {project_id}')
         idle_ticks = 0
         while True:
+            if self._draining:
+                return
             try:
                 should, reason = await self.buffer.should_trigger(project_id)
                 if not should:
