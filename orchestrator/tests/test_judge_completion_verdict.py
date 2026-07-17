@@ -125,3 +125,56 @@ class TestRunCompletionJudgeVerdictRouting:
         verdict = await f.wf._run_completion_judge([])
 
         assert verdict is None
+
+    async def test_stale_verdict_is_cleared_before_spawn(self, tmp_path: Path):
+        """(d) a stale prior verdict must never masquerade as this run's (I-FRESH)."""
+        f = self._setup(tmp_path)
+        # Pre-seed a stale complete=True verdict, as if left over from a
+        # prior _run_completion_judge invocation on this same worktree.
+        f.artifacts.write_verdict(
+            'judge',
+            _envelope('judge', 'stale-sid', {
+                'complete': True, 'reasoning': 'stale',
+                'uncovered_plan_steps': [], 'substantive_work': True,
+            }),
+        )
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_with_judge_verdict(
+                f, artifact=None, structured_output=None,
+            ),
+        )
+
+        verdict = await f.wf._run_completion_judge([])
+
+        # If the stale verdict had survived uncleared, its complete=True
+        # would leak through instead.
+        assert verdict is None
+
+    async def test_malformed_artifact_falls_back_to_structured_output(
+        self, tmp_path: Path,
+    ):
+        """(e) an envelope present but missing the 'verdict' key is untrusted
+        and degrades to the structured_output fallback (not straight to
+        None) — a malformed tool write must never discard a valid legacy
+        completion signal during the transition window.
+        """
+        f = self._setup(tmp_path)
+
+        def _invoke_writes_malformed(*args, **kwargs):
+            f.artifacts.write_verdict('judge', {'role': 'judge', 'schema_version': 1})
+            return AgentResult(
+                success=True, output='fine',
+                structured_output={
+                    'complete': True, 'reasoning': 'legacy path',
+                    'uncovered_plan_steps': [], 'substantive_work': True,
+                },
+            )
+
+        f.wf._invoke = AsyncMock(side_effect=_invoke_writes_malformed)  # type: ignore[method-assign]
+
+        verdict = await f.wf._run_completion_judge([])
+
+        assert verdict == {
+            'complete': True, 'reasoning': 'legacy path',
+            'uncovered_plan_steps': [], 'substantive_work': True,
+        }
