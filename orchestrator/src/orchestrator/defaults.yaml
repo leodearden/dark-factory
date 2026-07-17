@@ -451,6 +451,24 @@ unblock_auto:
 # vLLM ServerDisconnectedError burn (commit 3cd380a079) unless the target
 # endpoint is confirmed to handle the judge's tool-use pattern.
 #
+# Restart-only: like the global env_overrides above, this field is NOT in
+# RELOADABLE_FIELDS -- a change here takes effect only on orchestrator
+# restart, not via mcp__escalation__reload_config.
+#
+# Secrets: "${VAR}" / "${VAR:default}" IS expanded here -- the config loader
+# (YamlSettingsSource._expand_env_vars, config.py) walks the fully-merged
+# defaults+project YAML, including nested per-role maps like this one, and
+# substitutes from the orchestrator process's own environment. Prefer
+# "${VAR}" over a literal secret so no token is ever committed to this file.
+# If the referenced var is unset and no ":default" is given, config load
+# fails loudly with a pydantic ValidationError (empty-string expansion
+# coerces to None, which this dict[str, str] field rejects) rather than
+# silently forwarding an empty auth token.
+#
+# Unrecognized role-name keys (typos) log a WARNING at config load/reload
+# instead of being silently never read -- see
+# OrchestratorConfig._warn_unknown_role_env_overrides_keys.
+#
 # Example (commented out):
 # role_env_overrides:
 #   judge:
