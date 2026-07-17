@@ -51,9 +51,18 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 
 # Host-invariant safety switches that MUST be present in [Service] as
 # non-comment directives.  Extend this list to guard additional safety flags.
+# Restart=on-failure / RestartSec=5 / TimeoutStartSec=300 / TimeoutStopSec=90
+# are host-invariant literal strings (already present verbatim in
+# scripts/fused-memory.service.template) — exact membership matching both
+# detects a divergent value (e.g. a wrong TimeoutStopSec) and lets --fix
+# append the correct line.
 REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
     "Environment=MEM0_TELEMETRY=false",
     "WatchdogSec=120",
+    "Restart=on-failure",
+    "RestartSec=5",
+    "TimeoutStartSec=300",
+    "TimeoutStopSec=90",
 )
 
 # ---------------------------------------------------------------------------

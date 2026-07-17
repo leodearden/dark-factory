@@ -101,6 +101,11 @@ Description=Clean Service
 Type=simple
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
+ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=90
 
 [Install]
 WantedBy=default.target
