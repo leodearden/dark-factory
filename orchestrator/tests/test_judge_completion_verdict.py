@@ -26,7 +26,26 @@ import pytest
 from _workflow_helpers import _make
 from shared.cli_invoke import AgentResult
 
+from orchestrator.agents.roles import JUDGE
 from orchestrator.mcp.verdict_tools import _envelope
+
+
+class TestJudgeGrantSurface:
+    """Structural contract for the judge's verdict-tools grant (β/task 2482).
+
+    A membership/contract check (not a docstring/prose pin) pinning the
+    β-delivered grant the migrated prompt (step-6) now depends on — a
+    future edit to JUDGE.allowed_tools can't silently drop the tool while
+    the prompt still instructs the judge to call it. Mirrors
+    test_reviewer_verdict_routing.py::TestReviewerGrantSurface. Already
+    green (grant present via task 2482); included as a regression guard.
+    """
+
+    def test_has_verdict_tools_grant(self):
+        assert 'mcp__verdict-tools__*' in JUDGE.allowed_tools
+
+    def test_declares_verdict_tools_family(self):
+        assert 'verdict_tools' in JUDGE.mcp_families
 
 
 def _invoke_with_judge_verdict(
