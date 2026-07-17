@@ -2119,3 +2119,170 @@ class TestAcquireNextDeliveredGate:
         assert second is not None and second.task_id == '10', (
             f'Runner recovered → should dispatch; got {second!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestAcquireNextDeliveredGateRealFilteredFetch (task 2692 — step-11 RED / step-12 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestAcquireNextDeliveredGateRealFilteredFetch:
+    """The regression the delta/epsilon follow-up (task 2692) exists to
+    close: ``TestAcquireNextDeliveredGate`` above drives the gate via
+    ``scheduler.get_tasks = AsyncMock(return_value=[dep, dependent])`` —
+    this SMUGGLES the done dep past the real ``ACTIVE_TASK_STATUSES``
+    filter, so it lands in ``tasks_by_id`` regardless of whether the
+    backfill plumbing (``ctx.terminal_dep_records``) actually works.
+
+    These tests instead drive ``acquire_next()`` through a STATUS-HONORING
+    ``get_tasks`` fake that filters its return by the ``statuses=`` kwarg —
+    exactly like the real fused-memory tool. The active fetch then yields
+    ONLY the pending dependent; the done dep is genuinely excluded. Its
+    status arrives via a mocked ``get_statuses`` (the existing
+    ``backfill_dep_status`` phase) and its record via a mocked ``get_task``
+    (the new ``backfill_terminal_dep_records`` phase) — exactly the two
+    real fetches production takes. On baseline (before step-12 wires the
+    new phase into ``_TICK_PHASE_ORDER`` and threads
+    ``terminal_dep_records`` through both consumers) the FAILED-check test
+    below FAILS: the dependent dispatches anyway because the gate is a
+    silent no-op through this path.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=2)
+        scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+        scheduler.finish_startup()
+        return scheduler
+
+    _CHECKS = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+
+    def _dep(self, dep_id: str = '20', status: str = 'done') -> dict:
+        return {
+            'id': dep_id,
+            'status': status,
+            'dependencies': [],
+            'metadata': {'delivered_checks': self._CHECKS},
+        }
+
+    def _dependent(self, tid: str = '10', dep_id: str = '20') -> dict:
+        return {
+            'id': tid,
+            'title': f'Task {tid}',
+            'status': 'pending',
+            'dependencies': [{'id': dep_id}],
+            'metadata': {'files': ['backend']},
+        }
+
+    def _status_honoring_get_tasks(self, *records: dict):
+        """A ``get_tasks`` fake that honors the ``statuses=`` filter kwarg —
+        unlike a plain ``AsyncMock(return_value=...)``, which returns every
+        record regardless of the filter and so smuggles terminal deps past
+        the real active-only fetch."""
+
+        async def _gt(*, statuses=None):
+            xs = list(records)
+            return xs if statuses is None else [t for t in xs if t['status'] in statuses]
+
+        return _gt
+
+    def _held_events(self, scheduler: Scheduler) -> list[tuple[str, dict]]:
+        _event_store = scheduler.event_store
+        assert _event_store is not None
+        return [
+            (evt, data)
+            for evt, data in _event_store.events  # type: ignore[attr-defined]
+            if evt == str(EventType.delivered_check_gate_held)
+        ]
+
+    def _fake_sha(self, sha: str = 'sha1'):
+        async def _resolve():
+            return sha
+
+        return _resolve
+
+    def _fake_runner(self, outcome):
+        """Fake ``run_delivered_check`` returning (or raising) *outcome* for
+        every check it's invoked with."""
+
+        async def _fake(check, *, project_root, ref='main'):
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        return _fake
+
+    # --- (1) phase-order invariant ------------------------------------------
+
+    def test_backfill_terminal_dep_records_placed_between_dep_status_and_gate(self):
+        order = Scheduler._TICK_PHASE_ORDER
+
+        assert 'backfill_terminal_dep_records' in order
+        idx_dep_status = order.index('backfill_dep_status')
+        idx_terminal = order.index('backfill_terminal_dep_records')
+        idx_gate = order.index('delivered_check_gate')
+        idx_build = order.index('build_candidates')
+        idx_pins = order.index('select_pins')
+
+        assert idx_dep_status < idx_terminal < idx_gate
+        assert idx_terminal < idx_build
+        assert idx_terminal < idx_pins
+
+    # --- (2) FAILED withhold: the exact gap δ/ε left ------------------------
+
+    @pytest.mark.asyncio
+    async def test_failed_check_on_genuinely_excluded_dep_withholds(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        dep = self._dep()
+        dependent = self._dependent()
+        scheduler.get_tasks = self._status_honoring_get_tasks(dep, dependent)
+        scheduler.get_statuses = AsyncMock(return_value=({'20': 'done'}, None))
+        scheduler.get_task = AsyncMock(return_value=dep)
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner(DeliveredCheckResult.FAILED),
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, (
+            f'A FAILED delivered check on a dep genuinely excluded from the '
+            f'active-only fetch must still withhold its dependent — the '
+            f'gate must not be a silent no-op through the real dispatch '
+            f'path; got {result!r}'
+        )
+        assert scheduler._streak_delivered_hold.value('10') == 1
+        held = self._held_events(scheduler)
+        assert len(held) == 1
+        _evt, data = held[0]
+        assert data['task_id'] == '10'
+        assert data['data']['detail'] == {
+            'name': 'cap-one', 'dep_id': '20', 'main_sha': 'sha1', 'kind': 'grep',
+        }
+
+    # --- (3) DELIVERED transparency -----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_delivered_check_on_genuinely_excluded_dep_dispatches(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        dep = self._dep()
+        dependent = self._dependent()
+        scheduler.get_tasks = self._status_honoring_get_tasks(dep, dependent)
+        scheduler.get_statuses = AsyncMock(return_value=({'20': 'done'}, None))
+        scheduler.get_task = AsyncMock(return_value=dep)
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner(DeliveredCheckResult.DELIVERED),
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None and result.task_id == '10', (
+            f'A DELIVERED check must dispatch — the gate must stay '
+            f'transparent when the check actually passes; got {result!r}'
+        )
+        assert self._held_events(scheduler) == []
