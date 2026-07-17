@@ -5726,30 +5726,37 @@ def select_probe_depth(
          every call returns ``None`` regardless of the other arguments, so
          callers always fall through to the pre-task-2359
          ``_verify_frontier_depth()`` path.
-      2. Deterministic frequency gate: ``period = max(1, round(1 /
+      2. Flake-rate suppression: if *recent_fail_rate* is not ``None`` and
+         ``recent_fail_rate >= suppress_flake_rate`` -> ``None``
+         unconditionally. Checked immediately after the fraction<=0
+         short-circuit -- i.e. *before* the frequency gate/depth cycling
+         below -- so a suppressed round returns without advancing the
+         depth cycle (a suppressed round is not "spent"; the next
+         non-suppressed firing still resumes the cycle at the same
+         ``probe_index`` it would have reached anyway, since
+         ``probe_index`` is derived from ``round_index``, not from a
+         separate advancing counter). A ``None`` fail rate (no rolling-
+         window data yet) never suppresses.
+      3. Deterministic frequency gate: ``period = max(1, round(1 /
          probe_fraction))``; a round only fires when ``round_index % period
          == 0``. This bounds the firing rate at <= probe_fraction with no
          RNG/seed plumbing -- reproducible in unit tests by construction.
-      3. Depth cycling: on a firing round, ``probe_index = round_index //
+      4. Depth cycling: on a firing round, ``probe_index = round_index //
          period`` selects ``probe_depths[probe_index % len(probe_depths)]``,
          so consecutive firings advance through *probe_depths* in order
          (wrapping).
-
-      4. Availability fallback: if the sampled depth ``d`` exceeds
+      5. Availability fallback: if the sampled depth ``d`` exceeds
          *available_built_depth* (the deepest already-built speculative
          stack), return ``None`` instead of ``d``. A probe only ever
          targets an ALREADY-built cumulative commit -- it must never
          trigger building or rebasing a deeper stack to satisfy itself
          (task 1890's frozen-prefix invariant).
 
-    *recent_fail_rate* and *suppress_flake_rate* are accepted now (fixing
-    the function's signature/call sites) but not yet consulted -- the
-    flake-rate suppression guard is added on top of this core in a later
-    step.
-
     Pure/synchronous -- no I/O, no clock, no RNG.
     """
     if probe_fraction <= 0.0:
+        return None
+    if recent_fail_rate is not None and recent_fail_rate >= suppress_flake_rate:
         return None
     period = max(1, round(1 / probe_fraction))
     if round_index % period != 0:
