@@ -127,11 +127,13 @@ scope_cargo: true
 # _MODEL_COSTS (task 2459); seeds OrchestratorConfig.prices (config.py's
 # _DEFAULT_PRICES mirrors this block as a safety-net default — the two are
 # kept in lockstep by test_config.py's
-# test_default_price_table_matches_defaults_yaml). Green-tier hot-reloadable,
-# but NOT YET wired to any invoke_agent() call site — retuning a rate here
-# has no effect on cost estimation until a follow-up task threads
-# config.prices through (see OrchestratorConfig.prices' docstring in
-# config.py).
+# test_default_price_table_matches_defaults_yaml). Green-tier hot-reloadable.
+# Threaded into every task-workflow role invocation via the shared
+# TaskWorkflow._invoke chokepoint (task 2462) — retuning a rate here (and
+# reloading) takes effect on the very next codex/gemini/pi invocation for
+# any task-workflow role. steward.py's and cli.py's eval-flow invoke_agent()
+# call sites do not yet pass prices=config.prices — see OrchestratorConfig.
+# prices' docstring in config.py.
 prices:
   gpt-5.4:
     input_per_1m: 2.50

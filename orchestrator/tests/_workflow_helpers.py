@@ -19,7 +19,7 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -648,6 +648,7 @@ class AgentStub:
         startup_grace_secs: float = 120.0,
         working_idle_secs: float | None = None,
         absolute_cap_secs: float | None = None,
+        prices: dict[str, Any] | None = None,
     ) -> AgentResult:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)

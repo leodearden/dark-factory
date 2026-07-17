@@ -2098,20 +2098,25 @@ class OrchestratorConfig(BaseSettings):
     # Green-tier hot-reloadable (see RELOADABLE_FIELDS): a `prices` edit is
     # picked up by reload_config like any other green-tier field.
     #
-    # NOT YET WIRED: as of task 2459, no production invoke_agent() call site
-    # (cli.py, workflow.py, steward.py, evals/*) passes prices=config.prices,
-    # so orchestrator.agents.invoke._estimate_cost() always resolves the
-    # packaged default_price_table() regardless of what is configured here.
-    # Editing (or reloading) this field has no observable effect on cost
-    # estimation until that follow-up wiring lands — tracked as T1/T3/T4 in
-    # plans/harness-backend-reconnect-pi-prd.md; this task (T-price) delivers
-    # only the shared substrate.
+    # WIRED (task 2462): the shared TaskWorkflow._invoke chokepoint
+    # (workflow.py) threads prices=self.config.prices into every
+    # invoke_with_cap_retry() call, for every task-workflow role
+    # (architect/implementer/debugger/reviewer/merger/...) — it rides the
+    # same **invoke_kwargs forwarding path as backend= (task 2457) through
+    # to invoke_agent(prices=...), so orchestrator.agents.invoke.
+    # _estimate_cost() resolves this LIVE, operator-tunable table for
+    # codex/gemini/pi (claude ignores it — reports native cost) instead of
+    # always falling back to the packaged default_price_table(). steward.py
+    # and cli.py's eval-flow invoke_agent() call sites do NOT yet pass
+    # prices=config.prices — still a noted future follow-up.
     prices: dict[str, PriceEntry] = Field(
         default_factory=lambda: {k: PriceEntry(**v) for k, v in _DEFAULT_PRICES.items()},
         description=(
             'Per-model USD/1M token prices for backends without native cost '
-            'reporting (codex, gemini). NOT YET consulted by any production '
-            'invoke_agent() call site as of task 2459 — see field comment.'
+            'reporting (codex, gemini). Threaded into every task-workflow '
+            'role invocation via the shared TaskWorkflow._invoke chokepoint '
+            '(task 2462) — see field comment; steward.py/cli.py eval call '
+            'sites are a noted future follow-up.'
         ),
     )
 
@@ -3533,10 +3538,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # Verify env (fresh config's value already carries the sccache fold)
         'verify_env',
         # Per-model USD/1M-token price table (task 2459) — green-tier like
-        # verify_env above. NOTE: not yet consulted by any production
-        # invoke_agent() call site (see OrchestratorConfig.prices docstring);
-        # registered now so no second reload-tier migration is needed once
-        # T1/T3/T4 wire it in.
+        # verify_env above. Threaded into every task-workflow role
+        # invocation via the shared TaskWorkflow._invoke chokepoint (task
+        # 2462 — see OrchestratorConfig.prices docstring); a reload here is
+        # picked up by the very next invocation.
         'prices',
         # Offline-lane tunables (leaf fields on the existing `git` submodel —
         # leaf-mutation only per I3)
