@@ -154,6 +154,11 @@ async def test_happy_path_stamps_file_and_copies_mechanical_checks(tmp_path):
     assert reloaded['tasks'][0]['label'] == 'alpha'
     assert reloaded['tasks'][0]['task_id'] == 101
 
+    # The atomic temp+rename write leaves no stray .tmp file behind on the
+    # success path either.
+    leftovers = [p for p in plans_dir.iterdir() if p.name.endswith('.tmp')]
+    assert leftovers == []
+
     task_interceptor.update_task.assert_called_once()
     call = task_interceptor.update_task.call_args
     assert call.args[0] == '101'
@@ -293,10 +298,11 @@ async def test_missing_label_and_manual_only(tmp_path):
 
 @pytest.mark.asyncio
 async def test_write_failure_mid_stamp_leaves_original_sidecar_intact(tmp_path, monkeypatch):
-    """A failure between temp-write and os.replace (simulating a kill mid-write)
-    must never corrupt the tracked sidecar: os.replace is atomic, so the
-    original file is left byte-identical and parseable, and no stray .tmp
-    file lingers on disk."""
+    """A write/replace *exception* between temp-write and os.replace (e.g. a
+    disk error — the path where the ``finally`` unlink runs, unlike a hard
+    process kill) must never corrupt the tracked sidecar: os.replace is
+    atomic, so the original file is left byte-identical and parseable, and
+    no stray .tmp file lingers on disk for this exception path."""
     plans_dir = tmp_path / 'plans'
     plans_dir.mkdir()
     sidecar_path = plans_dir / 'foo-prd.capability-manifest.yaml'

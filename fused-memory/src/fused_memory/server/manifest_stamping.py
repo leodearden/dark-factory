@@ -250,8 +250,14 @@ async def _stamp_capability_manifests_impl(
             # tracked sidecar — os.replace is atomic, so the file is either
             # the old contents or the fully-written new ones. Unique
             # per-write temp filename (pid + id(raw)) so concurrent writers
-            # can never share a temp path; ``finally`` ensures a failed temp
-            # file never lingers on disk.
+            # can never share a temp path. ``finally`` cleans up the temp
+            # file on a write/replace *exception* (e.g. the os.replace
+            # failure the test below simulates); it does NOT run on a hard
+            # process kill between the write and the replace, so a
+            # uniquely-named ``.tmp`` sibling can still linger on disk in
+            # that case. That litter is harmless — sidecar discovery (step 2
+            # above) matches only the exact derived rel path, never a
+            # ``.tmp`` suffix — but it's real, not just theoretical.
             tmp_path = sidecar_abs.parent / (
                 f'{sidecar_abs.name}.{os.getpid()}.{id(raw)}.tmp'
             )
