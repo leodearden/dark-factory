@@ -967,8 +967,19 @@ def _print_fused_memory_liveness() -> None:
     Informational only: called from _cli's --report branch AFTER report()'s
     own staleness table, and never affects report()'s staleness-only exit
     code (see _cli's docstring below).
+
+    Wrapped in a try/except Exception mirroring fused_memory_liveness_pass()'s
+    per-unit isolation (B3): probe_port only catches FileNotFoundError/
+    TimeoutExpired, so an unusual subprocess failure (e.g. PermissionError)
+    could otherwise propagate out of the verdict chain and crash --report
+    after report() has already computed its exit code. An unexpected failure
+    here degrades to a logged 'unknown' row instead.
     """
-    verdict = _fused_memory_liveness_verdict()
+    try:
+        verdict = _fused_memory_liveness_verdict()
+    except Exception as exc:  # noqa: BLE001
+        log(f"watchdog error printing {FUSED_MEMORY_UNIT} liveness row: {exc}")
+        verdict = "unknown"
     print(f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /health): {verdict}")
 
 

@@ -4174,6 +4174,40 @@ def test_print_fused_memory_liveness_row(
         _assert_zero_mutating_calls(recorded_calls)
 
 
+def test_print_fused_memory_liveness_row_survives_verdict_exception(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """_print_fused_memory_liveness() must not crash --report on a probe failure.
+
+    Mirrors fused_memory_liveness_pass()'s per-unit try/except isolation (B3):
+    an unexpected exception surfacing from _fused_memory_liveness_verdict()
+    (e.g. a non-defensive OSError/PermissionError propagating out of
+    probe_port, which only catches FileNotFoundError/TimeoutExpired) must be
+    caught, logged, and degrade to an 'unknown' row rather than propagating
+    and aborting the read-only --report doctor path after report() has
+    already computed its exit code.
+    """
+    wdog = _load_watchdog()
+
+    def _boom() -> str:
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", _boom)
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda u: pytest.fail(f"must never restart {u}")
+    )
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    # Must not raise.
+    wdog._print_fused_memory_liveness()
+
+    captured = capsys.readouterr()
+    assert "fused-memory.service" in captured.out
+    assert "unknown" in captured.out
+    assert logged, "the swallowed exception must be logged"
+
+
 def test_cli_report_includes_fused_memory_row(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
