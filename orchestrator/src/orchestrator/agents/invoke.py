@@ -317,14 +317,20 @@ async def _invoke_codex(
     timeout_seconds: float | None = None,
     prices: dict[str, Any] | None = None,
 ) -> AgentResult:
-    """Invoke OpenAI Codex CLI."""
+    """Invoke OpenAI Codex CLI.
+
+    No instruction file (AGENTS.md) is ever written into the worktree —
+    system_prompt and prompt are folded together and delivered entirely via
+    stdin (cmd arg '-' tells codex exec to read instructions from stdin;
+    verified codex-cli 0.143.0 `codex exec --help`). This mirrors the
+    claude backend's stdin piping (used there to avoid ARG_MAX) and is
+    strictly stronger than relocating/excluding the file: with no file on
+    disk at all, no staging command run against this worktree — including
+    the single-implementer-commit path's `git add -A -- . :!.claude`
+    (git_ops.py:5320) — can ever pick it up.
+    """
     temp_files: list[Path] = []
     try:
-        # Write system prompt as AGENTS.md
-        agents_md = cwd / 'AGENTS.md'
-        _write_temp_instruction_file(agents_md, system_prompt)
-        temp_files.append(agents_md)
-
         # Write MCP config
         if mcp_config:
             codex_dir = cwd / '.codex'
@@ -339,7 +345,9 @@ async def _invoke_codex(
         if effort:
             cmd.extend(['-c', f'model_reasoning_effort={effort}'])
 
-        cmd.append(prompt)
+        # '-' tells codex exec to read the prompt from stdin instead of argv.
+        cmd.append('-')
+        codex_input = f'{system_prompt}\n\n{prompt}'.encode()
 
         if sandbox_modules is not None:
             from orchestrator.agents.sandbox_dispatch import wrap_command
@@ -348,7 +356,10 @@ async def _invoke_codex(
         # Strip OPENAI_API_KEY if using OAuth
         env = dict(os.environ)
 
-        result = await _run_subprocess_local(cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds)
+        result = await _run_subprocess_local(
+            cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds,
+            stdin_data=codex_input,
+        )
         return _parse_codex_output(result, model, prices)
 
     finally:
@@ -1076,8 +1087,16 @@ async def _run_subprocess_local(
     model: str,
     max_budget_usd: float,
     timeout_seconds: float | None = None,
+    stdin_data: bytes | None = None,
 ) -> _SubprocessResult:
-    """Run a subprocess, log output, enforce budget timeout."""
+    """Run a subprocess, log output, enforce budget timeout.
+
+    *stdin_data*, when set, is piped to the process's stdin (mirrors
+    shared.cli_invoke._run_subprocess's stdin_data param, used by the
+    codex backend to deliver instructions without a worktree file — see
+    _invoke_codex). When None (gemini/pi callers), behavior is
+    byte-identical to before this param existed.
+    """
     logger.info(f'Invoking agent: backend={backend} model={model} cwd={cwd} budget=${max_budget_usd}')
     logger.info(f'Command: {" ".join(cmd[:15])}...')
 
@@ -1087,6 +1106,7 @@ async def _run_subprocess_local(
         *cmd,
         cwd=str(cwd),
         env=env,
+        stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
@@ -1096,7 +1116,7 @@ async def _run_subprocess_local(
 
     try:
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(),
+            proc.communicate(input=stdin_data),
             timeout=timeout_seconds,
         )
     except TimeoutError:
