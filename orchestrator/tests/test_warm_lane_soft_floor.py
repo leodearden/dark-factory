@@ -491,3 +491,40 @@ class TestAcquireWarmLaneSoftFloor:
         assert all('--soft' not in line for line in check_lines), (
             f'θ soft guard must not run once ε hard-floor already blocked; got {check_lines}'
         )
+
+
+@pytest.mark.asyncio
+class TestWarmLaneSoftPressureException:
+    """WarmLaneSoftPressure exception + create_worktree mapping (step-9).
+
+    Mirrors test_warm_lane_disk_guard.py's TestWarmLaneDiskGuardE2E ---
+    ``test_create_worktree_raises_warm_lane_disk_pressure`` --- one floor
+    earlier. The disposition-table row assertion lives in
+    test_block_disposition.py (mirroring the WarmLanePoolExhausted /
+    WarmLaneDiskPressure row tests there), not here.
+    """
+
+    async def test_warm_lane_soft_pressure_is_a_warm_lane_requeue_subclass(self):
+        """WarmLaneSoftPressure exists in git_ops and IS-A WarmLaneRequeue,
+        so it rides the existing `except WarmLaneRequeue` requeue handler
+        (workflow.py) with zero new except-clause/harness plumbing (inv.11)."""
+        from orchestrator.git_ops import WarmLaneRequeue, WarmLaneSoftPressure
+
+        assert issubclass(WarmLaneSoftPressure, WarmLaneRequeue)
+
+    async def test_create_worktree_raises_warm_lane_soft_pressure(
+        self, git_repo: Path,
+    ):
+        """Fresh branch + soft-floor enabled + soft rc=3 ⇒ create_worktree
+        raises WarmLaneSoftPressure (mirrors
+        test_create_worktree_raises_warm_lane_disk_pressure one floor
+        earlier)."""
+        from orchestrator.git_ops import WarmLaneSoftPressure
+
+        await _add_all_warm_lane_scripts(git_repo)
+        _write_check_exits(git_repo, [3])
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        with pytest.raises(WarmLaneSoftPressure):
+            await git_ops.create_worktree('A')
