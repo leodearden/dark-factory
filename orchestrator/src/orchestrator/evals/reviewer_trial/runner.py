@@ -11,19 +11,30 @@ import asyncio
 import json
 import logging
 import os
+import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from orchestrator.agents.invoke import invoke_agent
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest
 from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
     VariantConfig,
     build_trial_reviewer_role,
 )
+from orchestrator.mcp_lifecycle import verdict_tools_mcp_server
 
 logger = logging.getLogger(__name__)
+
+# Orchestrator package root (contains src/, tests/, pyproject.toml) — used
+# as verdict_tools_mcp_server's --project fallback arg. runner.py lives at
+# src/orchestrator/evals/reviewer_trial/runner.py, four levels below the
+# package root; matches workflow.py's _ORCH_PROJECT_DIR (two levels below
+# its own shallower path).
+_ORCH_PROJECT_DIR = Path(__file__).resolve().parents[4]
 
 # Review output schema (identical to production)
 REVIEW_SCHEMA = {
@@ -74,7 +85,10 @@ def _build_reviewer_prompt(diff_text: str) -> str:
 
     Simplified from BriefingAssembler.build_reviewer_prompt — no memory
     context needed for the trial. Reviewers get the diff + codebase access
-    via read-only tools + their system prompt.
+    via read-only tools + their system prompt, which (task 2493) instructs
+    them to submit their verdict via the submit_review_verdict tool rather
+    than emit JSON/prose — so this action prompt no longer tells them to
+    "output pure JSON" (that would contradict the frozen CONTRACT).
     """
     if len(diff_text) > 50_000:
         diff_text = diff_text[:50_000] + '\n\n... [diff truncated] ...'
@@ -88,7 +102,7 @@ def _build_reviewer_prompt(diff_text: str) -> str:
 
 # Action
 
-Review the diff according to your specialization. Explore the codebase as needed for context. Output your review as pure JSON.
+Review the diff according to your specialization. Explore the codebase as needed for context.
 """
 
 
@@ -97,8 +111,24 @@ async def _run_single_reviewer(
     diff: CorpusDiff,
     max_retries: int = 2,
     prices: dict | None = None,
+    meta_root: Path | None = None,
 ) -> tuple[str, dict | None, float]:
-    """Run a single reviewer against a diff.
+    """Run a single reviewer against a diff via the live verdict-tools transport.
+
+    Mirrors workflow.TaskWorkflow._run_reviewer's read+fail-safe contract
+    (task 2493 trial-parity decision): the trial reviewer role is built from
+    the same PromptSpec as production (build_trial_reviewer_role), so its
+    CONTRACT tells the agent to submit its verdict by calling the
+    submit_review_verdict tool rather than emit prose/JSON — the verdict is
+    therefore read back from the verdicts/ artifact instead of
+    result.structured_output/json.loads(result.output). An invocation that
+    didn't successfully produce a valid verdict degrades to an ERROR
+    disposition rather than raising or returning nothing.
+
+    *meta_root* is injectable so tests can observe/pre-seed the verdict
+    artifact path; production leaves it unset and gets a fresh temp dir per
+    invocation (the trial has no real task worktree/.task root to anchor
+    TaskArtifacts to).
 
     Returns (reviewer_name, review_dict_or_None, cost_usd).
 
@@ -117,6 +147,16 @@ async def _run_single_reviewer(
     role = build_trial_reviewer_role(spec)
     prompt = _build_reviewer_prompt(diff.diff_text)
     cwd = diff.cwd or _DEFAULT_CWD
+    root = meta_root if meta_root is not None else Path(tempfile.mkdtemp(prefix='reviewer_trial_'))
+    artifacts = TaskArtifacts(cwd, meta_root=root)
+    mcp_config = {
+        'mcpServers': {
+            'verdict-tools': verdict_tools_mcp_server(
+                _ORCH_PROJECT_DIR, cwd, role.name,
+                python_executable=sys.executable, meta_root=root,
+            ),
+        },
+    }
 
     if spec.oauth_token_env:
         oauth_token = os.environ.get(spec.oauth_token_env)
@@ -130,6 +170,10 @@ async def _run_single_reviewer(
         oauth_token = None
 
     for attempt in range(1, max_retries + 1):
+        # I-FRESH: never consume a stale verdict from a prior attempt/run on
+        # this same meta_root (mirrors workflow._run_reviewer's pre-spawn
+        # clear_verdict).
+        artifacts.clear_verdict(role.name)
         try:
             result = await invoke_agent(
                 prompt=prompt,
@@ -140,41 +184,13 @@ async def _run_single_reviewer(
                 max_budget_usd=role.default_budget,
                 allowed_tools=role.allowed_tools,
                 disallowed_tools=role.disallowed_tools,
-                output_schema=REVIEW_SCHEMA,
+                mcp_config=mcp_config,
                 effort=spec.effort,
                 backend=spec.backend,
                 env_overrides=spec.env_overrides,
                 oauth_token=oauth_token,
                 prices=prices,
             )
-
-            cost = result.cost_usd
-
-            # Try structured output first, then JSON parse
-            if result.structured_output:
-                return spec.name, result.structured_output, cost
-
-            try:
-                review = json.loads(result.output)
-                return spec.name, review, cost
-            except (json.JSONDecodeError, TypeError):
-                if attempt < max_retries:
-                    logger.warning(
-                        'Reviewer %s attempt %d: unparseable output, retrying',
-                        spec.name, attempt,
-                    )
-                    continue
-                logger.warning(
-                    'Reviewer %s: unparseable output after %d attempts: %s',
-                    spec.name, max_retries, result.output[:200],
-                )
-                return spec.name, {
-                    'reviewer': spec.name,
-                    'verdict': 'ERROR',
-                    'issues': [],
-                    'summary': f'Unparseable output: {result.output[:200]}',
-                }, cost
-
         except Exception as exc:
             if attempt < max_retries:
                 logger.warning(
@@ -184,6 +200,40 @@ async def _run_single_reviewer(
                 continue
             logger.error('Reviewer %s failed after %d attempts: %s', spec.name, max_retries, exc)
             return spec.name, None, 0.0
+
+        cost = result.cost_usd
+
+        # Read the reviewer's structured verdict instead of the
+        # structured_output/json.loads cascade (task 2493, mirrors task
+        # 2484's production change). A dict envelope with a dict 'verdict'
+        # payload carrying verdict∈{PASS,ISSUES_FOUND} is trusted only when
+        # the invocation itself also reported success — an invocation
+        # failure is untrusted even if it happened to write a verdict
+        # before failing.
+        envelope = artifacts.read_verdict(role.name)
+        payload = envelope.get('verdict') if isinstance(envelope, dict) else None
+        if result.success and isinstance(payload, dict) and payload.get('verdict') in {'PASS', 'ISSUES_FOUND'}:
+            return spec.name, payload, cost
+
+        if attempt < max_retries:
+            logger.warning(
+                'Reviewer %s attempt %d: no/invalid verdict (result.success=%s), retrying',
+                spec.name, attempt, result.success,
+            )
+            continue
+        logger.warning(
+            'Reviewer %s: no/invalid verdict after %d attempts (result.success=%s)',
+            spec.name, max_retries, result.success,
+        )
+        return spec.name, {
+            'reviewer': role.name,
+            'verdict': 'ERROR',
+            'issues': [],
+            'summary': (
+                f'Reviewer emitted no/invalid verdict after {max_retries} '
+                f'attempt(s) (result.success={result.success}).'
+            ),
+        }, cost
 
     # Unreachable, but satisfy type checker
     return spec.name, None, 0.0
