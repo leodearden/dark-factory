@@ -21,16 +21,20 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import make_placeholder_future
 
+from orchestrator.landing_evidence import LandingEvidenceVerdict
+
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
     from orchestrator.git_ops import GitOps
     from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker, TrainCallbackFactory
+
+_MERGE_QUEUE_SRC_PATH = Path(__file__).parent.parent / 'src' / 'orchestrator' / 'merge_queue.py'
 
 # ─── Step 1 ─────────────────────────────────────────────────────────────────
 
@@ -114,6 +118,19 @@ def _stub_factory() -> TrainCallbackFactory:
             mark_member_done=AsyncMock(),
         )
     return _factory
+
+
+def _make_escalation_queue() -> MagicMock:
+    """MagicMock escalation queue wired like the harness's dedup pattern.
+
+    ``has_open_l1`` defaults False (no open dedup) so a rejected verdict's
+    escalation always gets through; ``submit``/``make_id`` are plain
+    MagicMocks callers can assert against.
+    """
+    eq = MagicMock()
+    eq.has_open_l1 = MagicMock(return_value=False)
+    eq.make_id = MagicMock(return_value='esc-coalesce-1')
+    return eq
 
 
 def _make_worker(
@@ -1845,13 +1862,17 @@ class TestRedriveCoalesceMembers:
         # m3 (in-progress) must NOT be called.
         assert 'm3' not in called_mids, 'm3 (in-progress) must be skipped'
 
-    async def test_on_main_calls_redrive_with_sha(
+    async def test_on_main_accepted_verdict_redrives_true_with_evidence_sha(
         self,
         git_ops: GitOps,
         coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
-        """is_ancestor=True + resolve_branch_sha='tipsha': called with (mid, True, 'tipsha')."""
+        """is_ancestor=True + validate_landing_evidence ACCEPTED (task 2678):
+        redrive_member is called with (mid, True, verdict.evidence_sha) — the
+        helper's evidence sha, NOT the raw resolve_branch_sha return value —
+        and no escalation is filed.
+        """
         from orchestrator.merge_queue import SpeculativeMergeWorker
 
         status_check = AsyncMock(return_value={
@@ -1860,9 +1881,13 @@ class TestRedriveCoalesceMembers:
             'm3': 'in-progress',
         })
         redrive_member = AsyncMock()
+        escalation_queue = _make_escalation_queue()
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue, train_callback_factory=_stub_factory())
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, train_callback_factory=_stub_factory(),
+            escalation_queue=escalation_queue,
+        )
 
         req = self._make_group(
             coalesce_config, tmp_path,
@@ -1870,9 +1895,16 @@ class TestRedriveCoalesceMembers:
             redrive_member=redrive_member,
         )
 
+        verdict = LandingEvidenceVerdict(
+            accepted=True, evidence_sha='tipsha1234', reason='ok', probe={},
+        )
         with (
             patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
-            patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value='tipsha1234')),
+            patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value='realtipsha')),
+            patch(
+                'orchestrator.merge_queue.validate_landing_evidence',
+                AsyncMock(return_value=verdict),
+            ) as mock_validate,
         ):
             await worker._redrive_coalesce_members(req, 'mainsha000')
 
@@ -1883,30 +1915,45 @@ class TestRedriveCoalesceMembers:
         )
         for c in calls:
             assert c.args[1] is True, f'found_on_main should be True: {c}'
-            assert c.args[2] == 'tipsha1234', f'sha mismatch: {c}'
+            assert c.args[2] == 'tipsha1234', (
+                f'sha should be verdict.evidence_sha, not raw resolve_branch_sha: {c}'
+            )
 
-    async def test_on_main_falls_back_to_main_sha_when_resolve_returns_none(
+        assert mock_validate.await_count == 2, (
+            f'validate_landing_evidence should be awaited once per on-main member; '
+            f'got {mock_validate.await_count}'
+        )
+        for call in mock_validate.await_args_list:
+            assert call.args[0] is git_ops
+            assert call.kwargs['branch_tip_sha'] == 'realtipsha'
+
+        escalation_queue.submit.assert_not_called()
+
+    async def test_on_main_rejected_no_citation_escalates_and_redrives_pending(
         self,
         git_ops: GitOps,
         coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
-        """resolve_branch_sha=None: fallback to main_sha guards against None reaching mark_done.
-
-        The expression ``sha = resolve_branch_sha(branch) or main_sha`` must produce
-        main_sha when resolve_branch_sha returns None (e.g. branch tip is not yet
-        reachable).  This is the path most likely to regress into a None-sha mark_done
-        failure; pinning it here catches that regression.
+        """validate_landing_evidence rejects with reason 'no_citation' (task
+        2678) — this models the retired ``resolve_branch_sha(branch) or
+        main_sha`` fallback path, where resolve_branch_sha returned None and
+        the old code silently anchored on main_sha instead.  The member must
+        NOT be redriven True; instead exactly one 'provenance_unattributed'
+        escalation is filed and the member is flipped to pending via
+        redrive_member(mid, False, None) so a fresh solo-merge re-attributes it.
         """
         from orchestrator.merge_queue import SpeculativeMergeWorker
 
-        status_check = AsyncMock(return_value={
-            'm1': 'merge-deferred',
-        })
+        status_check = AsyncMock(return_value={'m1': 'merge-deferred'})
         redrive_member = AsyncMock()
+        escalation_queue = _make_escalation_queue()
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue, train_callback_factory=_stub_factory())
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, train_callback_factory=_stub_factory(),
+            escalation_queue=escalation_queue,
+        )
 
         req = self._make_group(
             coalesce_config, tmp_path,
@@ -1914,10 +1961,16 @@ class TestRedriveCoalesceMembers:
             redrive_member=redrive_member,
         )
 
+        verdict = LandingEvidenceVerdict(
+            accepted=False, evidence_sha=None, reason='no_citation', probe={},
+        )
         with (
             patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
-            # resolve_branch_sha returns None → must fall back to main_sha
             patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.validate_landing_evidence',
+                AsyncMock(return_value=verdict),
+            ),
         ):
             await worker._redrive_coalesce_members(req, 'fallback-main-sha')
 
@@ -1925,11 +1978,71 @@ class TestRedriveCoalesceMembers:
         assert len(calls) == 1, f'Expected exactly 1 redrive_member call; got {len(calls)}'
         call = calls[0]
         assert call.args[0] == 'm1', f'mid mismatch: {call}'
-        assert call.args[1] is True, f'found_on_main should be True: {call}'
-        assert call.args[2] == 'fallback-main-sha', (
-            f'sha should fall back to main_sha when resolve_branch_sha returns None; '
-            f'got {call.args[2]!r}'
+        assert call.args[1] is False, (
+            'found_on_main must NOT be True on a rejected verdict — no silent '
+            'fallback anchor on main_sha'
         )
+        assert call.args[2] is None, f'sha must be None when rejected: {call}'
+
+        cast(MagicMock, escalation_queue.has_open_l1).assert_called_with('m1')
+        cast(MagicMock, escalation_queue.submit).assert_called_once()
+        esc = cast(MagicMock, escalation_queue.submit).call_args[0][0]
+        assert esc.category == 'provenance_unattributed'
+        assert esc.task_id == 'm1'
+        assert 'no_citation' in esc.detail
+
+    async def test_on_main_rejected_effect_absent_escalates_and_redrives_pending(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """validate_landing_evidence rejects with reason 'effect_absent' (the
+        task-1175 reverted-merge shape) -> escalate, redrive(mid, False, None).
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        status_check = AsyncMock(return_value={'m1': 'merge-deferred'})
+        redrive_member = AsyncMock()
+        escalation_queue = _make_escalation_queue()
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, train_callback_factory=_stub_factory(),
+            escalation_queue=escalation_queue,
+        )
+
+        req = self._make_group(
+            coalesce_config, tmp_path,
+            status_check=status_check,
+            redrive_member=redrive_member,
+        )
+
+        verdict = LandingEvidenceVerdict(
+            accepted=False, evidence_sha=None, reason='effect_absent', probe={},
+        )
+        with (
+            patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
+            patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value='realtipsha')),
+            patch(
+                'orchestrator.merge_queue.validate_landing_evidence',
+                AsyncMock(return_value=verdict),
+            ),
+        ):
+            await worker._redrive_coalesce_members(req, 'mainsha000')
+
+        calls = redrive_member.await_args_list
+        assert len(calls) == 1, f'Expected exactly 1 redrive_member call; got {len(calls)}'
+        call = calls[0]
+        assert call.args[0] == 'm1'
+        assert call.args[1] is False
+        assert call.args[2] is None
+
+        cast(MagicMock, escalation_queue.submit).assert_called_once()
+        esc = cast(MagicMock, escalation_queue.submit).call_args[0][0]
+        assert esc.category == 'provenance_unattributed'
+        assert esc.task_id == 'm1'
+        assert 'effect_absent' in esc.detail
 
     async def test_none_redrive_member_returns_without_raising(
         self,
@@ -1997,6 +2110,23 @@ class TestRedriveCoalesceMembers:
         # Both members should have been attempted.
         assert redrive_member.await_count == 2, (
             f'Expected 2 calls (both members attempted); got {redrive_member.await_count}'
+        )
+
+
+class TestRedriveCoalesceMembersMainShaFallbackGrepGuard:
+    """Source-level guard (task 2678): the silent
+    ``resolve_branch_sha(branch) or main_sha`` fallback must be fully
+    deleted from ``_redrive_coalesce_members``, not merely made
+    unreachable — a future edit must not resurrect it as dead code.
+    """
+
+    def test_main_sha_fallback_expression_absent(self) -> None:
+        content = _MERGE_QUEUE_SRC_PATH.read_text()
+        assert 'resolve_branch_sha(branch) or main_sha' not in content, (
+            'merge_queue.py still contains the silent '
+            '`resolve_branch_sha(branch) or main_sha` fallback expression; '
+            'task 2678 replaces it with validate_landing_evidence + '
+            'escalate-instead-of-stamp.'
         )
 
 
