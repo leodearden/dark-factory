@@ -3915,7 +3915,22 @@ async def reconcile_landed_row(
       call) — a ``LandedRow`` carries no task metadata, so this site cannot
       self-heal via ``should_skip``'s reopen_at-change invalidation arm; it
       relies solely on the escalation-resolved arm (an operator resolving the
-      ``provenance_conflict`` escalation). Known limitation, not a bug.
+      ``provenance_conflict`` escalation). Known limitation, not a bug: a
+      task genuinely re-landed against a newer ``reopen_at`` stays gated
+      here until that manual step, trading a rare extra scheduler round
+      trip (fetching the task just to read ``reopen_at``) for this one-time
+      operator action (reviewer_comprehensive amendment, task 2677,
+      robustness_self_heal_gap).
+
+      Operator runbook: once the flagged evidence is confirmed current (or
+      superseded by a fresh, valid landing), resolve the pending
+      ``provenance_conflict`` L2 escalation (e.g. via ``resolve_issue``) —
+      ``should_skip``'s escalation-resolved arm then makes the very next
+      reconcile pass retry the write automatically. No task-status re-pend
+      is required for this gate: unlike the delivered-checks dependency
+      gate's re-pend recipe, ``resolve_issue`` alone is sufficient here
+      because ``should_skip`` reads the escalation's own status, not the
+      task's.
     """
     if not await git_ops.is_ancestor(row.advanced_sha, main_sha):
         outbox.consume(row.task_id)
@@ -9192,7 +9207,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         derails before this pre-check existed. Like
         :func:`reconcile_landed_row`, this call omits ``reopen_at`` (no
         cheap task-metadata access from this worker) so it self-heals only
-        via the escalation-resolved invalidation arm.
+        via the escalation-resolved invalidation arm — same known
+        limitation and same operator runbook (resolve the pending
+        ``provenance_conflict`` escalation; no task re-pend needed), see
+        that function's docstring (reviewer_comprehensive amendment, task
+        2677, robustness_self_heal_gap).
         """
         if req.redrive_member is None:
             logger.warning(
