@@ -133,73 +133,112 @@ async def emit_pipeline_landing_tripwire(
 
     Fully fail-open (I6): *oracle_cmd* absent → logged no-op; oracle
     negative → no-op; zero overlapping in-flight tasks → no-op (nothing
-    actionable to report). Never raises.
+    actionable to report); ``escalation_queue`` ``None`` → no-op; a
+    pre-existing pending escalation for this landing → dedup no-op (≤1
+    escalation per landing). Every external call (oracle subprocess inside
+    ``_run_load_bearing_oracle``, each ``get_branch_diff``, ``submit``,
+    each ``update_task``) is individually guarded, and the whole body is
+    wrapped again as a backstop — this function NEVER raises.
     """
-    if not oracle_cmd:
-        logger.debug('emit_pipeline_landing_tripwire: no oracle_cmd configured, no-op')
-        return
-    if not landing_changed_files:
-        return
-    load_bearing = await _run_load_bearing_oracle(
-        project_root, oracle_cmd, landing_changed_files,
-    )
-    if not load_bearing:
-        return
+    try:
+        if not oracle_cmd:
+            logger.debug('emit_pipeline_landing_tripwire: no oracle_cmd configured, no-op')
+            return
+        if not landing_changed_files:
+            return
+        load_bearing = await _run_load_bearing_oracle(
+            project_root, oracle_cmd, landing_changed_files,
+        )
+        if not load_bearing:
+            return
+        if escalation_queue is None:
+            return
 
-    inflight_diffs: list[tuple[str, str, list[str]]] = []
-    for task_id, branch in inflight:
-        branch_files = await get_branch_diff(branch)
-        if branch_files is None:
-            continue
-        inflight_diffs.append((task_id, branch, branch_files))
+        sentinel = f'pipeline-landing-tripwire-{landing_sha[:12]}'
+        if escalation_queue.get_by_task(sentinel, status='pending'):
+            logger.debug(
+                'emit_pipeline_landing_tripwire: dedup — open escalation already '
+                'exists for %s', sentinel,
+            )
+            return
 
-    hits = compute_tripwire_overlap(landing_changed_files, inflight_diffs)
-    if not hits:
-        return
+        inflight_diffs: list[tuple[str, str, list[str]]] = []
+        for task_id, branch in inflight:
+            try:
+                branch_files = await get_branch_diff(branch)
+            except Exception:
+                logger.warning(
+                    'emit_pipeline_landing_tripwire: get_branch_diff failed for '
+                    'task %s branch %s', task_id, branch, exc_info=True,
+                )
+                continue
+            if branch_files is None:
+                continue
+            inflight_diffs.append((task_id, branch, branch_files))
 
-    from escalation.models import Escalation  # noqa: PLC0415, I001 — local import, escalation optional dep
+        hits = compute_tripwire_overlap(landing_changed_files, inflight_diffs)
+        if not hits:
+            return
 
-    sentinel = f'pipeline-landing-tripwire-{landing_sha[:12]}'
-    hit_lines = '\n'.join(
-        f'- task {hit.task_id} (branch {hit.branch}): {", ".join(hit.overlap_files)}'
-        for hit in hits
-    )
-    overlapping_task_ids = ', '.join(hit.task_id for hit in hits)
-    summary = (
-        f'Pipeline landing {landing_sha[:12]} touches load-bearing files also '
-        f'present on {len(hits)} in-flight branch(es): {overlapping_task_ids}'
-    )
-    detail = (
-        f'Landing task: {landing_task_id} (sha {landing_sha[:12]})\n'
-        f'Load-bearing changed files: {", ".join(landing_changed_files)}\n'
-        '\n'
-        f'In-flight branches with overlapping edits:\n{hit_lines}'
-    )
-    esc = Escalation(
-        id=escalation_queue.make_id(sentinel),
-        task_id=sentinel,
-        agent_role='orchestrator-merge-skew-tripwire',
-        severity='info',
-        level=0,
-        category='risk_identified',
-        summary=summary,
-        detail=detail,
-        suggested_action=(
-            "Port the landed change into each named in-flight branch's own "
-            'edits (not merely rebase) before it merges, to avoid silently '
-            'reverting or conflicting with the load-bearing change.'
-        ),
-    )
-    escalation_queue.submit(esc)
+        from escalation.models import Escalation  # noqa: PLC0415, I001 — local import, escalation optional dep
 
-    for hit in hits:
-        await update_task(
-            hit.task_id,
-            {
-                'merge_skew_tripwire': {
-                    'landing_sha': landing_sha,
-                    'overlap_files': list(hit.overlap_files),
-                },
-            },
-            metadata_mode='merge',
+        hit_lines = '\n'.join(
+            f'- task {hit.task_id} (branch {hit.branch}): {", ".join(hit.overlap_files)}'
+            for hit in hits
+        )
+        overlapping_task_ids = ', '.join(hit.task_id for hit in hits)
+        summary = (
+            f'Pipeline landing {landing_sha[:12]} touches load-bearing files also '
+            f'present on {len(hits)} in-flight branch(es): {overlapping_task_ids}'
+        )
+        detail = (
+            f'Landing task: {landing_task_id} (sha {landing_sha[:12]})\n'
+            f'Load-bearing changed files: {", ".join(landing_changed_files)}\n'
+            '\n'
+            f'In-flight branches with overlapping edits:\n{hit_lines}'
+        )
+        esc = Escalation(
+            id=escalation_queue.make_id(sentinel),
+            task_id=sentinel,
+            agent_role='orchestrator-merge-skew-tripwire',
+            severity='info',
+            level=0,
+            category='risk_identified',
+            summary=summary,
+            detail=detail,
+            suggested_action=(
+                "Port the landed change into each named in-flight branch's own "
+                'edits (not merely rebase) before it merges, to avoid silently '
+                'reverting or conflicting with the load-bearing change.'
+            ),
+        )
+        try:
+            escalation_queue.submit(esc)
+        except Exception:
+            logger.warning(
+                'emit_pipeline_landing_tripwire: escalation submit failed for %s',
+                sentinel, exc_info=True,
+            )
+
+        for hit in hits:
+            try:
+                await update_task(
+                    hit.task_id,
+                    {
+                        'merge_skew_tripwire': {
+                            'landing_sha': landing_sha,
+                            'overlap_files': list(hit.overlap_files),
+                        },
+                    },
+                    metadata_mode='merge',
+                )
+            except Exception:
+                logger.warning(
+                    'emit_pipeline_landing_tripwire: update_task failed for task %s',
+                    hit.task_id, exc_info=True,
+                )
+    except Exception:
+        logger.warning(
+            'emit_pipeline_landing_tripwire: unexpected error for landing %s',
+            landing_sha, exc_info=True,
         )
