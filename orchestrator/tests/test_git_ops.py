@@ -10626,3 +10626,60 @@ class TestSeedAndThinMutualExclusion:
             if not seed_task.done():
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(seed_task, 10)
+
+
+# ---------------------------------------------------------------------------
+# Task 2382 step-11: GitOps.get_branch_changed_files — three-dot diff vs main
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGetBranchChangedFiles:
+    """Step-11 (RED): get_branch_changed_files(ref) computes a branch's
+    changed files vs ``main_branch`` using a three-dot diff, excluding
+    ``.task/`` — the merge-skew pipeline-landing tripwire's per-branch
+    overlap source (task 2382).
+
+    Mirrors get_merge_diff_files' total (never-raises) (files, error)
+    contract: success → (files, None); any error (bogus ref, non-zero rc)
+    → ([], Exception).
+    """
+
+    async def test_branch_diff_lists_source_file_and_excludes_task_dir(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        # Branch off main and commit a source-file change plus a .task/ file.
+        rc, _, err = await _run(['git', 'checkout', '-b', 'task/2382'], cwd=git_repo)
+        assert rc == 0, f'checkout task/2382 failed: {err}'
+
+        (git_repo / 'feature.py').write_text('feature = 1\n')
+        task_dir = git_repo / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'plan.json').write_text('{}')
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'Add feature.py and .task/plan.json'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'commit failed: {err}'
+
+        files, returned_err = await git_ops.get_branch_changed_files('task/2382')
+
+        assert returned_err is None, f'expected no error; got {returned_err!r}'
+        assert 'feature.py' in files, f'expected feature.py in {files!r}'
+        assert not any(f.startswith('.task/') for f in files), (
+            f'.task/ files must be excluded; got {files!r}'
+        )
+
+    async def test_bogus_ref_returns_error(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        files, err = await git_ops.get_branch_changed_files('does-not-exist-xyz')
+
+        assert files == [], f'expected [] on bogus ref; got {files!r}'
+        assert err is not None, (
+            'expected a non-None error on a bogus ref (total-never-raises)'
+        )
+        assert isinstance(err, Exception), (
+            f'expected err to be an Exception; got {type(err)!r}'
+        )
