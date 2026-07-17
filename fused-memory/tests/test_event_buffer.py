@@ -1299,3 +1299,92 @@ async def test_mark_project_dead_letter_transitions_buffered_only(buf):
     # Assert: mark_project_dead_letter on a project with no buffered rows returns 0.
     n2 = await buf.mark_project_dead_letter('know-live')
     assert n2 == 0, f'Expected 0 for already-quarantined project, got {n2}'
+
+
+# ── Run-scoped drain/restore (task 2711 E7) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_event_buffer_has_drained_by_run_id_column_and_migration_is_idempotent(
+    tmp_path,
+):
+    """(a) event_buffer table has a drained_by_run_id column after initialize(),
+    and re-running _migrate on the same DB is idempotent (no error)."""
+    buf = EventBuffer(db_path=tmp_path / 'migrate.db')
+    await buf.initialize()
+    try:
+        db = buf._require_db()
+        async with db.execute('PRAGMA table_info(event_buffer)') as cursor:
+            columns = {row['name'] async for row in cursor}
+        assert 'drained_by_run_id' in columns, (
+            f'Expected drained_by_run_id column on event_buffer; got columns={columns!r}'
+        )
+
+        # Re-running _migrate on the same (already-migrated) DB must not raise —
+        # mirrors the idempotent ALTER-TABLE pattern already used for
+        # deferred_writes.claimed_at / attempt_count.
+        await buf._migrate()
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_restore_drained_scoped_to_run_id_does_not_clobber_other_runs(buf):
+    """(b) restore_drained(project, run_id=...) restores only that run's rows,
+    leaving a concurrent run's drained rows untouched."""
+    events_r1 = [_make_event() for _ in range(2)]
+    events_r2 = [_make_event() for _ in range(3)]
+    for e in events_r1:
+        await buf.push(e)
+
+    # Drain each subset attributed to a distinct run_id. drain() drains ALL
+    # buffered events for the project in one call, so drain r1's events first
+    # (only r1's events are buffered at that point), then push r2's events and
+    # drain those separately.
+    r1_ids = {e.id for e in events_r1}
+    drained_r1 = await buf.drain('test-project', run_id='R1')
+    assert {e.id for e in drained_r1} == r1_ids
+
+    for e in events_r2:
+        await buf.push(e)
+    r2_ids = {e.id for e in events_r2}
+    drained_r2 = await buf.drain('test-project', run_id='R2')
+    assert {e.id for e in drained_r2} == r2_ids
+
+    # Restoring R1 only must restore exactly R1's 2 events and leave R2's 3
+    # events still 'drained'.
+    restored_r1 = await buf.restore_drained('test-project', run_id='R1')
+    assert restored_r1 == 2
+    assert (await buf.get_buffer_stats('test-project'))['size'] == 2
+
+    db = buf._require_db()
+    async with db.execute(
+        "SELECT status FROM event_buffer WHERE id IN ({})".format(
+            ','.join('?' for _ in r2_ids)
+        ),
+        list(r2_ids),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    assert all(row['status'] == 'drained' for row in rows), (
+        "R2's events must remain 'drained' after R1-scoped restore"
+    )
+
+
+@pytest.mark.asyncio
+async def test_restore_drained_without_run_id_restores_all_project_wide(buf):
+    """(c) Legacy backward-compat: restore_drained(project) with no run_id still
+    restores ALL remaining drained rows project-wide (guards existing callers)."""
+    events_r1 = [_make_event() for _ in range(2)]
+    events_r2 = [_make_event() for _ in range(3)]
+    for e in events_r1:
+        await buf.push(e)
+    await buf.drain('test-project', run_id='R1')
+    for e in events_r2:
+        await buf.push(e)
+    await buf.drain('test-project', run_id='R2')
+
+    assert (await buf.get_buffer_stats('test-project'))['size'] == 0
+
+    restored = await buf.restore_drained('test-project')
+    assert restored == 5
+    assert (await buf.get_buffer_stats('test-project'))['size'] == 5
