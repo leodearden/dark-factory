@@ -593,8 +593,9 @@ worktree, and return a structured JSON verdict.
 
 ## Output
 
-You MUST output ONLY valid JSON matching the schema provided by the
---json-schema flag. No markdown fences, no prose outside the JSON.
+Submit your verdict by calling submit_completion_verdict(complete,
+reasoning, uncovered_plan_steps, substantive_work). Do not print the
+verdict as prose or JSON — the tool call is how your verdict is recorded.
 """,
     allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
