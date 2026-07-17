@@ -22,12 +22,16 @@ bare-harness construction helper exactly.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.harness import Harness
+from orchestrator.landing_evidence import LandingEvidenceVerdict
+
+_HARNESS_SRC_PATH = Path(__file__).parent.parent / 'src' / 'orchestrator' / 'harness.py'
 
 
 def _build_harness(mock_orch_config) -> Harness:
@@ -291,6 +295,68 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
         assert call_args.args[3] == 'dispatch-gate-already-on-main'
 
 
+@pytest.mark.asyncio
+class TestAlreadyLandedDispatchGateAncestryDelegatesToHelper:
+    """The ancestry path DELEGATES to the shared validate_landing_evidence
+    helper (task 2678) instead of inlining its own FIX2 lineage + FIX1'
+    effect-present logic. RED until step-06.
+
+    The open-L1 veto, the degenerate-branch veto, and the is_ancestor(branch,
+    main) gate all still short-circuit BEFORE the helper is ever consulted —
+    only pinned indirectly here by _wired_ancestry_harness's setup; the
+    dedicated veto tests live in TestAlreadyLandedDispatchGateAncestryGuards
+    and must remain green (unchanged) after step-06's refactor.
+    """
+
+    async def test_accepted_verdict_marks_done_and_returns_true(
+        self, mock_orch_config,
+    ) -> None:
+        h = _wired_ancestry_harness(mock_orch_config)
+        branch_tip_sha = 'f' * 40  # matches _wired_ancestry_harness's resolve_branch_sha
+        verdict = LandingEvidenceVerdict(
+            accepted=True, evidence_sha='a' * 40, reason='ok', probe={},
+        )
+
+        with patch(
+            'orchestrator.harness.validate_landing_evidence',
+            AsyncMock(return_value=verdict),
+        ) as mock_validate:
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        mock_validate.assert_awaited_once()
+        call = mock_validate.await_args
+        assert call is not None
+        assert call.args[0] is h.git_ops
+        assert call.args[1] == '42'
+        assert call.args[2] == 'task/42'
+        assert call.kwargs['branch_tip_sha'] == branch_tip_sha
+
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        mark_call = cast(AsyncMock, h._mark_in_progress_done).await_args
+        assert mark_call is not None
+        assert mark_call.args[0] == '42'
+        assert mark_call.args[1] == 'a' * 40
+        assert mark_call.args[3] == 'dispatch-gate-already-on-main'
+
+    async def test_rejected_verdict_returns_false_no_mark_done(
+        self, mock_orch_config,
+    ) -> None:
+        h = _wired_ancestry_harness(mock_orch_config)
+        verdict = LandingEvidenceVerdict(
+            accepted=False, evidence_sha=None, reason='effect_absent', probe={},
+        )
+
+        with patch(
+            'orchestrator.harness.validate_landing_evidence',
+            AsyncMock(return_value=verdict),
+        ):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+
 def _wired_marker_harness(
     mock_orch_config, *, marker_sha, branch_base_sha, marker_is_ancestor_of_base,
 ) -> Harness:
@@ -301,6 +367,11 @@ def _wired_marker_harness(
     called with two DIFFERENT argument pairs in this path: once for
     ``(branch, main_branch)`` (must be False to reach the marker path) and
     once for ``(marker_sha, branch_base_sha)`` (the stale-marker check).
+
+    ``commit_effect_present_in_main`` defaults to True (a healthy marker
+    landing) and ``_escalation_queue`` is a wired MagicMock with
+    ``has_open_l1`` defaulting False — callers flip either to exercise the
+    CANDIDATE-mode reject-and-escalate path (task 2678).
     """
     h = _build_harness(mock_orch_config)
     h.git_ops = MagicMock()
@@ -319,21 +390,27 @@ def _wired_marker_harness(
     h.git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
     h.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
     h.git_ops.find_task_citation_commit = AsyncMock(return_value=None)
+    h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)
 
     h.scheduler.get_task = AsyncMock(
         return_value={'id': '42', 'metadata': {'branch_base_sha': branch_base_sha}},
     )
     h._branch_is_degenerate = AsyncMock(return_value=False)
     h._mark_in_progress_done = AsyncMock()
-    h._escalation_queue = None
+    h._escalation_queue = MagicMock()
+    h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+    h._escalation_queue.make_id = MagicMock(return_value='esc-42-1')
     return h
 
 
 @pytest.mark.asyncio
 class TestAlreadyLandedDispatchGateMarkerPath:
-    """Branch-deleted merge-marker path (RED until step-8).
+    """Branch-deleted merge-marker path (RED until step-8 for the
+    effect-absent/escalation sub-case; the flip and stale-marker sub-cases
+    are already green from step-8's predecessor and are extended here with
+    escalation-queue assertions).
 
-    resolve_branch_sha(branch) is None in both sub-cases (the branch ref is
+    resolve_branch_sha(branch) is None in all sub-cases (the branch ref is
     gone), so the ancestry path never engages — only the marker path can
     produce a result.
     """
@@ -342,8 +419,9 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         self, mock_orch_config,
     ) -> None:
         """A merge marker on main, not an ancestor of branch_base_sha (i.e.
-        it postdates this incarnation's creation point) -> flips to done,
-        anchored on the marker sha.
+        it postdates this incarnation's creation point), with its effect
+        PRESENT at main HEAD (the CANDIDATE-mode helper accepts) -> flips
+        to done, anchored on the marker sha, with no escalation filed.
 
         Also pins the citation-laziness fix (task 2313 review): the marker
         path doesn't consume a citation, so find_task_citation_commit must
@@ -368,11 +446,59 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         assert call_args.args[1] == marker_sha
         assert call_args.args[3] == 'dispatch-gate-marker-found'
         cast(AsyncMock, h.git_ops.find_task_citation_commit).assert_not_called()
+        cast(MagicMock, h._escalation_queue).submit.assert_not_called()
+
+    async def test_marker_found_not_stale_effect_absent_escalates_no_mark_done(
+        self, mock_orch_config,
+    ) -> None:
+        """The task-1175 shape: a merge marker on main, not stale, but its
+        effect has been REVERTED at current main HEAD
+        (commit_effect_present_in_main False) — a later commit on main
+        undid exactly the paths the marker's landing touched. The
+        CANDIDATE-mode FIX 1' guard (task 2678, closing the 1175 clobber in
+        this path) must reject it: no _mark_in_progress_done call, the gate
+        returns False, and exactly one dedup-guarded 'provenance_unattributed'
+        L1 escalation is filed carrying the branch, the marker sha, and the
+        'effect_absent' reason. has_open_l1('42') is consulted for dedup
+        before the escalation is filed.
+
+        RED: the marker path has no effect check / escalation yet, so it
+        would flip to done regardless of commit_effect_present_in_main.
+        """
+        marker_sha = 'b' * 40
+        branch_base_sha = 'e' * 40
+        h = _wired_marker_harness(
+            mock_orch_config,
+            marker_sha=marker_sha,
+            branch_base_sha=branch_base_sha,
+            marker_is_ancestor_of_base=False,
+        )
+        h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+        # has_open_l1 is also consulted by the gate's pre-existing top-of-
+        # method open-L1 veto (unrelated to this dedup check) — assert the
+        # dedup call happened (most recent call), not an exact call count.
+        cast(MagicMock, h._escalation_queue).has_open_l1.assert_called_with('42')
+        cast(MagicMock, h._escalation_queue).submit.assert_called_once()
+        esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
+        assert esc.category == 'provenance_unattributed'
+        assert esc.task_id == '42'
+        assert 'task/42' in esc.detail
+        assert marker_sha in esc.detail
+        assert 'effect_absent' in esc.detail
 
     async def test_stale_marker_vetoes_flip(self, mock_orch_config) -> None:
         """A marker that IS an ancestor of branch_base_sha predates this
         incarnation (branch was deleted + re-created under the same task
-        id) -> vetoes the flip, no _mark_in_progress_done call.
+        id) -> vetoes the flip, no _mark_in_progress_done call, and no
+        escalation (this veto predates the incarnation entirely — it is
+        not an unattributed-landing signal, so it must not be treated as
+        one).
         """
         marker_sha = 'b' * 40
         branch_base_sha = 'e' * 40
@@ -387,85 +513,118 @@ class TestAlreadyLandedDispatchGateMarkerPath:
 
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        cast(MagicMock, h._escalation_queue).submit.assert_not_called()
 
 
 def _wired_content_harness(
-    mock_orch_config, *, citation_sha, main_sha, content_in_main,
+    mock_orch_config, *, citation_sha, content_in_main, effect_present=True,
 ) -> Harness:
-    """Bare harness with the branch existing but is_ancestor False and
-    find_merge_marker None, so neither the ancestry path nor the marker
-    path can produce a result — only the content-equivalence fallback is
-    under test.
+    """Bare harness with the branch existing but is_ancestor(branch, main)
+    False and find_merge_marker None, so neither the ancestry path nor the
+    marker path can produce a result — only the content-equivalence
+    fallback is under test.
 
     The branch must "exist" (resolve_branch_sha truthy) for this fallback
     to even be reached — the cheap pre-filter (task 2313 review) routes a
     nonexistent branch straight to the marker path instead.
+
+    ``is_ancestor`` is a side_effect function: the DISCOVERY-mode helper
+    (task 2678) calls it once for ``(branch, main)`` to bypass the ancestry
+    path (always False here) and, only once a citation is found, again for
+    the FIX 2 citation-lineage guard ``(citation, branch)`` — modeled here
+    as an in-branch work commit (True) so the interesting
+    content-equivalence behavior (accept/reject on effect-present) isn't
+    entangled with the lineage guard, which has its own dedicated coverage
+    in TestAlreadyLandedDispatchGateAncestryGuards and
+    test_landing_evidence.py. ``get_main_sha`` is wired but must NEVER be
+    called — the silent ``citation or get_main_sha()`` fallback (task 2678)
+    is deleted.
     """
     h = _build_harness(mock_orch_config)
     h.git_ops = MagicMock()
     h.git_ops.config.branch_prefix = 'task/'
     h.git_ops.config.main_branch = 'main'
+    branch = 'task/42'
+
+    async def _is_ancestor(a, b):
+        if (a, b) == (branch, 'main'):
+            return False  # bypass the ancestry path
+        if citation_sha is not None and (a, b) == (citation_sha, branch):
+            return True  # citation modeled as an in-branch work commit
+        raise AssertionError(f'unexpected is_ancestor call: {a!r}, {b!r}')
 
     h.git_ops.resolve_branch_sha = AsyncMock(return_value='f' * 40)
-    h.git_ops.is_ancestor = AsyncMock(return_value=False)
+    h.git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
     h.git_ops.find_merge_marker = AsyncMock(return_value=None)
     h.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
     h.git_ops.branch_content_in_main = AsyncMock(return_value=content_in_main)
-    h.git_ops.get_main_sha = AsyncMock(return_value=main_sha)
+    h.git_ops.get_main_sha = AsyncMock(return_value='c' * 40)
+    h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=effect_present)
 
     h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': {}})
     h._branch_is_degenerate = AsyncMock(return_value=False)
     h._mark_in_progress_done = AsyncMock()
-    h._escalation_queue = None
+    h._escalation_queue = MagicMock()
+    h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+    h._escalation_queue.make_id = MagicMock(return_value='esc-42-1')
     return h
 
 
 @pytest.mark.asyncio
 class TestAlreadyLandedDispatchGateContentEquivalence:
-    """Content-equivalence fallback (RED until step-10).
+    """Content-equivalence fallback (RED until step-10 for the no-citation
+    and effect-absent escalation sub-cases; the effect-present accept
+    sub-case is extended here with lineage/effect wiring and a
+    no-escalation assertion).
 
     is_ancestor(branch, main) is False and find_merge_marker returns None
-    in all three sub-cases, so only the content-equivalence fallback can
+    in every sub-case, so only the content-equivalence fallback can
     produce a result.
     """
 
-    async def test_content_equivalent_no_citation_anchors_on_main_head(
+    async def test_content_equivalent_no_citation_escalates_no_mark_done(
         self, mock_orch_config,
     ) -> None:
-        """branch_content_in_main True, no citation on main -> flips to
-        done, anchored on main HEAD (get_main_sha) since there is no
-        citation commit to prefer.
+        """branch_content_in_main True, no citation on main -> there is no
+        positive evidence to attribute a landing to (DISCOVERY mode
+        rejects with reason 'no_citation'). The silent
+        ``citation or get_main_sha()`` fallback (task 2678) is deleted: the
+        gate must NOT fabricate an anchor from main HEAD, must NOT mark
+        done, and must file exactly one 'provenance_unattributed'
+        escalation carrying the branch. get_main_sha must never be called.
         """
-        main_sha = 'c' * 40
         h = _wired_content_harness(
             mock_orch_config,
             citation_sha=None,
-            main_sha=main_sha,
             content_in_main=True,
         )
 
         result = await h._already_landed_dispatch_gate('42')
 
-        assert result is True
-        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
-        call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
-        assert call_args is not None
-        assert call_args.args[0] == '42'
-        assert call_args.args[1] == main_sha
-        assert call_args.args[3] == 'dispatch-gate-content-equivalent'
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        cast(AsyncMock, h.git_ops.get_main_sha).assert_not_called()
 
-    async def test_content_equivalent_with_citation_prefers_citation_anchor(
+        cast(MagicMock, h._escalation_queue).submit.assert_called_once()
+        esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
+        assert esc.category == 'provenance_unattributed'
+        assert esc.task_id == '42'
+        assert 'task/42' in esc.detail
+        assert 'no_citation' in esc.detail
+
+    async def test_content_equivalent_with_citation_and_effect_present_marks_done(
         self, mock_orch_config,
     ) -> None:
-        """branch_content_in_main True AND a citation commit is present on
-        main -> the citation sha anchors the flip, not main HEAD.
+        """branch_content_in_main True, a citation commit is present on
+        main AND its effect is present at main HEAD -> the citation sha
+        anchors the flip, not main HEAD; no escalation filed.
         """
         citation_sha = 'd' * 40
         h = _wired_content_harness(
             mock_orch_config,
             citation_sha=citation_sha,
-            main_sha='c' * 40,
             content_in_main=True,
+            effect_present=True,
         )
 
         result = await h._already_landed_dispatch_gate('42')
@@ -477,17 +636,46 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         assert call_args.args[0] == '42'
         assert call_args.args[1] == citation_sha
         assert call_args.args[3] == 'dispatch-gate-content-equivalent'
+        cast(MagicMock, h._escalation_queue).submit.assert_not_called()
+
+    async def test_content_equivalent_with_citation_and_effect_absent_escalates(
+        self, mock_orch_config,
+    ) -> None:
+        """branch_content_in_main True, a citation is present on main, but
+        its effect was reverted at current main HEAD
+        (commit_effect_present_in_main False) -> reject (FIX 1'), no
+        mark_done, and exactly one 'provenance_unattributed' escalation
+        (reason 'effect_absent').
+        """
+        citation_sha = 'd' * 40
+        h = _wired_content_harness(
+            mock_orch_config,
+            citation_sha=citation_sha,
+            content_in_main=True,
+            effect_present=False,
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+        cast(MagicMock, h._escalation_queue).submit.assert_called_once()
+        esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
+        assert esc.category == 'provenance_unattributed'
+        assert esc.task_id == '42'
+        assert 'effect_absent' in esc.detail
 
     async def test_content_not_equivalent_dispatches_normally(
         self, mock_orch_config,
     ) -> None:
         """branch_content_in_main False -> no evidence at all; the gate
-        returns False so the task dispatches normally this tick.
+        returns False so the task dispatches normally this tick, with no
+        escalation and no mark_done.
         """
         h = _wired_content_harness(
             mock_orch_config,
             citation_sha=None,
-            main_sha='c' * 40,
             content_in_main=False,
         )
 
@@ -495,6 +683,23 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
 
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        cast(MagicMock, h._escalation_queue).submit.assert_not_called()
+
+
+class TestAlreadyLandedDispatchGateGetMainShaFallbackGrepGuard:
+    """Source-level guard (task 2678): the silent
+    ``citation or await self.git_ops.get_main_sha()`` fallback must be
+    fully deleted from the content-equivalence path, not merely made
+    unreachable — a future edit must not resurrect it as dead code.
+    """
+
+    def test_get_main_sha_fallback_expression_absent(self) -> None:
+        content = _HARNESS_SRC_PATH.read_text()
+        assert 'or await self.git_ops.get_main_sha()' not in content, (
+            'harness.py still contains the silent get_main_sha() fallback '
+            'expression; task 2678 replaces it with '
+            'validate_landing_evidence + escalate-instead-of-stamp.'
+        )
 
 
 def _wired_absent_branch_harness(mock_orch_config) -> Harness:

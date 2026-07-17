@@ -45,6 +45,11 @@ from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps
+from orchestrator.landing_evidence import (
+    LandingEvidenceVerdict,
+    file_unattributed_landing_escalation,
+    validate_landing_evidence,
+)
 from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.mcp_lifecycle import McpLifecycle
@@ -3607,28 +3612,61 @@ Output JSON matching the schema. Every task must appear in the output.
                     )
                 return None
 
+            # BranchState docstring invariant (task_ground_truth.py): sha is
+            # always populated for ON_MAIN / GONE_WITH_MERGE_MARKER — the
+            # only variants that reach MARK_DONE_WITH_PROVENANCE. Guard it
+            # explicitly (review finding, task 2678 amendment): passing
+            # candidate_sha=None below would silently switch
+            # validate_landing_evidence from CANDIDATE to DISCOVERY mode
+            # instead of failing loudly on the violated invariant — a
+            # materially different code path (citation discovery + lineage
+            # against `branch`) than the effect-only check this call site
+            # intends. The one known way to reach sha=None is a TOCTOU in
+            # the git-archaeology fallback (_resolve_branch_state: the
+            # branch ref is deleted between the is_ancestor and
+            # resolve_branch_sha calls) — practically near-unreachable, so
+            # fail loud rather than silently degrade (project norm).
+            assert report.branch_state.sha is not None, (
+                f'BranchState invariant violated for task {tid}: kind='
+                f'{report.branch_state.kind!r} carries no sha'
+            )
+
             on_main = report.branch_state.kind == BranchStateKind.ON_MAIN
 
-            # FIX 1 effect-present refinement (task 2500): a cited ON_MAIN
-            # commit stays an ancestor of main forever — ancestry is
-            # immutable history — even after a LATER commit on main
-            # reverts exactly the paths it touched (the found_on_main
-            # post-hoc-revert blind spot; reify esc-5179-3/esc-5181-2).
-            # Sibling to the degenerate-branch refinement above: same
-            # downgrade shape, flip only on positive evidence. Journal
-            # (MergeProvenance advanced_sha) and merge-marker shas are
-            # always merge commits — commit_effect_present_in_main returns
-            # True unconditionally for those (empty diff-tree), so only
-            # the git-fallback branch-tip work-commit ON_MAIN case pays
-            # for a real check.
-            if on_main and report.branch_state.sha and not await (
-                self.git_ops.commit_effect_present_in_main(report.branch_state.sha)
-            ):
+            # FIX 1' effect-present refinement (task 2500/2678): a cited
+            # ON_MAIN commit or merge marker stays an ancestor of main
+            # forever — ancestry is immutable history — even after a LATER
+            # commit on main reverts exactly the paths it touched (the
+            # found_on_main post-hoc-revert blind spot; reify
+            # esc-5179-3/esc-5181-2). Sibling to the degenerate-branch
+            # refinement above: same downgrade shape, flip only on positive
+            # evidence. Delegates to the shared validate_landing_evidence
+            # helper (task 2678, INV-5) in CANDIDATE mode, applied
+            # UNIFORMLY to BOTH the on_main and marker sub-cases —
+            # attribution is already established by recovery_for's
+            # ground-truth report, so only the effect-present guard
+            # remains. Previously this check was gated on ``on_main`` only,
+            # so a branch-deleted merge marker whose effect had been
+            # reverted at current main HEAD skipped it entirely and was
+            # stamped done unconditionally (the task-1175 clobber,
+            # reproduced inside this sweep). No escalation on reject here
+            # (unlike the dispatch-gate marker/content-equivalence paths):
+            # the evidence is already ground-truth-attributed by
+            # recovery_for, and the existing revert-to-pending / leave-
+            # blocked recovery self-heals without a human (design decision,
+            # task 2678).
+            verdict = await validate_landing_evidence(
+                self.git_ops, tid, branch,
+                branch_tip_sha=None,
+                candidate_sha=report.branch_state.sha,
+            )
+            if not verdict.accepted:
                 logger.warning(
-                    'Reconcile: task %s ON_MAIN evidence sha %s is an ancestor '
+                    'Reconcile: task %s %s evidence sha %s is an ancestor '
                     'of main but its effect is not present at current HEAD '
                     '(post-hoc revert) — not marking done',
-                    tid, report.branch_state.sha,
+                    tid, 'ON_MAIN' if on_main else 'merge-marker',
+                    report.branch_state.sha,
                 )
                 if status == 'in-progress':
                     return await self._revert_in_progress_if_no_live_claimant(
@@ -7452,9 +7490,13 @@ Output JSON matching the schema. Every task must appear in the output.
         ancestors of main (squashed/rebased/manually-applied) by comparing
         the branch's actual changed files against main
         (:meth:`~orchestrator.git_ops.GitOps.branch_content_in_main`).  It
-        anchors on the citation commit when one is present on main, falling
-        back to main HEAD when a content-equivalent landing carries no
-        task-citing commit.  **Accepted risk**: this path can false-positive
+        delegates to :func:`~orchestrator.landing_evidence.validate_landing_evidence`
+        (DISCOVERY mode, task 2678) to discover and attribute the citation
+        commit and anchors on it; a content-equivalent landing that carries
+        no task-citing commit (or whose citation's effect is no longer
+        present at main HEAD) is no longer silently anchored on main HEAD —
+        it escalates instead via ``_file_unattributed_landing_escalation``.
+        **Accepted risk**: this path can false-positive
         on a branch whose completed-so-far files coincidentally match
         main's independent content while the rest of the task's scope is
         still unfinished — the primitive only sees the branch's own diff
@@ -7480,71 +7522,30 @@ Output JSON matching the schema. Every task must appear in the output.
         ):
             if await self._branch_is_degenerate(branch, metadata):
                 return False
-            citation = await self.git_ops.find_task_citation_commit(
-                task_id, pattern_template=self.git_ops.config.commit_citation_pattern,
+            # Delegates FIX 2 citation-lineage + FIX 1' effect-present to the
+            # shared helper (task 2678, INV-5) — see
+            # orchestrator.landing_evidence's module docstring for the full
+            # DISCOVERY-mode contract (citation discovery, both-direction
+            # lineage guard, branch-tip-or-citation effect anchor).
+            verdict = await validate_landing_evidence(
+                self.git_ops, task_id, branch,
+                branch_tip_sha=branch_tip_sha,
+                pattern_template=self.git_ops.config.commit_citation_pattern,
             )
-            if citation is None:
-                return False
-            # FIX 2 citation-lineage guard (task 2500): the grep-found
-            # citation must be tied to THIS task's own branch, not merely
-            # match the citation grep pattern. Two shapes legitimately
-            # qualify:
-            #   (a) a WORK commit ON the branch — an ancestor of its tip:
-            #       is_ancestor(citation, branch) is True; or
-            #   (b) THIS branch's OWN no-ff merge commit — the
-            #       ``^Merge task/{tid} into`` subject that
-            #       git_ops.DEFAULT_COMMIT_CITATION_PATTERN deliberately
-            #       matches. find_task_citation_commit returns the MOST
-            #       RECENT match on main, which after a no-ff landing is
-            #       that merge commit; a merge commit is a DESCENDANT of
-            #       the branch tip (the tip is one of its parents), so
-            #       is_ancestor(citation, branch) is False for it while
-            #       is_ancestor(branch, citation) is True. This shape is
-            #       a genuine landing (esc-2500-2: prior orchestrator run
-            #       that merged but crashed before delete/mark-done, or a
-            #       manual `git merge --no-ff task/{tid}`) and must NOT be
-            #       rejected — doing so regressed the pre-diff behavior and
-            #       re-dispatched the task as duplicate work.
-            # An unrelated task's commit that merely matched the grep (e.g.
-            # another task's merge commit — the task 2624 incident shape)
-            # is NEITHER: is_ancestor is False in BOTH directions, so it is
-            # rejected here before any provenance is fabricated.
-            citation_on_branch = await self.git_ops.is_ancestor(citation, branch)
-            if not citation_on_branch and not await self.git_ops.is_ancestor(
-                branch, citation,
-            ):
-                return False
-            # FIX 1 effect-present guard (task 2500): the citation may be a
-            # real, in-lineage work commit that a LATER commit on main
-            # changed — ancestry alone doesn't mean the effect survives at
-            # HEAD. Reject the flip unless the landing's effect still
-            # matches main (or the checked commit is a merge/empty commit,
-            # where path-based revert detection is inapplicable).
-            #
-            # Which sha to check depends on the citation shape established
-            # above (review finding, task 2500 amendment):
-            #   (a) citation_on_branch True — an in-branch WORK commit that
-            #       may be an INTERMEDIATE commit, not the branch's final
-            #       state. A later commit on this SAME branch (still part
-            #       of this landing, since the whole branch is an ancestor
-            #       of main) can legitimately re-touch the citation's paths
-            #       again on the way to the branch's final content —
-            #       checking the citation's own stale snapshot against main
-            #       would false-reject a genuine multi-commit landing.
-            #       Anchor on the branch TIP instead — the actual final
-            #       state this landing put on main.
-            #   (b) citation_on_branch False — shape (b) from above (this
-            #       branch's own no-ff merge commit): keep checking the
-            #       citation directly. Its diff-tree is empty, so the check
-            #       is an intentional no-op (see
-            #       commit_effect_present_in_main's empty-touched-set
-            #       contract) — using branch_tip_sha here would needlessly
-            #       turn a deliberate no-op into a real (redundant) check.
-            effect_check_sha = branch_tip_sha if citation_on_branch else citation
-            if not await self.git_ops.commit_effect_present_in_main(effect_check_sha):
+            if not verdict.accepted:
+                # No escalation here, deliberately — unlike the marker and
+                # content-equivalence paths below (design decision, task
+                # 2678). This branch is LIVE: a reject (no citation, a
+                # lineage mismatch, or a task-1175-shape effect-absent
+                # revert) self-heals by re-dispatch on the next tick with no
+                # human involved, and this gate is re-run on the order of
+                # every dispatch tick — escalating here would be noise, not
+                # signal. This silent-False shape also predates task 2678
+                # (it returned False here before the helper extraction too),
+                # so this is not a newly-introduced silent failure.
                 return False
             await self._mark_in_progress_done(
-                task_id, citation,
+                task_id, verdict.evidence_sha,
                 'reconcile: pre-dispatch check found branch already on main',
                 'dispatch-gate-already-on-main',
             )
@@ -7560,6 +7561,18 @@ Output JSON matching the schema. Every task must appear in the output.
                     branch_base_sha,
                 ) and await self.git_ops.is_ancestor(marker, branch_base_sha):
                     return False
+                # CANDIDATE mode (task 2678): the marker's subject match
+                # already attributes this landing to task_id — only the
+                # FIX 1' effect-present guard remains, closing the task-1175
+                # clobber (a reverted merge previously stamped done anyway).
+                verdict = await validate_landing_evidence(
+                    self.git_ops, task_id, branch,
+                    branch_tip_sha=None,
+                    candidate_sha=marker,
+                )
+                if not verdict.accepted:
+                    self._file_unattributed_landing_escalation(task_id, branch, verdict)
+                    return False
                 await self._mark_in_progress_done(
                     task_id, marker,
                     'reconcile: pre-dispatch check found merge marker on main',
@@ -7569,20 +7582,65 @@ Output JSON matching the schema. Every task must appear in the output.
             return False
 
         if await self.git_ops.branch_content_in_main(branch):
-            citation = await self.git_ops.find_task_citation_commit(
-                task_id, pattern_template=self.git_ops.config.commit_citation_pattern,
+            # DISCOVERY mode (task 2678): delegates citation discovery + FIX 2
+            # lineage + FIX 1' effect-present to the shared helper, exactly
+            # like the ancestry path above. The prior silent
+            # ``citation or get_main_sha()`` fallback fabricated an anchor
+            # from main HEAD whenever no citation was found; that is now a
+            # rejected verdict ('no_citation') that escalates instead of
+            # stamping done.
+            verdict = await validate_landing_evidence(
+                self.git_ops, task_id, branch,
+                branch_tip_sha=branch_tip_sha,
+                pattern_template=self.git_ops.config.commit_citation_pattern,
             )
-            anchor = citation or await self.git_ops.get_main_sha()
-            if anchor:
-                await self._mark_in_progress_done(
-                    task_id, anchor,
-                    'reconcile: pre-dispatch check found content-equivalent '
-                    'landing on main (squash/rebase/manual)',
-                    'dispatch-gate-content-equivalent',
-                )
-                return True
+            if not verdict.accepted:
+                self._file_unattributed_landing_escalation(task_id, branch, verdict)
+                return False
+            await self._mark_in_progress_done(
+                task_id, verdict.evidence_sha,
+                'reconcile: pre-dispatch check found content-equivalent '
+                'landing on main (squash/rebase/manual)',
+                'dispatch-gate-content-equivalent',
+            )
+            return True
 
         return False
+
+    def _file_unattributed_landing_escalation(
+        self, task_id: str, branch: str, verdict: LandingEvidenceVerdict,
+    ) -> None:
+        """Best-effort, dedup-guarded L1 escalation for unattributable
+        landing evidence (task 2678, INV-5).
+
+        Filed by the already-landed re-derivation sites that found a
+        positive landing signal (a merge marker, or branch content
+        equivalent to main) but whose :func:`validate_landing_evidence`
+        verdict came back rejected — an unattributed or effect-absent
+        landing that must not be silently stamped done (the task-1175
+        clobber this task closes). Escalate-instead-of-stamp is
+        deliberately non-status-blocking: the task row is simply left
+        pending and re-evaluated next tick, and the open-L1 veto at the top
+        of :meth:`_already_landed_dispatch_gate` naturally suppresses
+        reprocessing while this L1 stays open — no separate status
+        transition is needed here.
+
+        Best-effort (a no-op when ``_escalation_queue`` is None, e.g.
+        bare-Harness unit tests) and deduped via ``has_open_l1`` so repeated
+        ticks re-observing the same unattributable evidence don't stack
+        duplicate L1s — one open escalation per task at a time.
+
+        Delegates the actual filing (queue-None guard, dedup, ``Escalation``
+        construction, submit/log/except shape) to the shared
+        :func:`~orchestrator.landing_evidence.file_unattributed_landing_escalation`
+        (task 2678 amendment, INV-5) — this method now only supplies
+        ``agent_role``, the one thing that distinguishes it from
+        ``SpeculativeMergeWorker``'s equivalent method.
+        """
+        file_unattributed_landing_escalation(
+            self._escalation_queue, task_id, branch, verdict,
+            agent_role='harness-reconcile',
+        )
 
     async def _stop_escalation_server(self) -> None:
         """Stop the escalation server."""
