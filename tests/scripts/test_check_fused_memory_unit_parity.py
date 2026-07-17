@@ -160,6 +160,94 @@ def test_find_drift_does_not_report_present_watchdog():
 
 
 # ---------------------------------------------------------------------------
+# find_drift tests: restart-relevant EXACT directives (A1)
+# ---------------------------------------------------------------------------
+
+_MISSING_RESTART_DIRECTIVES_UNIT = """\
+[Unit]
+Description=Drifted Service Missing Restart Directives
+
+[Service]
+Type=notify
+Environment=MEM0_TELEMETRY=false
+WatchdogSec=120
+ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+
+[Install]
+WantedBy=default.target
+"""
+
+# A fully-populated [Service] except an injected divergence: TimeoutStopSec=45
+# instead of the required TimeoutStopSec=90. Exact-match semantics mean a
+# *different* value for the same key still counts as the required directive
+# being absent.
+_DIVERGENT_TIMEOUT_STOP_SEC_UNIT = """\
+[Unit]
+Description=Installed Fused Memory (divergent TimeoutStopSec)
+
+[Service]
+Type=notify
+Environment=MEM0_TELEMETRY=false
+WatchdogSec=120
+ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def test_find_drift_detects_missing_restart_directives():
+    """find_drift flags all four restart-relevant directives when absent.
+
+    RED until REQUIRED_SERVICE_DIRECTIVES grows to include Restart=on-failure,
+    RestartSec=5, TimeoutStartSec=300, and TimeoutStopSec=90 — today it only
+    lists MEM0_TELEMETRY + WatchdogSec, so find_drift returns [] here.
+    """
+    mod = _load_checker()
+    drift = mod.find_drift(_MISSING_RESTART_DIRECTIVES_UNIT)
+    assert "Restart=on-failure" in drift
+    assert "RestartSec=5" in drift
+    assert "TimeoutStartSec=300" in drift
+    assert "TimeoutStopSec=90" in drift
+
+
+def test_find_drift_detects_injected_timeout_stop_sec_divergence():
+    """A divergent TimeoutStopSec value (45 vs required 90) is flagged as missing.
+
+    Exact-match semantics: the required directive is the full string
+    'TimeoutStopSec=90', so a unit carrying a *different* value for the same
+    key still fails the check — the correct value is effectively absent.
+    """
+    mod = _load_checker()
+    drift = mod.find_drift(_DIVERGENT_TIMEOUT_STOP_SEC_UNIT)
+    assert "TimeoutStopSec=90" in drift
+
+
+def test_parity_checker_subprocess_exit_1_on_divergent_timeout_stop_sec(
+    tmp_path: pathlib.Path,
+):
+    """The divergent-TimeoutStopSec unit yields exit code 1 through the real CLI.
+
+    Mirrors test_parity_checker_callable_as_subprocess's subprocess-boundary
+    pattern, but for the injected TimeoutStopSec divergence case (A1c).
+    """
+    divergent = _write_unit(tmp_path, _DIVERGENT_TIMEOUT_STOP_SEC_UNIT, name="divergent.service")
+    result = subprocess.run(
+        [sys.executable, str(CHECKER_PATH), "--installed", str(divergent)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1, (
+        f"Expected exit 1 for divergent TimeoutStopSec unit; got {result.returncode}. "
+        f"stderr: {result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Template parity test  (step-5 / step-6)
 # ---------------------------------------------------------------------------
 
