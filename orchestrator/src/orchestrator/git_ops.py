@@ -3454,17 +3454,23 @@ class GitOps:
         On the defer path, emits a structured WARNING journal line naming
         *branch_name* — the user-observable B10 signal that a fresh
         allocation was throttled as backpressure (inv.11: never an
-        escalation or fault).
+        escalation or fault). The journal line is enriched with α's
+        (:meth:`_run_warm_lane_audit`) HEADROOM summary for operator
+        context — OBSERVABILITY ONLY (inv.12): a ``None`` headroom (α
+        absent/errored) degrades the log line gracefully and never affects
+        the ``True`` return value below; α is never consulted in the
+        decision itself, only after it has already been made.
 
         Never raises.
         """
         rc = await self._run_warm_lane_soft_guard()
         if rc != 3:
             return False
+        headroom = await self._run_warm_lane_audit()
         logger.warning(
             'θ soft-floor throttle: soft disk pressure (rc=3) for branch '
-            '%r — deferring dispatch (backpressure, inv.11)',
-            branch_name,
+            '%r — deferring dispatch (backpressure, inv.11); audit_headroom=%s',
+            branch_name, headroom,
         )
         return True
 
