@@ -207,6 +207,41 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
 
 
+@pytest.fixture
+def code_default_config(monkeypatch, tmp_path):
+    """Isolate ``OrchestratorConfig()`` from the ambient operational config.yaml.
+
+    Opt-in counterpart to the autouse ``_isolate_orch_config`` above.  That
+    fixture DELIBERATELY leaves ``config.yaml`` loading intact (only pinning
+    ``project_root``) so the majority of tests keep the tracked
+    ``orchestrator/config.yaml``'s operational values (``lock_depth`` etc.).
+    But the merge-verify harness runs pytest from the ``orchestrator/`` cwd, so
+    ``settings_customise_sources`` (config.py) falls back to the *relative*
+    ``Path('config.yaml')`` -> the tracked ``orchestrator/config.yaml``, whose
+    live operational overrides (commit b012af0e0e:
+    ``merge_verify_breadth='full'``, ``merge_train_former_enabled=true``,
+    ``merge_train_coalesce_enabled=true``) then bleed into any bare
+    ``OrchestratorConfig()``.
+
+    Tests that assert the CODE DEFAULTS (``defaults.yaml``:
+    ``merge_verify_breadth='scoped'``, trains OFF) — or that exercise the
+    default *scoped* merge-verify behaviour — must construct the config in
+    isolation from those live overrides.  Pointing ``ORCH_CONFIG_PATH`` at a
+    guaranteed-absent file makes ``YamlSettingsSource.__call__`` skip the
+    layer-2 project file (its ``.exists()`` is False) and load ONLY the
+    package-bundled ``defaults.yaml`` -> pure code defaults.  ``project_root``
+    still resolves to ``tmp_path`` via ``ORCH_PROJECT_ROOT`` (set by the autouse
+    fixture, which runs first), so bare-config tests still never write into the
+    live tree.
+
+    Opt-in via ``@pytest.mark.usefixtures("code_default_config")`` (or a direct
+    request) on exactly the default-asserting / scoped-behaviour tests — NEVER
+    autouse, which would strip config.yaml from the ~10k tests that legitimately
+    rely on it.
+    """
+    monkeypatch.setenv("ORCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Register the ``real_psi_reader`` opt-out marker (task 2418).
 

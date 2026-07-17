@@ -247,6 +247,7 @@ class TestReverseDependencyModuleConfigs:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("code_default_config")
 class TestRunScopedVerificationReverseDependencyWidening:
     """Integration: run_scoped_verification's module_configs branch widens to escalation.
 
@@ -383,6 +384,7 @@ class TestRunScopedVerificationReverseDependencyGuards:
     untriggered path stays byte-identical to pre-2607 behaviour.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     async def test_orchestrator_test_only_diff_does_not_widen(self, tmp_path: Path):
         """A diff touching only orchestrator/tests/*.py (no orchestrator/src/) must not widen.
 
@@ -412,6 +414,7 @@ class TestRunScopedVerificationReverseDependencyGuards:
             f'orchestrator test-only diff must not widen to escalation; recorded: {recorded}'
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     async def test_escalation_already_in_diff_is_not_double_widened(self, tmp_path: Path):
         """escalation already present (in diff + module_configs) -> exactly one invocation.
 

@@ -7369,6 +7369,7 @@ class TestRunVerificationGovernRouting:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_run_verification_merge_role_wraps_parsed_inner_command(self, tmp_path):
         """The inner (pre-govern-wrap) payload is the VerifyCmd-rendered form
         of test_command, not a verbatim copy of the config string (task 2125
