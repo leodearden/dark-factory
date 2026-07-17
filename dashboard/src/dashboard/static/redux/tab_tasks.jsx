@@ -6,7 +6,7 @@ const DF_T = window.DF_DATA;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusSubset } = window.DF_GRAPH_LAYOUT;
 const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
-const { rtCell } = window.DF_RUNTIME_FMT;
+const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
 
 // Persisted-state hook (same shape as elsewhere)
 function tasksPersistedState(key, def) {
@@ -174,7 +174,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
           <span className="id">{window.DF_SHELL.taskId(t.id)}</span>
           {t.train && <span className="train-badge" title={`train ${t.train.id} · order ${t.train.order}`}>🚂 {t.train.id}</span>}
           <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
-            {t.status === 'in-progress' ? `${t.started}m` : t.status === 'done' ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : t.status}
+            {t.status === 'in-progress' ? rtAge(t.started) : t.status === 'done' ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : t.status}
           </span>
         </div>
         <div className="ttl">{t.title}</div>
@@ -449,7 +449,8 @@ function fmtAge(t) {
   if (t.status === 'merge-deferred')   return 'parked for train';
   if (t.status === 'deferred')         return 'deferred';
   if (t.status === 'cancelled')        return t.completed ? window.DF_SHELL.timeago(t.completed) : 'cancelled';
-  return `${t.started}m running`;
+  const age = rtAge(t.started);
+  return age === '—' ? age : `${age} running`;
 }
 
 function MarkdownText({ text, className, empty }) {

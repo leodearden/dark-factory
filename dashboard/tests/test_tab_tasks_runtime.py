@@ -51,6 +51,20 @@ def task_detail_body(tab_tasks_jsx_body):
     return _extract_function_body(tab_tasks_jsx_body, 'TaskDetail')
 
 
+@pytest.fixture(scope='module')
+def task_graph_body(tab_tasks_jsx_body):
+    """TaskGraph's own source text, scoped away from the other component
+    functions in the same file."""
+    return _extract_function_body(tab_tasks_jsx_body, 'TaskGraph')
+
+
+@pytest.fixture(scope='module')
+def fmt_age_body(tab_tasks_jsx_body):
+    """fmtAge's own source text, scoped away from the other functions in the
+    same file."""
+    return _extract_function_body(tab_tasks_jsx_body, 'fmtAge')
+
+
 class TestTaskDetailRuntimeFields:
     """TaskDetail must mirror OrchTab's offline-'—' degradation for
     loops/attempts, and additionally surface lane/phase/lane_state (task
@@ -95,3 +109,41 @@ class TestTaskDetailRuntimeFields:
 
     def test_state_kv_label_present(self, task_detail_body):
         assert re.search(r'className="k">state<', task_detail_body)
+
+
+class TestRuntimeFmtDestructureIncludesRtAge:
+    """window.DF_RUNTIME_FMT must also expose rtAge at the top-level
+    destructure (task 2699) — TaskDetail already relied on rtCell alone, but
+    the graph-node meta and fmtAge() both need rtAge's null -> em-dash
+    degradation for the `started` field."""
+
+    def test_destructure_includes_rtage(self, tab_tasks_jsx_body):
+        assert re.search(r'const\s*\{\s*rtCell\s*,\s*rtAge\s*\}\s*=\s*window\.DF_RUNTIME_FMT', tab_tasks_jsx_body)
+
+
+class TestGraphNodeAgeRoutesThroughRtAge:
+    """The task-graph node's in-progress runtime-age badge (task 2699) must
+    route `t.started` through rtAge rather than interpolating it directly
+    into a template literal — a raw `${t.started}m` renders the literal
+    string "nullm" when started is null (offline snapshot)."""
+
+    def test_started_not_raw_interpolated(self, task_graph_body):
+        assert '${t.started}m' not in task_graph_body
+
+    def test_started_routes_through_rtage(self, task_graph_body):
+        assert re.search(r'rtAge\(\s*t\.started\s*\)', task_graph_body)
+
+
+class TestFmtAgeRoutesThroughRtAge:
+    """fmtAge()'s final "<n>m running" fallback (task 2699) must route
+    `t.started` through rtAge and must not append " running" to a null
+    (em-dash) age — that would render the nonsensical "— running"."""
+
+    def test_started_not_raw_interpolated(self, fmt_age_body):
+        assert '${t.started}m running' not in fmt_age_body
+
+    def test_started_routes_through_rtage(self, fmt_age_body):
+        assert re.search(r'rtAge\(\s*t\.started\s*\)', fmt_age_body)
+
+    def test_null_age_does_not_get_running_suffix(self, fmt_age_body):
+        assert '— running' not in fmt_age_body
