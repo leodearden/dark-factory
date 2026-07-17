@@ -53,11 +53,17 @@ from orchestrator.harness import Harness
 
 def test_imports_resolve_without_fused_memory():
     """Prerequisite pre-1: this file imports orchestrator + escalation only
-    (no fused_memory — orchestrator/pyproject.toml has no path to it)."""
-    assert EscalationQueue is not None
-    assert OrchestratorConfig is not None
-    assert EventType is not None
-    assert Harness is not None
+    (no fused_memory — orchestrator/pyproject.toml has no path to it).
+
+    The module-level imports above already enforce this at collection
+    time — a broken pythonpath fails `pytest --collect-only`, not an
+    in-body assert on an already-imported symbol. This documents the
+    contract with a direct import round-trip per package.
+    """
+    import importlib
+
+    for module_name in ('orchestrator.harness', 'escalation.queue'):
+        importlib.import_module(module_name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
