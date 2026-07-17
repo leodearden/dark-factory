@@ -6622,6 +6622,45 @@ class GitOps:
                 seen.add(ln)
         return sorted(seen)
 
+    async def get_branch_changed_files(
+        self, ref: str,
+    ) -> tuple[list[str], Exception | None]:
+        """Files *ref* changed relative to ``main_branch``, excluding ``.task/``.
+
+        Three-dot diff (``main_branch...ref``) — the files touched by *ref*
+        since it diverged from ``main_branch``, not a naive two-dot diff
+        against main's current (possibly since-advanced) tip.  Returns a
+        ``(files, error)`` tuple — **total, never raises** — mirroring
+        :meth:`get_merge_diff_files`'s contract and ``.task/`` exclusion:
+
+        * ``(files, None)`` on success.  An empty ``files`` list is a
+          legitimate outcome (a branch with no net changes vs main).
+        * ``([], exception)`` on any error: ``rc != 0`` from ``git diff``
+          (e.g. *ref* does not resolve — returns
+          :class:`subprocess.CalledProcessError`) or an unexpected raise
+          from the subprocess helper.
+
+        Used by the merge-skew pipeline-landing tripwire
+        (:mod:`orchestrator.merge_skew_tripwire`) to compute each in-flight
+        task's own changed-file set for overlap against a landing's
+        changed files.
+        """
+        cmd = [
+            'git', 'diff', '--name-only',
+            f'{self.config.main_branch}...{ref}', '--', ':!.task/',
+        ]
+        try:
+            rc, output, stderr = await _run(cmd, cwd=self.project_root)
+        except Exception as exc:
+            return [], exc
+        if rc != 0:
+            logger.warning(
+                'get_branch_changed_files: git diff %s...%s failed (rc=%s): %s',
+                self.config.main_branch, ref, rc, (stderr or '').strip()[:200],
+            )
+            return [], subprocess.CalledProcessError(rc, cmd, output=output, stderr=stderr)
+        return [f for f in output.strip().splitlines() if f.strip()], None
+
     async def merge_to_main(
         self,
         worktree: Path,
