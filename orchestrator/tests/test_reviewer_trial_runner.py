@@ -1,17 +1,31 @@
-"""Tests for reviewer trial runner — mock invoke_agent, verify structure."""
+"""Tests for reviewer trial runner — mock invoke_agent, verify structure.
+
+Post-2484/2493: the trial reviewer emits its verdict via the LIVE
+verdict-tools transport (the ``submit_review_verdict`` MCP tool), not
+``output_schema``/JSON parsing — mirrors
+``workflow.TaskWorkflow._run_reviewer``'s read+fail-safe contract. Tests in
+``TestRunSingleReviewerLiveTransport`` stub ``invoke_agent`` with a side
+effect that writes a verdict envelope into the injected ``meta_root`` (via
+``TaskArtifacts.write_verdict``), simulating the agent-side
+``submit_review_verdict`` tool call, and independently assert the call was
+wired for the live transport (a ``verdict-tools`` MCP server, no
+``output_schema``).
+"""
 
 from __future__ import annotations
 
-import json
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff
 from orchestrator.evals.reviewer_trial.runner import (
     REVIEW_SCHEMA,
     PanelRunResult,
     _build_reviewer_prompt,
+    _run_single_reviewer,
     run_panel,
 )
 from orchestrator.evals.reviewer_trial.variants import (
@@ -29,11 +43,11 @@ def _make_review(name: str = 'test', verdict: str = 'PASS') -> dict:
     }
 
 
-def _make_result(output: str = '', structured: dict | None = None):
+def _make_result(output: str = '', structured: dict | None = None, success: bool = True):
     """Build a mock AgentResult."""
     from types import SimpleNamespace
     return SimpleNamespace(
-        success=True,
+        success=success,
         output=output,
         cost_usd=0.50,
         duration_ms=5000,
@@ -42,6 +56,53 @@ def _make_result(output: str = '', structured: dict | None = None):
         structured_output=structured,
         stderr='',
     )
+
+
+def _parse_verdict_tools_target(mcp_config: dict) -> tuple[Path, str]:
+    """Extract ``(meta_root, verdict_role)`` from a verdict-tools mcp_config,
+    mirroring how the real ``orchestrator.mcp.verdict_tools`` CLI parses its
+    own argv (``--meta-root <path> ... --verdict-role <role>``) — lets a
+    stub discover WHERE to write regardless of whether ``meta_root`` was
+    explicitly injected or auto-generated (``tempfile.mkdtemp()``).
+    """
+    args = mcp_config['mcpServers']['verdict-tools']['args']
+    meta_root = Path(args[args.index('--meta-root') + 1])
+    role = args[args.index('--verdict-role') + 1]
+    return meta_root, role
+
+
+def _make_verdict_writing_invoke(verdict: str = 'PASS', success: bool = True, write: bool = True):
+    """Build an ``invoke_agent`` side effect that simulates a live reviewer:
+    asserts the call was wired for the verdict-tools transport (a
+    ``verdict-tools`` MCP server, no ``output_schema``), then — unless
+    *write* is False — writes a verdict envelope to the invocation's own
+    ``--meta-root`` (via ``TaskArtifacts.write_verdict``, exactly like the
+    real ``submit_review_verdict`` tool), before returning a mock
+    ``AgentResult`` with the given *success*.
+    """
+    async def _invoke(**kwargs):
+        mcp_config = kwargs.get('mcp_config')
+        assert mcp_config is not None, 'invoke_agent must be called with a mcp_config'
+        assert 'verdict-tools' in mcp_config.get('mcpServers', {}), (
+            'mcp_config must wire a verdict-tools MCP server (live transport)'
+        )
+        assert kwargs.get('output_schema') is None, (
+            'the live transport must NOT pass output_schema — the agent emits '
+            'via submit_review_verdict, not structured output capture'
+        )
+        if write:
+            meta_root, role = _parse_verdict_tools_target(mcp_config)
+            payload = {'reviewer': role, 'verdict': verdict, 'issues': [], 'summary': 'Trial verdict.'}
+            envelope = {
+                'role': role,
+                'schema_version': 1,
+                'session_id': 'mock-session',
+                'emitted_at': '2026-07-17T00:00:00+00:00',
+                'verdict': payload,
+            }
+            TaskArtifacts(kwargs['cwd'], meta_root=meta_root).write_verdict(role, envelope)
+        return _make_result(success=success)
+    return _invoke
 
 
 class TestBuildReviewerPrompt:
@@ -60,8 +121,22 @@ class TestBuildReviewerPrompt:
         prompt = _build_reviewer_prompt('diff')
         assert 'Review the diff' in prompt
 
+    def test_no_json_output_instruction(self) -> None:
+        """Post-2493: the reviewer's SYSTEM prompt (roles.build_reviewer_prompt_spec)
+        instructs it to call submit_review_verdict; this action prompt must no
+        longer also tell it to "output pure JSON" — that would contradict the
+        frozen CONTRACT and leave the agent unsure which channel to use.
+        """
+        prompt = _build_reviewer_prompt('diff')
+        assert 'Output your review as pure JSON' not in prompt
+
 
 class TestReviewSchema:
+    """REVIEW_SCHEMA is retained as the documented shape of a verdict's
+    payload (task 2493) even though it's no longer passed to invoke_agent
+    as output_schema.
+    """
+
     def test_required_fields(self) -> None:
         assert set(REVIEW_SCHEMA['required']) == {'reviewer', 'verdict', 'issues', 'summary'}
 
@@ -78,12 +153,117 @@ class TestPanelRunResult:
         assert result.errors == []
 
 
+class TestRunSingleReviewerLiveTransport:
+    """(b)/(c): _run_single_reviewer emits via the live verdict-tools
+    transport and reads its result back from the verdict artifact, with a
+    fail-safe ERROR disposition when no valid verdict was produced —
+    mirrors workflow.TaskWorkflow._run_reviewer's read+fail-safe contract.
+    """
+
+    @pytest.mark.asyncio
+    async def test_valid_verdict_returns_review_keyed_by_spec_name(self, tmp_path) -> None:
+        spec = ReviewerSpec(name='r1', model='sonnet', specialization='Testing.')
+        diff = CorpusDiff(
+            diff_id='d1', language='python', source='synthetic',
+            diff_text='diff', description='Test', ground_truth=[],
+        )
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(verdict='PASS'),
+        ):
+            name, review, cost = await _run_single_reviewer(spec, diff, meta_root=tmp_path)
+
+        assert name == 'r1'
+        assert review is not None
+        assert review['verdict'] in {'PASS', 'ISSUES_FOUND'}
+        assert review['reviewer'] == 'reviewer_r1'
+        assert cost == 0.50
+        # The verdict path is directly observable at the injected meta_root.
+        assert (tmp_path / 'verdicts' / 'reviewer_r1.json').exists()
+
+    @pytest.mark.asyncio
+    async def test_issues_found_verdict_also_accepted(self, tmp_path) -> None:
+        spec = ReviewerSpec(name='r1', model='sonnet', specialization='Testing.')
+        diff = CorpusDiff(
+            diff_id='d1', language='python', source='synthetic',
+            diff_text='diff', description='Test', ground_truth=[],
+        )
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(verdict='ISSUES_FOUND'),
+        ):
+            _name, review, _cost = await _run_single_reviewer(spec, diff, meta_root=tmp_path)
+
+        assert review['verdict'] == 'ISSUES_FOUND'
+
+    @pytest.mark.asyncio
+    async def test_missing_verdict_yields_error_disposition(self, tmp_path) -> None:
+        """A stub that writes NO verdict (agent never called
+        submit_review_verdict) must degrade to the {verdict: 'ERROR'}
+        disposition rather than raise or hang.
+        """
+        spec = ReviewerSpec(name='r1', model='sonnet', specialization='Testing.')
+        diff = CorpusDiff(
+            diff_id='d1', language='python', source='synthetic',
+            diff_text='diff', description='Test', ground_truth=[],
+        )
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(write=False),
+        ):
+            name, review, _cost = await _run_single_reviewer(spec, diff, max_retries=1, meta_root=tmp_path)
+
+        assert name == 'r1'
+        assert review is not None
+        assert review['verdict'] == 'ERROR'
+
+    @pytest.mark.asyncio
+    async def test_unsuccessful_result_yields_error_even_if_verdict_written(self, tmp_path) -> None:
+        """An invocation failure (crash / max_turns / budget exhaustion) is
+        untrusted even if it happened to write a verdict before failing
+        (mirrors workflow._run_reviewer's I-FAIL-SAFE handling).
+        """
+        spec = ReviewerSpec(name='r1', model='sonnet', specialization='Testing.')
+        diff = CorpusDiff(
+            diff_id='d1', language='python', source='synthetic',
+            diff_text='diff', description='Test', ground_truth=[],
+        )
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(verdict='PASS', success=False),
+        ):
+            _name, review, _cost = await _run_single_reviewer(spec, diff, max_retries=1, meta_root=tmp_path)
+
+        assert review['verdict'] == 'ERROR'
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_fresh_meta_root_when_uninjected(self) -> None:
+        """Production never injects meta_root — _run_single_reviewer must
+        still work, generating its own fresh temp dir per invocation.
+        """
+        spec = ReviewerSpec(name='r1', model='sonnet', specialization='Testing.')
+        diff = CorpusDiff(
+            diff_id='d1', language='python', source='synthetic',
+            diff_text='diff', description='Test', ground_truth=[],
+        )
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(verdict='PASS'),
+        ):
+            name, review, _cost = await _run_single_reviewer(spec, diff)
+
+        assert name == 'r1'
+        assert review['verdict'] == 'PASS'
+
+
 class TestRunPanel:
     @pytest.mark.asyncio
-    async def test_single_reviewer_structured_output(self) -> None:
-        review = _make_review('r1', 'PASS')
-        mock_result = _make_result(structured=review)
-
+    async def test_single_reviewer_live_verdict(self) -> None:
         variant = VariantConfig(
             name='test_variant',
             description='Test',
@@ -100,8 +280,10 @@ class TestRunPanel:
             ground_truth=[],
         )
 
-        with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = mock_result
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(verdict='PASS'),
+        ):
             result = await run_panel(variant, diff, stagger_secs=0)
 
         assert result.variant_name == 'test_variant'
@@ -130,15 +312,10 @@ class TestRunPanel:
             ground_truth=[],
         )
 
-        call_count = 0
-
-        async def mock_invoke(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            name = f'r{call_count}'
-            return _make_result(structured=_make_review(name))
-
-        with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', side_effect=mock_invoke):
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(verdict='PASS'),
+        ):
             result = await run_panel(variant, diff, stagger_secs=0)
 
         assert len(result.reviews) == 2
@@ -173,12 +350,14 @@ class TestRunPanel:
         assert 'r1' not in result.reviews
 
     @pytest.mark.asyncio
-    async def test_json_fallback_when_no_structured_output(self) -> None:
-        review = _make_review('r1', 'ISSUES_FOUND')
-        mock_result = _make_result(output=json.dumps(review))
-
+    async def test_missing_verdict_recorded_as_error_review_not_absence(self) -> None:
+        """A reviewer that never calls submit_review_verdict still produces
+        a (non-None) {verdict: 'ERROR'} review — mirrors production's
+        _run_reviewer, which always writes SOME review (never drops the
+        reviewer from the aggregation entirely).
+        """
         variant = VariantConfig(
-            name='json_test',
+            name='no_verdict_test',
             description='Test',
             reviewers=[
                 ReviewerSpec(name='r1', model='sonnet', specialization='S.'),
@@ -193,12 +372,15 @@ class TestRunPanel:
             ground_truth=[],
         )
 
-        with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = mock_result
-            result = await run_panel(variant, diff, stagger_secs=0)
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(write=False),
+        ):
+            result = await run_panel(variant, diff, stagger_secs=0, max_retries=1)
 
         assert 'r1' in result.reviews
-        assert result.reviews['r1']['verdict'] == 'ISSUES_FOUND'
+        assert result.reviews['r1']['verdict'] == 'ERROR'
+        assert result.errors == []
 
 
 class TestRunnerCrossFamilyThreading:
