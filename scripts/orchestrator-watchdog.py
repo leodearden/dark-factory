@@ -647,6 +647,47 @@ def main() -> None:
             log(f"watchdog error for {unit} (port {port}): {exc}")
 
 
+def fused_memory_liveness_pass() -> None:
+    """Probe fused-memory.service liveness; restart it if the verdict isn't 'healthy'.
+
+    Single-unit analogue of main()'s per-unit body, targeting FUSED_MEMORY_UNIT
+    only — fused-memory is deliberately NOT added to WATCHED (see the
+    module-level comment above FUSED_MEMORY_UNIT's definition), since both
+    WATCHED and main()'s loop are pinned by exact-equality drift tests. This
+    sibling pass reuses is_unit_enabled + STARTUP_GRACE_SECS gating verbatim
+    from main(), and _fused_memory_liveness_verdict() (B2) for the combined
+    port+/health verdict.
+
+    Both 'port-down' and 'wedged' trigger a restart via restart_unit() called
+    DIRECTLY — uncapped, with no fleet-deploy clock and no delegation to
+    restart-all-orchestrators.sh (I5: brokenness is not a scheduled deploy),
+    exactly like main()'s wedged-orchestrator revive path.
+
+    Wrapped in a single try/except Exception (mirroring main()'s per-unit
+    isolation) so a probe/verdict failure is logged and swallowed rather than
+    raising — a hiccup here must never crash the oneshot watchdog or prevent
+    staleness_pass() from running afterward.
+    """
+    try:
+        if not is_unit_enabled(FUSED_MEMORY_UNIT):
+            # Disabled (or unknown) — respect operator intent, skip silently.
+            return
+        elapsed = _unit_start_elapsed_secs(FUSED_MEMORY_UNIT)
+        if elapsed is not None and elapsed < STARTUP_GRACE_SECS:
+            log(
+                f"{FUSED_MEMORY_UNIT} started {elapsed:.0f}s ago; "
+                f"skipping probe (grace window {STARTUP_GRACE_SECS}s)"
+            )
+            return
+        verdict = _fused_memory_liveness_verdict()
+        if verdict != "healthy":
+            log(f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}'; restarting")
+            restart_unit(FUSED_MEMORY_UNIT)
+            log(f"{FUSED_MEMORY_UNIT} restart issued")
+    except Exception as exc:  # noqa: BLE001
+        log(f"watchdog error for {FUSED_MEMORY_UNIT} (port {FUSED_MEMORY_PORT}): {exc}")
+
+
 def _delegate_fleet_restart() -> None:
     """Delegate a fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain.
 
@@ -919,17 +960,19 @@ def _cli(argv: list[str] | None = None) -> int:
 
     With no ``argv`` argument, reads ``sys.argv[1:]``. If ``--report`` is
     present, runs ONLY the read-only report() and returns its exit code
-    (0 = all fresh, 1 = at least one stale unit) — main() and
-    staleness_pass() are not invoked, so this path never mutates systemd
-    state (I7 at the CLI boundary). Otherwise runs the existing liveness
-    main() followed by staleness_pass() (the timer path) and returns 0.
-    Unknown flags are not treated as an error — they fall through to the
-    timer path.
+    (0 = all fresh, 1 = at least one stale unit) — main(),
+    fused_memory_liveness_pass(), and staleness_pass() are not invoked, so
+    this path never mutates systemd state (I7 at the CLI boundary).
+    Otherwise runs the existing liveness main(), then
+    fused_memory_liveness_pass() (B3), then staleness_pass() (the timer
+    path) and returns 0. Unknown flags are not treated as an error — they
+    fall through to the timer path.
     """
     argv = sys.argv[1:] if argv is None else argv
     if "--report" in argv:
         return report()
     main()
+    fused_memory_liveness_pass()
     staleness_pass()
     return 0
 
