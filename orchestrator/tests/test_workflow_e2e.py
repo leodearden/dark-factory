@@ -8151,6 +8151,61 @@ class TestBuildAgentEnvRoleOverrides:
         assert env is not None
         assert env.get('ANTHROPIC_BASE_URL') == 'role'
 
+    async def test_role_override_colliding_with_infra_key_warns(
+        self, config, git_ops, task_assignment, tmp_path, caplog,
+    ):
+        """A role_env_overrides entry that clobbers an infra-provided key
+        (e.g. CARGO_MAKEFLAGS from the jobserver) still wins -- merge order
+        is unchanged -- but logs a WARNING naming the colliding key and
+        role, so an operator adding an endpoint env to a build role doesn't
+        silently break the jobserver/cpu-governance/REIFY_DEBUG_PORT wiring
+        (amendment: robustness_infra_env_clobber)."""
+        import logging as _logging
+
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+        workflow.config.role_env_overrides = {
+            'architect': {'CARGO_MAKEFLAGS': 'clobbered-value'},
+        }
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.workflow'):
+            env = workflow._build_agent_env(ARCHITECT)
+
+        assert env is not None
+        assert env.get('CARGO_MAKEFLAGS') == 'clobbered-value'
+        warned = [
+            r for r in caplog.records
+            if 'overrides infra-provided' in r.getMessage() and 'CARGO_MAKEFLAGS' in r.getMessage()
+        ]
+        assert warned, (
+            f"Expected a WARNING naming the CARGO_MAKEFLAGS collision for "
+            f"'architect'; got: {[r.getMessage() for r in caplog.records]}"
+        )
+
+    async def test_role_override_without_collision_does_not_warn(
+        self, config, git_ops, task_assignment, tmp_path, caplog,
+    ):
+        """No infra-key collision -> no clobber WARNING (the common case,
+        e.g. ANTHROPIC_BASE_URL, stays quiet)."""
+        import logging as _logging
+
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+        workflow.config.role_env_overrides = {
+            'architect': {'ANTHROPIC_BASE_URL': 'https://api.z.ai/api/anthropic'},
+        }
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.workflow'):
+            env = workflow._build_agent_env(ARCHITECT)
+
+        assert env is not None
+        assert env.get('ANTHROPIC_BASE_URL') == 'https://api.z.ai/api/anthropic'
+        assert not [r for r in caplog.records if 'overrides infra-provided' in r.getMessage()]
+
 
 # ---------------------------------------------------------------------------
 # Tests: _build_spawn_env (CLAUDE_SPAWN_* identity vars, task 2512)
