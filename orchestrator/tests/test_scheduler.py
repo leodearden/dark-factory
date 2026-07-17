@@ -10107,6 +10107,78 @@ class TestGetTasksStatusesParam:
 
 
 # ---------------------------------------------------------------------------
+# task 2704 step-1 RED: get_tasks(distinguish_failure=True) must return None
+# on a read FAILURE, distinct from a genuine empty result (survey finding C3).
+# ---------------------------------------------------------------------------
+
+class TestGetTasksDistinguishFailure:
+    """get_tasks(distinguish_failure=True) returns None on a read FAILURE,
+    distinguishable from a genuine empty task list (survey finding C3).
+
+    Without the flag (default), the legacy fail-safe ``[]`` is preserved so
+    all 8 existing callers (scheduler.py:2016, harness.py:1967/1995/5974/8946,
+    cli.py:329, workflow.py:1470/9959) stay byte-identical.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
+
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_raise_distinguish_failure_true_returns_none(self, scheduler: Scheduler):
+        """A dispatch_tool exception with distinguish_failure=True returns None, not []."""
+        scheduler.dispatch_tool = AsyncMock(side_effect=RuntimeError('fm unreachable'))
+        assert await scheduler.get_tasks(distinguish_failure=True) is None
+
+    @pytest.mark.asyncio
+    async def test_raise_legacy_default_returns_empty_list(self, scheduler: Scheduler):
+        """Without the flag, the same exception still returns [] (legacy fail-safe)."""
+        scheduler.dispatch_tool = AsyncMock(side_effect=RuntimeError('fm unreachable'))
+        assert await scheduler.get_tasks() == []
+
+    @pytest.mark.asyncio
+    async def test_malformed_result_distinguish_failure_true_returns_none(
+        self, scheduler: Scheduler
+    ):
+        """A structured parse failure (non-list 'tasks') with the flag returns None."""
+        scheduler.dispatch_tool = AsyncMock(
+            return_value=self._envelope({'tasks': {'not': 'a-list'}})
+        )
+        assert await scheduler.get_tasks(distinguish_failure=True) is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_result_legacy_default_returns_empty_list(
+        self, scheduler: Scheduler
+    ):
+        """Without the flag, the same parse failure still returns [] (legacy fail-safe)."""
+        scheduler.dispatch_tool = AsyncMock(
+            return_value=self._envelope({'tasks': {'not': 'a-list'}})
+        )
+        assert await scheduler.get_tasks() == []
+
+    @pytest.mark.asyncio
+    async def test_genuine_empty_returns_empty_list_regardless_of_flag(
+        self, scheduler: Scheduler
+    ):
+        """A genuine empty task list is NOT a failure — [] either way."""
+        scheduler.dispatch_tool = AsyncMock(return_value=self._envelope({'tasks': []}))
+        assert await scheduler.get_tasks() == []
+        assert await scheduler.get_tasks(distinguish_failure=True) == []
+
+
+# ---------------------------------------------------------------------------
 # step-3 RED: acquire_next() calls get_tasks with ACTIVE_TASK_STATUSES
 # ---------------------------------------------------------------------------
 
