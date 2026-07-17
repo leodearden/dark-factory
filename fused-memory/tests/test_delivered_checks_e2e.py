@@ -96,6 +96,11 @@ _CAPABILITY_TOKEN = 'ZETA_CAPABILITY_TOKEN_V1'
 _MARKER_REL_PATH = 'src/marker.py'
 _DEPENDENT_REL_PATH = 'src/dependent_target.py'
 
+# Headline part B (step-3): the grace_cycles used by the withhold->escalate
+# arc, set explicitly for tick-count determinism (not relying on whatever
+# DeliveredChecksConfig's own default happens to be).
+_GRACE_CYCLES = 3
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Rig helpers
@@ -328,3 +333,56 @@ class TestHeadline:
         assert producer_task['status'] == 'pending'
         dependent_task = await _get_task(server, project_root, dependent_id)
         assert dependent_task['status'] == 'pending'
+
+        # --- Headline part B (step-3): rows 4+5 -----------------------------
+        # Scope-cut: flip the producer straight to 'done' via the product
+        # write path while the capability token is still absent from main.
+        # A real orchestrator Harness/Scheduler (delegating _mcp_session onto
+        # this SAME live backend + a real EscalationQueue) then ticks:
+        # ticks 1..G-1 must withhold dispatch with no L2 filed yet; tick G
+        # must file exactly one born-at-L2 escalation naming the failed
+        # check, the producer's dep id, and the main SHA, and the dependent
+        # must be 'blocked'.
+        harness = _build_harness(
+            project_root, server, project_root / 'escalations',
+            grace_cycles=_GRACE_CYCLES,
+        )
+
+        await _flip_status(server, project_root, producer_id, 'done')
+
+        for tick in range(1, _GRACE_CYCLES):
+            result = await _run_tick(harness)
+            assert result is None, (
+                f'tick {tick}: dep-done-with-failing-check must withhold '
+                f'dispatch of the dependent; got {result!r}'
+            )
+            assert _l2_for(harness, dependent_id) == [], (
+                f'tick {tick}: no L2 escalation must exist before grace_cycles '
+                f'({_GRACE_CYCLES}) is reached'
+            )
+
+        # Tick G: born-at-L2 escalation fires naming the exact failed check;
+        # the dependent is not dispatched and is now blocked.
+        result = await _run_tick(harness)
+        assert result is None, (
+            f'tick {_GRACE_CYCLES}: dependent must still not be dispatched; '
+            f'got {result!r}'
+        )
+
+        escs = _l2_for(harness, dependent_id)
+        assert len(escs) == 1, (
+            f'expected exactly one pending born-at-L2 escalation for the '
+            f'dependent on tick {_GRACE_CYCLES}; got {escs!r}'
+        )
+        esc = escs[0]
+        assert 'DEP_CAPABILITY_NOT_DELIVERED' in esc.summary, esc.summary
+        assert _CAPABILITY_NAME in esc.summary, esc.summary
+        assert producer_id in esc.summary, esc.summary
+        main_sha = _run_git(project_root, 'rev-parse', 'main').stdout.strip()
+        assert main_sha[:12] in esc.summary, (
+            f'expected main sha prefix {main_sha[:12]!r} in summary; '
+            f'got {esc.summary!r}'
+        )
+
+        dependent_after_block = await _get_task(server, project_root, dependent_id)
+        assert dependent_after_block['status'] == 'blocked'
