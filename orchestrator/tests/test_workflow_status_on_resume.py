@@ -707,6 +707,89 @@ class TestSetTaskScope:
 
 
 # ---------------------------------------------------------------------------
+# _check_scope_invariant — plan.files vs metadata.files tripwire (task 2505)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCheckScopeInvariant:
+    """Unit tests for ``TaskWorkflow._check_scope_invariant`` — the MERGE-entry
+    tripwire that surfaces a plan.files/metadata.files divergence with a
+    WARNING + infra_issue escalation, fail-safe when the task can't be read.
+    """
+
+    def _build(self, config, git_ops, task_assignment, tmp_path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        scheduler = FakeScheduler()
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=scheduler,  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=FakeMcp(),  # type: ignore[arg-type]
+            escalation_queue=queue,
+        )
+        return workflow, scheduler, queue
+
+    async def test_divergent_plan_and_metadata_files_escalates(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        workflow, scheduler, queue = self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow.plan = {'files': ['a.py', 'b.py']}
+        scheduler.task_data[task_assignment.task_id] = {
+            'id': task_assignment.task_id,
+            'metadata': {'files': ['a.py']},
+        }
+
+        await workflow._check_scope_invariant()
+
+        pending = queue.get_by_task(task_assignment.task_id, status='pending')
+        infra_issues = [e for e in pending if e.category == 'infra_issue']
+        assert infra_issues, (
+            'expected an infra_issue escalation for the plan/metadata files '
+            f'divergence; pending escalations: {pending!r}'
+        )
+
+    async def test_consistent_plan_and_metadata_files_no_escalation(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        workflow, scheduler, queue = self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow.plan = {'files': ['a.py', 'b.py']}
+        scheduler.task_data[task_assignment.task_id] = {
+            'id': task_assignment.task_id,
+            'metadata': {'files': ['a.py', 'b.py']},
+        }
+
+        await workflow._check_scope_invariant()
+
+        assert queue.get_by_task(task_assignment.task_id, status='pending') == [], (
+            'no escalation should be filed when plan.files and '
+            'metadata.files already agree'
+        )
+
+    async def test_get_task_none_is_fail_safe_no_escalation_no_raise(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        workflow, scheduler, queue = self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow.plan = {'files': ['a.py', 'b.py']}
+        # scheduler.task_data intentionally left empty -> get_task() -> None.
+
+        await workflow._check_scope_invariant()  # must not raise
+
+        assert queue.get_by_task(task_assignment.task_id, status='pending') == [], (
+            'an unreadable task must be treated as "cannot check", not '
+            '"divergent" — no escalation on a transient read failure'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Regression: workflow passes real prompt (not 'continue') to invoke_with_cap_retry
 # ---------------------------------------------------------------------------
 
