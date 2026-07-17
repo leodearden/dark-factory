@@ -2975,6 +2975,14 @@ class OrchestratorConfig(BaseSettings):
     # Environment overrides forwarded to agent invocations
     env_overrides: dict[str, str] = Field(default_factory=dict)
 
+    # Per-role OPT-IN endpoint-env map (e.g. ANTHROPIC_BASE_URL /
+    # ANTHROPIC_AUTH_TOKEN), keyed on role.name. Empty by default. A role
+    # absent from this map receives NO endpoint env from it — forwarding is
+    # opt-in per role, not a global broadcast, so pointing (say) the judge at
+    # an alternate Claude-compatible endpoint requires explicitly naming
+    # 'judge' here. See _build_agent_env (workflow.py).
+    role_env_overrides: dict[str, dict[str, str]] = Field(default_factory=dict)
+
     # Project
     project_root: Path = Field(default=Path('.'))
 
