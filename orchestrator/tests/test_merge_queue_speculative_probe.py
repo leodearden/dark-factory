@@ -39,7 +39,6 @@ import asyncio
 import collections
 import math
 from pathlib import Path
-from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -228,6 +227,47 @@ class TestSelectProbeDepthFrequencyAndCycling:
         # (period=10 at fraction=0.1, so firings land at round_index
         # 0,10,20,... -- probe_index advances by 1 each firing).
         assert fired[:4] == probe_depths
+
+
+class TestSelectProbeDepthFrequencyBoundMidRange:
+    """Amendment (reviewer_comprehensive, task 2359): the frequency gate's
+    docstring guarantees firing rate <= probe_fraction for EVERY fraction,
+    not just the fraction=0.1/1.0 corners the tests above happen to cover.
+
+    ``period = max(1, round(1 / probe_fraction))`` broke that bound across a
+    wide mid-to-high range -- e.g. fraction=0.4 rounds ``1/0.4``=2.5 DOWN to
+    period 2 (50% observed firing, not <=40%), and fraction in [0.67, 1.0)
+    rounds down to period 1 (100% firing). ``math.ceil`` fixes this: period
+    is always >= 1/probe_fraction, so the observed rate can never exceed the
+    requested fraction. Parametrized over the exact mid-range fractions the
+    reviewer called out (0.3, 0.4, 0.5, 0.7).
+    """
+
+    @pytest.mark.parametrize('probe_fraction', [0.3, 0.4, 0.5, 0.7])
+    def test_observed_firing_rate_never_exceeds_fraction(self, probe_fraction):
+        from orchestrator.merge_queue import select_probe_depth
+
+        n_rounds = 1000
+        fired = [
+            d for d in (
+                select_probe_depth(
+                    probe_fraction=probe_fraction,
+                    probe_depths=[2],
+                    round_index=i,
+                    available_built_depth=99,
+                    recent_fail_rate=None,
+                    suppress_flake_rate=0.30,
+                )
+                for i in range(n_rounds)
+            )
+            if d is not None
+        ]
+
+        observed_rate = len(fired) / n_rounds
+        assert observed_rate <= probe_fraction, (
+            f'probe_fraction={probe_fraction}: observed firing rate '
+            f'{observed_rate} exceeds the requested bound'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -457,16 +497,6 @@ class TestRecentVerifyFailRate:
 # ---------------------------------------------------------------------------
 
 
-def _sentinel_entry() -> InflightEntry:
-    """Opaque, identity-only stand-in for a real ``InflightEntry``.
-
-    Copied from test_merge_queue_depth_telemetry.py's ``_sentinel_entry``
-    (per-file duplication convention): tests below only care about the
-    *count* of frozen entries, never their fields.
-    """
-    return cast(InflightEntry, object())
-
-
 def _make_spec_item(*, speculative: bool) -> RealMergeItem:
     """Build a minimal RealMergeItem for _available_built_depth() tests.
 
@@ -497,6 +527,61 @@ def _make_decided_item() -> DecidedItem:
     )
 
 
+def _make_frozen_decided_entry() -> InflightEntry:
+    """Wrap a :func:`_make_decided_item` passthrough in an InflightEntry.
+
+    Amendment (reviewer_comprehensive, task 2359): in real operation
+    ``_frozen_inflight_entries()`` never actually yields a passthrough (its
+    own docstring excludes them), but ``_available_built_depth()`` must not
+    assume that -- it should apply the exact same type/commit predicate on
+    the frozen scan as it does on the queue scan, so a hypothetical
+    passthrough landing here is provably as inert as one in the queue (see
+    ``test_decided_passthrough_in_queue_not_counted`` below).
+    """
+    return InflightEntry(
+        item=_make_decided_item(), lease=None, verify_task=MagicMock(),
+        merge_wt=None, was_speculative=False,
+    )
+
+
+def _make_frozen_commitless_entry() -> InflightEntry:
+    """A frozen entry wrapping a RealMergeItem with a falsy merge_commit.
+
+    Amendment (reviewer_comprehensive, task 2359): locks the invariant that
+    ``_available_built_depth()`` and ``_built_depth_tip()`` apply IDENTICAL
+    predicates. Before this amendment, ``_available_built_depth()`` counted
+    frozen entries unconditionally (no ``isinstance``/commit check at all),
+    so a commit-less frozen entry like this one would have inflated the
+    count past what ``_built_depth_tip()`` (which DOES require a truthy
+    commit) could actually resolve -- silently mis-walking a probe onto the
+    wrong (shallower) commit rather than failing closed. See
+    ``test_commitless_real_item_in_frozen_not_counted`` below.
+    """
+    item = RealMergeItem(
+        request=MagicMock(),
+        merge_result=MagicMock(merge_commit=''),
+        merge_wt=Path('_merge-x'),
+        base_sha='aabbccdd00000000aaaa',
+        speculative=True,
+    )
+    return InflightEntry(
+        item=item, lease=None, verify_task=MagicMock(), merge_wt=None,
+        was_speculative=True,
+    )
+
+
+def _make_commitless_spec_item() -> RealMergeItem:
+    """A queued RealMergeItem with a falsy merge_commit (mirrors
+    :func:`_make_frozen_commitless_entry` for the queue-side scan)."""
+    return RealMergeItem(
+        request=MagicMock(),
+        merge_result=MagicMock(merge_commit=''),
+        merge_wt=Path('_merge-x'),
+        base_sha='aabbccdd00000000aaaa',
+        speculative=True,
+    )
+
+
 class TestAvailableBuiltDepth:
     """SpeculativeMergeWorker._available_built_depth() -- the deepest
     already-built (merged) speculative cumulative stack depth: frozen/
@@ -514,12 +599,16 @@ class TestAvailableBuiltDepth:
 
     def test_frozen_only_returns_frozen_count(self):
         worker = _make_bare_worker()
-        worker._frozen_inflight_entries = lambda: [_sentinel_entry() for _ in range(3)]
+        worker._frozen_inflight_entries = lambda: [
+            _make_frozen_entry(f'commit-{i}') for i in range(3)
+        ]
         assert worker._available_built_depth() == 3
 
     def test_frozen_plus_queued_speculative_sums(self):
         worker = _make_bare_worker()
-        worker._frozen_inflight_entries = lambda: [_sentinel_entry() for _ in range(3)]
+        worker._frozen_inflight_entries = lambda: [
+            _make_frozen_entry(f'commit-{i}') for i in range(3)
+        ]
         for _ in range(2):
             worker._verifier_queue.put_nowait(_make_spec_item(speculative=True))
         assert worker._available_built_depth() == 5
@@ -531,6 +620,34 @@ class TestAvailableBuiltDepth:
         worker = _make_bare_worker()
         worker._frozen_inflight_entries = lambda: []
         worker._verifier_queue.put_nowait(_make_decided_item())
+        assert worker._available_built_depth() == 0
+
+    def test_decided_passthrough_in_frozen_not_counted(self):
+        """Amendment (reviewer_comprehensive, task 2359): mirrors the
+        queue-side passthrough test above -- a passthrough sitting in the
+        FROZEN scan must be equally inert, locking the two scans' predicate
+        parity.
+        """
+        worker = _make_bare_worker()
+        worker._frozen_inflight_entries = lambda: [_make_frozen_decided_entry()]
+        assert worker._available_built_depth() == 0
+
+    def test_commitless_real_item_in_frozen_not_counted(self):
+        """Amendment (reviewer_comprehensive, task 2359): a RealMergeItem
+        with an empty merge_commit must not be counted, matching
+        _built_depth_tip()'s truthy-commit requirement -- otherwise
+        select_probe_depth() could accept a depth this method claims is
+        available but _built_depth_tip() cannot actually resolve.
+        """
+        worker = _make_bare_worker()
+        worker._frozen_inflight_entries = lambda: [_make_frozen_commitless_entry()]
+        assert worker._available_built_depth() == 0
+
+    def test_commitless_real_item_in_queue_not_counted(self):
+        """Queue-side counterpart of the frozen-side test above."""
+        worker = _make_bare_worker()
+        worker._frozen_inflight_entries = lambda: []
+        worker._verifier_queue.put_nowait(_make_commitless_spec_item())
         assert worker._available_built_depth() == 0
 
     def test_none_sentinel_in_queue_not_counted(self):
@@ -547,6 +664,32 @@ class TestAvailableBuiltDepth:
         worker._available_built_depth()
         assert worker._verifier_queue.qsize() == 1
 
+    def test_lockstep_with_built_depth_tip_across_mixed_entries(self):
+        """Amendment (reviewer_comprehensive, task 2359): the core
+        lockstep invariant -- for ANY mix of real/commit-less/passthrough
+        entries, whatever _available_built_depth() reports must be exactly
+        what _built_depth_tip() can walk to (never None, never a
+        mis-resolved shallower commit). Mixes a commit-less frozen entry
+        and a passthrough BEFORE the two genuine built entries to prove the
+        walk in _built_depth_tip() and the count in
+        _available_built_depth() skip the same non-counting entries in the
+        same order.
+        """
+        worker = _make_bare_worker()
+        worker._frozen_inflight_entries = lambda: [
+            _make_frozen_commitless_entry(),
+            _make_frozen_decided_entry(),
+            _make_frozen_entry('commit-depth-1'),
+            _make_frozen_entry('commit-depth-2'),
+        ]
+        worker._verifier_queue.put_nowait(_make_commitless_spec_item())
+
+        available = worker._available_built_depth()
+
+        assert available == 2
+        assert worker._built_depth_tip(available) == 'commit-depth-2'
+        assert worker._built_depth_tip(1) == 'commit-depth-1'
+
 
 # ---------------------------------------------------------------------------
 # step-13 RED / step-14 GREEN: SpeculativeMergeWorker._probe_verify_placement()
@@ -559,11 +702,13 @@ def _make_frozen_entry(
     """Build a frozen InflightEntry wrapping a REAL RealMergeItem with a
     known merge_commit.
 
-    Unlike ``_sentinel_entry()`` (identity-only, used where only the
-    *count* of frozen entries matters -- e.g. TestAvailableBuiltDepth
-    above), ``_probe_verify_placement()``'s depth-d tip resolution needs a
-    real commit string to resolve and return, so this builds a minimally
-    real RealMergeItem instead of an opaque sentinel.
+    Used both by TestAvailableBuiltDepth above (a real, distinct commit per
+    entry -- required since task 2359's amendment made
+    ``_available_built_depth()`` apply the same truthy-commit predicate as
+    ``_built_depth_tip()``, so an opaque identity-only sentinel would no
+    longer count) and by ``_probe_verify_placement()``'s depth-d tip
+    resolution below, which needs a real commit string to resolve and
+    return.
 
     *base_sha* defaults to a fixed constant (sufficient when callers only
     care about the entry's merge_commit / count); pass an explicit value to

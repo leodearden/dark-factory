@@ -16,6 +16,7 @@ import collections
 import contextlib
 import dataclasses
 import logging
+import math
 import os
 import shutil
 import time
@@ -5737,10 +5738,16 @@ def select_probe_depth(
          ``probe_index`` is derived from ``round_index``, not from a
          separate advancing counter). A ``None`` fail rate (no rolling-
          window data yet) never suppresses.
-      3. Deterministic frequency gate: ``period = max(1, round(1 /
+      3. Deterministic frequency gate: ``period = max(1, math.ceil(1 /
          probe_fraction))``; a round only fires when ``round_index % period
-         == 0``. This bounds the firing rate at <= probe_fraction with no
-         RNG/seed plumbing -- reproducible in unit tests by construction.
+         == 0``. ``ceil`` (not ``round``) is required for the firing rate to
+         actually stay <= probe_fraction: ``1/period <= probe_fraction`` iff
+         ``period >= 1/probe_fraction``, which ``ceil`` guarantees for every
+         fraction in (0, 1]. ``round`` would violate the bound across a wide
+         mid-to-high range -- e.g. fraction=0.4 rounds ``1/0.4``=2.5 DOWN to
+         period 2 (50% firing, not 40%), and fraction=0.7 rounds ``1/0.7``
+         ~= 1.43 down to period 1 (100% firing, not 70%). No RNG/seed
+         plumbing -- reproducible in unit tests by construction.
       4. Depth cycling: on a firing round, ``probe_index = round_index //
          period`` selects ``probe_depths[probe_index % len(probe_depths)]``,
          so consecutive firings advance through *probe_depths* in order
@@ -5758,7 +5765,7 @@ def select_probe_depth(
         return None
     if recent_fail_rate is not None and recent_fail_rate >= suppress_flake_rate:
         return None
-    period = max(1, round(1 / probe_fraction))
+    period = max(1, math.ceil(1 / probe_fraction))
     if round_index % period != 0:
         return None
     probe_index = round_index // period
@@ -7521,18 +7528,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     def _available_built_depth(self) -> int:
         """Return the deepest already-built speculative cumulative stack depth.
 
-        = ``len(_frozen_inflight_entries())`` (already frozen/verifying --
-        each entry one level of the cumulative stack) + the count of
-        :class:`RealMergeItem` entries sitting BUILT-BUT-UNVERIFIED in
+        Counts frozen/verifying entries (:meth:`_frozen_inflight_entries`)
+        plus :class:`RealMergeItem` entries sitting BUILT-BUT-UNVERIFIED in
         ``_verifier_queue`` (merged by the Merger, not yet dispatched to a
         verify runner). These queued items extend the SAME chain one level
         further each, since every speculative merge is built against its
-        predecessor's already-computed merge commit -- exactly mirroring
-        how :meth:`_verify_frontier_depth` counts frozen entries without
-        filtering on ``.speculative`` (the first entry in a chain may
-        itself be the non-speculative head).
+        predecessor's already-computed merge commit.
 
         ``0`` when nothing is built (empty frontier, empty queue).
+
+        AMENDMENT (reviewer_comprehensive, task 2359): applies the EXACT
+        SAME predicate as :meth:`_built_depth_tip` to both scans --
+        ``isinstance(entry_or_item, RealMergeItem)`` AND a truthy
+        ``merge_result.merge_commit`` -- so the two methods are provably in
+        lockstep. Previously this method counted frozen entries via a bare
+        ``len(_frozen_inflight_entries())`` (no type/commit filter at all)
+        and queued entries via ``isinstance`` alone (no commit-truthiness
+        check), while :meth:`_built_depth_tip` required BOTH on both scans.
+        A frozen or queued entry that is a non-:class:`RealMergeItem`
+        passthrough, or a :class:`RealMergeItem` with an empty/``None``
+        ``merge_commit``, would inflate this method's count past what
+        :meth:`_built_depth_tip` can actually resolve -- a depth accepted by
+        ``select_probe_depth()``'s availability guard could then walk past
+        the commit-less entry and resolve to the WRONG (shallower) commit
+        instead of failing closed, silently mislabelling a probe's
+        ``merge_verify`` telemetry with an incorrect base commit. Matching
+        predicates exactly makes that divergence structurally impossible.
 
         :class:`DecidedItem` passthroughs (conflict / already_merged /
         etc.) and the ``None`` shutdown sentinel never extend the chain --
@@ -7546,9 +7567,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Pure/synchronous (no await).
         """
-        depth = len(self._frozen_inflight_entries())
+        depth = 0
+        for entry in self._frozen_inflight_entries():
+            if isinstance(entry.item, RealMergeItem) and entry.item.merge_result.merge_commit:
+                depth += 1
         for vq_item in self._verifier_queue._queue:  # type: ignore[attr-defined]
-            if isinstance(vq_item, RealMergeItem):
+            if isinstance(vq_item, RealMergeItem) and vq_item.merge_result.merge_commit:
                 depth += 1
         return depth
 
