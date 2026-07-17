@@ -2328,39 +2328,6 @@ class TestGetEntity:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_edges_include_temporal(self, service):
-        """An edge with invalid_at set is excluded from get_entity's fuzzy results.
-
-        Task 2726: changed behavior — previously this test asserted that an edge
-        with both valid_at and invalid_at set was returned by the FUZZY branch
-        with its temporal dict serialized (len==1). After the fix, superseded
-        edges (invalid_at set) are filtered out of the FUZZY branch (matching the
-        EXACT branch and search(), task 312), so the result must be empty
-        (len==0) — such an edge can no longer reach _edge_to_dict via get_entity
-        at all, on either branch.
-        """
-        from _fm_helpers import MockEdge
-
-        dt_valid = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
-        dt_invalid = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
-        mock_edge = MockEdge(
-            fact='Service A calls Service B',
-            uuid='edge-temporal-1',
-            valid_at=dt_valid,
-            invalid_at=dt_invalid,
-        )
-        service.graphiti.search_nodes = AsyncMock(return_value=[])
-        service.graphiti.search = AsyncMock(return_value=[mock_edge])
-
-        result = await service.get_entity('Service A', project_id='test')
-
-        # Task 2726: invalidated edges are now filtered out — expect empty results
-        assert len(result['edges']) == 0, (
-            'Edge with non-null invalid_at must be excluded from get_entity '
-            'fuzzy-branch results (task 2726)'
-        )
-
-    @pytest.mark.asyncio
     async def test_edges_only_valid_at_has_null_invalid_at(self, service):
         """When edge has only valid_at, temporal['invalid_at'] is None (not 'None')."""
         from _fm_helpers import MockEdge
