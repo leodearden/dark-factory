@@ -317,6 +317,69 @@ def test_fix_unit_text_is_idempotent():
 
 
 # ---------------------------------------------------------------------------
+# find_drift / fix_unit_text tests: ExecStartPre presence (A2)
+# ---------------------------------------------------------------------------
+
+_ALL_EXACT_NO_EXECSTARTPRE_UNIT = """\
+[Unit]
+Description=All Exact Directives Present, No ExecStartPre
+
+[Service]
+Type=notify
+Environment=MEM0_TELEMETRY=false
+WatchdogSec=120
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def test_find_drift_flags_missing_execstartpre():
+    """find_drift flags 'ExecStartPre=' as missing when no [Service] line has that prefix.
+
+    RED until find_drift gains a required_prefixes parameter — today it only
+    checks REQUIRED_SERVICE_DIRECTIVES via exact membership, so a unit that
+    satisfies every exact directive but lacks any ExecStartPre= line is
+    (incorrectly) reported as fully clean.
+    """
+    mod = _load_checker()
+    drift = mod.find_drift(_ALL_EXACT_NO_EXECSTARTPRE_UNIT)
+    assert "ExecStartPre=" in drift
+
+
+def test_find_drift_does_not_flag_present_execstartpre():
+    """find_drift does not flag 'ExecStartPre=' when a matching-prefix line is present."""
+    mod = _load_checker()
+    drift = mod.find_drift(_CLEAN_UNIT)
+    assert "ExecStartPre=" not in drift
+
+
+def test_fix_unit_text_never_synthesizes_bare_execstartpre():
+    """fix_unit_text appends the missing EXACT directives but never a bare 'ExecStartPre=' line.
+
+    A host-specific prefix value (e.g. carrying __REPO_ROOT__ or
+    /home/leo/bin paths) cannot be synthesized by --fix — only its presence
+    can be checked, never its correct value guessed. Exercised against a unit
+    missing BOTH ExecStartPre and the exact directives.
+    """
+    mod = _load_checker()
+    fixed = mod.fix_unit_text(_MISSING_MEM0_UNIT)
+    sections = mod.parse_unit_sections(fixed)
+    assert "Environment=MEM0_TELEMETRY=false" in sections["Service"]
+    assert "Restart=on-failure" in sections["Service"]
+    assert "RestartSec=5" in sections["Service"]
+    assert "TimeoutStartSec=300" in sections["Service"]
+    assert "TimeoutStopSec=90" in sections["Service"]
+    assert not any(line.startswith("ExecStartPre=") for line in sections["Service"]), (
+        "fix_unit_text must never synthesize an ExecStartPre= line (host-specific value)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # main(argv) CLI tests  (step-9 / step-10)
 # ---------------------------------------------------------------------------
 
