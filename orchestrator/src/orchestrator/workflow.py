@@ -6261,6 +6261,30 @@ class TaskWorkflow:
         # cleared, malformed) degrades to the role's existing worst-case
         # ERROR disposition (I-FAIL-SAFE).
         envelope = self.artifacts.read_verdict(role.name)
+        if envelope is None and result.success:
+            # Observability (reviewer_comprehensive amendment, task 2484):
+            # a missing meta-root would make the verdict-tools server
+            # silently no-op its write, and read_verdict() then returns
+            # None indistinguishably from a reviewer that simply never
+            # called submit_review_verdict — mirrors the merger's
+            # pre-existing diagnostic (workflow.py:_resolve_and_resubmit,
+            # itself a reviewer_comprehensive amendment on task 2483).
+            # This is purely diagnostic; the fail-safe ERROR outcome below
+            # is unchanged either way.
+            verdicts_dir = self.artifacts.root / 'verdicts'
+            if not verdicts_dir.is_dir():
+                logger.warning(
+                    'Task %s: reviewer %s verdict absent AND %s does not '
+                    'exist — likely a meta-root misconfiguration, not a '
+                    'reviewer no-op',
+                    self.task_id, role.name, verdicts_dir,
+                )
+            else:
+                logger.warning(
+                    'Task %s: reviewer %s verdict absent (verdicts dir %s '
+                    'exists) — reviewer did not call submit_review_verdict',
+                    self.task_id, role.name, verdicts_dir,
+                )
         payload = envelope.get('verdict') if isinstance(envelope, dict) else None
         if not isinstance(payload, dict) or payload.get('verdict') not in {'PASS', 'ISSUES_FOUND'}:
             return {
