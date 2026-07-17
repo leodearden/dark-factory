@@ -601,24 +601,28 @@ class ReconciliationConfig(BaseModel):
     # done-write citing commit-bearing done_provenance (kind in {"merged",
     # "found_on_main"}) on a task whose metadata.reopen_at is set gets
     # rejected when the evidence commit's committer date predates reopen_at
-    # (i.e. the cited evidence is stale — from before the reopen). 'warn'
-    # (default) logs a 'task_status.done_evidence_stale_warn' census WARNING
-    # and lets the write proceed; 'enforce' returns a typed
-    # done_evidence_stale rejection instead. This is the alpha default —
-    # the enforce flip is task gamma, gated on task beta (orchestrator
-    # consumer) landing first. Mirrors the require_done_provenance /
-    # enforce_transitions warn->enforce phased-rollout precedent above.
+    # (i.e. the cited evidence is stale — from before the reopen). 'enforce'
+    # (default, task 2680 / PRD task gamma) returns a typed
+    # done_evidence_stale rejection; 'warn' is the explicit opt-out — it
+    # logs a 'task_status.done_evidence_stale_warn' census WARNING and lets
+    # the write proceed instead. Task alpha shipped 'warn'; task gamma flips
+    # the shipped default to 'enforce' now that task beta (the orchestrator
+    # consumer — ProvenanceConflictSink + StaleEvidenceRejection) has
+    # landed. Mirrors the require_done_provenance / enforce_transitions
+    # warn->enforce phased-rollout precedent above.
     reject_stale_done_evidence: Literal['warn', 'enforce'] = Field(
-        default='warn',
+        default='enforce',
         description=(
-            "Reopen-freshness gate mode. 'warn' (default): a stale-evidence "
-            "done-write on a reopened task logs a "
+            "Reopen-freshness gate mode. 'enforce' (default, task gamma): "
+            "a stale-evidence done-write on a reopened task is rejected "
+            "with a typed done_evidence_stale error. 'warn': the explicit "
+            "opt-out — the write instead logs a "
             "'task_status.done_evidence_stale_warn' WARNING and proceeds. "
-            "'enforce': the write is rejected with a typed "
-            "done_evidence_stale error. Task alpha ships warn; task gamma "
-            "flips the default to enforce after task beta lands. NOTE: a "
-            "present-but-invalid stale_evidence_override (malformed shape, "
-            "or supplied by a recon-stage caller) always rejects with "
+            "Task alpha shipped warn; task gamma flipped the shipped "
+            "default to enforce after task beta (the orchestrator "
+            "consumer) landed. NOTE: a present-but-invalid "
+            "stale_evidence_override (malformed shape, or supplied by a "
+            "recon-stage caller) always rejects with "
             "done_evidence_stale_override_invalid regardless of this "
             'setting — that one rejection is not gated by warn/enforce.'
         ),
