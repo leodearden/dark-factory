@@ -69,6 +69,13 @@ class FakeScheduler:
         # claimant fields, tracked the same way as provenance/reopen_reasons.
         self.claimant_run_ids: dict[str, str | None] = {}
         self.heartbeats: dict[str, str | None] = {}
+        # Scope-reconciliation choke point (task 2505): every call's
+        # (current, needed, persist_files) is recorded here so tests can
+        # assert on what was persisted, and blast_radius_result configures
+        # the return value (default True == lock acquired successfully;
+        # tests force False to simulate a sibling lock conflict).
+        self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
+        self.blast_radius_result: bool = True
 
     async def set_task_status(
         self,
@@ -126,7 +133,8 @@ class FakeScheduler:
         *,
         persist_files: list[str] | None = None,
     ) -> bool:
-        return True
+        self.blast_radius_calls.append((current, needed, persist_files))
+        return self.blast_radius_result
 
     async def get_status(self, task_id: str) -> str | None:
         history = self.statuses.get(task_id)
