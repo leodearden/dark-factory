@@ -9204,7 +9204,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         ``role.prompt_spec.in_code_constant`` — so this call is always
         fail-safe (mirrors ``TaskCurator._resolve_curator_prompt``).
         """
-        if role.prompt_spec is None:
+        if role.prompt_spec is None or role.prompt_harness_version is None:
             return role.system_prompt
         if self._prompt_store is None:
             root = default_artifacts_root()

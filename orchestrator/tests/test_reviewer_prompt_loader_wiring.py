@@ -21,8 +21,8 @@ from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore, comp
 
 from orchestrator.agents.roles import (
     _REVIEWER_PROMPT_HARNESS_VERSION,
-    AgentRole,
     REVIEWER_COMPREHENSIVE,
+    AgentRole,
 )
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import TaskAssignment
@@ -83,10 +83,12 @@ class TestResolveRoleSystemPromptUnpinned:
     def test_nothing_pinned_returns_in_code_constant(self, tmp_path):
         store = PromptArtifactStore(tmp_path / 'artifacts')
         workflow = _make_workflow(tmp_path=tmp_path, prompt_store=store)
+        spec = REVIEWER_COMPREHENSIVE.prompt_spec
+        assert spec is not None  # premise: the reviewer role opts in
 
         result = workflow._resolve_role_system_prompt(REVIEWER_COMPREHENSIVE, 'opus')
 
-        assert result == REVIEWER_COMPREHENSIVE.prompt_spec.in_code_constant
+        assert result == spec.in_code_constant
 
 
 class TestResolveRoleSystemPromptPinnedPerModel:
@@ -100,6 +102,7 @@ class TestResolveRoleSystemPromptPinnedPerModel:
         store = PromptArtifactStore(tmp_path / 'artifacts')
         workflow = _make_workflow(tmp_path=tmp_path, prompt_store=store)
         spec = REVIEWER_COMPREHENSIVE.prompt_spec
+        assert spec is not None  # premise: the reviewer role opts in
 
         heuristics = 'PINNED: prefer flagging more suggestions.'
         provenance = ArtifactProvenance(**_provenance_kwargs())

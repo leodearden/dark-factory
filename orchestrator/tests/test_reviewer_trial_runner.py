@@ -196,6 +196,7 @@ class TestRunSingleReviewerLiveTransport:
         ):
             _name, review, _cost = await _run_single_reviewer(spec, diff, meta_root=tmp_path)
 
+        assert review is not None
         assert review['verdict'] == 'ISSUES_FOUND'
 
     @pytest.mark.asyncio
@@ -238,6 +239,7 @@ class TestRunSingleReviewerLiveTransport:
         ):
             _name, review, _cost = await _run_single_reviewer(spec, diff, max_retries=1, meta_root=tmp_path)
 
+        assert review is not None
         assert review['verdict'] == 'ERROR'
 
     @pytest.mark.asyncio
@@ -258,6 +260,7 @@ class TestRunSingleReviewerLiveTransport:
             name, review, _cost = await _run_single_reviewer(spec, diff)
 
         assert name == 'r1'
+        assert review is not None
         assert review['verdict'] == 'PASS'
 
 
