@@ -8045,6 +8045,114 @@ class TestBuildAgentEnvCpuGovern:
 
 
 # ---------------------------------------------------------------------------
+# Tests: _build_agent_env role_env_overrides widening (task 2460)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBuildAgentEnvRoleOverrides:
+    """Unit tests for TaskWorkflow._build_agent_env per-role opt-in endpoint env.
+
+    Widens forwarding beyond the architect/implementer/debugger allow-list:
+    a role receives an endpoint env (e.g. ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN)
+    iff it is named as a key in config.role_env_overrides. Defaults to {}, so
+    an unnamed role (e.g. judge) still receives no endpoint env — the vLLM
+    ServerDisconnectedError burn (3cd380a079) is avoided by construction.
+    """
+
+    def _make_workflow(self, config, git_ops, task_assignment):
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        return workflow
+
+    async def test_named_role_receives_its_endpoint_env(self, config, git_ops, task_assignment):
+        """JUDGE named in role_env_overrides gets exactly those keys/values."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.role_env_overrides = {
+            'judge': {
+                'ANTHROPIC_BASE_URL': 'https://api.z.ai/api/anthropic',
+                'ANTHROPIC_AUTH_TOKEN': 'tok',
+            },
+        }
+
+        env = workflow._build_agent_env(JUDGE)
+        assert env is not None
+        assert env.get('ANTHROPIC_BASE_URL') == 'https://api.z.ai/api/anthropic'
+        assert env.get('ANTHROPIC_AUTH_TOKEN') == 'tok'
+
+    async def test_unnamed_role_receives_no_endpoint_env(self, config, git_ops, task_assignment):
+        """JUDGE stays None when only 'architect' is named (safety property)."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.role_env_overrides = {
+            'architect': {
+                'ANTHROPIC_BASE_URL': 'https://api.z.ai/api/anthropic',
+                'ANTHROPIC_AUTH_TOKEN': 'tok',
+            },
+        }
+
+        assert workflow._build_agent_env(JUDGE) is None
+
+    async def test_empty_map_preserves_existing_none(self, config, git_ops, task_assignment):
+        """role_env_overrides={} (the default) -> MERGER and JUDGE still return None."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        assert workflow.config.role_env_overrides == {}
+
+        assert workflow._build_agent_env(MERGER) is None
+        assert workflow._build_agent_env(JUDGE) is None
+
+    async def test_endpoint_layer_additive_to_infra(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """ARCHITECT gets BOTH its opted-in endpoint env AND jobserver CARGO_MAKEFLAGS."""
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+        workflow.config.role_env_overrides = {
+            'architect': {'ANTHROPIC_BASE_URL': 'https://api.z.ai/api/anthropic'},
+        }
+
+        env = workflow._build_agent_env(ARCHITECT)
+        assert env is not None
+        assert env.get('ANTHROPIC_BASE_URL') == 'https://api.z.ai/api/anthropic'
+        assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
+
+    async def test_implementer_merges_unchanged_when_unnamed(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """role_env_overrides={} -> implementer still gets env_overrides,
+        REIFY_DEBUG_PORT, and CARGO_MAKEFLAGS exactly as before this task."""
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+        workflow.config.env_overrides = {'MY_CUSTOM_VAR': 'custom_value'}
+        workflow._reify_debug_port = 39411
+        assert workflow.config.role_env_overrides == {}
+
+        env = workflow._build_agent_env(IMPLEMENTER)
+        assert env is not None
+        assert env.get('MY_CUSTOM_VAR') == 'custom_value'
+        assert env.get('REIFY_DEBUG_PORT') == '39411'
+        assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
+
+    async def test_per_role_override_wins_over_global_env_overrides(
+        self, config, git_ops, task_assignment,
+    ):
+        """On a key collision, role_env_overrides (merged last) beats the
+        global config.env_overrides — most-specific-config-wins."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.env_overrides = {'ANTHROPIC_BASE_URL': 'global'}
+        workflow.config.role_env_overrides = {
+            'implementer': {'ANTHROPIC_BASE_URL': 'role'},
+        }
+
+        env = workflow._build_agent_env(IMPLEMENTER)
+        assert env is not None
+        assert env.get('ANTHROPIC_BASE_URL') == 'role'
+
+
+# ---------------------------------------------------------------------------
 # Tests: _build_spawn_env (CLAUDE_SPAWN_* identity vars, task 2512)
 # ---------------------------------------------------------------------------
 
