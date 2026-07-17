@@ -360,3 +360,167 @@ class TestEmitTripwire:
         assert note['merge_skew_tripwire']['landing_sha'] == landing_sha
         assert note['merge_skew_tripwire']['overlap_files'] == ['src/a.py']
         assert call.kwargs.get('metadata_mode') == 'merge'
+
+    async def test_empty_or_none_oracle_cmd_never_consults_downstream(
+        self, tmp_path: Path,
+    ) -> None:
+        """oracle_cmd falsy (None or []) → short-circuits before touching
+        get_branch_diff/update_task at all — asserted by making both raise
+        if they were ever (incorrectly) invoked."""
+        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+
+        get_branch_diff = AsyncMock(side_effect=AssertionError('get_branch_diff must not be called'))
+        update_task = AsyncMock(side_effect=AssertionError('update_task must not be called'))
+
+        for oracle_cmd in (None, []):
+            fake_eq = _FakeEscalationQueue()
+            await emit_pipeline_landing_tripwire(
+                project_root=tmp_path,
+                oracle_cmd=oracle_cmd,
+                escalation_queue=fake_eq,
+                landing_sha='f' * 40,
+                landing_task_id='999',
+                landing_changed_files=['src/a.py'],
+                inflight=[('101', 'task/101')],
+                get_branch_diff=get_branch_diff,
+                update_task=update_task,
+            )
+            assert fake_eq.submitted == [], (
+                f'oracle_cmd={oracle_cmd!r} must yield zero escalations'
+            )
+
+        get_branch_diff.assert_not_awaited()
+        update_task.assert_not_awaited()
+
+    async def test_dedup_skips_submit_when_open_escalation_exists(
+        self, tmp_path: Path,
+    ) -> None:
+        """I6 (≤1 escalation per landing): a pre-existing pending escalation
+        for this landing's sentinel task_id suppresses a duplicate submit —
+        mirrors _alarm_verify_worktree_contention's dedup guard."""
+        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+
+        script = _write_oracle_script(tmp_path, exit_code=0)
+        landing_sha = 'b' * 40
+        sentinel = f'pipeline-landing-tripwire-{landing_sha[:12]}'
+        fake_eq = _FakeEscalationQueue(by_task={sentinel: [object()]})
+        update_task = AsyncMock(return_value=True)
+
+        async def get_branch_diff(branch: str) -> list[str] | None:
+            return ['src/a.py']
+
+        await emit_pipeline_landing_tripwire(
+            project_root=tmp_path,
+            oracle_cmd=['bash', str(script)],
+            escalation_queue=fake_eq,
+            landing_sha=landing_sha,
+            landing_task_id='999',
+            landing_changed_files=['src/a.py'],
+            inflight=[('101', 'task/101')],
+            get_branch_diff=get_branch_diff,
+            update_task=update_task,
+        )
+
+        assert fake_eq.submitted == [], (
+            'a pre-existing pending escalation for this landing must suppress a duplicate submit'
+        )
+        update_task.assert_not_awaited()
+
+    async def test_get_branch_diff_raising_for_one_task_still_processes_others(
+        self, tmp_path: Path,
+    ) -> None:
+        """A raising get_branch_diff for one in-flight task must not prevent
+        the remaining in-flight tasks from being processed, and must not
+        propagate out of emit (fail-open)."""
+        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+
+        script = _write_oracle_script(tmp_path, exit_code=0)
+        fake_eq = _FakeEscalationQueue()
+        update_task = AsyncMock(return_value=True)
+
+        async def get_branch_diff(branch: str) -> list[str] | None:
+            if branch == 'task/101':
+                raise RuntimeError('git boom')
+            return ['src/a.py']
+
+        # Must not raise.
+        await emit_pipeline_landing_tripwire(
+            project_root=tmp_path,
+            oracle_cmd=['bash', str(script)],
+            escalation_queue=fake_eq,
+            landing_sha='c' * 40,
+            landing_task_id='999',
+            landing_changed_files=['src/a.py'],
+            inflight=[('101', 'task/101'), ('202', 'task/202')],
+            get_branch_diff=get_branch_diff,
+            update_task=update_task,
+        )
+
+        assert len(fake_eq.submitted) == 1
+        esc = fake_eq.submitted[0]
+        assert '101' not in esc.summary and '101' not in esc.detail, (
+            'the raising task must be skipped entirely, not named in the escalation'
+        )
+        assert '202' in esc.summary or '202' in esc.detail
+        update_task.assert_awaited_once()
+        assert update_task.await_args.args[0] == '202'
+
+    async def test_update_task_raising_is_swallowed_escalation_still_submitted(
+        self, tmp_path: Path,
+    ) -> None:
+        """update_task raising must not propagate — the escalation itself
+        (already submitted before update_task runs) is unaffected."""
+        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+
+        script = _write_oracle_script(tmp_path, exit_code=0)
+        fake_eq = _FakeEscalationQueue()
+        update_task = AsyncMock(side_effect=RuntimeError('update boom'))
+
+        async def get_branch_diff(branch: str) -> list[str] | None:
+            return ['src/a.py']
+
+        # Must not raise.
+        await emit_pipeline_landing_tripwire(
+            project_root=tmp_path,
+            oracle_cmd=['bash', str(script)],
+            escalation_queue=fake_eq,
+            landing_sha='d' * 40,
+            landing_task_id='999',
+            landing_changed_files=['src/a.py'],
+            inflight=[('101', 'task/101')],
+            get_branch_diff=get_branch_diff,
+            update_task=update_task,
+        )
+
+        assert len(fake_eq.submitted) == 1, (
+            'escalation must still be submitted despite update_task raising'
+        )
+
+    async def test_escalation_submit_raising_is_swallowed(self, tmp_path: Path) -> None:
+        """escalation_queue.submit raising must not propagate out of emit."""
+        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+
+        script = _write_oracle_script(tmp_path, exit_code=0)
+
+        class _RaisingSubmitQueue(_FakeEscalationQueue):
+            def submit(self, esc: Any) -> None:
+                raise RuntimeError('submit boom')
+
+        fake_eq = _RaisingSubmitQueue()
+        update_task = AsyncMock(return_value=True)
+
+        async def get_branch_diff(branch: str) -> list[str] | None:
+            return ['src/a.py']
+
+        # Must not raise.
+        await emit_pipeline_landing_tripwire(
+            project_root=tmp_path,
+            oracle_cmd=['bash', str(script)],
+            escalation_queue=fake_eq,
+            landing_sha='e' * 40,
+            landing_task_id='999',
+            landing_changed_files=['src/a.py'],
+            inflight=[('101', 'task/101')],
+            get_branch_diff=get_branch_diff,
+            update_task=update_task,
+        )
