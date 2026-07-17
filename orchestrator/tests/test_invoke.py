@@ -444,9 +444,10 @@ class TestCodexNoAgentsMdWorktreeLeak:
 
         assert captured['agents_md_exists'] is False
         assert 'AGENTS.md' not in captured['staged_names']
-        assert captured['stdin_data'] is not None
-        assert b'S3NT_SYS' in captured['stdin_data']
-        assert b'S3NT_USER' in captured['stdin_data']
+        # Exact composed payload — pins ordering (system_prompt before
+        # prompt) and the '\n\n' separator, not just that both substrings
+        # appear somewhere in the blob.
+        assert captured['stdin_data'] == b'S3NT_SYS\n\nS3NT_USER'
 
 
 @pytest.mark.asyncio
