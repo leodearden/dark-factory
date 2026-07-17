@@ -53,6 +53,7 @@ from orchestrator.config import (
 from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
+    MergeRequest,
     RealMergeItem,
     SpeculativeMergeWorker,
 )
@@ -543,3 +544,185 @@ class TestAvailableBuiltDepth:
         worker._verifier_queue.put_nowait(_make_spec_item(speculative=True))
         worker._available_built_depth()
         assert worker._verifier_queue.qsize() == 1
+
+
+# ---------------------------------------------------------------------------
+# step-13 RED / step-14 GREEN: SpeculativeMergeWorker._probe_verify_placement()
+# ---------------------------------------------------------------------------
+
+
+def _make_frozen_entry(merge_commit: str) -> InflightEntry:
+    """Build a frozen InflightEntry wrapping a REAL RealMergeItem with a
+    known merge_commit.
+
+    Unlike ``_sentinel_entry()`` (identity-only, used where only the
+    *count* of frozen entries matters -- e.g. TestAvailableBuiltDepth
+    above), ``_probe_verify_placement()``'s depth-d tip resolution needs a
+    real commit string to resolve and return, so this builds a minimally
+    real RealMergeItem instead of an opaque sentinel.
+    """
+    item = RealMergeItem(
+        request=MagicMock(),
+        merge_result=MagicMock(merge_commit=merge_commit),
+        merge_wt=Path('_merge-x'),
+        base_sha='aabbccdd00000000aaaa',
+        speculative=True,
+    )
+    return InflightEntry(
+        item=item, lease=None, verify_task=MagicMock(), merge_wt=None,
+        was_speculative=True,
+    )
+
+
+def _make_probe_config(
+    *,
+    probe_fraction: float,
+    probe_depths: list[int] | None = None,
+    suppress_flake_rate: float = 0.30,
+) -> OrchestratorConfig:
+    """Build an OrchestratorConfig carrying a live SpeculationProbeConfig.
+
+    Mirrors test_merge_queue_depth_telemetry.py's ``_make_bare_config()``
+    (bare inline construction, no monkeypatched chdir/env needed).
+    """
+    return OrchestratorConfig(
+        speculation_probe=SpeculationProbeConfig(
+            probe_fraction=probe_fraction,
+            probe_depths=probe_depths if probe_depths is not None else [2, 3, 5, 8],
+            suppress_flake_rate=suppress_flake_rate,
+        ),
+    )
+
+
+def _make_probe_item(*, speculative: bool, config: OrchestratorConfig) -> RealMergeItem:
+    """Build a RealMergeItem carrying a live *config* for
+    _probe_verify_placement() (task 2359).
+
+    Only ``.speculative`` and ``.request.config.speculation_probe`` are
+    read by the method under test; merge_result/merge_wt/base_sha are
+    near-bare placeholders (mirrors ``_make_spec_item`` above).
+    """
+    req = MergeRequest(
+        task_id='t-probe', branch='task/t-probe', worktree=Path('_wt'),
+        pre_rebased=False, task_files=None, module_configs=[], config=config,
+        result=MagicMock(),
+    )
+    return RealMergeItem(
+        request=req,
+        merge_result=MagicMock(merge_commit='unused'),
+        merge_wt=Path('_merge-y'),
+        base_sha='aabbccdd00000000aaaa',
+        speculative=speculative,
+    )
+
+
+class TestProbeVerifyPlacement:
+    """SpeculativeMergeWorker._probe_verify_placement(item) -- the stateful
+    wrapper around select_probe_depth() that owns the live round counter,
+    reads config off the DISPATCHED item (live, hot-reload-friendly), and
+    resolves the probed depth's already-built base commit (task 2359).
+
+    RED until step-14 GREEN adds ProbePlacement + the method.
+    """
+
+    def test_non_speculative_item_never_probed(self):
+        """The head trust-anchor verify (speculative=False) is never
+        probed, regardless of config -- even a probe_fraction=1.0 config
+        must not fire for it, and its dispatch must not consume a probe
+        round (the counter tracks SECOND-SLOT rounds only).
+        """
+        worker = _make_bare_worker()
+        config = _make_probe_config(probe_fraction=1.0, probe_depths=[2])
+        item = _make_probe_item(speculative=False, config=config)
+
+        result = worker._probe_verify_placement(item)
+
+        assert result is None
+        assert worker._probe_round_counter == 0
+
+    def test_default_config_byte_identical(self):
+        """probe_fraction=0.0 (the default) -> None, unconditionally --
+        _dispatch_item's caller falls through to the unchanged
+        _verify_frontier_depth() path.
+        """
+        worker = _make_bare_worker()
+        config = _make_probe_config(probe_fraction=0.0)
+        item = _make_probe_item(speculative=True, config=config)
+
+        result = worker._probe_verify_placement(item)
+
+        assert result is None
+
+    def test_probe_fires_returns_depth_and_built_tip_base(self):
+        """probe_fraction=1.0, probe_depths=[2], a built stack of depth 2,
+        and a low recent fail rate -> a placement at depth 2 whose base is
+        the depth-2 built cumulative tip (the newest of the two frozen
+        entries) -- resolved via the frozen-prefix chain machinery.
+        """
+        worker = _make_bare_worker()
+        entry_1 = _make_frozen_entry('commit-depth-1')
+        entry_2 = _make_frozen_entry('commit-depth-2')
+        worker._frozen_inflight_entries = lambda: [entry_1, entry_2]
+        worker._record_verify_outcome(True)  # recent_fail_rate == 0.0 (low)
+        config = _make_probe_config(probe_fraction=1.0, probe_depths=[2])
+        item = _make_probe_item(speculative=True, config=config)
+
+        result = worker._probe_verify_placement(item)
+
+        assert result is not None
+        assert result.depth == 2
+        assert result.base == 'commit-depth-2'
+
+    def test_round_counter_increments_deterministically_across_calls(self):
+        """Each speculative-item call advances the round counter by
+        exactly 1, so consecutive calls sample consecutive round_index
+        values (select_probe_depth()'s frequency/cycling behaviour)."""
+        worker = _make_bare_worker()
+        entry_1 = _make_frozen_entry('commit-depth-1')
+        entry_2 = _make_frozen_entry('commit-depth-2')
+        worker._frozen_inflight_entries = lambda: [entry_1, entry_2]
+        config = _make_probe_config(probe_fraction=1.0, probe_depths=[2])
+        item = _make_probe_item(speculative=True, config=config)
+
+        assert worker._probe_round_counter == 0
+        worker._probe_verify_placement(item)
+        assert worker._probe_round_counter == 1
+        worker._probe_verify_placement(item)
+        assert worker._probe_round_counter == 2
+        worker._probe_verify_placement(item)
+        assert worker._probe_round_counter == 3
+
+    def test_falls_back_to_none_when_built_depth_insufficient(self):
+        """Sampled depth exceeds the built stack -> None (fall back to the
+        normal _verify_frontier_depth() placement) -- a probe never
+        triggers building/rebasing to satisfy itself.
+        """
+        worker = _make_bare_worker()
+        worker._frozen_inflight_entries = lambda: []  # nothing built
+        config = _make_probe_config(probe_fraction=1.0, probe_depths=[2])
+        item = _make_probe_item(speculative=True, config=config)
+
+        result = worker._probe_verify_placement(item)
+
+        assert result is None
+
+    def test_reads_config_live_from_item(self):
+        """Config is read from item.request.config on EVERY call (never
+        cached at worker-construction time) -- an item carrying a
+        probe-enabled config fires even when a PRIOR call on this same
+        worker saw a probe-disabled config.
+        """
+        worker = _make_bare_worker()
+        entry_1 = _make_frozen_entry('commit-depth-1')
+        entry_2 = _make_frozen_entry('commit-depth-2')
+        worker._frozen_inflight_entries = lambda: [entry_1, entry_2]
+
+        off_config = _make_probe_config(probe_fraction=0.0)
+        off_item = _make_probe_item(speculative=True, config=off_config)
+        assert worker._probe_verify_placement(off_item) is None
+
+        on_config = _make_probe_config(probe_fraction=1.0, probe_depths=[2])
+        on_item = _make_probe_item(speculative=True, config=on_config)
+        result = worker._probe_verify_placement(on_item)
+        assert result is not None
+        assert result.depth == 2
