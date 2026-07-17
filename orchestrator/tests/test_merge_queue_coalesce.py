@@ -2227,9 +2227,21 @@ class TestRedriveCoalesceMembersStaleEvidence:
             redrive_member=cbs.redrive_member,
         )
 
+        # task 2678 (frozen tip) routes the found_on_main path through
+        # validate_landing_evidence; patch it to an ACCEPTED verdict so m2's
+        # legitimate landing reaches done. m1's rejection is raised later,
+        # from scheduler.mark_done inside redrive_member (above), independent
+        # of this verdict.
+        accepted_verdict = LandingEvidenceVerdict(
+            accepted=True, evidence_sha='shatip', reason='ok', probe={},
+        )
         with (
             patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
             patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value='shatip')),
+            patch(
+                'orchestrator.merge_queue.validate_landing_evidence',
+                AsyncMock(return_value=accepted_verdict),
+            ),
             patch('orchestrator.merge_queue.logger') as mock_logger,
         ):
             await worker._redrive_coalesce_members(req, 'mainsha000')

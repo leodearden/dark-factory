@@ -805,8 +805,11 @@ class TestAlreadyLandedDispatchGateStaleEvidenceConflict:
 
         from orchestrator.provenance_conflict import ProvenanceConflictSink
 
+        # A citation is required for task 2678's DISCOVERY-mode gate to accept
+        # the landing and proceed to the done-write — only then can the
+        # stale-evidence rejection this test exercises fire from mark_done.
         h = _wired_content_harness(
-            mock_orch_config, citation_sha=None, main_sha='c' * 40, content_in_main=True,
+            mock_orch_config, citation_sha='c' * 40, content_in_main=True,
         )
         _let_mark_in_progress_done_run_for_real(h, tmp_path)
         h._escalation_queue = EscalationQueue(tmp_path / 'esc')
