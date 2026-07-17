@@ -412,6 +412,16 @@ git:
   # _lane- (warm-lane pool) or _spec- (merge-speculation pool).
   iact_prefix: "_iact-"
 
+# Chronic pool-infra flake auto-file detector (task 2358). Gated OFF until
+# reify task 5142's flaky-ledger.jsonl + CHRONIC-FLAKY marker substrate is
+# confirmed on the target project's main (mirrors git.offline_lane_infra_enabled).
+chronic_flake:
+  enabled: false
+  threshold: 3
+  window: 20
+  rate_limit_days: 7
+  ledger_relpath: "data/verify-logs/flaky-ledger.jsonl"
+
 # Autonomous dry-run unblock hook
 unblock_auto:
   enabled: true

@@ -1478,6 +1478,75 @@ class GitConfig(BaseModel):
     )
 
 
+class ChronicFlakeConfig(BaseModel):
+    """Chronic pool-infra flake auto-file configuration (task 2358).
+
+    Substrate (reify task 5142, lands separately): reify's
+    ``tests/infra/run_all.sh`` persists every serial-retry pass to
+    ``data/verify-logs/flaky-ledger.jsonl`` (``{ts, test, role,
+    flaky_count_window}``) and emits a line-anchored ``=== CHRONIC-FLAKY
+    test=<name> count=<n> window=<m> ===`` marker when a test is flaky
+    ``>= threshold`` times in the last ``window`` ledger-recorded runs.
+
+    When enabled, ``TaskWorkflow._maybe_file_chronic_flakes`` reads this
+    marker/ledger after a verify completes and auto-files a medium-priority
+    De-flake fix task — the gate stays green (retry-once already absorbed
+    the failure); the flake debt becomes visible, owned work instead of a
+    warning nobody reads. Filing is non-blocking: failures here must never
+    fail the verify/merge path.
+
+    Shipped ``enabled: false`` in defaults.yaml — gated until reify:5142
+    lands and is confirmed on the target project's main, mirroring the
+    ``git.offline_lane_infra_enabled`` precedent for reify-substrate
+    features. All fields are green-tier hot-tunable via RELOADABLE_FIELDS.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            'Set to true to enable the chronic-flake auto-file detector. '
+            'Requires reify task 5142 (the flaky-ledger.jsonl + '
+            'CHRONIC-FLAKY marker substrate) to be present on the target '
+            'project; a harmless no-op until then.'
+        ),
+    )
+    threshold: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Minimum number of flaky occurrences for a test within the '
+            'last `window` ledger-recorded runs before it is considered '
+            'chronic. Must be >= 1. Mirrors reify run_all.sh\'s own '
+            'CHRONIC-FLAKY threshold (independent/fallback trigger).'
+        ),
+    )
+    window: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            'Number of most-recent ledger-recorded runs considered when '
+            'computing chronic-flake occurrences. Must be >= 1. Mirrors '
+            'reify run_all.sh\'s own CHRONIC-FLAKY window.'
+        ),
+    )
+    rate_limit_days: int = Field(
+        default=7,
+        ge=1,
+        description=(
+            'Minimum days between auto-filed De-flake tasks for the same '
+            'test, persisted in the FilingLedger. Must be >= 1.'
+        ),
+    )
+    ledger_relpath: str = Field(
+        default='data/verify-logs/flaky-ledger.jsonl',
+        description=(
+            'Project-root-relative path to reify\'s flaky-ledger.jsonl '
+            '(a STABLE project-root path, not the ephemeral verify '
+            'worktree).'
+        ),
+    )
+
+
 class VerifyRunnerConfig(BaseModel):
     """Configuration for a single remote verify runner (Lever C).
 
@@ -2810,6 +2879,11 @@ class OrchestratorConfig(BaseSettings):
     # Git
     git: GitConfig = Field(default_factory=GitConfig)
 
+    # Chronic pool-infra flake auto-file detector (task 2358). An absent
+    # stanza in orchestrator.yaml yields the disabled-by-default instance
+    # (gated until reify:5142's ledger/marker substrate is confirmed).
+    chronic_flake: ChronicFlakeConfig = Field(default_factory=ChronicFlakeConfig)
+
     # κ: shared sccache backend (the laptop warm multiplier)
     # An absent stanza in orchestrator.yaml yields the disabled default;
     # no defaults.yaml edit is required.
@@ -3377,6 +3451,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # test_routing_reload.py (boundary test 11) for the reload-applies +
     # fail-closed-on-unknown-key coverage.
     _submodel_leaf_paths('routing', RoutingConfig),
+    # Chronic pool-infra flake auto-file detector (task 2358) — a new
+    # dedicated submodel, so its whole-submodel group auto-covers every
+    # leaf (idiom shared with psi_admission/routing above).
+    _submodel_leaf_paths('chronic_flake', ChronicFlakeConfig),
     {
         # Steward grace
         'steward_completion_timeout',

@@ -40,6 +40,7 @@ from shared.task_claimant import compose_claimant_run_id
 from shared.task_metadata import RetryLedger, RoutingDecisionMirror, RoutingState
 from shared.task_statuses import TaskStatus
 
+from orchestrator import chronic_flake
 from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
 from orchestrator.agents.invoke import AgentResult, invoke_agent
 from orchestrator.agents.roles import (
@@ -5980,6 +5981,37 @@ class TaskWorkflow:
         # the harness HOLD guard and RESUME cascade key on (PRD C7/D3).
         return None
 
+    async def _maybe_file_chronic_flakes(self, verify_result: VerifyResult) -> None:
+        """Best-effort chronic pool-infra flake auto-file after a verify
+        completes (task 2358).
+
+        Detects a chronic flake from *verify_result*'s ``test_output`` (a
+        CHRONIC-FLAKY marker) and/or the on-disk flaky ledger, and
+        auto-files a non-blocking, medium-priority De-flake fix task — see
+        ``chronic_flake.py``'s module docstring for the full policy.
+
+        Thin by design: ``chronic_flake.maybe_file_chronic_flake_tasks`` is
+        already internally catch-all-defensive (chronic_flake.py
+        step-13/14), and this call site adds a second try/except as
+        belt-and-suspenders (mirrors ``_spawn_main_health_fix_task``'s
+        guard-and-log pattern) — a filing failure must never fail the
+        verify/merge path, so it can never alter the caller's DONE/BLOCKED
+        outcome.
+        """
+        if not self.config.chronic_flake.enabled:
+            return
+        try:
+            client = chronic_flake.SchedulerChronicFlakeTaskClient(
+                self.scheduler, self.config.project_root,
+            )
+            await chronic_flake.maybe_file_chronic_flake_tasks(
+                verify_result.test_output, self.config, client,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: chronic-flake auto-file failed: %s', self.task_id, exc,
+            )
+
     async def _verify_debugfix_loop(self) -> WorkflowOutcome:
         """Run verification, invoke debugger on failures."""
         assert self.worktree is not None and self.artifacts is not None
@@ -6006,6 +6038,10 @@ class TaskWorkflow:
             if result is None:
                 # Infra retry window exhausted; _infra_hold_info already stamped.
                 return WorkflowOutcome.BLOCKED
+            # Task 2358: chronic pool-infra flake auto-file. Fires on every
+            # completed verify (green AND red) now that `result` is
+            # guaranteed non-None — non-blocking, never alters the outcome.
+            await self._maybe_file_chronic_flakes(result)
             if rebase_notice is not None:
                 self._emit_rebase_verify_cost(rebase_notice, result)
             if not result.passed:
