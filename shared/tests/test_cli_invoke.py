@@ -4239,10 +4239,17 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
         assert result.timed_out is True
         assert result.transcript_turns is None
         terminate_pg_mock.assert_called_once()
-        assert wall < 1.0, (
+        # Discriminates the correct ~0.2s ceiling from the WRONG extended ceilings
+        # (working_idle_secs=5.0 / absolute_cap_secs=10.0). The kill itself fires at
+        # 0.2s (see the "Absolute ceiling reached after 0.2s — killing" log); the only
+        # thing wall measures beyond that is real-ish subprocess teardown + event-loop
+        # scheduling, which under parallel verify load can drift to ~1.3s. The bound
+        # only needs to sit comfortably below the nearest wrong ceiling (5.0s), so 3.0s
+        # keeps full discriminating power while tolerating teardown latency under load.
+        assert wall < 3.0, (
             f'Expected kill at the old ~0.2s ceiling (extension never engages on an '
             f'unreadable transcript), got {wall:.3f}s — looks like the huge idle/cap '
-            f'params leaked into the degrade path'
+            f'params (5.0s idle / 10.0s cap) leaked into the degrade path'
         )
 
 
