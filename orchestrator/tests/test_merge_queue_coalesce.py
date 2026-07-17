@@ -2130,6 +2130,137 @@ class TestRedriveCoalesceMembersMainShaFallbackGrepGuard:
         )
 
 
+# ─── task 2677 step-11 ──────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestRedriveCoalesceMembersStaleEvidence:
+    """task 2677 step-11 (RED): a done_evidence_stale rejection surfacing from
+    a member's re-drive must be routed to the provenance_conflict_sink, NOT
+    silently swallowed by the generic ``except Exception`` log-and-continue
+    path below it — the exact gap plan.json's premises call out: 'Wrapped in
+    a per-member except Exception that only logs — a stale rejection would
+    be silently swallowed and re-attempted on the next derail.'
+
+    Drives the REAL redrive_member callback (built by
+    harness.build_train_callback_factory over a FakeScheduler) so the
+    found_on_main branch's scheduler.mark_done call is what actually raises
+    StaleEvidenceRejection, rather than a bare mocked redrive_member.
+    """
+
+    async def test_stale_rejection_files_escalation_and_leaves_member_unflipped(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """m1's found_on_main re-drive hits done_evidence_stale; m2's succeeds.
+
+        Asserts: m1 is left un-flipped (still 'merge-deferred'), m2 still
+        reaches 'done' (per-member isolation intact), exactly one pending L2
+        provenance_conflict escalation is filed via the worker's sink, and
+        the generic except-Exception log path is not taken for m1.
+        """
+        from _workflow_helpers import FakeScheduler
+
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.harness import build_train_callback_factory
+        from orchestrator.merge_queue import (
+            GroupMergeRequest,
+            MergeOutcome,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+        from orchestrator.scheduler import StaleEvidenceRejection
+
+        reopen_at = '2026-07-15T00:00:00+00:00'
+
+        sched = FakeScheduler()
+        await sched.set_task_status('m1', 'merge-deferred')
+        await sched.set_task_status('m2', 'merge-deferred')
+
+        _orig_mark_done = sched.mark_done
+
+        async def _mark_done_stale_for_m1(task_id, *, kind, sha, note=None):
+            if task_id == 'm1':
+                raise StaleEvidenceRejection(
+                    task_id='m1',
+                    evidence_commit='a' * 40,
+                    evidence_committed_at='2026-07-10T00:00:00+00:00',
+                    reopen_at=reopen_at,
+                    agent_id='claude-recon-x',
+                    raw="success=False payload={'error': 'done_evidence_stale'}",
+                )
+            await _orig_mark_done(task_id, kind=kind, sha=sha, note=note)
+
+        sched.mark_done = _mark_done_stale_for_m1
+
+        # REAL redrive_member closure — the worker itself is never patched;
+        # only scheduler.mark_done is doubled (above).
+        factory = build_train_callback_factory(sched)
+        cbs = factory('coalesce-stale-deadbeef')
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        sink = ProvenanceConflictSink(escalation_queue=esc_queue)
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, train_callback_factory=_stub_factory(),
+            provenance_conflict_sink=sink,
+        )
+
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        req = GroupMergeRequest(
+            task_id='m2',
+            branch='task/m2',
+            worktree=tmp_path / 'wt-stale',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=coalesce_config,
+            result=future,
+            train_id='coalesce-stale-deadbeef',
+            member_task_ids=['m1', 'm2'],
+            tip_branch='task/m2',
+            tip_task_id='m2',
+            status_check=cbs.status_check,
+            mark_member_done=cbs.mark_member_done,
+            redrive_member=cbs.redrive_member,
+        )
+
+        with (
+            patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
+            patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value='shatip')),
+            patch('orchestrator.merge_queue.logger') as mock_logger,
+        ):
+            await worker._redrive_coalesce_members(req, 'mainsha000')
+
+        # Per-member isolation: m2 must still be attempted and reach 'done'
+        # despite m1's rejection.
+        assert sched.statuses['m2'][-1] == 'done', (
+            f"m2 must be marked done; got {sched.statuses.get('m2')!r}"
+        )
+        # m1's stale-rejected done-write must NOT flip its status.
+        assert sched.statuses['m1'][-1] == 'merge-deferred', (
+            f"m1 must be left un-flipped (still merge-deferred); "
+            f"got {sched.statuses.get('m1')!r}"
+        )
+
+        # The generic except-Exception log path must NOT fire for the
+        # StaleEvidenceRejection — only the new dedicated branch handles it.
+        mock_logger.exception.assert_not_called()
+
+        # Exactly one pending L2 provenance_conflict escalation filed via the
+        # worker's shared sink.
+        pending = [
+            e for e in esc_queue.get_by_task('m1', status='pending')
+            if e.category == 'provenance_conflict'
+        ]
+        assert len(pending) == 1, f'expected exactly one pending L2, got {len(pending)}'
+        assert pending[0].level == 2
+        assert pending[0].severity == 'urgent'
+
+
 # ─── 1867 Step 5 ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
