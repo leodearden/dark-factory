@@ -1,253 +1,287 @@
-# Machine-readable twin of fused-memory-restart-survey-2026-07-17.capability-manifest.md
-# Schema: plans/capability-delivered-checks-prd.md §Contract
-# (shared/src/shared/capability_manifest.py CapabilityManifestDoc).
-# Grep tokens below are mandated by the corresponding task's details text.
 prd: plans/fused-memory-restart-survey-2026-07-17.md
 schema_version: 1
 tasks:
-  - label: "α"
-    task_id: null
-    title: "Bound uvicorn graceful-shutdown wait; second-signal force-exit"
-    capabilities:
-      - name: "uvicorn-shutdown-wait-bounded"
-        binding: "capability→producer (wired) — uvicorn.Config site server/main.py:980-987; param exists uvicorn/config.py:218"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "timeout_graceful_shutdown"
-          paths: ["fused-memory/src/fused_memory/"]
-          expect: present
-  - label: "β"
-    task_id: null
-    title: "Fix memory_service.close() shutdown-budget exhaustion"
-    capabilities:
-      - name: "close-completes-within-shutdown-budget"
-        binding: "capability→producer — _graceful_shutdown step budgets server/main.py:1738-1823; journal shows 2-for-2 timeout"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "clean-close is a journal/runtime property, not mechanically greppable"
-  - label: "γ"
-    task_id: null
-    title: "Drain converges: honor _draining inside _project_loop"
-    capabilities:
-      - name: "project-loop-observes-draining"
-        binding: "capability→producer (wired) — _draining harness.py:1580; un-gated loop harness.py:1639-1786"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "drain_ack"
-          paths: ["fused-memory/src/fused_memory/reconciliation/"]
-          expect: present
-  - label: "δ"
-    task_id: null
-    title: "Structured recon_busy health field + defer-if-busy restart script"
-    capabilities:
-      - name: "structured-busy-signal-on-health"
-        binding: "capability→producer (wired) — /health server/tools.py:700-721; script scripts/restart-fused-memory.sh"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "recon_busy"
-          paths: ["fused-memory/src/fused_memory/", "scripts/restart-fused-memory.sh"]
-          expect: present
-  - label: "ε"
-    task_id: null
-    title: "Scheduler distinguishes fm-failure from empty tasks; eviction guard fail-safe"
-    capabilities:
-      - name: "eviction-drain-skipped-on-failed-read"
-        binding: "capability→producer (wired) — scheduler.py:2004-2027, :5964-5973, :4597-4619"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "park_eviction_deferred_fm_unavailable"
-          paths: ["orchestrator/src/orchestrator/"]
-          expect: present
-  - label: "ζ"
-    task_id: null
-    title: "fm returns 503+Retry-After during shutdown"
-    capabilities:
-      - name: "shutdown-window-503"
-        binding: "capability→producer (wired) — _ASGIExceptionShield server/main.py:329-354"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "Retry-After"
-          paths: ["fused-memory/src/fused_memory/server/"]
-          expect: present
-  - label: "η"
-    task_id: null
-    title: "Shared restart-window retry budget across orchestrator fm-clients"
-    capabilities:
-      - name: "single-source-restart-retry-window"
-        binding: "capability→producer (wired) — mcp_lifecycle.py:432-434; deterministic_runner.py:278-295"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "FM_RESTART_RETRY_WINDOW_SECS"
-          paths: ["orchestrator/src/orchestrator/"]
-          expect: present
-  - label: "θ"
-    task_id: null
-    title: "Atomic temp+rename sidecar stamping"
-    capabilities:
-      - name: "atomic-replace-on-stamp"
-        binding: "capability→producer (wired) — manifest_stamping.py:246-250; house pattern curator_escalator.py:182-224"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "os\\.replace"
-          paths: ["fused-memory/src/fused_memory/server/manifest_stamping.py"]
-          expect: present
-  - label: "ι"
-    task_id: null
-    title: "Track judge tasks; judge-pending marker re-runs verdicts"
-    capabilities:
-      - name: "judge-pending-persisted"
-        binding: "capability→producer (wired) — spawn sites harness.py:1952/:2911; finally harness.py:1628-1636"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "judge_pending"
-          paths: ["fused-memory/src/fused_memory/reconciliation/"]
-          expect: present
-  - label: "κ"
-    task_id: null
-    title: "Durable-at-enqueue recon events + event-queue dead-letter replay"
-    capabilities:
-      - name: "event-durable-before-ack"
-        binding: "capability→producer (wired) — event_queue.py:128/:229-252; pragmas shared/async_sqlite_base.py:57-86"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "durability-before-ack is a kill-test property"
-      - name: "event-dead-letter-replay-tool"
-        binding: "capability→producer (wired) — DL read-only today tools.py:2529-2608; replay gap survey D2"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "replay_event_dead_letters"
-          paths: ["fused-memory/src/fused_memory/"]
-          expect: present
-  - label: "λ"
-    task_id: null
-    title: "Write-ahead intent for dual-store add_memory"
-    capabilities:
-      - name: "mem0-intent-journaled-before-call"
-        binding: "capability→producer (wired) — dual_write branch memory_service.py:2085-2146; post-hoc journal :831-866"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "mem0_intent"
-          paths: ["fused-memory/src/fused_memory/services/"]
-          expect: present
-  - label: "μ"
-    task_id: null
-    title: "Instance-aware stale-run recovery; run-scoped restore_drained"
-    capabilities:
-      - name: "predecessor-runs-recovered-at-startup"
-        binding: "capability→producer (wired) — cutoff journal.py:629-638; reaper harness.py:1083-1213"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "predecessor_run_recovered"
-          paths: ["fused-memory/src/fused_memory/reconciliation/"]
-          expect: present
-      - name: "restore-drained-run-scoped"
-        binding: "capability→producer (wired) — project-scoped site event_buffer.py:593-604; RCA accepted-gap"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "scoping is a SQL-predicate test property"
-  - label: "ν"
-    task_id: null
-    title: "Idempotency keys for mutating task writes"
-    capabilities:
-      - name: "client-op-id-deduped-in-write-journal"
-        binding: "capability→producer (wired) — write_journal.py:18-33; uuid4 site task_interceptor.py:528; R4 precedent :2003-2070"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "client_op_id"
-          paths: ["fused-memory/src/fused_memory/", "orchestrator/src/orchestrator/"]
-          expect: present
-  - label: "ξ"
-    task_id: null
-    title: "fm liveness in orchestrator-watchdog + unit-parity gate extension"
-    capabilities:
-      - name: "watchdog-watches-fused-memory"
-        binding: "capability→producer (wired) — WATCHED orchestrator-watchdog.py:41-49; parity allowlist check_fused_memory_unit_parity.py"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "fused-memory\\.service"
-          paths: ["scripts/orchestrator-watchdog.py"]
-          expect: present
-  - label: "ο"
-    task_id: null
-    title: "Staleness-driven fm auto-redeploy via δ's gate"
-    capabilities:
-      - name: "fm-src-in-staleness-watch"
-        binding: "capability→producer — staleness_pass exists; deploy action producer:task-δ upstream (defer-if-busy chokepoint)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "fused-memory/src"
-          paths: ["scripts/orchestrator-watchdog.py"]
-          expect: present
-  - label: "π"
-    task_id: null
-    title: "Session capture substrate: mint ids, journal columns, per-run config_dir"
-    capabilities:
-      - name: "stage-session-id-persisted"
-        binding: "capability→producer (wired) — cli_invoke.py:1315-1328/:1555 (plumbing exists); cli_stage_runner.py:316-361 (discarded today); runs schema journal.py:40-52"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "session_id"
-          paths: ["fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py"]
-          expect: present
-  - label: "ρ"
-    task_id: null
-    title: "ReconReportState persisted to SQLite (run_id, stage)"
-    capabilities:
-      - name: "report-state-survives-restart"
-        binding: "capability→producer (wired) — in-process state stages/base.py:56, cli_stage_runner.py:66-70; SQLite base shared/async_sqlite_base.py"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "recon_report_state"
-          paths: ["fused-memory/src/fused_memory/"]
-          expect: present
-  - label: "σ"
-    task_id: null
-    title: "Resume interrupted recon runs across restarts"
-    capabilities:
-      - name: "interrupted-run-status"
-        binding: "capability→producer (wired) — RunStatus models/reconciliation.py:121-129; CancelledError handler harness.py:1970-2001"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "interrupted"
-          paths: ["fused-memory/src/fused_memory/models/reconciliation.py"]
-          expect: present
-      - name: "resume-opt-out-knob"
-        binding: "capability→producer (wired) — resume_delivers_prompt cli_invoke.py:824-833; stage_reports persisted harness.py:1913-1917/:2037"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "resume_after_restart"
-          paths: ["fused-memory/src/fused_memory/config/"]
-          expect: present
-  - label: "τ"
-    task_id: null
-    title: "Green-tier config hot-reload tool for fused-memory"
-    capabilities:
-      - name: "reload-reports-dispositions"
-        binding: "capability→producer — escalation reload_config precedent (applied/restart_required contract per CLAUDE.md); fm schema fused_memory/config/schema.py"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "restart_required"
-          paths: ["fused-memory/src/fused_memory/server/"]
-          expect: present
+- label: α
+  task_id: 2700
+  title: Bound uvicorn graceful-shutdown wait; second-signal force-exit
+  capabilities:
+  - name: uvicorn-shutdown-wait-bounded
+    binding: capability→producer (wired) — uvicorn.Config site server/main.py:980-987;
+      param exists uvicorn/config.py:218
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: timeout_graceful_shutdown
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+- label: β
+  task_id: 2701
+  title: Fix memory_service.close() shutdown-budget exhaustion
+  capabilities:
+  - name: close-completes-within-shutdown-budget
+    binding: capability→producer — _graceful_shutdown step budgets server/main.py:1738-1823;
+      journal shows 2-for-2 timeout
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: clean-close is a journal/runtime property, not mechanically greppable
+- label: γ
+  task_id: 2702
+  title: 'Drain converges: honor _draining inside _project_loop'
+  capabilities:
+  - name: project-loop-observes-draining
+    binding: capability→producer (wired) — _draining harness.py:1580; un-gated loop
+      harness.py:1639-1786
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: drain_ack
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/
+      expect: present
+- label: δ
+  task_id: 2703
+  title: Structured recon_busy health field + defer-if-busy restart script
+  capabilities:
+  - name: structured-busy-signal-on-health
+    binding: capability→producer (wired) — /health server/tools.py:700-721; script
+      scripts/restart-fused-memory.sh
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: recon_busy
+      paths:
+      - fused-memory/src/fused_memory/
+      - scripts/restart-fused-memory.sh
+      expect: present
+- label: ε
+  task_id: 2704
+  title: Scheduler distinguishes fm-failure from empty tasks; eviction guard fail-safe
+  capabilities:
+  - name: eviction-drain-skipped-on-failed-read
+    binding: capability→producer (wired) — scheduler.py:2004-2027, :5964-5973, :4597-4619
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: park_eviction_deferred_fm_unavailable
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+- label: ζ
+  task_id: 2705
+  title: fm returns 503+Retry-After during shutdown
+  capabilities:
+  - name: shutdown-window-503
+    binding: capability→producer (wired) — _ASGIExceptionShield server/main.py:329-354
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: Retry-After
+      paths:
+      - fused-memory/src/fused_memory/server/
+      expect: present
+- label: η
+  task_id: 2706
+  title: Shared restart-window retry budget across orchestrator fm-clients
+  capabilities:
+  - name: single-source-restart-retry-window
+    binding: capability→producer (wired) — mcp_lifecycle.py:432-434; deterministic_runner.py:278-295
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: FM_RESTART_RETRY_WINDOW_SECS
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+- label: θ
+  task_id: 2707
+  title: Atomic temp+rename sidecar stamping
+  capabilities:
+  - name: atomic-replace-on-stamp
+    binding: capability→producer (wired) — manifest_stamping.py:246-250; house pattern
+      curator_escalator.py:182-224
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: os\.replace
+      paths:
+      - fused-memory/src/fused_memory/server/manifest_stamping.py
+      expect: present
+- label: ι
+  task_id: 2708
+  title: Track judge tasks; judge-pending marker re-runs verdicts
+  capabilities:
+  - name: judge-pending-persisted
+    binding: capability→producer (wired) — spawn sites harness.py:1952/:2911; finally
+      harness.py:1628-1636
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: judge_pending
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/
+      expect: present
+- label: κ
+  task_id: 2709
+  title: Durable-at-enqueue recon events + event-queue dead-letter replay
+  capabilities:
+  - name: event-durable-before-ack
+    binding: capability→producer (wired) — event_queue.py:128/:229-252; pragmas shared/async_sqlite_base.py:57-86
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: durability-before-ack is a kill-test property
+  - name: event-dead-letter-replay-tool
+    binding: capability→producer (wired) — DL read-only today tools.py:2529-2608;
+      replay gap survey D2
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: replay_event_dead_letters
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+- label: λ
+  task_id: 2710
+  title: Write-ahead intent for dual-store add_memory
+  capabilities:
+  - name: mem0-intent-journaled-before-call
+    binding: capability→producer (wired) — dual_write branch memory_service.py:2085-2146;
+      post-hoc journal :831-866
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: mem0_intent
+      paths:
+      - fused-memory/src/fused_memory/services/
+      expect: present
+- label: μ
+  task_id: 2711
+  title: Instance-aware stale-run recovery; run-scoped restore_drained
+  capabilities:
+  - name: predecessor-runs-recovered-at-startup
+    binding: capability→producer (wired) — cutoff journal.py:629-638; reaper harness.py:1083-1213
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: predecessor_run_recovered
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/
+      expect: present
+  - name: restore-drained-run-scoped
+    binding: capability→producer (wired) — project-scoped site event_buffer.py:593-604;
+      RCA accepted-gap
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: scoping is a SQL-predicate test property
+- label: ν
+  task_id: 2712
+  title: Idempotency keys for mutating task writes
+  capabilities:
+  - name: client-op-id-deduped-in-write-journal
+    binding: capability→producer (wired) — write_journal.py:18-33; uuid4 site task_interceptor.py:528;
+      R4 precedent :2003-2070
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: client_op_id
+      paths:
+      - fused-memory/src/fused_memory/
+      - orchestrator/src/orchestrator/
+      expect: present
+- label: ξ
+  task_id: 2713
+  title: fm liveness in orchestrator-watchdog + unit-parity gate extension
+  capabilities:
+  - name: watchdog-watches-fused-memory
+    binding: capability→producer (wired) — WATCHED orchestrator-watchdog.py:41-49;
+      parity allowlist check_fused_memory_unit_parity.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: fused-memory\.service
+      paths:
+      - scripts/orchestrator-watchdog.py
+      expect: present
+- label: ο
+  task_id: 2714
+  title: Staleness-driven fm auto-redeploy via δ's gate
+  capabilities:
+  - name: fm-src-in-staleness-watch
+    binding: capability→producer — staleness_pass exists; deploy action producer:task-δ
+      upstream (defer-if-busy chokepoint)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: fused-memory/src
+      paths:
+      - scripts/orchestrator-watchdog.py
+      expect: present
+- label: π
+  task_id: 2715
+  title: 'Session capture substrate: mint ids, journal columns, per-run config_dir'
+  capabilities:
+  - name: stage-session-id-persisted
+    binding: capability→producer (wired) — cli_invoke.py:1315-1328/:1555 (plumbing
+      exists); cli_stage_runner.py:316-361 (discarded today); runs schema journal.py:40-52
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: session_id
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py
+      expect: present
+- label: ρ
+  task_id: 2716
+  title: ReconReportState persisted to SQLite (run_id, stage)
+  capabilities:
+  - name: report-state-survives-restart
+    binding: capability→producer (wired) — in-process state stages/base.py:56, cli_stage_runner.py:66-70;
+      SQLite base shared/async_sqlite_base.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: recon_report_state
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+- label: σ
+  task_id: 2717
+  title: Resume interrupted recon runs across restarts
+  capabilities:
+  - name: interrupted-run-status
+    binding: capability→producer (wired) — RunStatus models/reconciliation.py:121-129;
+      CancelledError handler harness.py:1970-2001
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: interrupted
+      paths:
+      - fused-memory/src/fused_memory/models/reconciliation.py
+      expect: present
+  - name: resume-opt-out-knob
+    binding: capability→producer (wired) — resume_delivers_prompt cli_invoke.py:824-833;
+      stage_reports persisted harness.py:1913-1917/:2037
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: resume_after_restart
+      paths:
+      - fused-memory/src/fused_memory/config/
+      expect: present
+- label: τ
+  task_id: 2718
+  title: Green-tier config hot-reload tool for fused-memory
+  capabilities:
+  - name: reload-reports-dispositions
+    binding: capability→producer — escalation reload_config precedent (applied/restart_required
+      contract per CLAUDE.md); fm schema fused_memory/config/schema.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: restart_required
+      paths:
+      - fused-memory/src/fused_memory/server/
+      expect: present
