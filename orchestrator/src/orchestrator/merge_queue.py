@@ -5782,6 +5782,20 @@ class ProbePlacement:
     Returned by :meth:`SpeculativeMergeWorker._probe_verify_placement` when
     ``select_probe_depth()`` selects a deeper stack to probe this round.
 
+    KNOWN PHASE-1 LIMITATION (reviewer_comprehensive amendment, task 2359):
+    ``depth``/``base`` are ATTRIBUTION facts only -- the verify that consumes
+    this placement still runs against the dispatched item's OWN (typically
+    shallower) ``merge_wt``, never against *base*'s worktree content. So the
+    resulting ``merge_verify`` record's ``depth=d`` says "a depth-d stack
+    was already built and healthy at this dispatch's decision time", NOT
+    "this specific verify exercised d cumulative layers of diff" -- the two
+    coincide only when the dispatched item happens to itself be the depth-d
+    tip. Treat probe-sourced buckets in ``analyze_speculation_depth.py`` as
+    a depth-availability proxy, not literal per-item cumulative-diff
+    coverage, until a follow-up phase redirects dispatch itself onto the
+    deep tip (which would also realize the throughput lever described in
+    this task's plan -- landing d+1 items per passing probe).
+
     Attributes:
         depth: The probed cumulative stack depth (a member of
             ``probe_depths``) -- flows into the merge_verify event's
@@ -5789,7 +5803,9 @@ class ProbePlacement:
             the normal ``_verify_frontier_depth()`` label for this dispatch.
         base: The merge_commit of the already-built item at that cumulative
             depth (the depth-d built cumulative tip) -- the base this
-            probed verify is attributed to.
+            probed verify is attributed to. A DIFFERENT commit than the
+            dispatched item's own merge_commit whenever the probe fires at
+            d > 1 (see the limitation note above).
     """
 
     depth: int
@@ -7616,6 +7632,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``probe_fraction=0.0`` is byte-identical; also ``None`` on flake-rate
         suppression, an off-cycle round, or when the sampled depth exceeds
         :meth:`_available_built_depth`).
+
+        *item* itself is ALWAYS the one the caller already chose to dispatch
+        (the FIFO front of ``_verifier_queue``/``_redispatch``) -- this
+        method never selects a different item to verify, only whether to
+        relabel THIS dispatch's depth/base attribution. See
+        :class:`ProbePlacement`'s docstring for the resulting label-vs-
+        actually-verified-content caveat (the returned ``base`` is usually a
+        DIFFERENT, deeper item's commit than *item*'s own).
 
         Reads ``item.request.config.speculation_probe`` LIVE on every call
         (never cached at worker-construction time), so a hot-reloaded config
@@ -11808,6 +11832,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             item.merge_wt).  ``None`` (default) keeps every existing caller
             byte-identical -- main_sha falls back to item.base_sha exactly
             as before this task.
+
+            KNOWN PHASE-1 LIMITATION (reviewer_comprehensive amendment):
+            because the content verified stays item.merge_wt, a firing
+            probe's ``depth`` label in the resulting merge_verify record
+            does NOT assert that d cumulative layers of diff were exercised
+            by THIS verify -- only that a depth-d stack existed and was
+            healthy-enough to reference at dispatch time.  See
+            :class:`ProbePlacement`'s docstring for the full caveat and the
+            deferred follow-up (redirecting dispatch itself onto the deep
+            tip) that would close this gap.
         """
         req = item.request
         merge_wt = item.merge_wt
@@ -13086,6 +13120,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # change. placement=None (default probe_fraction=0.0, a
         # non-speculative item, or any of the pure policy's guards) keeps
         # this branch byte-identical to the pre-task-2359 behaviour.
+        #
+        # KNOWN PHASE-1 LIMITATION (reviewer_comprehensive amendment): `item`
+        # dispatched here is still whatever the caller already popped off
+        # _verifier_queue/_redispatch (FIFO) — a firing placement does NOT
+        # redirect dispatch onto the deeper `placement.base` item itself, so
+        # the verify still exercises only `item`'s own (typically shallower)
+        # merge_wt. See ProbePlacement's docstring for the resulting
+        # label-vs-verified-content caveat this implies for consumers of
+        # analyze_speculation_depth.py's per-depth P(pass|depth) curve.
         placement = self._probe_verify_placement(item)
         depth = placement.depth if placement is not None else self._verify_frontier_depth()
         probe_base = placement.base if placement is not None else None

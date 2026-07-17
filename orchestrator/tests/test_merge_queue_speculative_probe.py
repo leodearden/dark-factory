@@ -31,6 +31,15 @@ build depth -- see plan.json design_decisions for the full rationale. Under
 default speculation_depth (K=2), _available_built_depth() stays low and
 every probe safely no-op-falls-back to the unchanged _verify_frontier_depth()
 path.
+
+KNOWN PHASE-1 LIMITATION (reviewer_comprehensive amendment): a firing probe
+relabels depth/main_sha attribution only -- the verify itself still runs
+against the DISPATCHED item's own (typically shallower) merge_wt, never
+against the probed base's worktree content. See ProbePlacement's docstring
+in merge_queue.py for the full caveat this implies for
+analyze_speculation_depth.py's per-depth P(pass|depth) consumers, and
+TestRunInflightVerifyProbeBaseWiring.test_probe_base_overrides_main_sha's
+merge_sha assertion below for the regression lock.
 """
 
 from __future__ import annotations
@@ -1077,6 +1086,14 @@ class TestRunInflightVerifyProbeBaseWiring:
         assert captured.get('main_sha') == 'deep-tip-commit'
         # item itself must never be mutated by the probe_base override.
         assert item.base_sha == 'items-own-base-sha'
+        # AMENDMENT (reviewer_comprehensive, task 2359): locks in the
+        # label-vs-verified-content distinction documented on ProbePlacement
+        # -- main_sha is attributed to the deep probed tip, but merge_sha
+        # (the commit whose worktree is ACTUALLY built/verified, threaded
+        # into the same merge_verify record) stays item's own merge_commit.
+        # A firing probe never substitutes the deep tip's content for
+        # item's own.
+        assert captured.get('merge_sha') == 'deadbeef'
 
     async def test_no_probe_base_keeps_main_sha_byte_identical(self, tmp_path: Path) -> None:
         """probe_base=None (default / non-probed dispatch) -> main_sha is
