@@ -1222,24 +1222,31 @@ class SqliteTaskBackend:
         guarded read, and it serializes access through the per-project
         :meth:`_read_lock` so that rollback can never tear a concurrent
         peer reader's in-flight cursor (see :meth:`_read_lock`'s
-        docstring). As of task 2694 step-2, :meth:`get_task` reads through
-        :meth:`_fresh_read_conn` and is therefore enforced this way;
-        :meth:`_get_tasks_internal`, :meth:`get_statuses_raw` (via
-        :meth:`_statuses_from_conn`), and :meth:`list_tags` still call this
-        method directly and rely on the belt alone until task 2694 step-4
-        migrates them too. A future caller should go through
-        :meth:`_fresh_read_conn` rather than call this method directly.
+        docstring). Every current caller of this method —
+        :meth:`get_task`, :meth:`_get_tasks_internal`,
+        :meth:`get_statuses_raw` (via :meth:`_statuses_from_conn`), and
+        :meth:`list_tags` — now reads exclusively through
+        :meth:`_fresh_read_conn` (task 2694 step-4) rather than calling
+        this method directly, so the "never pinned" invariant is enforced
+        for all of them, not just documented-by-convention. A future
+        caller should do the same rather than call this method directly.
 
-        Serialization trade-off (task 2651): this connection is now shared
-        by both the "hot" status reads (:meth:`get_statuses_raw` via
-        :meth:`_statuses_from_conn`) and the heavier full-tree reads
-        (:meth:`get_task`, :meth:`_get_tasks_internal`/:meth:`get_tasks`).
-        aiosqlite serializes every ``execute``/``fetch`` on a connection
-        through that connection's single background worker thread, so a
-        large ``get_tasks`` scan can head-of-line-block a concurrent
+        Serialization trade-off (task 2651, reinforced task 2694): this
+        connection is now shared by both the "hot" status reads
+        (:meth:`get_statuses_raw` via :meth:`_statuses_from_conn`) and the
+        heavier full-tree reads (:meth:`get_task`,
+        :meth:`_get_tasks_internal`/:meth:`get_tasks`). aiosqlite serializes
+        every ``execute``/``fetch`` on a connection through that
+        connection's single background worker thread, so a large
+        ``get_tasks`` scan can head-of-line-block a concurrent
         ``get_statuses`` hot read that would previously have run on the
-        separate write connection's thread instead. This is an accepted
-        trade-off, not an oversight: the freshness convergence this
+        separate write connection's thread instead. Task 2694's
+        :meth:`_read_lock` makes this explicit at the ``asyncio`` level too
+        — a caller now holds the lock for its entire logical read unit, not
+        just the underlying statements — but does not add any NEW blocking
+        beyond what the shared worker thread already serialized; see the
+        :meth:`_fresh_read_conn`/:meth:`_read_lock` docstrings. This is an
+        accepted trade-off, not an oversight: the freshness convergence this
         connection exists for requires get_task/get_tasks and get_statuses
         to read the SAME connection, so splitting the tree reads back onto
         a connection of their own would reopen the two-connections-can-
@@ -1436,21 +1443,21 @@ class SqliteTaskBackend:
     ) -> list[dict[str, Any]]:
         if statuses is not None and not statuses:
             return []
-        conn = await self._get_read_connection(project_root)
-        if statuses is None:
-            async with conn.execute(
-                'SELECT * FROM tasks WHERE tag = ? ORDER BY id',
-                (tag,),
-            ) as cursor:
-                rows = await cursor.fetchall()
-        else:
-            placeholders = ','.join('?' * len(statuses))
-            async with conn.execute(
-                f'SELECT * FROM tasks WHERE tag = ? AND status IN ({placeholders}) ORDER BY id',
-                (tag, *statuses),
-            ) as cursor:
-                rows = await cursor.fetchall()
-        deps = await self._fetch_dependencies(conn, tag)
+        async with self._fresh_read_conn(project_root) as conn:
+            if statuses is None:
+                async with conn.execute(
+                    'SELECT * FROM tasks WHERE tag = ? ORDER BY id',
+                    (tag,),
+                ) as cursor:
+                    rows = await cursor.fetchall()
+            else:
+                placeholders = ','.join('?' * len(statuses))
+                async with conn.execute(
+                    f'SELECT * FROM tasks WHERE tag = ? AND status IN ({placeholders}) ORDER BY id',
+                    (tag, *statuses),
+                ) as cursor:
+                    rows = await cursor.fetchall()
+            deps = await self._fetch_dependencies(conn, tag)
         return [
             _row_to_task(row, deps.get(row['id'], []), project_root=project_root)
             for row in rows
@@ -1590,10 +1597,14 @@ class SqliteTaskBackend:
         so metadata columns are never decoded.
 
         Reads via the cached per-project AUTOCOMMIT connection returned by
-        :meth:`_get_read_connection` (task 2455). As of task 2651,
-        :meth:`get_task`/:meth:`get_tasks` read via this same cached
-        connection too, rather than the cached WRITE connection
-        (:meth:`_get_connection`) they used before — see
+        :meth:`_get_read_connection` (task 2455), through the
+        :meth:`_fresh_read_conn` guard (task 2694): any lingering
+        transaction is rolled back before the read runs, and the read is
+        serialized against concurrent cached-read-connection callers via
+        the per-project read lock — see :meth:`_fresh_read_conn` for the
+        full rationale. As of task 2651, :meth:`get_task`/:meth:`get_tasks`
+        read via this same cached connection too, rather than the cached
+        WRITE connection (:meth:`_get_connection`) they used before — see
         :meth:`_get_read_connection` and :meth:`get_statuses_fresh` for why
         a pinnable connection could otherwise go stale.
 
@@ -1601,13 +1612,16 @@ class SqliteTaskBackend:
         now read the SAME cached connection as this method (task 2651), the
         two can no longer disagree due to one side being pinned to a stale
         WAL snapshot while the other reads fresh — the specific defect this
-        convergence closes. They remain independent calls, though (each
-        opens and closes its own cursor against the shared connection), so
-        a status committed between two separate calls can still show up in
-        one and not the other — the ordinary read-skew any two sequential
-        reads have. No in-tree caller currently depends on
-        stronger-than-that consistency: the one caller that compares a
-        ``get_tasks`` tree against a status census
+        convergence closes, and (task 2694) neither side can be pinned by a
+        lingering transaction in the first place, since every reader routes
+        through the same :meth:`_fresh_read_conn` guard. They remain
+        independent calls, though (each opens and closes its own cursor
+        against the shared connection, serialized by the read lock but not
+        merged into one snapshot), so a status committed between two
+        separate calls can still show up in one and not the other — the
+        ordinary read-skew any two sequential reads have. No in-tree caller
+        currently depends on stronger-than-that consistency: the one caller
+        that compares a ``get_tasks`` tree against a status census
         (``cross_verify_task_counts`` in ``reconciliation/task_filter.py``)
         is fed by :meth:`get_statuses_fresh`, not this method — see
         ``reconciliation/harness.py``'s ``_fetch_task_count_census`` — and
@@ -1634,8 +1648,8 @@ class SqliteTaskBackend:
         # safely callable in isolation without relying on the caller to connect first.
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
-        conn = await self._get_read_connection(project_root)
-        return await self._statuses_from_conn(conn, tag, ids)
+        async with self._fresh_read_conn(project_root) as conn:
+            return await self._statuses_from_conn(conn, tag, ids)
 
     async def get_statuses(
         self,
@@ -1753,18 +1767,25 @@ class SqliteTaskBackend:
 
         Reads via the cached per-project AUTOCOMMIT connection returned by
         :meth:`_get_read_connection` (task 2455) — the same lightweight,
-        connection-unpinning read pattern as :meth:`get_statuses_raw`.
-        Closes its cursor deterministically via ``async with conn.execute(
-        ...) as cursor:`` (mirrors :meth:`_statuses_from_conn`) so the
-        implicit WAL read transaction always releases, keeping the cached
-        read connection unpinnable (see :meth:`_get_read_connection`'s
-        Guardrail note).
+        connection-unpinning read pattern as :meth:`get_statuses_raw` — via
+        the :meth:`_fresh_read_conn` guard (task 2694), which rolls back
+        any lingering transaction before the read runs and serializes
+        access against concurrent cached-read-connection callers via the
+        per-project read lock. Closes its cursor deterministically via
+        ``async with conn.execute(...) as cursor:`` (mirrors
+        :meth:`_statuses_from_conn`) so the implicit WAL read transaction
+        always releases, keeping the cached read connection unpinnable (see
+        :meth:`_get_read_connection`'s Guardrail note) — belt-and-suspenders
+        alongside the guard.
 
         Snapshot consistency: as of task 2651, :meth:`get_task`/
         :meth:`get_tasks` also read via :meth:`_get_read_connection`, so
         this method and they now share the same cached connection — no
-        cross-connection WAL-snapshot divergence between them. They remain
-        independent calls, though: a caller combining them (e.g.
+        cross-connection WAL-snapshot divergence between them, and (task
+        2694) neither can be left pinned by a lingering transaction, since
+        every reader now routes through the same :meth:`_fresh_read_conn`
+        guard. They remain independent calls, though: a caller combining
+        them (e.g.
         :class:`~fused_memory.maintenance.backfill_curator_corpus.BackfillManager`'s
         cross-tag prune sweep, which calls this and then ``get_tasks`` once
         per tag) should still treat a tag created concurrently with the
@@ -1781,8 +1802,10 @@ class SqliteTaskBackend:
             sort). ``[]`` if the project has no tasks yet.
         """
         await self.ensure_connected()
-        conn = await self._get_read_connection(project_root)
-        async with conn.execute('SELECT DISTINCT tag FROM tasks') as cursor:
+        async with (
+            self._fresh_read_conn(project_root) as conn,
+            conn.execute('SELECT DISTINCT tag FROM tasks') as cursor,
+        ):
             rows = await cursor.fetchall()
         return [row['tag'] for row in rows]
 
