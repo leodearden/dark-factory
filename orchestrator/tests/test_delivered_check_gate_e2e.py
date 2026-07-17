@@ -473,3 +473,95 @@ class TestScriptRunnerErrorFailSafe:
             f'once the script exists and exits 0, the dependent must '
             f'dispatch; got {result!r}'
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Row 10 fixture constants (cancelled producer, gated exactly like done)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CAP_NAME_10 = 'row10_cap'
+_CAP_TOKEN_10 = 'ROW10_CAPABILITY_TOKEN_V1'
+_MARKER_REL_PATH_10 = 'src/row10_marker.py'
+_GRACE_CYCLES_10 = 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestCancelledProducerSameLaneAsDone — row 10: cancelled dep gated like done
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestCancelledProducerSameLaneAsDone:
+    """Row 10: a CANCELLED producer carrying a failing ``delivered_checks``
+    entry is gated EXACTLY like a 'done' one — the gate trusts what's
+    committed on ``main``, not the dep's status label. Ticks 1..G-1
+    withhold with no escalation; tick G files the born-at-L2 naming the
+    check and the 'cancelled' status, and the dependent goes 'blocked'.
+    Landing the capability token on main and manually re-pending the
+    dependent then dispatches it — a cancelled dep whose checks now PASS
+    satisfies the gate just as a done one would.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_dep_gated_like_done_then_heals(self, tmp_path: Path) -> None:
+        project_root = _init_git_repo(tmp_path, marker_rel_path=_MARKER_REL_PATH_10)
+        session = _LocalDepMcpSession()
+        _register_producer(
+            session, 'P10', status='cancelled',
+            checks=[_grep_check(_CAP_NAME_10, _CAP_TOKEN_10, [_MARKER_REL_PATH_10])],
+        )
+        _register_dependent(session, 'D10', dep_id='P10')
+
+        harness = _build_harness(
+            project_root, session, tmp_path / 'escalations',
+            grace_cycles=_GRACE_CYCLES_10,
+        )
+
+        # --- ticks 1..G-1: withhold, no escalation yet ---
+        for tick in range(1, _GRACE_CYCLES_10):
+            result = await _run_tick(harness)
+            assert result is None, (
+                f'tick {tick}: a cancelled dep with a failing check must '
+                f'withhold dispatch exactly like a done one; got {result!r}'
+            )
+            assert _l2_for(harness, 'D10') == [], (
+                f'tick {tick}: no L2 escalation must exist before grace_cycles '
+                f'({_GRACE_CYCLES_10}) is reached'
+            )
+
+        # --- tick G: born-at-L2 escalation names the check + the
+        # 'cancelled' status; the dependent is blocked ---
+        result = await _run_tick(harness)
+        assert result is None, (
+            f'tick {_GRACE_CYCLES_10}: dependent must still not be dispatched; '
+            f'got {result!r}'
+        )
+
+        escs = _l2_for(harness, 'D10')
+        assert len(escs) == 1, (
+            f'expected exactly one pending born-at-L2 escalation for the '
+            f'dependent on tick {_GRACE_CYCLES_10}; got {escs!r}'
+        )
+        esc = escs[0]
+        assert 'DEP_CAPABILITY_NOT_DELIVERED' in esc.summary, esc.summary
+        assert _CAP_NAME_10 in esc.summary, esc.summary
+        assert 'P10' in esc.summary, esc.summary
+        assert 'cancelled' in esc.summary, esc.summary
+
+        d10_status = next(
+            (t['status'] for t in session.tasks if str(t.get('id')) == 'D10'), None,
+        )
+        assert d10_status == 'blocked', (
+            f"expected D10.status=='blocked' after the grace-streak escalation; "
+            f"got {d10_status!r}"
+        )
+
+        # --- land the capability + re-pend -> dispatches (trusts main, not
+        # the status label) ---
+        _commit_marker(project_root, _MARKER_REL_PATH_10, _CAP_TOKEN_10)
+        await _flip_status(session, 'D10', 'pending')
+
+        result = await _run_tick(harness)
+        assert result == 'D10', (
+            f'once the capability lands on main, a cancelled dep must '
+            f'satisfy the gate exactly like a done one; got {result!r}'
+        )
