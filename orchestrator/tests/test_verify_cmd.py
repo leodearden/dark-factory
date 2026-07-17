@@ -19,6 +19,7 @@ import pytest
 from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
+    apply_pytest_numprocesses,
     cargo_scope,
     govern_cpu,
     parse_config_command,
@@ -595,6 +596,69 @@ class TestSerialPytest:
     def test_noop_on_opaque(self):
         cmd = parse_config_command('mypy src/')
         assert serial_pytest(cmd) == cmd
+
+
+class TestSeparateTokenValueFlagBinding:
+    """A pytest separate-token value flag (-k/-m/-p/-o/-n/...) must bind to its
+
+    following value at PARSE time, as an adjacent ``(flag, value)`` pair
+    inside ``base_flags`` — not be severed by the naive dash-prefix split,
+    which strands the value in ``targets``. Because every ``base_flags``
+    mutator (``apply_pytest_numprocesses``, ``serial_pytest``,
+    ``with_junitxml``) appends to the END of ``base_flags``, a bound
+    contiguous pair can never have a later flag inserted between it and its
+    value (task 2727).
+
+    Mirrors TestSerialPytest's and
+    test_verify_admission_pytest_n.py::TestApplyPytestNumprocesses's
+    parse -> mutate -> render -> assert style.
+    """
+
+    @pytest.mark.parametrize(
+        ('flag', 'value'),
+        [
+            ('-k', 'foo'),
+            ('-m', 'slow'),
+            ('-p', 'no:cacheprovider'),
+            ('-o', 'addopts='),
+            ('-n', '4'),
+        ],
+    )
+    def test_value_flag_binds_to_following_token_at_parse_time(self, flag, value):
+        cmd = parse_config_command(f'pytest {flag} {value} tests/')
+        assert cmd.base_flags == (flag, value)
+        assert cmd.targets == ('tests/',)
+
+    def test_round_trip_preserved(self):
+        """The pre-existing coincidental round-trip must still hold post-fix."""
+        raw = 'pytest -k foo tests/'
+        cmd = parse_config_command(raw)
+        assert shlex.split(render(cmd)) == shlex.split(raw)
+
+    @pytest.mark.parametrize('flag', ['-k', '-m', '-p'])
+    def test_apply_pytest_numprocesses_does_not_split_bound_value_flag(self, flag):
+        """Acceptance regression: appending `-n 16` must never land between a
+
+        bound value flag and its value (on main this renders
+        `pytest -k -n 16 foo tests/` — the flag consumes -n and the value
+        becomes a misplaced positional).
+        """
+        cmd = parse_config_command(f'pytest {flag} VAL tests/')
+        rendered = render(apply_pytest_numprocesses(cmd, '16'))
+        tokens = shlex.split(rendered)
+        assert tokens[tokens.index(flag) + 1] == 'VAL'
+        assert tokens[tokens.index('-n') + 1] == '16'
+        assert f'{flag} -n' not in rendered, f'flag/value split corruption in {rendered!r}'
+
+    def test_serial_pytest_does_not_split_bound_value_flag(self):
+        """Acceptance regression: serial_pytest's appended `-p no:xdist -o
+
+        addopts=` must never land between `-k` and its value `foo`.
+        """
+        cmd = parse_config_command('pytest -k foo tests/')
+        rendered = render(serial_pytest(cmd))
+        tokens = shlex.split(rendered)
+        assert tokens[tokens.index('-k') + 1] == 'foo'
 
 
 class TestGovernCpu:
