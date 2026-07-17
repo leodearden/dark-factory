@@ -1833,7 +1833,11 @@ class ReconciliationHarness:
         run_id = str(uuid4())
         watermark = await self.journal.get_watermark(project_id)
         if events is None:
-            events = await self.buffer.drain(project_id)
+            events = await self.buffer.drain(project_id, run_id=run_id)
+        else:
+            await self.buffer.mark_drained_run_id(
+                project_id, [e.id for e in events], run_id
+            )
 
         run = ReconciliationRun(
             id=run_id,
