@@ -5345,7 +5345,16 @@ class TaskWorkflow:
             )
             return None
 
-        verdict = result.structured_output
+        # PRD task ζ / task 2486: prefer the verdict-tools artifact
+        # (verdicts/judge.json) over the legacy result.structured_output,
+        # but FALL BACK to structured_output when the artifact is absent or
+        # malformed — the judge is completion-gating and this orchestrator
+        # self-hosts the PRD's own tasks, so a botched cutover that
+        # silently returned "not complete" would wedge completion. Task η
+        # removes this fallback after real-run verification.
+        envelope = self.artifacts.read_verdict('judge')
+        artifact_verdict = envelope.get('verdict') if isinstance(envelope, dict) else None
+        verdict = artifact_verdict if isinstance(artifact_verdict, dict) else result.structured_output
         if not isinstance(verdict, dict):
             logger.warning(
                 f'Task {self.task_id}: judge returned non-dict structured_output — '
