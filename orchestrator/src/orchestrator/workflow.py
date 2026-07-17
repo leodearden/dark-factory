@@ -2477,11 +2477,36 @@ class TaskWorkflow:
                         new_files = current_files + [
                             f for f in granted if f not in current_files
                         ]
-                        if (
-                            set(files_to_modules(new_files, self.config.lock_depth))
-                            != set(self.modules)
-                        ):
-                            await self._set_task_scope(new_files)
+                        new_modules = files_to_modules(new_files, self.config.lock_depth)
+                        if set(new_modules) != set(self.modules):
+                            if not await self._set_task_scope(new_files):
+                                # Lock conflict: the scheduler already
+                                # requeued the task to pending and persisted
+                                # metadata.files=new_files on its own (plan.json
+                                # was widened to match by _set_task_scope
+                                # before the conflict was detected). Do NOT
+                                # resume the implementer under a lock a
+                                # sibling task still holds — requeue and let
+                                # this task redispatch once the lock frees.
+                                additional = sorted(
+                                    set(new_modules) - set(self.modules)
+                                )
+                                block_detail = (
+                                    f'Scope grant blocked: additional locks '
+                                    f'{additional} unavailable (held by other '
+                                    f'tasks). Held modules: '
+                                    f'{sorted(self.modules)}; granted files: '
+                                    f'{sorted(granted)}.'
+                                )
+                                self._terminal_report = TerminalReport(
+                                    outcome=WorkflowOutcome.REQUEUED,
+                                    reason='scope_grant_lock_conflict',
+                                    phase=self.machine.state,
+                                    detail=block_detail,
+                                    category=None,
+                                    blocked_from_phase=self.machine.state,
+                                )
+                                return WorkflowOutcome.REQUEUED
 
                     # Resume with resolution context
                     logger.info(f'Task {self.task_id}: resuming after escalation resolution')
