@@ -2225,17 +2225,24 @@ class Scheduler:
                         raw=rejection,
                     )
                 if error_code == 'done_evidence_stale':
+                    # reviewer_comprehensive amendment (task 2677,
+                    # code_duplication): compute the dict-or-empty guard
+                    # once instead of repeating `if isinstance(structured,
+                    # dict) else ''` per field. `structured` is guaranteed
+                    # to be a dict here (error_code is only ever
+                    # 'done_evidence_stale' when structured.get('error', '')
+                    # produced that string, which requires `structured` to
+                    # already be a dict — see the error_code assignment
+                    # above), so `s` below is never actually the `{}`
+                    # fallback in practice; it exists for defensive/typing
+                    # symmetry with the sibling branches.
+                    s = structured if isinstance(structured, dict) else {}
                     raise StaleEvidenceRejection(
                         task_id=task_id,
-                        evidence_commit=str(structured.get('evidence_commit', ''))
-                        if isinstance(structured, dict) else '',
-                        evidence_committed_at=str(
-                            structured.get('evidence_committed_at', '')
-                        ) if isinstance(structured, dict) else '',
-                        reopen_at=str(structured.get('reopen_at', ''))
-                        if isinstance(structured, dict) else '',
-                        agent_id=str(structured.get('agent_id', ''))
-                        if isinstance(structured, dict) else '',
+                        evidence_commit=str(s.get('evidence_commit', '')),
+                        evidence_committed_at=str(s.get('evidence_committed_at', '')),
+                        reopen_at=str(s.get('reopen_at', '')),
+                        agent_id=str(s.get('agent_id', '')),
                         raw=rejection,
                     )
                 # Any other non-transient rejection: raise the family base
