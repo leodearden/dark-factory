@@ -74,6 +74,16 @@ TERMINAL_CORRECTIVE_PATH = 'set_task_status_done_provenance_repair'
 # never reach this predicate.
 CLEARABLE_ANNOTATION_KEYS: frozenset[str] = frozenset({'possible_scope_mismatch'})
 
+# The sanctioned forward-compat annotation-key namespace (task 2695), used
+# by :func:`is_terminal_annotation_add`. Mirrors the bare ``'x_'`` literal in
+# ``shared/src/shared/task_metadata.py:863`` (``parse_metadata`` admits any
+# key where ``key.startswith('x_')`` silently — no schema warning, no
+# allowlist entry required). Defined as a local constant rather than an
+# import because ``task_metadata.py`` exposes no shared constant of its own
+# to import (it uses the bare literal directly) — this is an intentional
+# literal-mirror; keep the two in sync by hand if either changes.
+X_ANNOTATION_PREFIX = 'x_'
+
 # Allowlist (robustness amendment, task 2684) of ``update_task`` kwargs that
 # NEVER disqualify the terminal-annotation-clear exemption. Deliberately an
 # allowlist of permitted kwargs, NOT a denylist of known content fields: a
@@ -391,12 +401,18 @@ def extract_snapshot_token(metadata: object) -> str | None:
     return None
 
 
-def is_terminal_annotation_clear(update_kwargs: dict) -> bool:
-    """Is *update_kwargs* a pure, allowlisted, terminal-task annotation clear?
+def _pure_terminal_annotation_merge(update_kwargs: dict) -> dict | None:
+    """Return the parsed ``metadata`` dict iff *update_kwargs* is a pure,
+    allowlisted-kwargs, merge-mode, non-empty metadata write — else ``None``.
 
-    True iff ALL of the following hold — used to compute Gate 1's
-    ``is_annotation_clear`` bypass (task 2684) for a non-load-bearing
-    annotation-only ``update_task`` write against a terminal task:
+    Shared eligibility core (task 2695) for both
+    :func:`is_terminal_annotation_clear` and :func:`is_terminal_annotation_add`:
+    both predicates layer their own per-key check (every key in
+    :data:`CLEARABLE_ANNOTATION_KEYS`, or every key starting with
+    :data:`X_ANNOTATION_PREFIX`, respectively) on top of the dict this
+    function returns.
+
+    Returns non-``None`` iff ALL of the following hold:
 
     (a) Every key in *update_kwargs* with a non-``None`` value is in
         :data:`_ANNOTATION_CLEAR_ALLOWED_KWARGS` — an unrecognized kwarg
@@ -412,26 +428,67 @@ def is_terminal_annotation_clear(update_kwargs: dict) -> bool:
         old-wins) — only ``merge`` both preserves other keys and overwrites
         the target.
     (c) ``update_kwargs['metadata']`` coerces (via :func:`_coerce_metadata_dict`)
-        to a non-empty ``dict``.
-    (d) Every top-level key of that dict is in :data:`CLEARABLE_ANNOTATION_KEYS`.
-
-    A "clear" is a merge-overwrite (including to ``None``); this predicate
-    has no notion of key deletion (metadata has no such primitive).
+        to a non-empty ``dict`` — the dict returned on success.
     """
     if any(
         key not in _ANNOTATION_CLEAR_ALLOWED_KWARGS and value is not None
         for key, value in update_kwargs.items()
     ):
-        return False
+        return None
 
     metadata_mode = update_kwargs.get('metadata_mode')
     append = update_kwargs.get('append')
     is_merge_mode = metadata_mode == 'merge' or (metadata_mode is None and append is None)
     if not is_merge_mode:
-        return False
+        return None
 
     parsed = _coerce_metadata_dict(update_kwargs.get('metadata'))
     if not parsed:
-        return False
+        return None
 
-    return all(key in CLEARABLE_ANNOTATION_KEYS for key in parsed)
+    return parsed
+
+
+def is_terminal_annotation_clear(update_kwargs: dict) -> bool:
+    """Is *update_kwargs* a pure, allowlisted, terminal-task annotation clear?
+
+    True iff :func:`_pure_terminal_annotation_merge` succeeds AND every
+    top-level key of the returned metadata dict is in
+    :data:`CLEARABLE_ANNOTATION_KEYS` — used to compute Gate 1's
+    ``is_annotation_clear`` bypass (task 2684) for a non-load-bearing
+    annotation-only ``update_task`` write against a terminal task. See
+    :func:`_pure_terminal_annotation_merge` for the shared (allowlisted-kwargs,
+    merge-mode, non-empty-metadata) eligibility checks.
+
+    A "clear" is a merge-overwrite (including to ``None``); this predicate
+    has no notion of key deletion (metadata has no such primitive).
+    """
+    parsed = _pure_terminal_annotation_merge(update_kwargs)
+    return parsed is not None and all(key in CLEARABLE_ANNOTATION_KEYS for key in parsed)
+
+
+def is_terminal_annotation_add(update_kwargs: dict) -> bool:
+    """Is *update_kwargs* a pure, allowlisted, terminal-task x_-annotation add?
+
+    True iff :func:`_pure_terminal_annotation_merge` succeeds AND every
+    top-level key of the returned metadata dict starts with
+    :data:`X_ANNOTATION_PREFIX` (``'x_'``) — the sanctioned forward-compat
+    annotation namespace (``shared.task_metadata.parse_metadata`` silently
+    admits any ``x_``-prefixed key; see :data:`X_ANNOTATION_PREFIX`). See
+    :func:`_pure_terminal_annotation_merge` for the shared (allowlisted-kwargs,
+    merge-mode, non-empty-metadata) eligibility checks.
+
+    Widens task 2684's terminal-write exemption
+    (:func:`is_terminal_annotation_clear`) to also cover ADDING (or
+    overwriting) x_-prefixed forward-compat annotation keys on a terminal
+    task, not just clearing :data:`CLEARABLE_ANNOTATION_KEYS`.
+
+    x_-only limitation: a metadata payload mixing a
+    :data:`CLEARABLE_ANNOTATION_KEYS` key with an ``x_``-prefixed key is NOT
+    exempted by either predicate and remains rejected on a terminal task —
+    real Stage-2 remediations are either a clear or an x_ add, never both in
+    the same ``update_task`` call, so this is treated as a known, immaterial
+    limitation rather than composing the two allowlists.
+    """
+    parsed = _pure_terminal_annotation_merge(update_kwargs)
+    return parsed is not None and all(key.startswith(X_ANNOTATION_PREFIX) for key in parsed)
