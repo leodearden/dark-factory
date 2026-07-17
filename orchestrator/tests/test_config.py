@@ -177,6 +177,38 @@ class TestDefaults:
         cfg = GitConfig(warm_lane_release_thin=True)
         assert cfg.warm_lane_release_thin is True
 
+    def test_load_bearing_oracle_cmd_defaults_none(self):
+        """GitConfig.load_bearing_oracle_cmd defaults to None — the merge-skew
+        pipeline-landing tripwire (task 2382) is a clean opt-in no-op until a
+        project sets a command (config knob absent -> logged no-op, I6)."""
+        from orchestrator.config import GitConfig
+
+        cfg = GitConfig()
+        assert cfg.load_bearing_oracle_cmd is None
+
+    def test_load_bearing_oracle_cmd_round_trips_list(self):
+        """An explicit oracle command list[str] round-trips verbatim."""
+        from orchestrator.config import GitConfig
+
+        cmd = ['bash', 'scripts/verify-pipeline-guard.sh', 'requires-full-gate']
+        cfg = GitConfig(load_bearing_oracle_cmd=cmd)
+        assert cfg.load_bearing_oracle_cmd == cmd
+
+    def test_load_bearing_oracle_cmd_exposed_on_orchestrator_config_git(
+        self, monkeypatch, tmp_path,
+    ):
+        """OrchestratorConfig exposes the knob at config.git.load_bearing_oracle_cmd."""
+        from orchestrator.config import GitConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = OrchestratorConfig()
+        assert config.git.load_bearing_oracle_cmd is None
+
+        cmd = ['bash', 'scripts/verify-pipeline-guard.sh', 'requires-full-gate']
+        config2 = OrchestratorConfig(git=GitConfig(load_bearing_oracle_cmd=cmd))
+        assert config2.git.load_bearing_oracle_cmd == cmd
+
     def test_fused_memory_defaults(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
