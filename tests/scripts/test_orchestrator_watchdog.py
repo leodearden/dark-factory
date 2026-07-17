@@ -2955,6 +2955,10 @@ def test_cli_report_flag_routes_to_report_only(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(wdog, "report", lambda: calls.append("report") or 0)
     monkeypatch.setattr(wdog, "main", lambda: calls.append("main"))
     monkeypatch.setattr(wdog, "staleness_pass", lambda: calls.append("staleness_pass"))
+    # No-op the fused-memory liveness row (B4) so this test drives no real
+    # ss/urllib I/O. raising=False: tolerates the attribute not existing yet
+    # (pre-B4-impl) so this test can be written before the impl lands.
+    monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
 
     exit_code = wdog._cli(["--report"])
 
@@ -2973,6 +2977,9 @@ def test_cli_report_flag_returns_reports_exit_code(monkeypatch: pytest.MonkeyPat
         "staleness_pass",
         lambda: pytest.fail("staleness_pass() must not run under --report"),
     )
+    # No-op the fused-memory liveness row (B4) — see comment in
+    # test_cli_report_flag_routes_to_report_only above.
+    monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
 
     assert wdog._cli(["--report"]) == 1
 
@@ -3021,6 +3028,9 @@ def test_cli_defaults_to_sys_argv(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(wdog, "report", lambda: calls.append("report") or 0)
     monkeypatch.setattr(wdog.sys, "argv", ["orchestrator-watchdog.py", "--report"])
+    # No-op the fused-memory liveness row (B4) — see comment in
+    # test_cli_report_flag_routes_to_report_only above.
+    monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
 
     exit_code = wdog._cli()
 
