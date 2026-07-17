@@ -227,6 +227,21 @@ routing:
     # there is no debugger-specific cap-pressure figure from the survey,
     # so the larger relative jump is a deliberate choice to share one
     # 120-turn ceiling across both roles rather than a measured need.
+    #
+    # Cost envelope: `large-plan-modules` fires on module count alone, with
+    # no step-count floor -- in this multi-package repo a plan can touch
+    # >=3 modules (e.g. orchestrator/shared/fused-memory) while still
+    # being small by step count, so this arm can upgrade modestly-sized
+    # plans to opus. This is accepted as an intentional reading of the
+    # task's "plan_min_steps>=12 OR plan_min_modules>=3" requirement, not
+    # gated with an additional step floor -- a floor would turn this arm
+    # into an AND and contradict the requested OR.
+    # `per_model_daily_ceiling_usd` (empty above) remains available as an
+    # operational lever if a fleet rollup shows this arm's opus spend is
+    # too high; the plan's STAGED ROLLOUT design decision (hot-reload
+    # onto dark_factory's orchestrator.yaml first, watch the rollup for a
+    # fixed window, then promote here) is exactly the mechanism intended
+    # to catch that before this ships fleet-wide.
     - id: large-plan-steps
       match:
         role: [implementer, debugger]
