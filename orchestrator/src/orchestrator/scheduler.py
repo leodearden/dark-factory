@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
 
 from shared.locking import (
     files_to_modules,
@@ -2032,11 +2032,26 @@ class Scheduler:
             key=_order_key,
         )
 
+    @overload
     async def get_tasks(
         self,
         *,
         statuses: Iterable[str] | None = None,
-    ) -> list[dict]:
+        distinguish_failure: Literal[False] = False,
+    ) -> list[dict]: ...
+    @overload
+    async def get_tasks(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+        distinguish_failure: Literal[True],
+    ) -> list[dict] | None: ...
+    async def get_tasks(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+        distinguish_failure: bool = False,
+    ) -> list[dict] | None:
         """Fetch tasks from fused-memory/taskmaster.
 
         Args:
@@ -2045,6 +2060,12 @@ class Scheduler:
                 argument is omitted and the server returns the full task tree —
                 byte-identical to the previous behaviour.  Pass
                 ``ACTIVE_TASK_STATUSES`` on hot paths to shrink the payload.
+            distinguish_failure: When True, a read FAILURE (exception or parse
+                error) returns ``None`` instead of the legacy fail-safe ``[]`` —
+                letting the caller distinguish "fm is unreadable" from "the
+                project genuinely has no tasks" (survey finding C3). Defaults
+                to False so every existing caller keeps its byte-identical
+                ``list[dict]`` contract.
         """
         try:
             arguments: dict = {'project_root': self._project_root}
@@ -2069,7 +2090,7 @@ class Scheduler:
             logger.exception(
                 'Failed to fetch tasks: %s: %s', type(e).__name__, e,
             )
-        return []
+        return None if distinguish_failure else []
 
     async def set_task_status(
         self,
