@@ -868,6 +868,62 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
         )
 
 
+# ===========================================================================
+# Task 2733 step-3/4: _load_scaled_grace -- load-adaptive SPAWN_STARTED_GRACE_SECS
+# ===========================================================================
+# Second recurrence of a started-grace flake in this file (task 2367 already
+# bumped the fixed 1s/2s -> 3s/8s six days ago). A fixed bump chases a moving
+# target as host load climbs; _load_scaled_grace instead scales the grace by
+# load-per-core -- floored at base_secs (an idle host is byte-identical to
+# today) and capped at cap_secs (a pathological host stays bounded).
+
+
+def test_load_scaled_grace_idle_host_returns_base_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """load-per-core <= 1 (idle host) floors at base_secs -- no scaling up."""
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    assert _load_scaled_grace(3, cap_secs=30) == 3
+
+
+def test_load_scaled_grace_scales_up_with_load_per_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """load-per-core > 1 scales grace up to ceil(base_secs * loadavg / cpu_count)."""
+    monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    assert _load_scaled_grace(3, cap_secs=30) == 6
+
+
+def test_load_scaled_grace_clamps_to_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pathological load is clamped at cap_secs instead of growing unbounded."""
+    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    assert _load_scaled_grace(3, cap_secs=30) == 30
+
+
+def test_load_scaled_grace_getloadavg_error_returns_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """getloadavg unavailable (OSError or AttributeError) fails safe to base_secs."""
+
+    def _raise_oserror() -> tuple[float, float, float]:
+        raise OSError("getloadavg not supported on this platform")
+
+    monkeypatch.setattr(os, "getloadavg", _raise_oserror)
+    assert _load_scaled_grace(3, cap_secs=30) == 3
+
+    def _raise_attributeerror() -> tuple[float, float, float]:
+        raise AttributeError("os has no getloadavg on this platform")
+
+    monkeypatch.setattr(os, "getloadavg", _raise_attributeerror)
+    assert _load_scaled_grace(3, cap_secs=30) == 3
+
+
 def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     """A fresh transcript file must suppress the failed-to-start flag.
 
