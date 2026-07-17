@@ -91,7 +91,7 @@ function HostLoadCard({ paused }) {
 function ModelRoleRollupPanel() {
   const rollup = D.COSTS.by_model_role || { rows: [], turn_cap_saturation: {} };
   const rows = [...(rollup.rows || [])].sort(
-    (a, b) => a.model.localeCompare(b.model) || a.role.localeCompare(b.role),
+    (a, b) => (a.model || '').localeCompare(b.model || '') || (a.role || '').localeCompare(b.role || ''),
   );
   const saturation = Object.entries(rollup.turn_cap_saturation || {}).sort(
     ([a], [b]) => a.localeCompare(b),
