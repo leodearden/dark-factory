@@ -2377,6 +2377,44 @@ class TestGetEntity:
         assert edge['temporal']['invalid_at'] is None
 
     # ------------------------------------------------------------------
+    # fuzzy branch drops invalidated edges (task 2726)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_branch_drops_invalidated_edges(self, service):
+        """FUZZY branch must drop invalidated edges, matching the EXACT branch.
+
+        The EXACT/topological branch excludes invalid_at-set edges at the Cypher
+        level (get_valid_edges_for_node: WHERE e.invalid_at IS NULL), and search()
+        already drops them too (task 312). Before this fix, the FUZZY/semantic
+        branch (graphiti.search) had no such filter, so a superseded edge could
+        leak through get_entity's fuzzy fallback and be silently acted on
+        (task 2726).
+        """
+        from _fm_helpers import MockEdge, MockNode
+
+        service.graphiti.search_nodes = AsyncMock(
+            return_value=[MockNode(name='Svc', uuid='n1')]
+        )
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Svc valid fact', uuid='e-valid', invalid_at=None),
+            MockEdge(
+                fact='Svc superseded fact',
+                uuid='e-invalid',
+                invalid_at=datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC),
+            ),
+        ])
+
+        result = await service.get_entity('Svc', project_id='test')
+
+        assert len(result['edges']) == 1
+        assert result['edges'][0]['uuid'] == 'e-valid'
+        assert 'e-invalid' not in {e['uuid'] for e in result['edges']}, (
+            'FUZZY branch must drop invalidated edges to match the EXACT/topological '
+            'branch (task 2726)'
+        )
+
+    # ------------------------------------------------------------------
     # exact-first lookup (task-1975): get_nodes_by_exact_name precedes fuzzy search_nodes
     # ------------------------------------------------------------------
 
