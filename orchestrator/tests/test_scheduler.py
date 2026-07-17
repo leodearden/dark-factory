@@ -21,6 +21,7 @@ from orchestrator.config import (
 )
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
+from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.scheduler import (
     ExternalResolverError,
     ModuleLockTable,
@@ -3464,6 +3465,82 @@ class TestSetTaskStatusForwarding:
         assert mock.await_count == 1, 'non-transient rejection must not retry'
         assert excinfo.value.task_id == '42'
         assert excinfo.value.missing_files == ['src/missing.py']
+
+    @pytest.mark.asyncio
+    async def test_transient_rejection_retries_shared_schedule_until_success(
+        self, scheduler: Scheduler, monkeypatch,
+    ):
+        """set_task_status consumes the shared orchestrator.fm_retry schedule
+        (task 2706), not the old hardcoded _TRANSIENT_RETRIES=3 budget."""
+        fixed = [0.0, 0.0, 0.0, 0.0]
+        monkeypatch.setattr(
+            'orchestrator.scheduler.fm_retry_backoffs', lambda *a, **kw: fixed,
+        )
+        transient = {
+            'result': {'structuredContent': {
+                'error': "TimeoutError('ensure_connected timed out')",
+                'error_type': 'TimeoutError',
+            }},
+        }
+        success = {
+            'result': {'structuredContent': {
+                'message': 'ok', 'tasks': [{'success': True}],
+            }},
+        }
+        mock = AsyncMock(
+            side_effect=[transient, transient, transient, transient, success],
+        )
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+        await scheduler.set_task_status('5', 'in-progress')
+        assert mock.await_count == 5
+
+    @pytest.mark.asyncio
+    async def test_transient_rejection_raises_after_shared_schedule_exhaust(
+        self, scheduler: Scheduler, monkeypatch,
+    ):
+        fixed = [0.0, 0.0, 0.0, 0.0]
+        monkeypatch.setattr(
+            'orchestrator.scheduler.fm_retry_backoffs', lambda *a, **kw: fixed,
+        )
+        transient = {
+            'result': {'structuredContent': {
+                'error': "TimeoutError('ensure_connected timed out')",
+                'error_type': 'TimeoutError',
+            }},
+        }
+        mock = AsyncMock(return_value=transient)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+        with pytest.raises(RuntimeError, match='5 transient retries'):
+            await scheduler.set_task_status('5', 'in-progress')
+        assert mock.await_count == 5
+
+    @pytest.mark.asyncio
+    async def test_default_path_exceeds_old_transient_budget(
+        self, scheduler: Scheduler, monkeypatch,
+    ):
+        """Unpatched (real) fm_retry_backoffs must drive more than the old
+        _TRANSIENT_RETRIES=3 attempts on a persistent transient rejection.
+
+        random.uniform is pinned to the max-draw boundary so the test's own
+        fm_retry_backoffs() call and the SUT's internal (unpatched) call are
+        guaranteed to agree (both are pure functions of the same entropy
+        source — see test_fm_retry.py's purity test).
+        """
+        transient = {
+            'result': {'structuredContent': {
+                'error': "TimeoutError('ensure_connected timed out')",
+                'error_type': 'TimeoutError',
+            }},
+        }
+        mock = AsyncMock(return_value=transient)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+        monkeypatch.setattr('asyncio.sleep', AsyncMock())
+        monkeypatch.setattr('random.uniform', lambda lo, hi: hi)
+        expected_attempts = len(fm_retry_backoffs(rng=lambda lo, hi: hi)) + 1
+        with pytest.raises(RuntimeError):
+            await scheduler.set_task_status('5', 'in-progress')
+        assert expected_attempts > 3
+        assert mock.await_count == expected_attempts
 
     @pytest.mark.asyncio
     async def test_structured_rejection_raises_on_provenance_invalid(
