@@ -19,6 +19,7 @@ the bottom:
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -27,7 +28,11 @@ import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.verify_cancel import read_lock_holder_pgid, write_lock_holder_pgid
+from orchestrator.verify_cancel import (
+    lane_lock_path,
+    read_lock_holder_pgid,
+    write_lock_holder_pgid,
+)
 from orchestrator.warm_lane_pool import WarmLanePool
 
 
@@ -279,4 +284,88 @@ class TestGcReclaimDefersOnMergeVerifyLease:
         mock_run.assert_awaited_once_with(
             [str(script), 'reclaim', '--mount', str(git_ops.worktree_base)],
             cwd=git_ops.project_root,
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2685, step-1 — merge_verify_lease() must hold the SHARED
+# <lane_dir>.lock (lane_lock_path(persistent_merge_worktree_path)), not the
+# divergent .merge_verify.lock.
+#
+# Incident: SEED/mutator actors (reify's seed-warm-lane.sh / thin-warm-lane.sh
+# / warm-lane-gc.sh, and DF's own GitOps._seed_warm_lane) all take
+# `flock -x <lane_dir>.lock`. merge_verify_lease() instead held a DIFFERENT
+# file, .merge_verify.lock (same directory, different inode) — so a live
+# verify never excluded a concurrent reseed/thin/gc, and the verify's
+# working tree could be clobbered mid-run. Both tests below are RED before
+# step-2's fix.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeVerifyLeaseHoldsLaneLock:
+    """merge_verify_lease() holds <lane_dir>.lock, not .merge_verify.lock (task 2685)."""
+
+    async def test_lease_holds_lane_lock_and_pgid_rendezvous(self, tmp_path: Path):
+        """(a) FLOCK-PATH PIN: the lease must hold
+        lane_lock_path(persistent_merge_worktree_path) (=
+        <worktree_base>/_merge-verify.lock for the singleton persistent
+        merge lane) — a non-blocking flock re-acquire on that SAME path
+        from this test process must fail while the lease is held. The pgid
+        rendezvous (read_lock_holder_pgid) must also still hold, unchanged.
+        """
+        git_ops = _git_ops(tmp_path)
+        lock_path = lane_lock_path(git_ops.persistent_merge_worktree_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        async with git_ops.merge_verify_lease():
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+            assert read_lock_holder_pgid(git_ops.worktree_base) == os.getpgrp(), (
+                'pgid rendezvous must still be recorded while the lease is held'
+            )
+
+    async def test_lease_excludes_concurrent_seed_warm_lane(
+        self, real_git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """(b) END-TO-END MUTUAL EXCLUSION: a live merge_verify_lease() must
+        block a concurrent _seed_warm_lane (the reseed side, real subprocess
+        flock) on the SAME <lane_dir>.lock, rather than letting it proceed
+        and clobber the tree underneath the verify.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        merge_commit = await _get_merge_commit(real_git_ops, 'lease-lock-1', 'll1.py')
+        warm_path = await real_git_ops.reset_persistent_merge_worktree(merge_commit)
+
+        scripts_dir = warm_path / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        marker = warm_path / 'seeded.marker'
+        script = scripts_dir / 'seed-warm-lane.sh'
+        script.write_text(
+            f'#!/usr/bin/env bash\nset -euo pipefail\necho seeded > {marker}\nexit 0\n'
+        )
+        script.chmod(0o755)
+
+        # Shrink the outer <lane_dir>.lock bound so the test doesn't have to
+        # wait the real 30s for _seed_warm_lane's lock-wait timeout.
+        monkeypatch.setattr(git_ops_mod, '_SEED_WARM_LANE_LOCK_WAIT_SECS', 2)
+
+        async with real_git_ops.merge_verify_lease():
+            rc = await asyncio.wait_for(
+                real_git_ops._seed_warm_lane(warm_path, '--fresh-checkout'), 10,
+            )
+
+        assert rc == 124, (
+            f'_seed_warm_lane must time out (124, lane-lock wait) while a '
+            f'live merge-verify lease holds the SAME <lane_dir>.lock, got '
+            f'rc={rc!r}'
+        )
+        assert not marker.exists(), (
+            'seed-warm-lane.sh must never have run — reseed and the live '
+            'verify must mutually exclude on the one <lane_dir>.lock'
         )
