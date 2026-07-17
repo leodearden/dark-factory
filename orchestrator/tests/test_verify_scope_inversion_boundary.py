@@ -1240,15 +1240,22 @@ class TestRow9FallbackNarrowingNeverWholeRepoChain:
             f'the unscoped global branch; got {set(executed)!r}'
         )
         fallback = executed['__fallback__']
-        for other in ('escalation', 'fused-memory', 'dashboard'):
-            assert other not in (fallback.lint_command or ''), (
-                f'whole-repo fleet chain leaked into the executed '
-                f'lint_command: {fallback.lint_command!r}'
-            )
-            assert other not in (fallback.type_check_command or ''), (
-                f'whole-repo fleet chain leaked into the executed '
-                f'type_check_command: {fallback.type_check_command!r}'
-            )
+        test_path = UNREGISTERED_PATH_DIFF[0]
+        # Positive equality (mirrors kappa's identical golden,
+        # test_opaque_fleet_chain_lint_type_scoped_to_first_clause) rather
+        # than a substring exclusion list: this pins the exact scoped shape,
+        # so ANY fleet subproject name surviving scoping — not just the ones
+        # named in a hardcoded exclusion set — fails the assertion.
+        assert fallback.lint_command == f'uv run --project shared ruff check {test_path}', (
+            f'expected the fleet lint command scoped to exactly the touched '
+            f'file, no other subproject name surviving; got '
+            f'{fallback.lint_command!r}'
+        )
+        assert fallback.type_check_command == f'npx pyright {test_path}', (
+            f'expected the fleet type-check command scoped to exactly the '
+            f'touched file, no other subproject name surviving; got '
+            f'{fallback.type_check_command!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
