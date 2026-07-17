@@ -6255,11 +6255,14 @@ class TaskWorkflow:
         # Read the reviewer's structured verdict instead of the
         # structured_output/json.loads cascade (task 2484 / PRD task δ).
         # Defensive extraction mirrors the merger's read_verdict handling
-        # in _resolve_and_resubmit (workflow.py:7108-7110): only a dict
-        # envelope with a dict 'verdict' payload carrying
-        # verdict∈{PASS,ISSUES_FOUND} is trusted; anything else (absent,
-        # cleared, malformed) degrades to the role's existing worst-case
-        # ERROR disposition (I-FAIL-SAFE).
+        # in _resolve_and_resubmit (workflow.py:7114): a dict envelope with
+        # a dict 'verdict' payload carrying verdict∈{PASS,ISSUES_FOUND} is
+        # trusted only when the invocation itself also reported success —
+        # an invocation failure (crash / max_turns / budget exhaustion) is
+        # untrusted even if it happened to write a verdict before failing;
+        # anything else (absent, cleared, malformed, or unsuccessful)
+        # degrades to the role's existing worst-case ERROR disposition
+        # (I-FAIL-SAFE).
         envelope = self.artifacts.read_verdict(role.name)
         if envelope is None and result.success:
             # Observability (reviewer_comprehensive amendment, task 2484):
@@ -6286,7 +6289,11 @@ class TaskWorkflow:
                     self.task_id, role.name, verdicts_dir,
                 )
         payload = envelope.get('verdict') if isinstance(envelope, dict) else None
-        if not isinstance(payload, dict) or payload.get('verdict') not in {'PASS', 'ISSUES_FOUND'}:
+        if (
+            not result.success
+            or not isinstance(payload, dict)
+            or payload.get('verdict') not in {'PASS', 'ISSUES_FOUND'}
+        ):
             return {
                 'reviewer': role.name,
                 'verdict': 'ERROR',

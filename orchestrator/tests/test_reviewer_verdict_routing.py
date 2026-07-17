@@ -17,7 +17,12 @@ through to the synthesized ERROR fallback instead. Cases (c)-(e) (absent /
 stale / malformed verdict => ERROR) already hold pre-δ, by coincidence —
 the old cascade also defaults to ERROR on unparseable/absent output — and
 are included as fail-safe/I-FRESH regression guards, not new RED behavior
-(mirrors the merger test's case (f)).
+(mirrors the merger test's case (f)). Case (f) here (invocation failure
+=> ERROR even with a written verdict) is a task 2484 amendment-pass
+addition, closing a gap versus the merger's own case (f)
+(``test_invocation_failure_still_blocks``): pre-amendment,
+``_run_reviewer`` trusted a written verdict regardless of
+``result.success``.
 """
 
 from __future__ import annotations
@@ -215,3 +220,25 @@ class TestRunReviewerVerdictRouting:
         result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
 
         assert result['verdict'] == 'ERROR'
+
+    async def test_invocation_failure_is_failsafe_error(self, tmp_path: Path):
+        """(f) ``_invoke`` success=False is fail-safe ERROR regardless of a
+        written verdict (preservation guard; mirrors the merger's
+        ``test_invocation_failure_still_blocks``).
+
+        A verdict written before an invocation failure (crash / max_turns /
+        budget exhaustion) is untrusted — the invocation itself must also
+        report success for its verdict to be authoritative (amendment,
+        task 2484).
+        """
+        f = self._setup(tmp_path)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_review_verdict(
+                f, verdict='PASS', summary='Looks good.', output='ok', success=False,
+            ),
+        )
+
+        result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+        assert result['verdict'] == 'ERROR'
+        assert result['reviewer'] == 'reviewer_comprehensive'
