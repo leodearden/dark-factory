@@ -2978,17 +2978,22 @@ def test_cli_report_flag_returns_reports_exit_code(monkeypatch: pytest.MonkeyPat
 
 
 def test_cli_default_runs_main_then_staleness_pass(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_cli([]) runs main() then staleness_pass(), in that order, and never report()."""
+    """_cli([]) runs main(), fused_memory_liveness_pass(), then staleness_pass(), never report()."""
     wdog = _load_watchdog()
     calls: list[str] = []
 
     monkeypatch.setattr(wdog, "report", lambda: calls.append("report") or 0)
     monkeypatch.setattr(wdog, "main", lambda: calls.append("main"))
+    monkeypatch.setattr(
+        wdog, "fused_memory_liveness_pass", lambda: calls.append("fused_memory_liveness_pass")
+    )
     monkeypatch.setattr(wdog, "staleness_pass", lambda: calls.append("staleness_pass"))
 
     wdog._cli([])
 
-    assert calls == ["main", "staleness_pass"], f"Expected main then staleness_pass, got {calls}"
+    assert calls == ["main", "fused_memory_liveness_pass", "staleness_pass"], (
+        f"Expected main then fused_memory_liveness_pass then staleness_pass, got {calls}"
+    )
 
 
 def test_cli_unknown_flag_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2998,12 +3003,15 @@ def test_cli_unknown_flag_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(wdog, "report", lambda: calls.append("report") or 0)
     monkeypatch.setattr(wdog, "main", lambda: calls.append("main"))
+    monkeypatch.setattr(
+        wdog, "fused_memory_liveness_pass", lambda: calls.append("fused_memory_liveness_pass")
+    )
     monkeypatch.setattr(wdog, "staleness_pass", lambda: calls.append("staleness_pass"))
 
     # Must not raise
     wdog._cli(["--bogus"])
 
-    assert calls == ["main", "staleness_pass"]
+    assert calls == ["main", "fused_memory_liveness_pass", "staleness_pass"]
 
 
 def test_cli_defaults_to_sys_argv(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3957,4 +3965,132 @@ def test_liveness_verdict_wedged(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wdog, "probe_health", lambda: False)
 
     assert wdog._fused_memory_liveness_verdict() == "wedged"
+
+
+# ---------------------------------------------------------------------------
+# Part B: fused_memory_liveness_pass() (B3)
+# ---------------------------------------------------------------------------
+
+
+def test_liveness_pass_revives_on_port_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    """USER-SIGNAL: fused_memory_liveness_pass() restarts the unit when the port is down."""
+    wdog = _load_watchdog()
+    restarted: list[str] = []
+
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: False)
+    monkeypatch.setattr(
+        wdog, "probe_health", lambda: pytest.fail("probe_health must not run when port is down")
+    )
+    monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_liveness_pass()
+
+    assert restarted == ["fused-memory.service"], (
+        f"Expected fused-memory.service restarted exactly once, got: {restarted}"
+    )
+
+
+def test_liveness_pass_no_restart_when_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fused_memory_liveness_pass() must not restart when port is up and health succeeds."""
+    wdog = _load_watchdog()
+    restarted: list[str] = []
+
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
+    monkeypatch.setattr(wdog, "probe_health", lambda: True)
+    monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_liveness_pass()
+
+    assert restarted == [], "No restart expected when port is up and health succeeds"
+
+
+def test_liveness_pass_restarts_when_wedged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fused_memory_liveness_pass() restarts when the port is up but the health fetch fails."""
+    wdog = _load_watchdog()
+    restarted: list[str] = []
+
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
+    monkeypatch.setattr(wdog, "probe_health", lambda: False)
+    monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_liveness_pass()
+
+    assert restarted == ["fused-memory.service"], (
+        f"Expected fused-memory.service restarted when wedged, got: {restarted}"
+    )
+
+
+def test_liveness_pass_skips_disabled_unit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fused_memory_liveness_pass() must not probe or restart a disabled unit.
+
+    Disabling is explicit operator intent, mirroring main()'s
+    test_main_skips_disabled_unit_entirely.
+    """
+    wdog = _load_watchdog()
+    probed: list[int] = []
+    restarted: list[str] = []
+
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: probed.append(port) or True)
+    monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_liveness_pass()
+
+    assert probed == [], f"probe_port must not be called for a disabled unit; probed: {probed}"
+    assert restarted == []
+
+
+def test_liveness_pass_skips_probe_in_grace_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fused_memory_liveness_pass() must not probe within STARTUP_GRACE_SECS of unit start.
+
+    Mirrors main()'s test_main_skips_probe_in_grace_window: a freshly (re)started
+    unit may not have bound its port yet, so probing would risk a false restart.
+    """
+    wdog = _load_watchdog()
+    probed: list[int] = []
+    restarted: list[str] = []
+
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 30.0)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: probed.append(port) or True)
+    monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_liveness_pass()
+
+    assert probed == [], (
+        f"probe_port must not be called inside the grace window; probed: {probed}"
+    )
+    assert restarted == []
+
+
+def test_liveness_pass_isolates_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An exception raised inside the probe/verdict must not propagate out of the pass.
+
+    Mirrors main()'s test_main_isolates_per_unit_failure — a single-unit
+    analogue since fused_memory_liveness_pass() only ever handles one unit.
+    """
+    wdog = _load_watchdog()
+
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+
+    def fake_probe(_port: int) -> bool:
+        raise RuntimeError("ss exploded")
+
+    monkeypatch.setattr(wdog, "probe_port", fake_probe)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    # Must not raise
+    wdog.fused_memory_liveness_pass()
 
