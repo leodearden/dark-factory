@@ -5351,12 +5351,19 @@ class TaskWorkflow:
             return None
 
         # PRD task ζ / task 2486: prefer the verdict-tools artifact
-        # (verdicts/judge.json) over the legacy result.structured_output,
-        # but FALL BACK to structured_output when the artifact is absent or
-        # malformed — the judge is completion-gating and this orchestrator
-        # self-hosts the PRD's own tasks, so a botched cutover that
-        # silently returned "not complete" would wedge completion. Task η
-        # removes this fallback after real-run verification.
+        # (verdicts/judge.json) over the legacy result.structured_output.
+        # FALL BACK to structured_output only when the artifact is absent,
+        # its envelope isn't a dict, or the envelope's 'verdict' payload
+        # isn't a dict — the judge is completion-gating and this
+        # orchestrator self-hosts the PRD's own tasks, so a botched
+        # cutover that silently returned "not complete" would wedge
+        # completion. A dict 'verdict' payload that is merely missing
+        # required keys is NOT rerouted to the fallback here: it is
+        # judged by the required-keys check below like any other
+        # selected verdict, and returns None (keep iterating) if
+        # incomplete — see design decision "Absent-both / final-invalid
+        # ⇒ None" (plan.json). Task η removes this fallback after
+        # real-run verification.
         envelope = self.artifacts.read_verdict('judge')
         artifact_verdict = envelope.get('verdict') if isinstance(envelope, dict) else None
         verdict = artifact_verdict if isinstance(artifact_verdict, dict) else result.structured_output
