@@ -300,6 +300,25 @@ def probe_health(
         return False
 
 
+def _fused_memory_liveness_verdict() -> str:
+    """Classify fused-memory.service liveness as 'port-down' / 'healthy' / 'wedged'.
+
+    Pure read-only (no restart, no logging) — the single source of truth for
+    fused-memory's liveness, consumed by both fused_memory_liveness_pass()
+    (which restarts on anything but 'healthy') and _print_fused_memory_liveness()
+    (the --report row).
+
+    The port probe runs first and short-circuits before the (up to 15s)
+    health fetch, so a fully-dead unit is classified quickly without waiting
+    on probe_health()'s timeout.
+    """
+    if not probe_port(FUSED_MEMORY_PORT):
+        return "port-down"
+    if probe_health():
+        return "healthy"
+    return "wedged"
+
+
 def restart_unit(unit: str) -> None:
     """Three-phase restart: stop → reset-failed → start *unit* via ``systemctl --user``.
 
