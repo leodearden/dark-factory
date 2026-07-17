@@ -2071,6 +2071,15 @@ Output JSON matching the schema. Every task must appear in the output.
             result = await invoke_with_cap_retry(
                 usage_gate=self.usage_gate,
                 label='Module tagging',
+                cost_store=self.cost_store,
+                run_id=self._run_id or '',
+                # task_id intentionally omitted: this invocation isn't
+                # scoped to one task, and invoke_with_cap_retry's own
+                # `task_id or None` normalization turns the default '' into
+                # a NULL invocations.task_id row, matching the module_tagger
+                # fixture in test_digest.py's rollup tests.
+                project_id=self.config.fused_memory.project_id,
+                role='module_tagger',
                 invoke_fn=invoke_agent,
                 prompt=prompt,
                 system_prompt='You are a code module classifier. Given task descriptions and a codebase structure, determine which code modules each task will modify. Be precise and conservative.',

@@ -123,3 +123,8 @@ class TestModuleTaggerCostThreading:
         assert row['project_id'] == config.fused_memory.project_id, row
         assert row['run_id'] == 'run-test-0001', row
         assert row['cost_usd'] == pytest.approx(0.0321), row
+        # No single task owns a module-tagging invocation (it tags a whole
+        # batch) — invoke_with_cap_retry's `task_id or None` normalization
+        # turns the omitted/default task_id into a NULL row, matching the
+        # module_tagger fixture in test_digest.py's rollup tests (step-1).
+        assert row['task_id'] is None, row
