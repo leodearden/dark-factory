@@ -68,7 +68,7 @@ def test_dark_factory_orchestrator_service_structure() -> None:
         in content
     ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/dark-factory/orchestrator/config.yaml"
+        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/dark-factory/dark-factory-orchestrator.yaml"
         in content
     ), "ExecStart must invoke the orchestrator with the df config, frozen"
     # --frozen: process start must NEVER implicitly re-sync the shared
@@ -209,7 +209,7 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
     # line, or the self-identifying ORCH_UNIT line (each unit names itself).
     allowed_df_fragments = {
         "Dark Factory Orchestrator",
-        "/home/leo/src/dark-factory/orchestrator/config.yaml",
+        "/home/leo/src/dark-factory/dark-factory-orchestrator.yaml",
     }
     allowed_reify_fragments = {
         "Reify Orchestrator",
