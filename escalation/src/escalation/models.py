@@ -149,6 +149,14 @@ class Escalation:
     triaged_by: str | None = None  # server-attributed from X-Escalation-Identity when present
     triage_note: str = ''  # freshness contract: verified predicate + probe (see watcher SKILLs)
     updated_at: str | None = None  # last-substantive-change marker; None means never bumped
+    # Steward's structured scope-expansion grant (task 2505) — file-level,
+    # project-relative paths — consumed by the orchestrator resume path to
+    # widen plan.files/metadata.files/locks. Distinct from the free-text
+    # `resolution` rationale string, which stays human-readable prose.
+    # Empty-list default keeps non-grant escalations bit-identical on disk;
+    # legacy JSON without this key deserialises to [] via the from_dict
+    # __dataclass_fields__ filter below — no migration required.
+    granted_files: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
