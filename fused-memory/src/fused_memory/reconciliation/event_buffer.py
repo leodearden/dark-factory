@@ -647,6 +647,35 @@ class EventBuffer:
             logger.info(f'Restored {count} drained events to buffered for {project_id}')
         return count
 
+    async def mark_drained_run_id(
+        self, project_id: str, event_ids: list[str], run_id: str,
+    ) -> int:
+        """Attribute already-drained rows to the run about to process them.
+
+        Used by the BacklogIterator path: ``drain_by_ids`` drains a chunk's
+        events *before* ``run_full_cycle`` mints that chunk's run_id, so those
+        rows would otherwise carry no ``drained_by_run_id`` attribution. This
+        lets the harness stamp them retroactively so a later run-scoped
+        ``restore_drained`` can restore exactly that chunk's events (task 2711
+        / E7).
+
+        Only rows currently ``status = 'drained'`` are touched; ids that don't
+        exist, aren't currently drained, or are empty are silently ignored (no
+        error). Returns the number of rows updated.
+        """
+        if not event_ids:
+            return 0
+        placeholders = ','.join('?' for _ in event_ids)
+        async with self._txn() as db:
+            cursor = await db.execute(
+                f"""UPDATE event_buffer SET drained_by_run_id = ?
+                    WHERE project_id = ? AND status = 'drained'
+                      AND id IN ({placeholders})""",
+                [run_id, project_id, *event_ids],
+            )
+            rowcount = cursor.rowcount
+        return rowcount
+
     async def mark_project_dead_letter(self, project_id: str) -> int:
         """Flip all 'buffered' rows for project_id to 'dead_letter'. Returns row count.
 
