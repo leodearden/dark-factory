@@ -10,12 +10,13 @@ import asyncio
 import os
 import signal
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import fused_memory.server.main as main_mod
-from fused_memory.server.main import _install_operator_stop_handler
+from fused_memory.server.main import _install_operator_stop_handler, _make_operator_stop_callback
 
 
 @pytest.fixture(autouse=True)
@@ -217,3 +218,53 @@ class TestMainExitCode:
             main_mod.main()
 
         mock_exit.assert_called_once_with(1)
+
+
+class TestOperatorStopCallbackForceExit:
+    """Survey finding D1 (second gap): the operator-stop callback must escalate
+    on a second signal.  uvicorn's own default signal handler supports a
+    graceful-then-forced escape hatch (1st SIGINT/SIGTERM graceful, 2nd forces
+    exit), but that handler is neutered here (install_signal_handlers = lambda:
+    None) so our own callback must reproduce the escalation — otherwise an
+    operator has no way to force-exit a wedged shutdown.
+    """
+
+    def _make_fake_server(self) -> SimpleNamespace:
+        return SimpleNamespace(should_exit=False, force_exit=False)
+
+    def test_first_call_sets_should_exit_but_not_force_exit(self):
+        s1, s2 = self._make_fake_server(), self._make_fake_server()
+        cb = _make_operator_stop_callback(s1, s2)
+
+        cb()
+
+        assert s1.should_exit is True
+        assert s2.should_exit is True
+        assert s1.force_exit is False
+        assert s2.force_exit is False
+
+    def test_second_call_also_sets_force_exit(self):
+        s1, s2 = self._make_fake_server(), self._make_fake_server()
+        cb = _make_operator_stop_callback(s1, s2)
+
+        cb()
+        cb()
+
+        assert s1.should_exit is True
+        assert s2.should_exit is True
+        assert s1.force_exit is True
+        assert s2.force_exit is True
+
+    def test_third_call_force_exit_remains_true(self):
+        """Idempotent: a 3rd+ signal must not error and must leave force_exit set."""
+        s1, s2 = self._make_fake_server(), self._make_fake_server()
+        cb = _make_operator_stop_callback(s1, s2)
+
+        cb()
+        cb()
+        cb()
+
+        assert s1.should_exit is True
+        assert s2.should_exit is True
+        assert s1.force_exit is True
+        assert s2.force_exit is True
