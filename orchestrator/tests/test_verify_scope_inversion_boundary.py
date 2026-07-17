@@ -12,7 +12,7 @@ main before this task started:
 
 - κ (2588): plan-authoritative execution — ``run_scoped_verification``
   derives→executes→aggregates the ``VerifyPlan``; ``VerifyResult.plan`` is
-  the EXECUTED plan (verify.py:4503, :2516).
+  the EXECUTED plan (verify.py).
 - λ (2589): role-differentiated policy + the ``merge_verify_breadth`` knob —
   ``derive_verify_plan(role=...)`` forks; merge+full expands every
   registered ``ModuleConfig`` to its FULL_SUITE per-module; task-role adds
@@ -1025,12 +1025,11 @@ class TestRow7TrainAmortizationOneFullBreadthVerify:
             member_names=['row7_m1', 'row7_m2', 'row7_m3'],
             tip_name='row7_m3', tip_worktree=wt_3,
         )
-        # Non-empty so run_scoped_verification's module_configs branch
-        # (verify.py:4675) is even entered; merge+full then widens it
-        # wholesale to the FULL registry (config.module_configs_or_empty —
-        # all 3 modules) regardless of which subset is listed here (lambda's
-        # train-tip-shaped-call precedent,
-        # test_train_tip_shaped_call_widens_to_every_registered_module,
+        # Non-empty so run_scoped_verification's module_configs branch is even
+        # entered; merge+full then widens it wholesale to the FULL registry
+        # (config.module_configs_or_empty — all 3 modules) regardless of
+        # which subset is listed here (lambda's train-tip-shaped-call
+        # precedent, test_train_tip_shaped_call_widens_to_every_registered_module,
         # explicitly labeled "boundary row 7 plan shape"). Left empty (the
         # build_group_merge_request default), the call instead falls through
         # to the no-module_configs FALLBACK path — a single synthetic
