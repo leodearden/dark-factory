@@ -165,6 +165,7 @@ from orchestrator.overlap_footprint import (  # noqa: F401  re-export seam for �
     get_overlap_detector,
     register_overlap_detector,
 )
+from orchestrator.scheduler import StaleEvidenceRejection
 from orchestrator.suffix_graph import (  # noqa: F401  re-export shim
     EMPTY_SUFFIX_CONFLICT_GRAPH,
     SuffixConflictGraph,
@@ -3850,6 +3851,7 @@ async def reconcile_landed_row(
     scheduler: Any,
     outbox: LandedOutbox,
     main_sha: str,
+    provenance_conflict_sink: Any = None,
 ) -> str:
     """Reconcile a single :class:`LandedRow` against RC-1/RC-2/RC-3 (task 2155, W1 γ).
 
@@ -3894,6 +3896,20 @@ async def reconcile_landed_row(
       transient MCP failure): fail-safe, leave the row unconsumed for the
       next startup to retry rather than guessing done-or-not (no
       phantom-done, no premature prune).
+    * ``'stale_conflict'`` (task 2677) — the found_on_main provenance-
+      integrity gate refused the RC-2 done-write: ``scheduler.mark_done``
+      raised ``StaleEvidenceRejection`` because ``row.advanced_sha`` predates
+      the task's most recent ``reopen_at``. The row is left unconsumed (like
+      ``'skipped'``) — the task is NOT done, so pruning it would lose the
+      only record of the crash-window intent — and the rejection is routed
+      to *provenance_conflict_sink* (a dedupe-guarded, born-at-L2
+      escalation) instead of propagating to :func:`reconcile_landed_outbox`'s
+      generic ``'errors'`` tally. When *provenance_conflict_sink* is
+      ``None`` (bare callers/tests), the exception is RE-RAISED — preserving
+      the pre-task-2677 propagate-and-tally-as-``'errors'`` behavior. A
+      ``should_skip`` pre-check guards the ``mark_done`` attempt itself so a
+      repeat pass at an unchanged ``reopen_at`` short-circuits straight to
+      ``'stale_conflict'`` without re-attempting the already-rejected write.
     """
     if not await git_ops.is_ancestor(row.advanced_sha, main_sha):
         outbox.consume(row.task_id)
@@ -3905,7 +3921,27 @@ async def reconcile_landed_row(
     if status in WORKFLOW_PRESERVE_STATUSES:
         outbox.consume(row.task_id)
         return 'already_done_pruned'
-    await scheduler.mark_done(row.task_id, kind='merged', sha=row.advanced_sha)
+    if (
+        provenance_conflict_sink is not None
+        and provenance_conflict_sink.should_skip(row.task_id)
+    ):
+        return 'stale_conflict'
+    try:
+        await scheduler.mark_done(row.task_id, kind='merged', sha=row.advanced_sha)
+    except StaleEvidenceRejection as exc:
+        if provenance_conflict_sink is None:
+            raise
+        provenance_conflict_sink.record_from_rejection(
+            exc, gate_source='landed-reconcile-rc2',
+        )
+        logger.warning(
+            'reconcile_landed_row: task %s done_evidence_stale — evidence %s '
+            '(%s) predates reopen_at %s; filed provenance_conflict escalation '
+            'instead of marking done',
+            row.task_id, exc.evidence_commit, exc.evidence_committed_at,
+            exc.reopen_at,
+        )
+        return 'stale_conflict'
     try:
         outbox.consume(row.task_id)
     except Exception:
@@ -3939,6 +3975,7 @@ async def reconcile_landed_task(
     git_ops: Any,
     scheduler: Any,
     outbox: LandedOutbox,
+    provenance_conflict_sink: Any = None,
 ) -> bool:
     """Single-task landed-outbox consult for the scheduler dispatch gate (task 2156, W1 δ / SD-1).
 
@@ -3957,12 +3994,14 @@ async def reconcile_landed_task(
 
     Returns ``True`` ⟺ ``row.advanced_sha`` is an ancestor of ``main`` ⟺ the
     task must NOT be dispatched — the disposition (drive to done via
-    ``'marked_done'``, preserve via ``'already_done_pruned'``, or fail-safe
-    wait via ``'skipped'``) has already happened inline via
-    ``reconcile_landed_row``. Returns ``False`` when there is no row, or
-    when the row's disposition is ``'pruned_not_landed'`` — the task never
-    actually landed (crash before the CAS advance), so it stays normally
-    dispatchable and its stale row has already been pruned.
+    ``'marked_done'``, preserve via ``'already_done_pruned'``, fail-safe wait
+    via ``'skipped'``, or gate via ``'stale_conflict'`` — task 2677: a
+    contested task under provenance-conflict arbitration must never
+    dispatch) has already happened inline via ``reconcile_landed_row``.
+    Returns ``False`` when there is no row, or when the row's disposition is
+    ``'pruned_not_landed'`` — the task never actually landed (crash before
+    the CAS advance), so it stays normally dispatchable and its stale row
+    has already been pruned.
     """
     row = outbox.lookup(task_id)
     if row is None:
@@ -3970,6 +4009,7 @@ async def reconcile_landed_task(
     main_sha = await git_ops.get_main_sha()
     disposition = await reconcile_landed_row(
         row, git_ops=git_ops, scheduler=scheduler, outbox=outbox, main_sha=main_sha,
+        provenance_conflict_sink=provenance_conflict_sink,
     )
     return disposition != 'pruned_not_landed'
 
@@ -3978,6 +4018,7 @@ async def reconcile_landed_outbox(
     outbox: LandedOutbox,
     git_ops: Any,
     scheduler: Any,
+    provenance_conflict_sink: Any = None,
 ) -> dict[str, int]:
     """Scan *outbox* at startup and reconcile every unconsumed row (task 2155, W1 γ).
 
@@ -3987,6 +4028,11 @@ async def reconcile_landed_outbox(
     per-row try/except (fail-open, mirroring ``recover_pending_merges``)
     ensures one bad row never aborts the scan — its exception is logged and
     tallied under ``'errors'`` while the remaining rows still get reconciled.
+    *provenance_conflict_sink* (task 2677), when given, is threaded straight
+    through to :func:`reconcile_landed_row` so a ``done_evidence_stale``
+    rejection reports the honest ``'stale_conflict'`` disposition below
+    instead of falling into the generic ``'errors'`` tally; ``None``
+    preserves the pre-task-2677 propagate-and-tally-as-``'errors'`` behavior.
 
     KNOWN LIMITATION (reviewer_comprehensive amendment #3, task 2155): the
     happy path (``advance_main`` → ``'advanced'`` → task marked done) never
@@ -4007,6 +4053,7 @@ async def reconcile_landed_outbox(
         'marked_done': 0,
         'already_done_pruned': 0,
         'skipped': 0,
+        'stale_conflict': 0,
         'errors': 0,
     }
     main_sha = await git_ops.get_main_sha()
@@ -4014,6 +4061,7 @@ async def reconcile_landed_outbox(
         try:
             disposition = await reconcile_landed_row(
                 row, git_ops=git_ops, scheduler=scheduler, outbox=outbox, main_sha=main_sha,
+                provenance_conflict_sink=provenance_conflict_sink,
             )
             report[disposition] += 1
         except Exception:

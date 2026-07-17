@@ -241,6 +241,7 @@ class TestReconcileLandedOutboxRobustness:
             'marked_done': 0,
             'already_done_pruned': 0,
             'skipped': 0,
+            'stale_conflict': 0,
             'errors': 0,
         }
         scheduler.get_status.assert_not_called()
@@ -383,7 +384,8 @@ class TestHarnessReconcileLandedOutboxWiring:
 
         When a merge worker with a bound LandedOutbox is present, the
         harness delegates to the module-level reconcile_landed_outbox with
-        the worker's outbox plus the harness's own git_ops/scheduler.
+        the worker's outbox plus the harness's own git_ops/scheduler, and
+        (task 2677) the harness's shared ProvenanceConflictSink.
         """
         h = _build_harness(mock_orch_config)
         worker = MagicMock()
@@ -392,7 +394,7 @@ class TestHarnessReconcileLandedOutboxWiring:
 
         empty_report = {
             'pruned_not_landed': 0, 'marked_done': 0,
-            'already_done_pruned': 0, 'skipped': 0, 'errors': 0,
+            'already_done_pruned': 0, 'skipped': 0, 'stale_conflict': 0, 'errors': 0,
         }
         with patch(
             'orchestrator.harness.reconcile_landed_outbox',
@@ -402,6 +404,7 @@ class TestHarnessReconcileLandedOutboxWiring:
 
         mock_reconcile.assert_awaited_once_with(
             worker._landed_outbox, h.git_ops, h.scheduler,
+            provenance_conflict_sink=h._provenance_conflict_sink,
         )
 
 

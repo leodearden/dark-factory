@@ -7481,14 +7481,16 @@ Output JSON matching the schema. Every task must appear in the output.
             return
         report = await reconcile_landed_outbox(
             self._merge_worker._landed_outbox, self.git_ops, self.scheduler,
+            provenance_conflict_sink=self._provenance_conflict_sink,
         )
         logger.info(
             '_reconcile_landed_outbox: pruned_not_landed=%d marked_done=%d '
-            'already_done_pruned=%d skipped=%d errors=%d',
+            'already_done_pruned=%d skipped=%d stale_conflict=%d errors=%d',
             report.get('pruned_not_landed', 0),
             report.get('marked_done', 0),
             report.get('already_done_pruned', 0),
             report.get('skipped', 0),
+            report.get('stale_conflict', 0),
             report.get('errors', 0),
         )
 
@@ -7512,6 +7514,13 @@ Output JSON matching the schema. Every task must appear in the output.
         AFTER this callback is wired onto the scheduler in ``__init__``.
         Fails open (returns False, i.e. does not gate dispatch) when the
         worker is absent (disabled / not yet started).
+
+        Passes the shared ``self._provenance_conflict_sink`` through to
+        :func:`reconcile_landed_task` (task 2677): a ``done_evidence_stale``
+        rejection of the inline done-write now reports ``'stale_conflict'``
+        rather than propagating, and ``reconcile_landed_task`` maps that
+        disposition to ``True`` too — a contested task must not dispatch
+        while under arbitration, same as an already-landed one.
         """
         if self._merge_worker is None or self._merge_worker._landed_outbox is None:
             return False
@@ -7520,6 +7529,7 @@ Output JSON matching the schema. Every task must appear in the output.
             git_ops=self.git_ops,
             scheduler=self.scheduler,
             outbox=self._merge_worker._landed_outbox,
+            provenance_conflict_sink=self._provenance_conflict_sink,
         )
 
     async def _already_landed_dispatch_gate(self, task_id: str) -> bool:
