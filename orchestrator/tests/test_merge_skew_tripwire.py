@@ -16,6 +16,8 @@ test_merge_queue_lifecycle_registry.py / test_merge_queue_request_liveness.py.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -222,3 +224,76 @@ class TestComputeTripwireOverlap:
         assert [h.task_id for h in hits] == ['301', '101', '202'], (
             'hits must preserve inflight_diffs input order, not be resorted'
         )
+
+
+class _FakeEscalationQueue:
+    """Minimal fake escalation queue (per-file duplication convention — see
+    test_merge_queue_lifecycle_registry.py:86 / test_multihost_verify_integration.py:639).
+
+    ``by_task`` seeds what ``get_by_task`` returns for a given sentinel
+    task_id (defaults to ``[]``, i.e. no pre-existing open escalation — the
+    common case in these tests).
+    """
+
+    def __init__(self, by_task: dict[str, list] | None = None) -> None:
+        self._by_task = by_task or {}
+        self._seq = 0
+        self.submitted: list[Any] = []
+        self.get_by_task_calls: list[tuple[str, str | None]] = []
+
+    def get_by_task(self, task_id: str, status: str | None = None) -> list:
+        self.get_by_task_calls.append((task_id, status))
+        return self._by_task.get(task_id, [])
+
+    def make_id(self, task_id: str) -> str:
+        self._seq += 1
+        return f'esc-{task_id}-{self._seq}'
+
+    def submit(self, esc: Any) -> None:
+        self.submitted.append(esc)
+
+
+def _write_oracle_script(project_root: Path, *, exit_code: int) -> Path:
+    """Write a real executable bash oracle script exiting *exit_code*."""
+    script = project_root / 'oracle.sh'
+    script.write_text(f"""\
+#!/usr/bin/env bash
+exit {exit_code}
+""")
+    script.chmod(0o755)
+    return script
+
+
+@pytest.mark.asyncio
+class TestEmitTripwire:
+    """Unit tests for ``emit_pipeline_landing_tripwire`` — the orchestration
+    entrypoint covering boundary rows 5-6 of
+    plans/merge-skew-attribution-prd.md.
+    """
+
+    async def test_oracle_negative_no_escalation(self, tmp_path: Path) -> None:
+        """Boundary row 6: oracle-negative landing → zero escalations, zero updates."""
+        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+
+        script = _write_oracle_script(tmp_path, exit_code=1)  # not load-bearing
+        fake_eq = _FakeEscalationQueue()
+        get_branch_diff = AsyncMock(return_value=['src/a.py'])
+        update_task = AsyncMock(return_value=True)
+
+        await emit_pipeline_landing_tripwire(
+            project_root=tmp_path,
+            oracle_cmd=['bash', str(script)],
+            escalation_queue=fake_eq,
+            landing_sha='deadbeef' * 5,
+            landing_task_id='999',
+            landing_changed_files=['src/a.py'],
+            inflight=[('101', 'task/101')],
+            get_branch_diff=get_branch_diff,
+            update_task=update_task,
+        )
+
+        assert fake_eq.submitted == [], (
+            f'oracle-negative landing must submit no escalation; got {fake_eq.submitted!r}'
+        )
+        update_task.assert_not_awaited()
+        get_branch_diff.assert_not_awaited()
