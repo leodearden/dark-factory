@@ -1506,6 +1506,22 @@ class Scheduler:
         # once the dep resolves definitively (DELIVERED/FAILED cached) so a
         # later, unrelated error episode starts its own count from zero.
         self._delivered_check_error_streak: dict[str, int] = {}
+        # Cross-tick cache of fetched TERMINAL dep records, keyed by
+        # dep_id (task 2692, reviewer_comprehensive performance amendment).
+        # Populated by _phase_backfill_terminal_dep_records and consulted
+        # there BEFORE issuing any get_task call: a terminal (done/
+        # cancelled) task's record is treated as immutable once observed,
+        # so a dep_id already present here is served for free on every
+        # later tick instead of being re-fetched — without this, a mature
+        # project's every pending task would re-fetch every one of its
+        # completed local deps on EVERY tick forever, even though the
+        # common case is a dep with no metadata.delivered_checks at all.
+        # Never evicted (process-local — an orchestrator restart is an
+        # acceptable implicit reset, matching every other process-local
+        # cache above); a terminal task's metadata being edited in place
+        # after this cache is warmed is an accepted, rare staleness
+        # trade-off, not a correctness guarantee.
+        self._terminal_dep_record_cache: dict[str, dict] = {}
         self._streak_registry = StreakRegistry()
         self._streak_registry.register('external_unresolved', self._streak_external_unresolved)
         self._streak_registry.register('local_backfill', self._streak_local_backfill)
@@ -2850,7 +2866,11 @@ class Scheduler:
         separately) already knows it's terminal. When the dep record is
         already present in *tasks_by_id*, this fallback is never consulted.
         Defaults to ``None``, in which case a dep missing from *tasks_by_id*
-        is simply skipped — byte-identical to before this param existed.
+        is simply skipped — byte-identical to before this param existed. A
+        dep whose record is absent from BOTH sources (e.g. a failed
+        ``get_task`` fetch upstream in ``_phase_backfill_terminal_dep_records``,
+        which logs a bounded WARNING for it) is likewise skipped — a
+        conscious fail-OPEN, not a silent gap; see the skip site below.
         """
         tasks_by_id = tasks_by_id or {}
 
@@ -2868,6 +2888,20 @@ class Scheduler:
                 if dep_task is None and terminal_dep_records is not None:
                     dep_task = terminal_dep_records.get(dep_id)
                 if dep_task is None:
+                    # Conscious fail-OPEN (task 2692, reviewer_comprehensive
+                    # robustness amendment): a record still missing here
+                    # (absent from BOTH tasks_by_id and terminal_dep_records
+                    # — e.g. a get_task fetch failure in
+                    # _phase_backfill_terminal_dep_records) means this dep's
+                    # delivered_checks, if any, can't even be read, so it's
+                    # simply never added to checked_deps/the projection —
+                    # NOT gated. The alternative (fail-safe-WAIT on an
+                    # unreadable record) risks permanently deadlocking a
+                    # dependent whose dep record genuinely can never be
+                    # fetched, so this trades correctness for liveness.
+                    # _phase_backfill_terminal_dep_records logs a bounded
+                    # WARNING on every such fetch failure so the bypass is
+                    # operator-visible rather than silent.
                     continue
                 checks = (dep_task.get('metadata') or {}).get('delivered_checks')
                 if not checks:
@@ -3690,6 +3724,15 @@ class Scheduler:
                     # when tasks_by_id genuinely misses (tasks_by_id wins).
                     dep_task = terminal_dep_records.get(dep_id)
                 if dep_task is None:
+                    # Conscious fail-OPEN, not a gap: see the identical
+                    # skip site in _compute_delivered_check_cache (task
+                    # 2692, reviewer_comprehensive robustness amendment)
+                    # for the full rationale. In short — an unreadable
+                    # record (fetch failed in
+                    # _phase_backfill_terminal_dep_records, which logs a
+                    # bounded WARNING for it) means this dep is simply
+                    # never gated here, rather than fail-safe-blocking a
+                    # dependent whose dep record may never be fetchable.
                     continue
                 dep_checks = (dep_task.get('metadata') or {}).get('delivered_checks')
                 if not dep_checks:
@@ -4832,8 +4875,10 @@ class Scheduler:
     async def _phase_backfill_terminal_dep_records(self, ctx: TickContext) -> object:
         """Backfill fetched TERMINAL dep records missing from tasks_by_id.
 
-        Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``.
-        Writes: ``ctx.terminal_dep_records`` (task 2692, δ/ε follow-up).
+        Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``,
+        ``self._terminal_dep_record_cache``.
+        Writes: ``ctx.terminal_dep_records`` (task 2692, δ/ε follow-up),
+        ``self._terminal_dep_record_cache``.
         Runs immediately after ``backfill_dep_status`` (so ``status_map`` is
         already populated) and before ``delivered_check_gate`` and both
         candidate-dispatch loops — all of which consult
@@ -4855,13 +4900,48 @@ class Scheduler:
         missing-id set) — zero extra cost when the gate is off or nothing
         is missing, mirroring ``_phase_delivered_check_gate``'s own kill
         switch. Only PENDING tasks' deps are considered, and only deps
-        whose ``status_map`` entry is TERMINAL. Fetches are issued
-        concurrently via ``asyncio.gather`` over ``self.get_task`` (the
-        lean per-id fetch primitive), which already returns ``None`` on
-        failure/absence — a dep that fails to fetch is simply left out of
-        ``ctx.terminal_dep_records``, degrading to today's (silent no-op)
-        behaviour for that one dep. The whole collection+fetch is wrapped
-        in try/except so an unexpected failure logs a WARNING and leaves
+        whose ``status_map`` entry is TERMINAL.
+
+        Cross-tick record cache (task 2692, reviewer_comprehensive
+        performance amendment): a dep_id already present in
+        ``self._terminal_dep_record_cache`` is served straight into
+        ``ctx.terminal_dep_records`` with NO ``get_task`` call at all — a
+        terminal task's record is treated as immutable once fetched.
+        Without this, every pending task's completed local deps would be
+        re-fetched on EVERY tick forever, even in the common case where
+        none of them carry ``metadata.delivered_checks``. Only dep_ids
+        that miss this cache are actually fetched below (and then stashed
+        into it for next time).
+
+        Those still-uncached fetches are further bounded by
+        ``config.delivered_checks.max_checks_per_tick`` — reusing the same
+        knob ``_compute_delivered_check_cache`` applies to check RUNS (a
+        *dedicated* cap would need a new ``config.py`` field, outside this
+        task's scheduler.py-only scope). A tick with more newly-missing
+        dep_ids than the budget fetches a deterministic (sorted) prefix and
+        logs one bounded WARNING naming how many were deferred — the
+        deferred ids are simply "needed" again next tick (they're never
+        negatively cached, and any id fetched this tick is cached and so
+        never recompetes for a future tick's budget), so this is fail-safe
+        deferral, not silent dropping.
+
+        Fetches are issued concurrently via ``asyncio.gather`` over
+        ``self.get_task`` (the lean per-id fetch primitive), which already
+        returns ``None`` on failure/absence. A dep that fails to fetch is
+        left out of ``ctx.terminal_dep_records`` (and NOT cached, so it's
+        retried next tick) for this tick's fail-safe wait — but a pending
+        dependent's delivered-check gate on THAT dep is bypassed
+        (fail-open) rather than withheld for this tick, since both
+        delivered-check consumers treat "dep record unavailable" as "not
+        checked" (:meth:`_deps_satisfied`, :meth:`_compute_delivered_check_cache`).
+        This is a conscious trade-off (reviewer_comprehensive robustness
+        amendment): the alternative (fail-safe-WAIT whenever a terminal
+        dep record can't be fetched) risks permanently deadlocking a
+        dependent whose dep record genuinely can never be fetched. A
+        bounded WARNING is logged for every such fetch failure so the
+        bypass is operator-visible instead of silent. The whole
+        collection+fetch is further wrapped in try/except so an
+        unexpected failure logs a WARNING and leaves
         ``ctx.terminal_dep_records`` as-is (fail-safe), mirroring
         ``_phase_delivered_check_gate``. Always continues.
         """
@@ -4883,13 +4963,45 @@ class Scheduler:
                     needed.add(_dep_id)
             if not needed:
                 return _CONTINUE
-            _ordered = sorted(needed)
+
+            _to_fetch: list[str] = []
+            for _dep_id in needed:
+                _cached_record = self._terminal_dep_record_cache.get(_dep_id)
+                if _cached_record is not None:
+                    ctx.terminal_dep_records[_dep_id] = _cached_record
+                else:
+                    _to_fetch.append(_dep_id)
+            if not _to_fetch:
+                return _CONTINUE
+
+            _ordered = sorted(_to_fetch)
+            _budget = self.config.delivered_checks.max_checks_per_tick
+            if len(_ordered) > _budget:
+                _total = len(_ordered)
+                _ordered = _ordered[:_budget]
+                logger.warning(
+                    'acquire_next: terminal dep record backfill has %d new '
+                    'dep(s) to fetch this tick, exceeding '
+                    'delivered_checks.max_checks_per_tick (%d) — fetching '
+                    '%d, deferring %d to a later tick.',
+                    _total, _budget, len(_ordered), _total - len(_ordered),
+                )
             _fetched = await asyncio.gather(
                 *(self.get_task(_dep_id) for _dep_id in _ordered)
             )
             for _dep_id, _record in zip(_ordered, _fetched, strict=True):
                 if _record is not None:
                     ctx.terminal_dep_records[_dep_id] = _record
+                    self._terminal_dep_record_cache[_dep_id] = _record
+                else:
+                    logger.warning(
+                        'acquire_next: terminal dep %s record fetch '
+                        'returned None (transient?) — any pending '
+                        "dependent's delivered-check gate on this dep is "
+                        'bypassed (fail-open, not affirmatively passed) '
+                        'this tick; will retry next tick.',
+                        _dep_id,
+                    )
         except Exception:
             logger.warning(
                 'acquire_next: terminal dep record backfill failed unexpectedly',
