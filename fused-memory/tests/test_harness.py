@@ -6316,6 +6316,11 @@ class TestBusyProjectDrainConvergence:
         try:
             with patch.object(harness, 'run_full_cycle', side_effect=fake_rfc):
                 loop_task = asyncio.create_task(harness._project_loop('test-project'))
+                # Register the task the way the real spawn path does so
+                # `_no_active_loops()` (and thus `is_drained` below) reflects
+                # this loop's actual completion state instead of vacuously
+                # seeing an empty `_project_tasks` dict.
+                harness._project_tasks['test-project'] = loop_task
                 await asyncio.wait_for(entered.wait(), 2.0)
 
                 # Drain strictly while the cycle is in-flight.
