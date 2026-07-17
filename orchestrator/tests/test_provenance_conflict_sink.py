@@ -197,6 +197,29 @@ class TestProvenanceConflictSinkShouldSkip:
 
         assert sink.should_skip('42', reopen_at='2026-07-16T00:00:00+00:00') is False
 
+    def test_should_skip_prunes_memo_when_reopen_at_differs(self, tmp_path):
+        """reviewer_comprehensive amendment (task 2677, resource_management):
+        a reopen_at mismatch proves the memo entry stale (the task was
+        reopened again since the conflict was recorded). It must be pruned
+        immediately rather than left for the next record() to overwrite —
+        the common self-heal case is that the retried write, now carrying
+        the fresh reopen_at, succeeds outright, so no subsequent record()
+        call ever arrives to overwrite a left-in-place entry and it would
+        otherwise linger in self._memo for the rest of the process
+        lifetime.
+        """
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        queue = EscalationQueue(tmp_path)
+        sink = ProvenanceConflictSink(escalation_queue=queue)
+
+        _record(sink)
+
+        assert sink.should_skip('42', reopen_at='2026-07-16T00:00:00+00:00') is False
+        assert '42' not in sink._memo, (
+            'a reopen_at mismatch must not leave a permanent memo entry behind'
+        )
+
     def test_should_skip_true_when_reopen_at_differs_only_in_iso8601_formatting(
         self, tmp_path,
     ):

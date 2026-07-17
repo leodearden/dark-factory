@@ -258,21 +258,25 @@ class ProvenanceConflictSink:
         that invalidation arm — used by callers that do not have the
         task's current metadata handy.
 
-        A memo whose escalation is no longer pending is pruned from
-        ``self._memo`` before returning False (task 2677 amendment,
-        reviewer_comprehensive resource_management) — otherwise a resolved
-        conflict's entry would linger for the rest of the process
-        lifetime, growing ``self._memo`` monotonically with the number of
-        distinct tasks that ever hit a stale-evidence conflict. A memo
-        invalidated by a *reopen_at* mismatch is left in place: it is
-        still the most recent record() write and will be overwritten (not
-        duplicated) by the next one.
+        A memo whose escalation is no longer pending, or whose *reopen_at*
+        no longer matches the caller-supplied value, is pruned from
+        ``self._memo`` before returning False (task 2677 amendments,
+        reviewer_comprehensive resource_management) — otherwise the entry
+        would linger for the rest of the process lifetime, growing
+        ``self._memo`` monotonically with the number of distinct tasks
+        that ever hit a stale-evidence conflict. A *reopen_at* mismatch is
+        pruned immediately rather than left for the next ``record()`` to
+        overwrite: the common self-heal case is that the retried write,
+        now carrying a fresh ``reopen_at``, succeeds outright — in which
+        case ``record()`` is never called again and a left-in-place entry
+        would never be overwritten.
         """
         memo = self._memo.get(task_id)
         if memo is None:
             return False
         memo_reopen_at, _evidence_commit, escalation_id = memo
         if reopen_at is not _UNKNOWN_REOPEN and not _reopen_at_matches(reopen_at, memo_reopen_at):
+            del self._memo[task_id]
             return False
         if self._escalation_pending(escalation_id):
             return True
@@ -296,6 +300,17 @@ class ProvenanceConflictSink:
         reviewer_comprehensive robustness_silent_degradation — previously
         this returned True unconditionally, silently gating the task for
         the rest of the process lifetime with no escalation ever filed).
+
+        Deliberately uncached (task 2677 amendment, reviewer_comprehensive
+        efficiency): ``self.escalation_queue.get(...)`` performs a disk
+        read on every call that finds a live memo, so a task under active
+        arbitration incurs one read per dispatch tick / stranded-sweep
+        cycle for as long as its conflict stays open. Reviewed and left
+        as-is — call volume is bounded by the (rare) count of
+        concurrently-contested tasks, this is not a hot path, and a
+        TTL/tick-based cache would trade that minor, bounded I/O cost for
+        a real risk: staleness in the one signal (an operator's
+        resolution) this check exists to observe promptly.
         """
         if escalation_id is None:
             return self.escalation_queue is None
