@@ -3799,3 +3799,125 @@ def test_boundary10_recover_pending_merges_link_seam() -> None:
         "must be present and callable"
     )
 
+
+# ---------------------------------------------------------------------------
+# Part B: fused-memory liveness — constants + probe_health() (B1)
+# ---------------------------------------------------------------------------
+
+
+def test_fused_memory_constants_exposed() -> None:
+    """The module exposes the fused-memory unit name, port, and health URL."""
+    wdog = _load_watchdog()
+    assert wdog.FUSED_MEMORY_UNIT == "fused-memory.service"
+    assert wdog.FUSED_MEMORY_PORT == 8002
+    assert hasattr(wdog, "FUSED_MEMORY_HEALTH_URL"), (
+        "Module must expose a FUSED_MEMORY_HEALTH_URL constant"
+    )
+    assert "8002" in wdog.FUSED_MEMORY_HEALTH_URL
+    assert "/health" in wdog.FUSED_MEMORY_HEALTH_URL
+
+
+def test_fused_memory_port_matches_configured_server_port() -> None:
+    """FUSED_MEMORY_PORT must equal fused-memory/config/config.yaml's server.port.
+
+    Config-drift guard mirroring test_watched_ports_match_configured_escalation_ports
+    above: skipped gracefully if the config file is unreachable in this environment.
+    """
+    yaml = pytest.importorskip("yaml")
+    wdog = _load_watchdog()
+
+    config_path = REPO_ROOT / "fused-memory" / "config" / "config.yaml"
+    if not config_path.exists():
+        pytest.skip(f"{config_path} not reachable in this environment")
+    cfg = yaml.safe_load(config_path.read_text())
+    server = cfg.get("server") if isinstance(cfg, dict) else None
+    port = server.get("port") if isinstance(server, dict) else None
+    assert port is not None, f"{config_path}: missing 'server.port' (schema may have changed)"
+    assert wdog.FUSED_MEMORY_PORT == port, (
+        f"FUSED_MEMORY_PORT ({wdog.FUSED_MEMORY_PORT}) != "
+        f"fused-memory/config/config.yaml server.port ({port})"
+    )
+
+
+class _FakeHealthResponse:
+    """Minimal context-manager stand-in for urllib.request.urlopen's return value."""
+
+    def __init__(self, status: int = 200) -> None:
+        self.status = status
+
+    def __enter__(self) -> "_FakeHealthResponse":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    def getcode(self) -> int:
+        return self.status
+
+
+def test_probe_health_true_on_200(monkeypatch: pytest.MonkeyPatch) -> None:
+    """probe_health returns True when urlopen succeeds with a 2xx response."""
+    wdog = _load_watchdog()
+
+    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        return _FakeHealthResponse(200)
+
+    monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
+    assert wdog.probe_health() is True
+
+
+def test_probe_health_true_on_503_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """probe_health returns True on HTTPError (e.g. 503) — the loop IS serving.
+
+    fused-memory's /health returns 503 when a backing store (FalkorDB/Qdrant)
+    is degraded, but the asyncio event loop DID respond within the timeout —
+    restarting the process would not fix a down store, so this response must
+    NOT be treated as dead/wedged.
+    """
+    wdog = _load_watchdog()
+
+    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise wdog.urllib.error.HTTPError(
+            "http://127.0.0.1:8002/health", 503, "Service Unavailable", None, None
+        )
+
+    monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
+    assert wdog.probe_health() is True
+
+
+def test_probe_health_false_on_url_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """probe_health returns False when urlopen raises URLError (no response received)."""
+    wdog = _load_watchdog()
+
+    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise wdog.urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
+    assert wdog.probe_health() is False
+
+
+def test_probe_health_false_on_connection_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """probe_health returns False when urlopen raises ConnectionRefusedError directly."""
+    wdog = _load_watchdog()
+
+    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise ConnectionRefusedError("connection refused")
+
+    monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
+    assert wdog.probe_health() is False
+
+
+def test_probe_health_false_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """probe_health returns False when urlopen times out — the true wedged/dead signal.
+
+    socket.timeout is an alias of TimeoutError (Python 3.10+), so a single
+    TimeoutError-raising test covers both names.
+    """
+    wdog = _load_watchdog()
+
+    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
+    assert wdog.probe_health() is False
+
