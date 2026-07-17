@@ -283,6 +283,7 @@ Description=Installed Fused Memory
 [Service]
 Type=notify
 WatchdogSec=120
+ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
 Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory,/home/leo/src/other
 
 [Install]
