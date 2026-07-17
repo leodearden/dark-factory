@@ -58,3 +58,70 @@ def test_imports_resolve_without_fused_memory():
     assert OrchestratorConfig is not None
     assert EventType is not None
     assert Harness is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Row 3+4 fixture constants (real `git grep` gate)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CAP_NAME_34 = 'row34_cap'
+_CAP_TOKEN_34 = 'ROW34_CAPABILITY_TOKEN_V1'
+_MARKER_REL_PATH_34 = 'src/row34_marker.py'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestRealGitGrepGate — rows 3+4: real `git grep` withhold, then dispatch
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestRealGitGrepGate:
+    """Rows 3+4, driven through the REAL (unmocked) ``run_delivered_check``
+    + ``Scheduler._resolve_main_sha`` — new coverage vs.
+    ``test_delivered_check_gate.py``, whose unit tests fake both.
+
+    A 'done' producer carries a grep-kind ``metadata.delivered_checks``
+    entry (the same shape gamma's ``commit_planning`` stamps) whose token
+    is initially absent from branch main; a pending dependent depends on
+    it via a LOCAL dependency. Row 4: while the token is absent, a real
+    ``git grep`` finds no match (rc==1 -> FAILED) so ``acquire_next()``
+    withholds dispatch and the hold is visible (event + streak). Row 3:
+    once the token is committed to main, the very next tick dispatches
+    the dependent (real ``git grep`` rc==0 -> DELIVERED).
+    """
+
+    @pytest.mark.asyncio
+    async def test_token_absent_withholds_then_landed_token_dispatches(
+        self, tmp_path: Path
+    ) -> None:
+        project_root = _init_git_repo(tmp_path, marker_rel_path=_MARKER_REL_PATH_34)
+        session = _LocalDepMcpSession()
+        _register_producer(
+            session, 'P34', status='done',
+            checks=[_grep_check(_CAP_NAME_34, _CAP_TOKEN_34, [_MARKER_REL_PATH_34])],
+        )
+        _register_dependent(session, 'D34', dep_id='P34')
+
+        harness = _build_harness(project_root, session, tmp_path / 'escalations')
+
+        # --- row 4: token absent from main -> withhold, held event/streak ---
+        result = await _run_tick(harness)
+        assert result is None, (
+            f'row 4: token absent from main must withhold dispatch of the '
+            f'dependent; got {result!r}'
+        )
+        assert _held_events(harness), (
+            'row 4: a delivered_check_gate_held event must be recorded for '
+            'the withheld dependent'
+        )
+        assert harness.scheduler._streak_delivered_hold.value('D34') >= 1, (
+            'row 4: _streak_delivered_hold must bump for the withheld dependent'
+        )
+
+        # --- row 3: land the token on main -> dispatch the very next tick ---
+        _commit_marker(project_root, _MARKER_REL_PATH_34, _CAP_TOKEN_34)
+
+        result = await _run_tick(harness)
+        assert result == 'D34', (
+            f'row 3: once the real `git grep` finds the token on main, the '
+            f'dependent must dispatch; got {result!r}'
+        )
