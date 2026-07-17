@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from fused_memory.server.main import _graceful_shutdown, _run_shielded
+from fused_memory.server.main import _build_uvicorn_config, _graceful_shutdown, _run_shielded
 
 
 class TestGracefulShutdownCallsMemoryServiceClose:
@@ -790,3 +790,64 @@ class TestShutdownBudgetArithmetic:
         import fused_memory.server.main as main_mod
 
         assert main_mod._SYSTEMD_TIMEOUT_STOP_SECS == 90.0
+
+
+class _DummyASGIApp:
+    """Minimal placeholder ASGI app. uvicorn.Config never calls it at
+    construction time, so this only needs to satisfy the type — matches the
+    `_RaisingApp` placeholder pattern in tests/server/test_asgi_exception_shield.py.
+    """
+
+    async def __call__(self, scope, receive, send):
+        raise NotImplementedError
+
+
+class TestBuildUvicornConfig:
+    """Survey finding D1: _build_uvicorn_config is the single tested seam that
+    routes both the primary and recon-report uvicorn.Config construction sites
+    through ServerConfig.graceful_shutdown_timeout, so the internal graceful-shutdown
+    wait is always bounded instead of defaulting to None (unbounded).
+    """
+
+    def test_graceful_shutdown_timeout_applied(self):
+        config = _build_uvicorn_config(
+            _DummyASGIApp(),
+            host='127.0.0.1',
+            port=8000,
+            graceful_shutdown_timeout=10,
+        )
+        assert config.timeout_graceful_shutdown == 10
+
+    def test_keepalive_timeout_applied_when_provided(self):
+        config = _build_uvicorn_config(
+            _DummyASGIApp(),
+            host='127.0.0.1',
+            port=8000,
+            graceful_shutdown_timeout=10,
+            keepalive_timeout=30,
+        )
+        assert config.timeout_keep_alive == 30
+
+    def test_keepalive_timeout_left_at_uvicorn_default_when_omitted(self):
+        """When keepalive_timeout is omitted, the helper must NOT force
+        timeout_keep_alive — uvicorn's own default (5s) applies unchanged.
+        Matches the pre-existing recon-report site, which never set
+        timeout_keep_alive.
+        """
+        config = _build_uvicorn_config(
+            _DummyASGIApp(),
+            host='127.0.0.1',
+            port=8000,
+            graceful_shutdown_timeout=10,
+        )
+        assert config.timeout_keep_alive == 5  # uvicorn.Config's own default
+
+    def test_host_and_port_pass_through(self):
+        config = _build_uvicorn_config(
+            _DummyASGIApp(),
+            host='0.0.0.0',
+            port=9123,
+            graceful_shutdown_timeout=10,
+        )
+        assert config.host == '0.0.0.0'
+        assert config.port == 9123
