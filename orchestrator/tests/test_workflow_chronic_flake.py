@@ -20,6 +20,7 @@ test-scope note.
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -47,7 +48,7 @@ class TestMaybeFileChronicFlakes:
         config.chronic_flake = ChronicFlakeConfig(enabled=enabled)
         return config
 
-    def _workflow(self, config: OrchestratorConfig, scheduler=None) -> TaskWorkflow:
+    def _workflow(self, config: OrchestratorConfig, scheduler: Any = None) -> TaskWorkflow:
         workflow = object.__new__(TaskWorkflow)
         workflow.config = config
         workflow.scheduler = scheduler
@@ -84,6 +85,7 @@ class TestMaybeFileChronicFlakes:
 
         entry_point.assert_awaited_once()
         call_args = entry_point.await_args
+        assert call_args is not None
         assert call_args.args[0] == 'some verify output'
         assert call_args.args[1] is workflow.config
         assert isinstance(call_args.args[2], SchedulerChronicFlakeTaskClient)
@@ -117,7 +119,8 @@ class TestVerifyDebugfixLoopInvokesChronicFlakeHook:
         workflow = object.__new__(TaskWorkflow)
         workflow.config = config
         workflow.worktree = tmp_path
-        workflow.artifacts = object()
+        artifacts_stub: Any = object()
+        workflow.artifacts = artifacts_stub
         workflow._last_verify_result = None
         return workflow
 
