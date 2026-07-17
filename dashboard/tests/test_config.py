@@ -128,6 +128,33 @@ class TestNoUrlWarnsNamingRoot:
         assert str(root) in records[0].getMessage()
         assert 'please migrate' not in records[0].getMessage()
 
+    def test_malformed_canonical_is_authoritative_over_valid_legacy(self, tmp_path, caplog):
+        """A malformed canonical config is NOT masked by a valid legacy config.
+
+        Mirrors ``test_portless_canonical_is_authoritative_over_valid_legacy``
+        for the ``_read_escalation_url`` parse-failure branch: the canonical
+        file's mere presence — even unparseable — makes it authoritative, so
+        resolution never falls through to the legacy port. Two WARNINGs fire
+        (the parse-failure naming the file, plus the no-URL one naming the
+        root); neither is the legacy-fallback warning, and the legacy port
+        is ignored entirely.
+        """
+        root = tmp_path / 'myproj'
+        _write_yaml(root / 'orchestrator.yaml', {'escalation': {'port': 9202}})
+        (root / 'dark-factory-orchestrator.yaml').write_text('escalation: [unclosed')
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _discover_escalation_urls([root])
+
+        assert result == {}
+        records = [r for r in caplog.records if r.name == _LOGGER_NAME]
+        assert len(records) == 2
+        assert all(r.levelno == logging.WARNING for r in records)
+        messages = [r.getMessage() for r in records]
+        assert sum('Failed to read' in m for m in messages) == 1
+        assert sum('No escalation URL discovered' in m for m in messages) == 1
+        assert not any('please migrate' in m for m in messages)
+
 
 class TestMultiRootDiscovery:
     """A single call spans multiple roots with independent outcomes."""
