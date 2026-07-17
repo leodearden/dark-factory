@@ -7057,12 +7057,28 @@ class GitOps:
 
         Returns the fixed path (:attr:`persistent_merge_worktree_path`).
         Raises :exc:`RuntimeError` on git failure (mirrors
-        :meth:`_create_merge_worktree`). Raises
-        :exc:`MergeVerifyLeaseHeld` (task 2315, BUG 1) BEFORE touching the
-        tree at all when a DIFFERENT live process holds the merge-verify
-        lease — self pgid is excluded so the normal reset-then-verify flow
-        (this orchestrator resetting the worktree it is about to verify)
-        is unaffected.
+        :meth:`_create_merge_worktree`) or on a bounded-wait timeout
+        acquiring the lane lock below (fail-CLOSED — a live reify/DF
+        holder must block the mutation, never be silently ignored).
+        Raises :exc:`MergeVerifyLeaseHeld` (task 2315, BUG 1) BEFORE
+        touching the tree at all when a DIFFERENT live process holds the
+        merge-verify lease — self pgid is excluded so the normal
+        reset-then-verify flow (this orchestrator resetting the worktree
+        it is about to verify) is unaffected.
+
+        Holds the shared ``<lane_dir>.lock``
+        (:func:`~orchestrator.verify_cancel.lane_lock_path` of *warm_path*)
+        across the tree-mutating body below (task 2685, step-4) — the SAME
+        lock reify's ``seed-warm-lane.sh`` / ``thin-warm-lane.sh`` /
+        ``warm-lane-gc.sh``, DF's own :meth:`_seed_warm_lane`, and
+        :meth:`merge_verify_lease` all take. This closes the residual
+        window between a reset returning and the caller's later
+        :meth:`merge_verify_lease` acquiring its own (separate,
+        sequential) hold on the same lock — reset and verify now each
+        serialize against reify/DF actors on the one lock, eliminating the
+        gap a reseed could previously race through. The bounded-wait
+        acquire runs off the event loop (:func:`asyncio.to_thread`) so a
+        contended wait never stalls other in-process coroutines.
         """
         warm_path = self.persistent_merge_worktree_path
 
@@ -7070,57 +7086,70 @@ class GitOps:
         if self._merge_verify_lease_active() and holder_pgid != os.getpgrp():
             raise MergeVerifyLeaseHeld(warm_path, holder_pgid)
 
-        if not await self._is_registered_worktree(warm_path):
-            # Create-once branch — self-heal a stale unregistered directory first.
-            # A previous run may have left the directory on disk without a git
-            # worktree registration (e.g. worktree metadata pruned after a crash).
-            # `git worktree add` refuses a non-empty directory, permanently
-            # wedging the warm path until manual cleanup.  Removing the orphaned
-            # directory here mirrors the stale-directory removal in create_worktree
-            # and makes the create-once path self-healing.
-            if warm_path.exists():
-                logger.warning(
-                    'Persistent merge worktree path %s exists on disk but is not '
-                    'a registered git worktree; removing stale directory to allow '
-                    'fresh creation (self-heal)',
-                    warm_path,
+        lock_path = lane_lock_path(warm_path)
+        fd = await asyncio.to_thread(
+            acquire_merge_verify_flock, lock_path, _SEED_WARM_LANE_LOCK_WAIT_SECS,
+        )
+        if fd is None:
+            raise RuntimeError(
+                f'Timed out after {_SEED_WARM_LANE_LOCK_WAIT_SECS}s waiting to '
+                f'acquire {lock_path} — a live reify/DF actor holds the lane '
+                f'lock; refusing to mutate {warm_path} unprotected'
+            )
+        try:
+            if not await self._is_registered_worktree(warm_path):
+                # Create-once branch — self-heal a stale unregistered directory first.
+                # A previous run may have left the directory on disk without a git
+                # worktree registration (e.g. worktree metadata pruned after a crash).
+                # `git worktree add` refuses a non-empty directory, permanently
+                # wedging the warm path until manual cleanup.  Removing the orphaned
+                # directory here mirrors the stale-directory removal in create_worktree
+                # and makes the create-once path self-healing.
+                if warm_path.exists():
+                    logger.warning(
+                        'Persistent merge worktree path %s exists on disk but is not '
+                        'a registered git worktree; removing stale directory to allow '
+                        'fresh creation (self-heal)',
+                        warm_path,
+                    )
+                    shutil.rmtree(warm_path)
+                warm_path.parent.mkdir(parents=True, exist_ok=True)
+                rc, _, err = await _run(
+                    ['git', 'worktree', 'add', '--detach', str(warm_path), merge_commit],
+                    cwd=self.project_root,
                 )
-                shutil.rmtree(warm_path)
-            warm_path.parent.mkdir(parents=True, exist_ok=True)
-            rc, _, err = await _run(
-                ['git', 'worktree', 'add', '--detach', str(warm_path), merge_commit],
-                cwd=self.project_root,
-            )
-            if rc != 0:
-                raise RuntimeError(
-                    f'Failed to create persistent merge worktree at {warm_path}: {err}'
+                if rc != 0:
+                    raise RuntimeError(
+                        f'Failed to create persistent merge worktree at {warm_path}: {err}'
+                    )
+                logger.info(
+                    'Created persistent merge worktree at %s (HEAD=%s)',
+                    warm_path, merge_commit[:8],
                 )
-            logger.info(
-                'Created persistent merge worktree at %s (HEAD=%s)',
-                warm_path, merge_commit[:8],
-            )
-        else:
-            # Reset-in-place branch (added in step-6)
-            rc, _, err = await _run(
-                ['git', 'reset', '--hard', merge_commit],
-                cwd=warm_path,
-            )
-            if rc != 0:
-                raise RuntimeError(
-                    f'Failed to reset persistent merge worktree {warm_path} '
-                    f'to {merge_commit}: {err}'
+            else:
+                # Reset-in-place branch (added in step-6)
+                rc, _, err = await _run(
+                    ['git', 'reset', '--hard', merge_commit],
+                    cwd=warm_path,
                 )
-            ok, err = await self._clean_lane_retaining_artifacts(
-                warm_path, caller='reset_persistent_merge_worktree',
-            )
-            if not ok:
-                raise RuntimeError(
-                    f'Failed to clean persistent merge worktree {warm_path}: {err}'
+                if rc != 0:
+                    raise RuntimeError(
+                        f'Failed to reset persistent merge worktree {warm_path} '
+                        f'to {merge_commit}: {err}'
+                    )
+                ok, err = await self._clean_lane_retaining_artifacts(
+                    warm_path, caller='reset_persistent_merge_worktree',
                 )
-            logger.info(
-                'Reset persistent merge worktree %s to HEAD=%s',
-                warm_path, merge_commit[:8],
-            )
+                if not ok:
+                    raise RuntimeError(
+                        f'Failed to clean persistent merge worktree {warm_path}: {err}'
+                    )
+                logger.info(
+                    'Reset persistent merge worktree %s to HEAD=%s',
+                    warm_path, merge_commit[:8],
+                )
+        finally:
+            release_merge_verify_flock(fd)
 
         return warm_path
 
