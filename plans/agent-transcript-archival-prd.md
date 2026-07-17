@@ -103,16 +103,20 @@ depends on, or races, worktree teardown. Five components, foundation-first.
   reaped without a completed resume. **Signal:** a worktree removed via `cleanup_worktree` whose
   config dir holds an un-archived transcript has it archived first; an already-archived transcript
   is not re-copied. **Consumer:** forensics, γ. **Depends:** α.
-- **γ — Legibility mining: second transcript root, gz-aware.** Teach `scripts/legibility` to
-  enumerate an additional configurable list of roots (`agent_transcript_roots`, added to
+- **γ — Legibility mining: second transcript root, gz-aware, turned ON.** Teach `scripts/legibility`
+  to enumerate an additional configurable list of roots (`agent_transcript_roots`, added to
   `legibility.yaml` and `config.load_config`) alongside `~/.claude/projects`, with **gz-aware**
   transcript reading, filtered by the existing `cwd_prefixes` (fleet transcripts carry a worktree
   cwd already admitted by `is_member`). Generalize `enumerate_sessions`/`iter_project_dirs` to
-  iterate a root list and accept the archive layout (`<task_id>/<sid>.jsonl.gz`). **Signal:** a
-  census/inventory run over a date with archived fleet transcripts enumerates them (they enter the
-  corpus, classified `orchestrated-task`); with the knob unset, output is byte-identical to today.
-  **Consumer:** the confusion-reduction census/digest; the legibility program. **Depends:** α
-  (needs archives to read). ∥ β, δ.
+  iterate a root list and accept the archive layout (`<task_id>/<sid>.jsonl.gz`). **This task also
+  SETS `agent_transcript_roots: [data/orchestrator/agent-transcripts]` in the committed
+  `legibility.yaml`** — live, not empty — so the confusion census reads archived fleet transcripts
+  as soon as they exist, with **no operator flip** (Leo's explicit ask: fleet corpus visible ASAP).
+  The empty *code default* is retained only as the parity/test baseline. **Signal:** a census/inventory
+  run over a date with archived fleet transcripts enumerates them (they enter the corpus, classified
+  `orchestrated-task`); the shipped `legibility.yaml` has the archive root set; the empty-list code
+  path is byte-identical to today. **Consumer:** the confusion-reduction census/digest; the
+  legibility program. **Depends:** α (needs archives to read). ∥ β, δ.
 - **δ — Retention GC sweep.** A `scripts/` GC over `<archive_root>` pruning by age and/or count
   cap (`transcript_archive.retention_*` config), best-effort, **loud** (logs each dropped task
   dir + a summary count — INV-4). Runnable standalone and wireable into the existing operator
@@ -189,8 +193,11 @@ dispatch path is introduced.
 6. **Destination `data/orchestrator/agent-transcripts/<task_id>/<relpath>.jsonl.gz`**, gzip
    (~3.3× on transcripts). One dir per task; role/session distinguished by filename.
 7. **Mining reads the archive via a config-driven root list** (`agent_transcript_roots` in
-   `legibility.yaml`), gz-aware, filtered by the existing `cwd_prefixes`. Default-unset → today's
-   behaviour exactly (opt-in). The knob and its default live in config, machine-read (INV-1).
+   `legibility.yaml`), gz-aware, filtered by the existing `cwd_prefixes`, machine-read (INV-1).
+   The *code* default is an empty list (byte-parity with today, for tests), but **this batch ships
+   `legibility.yaml` with the archive root SET** so the confusion census reads the fleet corpus as
+   soon as transcripts exist — no operator action (Leo's ask: visible ASAP). γ owns both the
+   enumerate change and turning the root on.
 8. **Retention by age and/or count cap, config-driven, loud.** Defaults sized to keep everything
    at current volume; the cap is the disk-safety valve, not an aggressive pruner.
 9. **`transcript_archive.*` and `retention.*` are green-tier hot-reloadable config**; the archive
@@ -234,11 +241,13 @@ dispatch path is introduced.
   archive-any-unarchived before `git worktree remove`. **Signal:** a `cleanup_worktree` on a
   config dir with an un-archived transcript archives it first; an already-archived transcript is
   not re-copied (size/mtime skip). **Consumer:** forensics, γ. **Depends:** α.
-- **γ — Legibility multi-root gz-aware enumerate**
+- **γ — Legibility multi-root gz-aware enumerate + turn the root ON**
   (`scripts/legibility/inventory.py`, `config.py`; `docs/legibility/legibility.yaml`). **Signal:**
   a census/inventory run over a date with archived fleet transcripts enumerates them (in-corpus,
-  classified `orchestrated-task`); knob-unset output is byte-identical to today; a `.jsonl.gz`
-  under the archive root is read as transcript. **Consumer:** confusion-reduction census/digest.
+  classified `orchestrated-task`); the shipped `legibility.yaml` has
+  `agent_transcript_roots: [data/orchestrator/agent-transcripts]` set (census reads the fleet
+  corpus with no operator flip); a `.jsonl.gz` under the archive root is read as transcript; the
+  empty-list code path is byte-identical to today. **Consumer:** confusion-reduction census/digest.
   **Depends:** α. ∥ β, δ.
 - **δ — Retention GC sweep** (`scripts/` + `orchestrator/config.py` `transcript_archive.retention_*`).
   **Signal:** with a low cap, oldest task dirs beyond the cap are removed and each removal + a
@@ -308,8 +317,10 @@ archive_root=...)` (session_id=None), best-effort + idempotent (a no-op when α 
 **Archive layout:** `data/orchestrator/agent-transcripts/<task_id>/<enc>/<session_id>.jsonl.gz`
 (+ `.../subagents/agent-*.jsonl.gz`). One dir per task; roles distinguished by session-id filename.
 
-**Mining root config (scripts/legibility, γ):** `legibility.yaml` gains
-`agent_transcript_roots: [<archive_root>]` (default empty → today's behaviour).
+**Mining root config (scripts/legibility, γ):** `legibility.yaml` is shipped with
+`agent_transcript_roots: [data/orchestrator/agent-transcripts]` **set** (the empty list is only
+the code default, for parity/tests) — so the census reads the fleet corpus as soon as archives
+exist, no operator flip.
 `enumerate_sessions(projects_roots: list[Path], cwd_prefixes, date)` iterates each root;
 `iter_project_dirs` accepts both the `~/.claude/projects/<enc>/*.jsonl` and archive
 `<task_id>/**/*.jsonl.gz` layouts; a `.gz` file is transparently gunzipped for the `cwd`/turn
@@ -333,7 +344,7 @@ transcript_archive:
 | E2 | Survives teardown | E1, then the worktree is removed via `cleanup_worktree` | the gz transcript still exists under `<archive_root>` after removal |
 | E3 | Backstop idempotent | a config dir with one already-archived and one un-archived transcript, then `cleanup_worktree` | the un-archived one is archived; the already-archived one is byte-unchanged (skipped by size/mtime) |
 | E4 | Credential-safe | a config dir containing `.credentials.json` + `projects/*/<sid>.jsonl` | archive contains only `*.jsonl.gz`; `.credentials.json` is absent anywhere under `<archive_root>` |
-| E5 | Mining enumerates the archive | an archived `<sid>.jsonl.gz` whose `cwd` is a `.worktrees/<id>` path, `agent_transcript_roots` set | `enumerate_sessions` yields it (is_member true); classified `orchestrated-task`; knob-unset → not yielded (parity with today) |
+| E5 | Mining enumerates the archive | an archived `<sid>.jsonl.gz` whose `cwd` is a `.worktrees/<id>` path; shipped `legibility.yaml` has `agent_transcript_roots` set to the archive dir | `enumerate_sessions` yields it (is_member true); classified `orchestrated-task`; the empty-list code default → not yielded (parity with today) |
 | E6 | Resumed session re-archives | a session archived, then its JSONL grows (resume) and `_invoke` finishes again | the archived gz reflects the grown transcript (last-write-wins), not the stale one |
 | E7 | Archive failure is soft + loud | archive root made unwritable during `_invoke` | the task still completes; a structured archival-failure fact is logged; the failure counter increments |
 | E8 | GC prunes by cap, loudly | archive with N > cap task dirs | GC removes oldest (N − cap) dirs; logs each removed dir + a summary count; default caps → no-op |
