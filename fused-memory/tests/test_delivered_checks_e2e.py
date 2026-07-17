@@ -49,9 +49,9 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 import yaml
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from orchestrator.config import OrchestratorConfig
-from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -69,17 +69,17 @@ from fused_memory.server.tools import create_mcp_server
 def test_cross_package_imports_resolve():
     """Prerequisite pre-1: fused_memory + orchestrator + escalation import
     together inside fused-memory's pytest env (pythonpath includes
-    ../orchestrator/src per fused-memory/pyproject.toml)."""
-    assert SqliteTaskBackend is not None
-    assert TaskmasterConfig is not None
-    assert TaskInterceptor is not None
-    assert TicketStore is not None
-    assert EventBuffer is not None
-    assert create_mcp_server is not None
-    assert EscalationQueue is not None
-    assert OrchestratorConfig is not None
-    assert EventType is not None
-    assert Harness is not None
+    ../orchestrator/src per fused-memory/pyproject.toml).
+
+    The module-level imports above already enforce this at collection
+    time — a broken pythonpath fails `pytest --collect-only`, not an
+    in-body assert on an already-imported symbol. This documents the
+    cross-package contract with a direct import round-trip per package.
+    """
+    import importlib
+
+    for module_name in ('fused_memory.server.tools', 'orchestrator.harness', 'escalation.queue'):
+        importlib.import_module(module_name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -376,141 +376,214 @@ def _l2_for(harness: Harness, task_id: str) -> list:
     )
 
 
+def _assert_summary_names_main_sha(summary: str, main_sha: str) -> None:
+    """Assert *summary* names a genuine prefix of *main_sha*.
+
+    ``Escalation`` (escalation/src/escalation/models.py) has no separate
+    structured sha field -- the sha is only ever embedded in the
+    human-readable ``summary``/``detail`` text, rendered by
+    ``orchestrator.scheduler._build_delivered_check_escalation`` as
+    ``main@{main_sha[:12]}``. Extracting whatever prefix follows ``main@``
+    and checking it against the FULL *main_sha* (rather than pre-slicing
+    the expected value to a hardcoded width) keeps this assertion correct
+    even if that formatter's prefix width ever changes.
+    """
+    match = re.search(r'main@([0-9a-f]+)\b', summary)
+    assert match is not None, f'expected a main@<sha> token in summary; got {summary!r}'
+    named_prefix = match.group(1)
+    assert main_sha.startswith(named_prefix), (
+        f'named sha prefix {named_prefix!r} is not a prefix of the current '
+        f'main sha {main_sha!r}; summary={summary!r}'
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TestHeadline — rows 1, 4, 5, 6, 3: stamp -> withhold -> escalate -> heal -> dispatch
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+async def _verify_row1_stamp(server, project_root: Path) -> tuple[str, str]:
+    """PRD row 1: commit_planning stamps the producer's real task_id into
+    the sidecar and copies the sidecar's mechanical delivered_check into
+    the producer's metadata.delivered_checks, visible via get_task.
+
+    Lives in its own top-level function (rather than inlined in the test
+    body) so a failure's traceback names this frame explicitly, keeping
+    the failure attributable to row 1 specifically — even though the
+    phase shares backend/git state with the phases that follow and so
+    cannot be split into an independent pytest item (see ``TestHeadline``
+    docstring). Returns ``(producer_id, dependent_id)`` for the later
+    phases.
+    """
+    _write_sidecar(
+        project_root,
+        prd_path=_PRD_PATH,
+        label=_PRODUCER_LABEL,
+        capability_name=_CAPABILITY_NAME,
+        pattern=_CAPABILITY_TOKEN,
+        paths=[_MARKER_REL_PATH],
+    )
+
+    producer_id, dependent_id = await _file_planning_batch(
+        server, project_root, prd_path=_PRD_PATH,
+    )
+
+    # --- row 1: commit_planning stamps the sidecar + copies delivered_checks ---
+    result = await _commit_planning(server, project_root, [producer_id, dependent_id])
+
+    expected_sidecar_rel = re.sub(r'\.md$', '', _PRD_PATH) + '.capability-manifest.yaml'
+    assert result['manifest_stamping'] == {
+        'path': expected_sidecar_rel,
+        'stamped': [_PRODUCER_LABEL],
+        'missing_labels': [],
+        'errors': [],
+    }
+
+    sidecar_path = project_root / expected_sidecar_rel
+    reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+    assert reloaded['tasks'][0]['task_id'] == int(producer_id)
+
+    producer_task = await _get_task(server, project_root, producer_id)
+    checks = producer_task['metadata']['delivered_checks']
+    assert len(checks) == 1
+    assert checks[0]['name'] == _CAPABILITY_NAME
+    assert checks[0]['kind'] == 'grep'
+    assert checks[0]['pattern'] == _CAPABILITY_TOKEN
+    assert checks[0]['expect'] == 'present'
+    assert checks[0]['paths'] == [_MARKER_REL_PATH]
+
+    # Status flip landed too (target_status defaults to 'pending').
+    assert producer_task['status'] == 'pending'
+    dependent_task = await _get_task(server, project_root, dependent_id)
+    assert dependent_task['status'] == 'pending'
+
+    return producer_id, dependent_id
+
+
+async def _verify_rows_4_5_withhold_escalate(
+    server, project_root: Path, producer_id: str, dependent_id: str,
+) -> tuple[Harness, Escalation]:
+    """PRD rows 4+5: scope-cut -> withhold -> grace-streak born-at-L2.
+
+    Scope-cut: flip the producer straight to 'done' via the product write
+    path while the capability token is still absent from main. A real
+    orchestrator Harness/Scheduler (delegating _mcp_session onto this
+    SAME live backend + a real EscalationQueue) then ticks: ticks 1..G-1
+    must withhold dispatch with no L2 filed yet; tick G must file exactly
+    one born-at-L2 escalation naming the failed check, the producer's dep
+    id, and the main SHA, and the dependent must be 'blocked'.
+
+    Lives in its own top-level function for the same traceback-
+    attribution reason as ``_verify_row1_stamp`` — a failure here is
+    unambiguously rows 4/5, never row 1 (already returned) or rows 6/3
+    (not yet reached). Returns ``(harness, esc)`` for the heal phase.
+    """
+    harness = _build_harness(
+        project_root, server, project_root / 'escalations',
+        grace_cycles=_GRACE_CYCLES,
+    )
+
+    await _flip_status(server, project_root, producer_id, 'done')
+
+    for tick in range(1, _GRACE_CYCLES):
+        result = await _run_tick(harness)
+        assert result is None, (
+            f'tick {tick}: dep-done-with-failing-check must withhold '
+            f'dispatch of the dependent; got {result!r}'
+        )
+        assert _l2_for(harness, dependent_id) == [], (
+            f'tick {tick}: no L2 escalation must exist before grace_cycles '
+            f'({_GRACE_CYCLES}) is reached'
+        )
+
+    # Tick G: born-at-L2 escalation fires naming the exact failed check;
+    # the dependent is not dispatched and is now blocked.
+    result = await _run_tick(harness)
+    assert result is None, (
+        f'tick {_GRACE_CYCLES}: dependent must still not be dispatched; '
+        f'got {result!r}'
+    )
+
+    escs = _l2_for(harness, dependent_id)
+    assert len(escs) == 1, (
+        f'expected exactly one pending born-at-L2 escalation for the '
+        f'dependent on tick {_GRACE_CYCLES}; got {escs!r}'
+    )
+    esc = escs[0]
+    assert 'DEP_CAPABILITY_NOT_DELIVERED' in esc.summary, esc.summary
+    assert _CAPABILITY_NAME in esc.summary, esc.summary
+    assert producer_id in esc.summary, esc.summary
+    main_sha = _run_git(project_root, 'rev-parse', 'main').stdout.strip()
+    _assert_summary_names_main_sha(esc.summary, main_sha)
+
+    dependent_after_block = await _get_task(server, project_root, dependent_id)
+    assert dependent_after_block['status'] == 'blocked'
+
+    return harness, esc
+
+
+async def _verify_rows_6_3_heal_dispatch(
+    server, project_root: Path, harness: Harness, dependent_id: str, esc: Escalation,
+) -> None:
+    """PRD rows 6+3: self-heal on capability land -> dispatch.
+
+    Commit a file containing the capability token to main (advancing the
+    SHA -- the stale-cache prune picks up the fix), then manually re-pend
+    the dependent via the product write path. The very next tick must
+    dispatch the dependent with ZERO further operator action beyond the
+    re-pend, and no NEW L2 escalation may be filed (the one from the
+    withhold/escalate phase stays as the sole pending record).
+
+    Lives in its own top-level function for the same traceback-
+    attribution reason as the earlier phases — a failure here is
+    unambiguously rows 6/3.
+    """
+    _commit_capability(project_root, _MARKER_REL_PATH, _CAPABILITY_TOKEN)
+
+    await _flip_status(server, project_root, dependent_id, 'pending')
+
+    result = await _run_tick(harness)
+    assert result == dependent_id, (
+        f'expected the dependent ({dependent_id!r}) to dispatch once the '
+        f'capability landed on main and it was re-pended; got {result!r}'
+    )
+
+    post_heal_escs = _l2_for(harness, dependent_id)
+    assert len(post_heal_escs) == 1 and post_heal_escs[0].id == esc.id, (
+        f'no NEW L2 escalation may be filed on the self-heal/dispatch tick; '
+        f'expected only the earlier escalation {esc.id!r} to remain, got '
+        f'{post_heal_escs!r}'
+    )
+
+
 class TestHeadline:
-    """The closed-loop headline scenario, built up incrementally across
-    steps 1/3/5 (each step appends more of the scenario to this same test
-    method — see plan.json step descriptions)."""
+    """The closed-loop headline scenario: rows 1, 4, 5, 6, 3 run as three
+    ordered phases against the SAME shared backend/git state (each
+    phase's side effects are the next phase's precondition — stamping
+    must precede withhold/escalate, which must precede heal/dispatch — so
+    they cannot be split into independent pytest items without losing the
+    closed-loop guarantee; see plan.json design_decisions).
+
+    Each phase lives in its own top-level function
+    (``_verify_row1_stamp`` / ``_verify_rows_4_5_withhold_escalate`` /
+    ``_verify_rows_6_3_heal_dispatch``, defined above) so a failure's
+    traceback names exactly which PRD row(s) were in flight, keeping a
+    late-phase regression attributable even though the phases run
+    in-process and share state (the original steps 1/3/5 this scenario
+    was built up across — see plan.json step descriptions — map 1:1 onto
+    these three functions).
+    """
 
     @pytest.mark.asyncio
     async def test_headline_stamp_withhold_escalate_heal_dispatch(self, backend_stack):
-        """Headline part A (step-1): row 1 — commit_planning stamps the
-        producer's real task_id into the sidecar and copies the sidecar's
-        mechanical delivered_check into the producer's
-        metadata.delivered_checks, visible via get_task."""
         server, _interceptor, project_root = backend_stack
 
-        _write_sidecar(
-            project_root,
-            prd_path=_PRD_PATH,
-            label=_PRODUCER_LABEL,
-            capability_name=_CAPABILITY_NAME,
-            pattern=_CAPABILITY_TOKEN,
-            paths=[_MARKER_REL_PATH],
+        producer_id, dependent_id = await _verify_row1_stamp(server, project_root)
+        harness, esc = await _verify_rows_4_5_withhold_escalate(
+            server, project_root, producer_id, dependent_id,
         )
-
-        producer_id, dependent_id = await _file_planning_batch(
-            server, project_root, prd_path=_PRD_PATH,
-        )
-
-        # --- row 1: commit_planning stamps the sidecar + copies delivered_checks ---
-        result = await _commit_planning(server, project_root, [producer_id, dependent_id])
-
-        expected_sidecar_rel = re.sub(r'\.md$', '', _PRD_PATH) + '.capability-manifest.yaml'
-        assert result['manifest_stamping'] == {
-            'path': expected_sidecar_rel,
-            'stamped': [_PRODUCER_LABEL],
-            'missing_labels': [],
-            'errors': [],
-        }
-
-        sidecar_path = project_root / expected_sidecar_rel
-        reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
-        assert reloaded['tasks'][0]['task_id'] == int(producer_id)
-
-        producer_task = await _get_task(server, project_root, producer_id)
-        checks = producer_task['metadata']['delivered_checks']
-        assert len(checks) == 1
-        assert checks[0]['name'] == _CAPABILITY_NAME
-        assert checks[0]['kind'] == 'grep'
-        assert checks[0]['pattern'] == _CAPABILITY_TOKEN
-        assert checks[0]['expect'] == 'present'
-        assert checks[0]['paths'] == [_MARKER_REL_PATH]
-
-        # Status flip landed too (target_status defaults to 'pending').
-        assert producer_task['status'] == 'pending'
-        dependent_task = await _get_task(server, project_root, dependent_id)
-        assert dependent_task['status'] == 'pending'
-
-        # --- Headline part B (step-3): rows 4+5 -----------------------------
-        # Scope-cut: flip the producer straight to 'done' via the product
-        # write path while the capability token is still absent from main.
-        # A real orchestrator Harness/Scheduler (delegating _mcp_session onto
-        # this SAME live backend + a real EscalationQueue) then ticks:
-        # ticks 1..G-1 must withhold dispatch with no L2 filed yet; tick G
-        # must file exactly one born-at-L2 escalation naming the failed
-        # check, the producer's dep id, and the main SHA, and the dependent
-        # must be 'blocked'.
-        harness = _build_harness(
-            project_root, server, project_root / 'escalations',
-            grace_cycles=_GRACE_CYCLES,
-        )
-
-        await _flip_status(server, project_root, producer_id, 'done')
-
-        for tick in range(1, _GRACE_CYCLES):
-            result = await _run_tick(harness)
-            assert result is None, (
-                f'tick {tick}: dep-done-with-failing-check must withhold '
-                f'dispatch of the dependent; got {result!r}'
-            )
-            assert _l2_for(harness, dependent_id) == [], (
-                f'tick {tick}: no L2 escalation must exist before grace_cycles '
-                f'({_GRACE_CYCLES}) is reached'
-            )
-
-        # Tick G: born-at-L2 escalation fires naming the exact failed check;
-        # the dependent is not dispatched and is now blocked.
-        result = await _run_tick(harness)
-        assert result is None, (
-            f'tick {_GRACE_CYCLES}: dependent must still not be dispatched; '
-            f'got {result!r}'
-        )
-
-        escs = _l2_for(harness, dependent_id)
-        assert len(escs) == 1, (
-            f'expected exactly one pending born-at-L2 escalation for the '
-            f'dependent on tick {_GRACE_CYCLES}; got {escs!r}'
-        )
-        esc = escs[0]
-        assert 'DEP_CAPABILITY_NOT_DELIVERED' in esc.summary, esc.summary
-        assert _CAPABILITY_NAME in esc.summary, esc.summary
-        assert producer_id in esc.summary, esc.summary
-        main_sha = _run_git(project_root, 'rev-parse', 'main').stdout.strip()
-        assert main_sha[:12] in esc.summary, (
-            f'expected main sha prefix {main_sha[:12]!r} in summary; '
-            f'got {esc.summary!r}'
-        )
-
-        dependent_after_block = await _get_task(server, project_root, dependent_id)
-        assert dependent_after_block['status'] == 'blocked'
-
-        # --- Headline part C (step-5): rows 6+3 -----------------------------
-        # Self-heal: commit a file containing the capability token to main
-        # (advancing the SHA -- the stale-cache prune picks up the fix), then
-        # manually re-pend the dependent via the product write path. The very
-        # next tick must dispatch the dependent with ZERO further operator
-        # action beyond the re-pend, and no NEW L2 escalation may be filed
-        # (the one from part B stays as the sole pending record).
-        _commit_capability(project_root, _MARKER_REL_PATH, _CAPABILITY_TOKEN)
-
-        await _flip_status(server, project_root, dependent_id, 'pending')
-
-        result = await _run_tick(harness)
-        assert result == dependent_id, (
-            f'expected the dependent ({dependent_id!r}) to dispatch once the '
-            f'capability landed on main and it was re-pended; got {result!r}'
-        )
-
-        post_heal_escs = _l2_for(harness, dependent_id)
-        assert len(post_heal_escs) == 1 and post_heal_escs[0].id == esc.id, (
-            f'no NEW L2 escalation may be filed on the self-heal/dispatch tick; '
-            f'expected only the part-B escalation {esc.id!r} to remain, got '
-            f'{post_heal_escs!r}'
+        await _verify_rows_6_3_heal_dispatch(
+            server, project_root, harness, dependent_id, esc,
         )
 
 
