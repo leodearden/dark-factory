@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -105,3 +107,41 @@ def compute_tripwire_overlap(
         if overlap:
             hits.append(TripwireHit(task_id=task_id, branch=branch, overlap_files=overlap))
     return hits
+
+
+async def emit_pipeline_landing_tripwire(
+    *,
+    project_root: Path,
+    oracle_cmd: list[str] | None,
+    escalation_queue: Any,
+    landing_sha: str,
+    landing_task_id: str,
+    landing_changed_files: list[str],
+    inflight: list[tuple[str, str]],
+    get_branch_diff: Callable[[str], Awaitable[list[str] | None]],
+    update_task: Callable[..., Awaitable[bool]],
+) -> None:
+    """Advisory pipeline-landing tripwire (PRD task δ, boundary rows 5-6).
+
+    If *landing_changed_files* trips the project-configured load-bearing
+    oracle (*oracle_cmd*), emit exactly ONE advisory info escalation naming
+    *landing_sha* and every in-flight task (from *inflight*, a list of
+    ``(task_id, branch)`` pairs — the just-landed task already excluded by
+    the caller) whose branch diff — fetched via *get_branch_diff* —
+    overlaps *landing_changed_files*, and attach a steward-visible note to
+    each such task's metadata via *update_task*.
+
+    Fully fail-open (I6): *oracle_cmd* absent → logged no-op; oracle
+    negative → no-op; zero overlapping in-flight tasks → no-op (nothing
+    actionable to report). Never raises.
+    """
+    if not oracle_cmd:
+        logger.debug('emit_pipeline_landing_tripwire: no oracle_cmd configured, no-op')
+        return
+    if not landing_changed_files:
+        return
+    load_bearing = await _run_load_bearing_oracle(
+        project_root, oracle_cmd, landing_changed_files,
+    )
+    if not load_bearing:
+        return
