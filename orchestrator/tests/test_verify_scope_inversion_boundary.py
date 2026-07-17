@@ -107,6 +107,7 @@ import pytest
 from _serial_merge_worker import MergeWorker
 from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
 from test_train_integration import _SpyEventStore, build_group_merge_request, make_stacked_member
+from test_verify import _real_worktree_reader
 from test_verify_scope_kappa import (
     _FLEET_LINT_COMMAND,
     _FLEET_TEST_COMMAND,
@@ -119,7 +120,7 @@ from test_verify_scope_lambda import _two_module_registry
 from test_workflow_verify_infra_resume import _infra_category_result
 from test_workflow_verify_infra_resume import _make as _make_workflow
 
-from orchestrator import verify
+from orchestrator import verify, verify_plan
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (
@@ -130,11 +131,13 @@ from orchestrator.merge_queue import (
 )
 from orchestrator.verify import (
     VerifyResult,
+    _mc_attr_for_run_or_none,
     run_scoped_verification,
     seed_main_baseline,
     verify_failure_is_preexisting_on_main,
 )
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
+from orchestrator.verify_cmd import render
 from orchestrator.workflow import WorkflowOutcome
 
 # ---------------------------------------------------------------------------
@@ -1254,11 +1257,72 @@ class TestRow9FallbackNarrowingNeverWholeRepoChain:
 # ---------------------------------------------------------------------------
 
 
-# NOTE (RED, step-19): _row10_mixed_diff and _row10_expected_command (the
-# row-10 mixed-diff fixture and plan-vs-executed comparison helper) are
-# intentionally NOT YET DEFINED here — the test below references them and
-# fails with a NameError until step-20 (GREEN) defines them, mirroring the
-# RED-via-not-yet-defined-helper split used by rows 8/9 above.
+# modA's touched file is a collectable TEST file — pytest is FILE_SCOPED to
+# it at BOTH roles (the collectable-tests branch of
+# verify_plan._derive_module_runs never forks on role). modB's touched file
+# is a plain SOURCE file with no collectable test alongside it, which DOES
+# fork by role: FULL_SUITE at role='task' (the R3 owning-module pytest
+# floor) vs SKIPPED at role='merge' (R4 — the legacy shape).
+ROW10_MODA_TEST_PATH: str = 'moda/tests/test_thing.py'
+ROW10_MODA_TEST_CONTENT: str = 'def test_thing():\n    pass\n'
+ROW10_MODB_SOURCE_PATH: str = 'modb/helpers.py'
+ROW10_MODB_SOURCE_CONTENT: str = 'def helper():\n    return 1\n'
+
+
+def _row10_mixed_diff(
+    tmp_path: Path,
+) -> tuple[ModuleConfig, ModuleConfig, OrchestratorConfig, list[str]]:
+    """Write row 10's mixed two-module diff to *tmp_path* and return
+    ``(mod_a, mod_b, config, task_files)``.
+
+    Reuses ``_two_module_registry(breadth='scoped')`` — the shipped-default
+    breadth — so role='merge' never widens to merge+full's
+    FULL_SUITE-everything gate (row-1/8 territory): that widening would put
+    BOTH modules on FULL_SUITE regardless of which files were touched,
+    masking the very role-fork this row exists to pin (see module-level
+    constants above for which file forks and which doesn't).
+    """
+    mod_a, mod_b, config = _two_module_registry(tmp_path, breadth='scoped')
+
+    test_full = tmp_path / ROW10_MODA_TEST_PATH
+    test_full.parent.mkdir(parents=True, exist_ok=True)
+    test_full.write_text(ROW10_MODA_TEST_CONTENT)
+
+    source_full = tmp_path / ROW10_MODB_SOURCE_PATH
+    source_full.parent.mkdir(parents=True, exist_ok=True)
+    source_full.write_text(ROW10_MODB_SOURCE_CONTENT)
+
+    task_files = [ROW10_MODA_TEST_PATH, ROW10_MODB_SOURCE_PATH]
+    return mod_a, mod_b, config, task_files
+
+
+def _row10_expected_command(
+    mc: ModuleConfig, run: verify_plan.PlannedRun,
+) -> str | None:
+    """The command *mc* is expected to execute for *run* — independently
+    derived from the plan, never by delegating to
+    ``verify._executed_module_configs_from_plan`` itself (that bridge is
+    what this row pins, not a helper to lean on).
+
+    Mirrors the two rendering rules that bridge's own docstring documents:
+    a SKIPPED run (``run.cmd is None``) means that check never runs at all
+    (``None``); a FULL_SUITE run reuses *mc*'s OWN verbatim command
+    (preserving e.g. a ``--directory`` flag — ``render(run.cmd)`` would
+    instead normalise it to a leading ``cd``, which is argv-equivalent but
+    NOT byte-identical, per ``verify_cmd.render``'s own docstring — so
+    FULL_SUITE must compare against *mc*'s field directly, never a
+    re-rendering of ``run.cmd``); every other non-SKIPPED scope_kind
+    reachable here (FILE_SCOPED — TRIVIAL never carries a real *mc*) renders
+    ``run.cmd`` via ``orchestrator.verify_cmd.render``.
+    """
+    if run.cmd is None:
+        return None
+    attr = _mc_attr_for_run_or_none(run)
+    if attr is None:
+        return None
+    if run.scope_kind is verify_plan.ScopeKind.FULL_SUITE:
+        return getattr(mc, attr)
+    return render(run.cmd)
 
 
 class TestRow10PlanAuthorityBothRoles:
