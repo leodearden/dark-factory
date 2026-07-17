@@ -37,6 +37,11 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.landing_evidence import (
+    LandingEvidenceVerdict,
+    format_unattributed_landing_detail,
+    validate_landing_evidence,
+)
 from orchestrator.merge_disposition import (
     MergeFailureDisposition,
     SkewEvidence,
@@ -9069,11 +9074,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         For each member task still in 'merge-deferred' status (per req.status_check):
           - If the member's branch is already an ancestor of main (double-landing
-            guard: a partner's merge brought it in), mark it done with
-            found_on_main provenance via req.redrive_member(mid, True, sha).
-          - Otherwise flip it to 'pending' via req.redrive_member(mid, False, None)
-            so the scheduler re-dispatches a fresh solo-merge workflow that owns
-            the merge-deferred→done transition.
+            guard: a partner's merge brought it in), delegate to the shared
+            :func:`~orchestrator.landing_evidence.validate_landing_evidence`
+            helper (DISCOVERY mode, task 2678) to discover and attribute the
+            citation commit and confirm its effect is still present at main
+            HEAD. An ACCEPTED verdict marks the member done with
+            found_on_main provenance via
+            ``req.redrive_member(mid, True, verdict.evidence_sha)``. A
+            REJECTED verdict (no citation, a lineage mismatch, or the
+            task-1175 reverted-merge shape) is no longer silently anchored
+            on ``main_sha`` — the retired ``resolve_branch_sha(...) or
+            main_sha`` fallback fabricated provenance whenever
+            ``resolve_branch_sha`` came up empty. It now files a
+            dedup-guarded 'provenance_unattributed' escalation via
+            :meth:`_file_unattributed_landing_escalation` and flips the
+            member to pending (``req.redrive_member(mid, False, None)``) so
+            a fresh solo-merge re-attributes it.
+          - Otherwise (branch not an ancestor of main) flip it to 'pending'
+            via req.redrive_member(mid, False, None) so the scheduler
+            re-dispatches a fresh solo-merge workflow that owns the
+            merge-deferred→done transition.
 
         Members not in 'merge-deferred' (e.g. raced to 'in-progress' by a sibling)
         are left alone — the live workflow owns their done-transition.
@@ -9102,13 +9122,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     branch, self._git_ops.config.main_branch,
                 )
                 if on_main:
-                    sha = await self._git_ops.resolve_branch_sha(branch) or main_sha
-                    await req.redrive_member(mid, True, sha)
-                    logger.info(
-                        'Coalesce train %s: member %s already on main — '
-                        'marked done (found_on_main, sha=%s)',
-                        req.train_id, mid, sha,
+                    branch_tip = await self._git_ops.resolve_branch_sha(branch)
+                    verdict = await validate_landing_evidence(
+                        self._git_ops, mid, branch,
+                        branch_tip_sha=branch_tip,
+                        pattern_template=self._git_ops.config.commit_citation_pattern,
                     )
+                    if verdict.accepted:
+                        await req.redrive_member(mid, True, verdict.evidence_sha)
+                        logger.info(
+                            'Coalesce train %s: member %s already on main — '
+                            'marked done (found_on_main, sha=%s)',
+                            req.train_id, mid, verdict.evidence_sha,
+                        )
+                    else:
+                        self._file_unattributed_landing_escalation(mid, branch, verdict)
+                        await req.redrive_member(mid, False, None)
+                        logger.info(
+                            'Coalesce train %s: member %s on main but landing '
+                            'evidence unattributable (reason=%s) — escalated, '
+                            'flipped to pending for solo-merge re-dispatch',
+                            req.train_id, mid, verdict.reason,
+                        )
                 else:
                     await req.redrive_member(mid, False, None)
                     logger.info(
@@ -9122,6 +9157,60 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     'continuing with remaining members',
                     req.train_id, mid,
                 )
+
+    def _file_unattributed_landing_escalation(
+        self, task_id: str, branch: str, verdict: LandingEvidenceVerdict,
+    ) -> None:
+        """Best-effort, dedup-guarded L1 escalation for unattributable
+        coalesce re-drive landing evidence (task 2678, INV-5).
+
+        Mirrors ``Harness._file_unattributed_landing_escalation`` exactly
+        (shared ``format_unattributed_landing_detail`` rendering, same
+        category/dedup shape) — filed when
+        :meth:`_redrive_coalesce_members` finds a member's branch already
+        an ancestor of main but :func:`validate_landing_evidence` rejects
+        the landing evidence (no citation, a lineage mismatch, or an
+        effect-absent reverted merge). Non-status-blocking: the member is
+        simply flipped to pending by the caller, not held in any blocked
+        state, and re-evaluated by its next solo-merge dispatch.
+
+        Best-effort (a no-op when ``_escalation_queue`` is None, e.g. bare-
+        worker unit tests) and deduped via ``has_open_l1`` so repeated
+        coalesce derails re-observing the same unattributable evidence
+        don't stack duplicate L1s.
+        """
+        if not self._escalation_queue:
+            return
+        try:
+            if self._escalation_queue.has_open_l1(task_id):
+                return
+            from escalation.models import Escalation  # noqa: PLC0415
+            summary, detail = format_unattributed_landing_detail(
+                task_id, branch, verdict,
+            )
+            esc = Escalation(
+                id=self._escalation_queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='orchestrator-merge-worker',
+                severity='blocking',
+                category='provenance_unattributed',
+                summary=summary,
+                detail=detail,
+                suggested_action='investigate_unattributed_landing_evidence',
+                level=1,
+            )
+            self._escalation_queue.submit(esc)
+            logger.warning(
+                'Filed provenance_unattributed escalation %s for coalesce '
+                'member %s (branch %s, reason %s)',
+                esc.id, task_id, branch, verdict.reason,
+            )
+        except Exception:
+            logger.warning(
+                'Failed to file provenance_unattributed escalation for '
+                'coalesce member %s (branch %s) — continuing without it',
+                task_id, branch, exc_info=True,
+            )
 
     def _default_coalesce_exclusion_reason(self, req: MergeRequest) -> str | None:
         """Built-in merge-ready predicate (δ/1720 confidence gate).

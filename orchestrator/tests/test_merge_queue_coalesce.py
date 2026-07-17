@@ -2384,10 +2384,29 @@ class TestCoalesceRedriveEndToEnd:
         )
 
         # ── git setup ───────────────────────────────────────────────────────
-        # 'e2e-on': branch at main HEAD → is_ancestor(task/e2e-on, main) = True
-        await _run(['git', 'branch', 'task/e2e-on', 'main'], cwd=git_ops.project_root)
+        # 'e2e-on': landed via a real no-ff merge onto main (simulates a
+        # partner coalesce member's merge already having brought this task's
+        # work in — the double-landing guard's precondition). task 2678's
+        # validate_landing_evidence requires an actual attributable citation
+        # commit, so a bare `git branch task/e2e-on main` pointer (no
+        # distinguishing commit) no longer qualifies as a genuine landing.
+        rc, _, err = await _run(['git', 'checkout', '-b', 'task/e2e-on'], cwd=git_ops.project_root)
+        assert rc == 0, f'checkout task/e2e-on failed: {err}'
+        (git_ops.project_root / 'e2e_on.py').write_text('on = 1\n')
+        await _run(['git', 'add', 'e2e_on.py'], cwd=git_ops.project_root)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'impl(e2e-on): add on file'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'e2e-on commit failed: {err}'
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_ops.project_root)
+        assert rc == 0, f'checkout main failed: {err}'
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'task/e2e-on', '-m', 'Merge task/e2e-on into main'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'merge task/e2e-on failed: {err}'
 
-        # 'e2e-off': branch with a new commit → is_ancestor = False
+        # 'e2e-off': branch with a new commit, never merged → is_ancestor = False
         await _make_branch_with_file(git_ops, 'e2e-off', 'e2e_off.py', 'off = 1\n')
 
         # ── scheduler setup ─────────────────────────────────────────────────
