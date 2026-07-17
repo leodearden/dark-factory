@@ -3614,26 +3614,40 @@ Output JSON matching the schema. Every task must appear in the output.
 
             on_main = report.branch_state.kind == BranchStateKind.ON_MAIN
 
-            # FIX 1 effect-present refinement (task 2500): a cited ON_MAIN
-            # commit stays an ancestor of main forever — ancestry is
-            # immutable history — even after a LATER commit on main
-            # reverts exactly the paths it touched (the found_on_main
-            # post-hoc-revert blind spot; reify esc-5179-3/esc-5181-2).
-            # Sibling to the degenerate-branch refinement above: same
-            # downgrade shape, flip only on positive evidence. Journal
-            # (MergeProvenance advanced_sha) and merge-marker shas are
-            # always merge commits — commit_effect_present_in_main returns
-            # True unconditionally for those (empty diff-tree), so only
-            # the git-fallback branch-tip work-commit ON_MAIN case pays
-            # for a real check.
-            if on_main and report.branch_state.sha and not await (
-                self.git_ops.commit_effect_present_in_main(report.branch_state.sha)
-            ):
+            # FIX 1' effect-present refinement (task 2500/2678): a cited
+            # ON_MAIN commit or merge marker stays an ancestor of main
+            # forever — ancestry is immutable history — even after a LATER
+            # commit on main reverts exactly the paths it touched (the
+            # found_on_main post-hoc-revert blind spot; reify
+            # esc-5179-3/esc-5181-2). Sibling to the degenerate-branch
+            # refinement above: same downgrade shape, flip only on positive
+            # evidence. Delegates to the shared validate_landing_evidence
+            # helper (task 2678, INV-5) in CANDIDATE mode, applied
+            # UNIFORMLY to BOTH the on_main and marker sub-cases —
+            # attribution is already established by recovery_for's
+            # ground-truth report, so only the effect-present guard
+            # remains. Previously this check was gated on ``on_main`` only,
+            # so a branch-deleted merge marker whose effect had been
+            # reverted at current main HEAD skipped it entirely and was
+            # stamped done unconditionally (the task-1175 clobber,
+            # reproduced inside this sweep). No escalation on reject here
+            # (unlike the dispatch-gate marker/content-equivalence paths):
+            # the evidence is already ground-truth-attributed by
+            # recovery_for, and the existing revert-to-pending / leave-
+            # blocked recovery self-heals without a human (design decision,
+            # task 2678).
+            verdict = await validate_landing_evidence(
+                self.git_ops, tid, branch,
+                branch_tip_sha=None,
+                candidate_sha=report.branch_state.sha,
+            )
+            if not verdict.accepted:
                 logger.warning(
-                    'Reconcile: task %s ON_MAIN evidence sha %s is an ancestor '
+                    'Reconcile: task %s %s evidence sha %s is an ancestor '
                     'of main but its effect is not present at current HEAD '
                     '(post-hoc revert) — not marking done',
-                    tid, report.branch_state.sha,
+                    tid, 'ON_MAIN' if on_main else 'merge-marker',
+                    report.branch_state.sha,
                 )
                 if status == 'in-progress':
                     return await self._revert_in_progress_if_no_live_claimant(
