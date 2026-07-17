@@ -104,6 +104,40 @@ class TestServerConfigGracefulShutdownTimeout:
         assert config.graceful_shutdown_timeout > 0
 
 
+class TestServerConfigGracefulShutdownTimeoutBudgetValidation:
+    """Fail-fast guard for the D1 shutdown-budget invariant on operator overrides.
+
+    The default (10) satisfies graceful_shutdown_timeout + _FORCE_EXIT_BUDGET (75)
+    < _SYSTEMD_TIMEOUT_STOP_SECS (90) — see TestShutdownBudgetArithmetic in
+    test_server_shutdown.py. That test only pins the *default*; ServerConfig is
+    operator-settable, so an override that breaks the invariant must fail loudly
+    at config load instead of silently at systemd SIGKILL time.
+    """
+
+    def test_rejects_non_positive_timeout(self):
+        with pytest.raises(ValidationError):
+            ServerConfig(graceful_shutdown_timeout=0)
+
+    def test_rejects_negative_timeout(self):
+        with pytest.raises(ValidationError):
+            ServerConfig(graceful_shutdown_timeout=-1)
+
+    def test_rejects_timeout_that_breaks_force_exit_budget_invariant(self):
+        # 30 + 75 (_FORCE_EXIT_BUDGET) = 105 >= 90 (_SYSTEMD_TIMEOUT_STOP_SECS).
+        with pytest.raises(ValidationError):
+            ServerConfig(graceful_shutdown_timeout=30)
+
+    def test_rejects_dead_heat_timeout(self):
+        # 15 + 75 = 90 == _SYSTEMD_TIMEOUT_STOP_SECS: zero margin, not "< 90".
+        with pytest.raises(ValidationError):
+            ServerConfig(graceful_shutdown_timeout=15)
+
+    def test_accepts_timeout_just_inside_the_budget(self):
+        # 14 + 75 = 89 < 90: the largest value that still satisfies the invariant.
+        config = ServerConfig(graceful_shutdown_timeout=14)
+        assert config.graceful_shutdown_timeout == 14
+
+
 class TestLLMConfigProvider:
     """Tests for LLMConfig.provider Literal validation."""
 

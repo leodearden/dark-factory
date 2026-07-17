@@ -75,6 +75,16 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
 
 # --- Server ---
 
+# Mirrors fused_memory.server.main._FORCE_EXIT_BUDGET and
+# _SYSTEMD_TIMEOUT_STOP_SECS (survey finding D1). Duplicated here as literals
+# rather than imported: main.py imports FusedMemoryConfig from this module, so
+# importing main.py here would be circular. Parity with main.py's constants is
+# enforced by TestShutdownBudgetArithmetic::test_schema_mirror_constants_match_main
+# in tests/test_server_shutdown.py — update both sides together.
+_MIRROR_FORCE_EXIT_BUDGET = 75.0
+_MIRROR_SYSTEMD_TIMEOUT_STOP_SECS = 90.0
+
+
 class ServerConfig(BaseModel):
     """Server configuration."""
 
@@ -120,6 +130,39 @@ class ServerConfig(BaseModel):
             raise ValueError(
                 f'recon_report_port ({self.recon_report_port}) must differ from '
                 f'port ({self.port}): both uvicorn servers cannot bind to the same port.'
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _validate_graceful_shutdown_timeout_budget(self) -> 'ServerConfig':
+        """Fail fast on a graceful_shutdown_timeout that breaks the D1 shutdown
+        budget invariant, instead of silently discovering it at systemd SIGKILL
+        time.
+
+        The bounded uvicorn graceful-shutdown wait runs BEFORE
+        _shutdown_with_watchdog arms the force-exit timer, so worst-case
+        shutdown is approximately graceful_shutdown_timeout + _FORCE_EXIT_BUDGET.
+        That must stay strictly under systemd's TimeoutStopSec so the
+        in-process force-exit watchdog provably fires before systemd SIGKILLs
+        the cgroup (preserving exit-code control: exit 0 for operator stop).
+        The default (10) satisfies this with 5s of margin; an operator
+        override is otherwise unconstrained and could silently violate it.
+        """
+        if self.graceful_shutdown_timeout <= 0:
+            raise ValueError(
+                f'graceful_shutdown_timeout ({self.graceful_shutdown_timeout}) must '
+                'be a positive number of seconds.'
+            )
+        budget = self.graceful_shutdown_timeout + _MIRROR_FORCE_EXIT_BUDGET
+        if budget >= _MIRROR_SYSTEMD_TIMEOUT_STOP_SECS:
+            raise ValueError(
+                f'graceful_shutdown_timeout ({self.graceful_shutdown_timeout}) + '
+                f'force-exit budget ({_MIRROR_FORCE_EXIT_BUDGET}s) = {budget}s, which '
+                f'is not less than systemd TimeoutStopSec '
+                f'({_MIRROR_SYSTEMD_TIMEOUT_STOP_SECS}s). systemd would SIGKILL the '
+                'cgroup before the in-process force-exit watchdog fires, losing '
+                'exit-code control. Lower graceful_shutdown_timeout so the sum stays '
+                'under the systemd timeout.'
             )
         return self
 
