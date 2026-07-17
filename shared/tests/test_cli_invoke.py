@@ -1220,6 +1220,23 @@ class TestEnvOverrides:
 class TestSpawnEnv:
     """Verify spawn_env (CLAUDE_SPAWN_*) is merged into the subprocess env."""
 
+    @pytest.fixture(autouse=True)
+    def _hermetic_spawn_env(self, monkeypatch):
+        """Strip any ambient CLAUDE_SPAWN_* vars before each test.
+
+        invoke_claude_agent seeds the child env from os.environ, so this
+        class's "no CLAUDE_SPAWN_* leaks" assertions only hold in a clean
+        ambient environment. That never holds when the suite is run from
+        inside an orchestrator-spawned agent's own shell (which exports
+        CLAUDE_SPAWN_ROLE/PROJECT/PARENT_ID/TASK_ID for the agent it drives),
+        as opposed to a clean CI/dev shell. Delete them here so the class is
+        hermetic regardless of who runs it; monkeypatch restores them after.
+        Tests that need specific CLAUDE_SPAWN_* values set their own via
+        spawn_env or patch.dict, which run after this fixture.
+        """
+        for key in [k for k in os.environ if k.startswith('CLAUDE_SPAWN_')]:
+            monkeypatch.delenv(key, raising=False)
+
     async def test_spawn_env_merged_into_subprocess_env(self, tmp_path):
         """spawn_env keys appear verbatim in the env dict passed to create_subprocess_exec."""
         captured_kwargs = {}
