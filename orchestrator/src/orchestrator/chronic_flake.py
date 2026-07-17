@@ -43,7 +43,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from shared.safe_io import load_json_or_warn
 from shared.task_statuses import TERMINAL
@@ -520,3 +520,116 @@ async def maybe_file_chronic_flake_tasks(
             'chronic_flake: maybe_file_chronic_flake_tasks failed unexpectedly', exc_info=True,
         )
         return []
+
+
+# ---------------------------------------------------------------------------
+# SchedulerChronicFlakeTaskClient: concrete adapter over dispatch_tool
+# (step-15/step-16)
+# ---------------------------------------------------------------------------
+
+
+def _unwrap_dispatch_envelope(result: object) -> dict:
+    """Best-effort unwrap of a ``dispatch_tool`` response down to the
+    underlying tool's own returned dict, tolerating whichever transport
+    shape it happens to hand back.
+
+    Generalises ``Harness._extract_task_id``'s envelope normalisation
+    (``{'task_id': ...}`` direct, ``{'structuredContent': {...}}`` /
+    ``{'result': {...}}`` nested, or a ``content`` list of text blocks
+    carrying JSON) so both id-extraction (:func:`extract_task_id`) and
+    results-list extraction (search_tasks) share one seam. Returns ``{}``
+    for a non-dict *result* or when no known shape unwraps.
+    """
+    if not isinstance(result, dict):
+        return {}
+    for key in ('structuredContent', 'result'):
+        inner = result.get(key)
+        if isinstance(inner, dict):
+            return inner
+    content = result.get('content')
+    if isinstance(content, list):
+        for chunk in content:
+            if isinstance(chunk, dict) and chunk.get('type') == 'text':
+                try:
+                    parsed = json.loads(str(chunk.get('text') or ''))
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(parsed, dict):
+                    return parsed
+    return result
+
+
+def extract_task_id(result: object) -> str:
+    """Best-effort extraction of a task/ticket id out of a
+    ``dispatch_tool('submit_task', ...)`` response envelope.
+
+    Self-contained (no ``harness``/``scheduler`` import — avoids a
+    workflow<->harness import cycle) so both
+    :class:`SchedulerChronicFlakeTaskClient` and any future adapter can
+    share it. Handles the direct ``{'task_id': ...}`` shape (e.g.
+    planning-mode submissions) AND ``{'ticket': ...}`` — ``submit_task``'s
+    actual two-phase response, ``{"ticket": "tkt_<id>"}`` — plus the
+    ``structuredContent``/``content``-text-block nested shapes via
+    :func:`_unwrap_dispatch_envelope`. Never raises; an
+    unrecognised/unparseable envelope returns ``''``. This id is
+    **log-only** (see the module docstring's dedup-layer note) — never
+    relied on for correctness.
+    """
+    envelope = _unwrap_dispatch_envelope(result)
+    for key in ('task_id', 'ticket'):
+        if envelope.get(key):
+            return str(envelope[key])
+    return ''
+
+
+def _extract_results_list(result: object) -> list[dict]:
+    """Best-effort extraction of a ``search_tasks`` response's ``results``
+    list from a ``dispatch_tool`` envelope (see
+    :func:`_unwrap_dispatch_envelope`). Non-dict results within the list,
+    or the absence of a ``results`` list altogether, degrade to ``[]``
+    rather than raising."""
+    envelope = _unwrap_dispatch_envelope(result)
+    results = envelope.get('results')
+    if not isinstance(results, list):
+        return []
+    return [entry for entry in results if isinstance(entry, dict)]
+
+
+# Per-call dispatch_tool timeout for submit_task — matches
+# harness._OfflineLaneTaskClient.submit_fix_task's precedent.
+_SUBMIT_TASK_TIMEOUT_SECS = 30
+
+
+class SchedulerChronicFlakeTaskClient:
+    """Concrete :class:`ChronicFlakeTaskClient` adapter over a duck-typed
+    scheduler exposing ``dispatch_tool`` (the ``SchedulerFacade`` surface).
+
+    Self-contained here (not in ``harness.py``) so this module never talks
+    to the fused-memory MCP directly and avoids a workflow<->harness import
+    cycle — mirrors ``harness._OfflineLaneTaskClient``'s scope boundary,
+    just re-derived locally rather than imported.
+    """
+
+    def __init__(self, scheduler: Any, project_root: str | Path) -> None:
+        self._scheduler = scheduler
+        self._project_root = str(project_root)
+
+    async def submit_task(self, arguments: dict) -> str:
+        """Submit *arguments* (see
+        :func:`build_chronic_flake_fix_task_arguments`) via
+        ``dispatch_tool('submit_task', ...)`` and return a best-effort id
+        (log-only — submit is two-phase server-side)."""
+        result = await self._scheduler.dispatch_tool(
+            'submit_task', arguments, timeout=_SUBMIT_TASK_TIMEOUT_SECS,
+        )
+        return extract_task_id(result)
+
+    async def search_tasks(self, query: str) -> list[dict]:
+        """Semantic search over already-filed tasks via
+        ``dispatch_tool('search_tasks', ...)``; returns the parsed
+        ``results`` list (each entry carrying at least ``title``/``status``),
+        or ``[]`` for a malformed/unrecognised response envelope."""
+        result = await self._scheduler.dispatch_tool(
+            'search_tasks', {'project_root': self._project_root, 'query': query},
+        )
+        return _extract_results_list(result)
