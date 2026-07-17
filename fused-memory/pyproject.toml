@@ -28,9 +28,10 @@ dark-factory-shared = { workspace = true }
 escalation = { workspace = true }
 
 [tool.pytest.ini_options]
+markers = ["integration: live tests requiring real external services/credentials (e.g. OpenAI API / network egress); deselect: -m 'not integration'"]
 pythonpath = ["src", "../orchestrator/src"]
 asyncio_mode = "strict"
-addopts = "-n auto --dist loadgroup"
+addopts = "-n auto --dist loadgroup -m 'not integration'"
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
 # (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns).
 # Slow tests opt out with @pytest.mark.timeout(N).
