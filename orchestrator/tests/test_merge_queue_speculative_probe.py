@@ -40,7 +40,7 @@ import collections
 import math
 from pathlib import Path
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -53,10 +53,12 @@ from orchestrator.config import (
 from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
+    InflightVerifyResult,
     MergeRequest,
     RealMergeItem,
     SpeculativeMergeWorker,
 )
+from orchestrator.verify_runner import HostLease
 
 # ---------------------------------------------------------------------------
 # step-1 RED / step-2 GREEN: SpeculationProbeConfig
@@ -551,7 +553,9 @@ class TestAvailableBuiltDepth:
 # ---------------------------------------------------------------------------
 
 
-def _make_frozen_entry(merge_commit: str) -> InflightEntry:
+def _make_frozen_entry(
+    merge_commit: str, *, base_sha: str = 'aabbccdd00000000aaaa',
+) -> InflightEntry:
     """Build a frozen InflightEntry wrapping a REAL RealMergeItem with a
     known merge_commit.
 
@@ -560,12 +564,17 @@ def _make_frozen_entry(merge_commit: str) -> InflightEntry:
     above), ``_probe_verify_placement()``'s depth-d tip resolution needs a
     real commit string to resolve and return, so this builds a minimally
     real RealMergeItem instead of an opaque sentinel.
+
+    *base_sha* defaults to a fixed constant (sufficient when callers only
+    care about the entry's merge_commit / count); pass an explicit value to
+    form a properly CHAINED sequence of entries for
+    check_frozen_prefix_invariant()-based tests.
     """
     item = RealMergeItem(
         request=MagicMock(),
         merge_result=MagicMock(merge_commit=merge_commit),
         merge_wt=Path('_merge-x'),
-        base_sha='aabbccdd00000000aaaa',
+        base_sha=base_sha,
         speculative=True,
     )
     return InflightEntry(
@@ -726,3 +735,237 @@ class TestProbeVerifyPlacement:
         result = worker._probe_verify_placement(on_item)
         assert result is not None
         assert result.depth == 2
+
+
+# ---------------------------------------------------------------------------
+# step-15 RED / step-16 GREEN: _dispatch_item integration
+# ---------------------------------------------------------------------------
+
+
+def _fake_local_allocator() -> MagicMock:
+    """A MagicMock HostAllocator stub with a free local slot and a patched
+    ``acquire`` returning a fake local HostLease directly -- bypasses the
+    real LocalRunner factory closure entirely (merge_wt realness is
+    irrelevant to these wiring tests).
+
+    Copied from test_merge_queue_verify_base_invariant.py's
+    ``_fake_local_allocator`` (per-file duplication convention).
+    """
+    allocator = MagicMock()
+    allocator.free_host_count.return_value = 1
+    allocator.acquire = AsyncMock(
+        return_value=HostLease(name='local', runner=MagicMock(), is_local=True),
+    )
+    return allocator
+
+
+def _make_dispatch_ready_item(
+    *,
+    config: OrchestratorConfig,
+    merge_wt: Path,
+    merge_commit: str,
+    base_sha: str = 'item-own-natural-base',
+) -> RealMergeItem:
+    """Build a dispatch-ready RealMergeItem with a REAL result Future.
+
+    Unlike ``_make_probe_item``'s bare ``MagicMock`` result,
+    ``_dispatch_item``'s ``_request_abandoned()`` guard calls
+    ``req.result.cancelled()`` -- a MagicMock call is always truthy, which
+    would incorrectly short-circuit dispatch down the pre-dispatch-abandon
+    path -- so this needs a genuine (never-cancelled) asyncio.Future.
+    """
+    req = MergeRequest(
+        task_id='t-dispatch', branch='task/t-dispatch', worktree=merge_wt,
+        pre_rebased=False, task_files=None, module_configs=[], config=config,
+        result=asyncio.get_running_loop().create_future(),
+    )
+    return RealMergeItem(
+        request=req,
+        merge_result=MagicMock(merge_commit=merge_commit),
+        merge_wt=merge_wt,
+        base_sha=base_sha,
+        speculative=True,
+    )
+
+
+@pytest.mark.asyncio
+class TestDispatchItemProbeWiring:
+    """_dispatch_item's depth/probe_base computation (task 2359 step-16) --
+    proof via a stand-in ``_run_inflight_verify`` capturing its kwargs
+    (mirrors test_merge_queue_verify_base_invariant.py's
+    TestDispatchRefreshesLastKnownMainSha harness style: a fake local
+    HostAllocator + a fully-replaced ``_run_inflight_verify`` -- no real
+    verify/runner/event-store machinery needed since this proves ONLY the
+    ``_dispatch_item`` -> ``_run_inflight_verify`` call-site wiring; task
+    2340's own tests already exhaustively cover depth's forwarding from
+    ``_run_inflight_verify`` through to the emitted ``merge_verify`` event).
+
+    RED until step-16 GREEN wires ``_probe_verify_placement()`` into
+    ``_dispatch_item`` and adds the ``probe_base`` param to
+    ``_run_inflight_verify``.
+    """
+
+    async def test_default_config_byte_identical(self, tmp_path: Path) -> None:
+        """probe_fraction=0.0 (default) -> depth == _verify_frontier_depth()
+        (the unchanged pre-task-2359 value) and probe_base is None."""
+        worker = _make_bare_worker()
+        worker._host_allocator = _fake_local_allocator()
+        worker._frozen_inflight_entries = lambda: [_make_frozen_entry('commit-x')]
+
+        captured: dict = {}
+
+        async def _fake_run_inflight_verify(item_arg, lease_arg, depth=None, probe_base=None):
+            captured['depth'] = depth
+            captured['probe_base'] = probe_base
+            return InflightVerifyResult(outcome=None, merge_wt=item_arg.merge_wt)
+
+        worker._run_inflight_verify = _fake_run_inflight_verify
+        config = _make_probe_config(probe_fraction=0.0)
+        item = _make_dispatch_ready_item(
+            config=config, merge_wt=tmp_path, merge_commit='c-dispatch',
+        )
+
+        entry = await worker._dispatch_item(item)
+
+        assert entry is not None, 'dispatch should succeed with a free local slot'
+        await entry.verify_task
+        assert captured['depth'] == 1
+        assert captured['probe_base'] is None
+
+    async def test_probe_fires_dispatches_with_probed_depth_and_base(
+        self, tmp_path: Path,
+    ) -> None:
+        """probe_fraction=1.0, probe_depths=[2], a built stack of depth 2
+        -> the dispatched verify is launched with depth=2 against the
+        depth-2 built cumulative tip. The dispatched item's OWN base_sha
+        (a distinct value from the probed tip) and the pre-existing frozen
+        chain are both untouched -- the probe never reorders/rebases any
+        in-flight verify (task 1890 invariant).
+        """
+        worker = _make_bare_worker()
+        worker._host_allocator = _fake_local_allocator()
+        main_sha = 'aabbccdd00000000aaaa'
+        entry_1 = _make_frozen_entry('commit-depth-1', base_sha=main_sha)
+        entry_2 = _make_frozen_entry('commit-depth-2', base_sha='commit-depth-1')
+        worker._frozen_inflight_entries = lambda: [entry_1, entry_2]
+
+        captured: dict = {}
+
+        async def _fake_run_inflight_verify(item_arg, lease_arg, depth=None, probe_base=None):
+            captured['depth'] = depth
+            captured['probe_base'] = probe_base
+            return InflightVerifyResult(outcome=None, merge_wt=item_arg.merge_wt)
+
+        worker._run_inflight_verify = _fake_run_inflight_verify
+        config = _make_probe_config(probe_fraction=1.0, probe_depths=[2])
+        item = _make_dispatch_ready_item(
+            config=config, merge_wt=tmp_path, merge_commit='c-dispatch',
+        )
+
+        entry = await worker._dispatch_item(item)
+
+        assert entry is not None, 'dispatch should succeed with a free local slot'
+        await entry.verify_task
+        assert captured['depth'] == 2
+        assert captured['probe_base'] == 'commit-depth-2'
+        # The probe must never mutate the dispatched item itself.
+        assert entry.item.base_sha == 'item-own-natural-base'
+        # And the pre-existing frozen chain must stay structurally healthy.
+        assert worker.check_frozen_prefix_invariant(main_sha) == []
+
+
+@pytest.mark.asyncio
+class TestRunInflightVerifyProbeBaseWiring:
+    """_run_inflight_verify's new ``probe_base`` parameter (task 2359
+    step-16) overrides the ``main_sha`` fed to ``_run_post_merge_verify``'s
+    merge-skew classification metadata -- WITHOUT touching ``item`` itself
+    (item.base_sha, hence the frozen-prefix chain, is never mutated).
+
+    Mirrors test_merge_queue_depth_telemetry.py's
+    TestRunInflightVerifyDepthWiring exactly (same MagicMock git_ops +
+    HostLease(is_local=False) + patched ``_run_post_merge_verify``
+    capturing kwargs), scoped to the NEW ``probe_base`` -> ``main_sha``
+    channel rather than the already-covered ``depth`` channel.
+
+    RED until step-16 GREEN adds the ``probe_base`` parameter.
+    """
+
+    async def test_probe_base_overrides_main_sha(self, tmp_path: Path) -> None:
+        from orchestrator.git_ops import MergeResult
+
+        config = OrchestratorConfig()
+        req = MergeRequest(
+            task_id='t-wire', branch='task/t-wire', worktree=tmp_path,
+            pre_rebased=False, task_files=None, module_configs=[], config=config,
+            result=asyncio.get_running_loop().create_future(),
+        )
+        item = RealMergeItem(
+            request=req,
+            merge_result=MergeResult(
+                success=True, merge_commit='deadbeef', merge_worktree=tmp_path,
+            ),
+            merge_wt=tmp_path,
+            base_sha='items-own-base-sha',
+            speculative=True,
+            merged_branch_tip=None,
+        )
+        lease = HostLease(name='remote', runner=MagicMock(), is_local=False)
+
+        captured: dict = {}
+
+        async def _fake_run_post_merge_verify(*_args, **kwargs):
+            captured.update(kwargs)
+            return None  # pass
+
+        worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
+
+        with patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            _fake_run_post_merge_verify,
+        ):
+            await worker._run_inflight_verify(
+                item, lease, depth=2, probe_base='deep-tip-commit',  # RED: no probe_base kwarg yet
+            )
+
+        assert captured.get('main_sha') == 'deep-tip-commit'
+        # item itself must never be mutated by the probe_base override.
+        assert item.base_sha == 'items-own-base-sha'
+
+    async def test_no_probe_base_keeps_main_sha_byte_identical(self, tmp_path: Path) -> None:
+        """probe_base=None (default / non-probed dispatch) -> main_sha is
+        item.base_sha, unchanged from pre-task-2359 behaviour."""
+        from orchestrator.git_ops import MergeResult
+
+        config = OrchestratorConfig()
+        req = MergeRequest(
+            task_id='t-wire-default', branch='task/t-wire-default', worktree=tmp_path,
+            pre_rebased=False, task_files=None, module_configs=[], config=config,
+            result=asyncio.get_running_loop().create_future(),
+        )
+        item = RealMergeItem(
+            request=req,
+            merge_result=MergeResult(
+                success=True, merge_commit='deadbeef', merge_worktree=tmp_path,
+            ),
+            merge_wt=tmp_path,
+            base_sha='items-own-base-sha',
+            speculative=True,
+            merged_branch_tip=None,
+        )
+        lease = HostLease(name='remote', runner=MagicMock(), is_local=False)
+
+        captured: dict = {}
+
+        async def _fake_run_post_merge_verify(*_args, **kwargs):
+            captured.update(kwargs)
+            return None  # pass
+
+        worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
+
+        with patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            _fake_run_post_merge_verify,
+        ):
+            await worker._run_inflight_verify(item, lease, depth=1)
+
+        assert captured.get('main_sha') == 'items-own-base-sha'
