@@ -10170,6 +10170,20 @@ Output JSON matching the schema. Every task must appear in the output.
                 self.cost_store, window_start, window_end
             )
 
+            # (8b) Per-(model×role) outcome rollup (task 2534 δ, boundary test
+            # 12). events_db_path (step 7) is the same runs.db file backing
+            # CostStore/RunStore in production (harness.py:1373-1398), so no
+            # separate DB handle is needed. Fail-open: empty rollup when the
+            # events DB path is unavailable (model_role_rollup itself is
+            # fail-open on a missing/unreadable DB).
+            model_role_rollup = (
+                digest_mod.model_role_rollup(
+                    events_db_path, window_start, window_end
+                )
+                if events_db_path is not None
+                else digest_mod.ModelRoleRollup()
+            )
+
             # (9) Parked-task counts via public Scheduler properties (task 1327).
             parked_live = self.scheduler.parked_live_count
             parked_window_churn = self.scheduler.parked_window_churn_count
@@ -10218,6 +10232,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 anomaly_flags=anomaly_flags,
                 watcher_clusters=[],
                 dry_run_proposals=[],
+                model_role_rollup=model_role_rollup,
             )
 
             digest_mod.write_digest_entry(digest_dir, inputs)
