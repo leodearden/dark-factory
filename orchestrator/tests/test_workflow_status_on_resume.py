@@ -29,9 +29,10 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.agents.invoke import AgentResult
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.scheduler import TaskAssignment
+from orchestrator.scheduler import TaskAssignment, files_to_modules
 from orchestrator.workflow import (
     IMPLEMENTER,
     TaskWorkflow,
@@ -479,6 +480,85 @@ class TestStatusPreservationOnResume:
         )
         assert invoke_mock.await_count == 0, (
             'No implementer resume on the already-on-main path.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# _set_task_scope — orchestrator-side plan.files widen (task 2505)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSetTaskScope:
+    """Unit tests for ``TaskWorkflow._set_task_scope`` — the single choke
+    point that widens plan.json (via ``artifacts.set_plan_files``) and
+    reconciles the scheduler's file-locks/metadata.files
+    (``_reconcile_scope_locks``) outside the architect/plan-boundary flow.
+    Consumed by the resume-path scope-grant logic added later in task 2505.
+    """
+
+    async def _build(self, config, git_ops, task_assignment, tmp_path):
+        """Shared setup: a workflow with artifacts/plan wired directly
+        (no run()), stamped-owned by the workflow's own session_id."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        queue = EscalationQueue(tmp_path / 'queue')
+        workflow, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+        )
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init(task_assignment.task_id, 'X', 'Y')
+        plan = dict(PLAN)
+        plan['files'] = ['lib.py']
+        workflow.artifacts.write_plan(plan)
+        workflow.artifacts.stamp_plan_provenance(workflow.session_id)
+        workflow.plan = workflow.artifacts.read_plan()
+        return workflow, scheduler
+
+    async def test_success_widens_plan_and_modules(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        workflow, scheduler = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+
+        result = await workflow._set_task_scope(['lib.py', 'new.py'])
+
+        assert result is True
+        on_disk = workflow.artifacts.read_plan()
+        assert on_disk['files'] == ['lib.py', 'new.py']
+        assert workflow.artifacts.validate_plan_owner(workflow.session_id) is True
+        assert len(scheduler.blast_radius_calls) == 1, (
+            'exactly one handle_blast_radius_expansion call expected'
+        )
+        _current, _needed, persist_files = scheduler.blast_radius_calls[0]
+        assert persist_files == ['lib.py', 'new.py']
+        assert workflow.modules == files_to_modules(
+            ['lib.py', 'new.py'], config.lock_depth,
+        )
+
+    async def test_lock_conflict_leaves_modules_unchanged_but_widens_plan(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        workflow, scheduler = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        original_modules = list(workflow.modules)
+        scheduler.blast_radius_result = False
+
+        result = await workflow._set_task_scope(['lib.py', 'new.py'])
+
+        assert result is False
+        assert workflow.modules == original_modules, (
+            'self.modules must stay unchanged on a lock conflict — the '
+            'scheduler already requeued the task holding the ORIGINAL lock.'
+        )
+        on_disk = workflow.artifacts.read_plan()
+        assert on_disk['files'] == ['lib.py', 'new.py'], (
+            'plan.json must still be widened on conflict — the scheduler '
+            'persists metadata.files=new_files on its requeue branch too, '
+            'so plan.files must match metadata.files even when the lock '
+            'could not be acquired.'
         )
 
 
