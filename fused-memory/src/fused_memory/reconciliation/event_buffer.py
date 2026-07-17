@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS event_buffer (
     agent_id TEXT,
     timestamp TEXT NOT NULL,
     payload TEXT NOT NULL DEFAULT '{}',
-    status TEXT NOT NULL DEFAULT 'buffered'
+    status TEXT NOT NULL DEFAULT 'buffered',
+    drained_by_run_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_eb_project_status ON event_buffer(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_eb_agent_timestamp ON event_buffer(agent_id, timestamp)
@@ -143,6 +144,23 @@ class EventBuffer:
         db = self._require_db()
         async with db.execute('PRAGMA table_info(deferred_writes)') as cursor:
             columns = {row['name'] async for row in cursor}
+
+        async with db.execute('PRAGMA table_info(event_buffer)') as cursor:
+            eb_columns = {row['name'] async for row in cursor}
+
+        # Add drained_by_run_id if missing — attributes a drained row to the run
+        # that drained it (task 2711 / E7) so restore_drained() can be scoped to
+        # a single run instead of unconditionally restoring the whole project.
+        if 'drained_by_run_id' not in eb_columns:
+            try:
+                await db.execute('ALTER TABLE event_buffer ADD COLUMN drained_by_run_id TEXT')
+                logger.info(
+                    'EventBuffer: migrated event_buffer — added drained_by_run_id column'
+                )
+            except Exception as exc:
+                if 'duplicate column name' not in str(exc).lower():
+                    raise
+                logger.debug('EventBuffer: drained_by_run_id already exists (concurrent init)')
 
         # Drop the now-redundant single-column project index.  idx_dw_project_claimed
         # (project_id, claimed_at) is a strict superset; keeping both wastes write
@@ -442,8 +460,16 @@ class EventBuffer:
 
     # ── Drain ──────────────────────────────────────────────────────────
 
-    async def drain(self, project_id: str) -> list[ReconciliationEvent]:
-        """Atomically drain buffered events for a project."""
+    async def drain(
+        self, project_id: str, run_id: str | None = None,
+    ) -> list[ReconciliationEvent]:
+        """Atomically drain buffered events for a project.
+
+        When ``run_id`` is provided, the drained rows are stamped with
+        ``drained_by_run_id = run_id`` so a later run-scoped ``restore_drained``
+        can restore exactly this run's events without touching a concurrent
+        run's drained rows (task 2711 / E7).
+        """
         db = self._require_db()
         async with db.execute(
             """SELECT * FROM event_buffer
@@ -460,8 +486,9 @@ class EventBuffer:
         placeholders = ','.join('?' for _ in ids)
         async with self._txn() as db:
             await db.execute(
-                f"UPDATE event_buffer SET status = 'drained' WHERE id IN ({placeholders})",
-                ids,
+                f"UPDATE event_buffer SET status = 'drained', drained_by_run_id = ? "
+                f"WHERE id IN ({placeholders})",
+                [run_id, *ids],
             )
 
         events = []
@@ -590,15 +617,32 @@ class EventBuffer:
             rowcount = cursor.rowcount
         return rowcount
 
-    async def restore_drained(self, project_id: str) -> int:
-        """Restore drained events to 'buffered' after a failed run."""
-        async with self._txn() as db:
-            cursor = await db.execute(
-                "UPDATE event_buffer SET status = 'buffered' "
-                "WHERE project_id = ? AND status = 'drained'",
-                (project_id,),
-            )
-            count = cursor.rowcount
+    async def restore_drained(self, project_id: str, run_id: str | None = None) -> int:
+        """Restore drained events to 'buffered' after a failed run.
+
+        When ``run_id`` is provided, only rows stamped with
+        ``drained_by_run_id = run_id`` are restored — this protects a
+        concurrent live run's drained events from being clobbered when the
+        reaper recovers a *different* orphaned run on the same project (task
+        2711 / E7). When omitted (the default), behaviour is unchanged: every
+        drained row for the project is restored, project-wide.
+        """
+        if run_id is None:
+            async with self._txn() as db:
+                cursor = await db.execute(
+                    "UPDATE event_buffer SET status = 'buffered' "
+                    "WHERE project_id = ? AND status = 'drained'",
+                    (project_id,),
+                )
+                count = cursor.rowcount
+        else:
+            async with self._txn() as db:
+                cursor = await db.execute(
+                    "UPDATE event_buffer SET status = 'buffered' "
+                    "WHERE project_id = ? AND status = 'drained' AND drained_by_run_id = ?",
+                    (project_id, run_id),
+                )
+                count = cursor.rowcount
         if count:
             logger.info(f'Restored {count} drained events to buffered for {project_id}')
         return count
