@@ -814,10 +814,10 @@ class TestDispatchItemProbeWiring:
 
         captured: dict = {}
 
-        async def _fake_run_inflight_verify(item_arg, lease_arg, depth=None, probe_base=None):
+        async def _fake_run_inflight_verify(item, lease, depth=None, probe_base=None):
             captured['depth'] = depth
             captured['probe_base'] = probe_base
-            return InflightVerifyResult(outcome=None, merge_wt=item_arg.merge_wt)
+            return InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
 
         worker._run_inflight_verify = _fake_run_inflight_verify
         config = _make_probe_config(probe_fraction=0.0)
@@ -828,6 +828,7 @@ class TestDispatchItemProbeWiring:
         entry = await worker._dispatch_item(item)
 
         assert entry is not None, 'dispatch should succeed with a free local slot'
+        assert entry.verify_task is not None
         await entry.verify_task
         assert captured['depth'] == 1
         assert captured['probe_base'] is None
@@ -851,10 +852,10 @@ class TestDispatchItemProbeWiring:
 
         captured: dict = {}
 
-        async def _fake_run_inflight_verify(item_arg, lease_arg, depth=None, probe_base=None):
+        async def _fake_run_inflight_verify(item, lease, depth=None, probe_base=None):
             captured['depth'] = depth
             captured['probe_base'] = probe_base
-            return InflightVerifyResult(outcome=None, merge_wt=item_arg.merge_wt)
+            return InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
 
         worker._run_inflight_verify = _fake_run_inflight_verify
         config = _make_probe_config(probe_fraction=1.0, probe_depths=[2])
@@ -865,6 +866,7 @@ class TestDispatchItemProbeWiring:
         entry = await worker._dispatch_item(item)
 
         assert entry is not None, 'dispatch should succeed with a free local slot'
+        assert entry.verify_task is not None
         await entry.verify_task
         assert captured['depth'] == 2
         assert captured['probe_base'] == 'commit-depth-2'
