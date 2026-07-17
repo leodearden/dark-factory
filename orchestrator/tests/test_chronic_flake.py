@@ -770,3 +770,136 @@ class TestMaybeFileChronicFlakeTasksNonBlocking:
         )
 
         assert result == []
+
+
+# ── Step-15 / Step-16: SchedulerChronicFlakeTaskClient adapter ────────────────
+
+
+class _StubScheduler:
+    """Stub scheduler exposing only ``dispatch_tool`` — the sole surface
+    ``SchedulerChronicFlakeTaskClient`` depends on (duck-typed; no import of
+    the real ``Scheduler``, mirroring the module's cross-project scope
+    boundary)."""
+
+    def __init__(self, return_value):
+        self.return_value = return_value
+        self.calls: list[tuple[str, dict, float | None]] = []
+
+    async def dispatch_tool(self, name, arguments, *, timeout=15):
+        self.calls.append((name, arguments, timeout))
+        return self.return_value
+
+
+class TestSchedulerChronicFlakeTaskClient:
+    """``SchedulerChronicFlakeTaskClient``: the concrete adapter over a
+    duck-typed scheduler exposing ``dispatch_tool`` — mirrors
+    ``harness._OfflineLaneTaskClient``'s "never talk to MCP directly" scope
+    boundary, but self-contained in ``chronic_flake.py`` to avoid a
+    workflow<->harness import cycle."""
+
+    async def _client(self, return_value):
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        scheduler = _StubScheduler(return_value)
+        return scheduler, SchedulerChronicFlakeTaskClient(scheduler, '/proj')
+
+    @pytest.mark.asyncio
+    async def test_submit_task_dispatches_with_arguments_and_extracts_task_id(self):
+        scheduler, client = await self._client({'task_id': 'fix-7'})
+        result = await client.submit_task({'title': 't'})
+        assert result == 'fix-7'
+        assert scheduler.calls[0][0] == 'submit_task'
+        assert scheduler.calls[0][1] == {'title': 't'}
+
+    @pytest.mark.asyncio
+    async def test_submit_task_uses_timeout_30(self):
+        scheduler, client = await self._client({'task_id': 'fix-7'})
+        await client.submit_task({'title': 't'})
+        assert scheduler.calls[0][2] == 30
+
+    @pytest.mark.asyncio
+    async def test_submit_task_extracts_ticket_shape(self):
+        """submit_task is two-phase server-side; its common real response
+        shape is {'ticket': 'tkt_...'}, not {'task_id': ...} — the id is
+        log-only (never relied on for dedup) but must still be recognised."""
+        scheduler, client = await self._client({'ticket': 'tkt_abc123'})
+        result = await client.submit_task({'title': 't'})
+        assert result == 'tkt_abc123'
+
+    @pytest.mark.asyncio
+    async def test_submit_task_extracts_from_structured_content(self):
+        scheduler, client = await self._client({'structuredContent': {'task_id': 'fix-9'}})
+        result = await client.submit_task({'title': 't'})
+        assert result == 'fix-9'
+
+    @pytest.mark.asyncio
+    async def test_submit_task_extracts_from_content_text_block(self):
+        envelope = {'content': [{'type': 'text', 'text': json.dumps({'ticket': 'tkt_xyz'})}]}
+        scheduler, client = await self._client(envelope)
+        result = await client.submit_task({'title': 't'})
+        assert result == 'tkt_xyz'
+
+    @pytest.mark.asyncio
+    async def test_submit_task_unrecognised_shape_returns_empty_string(self):
+        scheduler, client = await self._client({'unexpected': 'shape'})
+        result = await client.submit_task({'title': 't'})
+        assert result == ''
+
+    @pytest.mark.asyncio
+    async def test_submit_task_non_dict_envelope_returns_empty_string_without_raising(self):
+        scheduler, client = await self._client(None)
+        result = await client.submit_task({'title': 't'})
+        assert result == ''
+
+    @pytest.mark.asyncio
+    async def test_search_tasks_dispatches_with_project_root_and_query(self):
+        envelope = {'results': [{'title': 'De-flake test_a.sh', 'status': 'pending'}]}
+        scheduler, client = await self._client(envelope)
+        result = await client.search_tasks('test_a.sh')
+        assert scheduler.calls[0][0] == 'search_tasks'
+        assert scheduler.calls[0][1]['project_root'] == '/proj'
+        assert scheduler.calls[0][1]['query'] == 'test_a.sh'
+        assert result == [{'title': 'De-flake test_a.sh', 'status': 'pending'}]
+
+    @pytest.mark.asyncio
+    async def test_search_tasks_extracts_from_structured_content(self):
+        envelope = {
+            'structuredContent': {'results': [{'title': 'De-flake test_b.sh', 'status': 'done'}]}
+        }
+        scheduler, client = await self._client(envelope)
+        result = await client.search_tasks('test_b.sh')
+        assert result == [{'title': 'De-flake test_b.sh', 'status': 'done'}]
+
+    @pytest.mark.asyncio
+    async def test_search_tasks_malformed_envelope_returns_empty_list(self):
+        scheduler, client = await self._client({'unexpected': 'shape'})
+        result = await client.search_tasks('test_a.sh')
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_search_tasks_non_dict_envelope_returns_empty_list_without_raising(self):
+        scheduler, client = await self._client(['not', 'a', 'dict'])
+        result = await client.search_tasks('test_a.sh')
+        assert result == []
+
+
+class TestExtractTaskId:
+    """``extract_task_id``: self-contained module-level helper (no
+    harness/scheduler import) shared by ``SchedulerChronicFlakeTaskClient``
+    and available to any future adapter without an import cycle."""
+
+    def test_extracts_task_id_key(self):
+        from orchestrator.chronic_flake import extract_task_id
+        assert extract_task_id({'task_id': 'fix-1'}) == 'fix-1'
+
+    def test_extracts_ticket_key(self):
+        from orchestrator.chronic_flake import extract_task_id
+        assert extract_task_id({'ticket': 'tkt_1'}) == 'tkt_1'
+
+    def test_non_dict_returns_empty_string(self):
+        from orchestrator.chronic_flake import extract_task_id
+        assert extract_task_id(None) == ''
+        assert extract_task_id('nope') == ''
+
+    def test_unrecognised_shape_returns_empty_string(self):
+        from orchestrator.chronic_flake import extract_task_id
+        assert extract_task_id({'unexpected': 'shape'}) == ''
