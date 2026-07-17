@@ -2865,10 +2865,12 @@ async def test_reopen_freshness_enforce_rejects_stale_evidence_real_backend(
 async def test_reopen_freshness_warn_mode_emits_census_line(
     tmp_path, event_buffer, caplog,
 ):
-    """DEFAULT (warn) mode: a stale-evidence re-done write PROCEEDS but emits
-    exactly one task_status.done_evidence_stale_warn census WARNING carrying
-    the same structured fields as the enforce-mode rejection (grep-stable
-    anchor -- see reconciliation.reject_stale_done_evidence in schema.py).
+    """EXPLICIT warn-mode opt-out (the shipped default is 'enforce' as of
+    task 2680 / PRD task gamma): a stale-evidence re-done write PROCEEDS but
+    emits exactly one task_status.done_evidence_stale_warn census WARNING
+    carrying the same structured fields as the enforce-mode rejection
+    (grep-stable anchor -- see reconciliation.reject_stale_done_evidence in
+    schema.py).
     """
     from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
     from fused_memory.config.schema import TaskmasterConfig
@@ -2877,12 +2879,19 @@ async def test_reopen_freshness_warn_mode_emits_census_line(
     _init_git_repo(tmp_path)
     stale_sha = _commit_on_main(tmp_path, 'stale_evidence.txt', '2020-01-01T00:00:00+00:00')
 
-    # No config override -- reject_stale_done_evidence stays at its 'warn' default.
+    # Task 2680 (PRD task gamma) flipped the schema default to 'enforce', so
+    # this warn-mode test must construct an EXPLICIT warn config rather than
+    # relying on the config=None fallback (which also happens to be 'warn',
+    # but for a different, fail-safe reason -- see
+    # _reject_stale_done_evidence_mode).
+    cfg = FusedMemoryConfig()
+    cfg.reconciliation.reject_stale_done_evidence = 'warn'
+
     backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
     await backend.start()
     try:
         await backend.add_task(project_root=project_root, title='T')
-        interceptor = TaskInterceptor(backend, None, event_buffer)
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg)
 
         stale_provenance = {'kind': 'found_on_main', 'commit': stale_sha, 'note': 'sibling'}
 
@@ -3337,8 +3346,9 @@ async def test_reopen_freshness_invalid_override_rejected_in_warn_mode(
     override-invalid rejection is mode-independent BY DESIGN (see
     ``_check_reopen_freshness``'s "Rollout-safety note" and
     ``reject_stale_done_evidence``'s schema docstring) but was previously
-    only exercised under enforce config. Confirms warn mode (the alpha
-    rollout default) still rejects a malformed override rather than
+    only exercised under enforce config. Confirms EXPLICIT warn mode (the
+    alpha rollout default; the shipped default is 'enforce' as of task 2680
+    / PRD task gamma) still rejects a malformed override rather than
     silently proceeding, and does so WITHOUT also emitting the normal
     ``done_evidence_stale_warn`` census line -- the override-invalid branch
     returns before the enforce/warn mode dispatch that would log it.
@@ -3350,12 +3360,19 @@ async def test_reopen_freshness_invalid_override_rejected_in_warn_mode(
     _init_git_repo(tmp_path)
     stale_sha = _commit_on_main(tmp_path, 'stale_evidence.txt', '2020-01-01T00:00:00+00:00')
 
-    # No config override -- reject_stale_done_evidence stays at its 'warn' default.
+    # Task 2680 (PRD task gamma) flipped the schema default to 'enforce', so
+    # this warn-mode test must construct an EXPLICIT warn config rather than
+    # relying on the config=None fallback (which also happens to be 'warn',
+    # but for a different, fail-safe reason -- see
+    # _reject_stale_done_evidence_mode).
+    cfg = FusedMemoryConfig()
+    cfg.reconciliation.reject_stale_done_evidence = 'warn'
+
     backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
     await backend.start()
     try:
         await backend.add_task(project_root=project_root, title='T')
-        interceptor = TaskInterceptor(backend, None, event_buffer)
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg)
 
         stale_provenance = {'kind': 'found_on_main', 'commit': stale_sha, 'note': 'sibling'}
 
