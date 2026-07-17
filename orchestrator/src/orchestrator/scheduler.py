@@ -2771,6 +2771,7 @@ class Scheduler:
         pending_tasks: list[dict],
         status_map: dict[str, str],
         tasks_by_id: dict[str, dict],
+        terminal_dep_records: dict[str, dict] | None = None,
     ) -> dict[str, bool]:
         """Per-tick sweep for the delivered-check dep-gate (capability-
         delivered-checks PRD, task delta).
@@ -2839,6 +2840,16 @@ class Scheduler:
         ``_apply_external_dep_policy``, this must NOT be called from
         ``_deps_satisfied`` / ``_eligible_for_dispatch``. Those are pure
         predicates called per-candidate; side effects here would N-fire.
+
+        *terminal_dep_records* (task 2692, δ/ε follow-up) is an additive
+        fallback source consulted ONLY when a dep is absent from
+        *tasks_by_id* — the active-only ``get_tasks`` fetch that seeds
+        *tasks_by_id* excludes done/cancelled producers, so a just-completed
+        dep is genuinely missing there even though ``status_map`` (backfilled
+        separately) already knows it's terminal. When the dep record is
+        already present in *tasks_by_id*, this fallback is never consulted.
+        Defaults to ``None``, in which case a dep missing from *tasks_by_id*
+        is simply skipped — byte-identical to before this param existed.
         """
         tasks_by_id = tasks_by_id or {}
 
@@ -2853,6 +2864,8 @@ class Scheduler:
                 if status_map.get(dep_id) not in TERMINAL_STATUSES:
                     continue
                 dep_task = tasks_by_id.get(dep_id)
+                if dep_task is None and terminal_dep_records is not None:
+                    dep_task = terminal_dep_records.get(dep_id)
                 if dep_task is None:
                     continue
                 checks = (dep_task.get('metadata') or {}).get('delivered_checks')
