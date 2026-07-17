@@ -955,22 +955,43 @@ def report() -> int:
     return 1 if any_stale else 0
 
 
+def _print_fused_memory_liveness() -> None:
+    """Print a single labelled fused-memory liveness row for ``--report``.
+
+    Strictly read-only, mirroring report()'s I7/I8 guarantee: computes the
+    verdict via _fused_memory_liveness_verdict() (port probe + /health fetch
+    only — no is_unit_enabled/STARTUP_GRACE_SECS gating, since report()
+    likewise shows every unit's raw verdict unconditionally) and prints it.
+    No systemctl mutation, no clock write, no restart.
+
+    Informational only: called from _cli's --report branch AFTER report()'s
+    own staleness table, and never affects report()'s staleness-only exit
+    code (see _cli's docstring below).
+    """
+    verdict = _fused_memory_liveness_verdict()
+    print(f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /health): {verdict}")
+
+
 def _cli(argv: list[str] | None = None) -> int:
     """Dispatch the CLI: ``--report`` routes to the read-only doctor mode.
 
     With no ``argv`` argument, reads ``sys.argv[1:]``. If ``--report`` is
-    present, runs ONLY the read-only report() and returns its exit code
-    (0 = all fresh, 1 = at least one stale unit) — main(),
-    fused_memory_liveness_pass(), and staleness_pass() are not invoked, so
-    this path never mutates systemd state (I7 at the CLI boundary).
-    Otherwise runs the existing liveness main(), then
+    present, runs the read-only report() followed by the read-only
+    _print_fused_memory_liveness() (B4) and returns report()'s OWN exit code
+    (0 = all fresh, 1 = at least one stale unit) — the fm row is
+    informational only and never alters this exit code. main(),
+    fused_memory_liveness_pass(), and staleness_pass() are not invoked under
+    --report, so this path never mutates systemd state (I7 at the CLI
+    boundary). Otherwise runs the existing liveness main(), then
     fused_memory_liveness_pass() (B3), then staleness_pass() (the timer
     path) and returns 0. Unknown flags are not treated as an error — they
     fall through to the timer path.
     """
     argv = sys.argv[1:] if argv is None else argv
     if "--report" in argv:
-        return report()
+        rc = report()
+        _print_fused_memory_liveness()
+        return rc
     main()
     fused_memory_liveness_pass()
     staleness_pass()

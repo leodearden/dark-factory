@@ -4157,6 +4157,10 @@ def test_print_fused_memory_liveness_row(
         monkeypatch.setattr(
             wdog, "restart_unit", lambda u: pytest.fail(f"must never restart {u}")
         )
+        # probe_health()'s no-response branch calls log(), which itself
+        # shells out to `systemd-cat` via subprocess.run — no-op it so
+        # fake_run only ever sees the `ss` probe call it's built to handle.
+        monkeypatch.setattr(wdog, "log", lambda _m: None)
 
         wdog._print_fused_memory_liveness()
 
