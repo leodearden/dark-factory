@@ -286,3 +286,81 @@ class TestSelectProbeDepthAvailabilityFallback:
             suppress_flake_rate=0.30,
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED / step-8 GREEN: flake-rate suppression (recent_fail_rate >=
+# suppress_flake_rate)
+# ---------------------------------------------------------------------------
+
+
+class TestSelectProbeDepthFlakeSuppression:
+    """A high recent per-verify FAIL rate suppresses probing entirely --
+    when the speculative stack is already thrashing, spending the second
+    slot on a deep probe (rather than the normal adjacent depth-1 verify)
+    is not worth the coordination overhead.
+
+    probe_fraction=1.0 (period=1) makes round_index=0 a frequency-eligible
+    probe round, isolating suppression from the frequency gate.
+    available_built_depth is set comfortably above probe_depths so the
+    availability guard (step-6) stays inert.
+
+    RED until step-8 GREEN adds the ``recent_fail_rate >=
+    suppress_flake_rate`` guard.
+    """
+
+    def test_high_fail_rate_suppresses_probe(self):
+        from orchestrator.merge_queue import select_probe_depth
+
+        result = select_probe_depth(
+            probe_fraction=1.0,
+            probe_depths=[2],
+            round_index=0,
+            available_built_depth=9,
+            recent_fail_rate=0.5,
+            suppress_flake_rate=0.30,
+        )
+        assert result is None
+
+    def test_fail_rate_exactly_at_threshold_suppresses_probe(self):
+        """>= is inclusive of the threshold itself."""
+        from orchestrator.merge_queue import select_probe_depth
+
+        result = select_probe_depth(
+            probe_fraction=1.0,
+            probe_depths=[2],
+            round_index=0,
+            available_built_depth=9,
+            recent_fail_rate=0.30,
+            suppress_flake_rate=0.30,
+        )
+        assert result is None
+
+    def test_low_fail_rate_allows_probe(self):
+        from orchestrator.merge_queue import select_probe_depth
+
+        result = select_probe_depth(
+            probe_fraction=1.0,
+            probe_depths=[2],
+            round_index=0,
+            available_built_depth=9,
+            recent_fail_rate=0.1,
+            suppress_flake_rate=0.30,
+        )
+        assert result == 2
+
+    def test_none_fail_rate_allows_probe(self):
+        """No rolling-window data yet (e.g. a freshly started worker) must
+        not suppress -- only an observed high fail rate suppresses.
+        """
+        from orchestrator.merge_queue import select_probe_depth
+
+        result = select_probe_depth(
+            probe_fraction=1.0,
+            probe_depths=[2],
+            round_index=0,
+            available_built_depth=9,
+            recent_fail_rate=None,
+            suppress_flake_rate=0.30,
+        )
+        assert result == 2
