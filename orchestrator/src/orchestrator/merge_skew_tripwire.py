@@ -145,3 +145,61 @@ async def emit_pipeline_landing_tripwire(
     )
     if not load_bearing:
         return
+
+    inflight_diffs: list[tuple[str, str, list[str]]] = []
+    for task_id, branch in inflight:
+        branch_files = await get_branch_diff(branch)
+        if branch_files is None:
+            continue
+        inflight_diffs.append((task_id, branch, branch_files))
+
+    hits = compute_tripwire_overlap(landing_changed_files, inflight_diffs)
+    if not hits:
+        return
+
+    from escalation.models import Escalation  # noqa: PLC0415, I001 — local import, escalation optional dep
+
+    sentinel = f'pipeline-landing-tripwire-{landing_sha[:12]}'
+    hit_lines = '\n'.join(
+        f'- task {hit.task_id} (branch {hit.branch}): {", ".join(hit.overlap_files)}'
+        for hit in hits
+    )
+    overlapping_task_ids = ', '.join(hit.task_id for hit in hits)
+    summary = (
+        f'Pipeline landing {landing_sha[:12]} touches load-bearing files also '
+        f'present on {len(hits)} in-flight branch(es): {overlapping_task_ids}'
+    )
+    detail = (
+        f'Landing task: {landing_task_id} (sha {landing_sha[:12]})\n'
+        f'Load-bearing changed files: {", ".join(landing_changed_files)}\n'
+        '\n'
+        f'In-flight branches with overlapping edits:\n{hit_lines}'
+    )
+    esc = Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-merge-skew-tripwire',
+        severity='info',
+        level=0,
+        category='risk_identified',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            "Port the landed change into each named in-flight branch's own "
+            'edits (not merely rebase) before it merges, to avoid silently '
+            'reverting or conflicting with the load-bearing change.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+    for hit in hits:
+        await update_task(
+            hit.task_id,
+            {
+                'merge_skew_tripwire': {
+                    'landing_sha': landing_sha,
+                    'overlap_files': list(hit.overlap_files),
+                },
+            },
+            metadata_mode='merge',
+        )
