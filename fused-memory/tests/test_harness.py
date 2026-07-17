@@ -6338,6 +6338,60 @@ class TestBusyProjectDrainConvergence:
                 with contextlib.suppress(asyncio.CancelledError):
                     await loop_task
 
+    @pytest.mark.asyncio
+    async def test_drain_exit_emits_drain_ack_structured_token(
+        self, journal, event_buffer, mock_memory_service, monkeypatch, caplog
+    ):
+        """A drain-triggered `_project_loop` exit must log a structured drain_ack token.
+
+        The message is the token (`drain_ack`) and `project_id` is a STRUCTURED
+        `extra=` field — consumers read `record.project_id`, never scrape prose.
+
+        RED (pre-fix): the drain exit added in step-2 is a bare `return` with no
+        log, so no `drain_ack` record exists and the assertion fails.
+        """
+        real_sleep = asyncio.sleep
+
+        async def fast_sleep(seconds: float) -> None:
+            await real_sleep(0)
+
+        monkeypatch.setattr('fused_memory.reconciliation.harness._sleep', fast_sleep)
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        self._wire_busy_harness(harness)
+        fake_rfc, entered, release, completed = self._make_blocking_fake_rfc()
+
+        loop_task = None
+        try:
+            with (
+                caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'),
+                patch.object(harness, 'run_full_cycle', side_effect=fake_rfc),
+            ):
+                loop_task = asyncio.create_task(harness._project_loop('test-project'))
+                await asyncio.wait_for(entered.wait(), 2.0)
+
+                harness.drain()
+
+                release.set()
+                await asyncio.wait_for(loop_task, 2.0)
+
+            assert completed['n'] == 1
+
+            acks = [r for r in caplog.records if 'drain_ack' in r.getMessage()]
+            assert acks, (
+                f"Expected a 'drain_ack' log record but got: "
+                f"{[r.getMessage() for r in caplog.records]}"
+            )
+            assert getattr(acks[0], 'project_id', None) == 'test-project', (
+                f"Expected drain_ack record.project_id == 'test-project', "
+                f"got {getattr(acks[0], 'project_id', None)!r}"
+            )
+        finally:
+            if loop_task is not None and not loop_task.done():
+                loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await loop_task
+
 
 # ── Deferred-write replay deduplication (Fix 2) ───────────────────────────────
 
