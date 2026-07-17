@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -769,8 +770,19 @@ class TestTimeout:
         those three leading values are drained first, so the watcher's
         deadline-call gets 0.5 (deadline=5.5) and its loop-call gets 0.5
         again (remaining=int((5.5-0.5)*1000)=5000) — exactly the observed
-        "expected 4500, got 5000" flake. A correct fix makes the read
-        timeout independent of how many interlopers ran first.
+        "expected 4500, got 5000" flake.
+
+        ``_run`` is parametrized on which monotonic stub to install so this
+        test can CONTRAST the two idioms instead of only asserting on the
+        fixed one in isolation: a bare ``_run(0) == _run(3)`` against a stub
+        that is *always* a constant ``return_value`` is tautological (it
+        cannot fail no matter what the watcher's arithmetic does, since
+        constant-in implies constant-out by construction). The
+        ``constant_stub=False`` arm reproduces the OLD, order-sensitive
+        idiom live — hardcoding the exact 4500-vs-5000 split across
+        interloper counts — which is the executable proof that the
+        ``constant_stub=True`` equality is a meaningful, falsifiable claim
+        about the fix, not an artifact of the stub shape.
         """
         queue_dir = tmp_path / 'queue'
         queue_dir.mkdir()
@@ -782,18 +794,29 @@ class TestTimeout:
         mock_event = MagicMock()
         mock_event.name = f'{blocking_escalation.id}.json'
 
-        def _run(n_interlopers):
+        def _run(n_interlopers, *, constant_stub):
+            # constant_stub=True: the task-2722 fix — a single value
+            # regardless of caller or call count, so an interloping
+            # time.monotonic() call can't shift what the watcher observes.
+            # constant_stub=False: the OLD idiom task 2722 replaced — a
+            # position-sensitive iterator that a prefix-consuming
+            # interloper (e.g. an xdist/execnet background thread) can
+            # partially drain, shifting the values the watcher receives.
+            monotonic_patch = (
+                patch('escalation.watcher.time.monotonic', return_value=1000.0)
+                if constant_stub
+                else patch(
+                    'escalation.watcher.time.monotonic',
+                    side_effect=itertools.chain([0.0], itertools.repeat(0.5)),
+                )
+            )
             with (
                 patch('escalation.watcher.INotify') as MockINotify,
                 patch('escalation.watcher.sys.argv', [
                     'watcher', '--queue-dir', str(queue_dir), '--timeout', '5',
                 ]),
                 patch('escalation.watcher._initial_scan', return_value=None),
-                # Constant, order-immune stub (task 2722): every call
-                # returns the same value regardless of caller or call
-                # count, so an interloping time.monotonic() call can't
-                # shift which value the watcher's own calls observe.
-                patch('escalation.watcher.time.monotonic', return_value=1000.0),
+                monotonic_patch,
             ):
                 mock_inotify = MockINotify.return_value
                 mock_inotify.read.return_value = [mock_event]
@@ -804,7 +827,7 @@ class TestTimeout:
                 # .monotonic attribute on the actual process-global `time`
                 # module object (watcher.py does a plain `import time`), so
                 # this call site and the watcher's internal calls draw from
-                # the exact same shared iterator.
+                # the exact same shared stub.
                 import escalation.watcher
 
                 for _ in range(n_interlopers):
@@ -820,10 +843,17 @@ class TestTimeout:
             capsys.readouterr()  # drain stdout between runs
             return mock_inotify.read.call_args.kwargs['timeout']
 
-        # The read timeout must not depend on how many interlopers ran
-        # first — GREEN (task 2722): _run(0) == _run(3) == 5000 regardless
-        # of interloper count, since the clock is constant.
-        assert _run(0) == _run(3)
+        # GREEN (task 2722): the fixed constant stub's read timeout does
+        # not depend on how many interlopers ran first.
+        assert _run(0, constant_stub=True) == _run(3, constant_stub=True) == 5000
+
+        # Contrast: the OLD position-sensitive stub IS order-sensitive
+        # under the identical interloper simulation, reproducing the
+        # task-2702 "expected 4500, got 5000" flake directly. This is what
+        # makes the equality assertion above a meaningful, falsifiable
+        # claim rather than a tautology of a constant return_value.
+        assert _run(0, constant_stub=False) == 4500
+        assert _run(3, constant_stub=False) == 5000
 
 
 class TestLevelFilter:
