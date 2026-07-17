@@ -135,11 +135,37 @@ def _commit_marker(project_root: Path, rel_path: str, token: str) -> str:
     return _run_git(project_root, 'rev-parse', 'main').stdout.strip()
 
 
+def _write_exec_script(project_root: Path, rel_path: str, body: str) -> None:
+    """Write *body* to *rel_path* under *project_root* and mark it
+    executable (0o755) — the real recovery leg of row 7: a missing script
+    produces a genuine ``FileNotFoundError`` from the subprocess spawn
+    (-> ``DeliveredCheckResult.ERRORED``); writing + chmod-ing it here makes
+    the real (unmocked) runner succeed on the very next tick. Deliberately
+    NOT committed to git — the script kind is evaluated against the WORKING
+    CHECKOUT, not the committed ``main`` tree (unlike the grep kind; see
+    ``orchestrator.delivered_checks``'s module docstring).
+    """
+    target = project_root / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding='utf-8')
+    os.chmod(target, 0o755)
+
+
 def _grep_check(name: str, token: str, paths: list[str]) -> dict:
     """Build a grep-kind ``delivered_checks`` entry — the same shape
     gamma's ``commit_planning`` stamps from a capability-manifest sidecar
     (``fused-memory/tests/test_manifest_stamping.py``)."""
     return {'name': name, 'kind': 'grep', 'pattern': token, 'expect': 'present', 'paths': paths}
+
+
+def _script_check(name: str, script_rel_path: str, *, timeout_secs: float = 5) -> dict:
+    """Build a script-kind ``delivered_checks`` entry — the same shape
+    gamma's ``commit_planning`` stamps from a capability-manifest sidecar's
+    script capability."""
+    return {
+        'name': name, 'kind': 'script', 'script': script_rel_path,
+        'args': [], 'timeout_secs': timeout_secs,
+    }
 
 
 class _LocalDepMcpSession:
