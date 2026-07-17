@@ -566,6 +566,43 @@ class TestLegacyNoSidecar:
 _MANUAL_PRD_PATH = 'plans/e2e-manual-fixture-prd.md'
 
 
+def _write_manual_sidecar(project_root: Path, *, prd_path: str, label: str) -> Path:
+    """Write a capability-manifest sidecar (α schema) whose sole capability
+    for *label* is a manual-kind check (reusing the ``_MANUAL`` shape from
+    ``test_manifest_stamping.py``): ``commit_planning`` stamps the label's
+    real task_id into the sidecar like any other label match, but a
+    manual-kind check is excluded from the mechanical
+    metadata.delivered_checks copy — so the scheduler's delivered-check gate
+    never engages for this producer at all (PRD row 8)."""
+    sidecar_rel = re.sub(r'\.md$', '', prd_path) + '.capability-manifest.yaml'
+    sidecar_path = project_root / sidecar_rel
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    doc = {
+        'prd': prd_path,
+        'schema_version': 1,
+        'tasks': [
+            {
+                'label': label,
+                'task_id': None,
+                'title': f'Producer {label}',
+                'capabilities': [
+                    {
+                        'name': 'manual_only_cap',
+                        'binding': 'eyeball the UI',
+                        'verdict': 'PASS',
+                        'delivered_check': {
+                            'kind': 'manual',
+                            'reason': 'no automated check available',
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+    sidecar_path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding='utf-8')
+    return sidecar_path
+
+
 class TestManualOnlySidecar:
     """Row 8: a sidecar label whose ONLY capability is manual-kind still gets
     its task_id stamped (it's a normal label match), but is excluded from the
