@@ -5768,6 +5768,27 @@ def select_probe_depth(
     return d
 
 
+@dataclasses.dataclass(frozen=True)
+class ProbePlacement:
+    """Result of a firing variable-depth speculative verify probe (task 2359).
+
+    Returned by :meth:`SpeculativeMergeWorker._probe_verify_placement` when
+    ``select_probe_depth()`` selects a deeper stack to probe this round.
+
+    Attributes:
+        depth: The probed cumulative stack depth (a member of
+            ``probe_depths``) -- flows into the merge_verify event's
+            ``depth`` field via task 2340's existing plumbing, OVERRIDING
+            the normal ``_verify_frontier_depth()`` label for this dispatch.
+        base: The merge_commit of the already-built item at that cumulative
+            depth (the depth-d built cumulative tip) -- the base this
+            probed verify is attributed to.
+    """
+
+    depth: int
+    base: str
+
+
 class SpeculativeMergeWorker(_WipHaltMixin):
     """Two-coroutine speculative merge-verify pipeline.
 
@@ -6356,6 +6377,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._recent_verify_outcomes: collections.deque[bool] = collections.deque(
             maxlen=self.RECENT_VERIFY_OUTCOME_WINDOW,
         )
+        # task 2359: monotonically increasing SECOND-SLOT dispatch round
+        # counter -- the round_index select_probe_depth() cycles its
+        # deterministic frequency/depth-cycling on. Incremented only for
+        # speculative items (see _probe_verify_placement); a non-speculative
+        # (head trust-anchor) dispatch never consumes a probe round.
+        self._probe_round_counter: int = 0
 
     # ── MQ-reliability kappa (task 2169): ItemLifecycle chokepoint helpers ──
     # register/transition/retire an item's lifecycle state + the lockstep
@@ -7524,6 +7551,83 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if isinstance(vq_item, RealMergeItem):
                 depth += 1
         return depth
+
+    def _built_depth_tip(self, depth: int) -> str | None:
+        """Return the merge_commit of the already-built item at cumulative
+        *depth* (1-indexed: depth 1 = the shallowest built item), or
+        ``None`` if *depth* exceeds :meth:`_available_built_depth`.
+
+        Walks the identical two sources ``_available_built_depth()`` counts,
+        in the same order -- frozen/verifying entries
+        (:meth:`_frozen_inflight_entries`) first, then built-but-unverified
+        :class:`RealMergeItem`\\ s still sitting in ``_verifier_queue``
+        (read-only snapshot; never drains or reorders it) -- so any *depth*
+        accepted by ``select_probe_depth()``'s availability guard (``d <=
+        available_built_depth``) always resolves to a real commit here.
+
+        Pure/synchronous (no await); must not dequeue or reorder
+        ``_verifier_queue``.
+        """
+        remaining = depth
+        for entry in self._frozen_inflight_entries():
+            if isinstance(entry.item, RealMergeItem) and entry.item.merge_result.merge_commit:
+                remaining -= 1
+                if remaining == 0:
+                    return entry.item.merge_result.merge_commit.strip()
+        for vq_item in self._verifier_queue._queue:  # type: ignore[attr-defined]
+            if isinstance(vq_item, RealMergeItem) and vq_item.merge_result.merge_commit:
+                remaining -= 1
+                if remaining == 0:
+                    return vq_item.merge_result.merge_commit.strip()
+        return None
+
+    def _probe_verify_placement(self, item: SpeculativeItem) -> ProbePlacement | None:
+        """Decide whether THIS second-slot dispatch should probe a deeper
+        already-built speculative stack instead of the normal adjacent
+        depth-1 placement (task 2359).
+
+        Returns ``None`` for a non-speculative item -- the head trust-anchor
+        verify (against real main) is never probed -- and whenever the pure
+        :func:`select_probe_depth` policy returns ``None`` (default
+        ``probe_fraction=0.0`` is byte-identical; also ``None`` on flake-rate
+        suppression, an off-cycle round, or when the sampled depth exceeds
+        :meth:`_available_built_depth`).
+
+        Reads ``item.request.config.speculation_probe`` LIVE on every call
+        (never cached at worker-construction time), so a hot-reloaded config
+        change takes effect on the very next dispatch.
+
+        Increments ``self._probe_round_counter`` on every call for a
+        SPECULATIVE item only -- matching the counter's role as the
+        second-slot round index ``select_probe_depth()`` cycles on; a
+        non-speculative item's dispatch does not consume a probe round.
+
+        Pure/synchronous (no await); does not mutate ``_verifier_queue`` or
+        ``_inflight``.
+        """
+        if not item.speculative:
+            return None
+        cfg = item.request.config.speculation_probe
+        round_index = self._probe_round_counter
+        self._probe_round_counter += 1
+        d = select_probe_depth(
+            cfg.probe_fraction,
+            cfg.probe_depths,
+            round_index,
+            self._available_built_depth(),
+            self._recent_verify_fail_rate(),
+            cfg.suppress_flake_rate,
+        )
+        if d is None:
+            return None
+        base = self._built_depth_tip(d)
+        if base is None:
+            # Defensive fail-open: _available_built_depth() and
+            # _built_depth_tip() must stay in lockstep so this should be
+            # unreachable, but a bookkeeping mismatch must never crash the
+            # dispatch hot path -- fall back to the unprobed placement.
+            return None
+        return ProbePlacement(depth=d, base=base)
 
     # ── MQ-invariants iota (task 1994): resource-conservation audits ────────
     #
