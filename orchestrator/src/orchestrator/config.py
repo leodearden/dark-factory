@@ -1554,6 +1554,20 @@ class GitConfig(BaseModel):
             'invariant I1).'
         ),
     )
+    load_bearing_oracle_cmd: list[str] | None = Field(
+        default=None,
+        description=(
+            'Per-project load-bearing oracle command for the merge-skew '
+            'pipeline-landing tripwire (task 2382, PRD task delta): a '
+            'landing whose changed files trip this oracle files exactly one '
+            'advisory info escalation naming the in-flight tasks whose own '
+            'branch diffs overlap the landing.  Changed files are appended '
+            'as trailing argv (list[str], not a shell string, to avoid '
+            'shell-quoting/injection); exit 0 = load-bearing, any other '
+            'outcome (non-zero, absent, erroring) = not load-bearing.  None '
+            '(default) disables the tripwire entirely — logged no-op.'
+        ),
+    )
 
 
 class ChronicFlakeConfig(BaseModel):
