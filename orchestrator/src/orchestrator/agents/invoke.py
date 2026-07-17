@@ -161,6 +161,7 @@ async def invoke_agent(
             max_budget_usd=max_budget_usd, mcp_config=mcp_config,
             sandbox_modules=sandbox_modules, effort=effort,
             timeout_seconds=timeout_seconds, prices=prices,
+            max_turns=max_turns,
         )
     elif backend == 'gemini':
         return await _invoke_gemini(
@@ -316,6 +317,7 @@ async def _invoke_codex(
     effort: str | None,
     timeout_seconds: float | None = None,
     prices: dict[str, Any] | None = None,
+    max_turns: int | None = None,
 ) -> AgentResult:
     """Invoke OpenAI Codex CLI.
 
@@ -328,7 +330,22 @@ async def _invoke_codex(
     disk at all, no staging command run against this worktree — including
     the single-implementer-commit path's `git add -A -- . :!.claude`
     (git_ops.py:5320) — can ever pick it up.
+
+    *max_turns* and *max_budget_usd* are accepted for dispatcher-signature
+    uniformity/observability only: codex-cli (verified 0.143.0, full `codex
+    exec --help`) has NO native --max-turns flag and NO budget flag, so
+    neither cap is natively enforceable here. The wall-clock watchdog
+    (*timeout_seconds*, enforced by `_run_subprocess_local`'s
+    `asyncio.wait_for`) is the sole ceiling on a codex invocation — parity
+    with the pi backend (PRD open-Q3). Do not read cap enforcement into the
+    mere presence of these params.
     """
+    logger.info(
+        'codex backend: requested max_turns=%r max_budget_usd=%r are NOT '
+        'natively enforced by codex-cli (no --max-turns/budget flag); only '
+        'the wall-clock watchdog (timeout_seconds=%r) is enforced',
+        max_turns, max_budget_usd, timeout_seconds,
+    )
     temp_files: list[Path] = []
     try:
         # Write MCP config
