@@ -1563,6 +1563,41 @@ def test_strip_reserved_control_keys_passthrough_on_non_dict_json(incoming):
 
 
 @pytest.mark.asyncio
+async def test_update_task_never_persists_reserved_control_keys(backend, project_root):
+    """End-to-end regression (task 2735): a payload that conflates update_task's
+    call-flags with metadata fields must never have those keys persisted, while
+    the legit write (memory_hints union, sibling keys) still lands.
+
+    Reproduces the Stage-2 recon LLM's call shape:
+    update_task(metadata={..., "append": True, "metadata_mode": "additive"},
+    append=True) — the exact write that leaked into task 2682.
+    """
+    await backend.add_task(
+        project_root=project_root,
+        title='hinted',
+        metadata=json.dumps({
+            'source': 'x',
+            'memory_hints': {'entities': ['A'], 'queries': ['q1']},
+        }),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({
+            'memory_hints': {'entities': ['B'], 'queries': ['q2']},
+            'append': True,
+            'metadata_mode': 'additive',
+        }),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    metadata = task['metadata']
+    assert 'append' not in metadata
+    assert 'metadata_mode' not in metadata
+    assert metadata['source'] == 'x'
+    assert metadata['memory_hints'] == {'entities': ['A', 'B'], 'queries': ['q1', 'q2']}
+
+
+@pytest.mark.asyncio
 async def test_sqlite_task_backend_has_no_add_subtask_method():
     """SqliteTaskBackend must NOT have an add_subtask method after DF-D (task 1543).
 
