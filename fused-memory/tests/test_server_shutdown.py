@@ -2,11 +2,30 @@
 
 import asyncio
 import contextlib
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from fused_memory.server.main import _build_uvicorn_config, _graceful_shutdown, _run_shielded
+
+
+def _parse_timeout_stop_sec(unit_file_path: Path) -> float:
+    """Extract the numeric value of a non-comment ``TimeoutStopSec=`` directive
+    from a systemd unit file.
+
+    Skips blank/comment (``#``, ``;``) lines so a commented-out directive can't
+    silently match. Raises ``AssertionError`` (rather than returning a default)
+    if the directive is absent, so a future template rewrite that drops the
+    directive fails loudly instead of the comparison being skipped.
+    """
+    for raw_line in unit_file_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("TimeoutStopSec="):
+            return float(line.split("=", 1)[1])
+    raise AssertionError(f"TimeoutStopSec= directive not found in {unit_file_path}")
 
 
 class TestGracefulShutdownCallsMemoryServiceClose:
@@ -786,10 +805,42 @@ class TestShutdownBudgetArithmetic:
         default_timeout = ServerConfig().graceful_shutdown_timeout
         assert default_timeout + main_mod._FORCE_EXIT_BUDGET < main_mod._SYSTEMD_TIMEOUT_STOP_SECS
 
+    def test_schema_mirror_constants_match_main(self):
+        """ServerConfig._validate_graceful_shutdown_timeout_budget duplicates
+        _FORCE_EXIT_BUDGET/_SYSTEMD_TIMEOUT_STOP_SECS as private
+        _MIRROR_* constants in config/schema.py (importing main.py there would
+        be circular, since main.py imports FusedMemoryConfig from schema.py).
+        Guard that the mirror doesn't silently drift from the source of truth.
+        """
+        import fused_memory.server.main as main_mod
+        from fused_memory.config import schema as schema_mod
+
+        assert schema_mod._MIRROR_FORCE_EXIT_BUDGET == main_mod._FORCE_EXIT_BUDGET
+        assert (
+            schema_mod._MIRROR_SYSTEMD_TIMEOUT_STOP_SECS
+            == main_mod._SYSTEMD_TIMEOUT_STOP_SECS
+        )
+
     def test_systemd_timeout_stop_secs_matches_unit_file(self):
+        """Compare the constant against the *actual* TimeoutStopSec= value
+        parsed from scripts/fused-memory.service.template, not a restated
+        literal — so drift in either direction (template edited without the
+        constant, or vice versa) fails this test instead of passing silently.
+        """
         import fused_memory.server.main as main_mod
 
-        assert main_mod._SYSTEMD_TIMEOUT_STOP_SECS == 90.0
+        unit_file = (
+            Path(__file__).resolve().parent.parent.parent
+            / "scripts"
+            / "fused-memory.service.template"
+        )
+        parsed_timeout_stop_sec = _parse_timeout_stop_sec(unit_file)
+        assert main_mod._SYSTEMD_TIMEOUT_STOP_SECS == parsed_timeout_stop_sec, (
+            f"_SYSTEMD_TIMEOUT_STOP_SECS ({main_mod._SYSTEMD_TIMEOUT_STOP_SECS}) no "
+            f"longer matches TimeoutStopSec={parsed_timeout_stop_sec} in {unit_file}. "
+            "Update the constant in fused_memory/server/main.py so the "
+            "force-exit-before-SIGKILL invariant stays honest."
+        )
 
 
 class _DummyASGIApp:
