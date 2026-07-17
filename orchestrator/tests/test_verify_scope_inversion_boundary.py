@@ -685,11 +685,15 @@ class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
     baseline); the branch introduces NO new failure — every failing id it
     reports is already in the baseline. TWO separate merges against the
     SAME main SHA must BOTH route MAIN_HEALTH_RED (the branch is never
-    charged), and the baseline cache must be consulted rather than
-    re-probed: the REAL main-probe entry point
+    charged). The REAL classification entry point
     (``verify_failure_is_preexisting_on_main``) — wrapped, not replaced, so
-    its real cache-hit logic genuinely runs — is invoked at most once
-    across the two merges.
+    its real logic genuinely runs — is expected to be invoked ONCE PER
+    MERGE (twice total): that entry point is not itself the cache. The
+    actual cache-hit guarantee (μ B2) lives one layer inside, in
+    ``main_baseline_failing_ids``'s ``_BASELINE_FAILING_IDS_CACHE``, and is
+    asserted by the real, expensive main-probe worktree
+    (``git_ops.ephemeral_worktree``) never being reached — zero calls
+    across both merges against the pre-seeded baseline.
     """
 
     @pytest.mark.asyncio
