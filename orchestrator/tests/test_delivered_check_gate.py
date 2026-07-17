@@ -1467,6 +1467,73 @@ class TestComputeDeliveredCheckCache:
         assert scheduler._streak_delivered_hold.value('10') == 0
         assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
 
+    # --- terminal_dep_records fallback (task 2692 — step-7 RED / step-8 GREEN)
+    #
+    # Mirrors TestDepsSatisfiedDeliveredGate's terminal_dep_records tests: a
+    # dep genuinely absent from tasks_by_id (the active-only get_tasks fetch
+    # excluded it) but present in terminal_dep_records must still be swept —
+    # checked_deps collects it, the runner evaluates its checks, and the
+    # projection reflects the real outcome.
+
+    @pytest.mark.asyncio
+    async def test_terminal_dep_records_fallback_dep_delivered_projects_true(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        fake_resolve, sha_calls = self._fake_sha('sha1')
+        scheduler._resolve_main_sha = fake_resolve
+        fake_runner, runner_calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'10': task}  # dep genuinely absent — active-only fetch excluded it
+
+        result = await scheduler._compute_delivered_check_cache(
+            [task], status_map, tasks_by_id, terminal_dep_records={'20': dep}
+        )
+
+        assert result == {'20': True}
+        assert sha_calls['n'] == 1
+        assert runner_calls == ['cap-one']
+
+    @pytest.mark.asyncio
+    async def test_terminal_dep_records_fallback_dep_failed_projects_false(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, runner_calls = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'10': task}
+
+        result = await scheduler._compute_delivered_check_cache(
+            [task], status_map, tasks_by_id, terminal_dep_records={'20': dep}
+        )
+
+        assert result == {'20': False}
+        assert runner_calls == ['cap-one']
+
+    @pytest.mark.asyncio
+    async def test_without_terminal_dep_records_dep_absent_from_both_returns_empty(
+        self, scheduler: Scheduler
+    ):
+        """terminal_dep_records omitted (default None): a dep absent from
+        tasks_by_id is simply skipped by the collection loop — byte-identical
+        no-op, exactly like
+        test_no_checked_deps_returns_empty_and_never_resolves_sha."""
+        fake_resolve, sha_calls = self._fake_sha('sha1')
+        scheduler._resolve_main_sha = fake_resolve
+        task = self._dependent()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'10': task}
+
+        result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert result == {}
+        assert sha_calls['n'] == 0
+
 
 # ---------------------------------------------------------------------------
 # TestDeliveredCheckGraceEscalation (task 2583 — step-9 RED / step-10 GREEN)
