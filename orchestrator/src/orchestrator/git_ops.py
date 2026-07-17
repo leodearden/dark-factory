@@ -690,6 +690,9 @@ class WarmLaneRequeue(Exception):
         WarmLanePoolExhausted — all lanes ASSIGNED (backpressure).
         WarmLaneDiskPressure  — seed exited 75 (EX_TEMPFAIL, transient infra).
         WarmLanePoolHardDown  — warm base absent (host-scoped pool condition).
+        WarmLaneSoftPressure  — θ proactive soft-floor throttle (task 2443,
+            §9.5): pure backpressure/defer for a FRESH allocation, distinct
+            from WarmLaneDiskPressure's exit-75 hard floor.
     """
 
 
@@ -697,6 +700,22 @@ class WarmLanePoolExhausted(WarmLaneRequeue):
     """All pool lanes are ASSIGNED; task must be requeued (backpressure).
 
     Scheduler should release the task and re-dispatch it when a lane frees up.
+    """
+
+
+class WarmLaneSoftPressure(WarmLaneRequeue):
+    """θ proactive soft-floor throttle detected soft pressure for a FRESH
+    allocation (task 2443, §9.5 inv.11) — pure backpressure/defer.
+
+    Raised by :meth:`GitOps.create_worktree` when ``config.warm_lane_soft_floor``
+    is enabled and :meth:`GitOps._warm_lane_soft_pressure_defer` reports soft
+    disk pressure (rc=3) for a branch with no lane already mapped to it (a
+    reuse/live-requeue is never throttled this way). Distinct from
+    :class:`WarmLaneDiskPressure` (ε's exit-75 hard floor): this is NEVER an
+    escalation or a fault — it is deliberately weaker backpressure than the
+    hard floor's requeue, and its disposition-table row sets
+    ``counts_against_requeue_cap=False`` so it never contributes to a
+    requeue-cap escalation.
     """
 
 
@@ -2129,6 +2148,11 @@ class GitOps:
             if pool_info is WarmLaneUnavailable.DISK_PRESSURE:
                 raise WarmLaneDiskPressure(
                     f'warm-lane seed disk pressure for branch {branch_name!r}; requeue'
+                )
+            if pool_info is WarmLaneUnavailable.SOFT_PRESSURE:
+                raise WarmLaneSoftPressure(
+                    f'warm-lane soft-floor backpressure for branch {branch_name!r}; '
+                    f'defer/requeue'
                 )
             if pool_info is WarmLaneUnavailable.BASE_ABSENT:
                 raise WarmLanePoolHardDown(
