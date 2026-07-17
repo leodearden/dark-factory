@@ -19,32 +19,83 @@ logger = logging.getLogger(__name__)
 # fallback to stale code — a correctness bug, not graceful degradation.
 DEFAULT_FUSED_MEMORY_URLS: Final = ('http://localhost:8002',)
 
+# The canonical top-level orchestrator config name (task 2698 / commit
+# 97f0bd9f85). Every onboarded project's top-level orchestrator config MUST
+# live at ``<project_root>/dark-factory-orchestrator.yaml`` — this is the
+# name dashboard discovery keys on first.
+_CANONICAL_CONFIG_NAME: Final = 'dark-factory-orchestrator.yaml'
+
+# Legacy spellings tolerated as a fallback (transitional symlinks left behind
+# by the migration to the canonical name). Resolution order matters: each is
+# tried in turn only after the canonical name is absent.
+_LEGACY_CONFIG_NAMES: Final = (
+    'orchestrator.yaml',
+    'orchestrator-config.yaml',
+    'orchestrator/config.yaml',
+)
+
+
+def _read_escalation_url(yaml_path: Path) -> str | None:
+    """Parse *yaml_path* and return its escalation MCP URL, or None.
+
+    Returns None when the file doesn't exist, is malformed (logged at
+    warning level), or has no ``escalation.port``. Callers decide what
+    "no URL" means for logging purposes.
+    """
+    if not yaml_path.is_file():
+        return None
+    try:
+        with yaml_path.open() as f:
+            data: Any = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning('Failed to read %s: %s', yaml_path, exc)
+        return None
+    esc = (data.get('escalation') or {}) if isinstance(data, dict) else {}
+    host = esc.get('host', '127.0.0.1')
+    port = esc.get('port')
+    if not port:
+        return None
+    return f'http://{host}:{port}/mcp'
+
+
+def _discover_root_escalation_url(root: Path) -> str | None:
+    """Resolve *root*'s escalation MCP URL, preferring the canonical config name.
+
+    Tries ``_CANONICAL_CONFIG_NAME`` first; if absent, falls back to each of
+    ``_LEGACY_CONFIG_NAMES`` in order, logging a WARNING naming the project
+    (``root.name``) when a legacy spelling is what resolved it — a nudge to
+    migrate. Returns None if no candidate yields a URL.
+    """
+    canonical_url = _read_escalation_url(root / _CANONICAL_CONFIG_NAME)
+    if canonical_url is not None:
+        return canonical_url
+    for legacy_name in _LEGACY_CONFIG_NAMES:
+        legacy_url = _read_escalation_url(root / legacy_name)
+        if legacy_url is not None:
+            logger.warning(
+                'Project %s: found orchestrator config at legacy path %s '
+                '(expected %s) — please migrate.',
+                root.name,
+                root / legacy_name,
+                _CANONICAL_CONFIG_NAME,
+            )
+            return legacy_url
+    return None
+
 
 def _discover_escalation_urls(roots: list[Path]) -> dict[str, str]:
-    """Read each root's orchestrator.yaml to derive its escalation MCP URL.
+    """Derive each root's escalation MCP URL from its orchestrator config.
 
-    Keyed by project basename — the same key the Merge UI uses. Roots whose
-    yaml is missing or malformed are skipped (logged at debug level).
+    Keyed by project basename — the same key the Merge UI uses. Prefers the
+    canonical ``dark-factory-orchestrator.yaml`` name, falling back to legacy
+    spellings (see ``_discover_root_escalation_url``).
     """
     out: dict[str, str] = {}
     for root in roots:
-        yaml_path = root / 'orchestrator.yaml'
-        if not yaml_path.is_file():
-            logger.debug('No orchestrator.yaml at %s', yaml_path)
+        url = _discover_root_escalation_url(root)
+        if url is None:
             continue
-        try:
-            with yaml_path.open() as f:
-                data: Any = yaml.safe_load(f) or {}
-        except (OSError, yaml.YAMLError) as exc:
-            logger.warning('Failed to read %s: %s', yaml_path, exc)
-            continue
-        esc = (data.get('escalation') or {}) if isinstance(data, dict) else {}
-        host = esc.get('host', '127.0.0.1')
-        port = esc.get('port')
-        if not port:
-            logger.debug('No escalation.port in %s', yaml_path)
-            continue
-        out[root.name] = f'http://{host}:{port}/mcp'
+        out[root.name] = url
     return out
 
 
