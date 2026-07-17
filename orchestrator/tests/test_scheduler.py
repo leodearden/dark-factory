@@ -11496,6 +11496,137 @@ class TestAcquireNextFmReadFailureFailSafe:
         assert scheduler._fm_read_failure_streak == 0
 
 
+# ---- fm-read-storm loud escalation (task 2704 step-6) ----
+
+class TestFmReadFailureStormEscalation:
+    """A PERSISTENT fm-read-failure streak files a loud, deduped L1 escalation.
+
+    Mirrors TestSchedulerPauseEscalation (test_harness_park_stop.py) but for
+    the scheduler-filed fm-read-storm escalation: fires once the
+    consecutive-failure streak crosses _FM_READ_FAILURE_ESCALATION_THRESHOLD,
+    deduped via has_open_l1 (one open escalation per outage episode), and
+    re-fires after a human resolves it while fm is still down.
+    """
+
+    def _make_scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
+
+    @pytest.mark.asyncio
+    async def test_escalation_files_at_threshold(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.scheduler import (
+            _FM_READ_FAILURE_ESCALATION_THRESHOLD as THRESH,
+        )
+
+        scheduler = self._make_scheduler()
+        scheduler.escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        scheduler.get_tasks = AsyncMock(return_value=None)
+
+        for _ in range(THRESH):
+            await scheduler.acquire_next()
+
+        sentinel = [
+            e for e in scheduler.escalation_queue.get_pending()
+            if e.task_id == '__fm_read_storm__'
+        ]
+        assert len(sentinel) == 1, f'Expected exactly one storm escalation; got {sentinel!r}'
+        esc = sentinel[0]
+        assert esc.agent_role == 'orchestrator-scheduler', f'got {esc.agent_role!r}'
+        assert esc.category == 'infra_issue', f'got {esc.category!r}'
+        assert esc.level == 1, f'expected L1; got level={esc.level}'
+        assert esc.severity == 'blocking', f'got {esc.severity!r}'
+        assert esc.summary, 'summary must be non-empty'
+        assert 'fused-memory' in esc.summary.lower(), (
+            f'summary should name fused-memory; got {esc.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_escalation_below_threshold(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.scheduler import (
+            _FM_READ_FAILURE_ESCALATION_THRESHOLD as THRESH,
+        )
+
+        scheduler = self._make_scheduler()
+        scheduler.escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        scheduler.get_tasks = AsyncMock(return_value=None)
+
+        for _ in range(THRESH - 1):
+            await scheduler.acquire_next()
+
+        assert scheduler.escalation_queue.get_pending() == [], (
+            'No escalation should fire before the streak crosses the threshold'
+        )
+
+    @pytest.mark.asyncio
+    async def test_escalation_deduped_across_further_failures(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.scheduler import (
+            _FM_READ_FAILURE_ESCALATION_THRESHOLD as THRESH,
+        )
+
+        scheduler = self._make_scheduler()
+        scheduler.escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        scheduler.get_tasks = AsyncMock(return_value=None)
+
+        for _ in range(THRESH):
+            await scheduler.acquire_next()
+        for _ in range(5):
+            await scheduler.acquire_next()
+
+        sentinel = [
+            e for e in scheduler.escalation_queue.get_pending()
+            if e.task_id == '__fm_read_storm__'
+        ]
+        assert len(sentinel) == 1, f'has_open_l1 must dedup repeat failures; got {sentinel!r}'
+
+    @pytest.mark.asyncio
+    async def test_reescalates_after_resolve_while_still_down(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.scheduler import (
+            _FM_READ_FAILURE_ESCALATION_THRESHOLD as THRESH,
+        )
+
+        scheduler = self._make_scheduler()
+        queue = EscalationQueue(tmp_path / 'escalations')
+        scheduler.escalation_queue = queue
+        scheduler.get_tasks = AsyncMock(return_value=None)
+
+        for _ in range(THRESH):
+            await scheduler.acquire_next()
+        first = [e for e in queue.get_pending() if e.task_id == '__fm_read_storm__']
+        assert len(first) == 1
+        queue.resolve(first[0].id, 'fixed')
+
+        await scheduler.acquire_next()
+
+        second = [e for e in queue.get_pending() if e.task_id == '__fm_read_storm__']
+        assert len(second) == 1, f'Expected a fresh escalation after resolve; got {second!r}'
+        assert second[0].id != first[0].id, (
+            'Re-escalation after resolve must be a NEW escalation, not the resolved one'
+        )
+
+    @pytest.mark.asyncio
+    async def test_bare_scheduler_no_queue_is_noop(self):
+        from orchestrator.scheduler import (
+            _FM_READ_FAILURE_ESCALATION_THRESHOLD as THRESH,
+        )
+
+        scheduler = self._make_scheduler()
+        assert scheduler.escalation_queue is None
+        scheduler.get_tasks = AsyncMock(return_value=None)
+
+        for _ in range(THRESH):
+            await scheduler.acquire_next()  # must not raise
+
+
 # ---- Buried-owner restored-event at drain level (task 1871 amend-4) ----
 
 class TestDrainBuriedOwnerRestoredEvents:
