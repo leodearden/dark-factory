@@ -1112,43 +1112,15 @@ class ReconciliationHarness:
             ):
                 continue
 
-            diag = build_stale_run_diagnostics(run, lock_holder, lock_age, cutoff)
+            diag = await self._recover_one_run(
+                run, lock_holder, lock_age,
+                error_message=f'Run stale (>{cutoff}s, lock expired), recovered by harness',
+            )
             logger.warning(
                 f'Recovering stale run {run.id} for {run.project_id} '
                 f'(started {run.started_at.isoformat()}, lock expired, '
                 f'instance={run.instance_id}, disposition={diag["disposition"]})'
             )
-            run.stage_reports['_error'] = {
-                'error_type': 'StaleRunRecovery',
-                'error_message': f'Run stale (>{cutoff}s, lock expired), recovered by harness',
-                'failed_stage': None,
-                **diag,
-            }
-            await self.journal.update_run_stage_reports(run.id, run.stage_reports)
-            await self.journal.complete_run(run.id, 'failed')
-            restored = await self.buffer.restore_drained(run.project_id)
-            if restored:
-                logger.info(f'Restored {restored} drained events for stale run {run.id}')
-            # Ownership-scoped release: see plans/recon-stale-recovery-rca.md.
-            # Releasing without an instance_id filter would strip a live cycle's
-            # lock on the same project, causing the next reaper tick to
-            # misclassify the live run as stale (cross-instance lock theft, the
-            # 2026-05-28 false-positive cascade).  Only release when the
-            # orphan's instance_id is known AND owns the current lock — the
-            # `continue` above guarantees we're not on the "same live instance"
-            # branch, so a match here means a defunct previous incarnation of
-            # this very instance left the row behind.  Genuinely-abandoned
-            # locks held by other dead instances are cleaned up by the
-            # heartbeat-staleness sweep (stale_lock_seconds = 7200s) inside
-            # mark_run_active / get_lock_holder_instance_id.
-            if (
-                run.instance_id is not None
-                and lock_holder == run.instance_id
-            ):
-                await self.buffer.mark_run_complete(
-                    run.project_id, instance_id=run.instance_id,
-                )
-            await self._replay_deferred_writes(ProjectId(run.project_id))
             detail = (
                 f"project={diag['project_id']} run_type={diag['run_type']} "
                 f"instance={diag['instance_id']} age={diag['age_seconds']:.0f}s "
@@ -1210,6 +1182,73 @@ class ReconciliationHarness:
                     f'Run stale (>{cutoff}s, lock expired), recovered',
                     detail,
                 )
+
+    async def _recover_one_run(
+        self,
+        run: ReconciliationRun,
+        lock_holder: str | None,
+        lock_age: float | None,
+        *,
+        disposition: str = 'failed',
+        error_type: str = 'StaleRunRecovery',
+        error_message: str | None = None,
+    ) -> dict:
+        """Recover a single stuck 'running' row to a terminal status.
+
+        Shared mechanical body for both recovery passes — the age-based
+        ``_recover_stale_runs`` reaper and the startup ``_recover_predecessor_runs``
+        pass: error-stamp the run, complete it, restore the drained events it
+        owned, release the lock when this run's own instance still owns it,
+        and replay any deferred writes for the project. Returns the
+        ``build_stale_run_diagnostics`` dict so the caller can drive its own
+        logging/escalation policy on top of this shared body.
+
+        The restore is run-scoped (task 2711 / E7): only events this run
+        itself drained are restored, so a concurrent live run's in-flight
+        drained events on the same project are never clobbered back to
+        'buffered'.
+
+        ``disposition`` is the terminal journal status to complete the run
+        with; it defaults to (and, as of task 2711, is always) 'failed'. This
+        is the seam for task σ (session-resume): a future caller can pass a
+        resumable disposition instead before falling into this same body.
+        """
+        cutoff = self.config.stale_run_recovery_seconds
+        diag = build_stale_run_diagnostics(run, lock_holder, lock_age, cutoff)
+
+        run.stage_reports['_error'] = {
+            'error_type': error_type,
+            'error_message': error_message or f'Run recovered by harness ({error_type})',
+            'failed_stage': None,
+            **diag,
+        }
+        await self.journal.update_run_stage_reports(run.id, run.stage_reports)
+        await self.journal.complete_run(run.id, disposition)
+
+        restored = await self.buffer.restore_drained(run.project_id, run_id=run.id)
+        if restored:
+            logger.info(f'Restored {restored} drained events for run {run.id}')
+
+        # Ownership-scoped release: see plans/recon-stale-recovery-rca.md.
+        # Releasing without an instance_id filter would strip a live cycle's
+        # lock on the same project, causing the next reaper tick to
+        # misclassify the live run as stale (cross-instance lock theft, the
+        # 2026-05-28 false-positive cascade).  Only release when the
+        # orphan's instance_id is known AND owns the current lock — a match
+        # here means a defunct previous incarnation of this very instance (or,
+        # for the predecessor pass, the dead predecessor itself) left the row
+        # behind.  Genuinely-abandoned locks held by other dead instances are
+        # cleaned up by the heartbeat-staleness sweep (stale_lock_seconds =
+        # 7200s) inside mark_run_active / get_lock_holder_instance_id.
+        if (
+            run.instance_id is not None
+            and lock_holder == run.instance_id
+        ):
+            await self.buffer.mark_run_complete(
+                run.project_id, instance_id=run.instance_id,
+            )
+        await self._replay_deferred_writes(ProjectId(run.project_id))
+        return diag
 
     # ── Dead-owner suppression storm counter ─────────────────────────
 
