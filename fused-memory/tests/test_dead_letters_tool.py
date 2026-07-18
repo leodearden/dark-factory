@@ -15,6 +15,7 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.event_queue import EventQueue
 from fused_memory.server.tools import (
     _DEAD_LETTER_PAYLOAD_MAX_BYTES,
@@ -788,3 +789,94 @@ class TestGetStatusToolDeadLetters:
         # When limit (100) exceeds actual count (5), items are also complete.
         dl_count = len(dl_result['items'])
         assert dl_count == 5, f'Expected 5 items from get_dead_letters; got {dl_count}'
+
+
+# ── step-15 tests (replay_event_dead_letters MCP tool, task 2709) ────────────
+
+
+class TestReplayEventDeadLettersTool:
+    """MCP-level tests for the replay_event_dead_letters tool (S15)."""
+
+    @pytest.mark.asyncio
+    async def test_replays_dead_lettered_events_back_into_queue(self, tmp_path):
+        """With dead-lettered recon events present, the tool returns
+        {'status':'replayed','replayed':N,'failed':0} and the events re-enter
+        the queue (drainer commits them to the buffer; file is cleared)."""
+        dl = tmp_path / 'dl.jsonl'
+        buf = EventBuffer(db_path=tmp_path / 'buf.db', buffer_size_threshold=100)
+        await buf.initialize()
+        eq = EventQueue(
+            buf,
+            dead_letter_path=dl,
+            journal_path=tmp_path / 'ej.db',
+            maxsize=100,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.05,
+            shutdown_flush_seconds=1.0,
+        )
+        await eq.start()
+        try:
+            # Seed 3 dead-letter records for proj-a directly.
+            for _ in range(3):
+                eq._write_dead_letter(
+                    _make_recon_event('proj-a'), reason='non_retriable', attempts=1,
+                )
+            assert len(dl.read_text().strip().splitlines()) == 3
+
+            svc = AsyncMock()
+            svc.durable_queue = None
+            server = create_mcp_server(svc, event_queue=eq)
+
+            result = await server._tool_manager.call_tool(
+                'replay_event_dead_letters', {},
+            )
+
+            assert result == {'status': 'replayed', 'replayed': 3, 'failed': 0}, (
+                f'Unexpected replay result: {result}'
+            )
+            # Drainer commits the replayed events to the buffer.
+            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
+            assert (await buf.get_buffer_stats('proj-a'))['size'] == 3
+            # The dead-letter file no longer holds the replayed records.
+            assert (dl.read_text().strip() if dl.exists() else '') == ''
+        finally:
+            await eq.close()
+            await buf.close()
+
+    @pytest.mark.asyncio
+    async def test_project_id_forwarded_to_event_queue(self, tmp_path):
+        """project_id is forwarded to EventQueue.replay_dead_letters and the
+        returned counts are mapped into the tool envelope."""
+        eq = EventQueue(AsyncMock(), dead_letter_path=tmp_path / 'dl.jsonl')
+        # Spy on the synchronous replay method (called via asyncio.to_thread).
+        eq.replay_dead_letters = MagicMock(return_value={'replayed': 2, 'failed': 1})
+
+        svc = AsyncMock()
+        svc.durable_queue = None
+        server = create_mcp_server(svc, event_queue=eq)
+
+        result = await server._tool_manager.call_tool(
+            'replay_event_dead_letters', {'project_id': 'proj-z'},
+        )
+
+        eq.replay_dead_letters.assert_called_once_with(project_id='proj-z')
+        assert result == {'status': 'replayed', 'replayed': 2, 'failed': 1}, (
+            f'Unexpected replay result: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_event_queue_returns_configuration_error(self):
+        """When event_queue is None, the tool returns a ConfigurationError dict
+        without raising (mirroring replay_dead_letters)."""
+        svc = AsyncMock()
+        svc.durable_queue = None
+        server = create_mcp_server(svc, event_queue=None)
+
+        result = await server._tool_manager.call_tool(
+            'replay_event_dead_letters', {},
+        )
+
+        assert isinstance(result, dict), f'expected a dict envelope; got {result!r}'
+        assert result.get('error_type') == 'ConfigurationError', (
+            f"expected 'ConfigurationError'; got: {result}"
+        )
