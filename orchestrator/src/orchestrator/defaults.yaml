@@ -355,21 +355,42 @@ fairness:
 
 # Starvation watchdog (task 1880).
 #
-# Files exactly ONE INFO-level escalation when a dispatch-eligible pending task
-# (all deps satisfied, no live claimant) is skipped as the TOP-scored candidate
-# past BOTH thresholds simultaneously:
-#   - skip_threshold: consecutive top-skips (reuses the fairness _skip_count)
-#   - idle_secs: continuous wall-clock eligibility in seconds
+# Files exactly ONE INFO-level escalation for a dispatch-eligible pending task
+# (all deps satisfied, no live claimant) when EITHER gate fires (OR, not AND):
+#   - dual gate — skipped as the TOP-scored candidate past BOTH:
+#       - skip_threshold: consecutive top-skips (reuses the fairness _skip_count)
+#       - idle_secs: continuous wall-clock eligibility in seconds
+#   - idle-only backstop — idle_only_secs of continuous eligibility ALONE,
+#     regardless of skip_count (see idle_only_secs below).
 # Auto-resolves when the task finally dispatches.  Set enabled: false to silence.
 #
 # idle_secs default raised to 259200 (72h) — task 2631, owner decision (Leo
 # 2026-07-15): archive analysis of 209 prior firings found max starving
 # duration 5.8h and legitimate sibling-project lock waits of ~48h, so 72h
 # isolates genuine multi-day wedges while silencing ordinary contention.
+#
+# idle_only_secs (task 2755) is the never-top-scored starvation backstop: a task
+# continuously dispatch-eligible for this many seconds files the escalation
+# regardless of skip_count.  It fixes the structural blind spot where a
+# low-priority task can never outscore a medium/high candidate (TIER_BASE
+# low=2000 max 2999 < medium=4000), is never the top-scored candidate, accrues
+# ZERO skips, and so the dual skip+idle gate can never trip — reify-5166 RCA
+# (77h continuously eligible, 547 higher-tier dispatches passed it, zero skips,
+# no escalation).  Must be >= idle_secs (enforced by the config validator).
+# Default == idle_secs (72h) fires on idle alone with zero new false positives
+# (all 209 prior firings starved < 6h); raise it above idle_secs to restore a
+# two-tier fast-skip / slow-idle scheme.
+#
+# COUPLING GOTCHA (task 2755): idle_only_secs defaults to 259200 (== the idle_secs
+# default), so raising idle_secs ABOVE 259200 WITHOUT also raising idle_only_secs
+# violates the idle_only_secs >= idle_secs validator and FAILS config load AND
+# hot-reload (both knobs are green-tier reloadable).  This is loud-over-silent by
+# design — bump BOTH knobs together whenever you push idle_secs past 259200.
 starvation_watchdog:
   enabled: true
   skip_threshold: 50
   idle_secs: 259200.0
+  idle_only_secs: 259200.0
 
 # Warm-lane base hard-down watchdog (task 2061).
 #

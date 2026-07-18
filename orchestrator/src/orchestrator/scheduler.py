@@ -139,6 +139,13 @@ _STARVATION_NON_ELIGIBLE = frozenset(
     {'blocked', 'deferred', 'review', 'merge-deferred'}
 )
 
+# Stable grep-anchor token leading every starvation-watchdog escalation summary.
+# Tests and downstream classifiers key on this literal, so it is single-sourced
+# here rather than repeated across the two escalation-message branches in
+# _apply_starvation_watchdog (idle-only backstop vs. dual-gate lock-contention) —
+# the one fragment that MUST stay identical between them can no longer drift.
+_STARVATION_WATCHDOG_MARKER = 'STARVATION_WATCHDOG'
+
 
 class SetTaskStatusRejected(Exception):
     """Base class for non-transient set_task_status rejections.
@@ -3315,11 +3322,15 @@ class Scheduler:
            dispatch-eligibility; gaps reset the anchor).
         2. Stamp ``_starvation_first_seen[tid]`` on the first tick the task
            appears as a candidate.
-        3. Fire ``_on_starvation_warn`` when ALL of:
-           - ``_skip_count[tid] >= starvation_watchdog.skip_threshold``
-           - ``(now - first_seen) >= starvation_watchdog.idle_secs``
-           - ``tid`` is NOT already in ``_starvation_escalated``
-           - ``_on_starvation_warn`` is not None (callback installed)
+        3. Fire ``_on_starvation_warn`` when NOT already escalated, a callback
+           is installed, and EITHER gate is crossed (OR, not AND):
+           - dual gate — ``_skip_count[tid] >= skip_threshold`` AND
+             ``(now - first_seen) >= idle_secs`` (the original lock-contention
+             path, requires the task to have been the top-scored candidate); OR
+           - idle-only backstop — ``(now - first_seen) >= idle_only_secs``
+             regardless of skip_count (the never-top-scored path, reify-5166 /
+             task 2755: a task that can never outscore a higher-tier candidate
+             accrues zero skips and can never cross the dual gate).
         """
         cfg = self.config.starvation_watchdog
 
@@ -3357,31 +3368,78 @@ class Scheduler:
             skip = self._skip_count.get(tid, 0)
             idle_elapsed = self._streak_starvation.age(tid, now)
 
-            # Fire when BOTH gates are crossed AND not already escalated.
+            # Two independent fire conditions (OR, not AND):
+            #  - dual_gate: the original lock-contention path — the task keeps
+            #    losing the lock race as the TOP-scored candidate (skip_count
+            #    bumps) AND has been eligible past idle_secs.
+            #  - idle_only: the never-top-scored backstop (reify-5166, task
+            #    2755).  A task that can never outscore a higher-tier candidate
+            #    is never the top-scored candidate, accrues ZERO skips, and so
+            #    can never cross the dual gate.  It fires on continuous
+            #    dispatch-eligibility ALONE once idle_only_secs is crossed,
+            #    regardless of skip_count.  With idle_only_secs default
+            #    == idle_secs (72h) it never trips on ordinary contention.
+            dual_gate = skip >= cfg.skip_threshold and idle_elapsed >= cfg.idle_secs
+            idle_only = idle_elapsed >= cfg.idle_only_secs
+
+            # Fire when EITHER gate is crossed AND not already escalated.
             if (
-                skip >= cfg.skip_threshold
-                and idle_elapsed >= cfg.idle_secs
+                (dual_gate or idle_only)
                 and not self._streak_starvation.is_escalated(tid)
                 and self._callbacks.on_starvation_warn is not None
             ):
-                summary = (
-                    f'STARVATION_WATCHDOG: task {tid} skip_count={skip} '
-                    f'(threshold={cfg.skip_threshold}), dispatch-eligible for '
-                    f'{idle_elapsed:.0f}s (idle_secs={cfg.idle_secs}) — '
-                    f'unable to acquire locks'
-                )
-                detail = (
-                    f'Task {tid} has been dispatch-eligible (all deps satisfied, '
-                    f'no live claimant) for {idle_elapsed:.0f}s and has '
-                    f'accumulated skip_count={skip} (tallied while this task is '
-                    f'the highest-scored candidate unable to acquire its module '
-                    f'locks; a task displaced by a higher-priority task retains '
-                    f'its accumulated count without incrementing).  This typically '
-                    f'indicates persistent lock contention (broad-footprint task '
-                    f'vs. a long-running narrow task) that has not been resolved '
-                    f'by the fairness parks.\n\n'
-                    f'skip_threshold={cfg.skip_threshold}, idle_secs={cfg.idle_secs}'
-                )
+                # Shared scaffolding single-sourced across both escalation paths
+                # so it cannot drift on future edits: the marker is the grep-anchor
+                # tests/classifiers key on, and the eligibility clause is identical
+                # verbatim.  Only the path-specific narrative and the (deliberately
+                # different) structured-facts tail branch below.
+                eligibility_note = '(all deps satisfied, no live claimant)'
+                if idle_only and not dual_gate:
+                    # Pure-idle backstop: never top-scored, so skip_count is
+                    # typically 0 — this is priority starvation (a low-priority
+                    # task perpetually outscored), NOT lock contention.  Carry
+                    # structured facts distinguishing this path from the dual
+                    # gate (design-invariants: structured-facts-at-failure).
+                    summary = (
+                        f'{_STARVATION_WATCHDOG_MARKER}: task {tid} dispatch-eligible '
+                        f'for {idle_elapsed:.0f}s (idle_only_secs={cfg.idle_only_secs}) '
+                        f'with skip_count={skip} — never top-scored '
+                        f'(continuous-eligibility backstop)'
+                    )
+                    detail = (
+                        f'Task {tid} has been continuously dispatch-eligible '
+                        f'{eligibility_note} for {idle_elapsed:.0f}s '
+                        f'yet has skip_count={skip} — it has never been the '
+                        f'highest-scored candidate, so the dual skip+idle gate '
+                        f'(skip_threshold={cfg.skip_threshold}, '
+                        f'idle_secs={cfg.idle_secs}) can never trip.  This is '
+                        f'priority starvation (e.g. a low-priority task '
+                        f'perpetually outscored by a stream of higher-tier '
+                        f'candidates on disjoint modules), NOT lock contention.  '
+                        f'The idle-only backstop fired on continuous '
+                        f'dispatch-eligibility alone.\n\n'
+                        f'skip_count={skip}, idle_elapsed={idle_elapsed:.0f}s, '
+                        f'idle_only_secs={cfg.idle_only_secs}'
+                    )
+                else:
+                    summary = (
+                        f'{_STARVATION_WATCHDOG_MARKER}: task {tid} skip_count={skip} '
+                        f'(threshold={cfg.skip_threshold}), dispatch-eligible for '
+                        f'{idle_elapsed:.0f}s (idle_secs={cfg.idle_secs}) — '
+                        f'unable to acquire locks'
+                    )
+                    detail = (
+                        f'Task {tid} has been dispatch-eligible {eligibility_note} '
+                        f'for {idle_elapsed:.0f}s and has '
+                        f'accumulated skip_count={skip} (tallied while this task is '
+                        f'the highest-scored candidate unable to acquire its module '
+                        f'locks; a task displaced by a higher-priority task retains '
+                        f'its accumulated count without incrementing).  This typically '
+                        f'indicates persistent lock contention (broad-footprint task '
+                        f'vs. a long-running narrow task) that has not been resolved '
+                        f'by the fairness parks.\n\n'
+                        f'skip_threshold={cfg.skip_threshold}, idle_secs={cfg.idle_secs}'
+                    )
                 await self._callbacks.on_starvation_warn(tid, summary=summary, detail=detail)
                 self._streak_starvation.mark_escalated(tid)
 

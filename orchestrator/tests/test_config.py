@@ -1788,6 +1788,118 @@ class TestStarvationWatchdogConfig:
             f'got {cfg.starvation_watchdog.idle_secs!r}'
         )
 
+    def test_idle_only_secs_default(self):
+        """Bare OrchestratorConfig() exposes idle_only_secs == 259200.0 (== idle_secs default).
+
+        The never-top-scored starvation backstop: a task continuously
+        dispatch-eligible for this many seconds fires the escalation on idle
+        ALONE (skip-gate waived).  Default == idle_secs so a task eligible past
+        the tuned 72h boundary fires regardless of skip_count (reify-5166 RCA).
+        """
+        cfg = OrchestratorConfig()
+        assert cfg.starvation_watchdog.idle_only_secs == 259200.0, (
+            f'Expected idle_only_secs=259200.0; '
+            f'got {cfg.starvation_watchdog.idle_only_secs!r}'
+        )
+
+    def test_idle_only_secs_full_yaml_override(self, tmp_path: Path, monkeypatch):
+        """A project config with idle_only_secs (>= idle_secs) is adopted by load_config."""
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({
+            'starvation_watchdog': {
+                'idle_secs': 300.0,
+                'idle_only_secs': 400.0,
+            },
+        }))
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        cfg = load_config(project_cfg)
+
+        assert cfg.starvation_watchdog.idle_secs == 300.0, (
+            f'Expected idle_secs=300.0; got {cfg.starvation_watchdog.idle_secs!r}'
+        )
+        assert cfg.starvation_watchdog.idle_only_secs == 400.0, (
+            f'Expected idle_only_secs=400.0; '
+            f'got {cfg.starvation_watchdog.idle_only_secs!r}'
+        )
+
+    def test_idle_only_secs_partial_override_keeps_default(self, tmp_path: Path, monkeypatch):
+        """Overriding only enabled=False preserves idle_only_secs at its default."""
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({
+            'starvation_watchdog': {
+                'enabled': False,
+            },
+        }))
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        cfg = load_config(project_cfg)
+
+        assert cfg.starvation_watchdog.idle_only_secs == 259200.0, (
+            f'Expected idle_only_secs=259200.0 (default preserved); '
+            f'got {cfg.starvation_watchdog.idle_only_secs!r}'
+        )
+
+    def test_idle_only_secs_below_idle_secs_rejected(self):
+        """A model_validator rejects idle_only_secs < idle_secs, naming both fields.
+
+        An idle-only threshold narrower than the dual-gate's idle component would
+        silently pre-empt the skip path for all tasks — a loud guard rejects it
+        (project norm: loud-over-silent).
+        """
+        from orchestrator.config import StarvationWatchdogConfig
+        with pytest.raises(ValidationError) as excinfo:
+            StarvationWatchdogConfig(idle_secs=300.0, idle_only_secs=100.0)
+        msg = str(excinfo.value)
+        assert 'idle_only_secs' in msg, (
+            f'Validation error must name idle_only_secs; got: {msg}'
+        )
+        assert 'idle_secs' in msg, (
+            f'Validation error must name idle_secs; got: {msg}'
+        )
+
+    def test_idle_secs_only_override_above_default_idle_only_rejected(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Raising ONLY idle_secs above the idle_only_secs default (259200) fails loudly.
+
+        Regression guard for the silent-at-authoring-time coupling between two
+        independently-overridable knobs (task 2755 amendment, reviewer
+        robustness finding).  Because idle_only_secs defaults to 259200 (== the
+        idle_secs default), an operator who bumps idle_secs above 72h WITHOUT
+        also raising idle_only_secs would otherwise ship a config where the
+        idle-only backstop is narrower than the dual-gate idle component.  The
+        model_validator rejects it at config load (and at hot-reload, since the
+        field is in RELOADABLE_FIELDS) with an ACTIONABLE message naming both
+        fields and stating the fix — loud-over-silent, matching the frozen
+        design decision (hard reject, not a silent clamp).
+        """
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({
+            'starvation_watchdog': {
+                # > idle_only_secs default (259200); idle_only_secs deliberately
+                # left unset so it stays at its default and trips the validator.
+                'idle_secs': 300000.0,
+            },
+        }))
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        with pytest.raises(ValidationError) as excinfo:
+            load_config(project_cfg)
+        msg = str(excinfo.value)
+        assert 'idle_only_secs' in msg and 'idle_secs' in msg, (
+            'Validation error must name BOTH idle_only_secs and idle_secs so the '
+            f'operator knows to raise idle_only_secs alongside idle_secs; got: {msg}'
+        )
+        # Actionable: the message must tell the operator what to do.
+        assert 'idle_only_secs >= idle_secs' in msg, (
+            f'Message must give the actionable fix (raise idle_only_secs); got: {msg}'
+        )
+
+    def test_idle_only_secs_in_reloadable_fields(self):
+        """'starvation_watchdog.idle_only_secs' is green-tier hot-reloadable."""
+        assert 'starvation_watchdog.idle_only_secs' in RELOADABLE_FIELDS, (
+            "'starvation_watchdog.idle_only_secs' must be in RELOADABLE_FIELDS "
+            '(green-tier hot-reloadable, alongside the other starvation leaves)'
+        )
+
 
 class TestVerifyInfraRetryConfig:
     """Tests for verify_infra_retry_* config fields (step-5)."""
