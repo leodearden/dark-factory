@@ -185,6 +185,37 @@ class TestGzAwareReader:
         assert mod.session_cwd(corrupt) is None
 
 
+class TestResolveAgentTranscriptRoots:
+    """resolve_agent_transcript_roots joins each relative root against
+    project_root (so mining is independent of the process CWD) and returns
+    an already-absolute root unchanged — always as pathlib.Path instances."""
+
+    PROJECT_ROOT = '/home/leo/src/dark-factory'
+
+    def test_relative_root_resolved_against_project_root(self):
+        roots = mod.resolve_agent_transcript_roots(
+            self.PROJECT_ROOT, ['data/orchestrator/agent-transcripts']
+        )
+        assert roots == [
+            Path('/home/leo/src/dark-factory/data/orchestrator/agent-transcripts')
+        ]
+
+    def test_absolute_root_returned_unchanged(self):
+        roots = mod.resolve_agent_transcript_roots(
+            self.PROJECT_ROOT, ['/var/lib/agent-transcripts']
+        )
+        assert roots == [Path('/var/lib/agent-transcripts')]
+
+    def test_empty_roots_returns_empty_list(self):
+        assert mod.resolve_agent_transcript_roots(self.PROJECT_ROOT, []) == []
+
+    def test_result_elements_are_paths(self):
+        roots = mod.resolve_agent_transcript_roots(
+            self.PROJECT_ROOT, ['data/orchestrator/agent-transcripts', '/abs/root']
+        )
+        assert roots and all(isinstance(r, Path) for r in roots)
+
+
 class TestEnumerateSessions:
     """enumerate_sessions aggregates across every matching encoded dir
     (never one-dir-per-project), filters by first-timestamp UTC date,
