@@ -62,17 +62,24 @@ def _archive_one(
 
     The destination mirrors *src*'s path relative to ``projects/`` with a
     ``.gz`` suffix: ``<archive_root>/<task_id>/<relpath-under-projects>.gz``.
-    The source mtime is mirrored onto the ``.gz`` so idempotency (a later
-    step) can detect an already-current archive. Returns ``True`` when a file
-    was written.
+    The source mtime is mirrored onto the ``.gz`` so an already-current
+    archive is skipped: if the dest exists and its (int-truncated) mtime
+    equals the source's, the file is left untouched and ``False`` is
+    returned. A resumed session only ever grows its transcript, so its mtime
+    strictly advances and the grown file is re-archived (last-write-wins).
+    Returns ``True`` when a file was newly written.
     """
     rel = src.relative_to(projects_root)
     dest = archive_root / task_id / rel.parent / (rel.name + '.gz')
+    st = src.stat()
+    # Idempotency: skip when the archive is already current. int-truncate to
+    # dodge FS mtime-granularity mismatch between source and the utime copy.
+    if dest.exists() and int(dest.stat().st_mtime) == int(st.st_mtime):
+        return False
     dest.parent.mkdir(parents=True, exist_ok=True)
     data = src.read_bytes()
     with gzip.open(dest, 'wb') as fh:
         fh.write(data)
-    st = src.stat()
     os.utime(dest, (st.st_atime, st.st_mtime))
     return True
 
