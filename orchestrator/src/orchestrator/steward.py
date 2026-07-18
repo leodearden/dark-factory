@@ -33,6 +33,8 @@ from shared.proc_group import terminate_process_group
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.routing import RoleDefaults
+from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.workflow_types import (
     StewardBudgetExhausted,
     StewardInterrupted,
@@ -613,17 +615,41 @@ class TaskSteward:
                 worktree=self.worktree,
             )
 
+        # Route resolution (task η): resolve model/effort/max_turns through the
+        # single layered resolver + emit a routing_decision event. max_budget_usd
+        # stays per_invocation_budget (a lifetime-capped cross-invocation budget
+        # the resolver has no concept of — see this task's plan design_decisions)
+        # and backend stays self.config.backends.steward (resolver-external).
+        # Because the enforced cap (per_invocation_budget) differs in kind from
+        # the resolver's advisory decision.budget_usd, pass applied_budget_usd so
+        # the routing_decision event records the actually-applied cap + a
+        # budget_usd_advisory flag — otherwise cost triage would read the
+        # advisory resolved budget_usd as the enforced ceiling.
+        decision = await resolve_and_record_route(
+            role_name='steward',
+            role_defaults=RoleDefaults(
+                STEWARD.default_model, 'high',
+                STEWARD.default_budget, STEWARD.default_max_turns,
+            ),
+            config=self.config,
+            task_id=self.task_id,
+            task_metadata=self.task.get('metadata'),
+            in_memory_task=self.task,
+            event_store=self.event_store,
+            cost_store=self.cost_store,
+            applied_budget_usd=per_invocation_budget,
+        )
         kwargs: dict = dict(
             prompt=prompt,
             system_prompt=STEWARD.system_prompt,
             cwd=cwd,
-            model=self.config.models.steward,
-            max_turns=self.config.max_turns.steward,
+            model=decision.model,
+            max_turns=decision.max_turns,
             max_budget_usd=per_invocation_budget,
             timeout_seconds=self.config.timeouts.steward,
             allowed_tools=STEWARD.allowed_tools or None,
             mcp_config=mcp_config,
-            effort=self.config.effort.steward,
+            effort=decision.effort,
         )
         if self._session_id is not None:
             kwargs['resume_session_id'] = self._session_id
@@ -735,6 +761,31 @@ class TaskSteward:
             self.mcp.mcp_config_json(), self.worktree, TRIAGE,
         )
 
+        # Route resolution (task η): the inner triage invoke resolves
+        # model/effort/budget/max_turns through the shared resolver + emits a
+        # routing_decision event. backend stays self.config.backends.triage
+        # (resolver-external).
+        decision = await resolve_and_record_route(
+            role_name='triage',
+            role_defaults=RoleDefaults(
+                TRIAGE.default_model,
+                # Layer-4 effort base kept == EffortConfig.triage's default
+                # ('medium') — the value config-layer-3 always supplies today.
+                # AgentRole has no default_effort field, so effort is the one
+                # RoleDefaults field not sourced from the TRIAGE role object;
+                # matching the config default means a future EffortConfig field
+                # removal degrades to the same effort rather than silently
+                # jumping to a mismatched base.
+                'medium',
+                TRIAGE.default_budget, TRIAGE.default_max_turns,
+            ),
+            config=self.config,
+            task_id=self.task_id,
+            task_metadata=self.task.get('metadata'),
+            in_memory_task=self.task,
+            event_store=self.event_store,
+            cost_store=self.cost_store,
+        )
         try:
             result = await invoke_with_cap_retry(
                 self.usage_gate,
@@ -743,12 +794,12 @@ class TaskSteward:
                 prompt=prompt,
                 system_prompt=TRIAGE.system_prompt,
                 cwd=self.config.project_root,
-                model=self.config.models.triage,
-                max_turns=self.config.max_turns.triage,
-                max_budget_usd=self.config.budgets.triage,
+                model=decision.model,
+                max_turns=decision.max_turns,
+                max_budget_usd=decision.budget_usd,
                 allowed_tools=TRIAGE.allowed_tools,
                 mcp_config=mcp_config,
-                effort=self.config.effort.triage,
+                effort=decision.effort,
                 backend=self.config.backends.triage,
                 # NOTE: same internal-save delegation as _invoke_with_session
                 # above — cost_store here feeds invoke_with_cap_retry's own

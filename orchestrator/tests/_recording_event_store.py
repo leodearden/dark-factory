@@ -10,8 +10,14 @@ from __future__ import annotations
 class _RecordingEventStore:
     """Minimal EventStore stand-in capturing emit() calls in-memory."""
 
-    def __init__(self) -> None:
+    def __init__(self, run_id: str = 'run-test') -> None:
         self.events: list[tuple[str, dict]] = []
+        # Several dispatch sites read ``event_store.run_id`` unconditionally
+        # when threading cost telemetry into ``invoke_with_cap_retry`` (e.g.
+        # steward.py / dry_run_unblock.py); expose it so this store can stand
+        # in for those sites, not just workflow._invoke (which gates the read
+        # behind ``if self.cost_store``).
+        self.run_id = run_id
 
     def emit(
         self,

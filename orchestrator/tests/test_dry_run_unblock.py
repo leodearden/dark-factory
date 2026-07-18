@@ -15,7 +15,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
-from _orch_helpers import pydantic_spec
+from _orch_helpers import (
+    pydantic_spec,
+    skip_role_config_layer,
+    stamp_stock_routing_config,
+)
 from shared.cli_invoke import AllAccountsCappedException
 from shared.config_dir import TaskConfigDir
 
@@ -115,6 +119,16 @@ def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
     # dry_run_unblock's _one_attempt invoke_with_cap_retry call.
     cfg.timeouts.working_idle_secs = working_idle_secs
     cfg.invocation_timeout = invocation_timeout
+    # task η (step-9/10): run_dry_run_unblock now resolves its route through
+    # orchestrator.routing.resolve_route (via resolve_and_record_route), which
+    # does real membership/dict ops on config.routing.* — stamp the stock
+    # routing block so those ops run against real values, not a bare MagicMock.
+    # skip_role_config_layer makes the resolver's layer-3 config read skip the
+    # 'unblock_auto' role (its model/effort/budget/turns live on the top-level
+    # config.unblock_auto block, not on the role-keyed sub-models), so the
+    # RoleDefaults(ua_cfg.*) base stands — byte-equivalent to pre-η.
+    skip_role_config_layer(cfg)
+    stamp_stock_routing_config(cfg)
     return cfg
 
 
@@ -176,6 +190,28 @@ def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
     return r
 
 
+def _assert_one_proposal_persist(scheduler) -> None:
+    """Assert exactly one dry_run_proposals persist (``append=True``) update_task.
+
+    task η: run_dry_run_unblock now resolves its route through
+    resolve_and_record_route, which mirrors ``metadata.routing`` via a SECOND
+    ``scheduler.update_task(metadata_mode='merge')`` call at resolution time —
+    so ``update_task`` is no longer awaited exactly once.  These tests pin that
+    the proposal was persisted exactly once; filter to the ``append=True``
+    persist call rather than asserting a single total await (the routing-mirror
+    call is exercised in test_out_of_band_routing.py).
+    """
+    persist_calls = [
+        c for c in scheduler.update_task.call_args_list
+        if c.kwargs.get('append') is True
+    ]
+    assert len(persist_calls) == 1, (
+        f'expected exactly one dry_run_proposals persist (append=True) '
+        f'update_task call; got {len(persist_calls)} '
+        f'(all: {scheduler.update_task.call_args_list})'
+    )
+
+
 # ---------------------------------------------------------------------------
 # step-7: happy path
 # ---------------------------------------------------------------------------
@@ -210,7 +246,7 @@ class TestHappyPath:
             )
 
         # scheduler.update_task called once with append=True
-        scheduler.update_task.assert_awaited_once()
+        _assert_one_proposal_persist(scheduler)
         call_args = scheduler.update_task.call_args
         assert call_args.args[0] == '42'
         metadata_arg = call_args.args[1]
@@ -336,7 +372,7 @@ class TestAgentFailureFallback:
                 config=_make_config(),
             )
 
-        scheduler.update_task.assert_awaited_once()
+        _assert_one_proposal_persist(scheduler)
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['risk_label'] == 'human-review-required'
         assert 'error_max_turns' in entry['proposal_text']
@@ -387,7 +423,7 @@ class TestBudgetExhaustedFallback:
                 config=_make_config(budget_usd=5.0),
             )
 
-        scheduler.update_task.assert_awaited_once()
+        _assert_one_proposal_persist(scheduler)
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry.get('status') == 'budget_exhausted'
         assert 'budget exhausted' in entry['proposal_text'].lower()
@@ -436,12 +472,21 @@ class TestEventTagging:
                 event_store=event_store,
             )
 
-        event_store.emit.assert_called_once()
-        emit_call = event_store.emit.call_args
-
-        # First positional arg must be EventType.invocation_end
+        # task η (step-9/10): run_dry_run_unblock now ALSO emits a
+        # routing_decision event (via resolve_and_record_route) at route
+        # resolution time, so emit() is called more than once. The
+        # invocation_end tagging this test pins is unchanged — filter by
+        # EventType rather than asserting a single emit.
         from orchestrator.event_store import EventType
-        assert emit_call.args[0] == EventType.invocation_end
+        invocation_end_calls = [
+            c for c in event_store.emit.call_args_list
+            if c.args and c.args[0] == EventType.invocation_end
+        ]
+        assert len(invocation_end_calls) == 1, (
+            'expected exactly one invocation_end emit; got '
+            f'{[c.args[0] for c in event_store.emit.call_args_list if c.args]}'
+        )
+        emit_call = invocation_end_calls[0]
 
         # Keyword args that operators filter on to find dry-run emissions
         assert emit_call.kwargs.get('phase') == 'blocked'
@@ -973,7 +1018,16 @@ class TestDryRunWireMode:
                 config=_make_config(b3_proposal_keep_last=5),
             )
 
-        update_calls = [p for p in captured_payloads if p.get('name') == 'update_task']
+        # task η: run_dry_run_unblock now also mirrors metadata.routing via a
+        # THIRD update_task wire call (metadata_mode='merge', payload
+        # {'routing': …}, no dry_run_proposals) at route-resolution time.
+        # Filter to the two proposal/trim writes this wire-mode test pins (the
+        # routing mirror is exercised in test_out_of_band_routing.py).
+        update_calls = [
+            p for p in captured_payloads
+            if p.get('name') == 'update_task'
+            and 'dry_run_proposals' in (p.get('arguments', {}).get('metadata') or '')
+        ]
         assert len(update_calls) == 2, (
             f'Expected 2 update_task wire calls (proposal + trim); '
             f'got {len(update_calls)} '
@@ -1042,7 +1096,7 @@ class TestInfraFailureClassification:
                 config=_make_config(),
             )
 
-        scheduler.update_task.assert_awaited_once()
+        _assert_one_proposal_persist(scheduler)
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['status'] == 'infra_failure'
         assert entry['risk_label'] == 'human-review-required'
@@ -1087,7 +1141,7 @@ class TestInfraFailureClassification:
                 config=_make_config(),
             )
 
-        scheduler.update_task.assert_awaited_once()
+        _assert_one_proposal_persist(scheduler)
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['status'] == 'investigation_failed'
 
@@ -1135,7 +1189,7 @@ class TestInfraFailureClassification:
                 config=_make_config(),
             )
 
-        scheduler.update_task.assert_awaited_once()
+        _assert_one_proposal_persist(scheduler)
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['status'] == 'infra_failure'
         assert entry['transcript_turns'] == 47
@@ -1190,7 +1244,7 @@ class TestTruthfulInfraFailureProposalText:
                 config=_make_config(),
             )
 
-        scheduler.update_task.assert_awaited_once()
+        _assert_one_proposal_persist(scheduler)
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
 
         # Still classified infra_failure — TestInfraFailureClassification's
@@ -1281,7 +1335,7 @@ class TestExceptionFallbackDiagnostics:
                 config=_make_config(),
             )
 
-        scheduler.update_task.assert_awaited_once()
+        _assert_one_proposal_persist(scheduler)
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['status'] == 'investigation_failed'
         assert entry['risk_label'] == 'human-review-required'
@@ -1524,7 +1578,7 @@ class TestDryRunFreshRetry:
             'retry must allocate a FRESH session_id, never reuse the wedged one'
         )
 
-        scheduler.update_task.assert_awaited_once()
+        _assert_one_proposal_persist(scheduler)
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry.get('risk_label') == 'low'
         assert entry.get('status') is None, (
@@ -1560,7 +1614,7 @@ class TestDryRunFreshRetry:
             f'Expected exactly one retry (2 total attempts, bounded — not a '
             f'loop), got {mock_invoke.await_count}'
         )
-        scheduler.update_task.assert_awaited_once()
+        _assert_one_proposal_persist(scheduler)
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['status'] == 'infra_failure'
 
@@ -1603,7 +1657,7 @@ class TestDryRunCapExhaustion:
                 config=_make_config(),
             )
 
-        scheduler.update_task.assert_awaited_once()
+        _assert_one_proposal_persist(scheduler)
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['status'] == 'infra_failure', (
             f"cap exhaustion must land on 'infra_failure', not "
@@ -1790,7 +1844,7 @@ class TestDryRunCapExhaustionRealLoop:
                 usage_gate=_ForcedCapUsageGate(),
             )
 
-        scheduler.update_task.assert_awaited_once()
+        _assert_one_proposal_persist(scheduler)
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['status'] == 'infra_failure', (
             f"expected the real cap-wait loop to raise AllAccountsCappedException "
