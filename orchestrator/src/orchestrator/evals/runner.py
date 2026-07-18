@@ -571,8 +571,8 @@ class _StubMcpSession:
         """Dispatch an in-memory MCP tool call and return a JSON-RPC envelope.
 
         Supported tools: ``set_task_status``, ``get_task``, ``get_tasks``,
-        ``get_statuses``, ``update_task``.  Unknown tool names raise
-        ``NotImplementedError``.
+        ``get_statuses``, ``update_task``, ``set_task_claimant``.  Unknown tool
+        names raise ``NotImplementedError``.
 
         .. note::
             Terminal-state enforcement is intentionally **not** simulated.
@@ -603,6 +603,14 @@ class _StubMcpSession:
                 mapping = dict(self._statuses)
             return self._envelope(json.dumps({'statuses': mapping}))
         if name == 'update_task':
+            task_id = arguments['id']
+            return self._envelope(json.dumps({'id': task_id}))
+        if name == 'set_task_claimant':
+            # Status-untouching heartbeat/clear path (Scheduler.set_task_claimant
+            # dispatches this every ~60s in eval mode). Return a clean payload
+            # with no 'error'/'success:False' key so extract_rejection → None
+            # and the heartbeat logs zero warnings (B9). Status is intentionally
+            # NOT recorded here, mirroring the real tool which never touches it.
             task_id = arguments['id']
             return self._envelope(json.dumps({'id': task_id}))
         raise NotImplementedError(
