@@ -47,6 +47,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from dataclasses import dataclass
@@ -284,6 +285,16 @@ _SEED_WARM_LANE_LOCK_WAIT_SECS: int = 30
 # 124 would be misattributed to a lock-wait timeout, but no script
 # convention in this codebase uses 124 for anything else.
 _SEED_WARM_LANE_LOCK_TIMEOUT_RC: int = 124
+
+# Short window (seconds) over which the θ soft-floor defer path memoizes the
+# α warm-lane-audit (:meth:`GitOps._warm_lane_audit_cached`).  α is
+# observability-only (inv.12), so a slightly-stale HEADROOM in the defer
+# WARNING is acceptable; the memo exists so a SUSTAINED soft-pressure
+# condition — which requeues the same fresh allocation across many dispatch
+# cycles — does not re-fork the audit subprocess on every cycle (amendment,
+# reviewer_comprehensive performance-efficiency).  Read as a module global
+# (not a default arg) so tests can monkeypatch it (0.0 disables the memo).
+_WARM_LANE_AUDIT_CACHE_TTL_SECS: float = 30.0
 
 # Fixed name for the SECOND persistent warm worktree (task 1952, PRD δ /
 # §5 C5), dedicated to the offline-deep lane worker (β2).  Lives at
@@ -1198,6 +1209,14 @@ class GitOps:
         # when pool_storage_present() is False.  None (unwired) is
         # byte-identical to today — e.g. cli/recover/evals call sites.
         self._on_pool_storage_absent: Callable[..., Any] | None = None
+        # θ soft-floor defer α-audit memo (task 2443, amendment): a
+        # (monotonic_deadline, headroom) pair, or None before the first defer.
+        # Consulted only by _warm_lane_audit_cached() on the (non-hot) defer
+        # path; see _WARM_LANE_AUDIT_CACHE_TTL_SECS.  This GitOps is long-lived
+        # (Harness holds one for the process lifetime), so the memo genuinely
+        # survives across the requeue cycles a sustained soft-pressure
+        # condition produces.
+        self._warm_lane_audit_cache: tuple[float, str | None] | None = None
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
@@ -3179,6 +3198,39 @@ class GitOps:
             )
             return None
 
+    async def _warm_lane_audit_cached(self) -> str | None:
+        """Short-window memo over :meth:`_run_warm_lane_audit` (α, inv.12).
+
+        The θ soft-floor defer path (:meth:`_warm_lane_soft_pressure_defer`)
+        enriches its WARNING with the α HEADROOM summary. Under SUSTAINED
+        soft pressure a fresh allocation requeues indefinitely (documented,
+        inv.11), so without a memo each dispatch/requeue cycle re-forks the
+        ``warm-lane-audit.sh`` subprocess even though nothing has changed
+        (amendment, reviewer_comprehensive performance-efficiency). This
+        memoizes the last HEADROOM for :data:`_WARM_LANE_AUDIT_CACHE_TTL_SECS`
+        so repeated defers within that window reuse it instead of re-forking.
+
+        α is OBSERVABILITY-ONLY (inv.12): a slightly-stale cached HEADROOM in
+        a log line is acceptable, and this NEVER gates the defer decision —
+        the per-defer WARNING itself is retained (it is the intended B10
+        backpressure signal); only the audit *subprocess* is rate-limited.
+        Fail-soft like the underlying wrapper: never raises (any error from
+        :meth:`_run_warm_lane_audit` already degrades to ``None``).
+
+        A TTL of ``0.0`` (e.g. monkeypatched in tests) disables the memo —
+        the deadline never lies strictly in the future — so every call
+        re-forks.
+        """
+        now = time.monotonic()
+        cache = self._warm_lane_audit_cache
+        if cache is not None and now < cache[0]:
+            return cache[1]
+        headroom = await self._run_warm_lane_audit()
+        self._warm_lane_audit_cache = (
+            now + _WARM_LANE_AUDIT_CACHE_TTL_SECS, headroom,
+        )
+        return headroom
+
     async def _run_warm_lane_gc_reclaim(self) -> int:
         """Invoke ``<project_root>/scripts/warm-lane-gc.sh reclaim``.
 
@@ -3497,12 +3549,16 @@ class GitOps:
         On a defer, emits a structured WARNING journal line naming
         *branch_name* — the user-observable B10 signal that a fresh
         allocation was throttled as backpressure (inv.11: never an
-        escalation or fault). The journal line is enriched with α's
-        (:meth:`_run_warm_lane_audit`) HEADROOM summary for operator
-        context — OBSERVABILITY ONLY (inv.12): a ``None`` headroom (α
-        absent/errored) degrades the log line gracefully and never affects
-        the ``True`` return value below; α is never consulted in the
-        decision itself, only after it has already been made.
+        escalation or fault). The journal line is enriched with α's HEADROOM
+        summary (:meth:`_warm_lane_audit_cached`, a short-window memo over
+        :meth:`_run_warm_lane_audit` so a sustained soft-pressure condition
+        does not re-fork the audit subprocess on every requeue cycle) for
+        operator context — OBSERVABILITY ONLY (inv.12): a ``None`` headroom
+        (α absent/errored) degrades the log line gracefully and never affects
+        the ``True`` return value below; α is never consulted in the decision
+        itself, only after it has already been made. The WARNING itself is
+        emitted on every defer (it is the intended backpressure signal); only
+        the audit subprocess is rate-limited.
 
         Never raises.
         """
@@ -3516,7 +3572,12 @@ class GitOps:
         # (amendment, reviewer_comprehensive robustness). See docstring.
         if rc not in (3, 75):
             return False
-        headroom = await self._run_warm_lane_audit()
+        # α (inv.12, observability-only) — memoized for a short window so a
+        # sustained soft-pressure condition that requeues the same fresh
+        # allocation across many dispatch cycles does not re-fork the audit
+        # subprocess on every cycle (amendment, reviewer_comprehensive
+        # performance-efficiency).  Never affects the return value below.
+        headroom = await self._warm_lane_audit_cached()
         reason = (
             'soft disk pressure'
             if rc == 3

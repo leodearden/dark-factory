@@ -889,3 +889,95 @@ class TestB10SoftFloorCapstone:
         disp = classify_failure(exc_info.value)
         assert disp.requeue_kind is RequeueKind.REQUEUE
         assert disp.counts_against_requeue_cap is False
+
+
+@pytest.mark.asyncio
+class TestWarmLaneAuditCached:
+    """Amendment (reviewer_comprehensive performance-efficiency): the θ defer
+    path memoizes the α warm-lane-audit over a short window
+    (_WARM_LANE_AUDIT_CACHE_TTL_SECS) so a SUSTAINED soft-pressure condition —
+    which requeues the same fresh allocation across many dispatch cycles — does
+    not re-fork the audit subprocess on every cycle. The per-defer WARNING is
+    still emitted every time (it is the intended B10 backpressure signal); only
+    the audit subprocess is rate-limited. α stays observability-only (inv.12):
+    the memo never affects the defer decision.
+    """
+
+    async def test_repeated_defers_within_window_fork_audit_once(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Two consecutive defers inside the TTL window ⇒ the audit subprocess
+        runs exactly ONCE (the 2nd reuses the memo), but BOTH defers emit their
+        WARNING (the backpressure signal is never suppressed)."""
+        await _add_disk_guard_scripts(git_repo)
+        await _add_audit_stub_script(git_repo)
+        _set_audit_output(git_repo, 'HEADROOM resident=1 free_gib=600\n')
+        # One soft check (rc=3) per defer.
+        _write_check_exits(git_repo, [3, 3])
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            first = await git_ops._warm_lane_soft_pressure_defer('A')
+            second = await git_ops._warm_lane_soft_pressure_defer('A')
+
+        assert first is True and second is True, 'both rc=3 defers must return True'
+        # Audit subprocess forked once — the 2nd defer reused the memo.
+        assert len(_read_audit_call_log(git_repo)) == 1, (
+            'α audit subprocess must be forked once within the TTL window; '
+            f'got {_read_audit_call_log(git_repo)}'
+        )
+        # ...but BOTH defers logged their own WARNING (signal not throttled).
+        defer_warnings = [
+            r.message for r in caplog.records
+            if r.levelno >= logging.WARNING and 'deferring' in r.message.lower()
+        ]
+        assert len(defer_warnings) == 2, (
+            f'Each defer must emit its own WARNING; got {defer_warnings}'
+        )
+        # Both WARNINGs carry the (cached) HEADROOM detail.
+        assert all('HEADROOM' in t for t in defer_warnings), (
+            f'Both defer WARNINGs must include the cached α HEADROOM; got {defer_warnings}'
+        )
+
+    async def test_ttl_zero_disables_memo_refetches_each_defer(
+        self, git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """TTL=0 (memo disabled) ⇒ every defer re-forks the audit subprocess.
+
+        Guards against the memo silently pinning to a single fork regardless
+        of the window; the module global is read at call time so this
+        monkeypatch takes effect.
+        """
+        import orchestrator.git_ops as git_ops_mod
+        monkeypatch.setattr(git_ops_mod, '_WARM_LANE_AUDIT_CACHE_TTL_SECS', 0.0)
+
+        await _add_disk_guard_scripts(git_repo)
+        await _add_audit_stub_script(git_repo)
+        _set_audit_output(git_repo, 'HEADROOM resident=1 free_gib=600\n')
+        _write_check_exits(git_repo, [3, 3])
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        await git_ops._warm_lane_soft_pressure_defer('A')
+        await git_ops._warm_lane_soft_pressure_defer('A')
+
+        assert len(_read_audit_call_log(git_repo)) == 2, (
+            'With the memo disabled (TTL=0) each defer must re-fork the audit; '
+            f'got {_read_audit_call_log(git_repo)}'
+        )
+
+    async def test_memo_never_affects_defer_decision(self, git_repo: Path):
+        """inv.12: α is observability-only — a memoized (or None) headroom
+        never changes the True/False defer verdict."""
+        await _add_disk_guard_scripts(git_repo)
+        # No audit stub committed ⇒ _run_warm_lane_audit returns None (fail-soft),
+        # so the memo caches None. The decision keys solely on the soft-guard rc.
+        _write_check_exits(git_repo, [3, 0])
+        config = _make_soft_floor_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        # rc=3 ⇒ defer True even though α headroom is None (absent script).
+        assert await git_ops._warm_lane_soft_pressure_defer('A') is True
+        # rc=0 ⇒ never defers, regardless of any cached headroom.
+        assert await git_ops._warm_lane_soft_pressure_defer('A') is False
