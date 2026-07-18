@@ -6522,6 +6522,75 @@ class TestGetChangedLineRanges:
 
 
 # ---------------------------------------------------------------------------
+# parse_diff_added_line_ranges — NEW-side pure parser unit tests (task 2750)
+# ---------------------------------------------------------------------------
+
+
+class TestParseDiffAddedLineRanges:
+    """Unit tests for parse_diff_added_line_ranges (pure function, no git).
+
+    NEW-side (HEAD-relative) counterpart of parse_diff_line_ranges.  Reviewer
+    ``location`` line numbers are new-side, so scoping post-amendment review
+    to the amendment delta needs new-side hunk ranges, keyed by the
+    ``+++ b/<path>`` new path.  A hunk header ``@@ -x,y +a,b @@`` describes
+    new-side lines ``[a, a + max(b, 1) - 1]``; a hunk with new-count ``0``
+    (pure deletion) contributes no new-side range.
+    """
+
+    def _fn(self):
+        from orchestrator.git_ops import parse_diff_added_line_ranges
+        return parse_diff_added_line_ranges
+
+    def test_modified_file_new_side_ranges_keyed_by_new_path(self):
+        """(a) A modified file yields new-side (start,end) tuples per +++ b/ path."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_TWO_FILES)
+        # src/bar.rs: @@ -5,2 +5,3 @@ → new_start=5, new_count=3 → (5, 7)
+        assert 'src/bar.rs' in result
+        assert (5, 7) in result['src/bar.rs']
+
+    def test_multiple_hunks_accumulate(self):
+        """(b) Multiple hunks in one file accumulate as multiple new-side ranges."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_TWO_FILES)
+        # src/foo.rs: @@ -10,3 +10,2 @@ → (10, 11); @@ -40,1 +41,1 @@ → (41, 41)
+        assert 'src/foo.rs' in result
+        assert (10, 11) in result['src/foo.rs']
+        assert (41, 41) in result['src/foo.rs']
+
+    def test_new_file_maps_to_full_new_side_range(self):
+        """(c) A new file @@ -0,0 +1,N @@ → (1, N)."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_NEW_FILE)
+        # @@ -0,0 +1,5 @@ → new_start=1, new_count=5 → (1, 5)
+        assert 'src/new.rs' in result
+        assert (1, 5) in result['src/new.rs']
+
+    def test_pure_deletion_hunk_contributes_no_new_side_range(self):
+        """(d) A pure-deletion hunk (new_count==0) contributes NO new-side range."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_DELETION_ONLY)
+        # @@ -20,4 +20,0 @@ → new_count=0 → no new-side range recorded.
+        assert result.get('src/qux.rs', []) == []
+
+    def test_fully_deleted_file_produces_no_new_side_entry(self):
+        """(e) A fully deleted file (+++ /dev/null) has no new-side entry."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_FILE_DELETED)
+        assert 'src/gone.rs' not in result, (
+            'A deleted file has no new-side path, so no entry'
+        )
+        assert all('/dev/null' not in k for k in result), (
+            '/dev/null must never be a key in the result dict'
+        )
+
+    def test_empty_diff_returns_empty_dict(self):
+        """(f) Empty/header-only diff → {}."""
+        fn = self._fn()
+        assert fn('') == {}
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers: branch/worktree creation + clean-state assertion
 # ---------------------------------------------------------------------------
 
