@@ -21,6 +21,7 @@ no package __init__ needed).
 """
 from __future__ import annotations
 
+import gzip
 import json
 
 import yaml
@@ -110,6 +111,18 @@ def _write_jsonl(tmp_path, records):
     return path
 
 
+def _write_jsonl_gz(tmp_path, records, name='transcript.jsonl.gz'):
+    """Serialize *records* gzip-compressed to ``<tmp_path>/<name>``; return its
+    Path. Mirrors the on-disk form of an archived fleet session produced by
+    ``shared.transcript_archive`` (``<sid>.jsonl.gz``)."""
+    path = tmp_path / name
+    with gzip.open(path, 'wt', encoding='utf-8') as f:
+        for r in records:
+            f.write(json.dumps(r))
+            f.write('\n')
+    return path
+
+
 # ---------------------------------------------------------------------------
 # load_transcript — ordered parse; blank/malformed lines degrade (skip)
 # rather than raise (mirrors analyze_speculation_depth.load_events).
@@ -135,6 +148,36 @@ class TestLoadTranscript:
             f.write(json.dumps(_user_text('two')) + '\n')
 
         loaded = mod.load_transcript(path)  # must not raise
+
+        assert [r['message']['content'] for r in loaded] == ['one', 'two']
+
+
+# ---------------------------------------------------------------------------
+# load_transcript — gz transparency. Archived fleet sessions land on disk as
+# ``<sid>.jsonl.gz`` (shared.transcript_archive); load_transcript must read
+# them identically to a plain .jsonl so census/nightly RENDER their digests
+# rather than enumerate-then-drop the whole archive at build_digest time.
+# ---------------------------------------------------------------------------
+
+class TestLoadTranscriptGzAware:
+    def test_gz_transcript_parses_identically_to_plain_jsonl(self, tmp_path):
+        records = [_user_text('first'), _assistant(_text('second')), _user_text('third')]
+        gz_path = _write_jsonl_gz(tmp_path, records)
+        plain_path = _write_jsonl(tmp_path, records)
+
+        loaded_gz = mod.load_transcript(gz_path)
+
+        assert loaded_gz == mod.load_transcript(plain_path)
+        assert [r['message']['content'] for r in loaded_gz] == [
+            'first', [{'type': 'text', 'text': 'second'}], 'third',
+        ]
+
+    def test_plain_jsonl_still_parses_as_before(self, tmp_path):
+        # Byte-parity: the non-gz branch keeps the exact pre-existing read.
+        records = [_user_text('one'), _user_text('two')]
+        path = _write_jsonl(tmp_path, records)
+
+        loaded = mod.load_transcript(path)
 
         assert [r['message']['content'] for r in loaded] == ['one', 'two']
 
