@@ -340,7 +340,8 @@ class _BriefingLike(Protocol):
         task_id: str | None = ...,
     ) -> str: ...
     async def build_reviewer_prompt(
-        self, reviewer_type: str, diff: str, context: str | None = ...
+        self, reviewer_type: str, diff: str, context: str | None = ...,
+        *, amendment_suggestions: list[dict] | None = ...,
     ) -> str: ...
     async def build_merger_prompt(
         self, conflicts: str, task_intent: str, context: str | None = ...
@@ -6576,8 +6577,15 @@ class TaskWorkflow:
         )
         return replace(reviews, suggestions=in_delta)
 
-    async def _review(self):
-        """Run all 5 reviewers with stagger, retry errors."""
+    async def _review(self, amendment_ctx: AmendmentReviewContext | None = None):
+        """Run all 5 reviewers with stagger, retry errors.
+
+        When *amendment_ctx* is set (this review immediately follows an
+        amendment round), the amendment's addressed suggestions are threaded
+        into each reviewer's prompt as an advisory scope constraint (task
+        2750). The deterministic partition filter applied by the caller is the
+        enforceable guarantee; this only reduces wasted reviewer effort.
+        """
         assert self.worktree is not None and self.artifacts is not None
         base_commit = self.artifacts.read_base_commit()
         if base_commit:
@@ -6585,13 +6593,18 @@ class TaskWorkflow:
         else:
             diff = await self.git_ops.get_diff_from_main(self.worktree)
 
+        amendment_suggestions = (
+            amendment_ctx.amended_suggestions if amendment_ctx is not None else None
+        )
         stagger = self.config.reviewer_stagger_secs
 
         # Staggered launch — spread OAuth session creation
         async def _staggered(idx: int, role: AgentRole):
             if idx > 0:
                 await asyncio.sleep(idx * stagger)
-            return await self._run_reviewer(role, diff)
+            return await self._run_reviewer(
+                role, diff, amendment_suggestions=amendment_suggestions,
+            )
 
         tasks = [_staggered(i, r) for i, r in enumerate(ALL_REVIEWERS)]
         results = list(await asyncio.gather(*tasks, return_exceptions=True))
@@ -6612,7 +6625,10 @@ class TaskWorkflow:
             for i in error_indices:
                 await asyncio.sleep(stagger)
                 try:
-                    results[i] = await self._run_reviewer(ALL_REVIEWERS[i], diff)
+                    results[i] = await self._run_reviewer(
+                        ALL_REVIEWERS[i], diff,
+                        amendment_suggestions=amendment_suggestions,
+                    )
                 except Exception as exc:
                     results[i] = exc
 
@@ -6634,10 +6650,19 @@ class TaskWorkflow:
 
         return self.artifacts.aggregate_reviews()
 
-    async def _run_reviewer(self, role: AgentRole, diff: str) -> dict:
-        """Run a single reviewer and read its verdict artifact."""
+    async def _run_reviewer(
+        self, role: AgentRole, diff: str,
+        amendment_suggestions: list[dict] | None = None,
+    ) -> dict:
+        """Run a single reviewer and read its verdict artifact.
+
+        *amendment_suggestions*, when set, threads the post-amendment advisory
+        scope section into the reviewer prompt (task 2750).
+        """
         assert self.worktree is not None and self.artifacts is not None
-        prompt = await self.briefing.build_reviewer_prompt(role.name, diff)
+        prompt = await self.briefing.build_reviewer_prompt(
+            role.name, diff, amendment_suggestions=amendment_suggestions,
+        )
 
         # I-FRESH: never consume a stale verdict from a prior invocation on
         # this same worktree (mirrors _resolve_and_resubmit's pre-spawn
