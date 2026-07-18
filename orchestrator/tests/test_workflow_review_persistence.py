@@ -117,3 +117,87 @@ class TestVerdictCacheSkip:
         wf._route_review_suggestions_to_curator.assert_not_called()
         wf._write_suggestions_to_memory.assert_not_called()
         wf._amend.assert_not_called()
+
+
+_OUT_OF_SCOPE_SUGGESTION = {
+    'reviewer': 'analyst',
+    'severity': 'suggestion',
+    'location': 'zzz/other.py:5',  # not under modules=['src/foo'] → out of scope
+    'category': 'coverage',
+    'description': 'Missing edge case',
+    'suggested_fix': 'Add a test',
+}
+
+
+@pytest.mark.asyncio
+class TestVerdictRecording:
+    """The non-blocking DONE path records a tree-hash-keyed verdict."""
+
+    async def test_suggestions_only_verdict_recorded(self, tmp_path: Path):
+        wf = _make_workflow(tmp_path=tmp_path)
+        # One OUT-OF-scope suggestion: no amend (nothing in-scope), routed to
+        # the curator, DONE.
+        wf._review = AsyncMock(
+            return_value=ReviewAggregation(
+                has_blocking_issues=False,
+                blocking_issues=[],
+                suggestions=[_OUT_OF_SCOPE_SUGGESTION],
+                reviews={'analyst': {}},
+            )
+        )
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        wf._route_review_suggestions_to_curator.assert_awaited_once()
+        wf._amend.assert_not_called()
+        rec = wf.artifacts.get_cached_verdict('TREE1')
+        assert rec is not None
+        assert rec['verdict'] == 'suggestions_only'
+        assert rec['suggestions_routed'] is True
+
+    async def test_pass_verdict_recorded(self, tmp_path: Path):
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf._review = AsyncMock(
+            return_value=ReviewAggregation(
+                has_blocking_issues=False,
+                blocking_issues=[],
+                suggestions=[],
+                reviews={'analyst': {}},
+            )
+        )
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        wf._write_suggestions_to_memory.assert_awaited_once()
+        rec = wf.artifacts.get_cached_verdict('TREE1')
+        assert rec is not None
+        assert rec['verdict'] == 'PASS'
+        assert rec['suggestions_routed'] is False
+
+    async def test_blocking_verdict_not_recorded(self, tmp_path: Path):
+        wf = _make_workflow(tmp_path=tmp_path, max_review_cycles=1)
+        wf._review = AsyncMock(
+            return_value=ReviewAggregation(
+                has_blocking_issues=True,
+                blocking_issues=[{
+                    'reviewer': 'analyst',
+                    'category': 'bug',
+                    'description': 'boom',
+                }],
+                suggestions=[],
+                reviews={'analyst': {}},
+            )
+        )
+        wf._escalate_review_issues = MagicMock()
+        wf._replan = AsyncMock()
+
+        outcome = await wf._execute_verify_review_loop()
+
+        # max_review_cycles=1 → escalate on the first blocking cycle,
+        # before any replan.
+        assert outcome == WorkflowOutcome.ESCALATED
+        wf._replan.assert_not_called()
+        # Blocking verdicts are NEVER cached.
+        assert wf.artifacts.get_cached_verdict('TREE1') is None
