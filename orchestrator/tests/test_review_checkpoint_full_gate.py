@@ -12,7 +12,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import pydantic_spec, stamp_stock_routing_config
+from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
@@ -30,9 +31,13 @@ def _make_checkpoint(
     config.project_root = Path('/tmp')
     config.review.full_review_min_interval_secs = min_interval
     config.review.full_review_min_tasks = min_tasks
+    # deep_reviewer resolves via resolve_route (task η) — real config.routing.*.
+    stamp_stock_routing_config(config)
     mcp = MagicMock()
     mcp.mcp_config_json.return_value = {'mcpServers': {}}
-    return ReviewCheckpoint(config, mcp=mcp, usage_gate=None)
+    cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None)
+    cp.event_store = _RecordingEventStore()
+    return cp
 
 
 class TestShouldRunFullGate:

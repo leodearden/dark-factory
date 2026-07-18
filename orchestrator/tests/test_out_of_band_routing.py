@@ -30,8 +30,10 @@ from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
+from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.routing import RoutingDecision
 from orchestrator.steward import TaskSteward
+from orchestrator.verify import VerifyResult
 
 
 def _routing_entries(rec: _RecordingEventStore) -> list[dict]:
@@ -264,3 +266,156 @@ class TestStewardTriageAdoptsResolveRoute:
         assert len(entries) == 1
         assert entries[0]['data']['role'] == 'triage'
         assert entries[0]['data']['model'] == 'sonnet'
+
+
+# ---------------------------------------------------------------------------
+# deep_reviewer (steps 5-6)
+# ---------------------------------------------------------------------------
+
+
+_REVIEW_PHASE1 = VerifyResult(
+    passed=True, summary='OK', test_output='', lint_output='', type_output='',
+)
+
+
+def _review_config():
+    cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    cfg.project_root = Path('/tmp/fake-project')
+    cfg.fused_memory.project_id = 'dark_factory'
+    cfg.models.deep_reviewer = 'opus'
+    cfg.budgets.deep_reviewer = 10.0
+    cfg.max_turns.deep_reviewer = 50
+    cfg.effort.deep_reviewer = 'max'
+    cfg.backends.deep_reviewer = 'claude'
+    cfg.escalation.host = 'localhost'
+    cfg.escalation.port = 8102
+    stamp_stock_routing_config(cfg)
+    return cfg
+
+
+def _build_checkpoint(*, event_store=None, cost_store=None) -> ReviewCheckpoint:
+    mcp = MagicMock()
+    mcp.mcp_config_json.return_value = {'mcpServers': {}}
+    cp = ReviewCheckpoint(_review_config(), mcp, None)
+    cp.event_store = event_store
+    cp.cost_store = cost_store
+    return cp
+
+
+@pytest.mark.asyncio
+class TestDeepReviewerAdoptsResolveRoute:
+    """deep_reviewer (`ReviewCheckpoint._run_review`) resolves via the helper.
+
+    deep_reviewer is STRUCTURALLY project-level — ``_run_review(mode, modules)``
+    has no task/task_metadata anywhere in scope (callers ``run_full()`` /
+    ``run_focused()`` pass module-path lists, not tasks) — so the helper is
+    called with no task_id/task_metadata/scheduler/in_memory_task (no
+    ``metadata.routing`` mirror); it resolves at the config/role_default/
+    policy_rule layers and emits a routing_decision when an event_store is
+    wired. The ``metadata_override`` layer is unreachable here (proven at the
+    shared-helper unit level in test_routing_dispatch.py instead).
+    """
+
+    async def test_decision_feeds_invoke_and_keeps_backend(self) -> None:
+        cp = _build_checkpoint()
+        fake = _fake_decision(model='sonnet', effort='low', budget_usd=3.5, max_turns=42)
+        with (
+            patch('orchestrator.review_checkpoint.resolve_and_record_route',
+                  new=AsyncMock(return_value=fake)) as mock_helper,
+            patch('orchestrator.review_checkpoint.invoke_with_cap_retry',
+                  new=AsyncMock(return_value=_stub_result())) as mock_iwcr,
+            patch('orchestrator.review_checkpoint.run_full_verification',
+                  new=AsyncMock(return_value=_REVIEW_PHASE1)),
+            patch.object(ReviewCheckpoint, '_save_report', lambda *a, **k: None),
+        ):
+            await cp._run_review('focused', ['orchestrator/foo.py'])
+
+        mock_helper.assert_awaited_once()
+        hk = mock_helper.call_args.kwargs
+        assert hk['role_name'] == 'deep_reviewer'
+        # Project-level: no task identity flows into resolution / no mirror sink.
+        assert hk.get('task_id') is None
+        assert hk.get('task_metadata') is None
+        assert hk.get('scheduler') is None
+        assert hk.get('in_memory_task') is None
+
+        kwargs = mock_iwcr.call_args.kwargs
+        assert kwargs['model'] == 'sonnet'
+        assert kwargs['effort'] == 'low'
+        assert kwargs['max_budget_usd'] == 3.5
+        assert kwargs['max_turns'] == 42
+        # backend stays the site's own config.backends.deep_reviewer read.
+        assert kwargs['backend'] == 'claude'
+
+    async def test_emits_one_routing_decision_event_stock_config(self) -> None:
+        rec = _RecordingEventStore()
+        cp = _build_checkpoint(event_store=rec)
+        with (
+            patch('orchestrator.review_checkpoint.invoke_with_cap_retry',
+                  new=AsyncMock(return_value=_stub_result())) as mock_iwcr,
+            patch('orchestrator.review_checkpoint.run_full_verification',
+                  new=AsyncMock(return_value=_REVIEW_PHASE1)),
+            patch.object(ReviewCheckpoint, '_save_report', lambda *a, **k: None),
+        ):
+            await cp._run_review('full', [])
+
+        entries = _routing_entries(rec)
+        assert len(entries) == 1
+        assert entries[0]['data']['role'] == 'deep_reviewer'
+        # Stock config, no override, no rule → config-layer resolution == pre-η.
+        assert entries[0]['data']['model'] == 'opus'
+        assert entries[0]['data']['source_layer'] == 'config'
+        # Byte-equivalence: the resolved invoke values equal config.*.deep_reviewer.
+        kwargs = mock_iwcr.call_args.kwargs
+        assert kwargs['model'] == 'opus'
+        assert kwargs['effort'] == 'max'
+        assert kwargs['max_budget_usd'] == 10.0
+        assert kwargs['max_turns'] == 50
+
+    async def test_no_event_and_no_raise_when_event_store_none(self) -> None:
+        cp = _build_checkpoint(event_store=None)
+        with (
+            patch('orchestrator.review_checkpoint.invoke_with_cap_retry',
+                  new=AsyncMock(return_value=_stub_result())) as mock_iwcr,
+            patch('orchestrator.review_checkpoint.run_full_verification',
+                  new=AsyncMock(return_value=_REVIEW_PHASE1)),
+            patch.object(ReviewCheckpoint, '_save_report', lambda *a, **k: None),
+        ):
+            # Must not raise despite no event_store wired.
+            await cp._run_review('full', [])
+        # Still resolves through the resolver to the stock config value.
+        assert mock_iwcr.call_args.kwargs['model'] == 'opus'
+
+    async def test_cost_row_model_equals_decision_model(self) -> None:
+        cost_store = MagicMock()
+        cost_store.save_invocation = AsyncMock()
+        cp = _build_checkpoint(cost_store=cost_store)
+        fake = _fake_decision(model='sonnet')
+        with (
+            patch('orchestrator.review_checkpoint.resolve_and_record_route',
+                  new=AsyncMock(return_value=fake)),
+            patch('orchestrator.review_checkpoint.invoke_with_cap_retry',
+                  new=AsyncMock(return_value=_stub_result())),
+            patch('orchestrator.review_checkpoint.run_full_verification',
+                  new=AsyncMock(return_value=_REVIEW_PHASE1)),
+            patch.object(ReviewCheckpoint, '_save_report', lambda *a, **k: None),
+        ):
+            await cp._run_review('full', [])
+
+        cost_store.save_invocation.assert_awaited_once()
+        # The persisted cost row's model is the RESOLVED model, not the raw
+        # config.models.deep_reviewer (they diverge under a rule/override).
+        assert cost_store.save_invocation.call_args.kwargs['model'] == 'sonnet'
+
+
+class TestReviewCheckpointEventStoreAttribute:
+    """ReviewCheckpoint gains ``event_store`` as a settable attr (default None),
+    wired post-construction in the harness (like cost_store/run_id) — so the
+    ``ReviewCheckpoint(config, mcp, usage_gate)`` constructor is unchanged."""
+
+    def test_construction_unchanged_and_event_store_defaults_none(self) -> None:
+        mcp = MagicMock()
+        mcp.mcp_config_json.return_value = {'mcpServers': {}}
+        # (config, mcp, usage_gate) positional signature is unchanged.
+        cp = ReviewCheckpoint(_review_config(), mcp, None)
+        assert cp.event_store is None

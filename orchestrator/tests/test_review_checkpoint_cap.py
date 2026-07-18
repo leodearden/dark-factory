@@ -12,7 +12,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import pydantic_spec, stamp_stock_routing_config
+from _recording_event_store import _RecordingEventStore
 from shared.cli_invoke import AllAccountsCappedException
 
 from orchestrator.config import OrchestratorConfig
@@ -36,11 +37,18 @@ def _make_checkpoint() -> ReviewCheckpoint:
     config.fused_memory.project_id = 'test-project'
     config.escalation.host = 'localhost'
     config.escalation.port = 9999
+    # deep_reviewer now resolves its route through orchestrator.routing.
+    # resolve_route (task η), which does real membership/dict ops on
+    # config.routing.* — a bare-MagicMock routing child cannot satisfy them.
+    stamp_stock_routing_config(config)
 
     mcp = MagicMock()
     mcp.mcp_config_json.return_value = {'mcpServers': {}}
 
     cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None)
+    # event_store is wired post-construction in the harness (task η); a
+    # recording store here lets _run_review emit its routing_decision event.
+    cp.event_store = _RecordingEventStore()
     return cp
 
 
