@@ -88,7 +88,11 @@ class LegibilityConfig(BaseModel):
     are required — there is no sensible project-agnostic default for any of
     them. Every nested block defaults to its own all-defaults instance, so a
     minimal YAML carrying only the four required fields still produces a
-    fully-populated, typed config.
+    fully-populated, typed config. ``agent_transcript_roots`` is an optional
+    list of additional archive roots the miner enumerates alongside
+    ``~/.claude/projects`` (the ``shared.transcript_archive`` fleet-transcript
+    tree); it defaults to ``[]`` — the byte-parity baseline in which only
+    ``~/.claude/projects`` is read.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -97,6 +101,7 @@ class LegibilityConfig(BaseModel):
     project_root: str
     escalation_port: int
     cwd_prefixes: list[str]
+    agent_transcript_roots: list[str] = Field(default_factory=list)
     budgets: Budgets = Field(default_factory=Budgets)
     sampling: Sampling = Field(default_factory=Sampling)
     census: Census = Field(default_factory=Census)
