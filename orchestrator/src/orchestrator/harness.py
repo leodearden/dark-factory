@@ -98,6 +98,7 @@ from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 if TYPE_CHECKING:
     from escalation.models import Escalation
+
     from orchestrator.merge_queue import (
         BreakerTrip,
         SpeculativeMergeWorker,
@@ -499,7 +500,7 @@ def _deterministic_deploy_stranded(metadata: dict | None) -> bool:
     )
 
 
-def _is_done_step_commit_orphan(esc: 'Escalation') -> bool:
+def _is_done_step_commit_orphan(esc: Escalation) -> bool:
     """Return True iff *esc* is the done-step-commit orphan class filed by
     ``TaskWorkflow._escalate_unreconciled_done_step`` (workflow.py:5488).
 
