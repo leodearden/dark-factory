@@ -130,12 +130,15 @@ _TIMEOUT_TOKEN_RE = re.compile(r'\btimed?\s*out\b', re.IGNORECASE)
 # concurrency-limiter WRAPPER (reify lib_slot_acquire.sh / `flock -w`) BEFORE
 # the wrapped tool ever runs, so its output CANNOT also contain a compiler/
 # lint diagnostic. `_LOCK_TOKEN_RE`/`_TIMEOUT_TOKEN_RE` are independent
-# whole-output searches, so a deterministic `cargo clippy` diagnostic that
-# quotes lock/slot/semaphore source and mentions "timed out" in a note
+# whole-output searches, so a deterministic `cargo clippy`/rustc diagnostic
+# that quotes lock/slot/semaphore source and mentions "timed out" in a note
 # satisfies both and is misclassified SEMAPHORE_TIMEOUT. The clippy
 # lint-namespace token `clippy::` is present in every denied-lint note (e.g.
-# `-D clippy::await-holding-lock`) and therefore PROVES the wrapped command
-# ran — reused as the veto marker rather than inventing a new one.
+# `-D clippy::await-holding-lock`) and a rustc error code (`_COMPILE_ERROR_
+# RUSTC_CODE_RE`, reused from the shared primitives above) is present in
+# every rustc compile-error diagnostic — either PROVES the wrapped command
+# ran, so both are used as the veto marker set rather than inventing a new
+# one.
 _CLIPPY_LINT_MARKER_RE = re.compile(r'clippy::')
 
 
@@ -153,8 +156,9 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     slot/lock-acquisition timeout is raised by the concurrency-limiter
     wrapper BEFORE the wrapped tool runs, so its output can never carry a
     Rust compiler/clippy diagnostic. When *output* carries the clippy
-    lint-namespace token (``clippy::``), the lock/slot/semaphore + timeout
-    tokens are incidental to a deterministic lint failure, so this returns
+    lint-namespace token (``clippy::``) or a rustc error code
+    (``error[E\\d+]:``), the lock/slot/semaphore + timeout tokens are
+    incidental to a deterministic lint/compile failure, so this returns
     ``None`` instead of ``SEMAPHORE_TIMEOUT`` and defers to per-tool
     dispatch. Applies ONLY to the SEMAPHORE_TIMEOUT arm — DISK_FULL's ENOSPC
     markers are specific enough (and checked first) that a compile/lint
@@ -169,6 +173,7 @@ def _classify_environmental(output: str) -> FailureCategory | None:
         _LOCK_TOKEN_RE.search(output)
         and _TIMEOUT_TOKEN_RE.search(output)
         and not _CLIPPY_LINT_MARKER_RE.search(output)
+        and not _COMPILE_ERROR_RUSTC_CODE_RE.search(output)
     ):
         return FailureCategory.SEMAPHORE_TIMEOUT
     return None
