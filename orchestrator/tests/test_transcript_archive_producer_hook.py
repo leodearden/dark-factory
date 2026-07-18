@@ -187,3 +187,60 @@ class TestProducerHook:
             workflow._last_invoke_session_id,
             archive_root=config.project_root / 'data/orchestrator/agent-transcripts',
         )
+
+    async def test_helper_error_does_not_mask_in_flight(
+        self, monkeypatch, git_repo, git_ops, task_assignment
+    ):
+        """A non-cancellation error escaping the helper is swallowed, not raised.
+
+        archive_task_transcripts guards per-file work with ``except OSError`` but
+        NOT its top-level glob/Path/archive_root construction. Awaiting it inside
+        _invoke's finally means any such escaped error would REPLACE the in-flight
+        exception the finally is unwinding (finally-masks-original). The hook's own
+        ``try/except Exception`` is the structural guarantee that it cannot — even
+        if the helper's contract regresses (review #1).
+        """
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = _config(git_repo)  # enabled by default
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+
+        with patch(
+            'orchestrator.workflow.archive_task_transcripts',
+            side_effect=RuntimeError('unguarded glob boom'),
+        ) as mock_helper, patch(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            new_callable=AsyncMock,
+            return_value=AgentResult(success=True, output=''),
+        ):
+            # Must NOT raise RuntimeError out of the finally — _invoke returns
+            # its result normally and the hook logs+swallows the archival error.
+            result = await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+
+        assert result.success is True
+        mock_helper.assert_called_once()
+
+    async def test_cancellation_propagates_not_swallowed(
+        self, monkeypatch, git_repo, git_ops, task_assignment
+    ):
+        """CancelledError from the archive await must re-raise, never be swallowed.
+
+        Loop teardown / hard-kill surfaces CancelledError from the ``await``; the
+        hook re-raises it (cooperative cancellation must propagate), so a killed
+        invocation is deliberately not archived here — that abandoned tail is
+        β/task 2729's teardown-backstop's job (review #2). The masking guard's
+        ``except Exception`` deliberately does NOT catch CancelledError (a
+        BaseException), so this asserts the two clauses are ordered correctly.
+        """
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = _config(git_repo)  # enabled by default
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+
+        with patch(
+            'orchestrator.workflow.archive_task_transcripts',
+            side_effect=asyncio.CancelledError,
+        ), patch(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            new_callable=AsyncMock,
+            return_value=AgentResult(success=True, output=''),
+        ), pytest.raises(asyncio.CancelledError):
+            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
