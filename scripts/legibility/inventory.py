@@ -217,10 +217,77 @@ def resolve_agent_transcript_roots(
     return [Path(project_root) / r for r in roots]
 
 
+def _build_session_record(
+    session_path: Path,
+    encoded_dir: str,
+    cwd_prefixes: Sequence[str],
+    target_date: date,
+) -> SessionRecord | None:
+    """Build a :class:`SessionRecord` for one transcript file, or ``None`` to skip it.
+
+    Skips (returns ``None``) a non-existent/unreadable/empty file, a session
+    whose real ``cwd`` is not a project member (:func:`is_member`), and a
+    session whose date — first-timestamp (:func:`_session_cwd_and_date`),
+    falling back to file mtime — is not *target_date*. Shared by the
+    ``~/.claude/projects`` loop and the archive-roots loop in
+    :func:`enumerate_sessions`: the projects path is behaviorally unchanged
+    (guarded by ``TestEnumerateSessions``), while the archive path passes the
+    encoded worktree dir (``session_path.parent.name``) as *encoded_dir*.
+    """
+    try:
+        size_bytes = session_path.stat().st_size
+    except OSError:
+        return None
+    if size_bytes == 0:
+        return None
+
+    cwd, session_date = _session_cwd_and_date(session_path)
+    if cwd is None or not is_member(cwd, cwd_prefixes):
+        return None
+
+    if session_date is None:
+        try:
+            session_date = datetime.fromtimestamp(
+                session_path.stat().st_mtime, tz=UTC
+            ).date()
+        except OSError:
+            return None
+    if session_date != target_date:
+        return None
+
+    return SessionRecord(
+        path=session_path,
+        encoded_dir=encoded_dir,
+        cwd=cwd,
+        date=session_date,
+        size_bytes=size_bytes,
+    )
+
+
+def _iter_archive_transcripts(root: Path) -> Iterator[Path]:
+    """Yield every ``*.jsonl`` / ``*.jsonl.gz`` transcript under *root*, recursively.
+
+    The archived fleet-transcript tree (``shared.transcript_archive``) nests
+    transcripts under ``<task_id>/<enc>/<sid>.jsonl.gz`` with an even-deeper
+    ``<sid>/subagents/agent-*.jsonl.gz`` variant, so — unlike the
+    ``~/.claude/projects`` pre-filter (:func:`iter_project_dirs`), whose
+    top-level dir names ARE the encoded cwds — the archive is walked
+    RECURSIVELY and membership is decided per-file downstream via
+    :func:`is_member` (in :func:`_build_session_record`), the sole
+    membership authority. Yields nothing when *root* is not an existing
+    directory: an absent, not-yet-created archive root is normal (the tree
+    is git-ignored and may not exist yet).
+    """
+    if not root.is_dir():
+        return
+    yield from sorted([*root.rglob('*.jsonl'), *root.rglob('*.jsonl.gz')])
+
+
 def enumerate_sessions(
     projects_root: Path | str,
     cwd_prefixes: Sequence[str],
     target_date: date,
+    agent_transcript_roots: Sequence[Path | str] = (),
 ) -> list[SessionRecord]:
     """Enumerate every session transcript for *target_date* across all matching encoded dirs.
 
@@ -231,42 +298,34 @@ def enumerate_sessions(
     together in one pass (:func:`_session_cwd_and_date`) and confirm
     membership via :func:`is_member`, falling back to file mtime for the
     date when no timestamp is present, and keep only sessions matching
-    *target_date*.
+    *target_date* (all via :func:`_build_session_record`).
+
+    *agent_transcript_roots* is an ADDITIONAL, opt-in list of archive roots
+    (the ``shared.transcript_archive`` fleet-transcript tree, resolved via
+    :func:`resolve_agent_transcript_roots`) walked recursively ALONGSIDE the
+    ``~/.claude/projects`` tree — each ``*.jsonl``/``*.jsonl.gz`` under a
+    root is admitted by the same per-file membership + date filter, with the
+    encoded worktree dir taken from ``session_path.parent.name``. It
+    defaults to an empty tuple: when empty, the archive loop does not
+    execute and this function is byte-identical to the projects-only path.
     """
     root = Path(projects_root)
     records: list[SessionRecord] = []
     for project_dir in iter_project_dirs(root, cwd_prefixes):
         for session_path in sorted(project_dir.glob('*.jsonl')):
-            try:
-                size_bytes = session_path.stat().st_size
-            except OSError:
-                continue
-            if size_bytes == 0:
-                continue
-
-            cwd, session_date = _session_cwd_and_date(session_path)
-            if cwd is None or not is_member(cwd, cwd_prefixes):
-                continue
-
-            if session_date is None:
-                try:
-                    session_date = datetime.fromtimestamp(
-                        session_path.stat().st_mtime, tz=UTC
-                    ).date()
-                except OSError:
-                    continue
-            if session_date != target_date:
-                continue
-
-            records.append(
-                SessionRecord(
-                    path=session_path,
-                    encoded_dir=project_dir.name,
-                    cwd=cwd,
-                    date=session_date,
-                    size_bytes=size_bytes,
-                )
+            record = _build_session_record(
+                session_path, project_dir.name, cwd_prefixes, target_date
             )
+            if record is not None:
+                records.append(record)
+
+    for archive_root in agent_transcript_roots:
+        for session_path in _iter_archive_transcripts(Path(archive_root)):
+            record = _build_session_record(
+                session_path, session_path.parent.name, cwd_prefixes, target_date
+            )
+            if record is not None:
+                records.append(record)
     return records
 
 
