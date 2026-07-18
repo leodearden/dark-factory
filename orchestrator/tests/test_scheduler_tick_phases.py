@@ -106,6 +106,64 @@ class TestHygienePhases:
         assert ('A', '9') not in scheduler._streak_local_backfill.counts
 
     @pytest.mark.asyncio
+    async def test_phase_stale_sweep_protects_delivered_streaks_on_transient_absence(
+        self, scheduler: Scheduler
+    ):
+        """A still-pending gate-held dependent that transiently drops out of
+        the active-only fetch (absent from tasks_by_id, non-terminal status)
+        must KEEP its delivered-check grace/hold streaks — otherwise the
+        grace_cycles escalation never fires (task 2743). Every OTHER counter
+        still GCs on absence, and the bookkeeping cleanup is unchanged.
+        """
+        # Delivered-check streaks for dependent '10' (dep '20').
+        scheduler._streak_delivered_fail.counts[('10', '20')] = 2
+        scheduler._streak_delivered_hold.counts['10'] = 2
+        # A non-delivered streak for the same dependent — must STILL be GC'd.
+        scheduler._streak_local_backfill.counts[('10', '9')] = 2
+        # '10' is tracked (pending-age anchor) but drops out of the fetch.
+        scheduler._pending_anchor['10'] = 10.0
+
+        ctx = TickContext(
+            tasks=[],
+            status_map={'10': 'pending'},  # NON-terminal
+            tasks_by_id={},  # ABSENT — the transient active-fetch churn
+        )
+        result = await scheduler._phase_stale_sweep(ctx)
+
+        assert result is _CONTINUE
+        # Delivered streaks SURVIVE the transient absence (the fix).
+        assert scheduler._streak_delivered_fail.value(('10', '20')) == 2
+        assert scheduler._streak_delivered_hold.value('10') == 2
+        # Non-delivered streak is still swept (base stale_ids path unchanged).
+        assert scheduler._streak_local_backfill.value(('10', '9')) == 0
+        # Bookkeeping cleanup preserved — '10' is still stale-swept.
+        assert '10' in ctx.stale_ids
+        assert '10' not in scheduler._pending_anchor
+
+    @pytest.mark.asyncio
+    async def test_phase_stale_sweep_still_gcs_delivered_streaks_on_terminal_status(
+        self, scheduler: Scheduler
+    ):
+        """A genuinely-terminal dependent's delivered-check streak IS still
+        GC'd — the protection is narrowed to non-terminal transient absence,
+        not a blanket exemption (task 2743)."""
+        scheduler._streak_delivered_fail.counts[('11', '21')] = 2
+        scheduler._pending_anchor['11'] = 11.0
+
+        ctx = TickContext(
+            tasks=[],
+            status_map={'11': 'done'},  # genuinely TERMINAL
+            tasks_by_id={},  # absent from the active fetch
+        )
+        result = await scheduler._phase_stale_sweep(ctx)
+
+        assert result is _CONTINUE
+        # Terminal → still cleaned up (no leak on genuine completion).
+        assert scheduler._streak_delivered_fail.value(('11', '21')) == 0
+        assert '11' in ctx.stale_ids
+        assert '11' not in scheduler._pending_anchor
+
+    @pytest.mark.asyncio
     async def test_phase_cooldown_gc_drops_expired(self, scheduler: Scheduler):
         scheduler._requeue_until['A'] = scheduler._time_source() - 1.0
 
