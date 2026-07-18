@@ -489,6 +489,17 @@ class ReconciliationHarness:
         self._placeholder_finding_drops: deque[tuple[datetime, str]] = deque()
         self._last_placeholder_drop_storm_escalation_at: datetime | None = None
 
+        # Task σ / 2717: rolling-window per-event counter of unresumable/failed
+        # interrupted-run resume attempts (config-driven
+        # resume_failure_storm_threshold / _window_seconds).  Same
+        # (timestamp, project_id) shape, in-process-lifetime caveat, and
+        # rate-limited single-fire semantics as _placeholder_finding_drops above.
+        # Fed from _resume_interrupted_runs' failed+restore fallback arm so a
+        # persistent resume failure (prompt/tool drift, stale transcripts) surfaces
+        # ONE loud recon_resume_failure_storm escalation instead of silent churn.
+        self._resume_failures: deque[tuple[datetime, str]] = deque()
+        self._last_resume_failure_storm_escalation_at: datetime | None = None
+
         # Usage gate (multi-account cap failover)
         self.usage_gate: UsageGate | None = None
         if hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
@@ -1443,7 +1454,30 @@ class ReconciliationHarness:
                         'reason': unresumable_reason,
                     },
                 )
-                # Storm counter / escalation on the fallback arm is wired in s20.
+                # Rolling-window storm counter: a single unresumable run is
+                # expected operational noise (kept to the INFO log above), but
+                # repeated resume failures across runs — prompt/tool drift or
+                # systematically stale transcripts — fire ONE loud recon-scoped
+                # escalation per window (rate-limited single-fire, mirroring
+                # _record_dead_owner_suppression).
+                storm = self._record_resume_failure(run.project_id)
+                if storm is not None:
+                    window_min = storm['window_seconds'] / 60
+                    proj_label = ', '.join(storm['projects']) or run.project_id
+                    summary = (
+                        f"resume-failure storm: {storm['count']} unresumable "
+                        f"interrupted runs in {window_min:.0f} min "
+                        f"(projects: {proj_label}) — interrupted reconciliation "
+                        f"runs are not resuming (check recon prompt/tool drift or "
+                        f"stale transcripts)"
+                    )
+                    detail = (
+                        f'run_id={run.id} project={run.project_id} '
+                        f'reason={unresumable_reason}'
+                    )
+                    self._escalate(
+                        'recon_resume_failure_storm', run.id, summary, detail,
+                    )
                 continue
 
             # Persist the incremented resume bookkeeping BEFORE adopting/resuming
@@ -1683,6 +1717,63 @@ class ReconciliationHarness:
         return {
             'count': count,
             'window_seconds': _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
+            'projects': projects,
+        }
+
+    # ── Resume-failure storm counter (task σ / 2717) ───────────────────
+
+    def _record_resume_failure(
+        self, project_id: str, *, now: datetime | None = None
+    ) -> dict | None:
+        """Record one unresumable/failed interrupted-run resume and check for a storm.
+
+        Same rolling-window per-event counter + rate-limited single-fire shape as
+        :meth:`_record_placeholder_finding_drop`, applied to the failed+restore
+        fallback arm of :meth:`_resume_interrupted_runs`.  Thresholds are the
+        config fields ``resume_failure_storm_threshold`` /
+        ``resume_failure_storm_window_seconds`` (mirroring
+        :meth:`_record_dead_owner_suppression`, which likewise reads config)
+        rather than module constants, so an operator can retune the alarm.
+
+        Appends ``(effective_now, project_id)`` to the rolling deque, prunes
+        entries older than the configured window, then:
+        - Returns None if the count is below the threshold.
+        - Returns None if the alarm already fired within this window (rate limit:
+          <=1 per window).
+        - Otherwise sets ``_last_resume_failure_storm_escalation_at =
+          effective_now`` and returns a storm summary dict with ``count``,
+          ``window_seconds``, and ``projects`` (sorted distinct project labels
+          seen in the window).
+
+        The now= parameter follows the same time-injection convention as the
+        sibling storm counters, for deterministic unit tests.
+        """
+        effective_now = now if now is not None else datetime.now(UTC)
+
+        # Append and prune the rolling window.
+        self._resume_failures.append((effective_now, project_id))
+        window = timedelta(seconds=self.config.resume_failure_storm_window_seconds)
+        cutoff_ts = effective_now - window
+        while self._resume_failures and self._resume_failures[0][0] < cutoff_ts:
+            self._resume_failures.popleft()
+
+        count = len(self._resume_failures)
+        if count < self.config.resume_failure_storm_threshold:
+            return None
+
+        # Threshold crossed — apply the per-window rate limit.
+        if (
+            self._last_resume_failure_storm_escalation_at is not None
+            and (effective_now - self._last_resume_failure_storm_escalation_at) < window
+        ):
+            return None
+
+        # Fire: set rate-limit timestamp and build the storm summary dict.
+        self._last_resume_failure_storm_escalation_at = effective_now
+        projects = sorted({pid for _, pid in self._resume_failures})
+        return {
+            'count': count,
+            'window_seconds': self.config.resume_failure_storm_window_seconds,
             'projects': projects,
         }
 
