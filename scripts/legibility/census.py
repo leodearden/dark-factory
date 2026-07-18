@@ -1051,7 +1051,12 @@ def default_batch_source(cfg, *, projects_root, now: datetime,
 
     scored = []
     for target_date in _census_window_dates(cfg.project_root, now=now):
-        for session in inventory.enumerate_sessions(projects_root, cfg.cwd_prefixes, target_date):
+        for session in inventory.enumerate_sessions(
+            projects_root, cfg.cwd_prefixes, target_date,
+            agent_transcript_roots=inventory.resolve_agent_transcript_roots(
+                cfg.project_root, cfg.agent_transcript_roots
+            ),
+        ):
             counts, first_turn = sampling._score_and_find_first_turn(session.path)
             stratum = sampling.classify_agent_class(first_turn, session.path)
             scored.append(sampling.ScoredRecord(session=session, stratum=stratum, counts=counts))

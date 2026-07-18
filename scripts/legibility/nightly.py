@@ -121,7 +121,12 @@ def select_scored_records(
     rather than duplicating the score+first-turn pass or adding a new public
     function to the already-landed β module.
     """
-    sessions = inventory.enumerate_sessions(projects_root, cfg.cwd_prefixes, target_date)
+    sessions = inventory.enumerate_sessions(
+        projects_root, cfg.cwd_prefixes, target_date,
+        agent_transcript_roots=inventory.resolve_agent_transcript_roots(
+            cfg.project_root, cfg.agent_transcript_roots
+        ),
+    )
 
     scored: list[sampling.ScoredRecord] = []
     for session in sessions:

@@ -42,6 +42,7 @@ from legibility.inventory import (  # noqa: E402
     SessionRecord,
     _iter_json_lines,
     enumerate_sessions,
+    resolve_agent_transcript_roots,
 )
 
 # _iter_json_lines lives in legibility.inventory — this module reuses that
@@ -657,7 +658,12 @@ def main(argv: Sequence[str]) -> int:
         else (datetime.now(UTC) - timedelta(days=1)).date()
     )
 
-    sessions = enumerate_sessions(args.projects_root, cfg.cwd_prefixes, target_date)
+    sessions = enumerate_sessions(
+        args.projects_root, cfg.cwd_prefixes, target_date,
+        agent_transcript_roots=resolve_agent_transcript_roots(
+            cfg.project_root, cfg.agent_transcript_roots
+        ),
+    )
 
     scored: list[ScoredRecord] = []
     for session in sessions:
