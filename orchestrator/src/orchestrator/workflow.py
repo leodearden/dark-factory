@@ -1003,6 +1003,19 @@ class TaskWorkflow:
         self._merge_recovery_basis: str | None = None
         self._last_completed_role: str | None = None  # role of the last successfully-completed invocation
         self._last_verify_result: VerifyResult | None = None  # most recent failing VerifyResult from _verify_debugfix_loop
+        # Durable verified-green checkpoint state (task 2752).
+        # _verify_checkpoint_hit: set True for the current loop iteration when
+        # the VERIFY-phase checkpoint fires (a durable prior-run workflow_verify
+        # green exists at the current branch tip) and _verify_debugfix_loop is
+        # SKIPPED.  Read in _enter_phase to SUPPRESS the VERIFY->REVIEW
+        # workflow_verify re-emit — verify did not run this cycle, so
+        # re-asserting a green would be dishonest (the honest signal is
+        # phase_skipped(verify)).  Reset to False at the top of each loop pass.
+        # _verify_green_tip_sha: the branch tip captured right after a PASSING
+        # _verify_debugfix_loop and before _enter_phase(REVIEW); recorded in the
+        # workflow_verify payload as the durable checkpoint key for the next run.
+        self._verify_checkpoint_hit: bool = False
+        self._verify_green_tip_sha: str | None = None
         # Set by _verify_debugfix_loop when a failure is classified as inherited
         # from main (preexisting break).  Read at the call site (run()) to route
         # _mark_blocked with dedupe_fingerprint instead of the generic reason.
@@ -1863,12 +1876,32 @@ class TaskWorkflow:
             # tradeoff (merge_disposition.py's any-prior-green keying is out
             # of this task's module scope to change); pinned by
             # test_merge_skew_end_to_end.py::TestReviewBounceStaleGreenTradeoff.
-            if prev is WorkflowState.VERIFY and new_state is WorkflowState.REVIEW:
+            #
+            # Task 2752: 'tip_sha' (the branch tip captured right after the
+            # passing verify) is the DURABLE cross-restart checkpoint key —
+            # verify_checkpoint.green_checkpoint_at_tip matches on it to skip a
+            # redundant re-verify at an unchanged tip in a later run.  The
+            # `not self._verify_checkpoint_hit` gate SUPPRESSES this emit when
+            # the checkpoint already fired this cycle: verify did NOT run, so
+            # re-asserting workflow_verify(passed=True) would claim a verify
+            # that never happened (the honest signal on a skip is
+            # phase_skipped(verify), emitted in _execute_verify_review_loop);
+            # the prior-run durable row is what the checkpoint relies on, so
+            # nothing is lost by not re-emitting.  Backward-compat: I5
+            # (merge_disposition._branch_pre_merge_verify_green) and
+            # merge_completion_eligible read only data['passed'], so adding
+            # tip_sha does not affect them.
+            if (
+                prev is WorkflowState.VERIFY
+                and new_state is WorkflowState.REVIEW
+                and not self._verify_checkpoint_hit
+            ):
                 self.event_store.emit(
                     EventType.workflow_verify,
                     task_id=self.task_id,
                     data={
                         'passed': True,
+                        'tip_sha': self._verify_green_tip_sha,
                         'base_sha': self._base_commit,
                         'branch': f'{self.config.git.branch_prefix}{self.task_id}',
                     },
