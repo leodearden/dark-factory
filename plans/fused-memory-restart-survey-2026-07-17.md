@@ -77,7 +77,8 @@ Restarts today are **clean but wasteful and only accidentally safe**:
 | # | Sev | Finding |
 |---|-----|---------|
 | A1 | HIGH | **No liveness watchdog exists for fused-memory.** `orchestrator-watchdog.py` watches only `orchestrator-*` units and paths; the in-process systemd watchdog thread pings `WATCHDOG=1` unconditionally from an OS thread — by design (task 1731), but it means a wedged event loop stays "healthy" forever. Nothing port-probes 8002 or `/health`. |
-| A2 | MED | **No staleness signal → no automatic redeploy.** Merged fm changes sit undeployed until a human/PRD files a deterministic deploy task. (Compare orchestrator staleness backstop + shared 8h deploy clock.) |
+| A2 | MED | **No staleness *backstop* → merged fm changes can sit undeployed for hours.** ~~Merged fm changes sit undeployed until a human/PRD files a deterministic deploy task.~~ **CORRECTED 2026-07-17 (see A7):** an on-merge redeploy path *does* exist — the orchestrator's fused-memory `StaleServiceRestartCoordinator` arms on any merge touching `fused-memory/src/` — but it is idle-only with no force-fire escape, so under fleet saturation it starves and never fires (A7). What's missing is the *backstop* the orchestrator fleet has (watchdog staleness pass + shared 8h deploy clock); nothing catches an fm change the on-merge path failed to deploy. |
+| A7 | MED | **The fused-memory on-merge restart coordinator starves under sustained load.** `Harness._build_service_restart_coordinator` builds the fm coordinator with `require_idle=True` and leaves `force_fire_after_secs` at its `0.0` default (only the orchestrator's *own* coordinator got the fleet-redeploy force-fire escape; the dashboard sidesteps the issue with `require_idle=False`). In `maybe_restart`, the gate `(agents_idle or not require_idle)` means fm can only fire from the run-loop's idle branch — so if the orchestrator never reaches an idle quiet-window, the pending restart is retained indefinitely with no bound. **Evidence:** task 2622's fix (`731e1cf315`, touching `fused-memory/src/fused_memory/reconciliation/targeted.py`) merged 2026-07-16 17:13 UTC; the coordinator armed correctly (`fused-memory restart pending: merge … touched 1 watched file(s)` at 17:14:58, re-arming repeatedly through the window) and file-scope matching worked — but it never fired, while the `require_idle=False` **dashboard** coordinator fired normally at 17:30. fused-memory ran the stale pre-2622 code for ~14h until a manual restart at 2026-07-17 08:13 BST. **Do not "fix" by simply adding `force_fire_after_secs` to the fm coordinator:** force-firing fm *under load* is exactly the client-disruption / in-flight-recon-kill hazard C1–C5 + D-series warn against. The safe fix is gated on recs 1–3 (bounded shutdown, `--drain` hang fix, cycle-aware restart) landing first; only then can a bounded force-fire *or* rec 12's staleness backstop safely deploy fm without an idle window. |
 | A3 | MED | **No config hot-reload** — every knob change is a full restart; a prior partial dynamic-reread was deliberately removed (task 1164, `ticket_janitor.py:100-134`), while `schema.py` still says "hot-reloadable" in places. |
 | A4 | LOW | **Unit-parity drift gate checks only 2 directives** (`MEM0_TELEMETRY`, `WatchdogSec`); `Restart=`, `RestartSec=`, `TimeoutStartSec/StopSec`, ExecStartPre ordering can silently drift template↔installed. |
 | A5 | LOW | **Journal volume (≈9M lines / ~2 days, 2–3 log lines per MCP request) breaks naive post-restart verification** — full-unit journalctl scans time out at 280s; automation must use narrow `--since` / field-scoped queries. |
@@ -144,7 +145,14 @@ Restarts today are **clean but wasteful and only accidentally safe**:
     cycle-aware restart from rec. 3 — gated by its own deploy clock. That makes
     "merged ⇒ deployed" automatic and safe, closing the loop the orchestrator
     fleet already has. Extend the parity gate (A4) to the restart-relevant
-    directives so template tuning actually propagates.
+    directives so template tuning actually propagates. **Note (A7):** the
+    on-merge `StaleServiceRestartCoordinator` for fm already exists — this rec
+    is the *backstop* for when it starves (idle-only, no force-fire), not a
+    net-new deploy path. Once rec. 3 makes the restart safe under load, the
+    cheaper alternative is to give that existing coordinator a bounded
+    `force_fire_after_secs` (as the orchestrator's own coordinator has); the
+    watchdog staleness pass is the more robust option because it also catches a
+    coordinator that never armed (process restart between merge and fire).
 13. **Session-resume for interrupted recon stage agents** (E2) — *revised
     2026-07-17 after mapping the orchestrator's crash-recovery resume seam;
     supersedes the original per-stage-checkpoint sketch.* The resume machinery
