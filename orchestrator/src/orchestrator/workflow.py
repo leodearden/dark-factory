@@ -4637,8 +4637,16 @@ class TaskWorkflow:
                 logger.info('Task %s: removing stale merge.json review', self.task_id)
                 stale_merge.unlink()
 
-        review_cycle = 0
-        amendment_round = 0
+        # Seed the loop counters from the persisted task-lifetime totals
+        # (task 2749) so max_amendment_rounds / max_review_cycles bound the
+        # WHOLE task lifetime, not each dispatch — a re-dispatch (restart
+        # churn, requeue, resume) no longer grants a fresh allowance.
+        review_cycle = (
+            self.artifacts.get_review_cycles_total() if self.artifacts else 0
+        )
+        amendment_round = (
+            self.artifacts.get_amendment_rounds_total() if self.artifacts else 0
+        )
 
         while True:
             # EXECUTE
@@ -4765,6 +4773,11 @@ class TaskWorkflow:
                     and amendment_round < self.config.max_amendment_rounds
                 ):
                     amendment_round += 1
+                    # Persist the new task-lifetime total (task 2749).
+                    if self.artifacts:
+                        self.artifacts.set_review_counters(
+                            amendment_rounds_total=amendment_round
+                        )
                     logger.info(
                         'Task %s: amendment round %d, %d in-scope '
                         'suggestion(s) (of %d total)',
@@ -4815,6 +4828,11 @@ class TaskWorkflow:
                 return WorkflowOutcome.DONE
 
             review_cycle += 1
+            # Persist the new task-lifetime total (task 2749).
+            if self.artifacts:
+                self.artifacts.set_review_counters(
+                    review_cycles_total=review_cycle
+                )
 
             # Archive reviews from this cycle before re-plan overwrites them
             if self.artifacts:
