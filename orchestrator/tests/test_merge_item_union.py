@@ -39,6 +39,7 @@ from orchestrator.merge_queue import (
     RealMergeItem,
     SpeculativeMergeWorker,
 )
+from _merge_queue_harness import drive_verify_and_advance
 
 pytestmark = pytest.mark.asyncio
 
@@ -114,13 +115,13 @@ async def _make_branch_with_file(
 # ── (1) RealMergeItem: real-verify path advances main ───────────────────────
 
 
-async def test_real_merge_item_lands_via_verify_and_advance(
+async def test_real_merge_item_lands_via_harness(
     git_ops: GitOps, config: OrchestratorConfig,
 ) -> None:
-    """A RealMergeItem driven through _verify_and_advance takes the
-    real-verify path (host lease → _run_inflight_verify → _finalize_inflight
-    CAS loop) and advances main — the REAL arm of the union must still land
-    merges exactly as the pre-split product type did.
+    """A RealMergeItem driven through the drive_verify_and_advance harness
+    takes the real-verify path (host lease → _run_inflight_verify →
+    _finalize_inflight CAS loop) and advances main — the REAL arm of the union
+    must still land merges exactly as the pre-split product type did.
     """
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
     worker = SpeculativeMergeWorker(git_ops, queue)
@@ -147,7 +148,7 @@ async def test_real_merge_item_lands_via_verify_and_advance(
         'orchestrator.merge_queue.run_scoped_verification',
         AsyncMock(return_value=passing),
     ):
-        advanced = await worker._verify_and_advance(item)
+        advanced = await drive_verify_and_advance(worker, item)
 
     assert advanced is True, 'RealMergeItem must take the real-verify path and advance main'
     outcome = req.result.result()
