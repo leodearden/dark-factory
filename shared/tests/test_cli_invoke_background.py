@@ -21,9 +21,11 @@ from pathlib import Path
 import pytest
 
 from shared.cli_invoke import (
+    AgentFailureKind,
     AgentResult,
     _parse_claude_output,
     _SubprocessResult,
+    classify_agent_failure,
     detect_ended_awaiting_background,
     ended_awaiting_background_for_session,
 )
@@ -300,3 +302,57 @@ class TestParseClaudeOutputDowngrade:
         agent = _parse_claude_output(sub)
         assert agent.success is False
         assert agent.ended_awaiting_background is True
+
+
+class TestClassifyEndedAwaitingBackground:
+    """The classification layer routes a downgraded ended-awaiting-background
+    result to a dedicated kind, placed after the OK/SUCCESS check (so it never
+    shadows a genuine success) and before the timed_out rule (which it must not
+    shadow either, since the two flags are mutually exclusive by construction)."""
+
+    def test_failure_kind_exists(self) -> None:
+        """AgentFailureKind.ENDED_AWAITING_BACKGROUND exists."""
+        assert AgentFailureKind.ENDED_AWAITING_BACKGROUND
+
+    def test_downgraded_result_classified_as_ended_awaiting_background(self) -> None:
+        """success=False + ended_awaiting_background=True → dedicated kind, summary
+        mentions background."""
+        result = AgentResult(
+            success=False,
+            output='done',
+            subtype='success',
+            turns=19,
+            ended_awaiting_background=True,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.ENDED_AWAITING_BACKGROUND
+        assert 'background' in cls.summary.lower()
+
+    def test_plain_success_not_misfired(self) -> None:
+        """A genuine success (flag False) stays SUCCESS — the new rule, placed
+        after the OK check, cannot misfire."""
+        result = AgentResult(
+            success=True, output='ok', subtype='success', turns=3,
+            ended_awaiting_background=False,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.SUCCESS
+
+    def test_timed_out_not_shadowed(self) -> None:
+        """A timed-out result (flag False) still classifies as TIMED_OUT — the
+        new rule does not shadow the timeout rule below it."""
+        result = AgentResult(
+            success=False, output='', subtype='error_empty_output',
+            duration_ms=300_000, timed_out=True, ended_awaiting_background=False,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.TIMED_OUT
+
+    def test_diagnostic_detail_still_renders(self) -> None:
+        """diagnostic_detail keeps its full signal dump (transcript_turns line)."""
+        result = AgentResult(
+            success=False, output='done', subtype='success',
+            ended_awaiting_background=True, transcript_turns=19,
+        )
+        cls = classify_agent_failure(result)
+        assert 'transcript_turns=' in cls.diagnostic_detail
