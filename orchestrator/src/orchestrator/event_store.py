@@ -82,6 +82,13 @@ class EventType(StrEnum):
     set_to_plan = 'set_to_plan'
     merge_attempt = 'merge_attempt'
     merge_verify = 'merge_verify'
+    # A merge-role scoped-verify red that the isolated-rerun-confirm gate
+    # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a
+    # CPU-starvation flake and suppressed so the merge could proceed.
+    # task_id-keyed; data carries {node_ids: list[str], merge_sha: str,
+    # measured_at: ISO-8601 str} — the suppressed pytest node-ids, the merge
+    # commit whose verify was suppressed, and when the suppression was decided.
+    merge_flake_suppressed = 'merge_flake_suppressed'
     # The branch's OWN pre-merge verify verdict, recorded by the orchestrator
     # workflow VERIFY phase (branch-vs-its-merge-base) — distinct from
     # merge_verify, which is the merge worker's POST-rebase verify (branch
