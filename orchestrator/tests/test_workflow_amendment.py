@@ -15,10 +15,13 @@ granted at schedule time) and must:
 from __future__ import annotations
 
 import logging
-from unittest.mock import MagicMock
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from _orch_helpers import pydantic_spec
 
+from orchestrator.artifacts import ReviewAggregation
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow
 
@@ -172,3 +175,116 @@ class TestSuggestionsInScope:
         s2 = _sugg('crates/reify-types/src/b.rs:2', description='second')
         s3 = _sugg('crates/reify-types/src/c.rs:3', description='third')
         assert wf._suggestions_in_scope([s1, s2, s3]) == [s1, s2, s3]
+
+
+# ---------------------------------------------------------------------------
+# task 2750: _apply_amendment_delta_scope — deterministic delta partition
+# ---------------------------------------------------------------------------
+
+
+def _make_scope_workflow(delta: dict) -> TaskWorkflow:
+    """Workflow wired for _apply_amendment_delta_scope tests.
+
+    ``get_new_side_changed_line_ranges`` returns *delta*; the curator router
+    is replaced with an AsyncMock so routing is observable without MCP.
+    """
+    wf = _make_workflow(modules=['src'])
+    wf.worktree = Path('/tmp/wt-2750')
+    wf.git_ops.get_new_side_changed_line_ranges = AsyncMock(return_value=delta)
+    wf._route_review_suggestions_to_curator = AsyncMock()
+    return wf
+
+
+def _blocking(location: str) -> dict:
+    return {
+        'reviewer': 'test_analyst',
+        'severity': 'blocking',
+        'category': 'correctness',
+        'location': location,
+        'description': 'a real bug',
+        'suggested_fix': 'fix it',
+    }
+
+
+@pytest.mark.asyncio
+class TestApplyAmendmentDeltaScope:
+    """TaskWorkflow._apply_amendment_delta_scope — the enforceable delta scope."""
+
+    async def _ctx(self, suggestions):
+        from orchestrator.workflow import AmendmentReviewContext
+        return AmendmentReviewContext(
+            pre_amendment_head='PRESHA', amended_suggestions=suggestions,
+        )
+
+    async def test_partitions_and_routes_out_of_delta(self):
+        wf = _make_scope_workflow({'src/foo.py': [(10, 20)]})
+        blocking = _blocking('src/other.py:99')
+        in_sugg = _sugg('src/foo.py:15')
+        out_sugg = _sugg('src/other.py:5')
+        reviews = ReviewAggregation(
+            has_blocking_issues=True,
+            blocking_issues=[blocking],
+            suggestions=[in_sugg, out_sugg],
+            reviews={'test_analyst': {'verdict': 'APPROVE'}},
+            reviewer_errors=[],
+        )
+        ctx = await self._ctx([in_sugg])
+
+        result = await wf._apply_amendment_delta_scope(reviews, ctx)
+
+        # (i) verdict keeps only the in-delta suggestion.
+        assert result.suggestions == [in_sugg]
+        # (ii) blocking fields pass through untouched (safety valve).
+        assert result.has_blocking_issues is True
+        assert result.blocking_issues == [blocking]
+        # (iii) the out-of-delta suggestion is routed to the curator, once.
+        wf._route_review_suggestions_to_curator.assert_awaited_once()
+        routed = wf._route_review_suggestions_to_curator.call_args.args[0]
+        assert routed.suggestions == [out_sugg]
+        # the git delta query used the pre-amendment head.
+        wf.git_ops.get_new_side_changed_line_ranges.assert_awaited_once()
+        gargs = wf.git_ops.get_new_side_changed_line_ranges.call_args
+        assert gargs.args[0] == wf.worktree
+        assert gargs.args[1] == 'PRESHA'
+
+    async def test_no_out_of_delta_does_not_route(self):
+        wf = _make_scope_workflow({'src/foo.py': [(10, 20)]})
+        in1 = _sugg('src/foo.py:12')
+        in2 = _sugg('src/foo.py')  # file-level on a delta file → in-delta
+        reviews = ReviewAggregation(
+            has_blocking_issues=False,
+            blocking_issues=[],
+            suggestions=[in1, in2],
+            reviews={},
+            reviewer_errors=[],
+        )
+        ctx = await self._ctx([in1, in2])
+
+        result = await wf._apply_amendment_delta_scope(reviews, ctx)
+
+        assert result.suggestions == [in1, in2]
+        wf._route_review_suggestions_to_curator.assert_not_awaited()
+
+    async def test_fail_open_on_empty_delta(self, caplog):
+        wf = _make_scope_workflow({})  # uncomputable / empty delta
+        s1 = _sugg('src/foo.py:15')
+        s2 = _sugg('src/other.py:5')
+        reviews = ReviewAggregation(
+            has_blocking_issues=False,
+            blocking_issues=[],
+            suggestions=[s1, s2],
+            reviews={},
+            reviewer_errors=[],
+        )
+        ctx = await self._ctx([s1])
+
+        with caplog.at_level(logging.WARNING):
+            result = await wf._apply_amendment_delta_scope(reviews, ctx)
+
+        # Fail-open: reviews returned unchanged (no suggestion silently dropped).
+        assert result is reviews
+        assert result.suggestions == [s1, s2]
+        wf._route_review_suggestions_to_curator.assert_not_awaited()
+        assert any(rec.levelno == logging.WARNING for rec in caplog.records), (
+            'fail-open must log a WARNING for audit'
+        )
