@@ -24,7 +24,7 @@ from orchestrator.config import (
 )
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import WorkflowOutcome, build_workflow
 
 from .configs import EVAL_CONFIGS, EvalConfig
 from .metrics import collect_metrics
@@ -263,7 +263,7 @@ async def run_eval(
             logger.warning(f'Failed to create UsageGate for eval: {exc} — running without failover')
 
     # 6. Run the real workflow
-    workflow = TaskWorkflow(
+    workflow = build_workflow(
         assignment=assignment,
         config=orch_config,
         git_ops=git_ops,

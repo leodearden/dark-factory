@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 from _orch_helpers import pydantic_spec
@@ -47,13 +48,15 @@ def test_build_workflow_forwards_params():
     briefing = MagicMock()
     mcp = MagicMock()
 
-    # Distinct sentinels for the optional pass-through params — assert the
-    # factory forwards the *identical* objects, not equal copies.
-    cost_store = object()
-    event_store = object()
-    initial_plan = object()
-    usage_gate = object()
-    escalation_queue = object()
+    # Distinct opaque sentinels for the optional pass-through params — assert
+    # the factory forwards the *identical* objects, not equal copies. Typed
+    # ``Any`` so they satisfy build_workflow's (deliberately explicit) param
+    # types while staying inert pass-through tokens.
+    cost_store: Any = object()
+    event_store: Any = object()
+    initial_plan: Any = object()
+    usage_gate: Any = object()
+    escalation_queue: Any = object()
 
     wf = build_workflow(
         assignment=assignment,
