@@ -139,7 +139,10 @@ _TIMEOUT_TOKEN_RE = re.compile(r'\btimed?\s*out\b', re.IGNORECASE)
 # every rustc compile-error diagnostic — either PROVES the wrapped command
 # ran, so both are used as the veto marker set rather than inventing a new
 # one.
-_CLIPPY_LINT_MARKER_RE = re.compile(r'clippy::')
+# Plain substring check (not a compiled regex — 'clippy::' has no
+# metacharacters to match and this mirrors the _ENOSPC_MARKERS substring
+# style used a few lines below).
+_CLIPPY_LINT_MARKER = 'clippy::'
 
 
 def _classify_environmental(output: str) -> FailureCategory | None:
@@ -163,6 +166,22 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     dispatch. Applies ONLY to the SEMAPHORE_TIMEOUT arm — DISK_FULL's ENOSPC
     markers are specific enough (and checked first) that a compile/lint
     failure caused by a genuinely full disk must stay DISK_FULL.
+
+    Known gap (out of scope for task 2748): the veto marker set is
+    Rust-specific (clippy/rustc diagnostics only), because this guard runs
+    tool-blind, BEFORE per-tool dispatch, for every ``ToolKind``. A
+    deterministic non-Rust failure whose output incidentally quotes a
+    lock/slot/semaphore token together with a "timed out" token — e.g. a
+    pytest failure in a test named ``test_lock_timed_out``, or a similarly
+    incidental npm/tree-sitter message — still satisfies the loose
+    ``_LOCK_TOKEN_RE`` + ``_TIMEOUT_TOKEN_RE`` co-occurrence with no veto
+    marker to suppress it, and is still misclassified ``SEMAPHORE_TIMEOUT``.
+    That looseness predates task 2748 and is only narrowed for Rust here; a
+    future task extending the marker set per-tool, or tightening
+    ``_LOCK_TOKEN_RE``/``_TIMEOUT_TOKEN_RE`` to require wrapper-emitted
+    context (e.g. an anchored ``lib_slot_acquire.sh``/``flock -w`` marker so
+    a genuine slot timeout is matched positively instead of by loose
+    co-occurrence), would close it.
     """
     lower = output.lower()
     if any(marker in lower for marker in _ENOSPC_MARKERS):
@@ -172,7 +191,7 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     if (
         _LOCK_TOKEN_RE.search(output)
         and _TIMEOUT_TOKEN_RE.search(output)
-        and not _CLIPPY_LINT_MARKER_RE.search(output)
+        and _CLIPPY_LINT_MARKER not in output
         and not _COMPILE_ERROR_RUSTC_CODE_RE.search(output)
     ):
         return FailureCategory.SEMAPHORE_TIMEOUT
