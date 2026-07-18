@@ -144,16 +144,35 @@ _TIMEOUT_TOKEN_RE = re.compile(r'\btimed?\s*out\b', re.IGNORECASE)
 # style used a few lines below).
 _CLIPPY_LINT_MARKER = 'clippy::'
 
+# Broken _merge-verify worktree (task 2756) — a guard script (e.g. reify's
+# check-manifold-deps.sh) that cannot read the ephemeral merge-verify
+# worktree's own Cargo.lock is a broken verify ENVIRONMENT, not a branch
+# fault — exactly like DISK_FULL/SEMAPHORE_TIMEOUT above. Line-scoped: the
+# read-failure verb and the `Cargo.lock` token must appear on the same line,
+# mirroring the single-line grounded sample below.
+#
+# Grounded in a real observed guard-script failure (reify task 5120 RC-2,
+# 2026-07-13):
+#   'check-manifold-deps.sh: could not read manifold-csg-sys version from
+#    /work/_merge-verify/Cargo.lock'
+# Extend the verb alternation only when a new grounded read-failure sample
+# appears, mirroring _CARGO_CLI_ERROR_RE's allowlist-tightening discipline.
+_VERIFY_ENV_BROKEN_RE = re.compile(
+    r"^.*\b(?:could not|cannot|can[’']t|unable to|failed to)\s+read\b.*\bCargo\.lock\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+
 
 def _classify_environmental(output: str) -> FailureCategory | None:
-    """Tool-blind host-infrastructure guard: DISK_FULL / SEMAPHORE_TIMEOUT.
+    """Tool-blind host-infrastructure guard: DISK_FULL / SEMAPHORE_TIMEOUT /
+    ENV_TRANSIENT (broken ``_merge-verify`` worktree).
 
     Checked in ``classify_failure`` immediately after the ``timed_out`` ->
     ``INFRA_TIMEOUT`` guard and before any per-tool dispatch — these
     conditions are properties of the HOST, not of any one tool, so no
     per-tool table is the right home for them. Returns ``None`` (the caller
-    proceeds to per-tool dispatch) when neither condition is grounded in
-    *output*.
+    proceeds to per-tool dispatch) when none of these conditions is grounded
+    in *output*.
 
     SEMAPHORE_TIMEOUT deterministic-diagnostic veto (task 2748): a genuine
     slot/lock-acquisition timeout is raised by the concurrency-limiter
@@ -182,6 +201,21 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     context (e.g. an anchored ``lib_slot_acquire.sh``/``flock -w`` marker so
     a genuine slot timeout is matched positively instead of by loose
     co-occurrence), would close it.
+
+    ENV_TRANSIENT — broken verify worktree (task 2756): a malformed
+    ``_merge-verify`` worktree (e.g. an unreadable or missing ``Cargo.lock``)
+    is a property of the HOST/environment, not of whichever guard script or
+    tool happened to trip over it, so it is checked LAST here — after the
+    more specific ENOSPC/linker/semaphore checks, so a co-occurring disk-full
+    still wins as the more specific root cause (see
+    ``test_enospc_with_unreadable_lock_stays_disk_full``) — and wins over
+    per-tool dispatch regardless of ``ToolKind``. This source is DISTINCT
+    from the pytest-scoped shared-venv ``_ENV_TRANSIENT_PATTERNS`` below
+    (different grounded patterns mapping to the same ``ENV_TRANSIENT``
+    category, exactly like how ``DISK_FULL`` above is produced by this same
+    tool-blind guard rather than any per-tool table) — this does not violate
+    Invariant C1, which forbids duplicating the SAME pattern across per-tool
+    tables, not a category being reachable from more than one guard.
     """
     lower = output.lower()
     if any(marker in lower for marker in _ENOSPC_MARKERS):
@@ -195,6 +229,8 @@ def _classify_environmental(output: str) -> FailureCategory | None:
         and not _COMPILE_ERROR_RUSTC_CODE_RE.search(output)
     ):
         return FailureCategory.SEMAPHORE_TIMEOUT
+    if _VERIFY_ENV_BROKEN_RE.search(output):
+        return FailureCategory.ENV_TRANSIENT
     return None
 
 
@@ -207,12 +243,13 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
     2. ``timed_out`` -> ``FailureCategory.INFRA_TIMEOUT`` (wins over any
        output pattern — the root cause is the wall-clock limit, not the
        command output)
-    3. ``_classify_environmental(output)`` -> ``FailureCategory.DISK_FULL``
-       or ``FailureCategory.SEMAPHORE_TIMEOUT`` when grounded in *output*
-       (wins over any per-tool output pattern for the same "root cause is
-       the environment, not the command output" reason as guard 2 — a host
-       condition like a full disk or a lock/semaphore-slot timeout is not a
-       property of any one tool).
+    3. ``_classify_environmental(output)`` -> ``FailureCategory.DISK_FULL``,
+       ``FailureCategory.SEMAPHORE_TIMEOUT``, or ``FailureCategory.ENV_TRANSIENT``
+       (broken ``_merge-verify`` worktree) when grounded in *output* (wins
+       over any per-tool output pattern for the same "root cause is the
+       environment, not the command output" reason as guard 2 — a host
+       condition like a full disk, a lock/semaphore-slot timeout, or an
+       unreadable worktree lockfile is not a property of any one tool).
 
     Then dispatches on *tool* to a per-tool classification table (Invariant
     C1: a tool-T pattern lives ONLY in tool-T's table, so a cargo token can
@@ -221,7 +258,12 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
       shared-venv-mutation signatures, consulted ONLY here — see the
       "BEHAVIORAL NARROWING" note above ``_ENV_TRANSIENT_PATTERNS`` below for
       the resulting constraint: the caller must resolve a command to
-      ``ToolKind.PYTEST`` for env_transient auto-recovery to ever fire).
+      ``ToolKind.PYTEST`` for THIS shared-venv-mutation flavor of
+      env_transient auto-recovery to ever fire. Since task 2756,
+      ``FailureCategory.ENV_TRANSIENT`` also has a second, ToolKind-
+      independent producer — guard 3's ``_classify_environmental`` above,
+      via ``_VERIFY_ENV_BROKEN_RE`` — so env_transient auto-recovery overall
+      is NOT PYTEST-gated, only this particular pattern source is).
     - ``ToolKind.CARGO_TEST`` / ``ToolKind.CARGO_CLIPPY`` -> a structured
       NDJSON parse (``_parse_cargo_json``) is attempted FIRST (Invariant C2);
       when *output* isn't detected as cargo's ``--message-format json`` NDJSON
@@ -289,8 +331,9 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
 # for the same rc=5-stays-RED contract, which applies here identically).
 #
 # BEHAVIORAL NARROWING vs. the pre-δ tool-blind ladder (intentional, tracked
-# here rather than reverted): env_transient auto-recovery is now reachable
-# ONLY when the failing check's config command lexically resolves to
+# here rather than reverted): auto-recovery keyed on THIS pattern table (the
+# shared-venv-mutation signatures immediately below) is now reachable ONLY
+# when the failing check's config command lexically resolves to
 # ToolKind.PYTEST via `parse_config_command` (see verify.py's
 # `_tool_for_cmd`) — the tool-blind `_classify_failure` used to consult these
 # patterns unconditionally, for every check. A test command the parser
@@ -310,6 +353,17 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
 # active gap; if a wrapped/indirect test command shape is ever introduced,
 # either extend `parse_config_command` to see through the wrapper to PYTEST,
 # or revisit whether these patterns belong in the OPAQUE ladder too.
+#
+# SCOPE OF THE NARROWING (task 2756 update): the "ONLY … ToolKind.PYTEST"
+# constraint above binds THIS `_ENV_TRANSIENT_PATTERNS` source only, not
+# `FailureCategory.ENV_TRANSIENT` as a whole. Since task 2756,
+# `_classify_environmental`'s `_VERIFY_ENV_BROKEN_RE` check (above,
+# `classify_failure` guard 3) is a second, ToolKind-independent producer of
+# the same category — it runs tool-blind, before per-tool dispatch, so a
+# broken-`_merge-verify`-worktree failure trips `ENV_TRANSIENT` (and its
+# verify.py auto-recovery retry) regardless of which ToolKind the failing
+# check resolves to. verify.py's `_tool_for_cmd` NOTE echoes this same
+# now-narrower PYTEST-only claim; read it as scoped identically to this one.
 # ---------------------------------------------------------------------------
 
 # Shared-venv mutation signatures (task 2048): a concurrent `uv sync` from

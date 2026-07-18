@@ -861,6 +861,82 @@ class TestSemaphoreTimeoutDeterministicDiagnosticVeto:
         )
 
 
+# ---------------------------------------------------------------------------
+# task 2756: broken _merge-verify worktree (unreadable/missing Cargo.lock) is
+# a HOST/ENVIRONMENT condition, not a per-tool output pattern — exactly like
+# DISK_FULL/SEMAPHORE_TIMEOUT above. Grounded in the reify 5120 RC-2 07-13
+# sample: check-manifold-deps.sh (an OPAQUE guard script) failed with
+# "could not read manifold-csg-sys version from .../_merge-verify/Cargo.lock"
+# because the ephemeral merge-verify worktree's own Cargo.lock was
+# unreadable — a broken verify ENVIRONMENT, not a branch fault. Mirrors
+# TestEnvironmentalGuardsApplyToEveryToolKind's tool-blind coverage.
+#
+# RED today: no broken-verify-worktree signature exists yet, so the golden
+# below falls through _classify_environmental (no ENOSPC/linker/semaphore
+# match) and per-tool dispatch (no table matches this shape either) to
+# UNKNOWN_TEST_FAILURE instead of ENV_TRANSIENT.
+# ---------------------------------------------------------------------------
+
+_VERIFY_WORKTREE_BROKEN_CARGO_LOCK_OUTPUT = (
+    'check-manifold-deps.sh: could not read manifold-csg-sys version from '
+    '/work/_merge-verify/Cargo.lock\n'
+)
+
+
+class TestVerifyWorktreeBrokenEnvGuard:
+    """task 2756: a broken _merge-verify worktree's unreadable Cargo.lock
+    classifies ENV_TRANSIENT — tool-blind, like DISK_FULL/SEMAPHORE_TIMEOUT —
+    so the merge_queue's transient-infra hold (INFRA_TRANSIENT_CATEGORIES)
+    fires instead of a silent generic block."""
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_broken_verify_worktree_cargo_lock_is_env_transient(self, tool):
+        assert (
+            _classify(tool, _VERIFY_WORKTREE_BROKEN_CARGO_LOCK_OUTPUT, 1, False)
+            == FailureCategory.ENV_TRANSIENT
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_broken_verify_worktree_is_infra_transient(self, tool):
+        """Observable signal #1: the unit-level proxy that this output will
+        hit the merge_queue.py:1886 transient-infra gate."""
+        result = _classify(tool, _VERIFY_WORKTREE_BROKEN_CARGO_LOCK_OUTPUT, 1, False)
+        assert result in INFRA_TRANSIENT_CATEGORIES
+
+
+class TestVerifyWorktreeBrokenEnvGuardNegatives:
+    """Narrowness / ordering regression guards for the broken-verify-worktree
+    signature — green both before and after the impl."""
+
+    def test_genuine_cargo_lock_mention_not_env_transient(self):
+        """A real rustc compile fault that merely mentions Cargo.lock on a
+        line WITHOUT a read-failure verb must not be swallowed by the new
+        pattern — proves the pattern does not shadow genuine branch faults."""
+        output = (
+            'error[E0308]: mismatched types\n'
+            '  --> src/lib.rs:10:5\n'
+            'note: Cargo.lock is up to date\n'
+        )
+        assert (
+            _classify(ToolKind.CARGO_TEST, output, 1, False) == FailureCategory.COMPILE_ERROR
+        )
+
+    def test_read_failure_without_cargo_lock_not_env_transient(self):
+        """A read failure that doesn't mention Cargo.lock must not classify
+        ENV_TRANSIENT — proves the pattern requires the Cargo.lock lockfile
+        token, not any read failure."""
+        output = 'could not read /work/_merge-verify/config/settings.toml\n'
+        assert (
+            _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.UNKNOWN_TEST_FAILURE
+        )
+
+    def test_enospc_with_unreadable_lock_stays_disk_full(self):
+        """The more specific DISK_FULL root cause wins on co-occurrence —
+        the ENOSPC check is ordered first in _classify_environmental."""
+        output = _DISK_FULL_ENOSPC_OUTPUT + _VERIFY_WORKTREE_BROKEN_CARGO_LOCK_OUTPUT
+        assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.DISK_FULL
+
+
 # step-9: verify._summarize_checks must thread the per-check config command
 # (test_cmd/lint_cmd/type_cmd) into classify_failure as that check's
 # ToolKind, instead of discarding tool identity (today's tool-blind
