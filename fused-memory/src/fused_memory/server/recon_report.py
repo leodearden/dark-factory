@@ -13,11 +13,12 @@ import asyncio
 import contextlib
 import hashlib
 import inspect
+import json
 import logging
 import re
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from graphiti_core.errors import EdgeNotFoundError
@@ -329,6 +330,117 @@ class _ReportEntry:
     # Mirrors this stage's contribution to _run_desc_index; same
     # run-quiescence-release caveat as _signature_to_finding above.
     _deschash_to_finding: dict[str, str] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Entry (de)serialization — SQLite write-through persistence (task 2716)
+# ---------------------------------------------------------------------------
+#
+# entry_json's shape is an internal implementation detail of the persistence
+# write-through path (ReconReportState._persist_run / hydrate_from_store) and
+# ReconReportStore rows — never surfaced to MCP tool callers.
+
+
+def _encode_sig_map(
+    sig_map: dict[tuple[str | None, str | None], str],
+) -> list[list[str | None]]:
+    """Encode a ``(task_id|None, flag_type|None) -> finding_id`` map as a JSON-safe
+    list of ``[task_id, flag_type, finding_id]`` triples.
+
+    A dict with a tuple key is not JSON-serializable directly, and coercing the
+    tuple to a string key (e.g. ``str((task_id, flag_type))``) would collapse
+    ``None`` into the literal string ``'None'`` — indistinguishable from a real
+    ``'None'`` task_id/flag_type string on decode.  A flat list of triples sidesteps
+    both problems: ``None`` round-trips through JSON ``null`` unchanged.
+    """
+    return [[sig[0], sig[1], finding_id] for sig, finding_id in sig_map.items()]
+
+
+def _decode_sig_map(
+    rows: list[list[str | None]],
+) -> dict[tuple[str | None, str | None], str]:
+    """Inverse of :func:`_encode_sig_map`."""
+    return {(row[0], row[1]): row[2] for row in rows}  # type: ignore[misc]
+
+
+def _serialize_entry(
+    entry: _ReportEntry,
+    *,
+    sig_anchor_slice: dict[tuple[str | None, str | None], str],
+    cited_task_slice: dict[str, str],
+) -> str:
+    """Serialize *entry* (plus its run-level fold-anchor slices) to a JSON string.
+
+    *sig_anchor_slice* and *cited_task_slice* are NOT part of ``_ReportEntry`` —
+    they are this entry's OWNED portion of the run-scoped
+    ``ReconReportState._run_sig_index`` / ``_run_cited_task_index``, computed by
+    the caller (``ReconReportState._persist_run``) from the live indices at
+    persist time.  They ride along in the same JSON blob (rather than a second
+    row/table) purely so one row still fully describes one ``(run_id, stage)``
+    entry; :func:`_deserialize_entry` ignores them (they are not part of
+    ``_ReportEntry``'s fields) — use :func:`_deserialize_fold_anchor_slices` to
+    read them back for rebuilding the run-level indices on hydrate.
+
+    ``_Finding`` and the entry's own scalar/collection fields are all built from
+    JSON-safe primitives already (str / bool / float / None / list[dict]), so
+    ``dataclasses.asdict`` needs no custom encoder.
+    """
+    payload = {
+        'run_id': entry.run_id,
+        'stage': entry.stage,
+        'project_id': entry.project_id,
+        'findings': [asdict(f) for f in entry.findings],
+        'stats': dict(entry.stats),
+        'summary': entry.summary,
+        'summary_warnings': list(entry.summary_warnings),
+        'completed_at': entry.completed_at,
+        'created_at': entry.created_at,
+        'signature_to_finding': _encode_sig_map(entry._signature_to_finding),
+        'deschash_to_finding': dict(entry._deschash_to_finding),
+        'sig_anchor_slice': _encode_sig_map(sig_anchor_slice),
+        'cited_task_slice': dict(cited_task_slice),
+    }
+    return json.dumps(payload)
+
+
+def _deserialize_entry(entry_json: str) -> _ReportEntry:
+    """Inverse of :func:`_serialize_entry`'s ``_ReportEntry``-shaped fields.
+
+    Does NOT restore the fold-anchor slices — call
+    :func:`_deserialize_fold_anchor_slices` on the same *entry_json* for those;
+    they are run-level, not part of ``_ReportEntry``.
+    """
+    data = json.loads(entry_json)
+    findings = [_Finding(**fd) for fd in data['findings']]
+    return _ReportEntry(
+        run_id=data['run_id'],
+        stage=data['stage'],
+        project_id=data['project_id'],
+        findings=findings,
+        stats=dict(data['stats']),
+        summary=data['summary'],
+        summary_warnings=list(data['summary_warnings']),
+        completed_at=data['completed_at'],
+        created_at=data['created_at'],
+        _signature_to_finding=_decode_sig_map(data['signature_to_finding']),
+        _deschash_to_finding=dict(data['deschash_to_finding']),
+    )
+
+
+def _deserialize_fold_anchor_slices(
+    entry_json: str,
+) -> tuple[dict[tuple[str | None, str | None], str], dict[str, str]]:
+    """Return ``(sig_anchor_slice, cited_task_slice)`` persisted by
+    :func:`_serialize_entry` — this entry's owned slice of the run-scoped
+    ``_run_sig_index`` / ``_run_cited_task_index``.  Used by
+    :meth:`ReconReportState.hydrate_from_store` to rebuild those indices by
+    unioning every entry's slice.
+    """
+    data = json.loads(entry_json)
+    return (
+        _decode_sig_map(data['sig_anchor_slice']),
+        dict(data['cited_task_slice']),
+    )
 
 
 # ---------------------------------------------------------------------------
