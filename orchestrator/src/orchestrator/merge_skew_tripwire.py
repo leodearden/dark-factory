@@ -198,6 +198,23 @@ async def emit_pipeline_landing_tripwire(
     overlaps *landing_changed_files*, and attach a steward-visible note to
     each such task's metadata via *update_task*.
 
+    On-task note durability — last-writer-wins by design: the note is written
+    under the single ``x_merge_skew_tripwire`` metadata key with
+    ``metadata_mode='merge'`` (shallow last-write-wins — omitted keys are
+    preserved, this key's value is overwritten wholesale). If the SAME
+    in-flight task is flagged by two distinct load-bearing landings before it
+    merges, the second write replaces the first, so the on-task note reflects
+    only the MOST RECENT landing. This is intentional, not lossy: the on-task
+    note is a convenience pointer ("this branch must port a recently-landed
+    change — see the escalation"), while the **escalation is the durable,
+    complete per-landing record** — each landing files its own escalation
+    under a unique ``pipeline-landing-tripwire-{sha12}`` sentinel (≤1 per
+    landing), and a task hit by N landings is named in N distinct escalations,
+    so no landing's signal is ever lost. Accumulating every landing's overlap
+    onto the task would require a racy read-modify-write (``merge`` mode does
+    not deep-merge a nested value) on this deliberately fail-open path, for no
+    signal the escalation stream does not already carry durably.
+
     *oracle_timeout_secs* bounds the oracle subprocess (see
     ``_run_load_bearing_oracle``) — defaults to
     :data:`DEFAULT_ORACLE_TIMEOUT_SECS`, matching
@@ -307,6 +324,12 @@ async def emit_pipeline_landing_tripwire(
                         # convention, so it must not be a bare top-level key
                         # (that would emit a task_metadata.schema_warning
                         # code=unknown_key census line on every read/write).
+                        #
+                        # metadata_mode='merge' is shallow last-write-wins:
+                        # a task flagged by two landings keeps only the most
+                        # recent one here. Intentional — see the docstring;
+                        # the per-landing escalation (unique sentinel) is the
+                        # durable, complete record, so nothing is lost.
                         'x_merge_skew_tripwire': {
                             'landing_sha': landing_sha,
                             'overlap_files': list(hit.overlap_files),
