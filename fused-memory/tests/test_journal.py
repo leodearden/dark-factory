@@ -202,6 +202,73 @@ async def test_get_running_runs_returns_all_running_regardless_of_age(journal):
 
 
 @pytest.mark.asyncio
+async def test_interrupted_status_roundtrips_and_get_interrupted_runs(journal):
+    """complete_run(run_id, 'interrupted') persists RunStatus.interrupted and
+    stamps completed_at (the interrupt instant); get_interrupted_runs() returns
+    exactly the interrupted rows, excluding running/failed/completed."""
+    interrupted = ReconciliationRun(
+        id=str(uuid.uuid4()),
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+        instance_id='instance-interrupted',
+    )
+    still_running = ReconciliationRun(
+        id=str(uuid.uuid4()),
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+        instance_id='instance-running',
+    )
+    failed = ReconciliationRun(
+        id=str(uuid.uuid4()),
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+    )
+    completed = ReconciliationRun(
+        id=str(uuid.uuid4()),
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+    )
+    await journal.start_run(interrupted)
+    await journal.start_run(still_running)
+    await journal.start_run(failed)
+    await journal.start_run(completed)
+    await journal.complete_run(interrupted.id, 'interrupted')
+    await journal.complete_run(failed.id, 'failed')
+    await journal.complete_run(completed.id, 'completed')
+
+    # Roundtrip: status persists as interrupted and completed_at (the interrupt
+    # instant, later reused as the resume freshness clock) is stamped.
+    loaded = await journal.get_run(interrupted.id)
+    assert loaded is not None
+    assert loaded.status == RunStatus.interrupted
+    assert loaded.completed_at is not None
+
+    # get_interrupted_runs returns exactly the interrupted row, mapping
+    # instance_id/session snapshot faithfully, and excludes every other status.
+    interrupted_runs = await journal.get_interrupted_runs()
+    interrupted_ids = {r.id for r in interrupted_runs}
+    assert interrupted_ids == {interrupted.id}, (
+        f'Expected exactly the interrupted run; got ids={interrupted_ids!r}'
+    )
+    assert still_running.id not in interrupted_ids
+    assert failed.id not in interrupted_ids
+    assert completed.id not in interrupted_ids
+    assert interrupted_runs[0].instance_id == 'instance-interrupted'
+
+
+@pytest.mark.asyncio
 async def test_runs_table_has_session_columns(journal):
     """A freshly-initialized runs table exposes session_id, stage_cursor, attempt."""
     db = journal._require_db()
