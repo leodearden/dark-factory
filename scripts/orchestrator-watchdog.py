@@ -673,6 +673,55 @@ def _newest_watched_commit_epoch() -> int | None:
         return None
 
 
+def _newest_fm_watched_commit_epoch() -> int | None:
+    """Return the newest committer epoch touching FM_WATCHED_PATHS on HEAD, or None.
+
+    fm sibling of _newest_watched_commit_epoch, identical body but diffing
+    FM_WATCHED_PATHS (fused-memory/src/ + shared/src/) instead of WATCHED_PATHS.
+    fused_memory_staleness_pass() (task 2714) compares this against
+    fused-memory.service's ActiveEnterTimestamp to detect a merged-but-
+    undeployed fm change.
+
+    Returns None if no commit touches the fm-watched paths (git exits 0 with
+    EMPTY stdout — must be treated as undeterminable, not epoch 0, or
+    fused-memory would look infinitely stale), on a non-zero exit, on
+    unparseable stdout, or on any subprocess/OS error. Callers must treat None
+    as "staleness cannot be determined this tick".
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                REPO_DIR,
+                "log",
+                "-1",
+                "--format=%ct",
+                "HEAD",
+                "--",
+                *FM_WATCHED_PATHS,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        stdout = result.stdout.strip()
+        if not stdout:
+            return None
+        try:
+            return int(stdout)
+        except ValueError:
+            return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"_newest_fm_watched_commit_epoch: swallowed {exc!r}; "
+            "returning None (fm staleness undeterminable this tick)"
+        )
+        return None
+
+
 def _read_last_fleet_deploy_epoch() -> float | None:
     """Return the last verified fleet-deploy epoch from FLEET_DEPLOY_CLOCK_PATH, or None.
 
