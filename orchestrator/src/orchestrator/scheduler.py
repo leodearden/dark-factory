@@ -139,6 +139,13 @@ _STARVATION_NON_ELIGIBLE = frozenset(
     {'blocked', 'deferred', 'review', 'merge-deferred'}
 )
 
+# Stable grep-anchor token leading every starvation-watchdog escalation summary.
+# Tests and downstream classifiers key on this literal, so it is single-sourced
+# here rather than repeated across the two escalation-message branches in
+# _apply_starvation_watchdog (idle-only backstop vs. dual-gate lock-contention) —
+# the one fragment that MUST stay identical between them can no longer drift.
+_STARVATION_WATCHDOG_MARKER = 'STARVATION_WATCHDOG'
+
 
 class SetTaskStatusRejected(Exception):
     """Base class for non-transient set_task_status rejections.
@@ -3381,6 +3388,12 @@ class Scheduler:
                 and not self._streak_starvation.is_escalated(tid)
                 and self._callbacks.on_starvation_warn is not None
             ):
+                # Shared scaffolding single-sourced across both escalation paths
+                # so it cannot drift on future edits: the marker is the grep-anchor
+                # tests/classifiers key on, and the eligibility clause is identical
+                # verbatim.  Only the path-specific narrative and the (deliberately
+                # different) structured-facts tail branch below.
+                eligibility_note = '(all deps satisfied, no live claimant)'
                 if idle_only and not dual_gate:
                     # Pure-idle backstop: never top-scored, so skip_count is
                     # typically 0 — this is priority starvation (a low-priority
@@ -3388,14 +3401,14 @@ class Scheduler:
                     # structured facts distinguishing this path from the dual
                     # gate (design-invariants: structured-facts-at-failure).
                     summary = (
-                        f'STARVATION_WATCHDOG: task {tid} dispatch-eligible for '
-                        f'{idle_elapsed:.0f}s (idle_only_secs={cfg.idle_only_secs}) '
+                        f'{_STARVATION_WATCHDOG_MARKER}: task {tid} dispatch-eligible '
+                        f'for {idle_elapsed:.0f}s (idle_only_secs={cfg.idle_only_secs}) '
                         f'with skip_count={skip} — never top-scored '
                         f'(continuous-eligibility backstop)'
                     )
                     detail = (
-                        f'Task {tid} has been continuously dispatch-eligible (all '
-                        f'deps satisfied, no live claimant) for {idle_elapsed:.0f}s '
+                        f'Task {tid} has been continuously dispatch-eligible '
+                        f'{eligibility_note} for {idle_elapsed:.0f}s '
                         f'yet has skip_count={skip} — it has never been the '
                         f'highest-scored candidate, so the dual skip+idle gate '
                         f'(skip_threshold={cfg.skip_threshold}, '
@@ -3410,14 +3423,14 @@ class Scheduler:
                     )
                 else:
                     summary = (
-                        f'STARVATION_WATCHDOG: task {tid} skip_count={skip} '
+                        f'{_STARVATION_WATCHDOG_MARKER}: task {tid} skip_count={skip} '
                         f'(threshold={cfg.skip_threshold}), dispatch-eligible for '
                         f'{idle_elapsed:.0f}s (idle_secs={cfg.idle_secs}) — '
                         f'unable to acquire locks'
                     )
                     detail = (
-                        f'Task {tid} has been dispatch-eligible (all deps satisfied, '
-                        f'no live claimant) for {idle_elapsed:.0f}s and has '
+                        f'Task {tid} has been dispatch-eligible {eligibility_note} '
+                        f'for {idle_elapsed:.0f}s and has '
                         f'accumulated skip_count={skip} (tallied while this task is '
                         f'the highest-scored candidate unable to acquire its module '
                         f'locks; a task displaced by a higher-priority task retains '
