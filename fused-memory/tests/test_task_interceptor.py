@@ -8200,6 +8200,93 @@ async def test_update_task_without_client_op_id_applies_each_time(
         await journal.close()
 
 
+@pytest.mark.asyncio
+async def test_set_task_status_client_op_id_dedups(
+    taskmaster,
+    reconciler,
+    event_buffer,
+    tmp_path,
+):
+    """A retried set_task_status with the same client_op_id applies once."""
+    from fused_memory.services.write_journal import WriteJournal
+
+    journal = WriteJournal(tmp_path / 'wj_sts')
+    await journal.initialize()
+    try:
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+        interceptor.set_write_journal(journal)
+
+        first = await interceptor.set_task_status(
+            '1', 'in-progress', '/project', client_op_id='s1'
+        )
+        second = await interceptor.set_task_status(
+            '1', 'in-progress', '/project', client_op_id='s1'
+        )
+
+        assert taskmaster.set_task_status.call_count == 1
+        assert first == second
+    finally:
+        await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_client_op_id_dedups(
+    taskmaster,
+    reconciler,
+    event_buffer,
+    tmp_path,
+):
+    """A retried add_dependency with the same client_op_id applies once."""
+    from fused_memory.services.write_journal import WriteJournal
+
+    journal = WriteJournal(tmp_path / 'wj_adddep')
+    await journal.initialize()
+    try:
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+        interceptor.set_write_journal(journal)
+
+        first = await interceptor.add_dependency(
+            '1', '2', '/project', client_op_id='d1'
+        )
+        second = await interceptor.add_dependency(
+            '1', '2', '/project', client_op_id='d1'
+        )
+
+        assert taskmaster.add_dependency.call_count == 1
+        assert first == second
+    finally:
+        await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_remove_dependency_client_op_id_dedups(
+    taskmaster,
+    reconciler,
+    event_buffer,
+    tmp_path,
+):
+    """A retried remove_dependency with the same client_op_id applies once."""
+    from fused_memory.services.write_journal import WriteJournal
+
+    journal = WriteJournal(tmp_path / 'wj_rmdep')
+    await journal.initialize()
+    try:
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+        interceptor.set_write_journal(journal)
+
+        first = await interceptor.remove_dependency(
+            '1', '2', '/project', client_op_id='r1'
+        )
+        second = await interceptor.remove_dependency(
+            '1', '2', '/project', client_op_id='r1'
+        )
+
+        assert taskmaster.remove_dependency.call_count == 1
+        assert first == second
+    finally:
+        await journal.close()
+
+
 # ── Tests for update_task status-kwarg rejection (defence-in-depth) ─────────
 
 
