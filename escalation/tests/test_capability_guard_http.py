@@ -86,22 +86,35 @@ def http_server(
     ``fastmcp.Client(StreamableHttpTransport(f'{base_url}/mcp/', headers=...))``
     per scenario to send per-connection capability headers over real HTTP.
 
-    The serving thread is a daemon thread with no explicit shutdown: it is
-    killed automatically when the test process exits.
+    Teardown is explicit: the event loop is created here in the fixture
+    body (not inside the thread target), so it can be stopped thread-safely
+    at teardown — ``loop.call_soon_threadsafe(loop.stop)`` unblocks
+    ``run_until_complete`` in the serving thread, which is then joined
+    (bounded to 5s) before this fixture finishes tearing down. This
+    prevents the daemon thread's event loop from outliving the test and
+    acting as a background ``time.monotonic()`` caller for the rest of the
+    process (task 2741).
     """
     queue_dir = tmp_path_factory.mktemp('esc_capability_guard')
     queue = EscalationQueue(queue_dir)
     mcp = create_server(queue, startup_sweep=False)
     port = _free_port()
+    loop = asyncio.new_event_loop()
 
     def _serve_forever() -> None:
-        loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(
-            mcp.run_http_async(
-                host='127.0.0.1', port=port, show_banner=False, log_level='error',
+        try:
+            loop.run_until_complete(
+                mcp.run_http_async(
+                    host='127.0.0.1', port=port, show_banner=False, log_level='error',
+                )
             )
-        )
+        except RuntimeError:
+            # Expected when teardown stops the loop mid-serve ("Event loop
+            # stopped before Future completed").
+            pass
+        finally:
+            loop.close()
 
     thread = threading.Thread(
         target=_serve_forever, name='escalation-capability-guard-http', daemon=True,
@@ -123,7 +136,11 @@ def http_server(
             f'127.0.0.1:{port} within 10s'
         )
 
-    yield f'http://127.0.0.1:{port}', queue
+    try:
+        yield f'http://127.0.0.1:{port}', queue
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
 
 
 # ---------------------------------------------------------------------------
