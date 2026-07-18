@@ -285,3 +285,88 @@ class TestEnumerateSessions:
         assert 'notes' not in names
         assert 'empty' not in names
         assert 'garbage' not in names
+
+
+class TestEnumerateArchiveRoots:
+    """enumerate_sessions additionally walks agent_transcript_roots — the
+    archived fleet-transcript tree written by shared.transcript_archive in
+    the production nested layout ``<archive>/<task_id>/<enc>/<sid>.jsonl.gz``
+    (+ a plain ``.jsonl`` variant) — recursively, gated solely by
+    :func:`is_member` on each session's REAL cwd. The empty-roots path is
+    byte-identical to today (the archive loop simply does not execute).
+    """
+
+    TARGET_DATE = dt_date(2026, 7, 13)
+    WT_ENC = '-home-leo-src-dark-factory--worktrees-2573'
+
+    def _build_archive(self, root: Path) -> Path:
+        # Production nested layout: <archive>/<task_id>/<enc>/<sid>.jsonl(.gz)
+        enc_dir = root / '2573' / self.WT_ENC
+        _write_session_gz(
+            enc_dir, 'gz-session', WORKTREE_CWD, timestamp='2026-07-13T09:00:00.000Z'
+        )
+        _write_session(
+            enc_dir, 'plain-session', WORKTREE_CWD, timestamp='2026-07-13T10:00:00.000Z'
+        )
+        # A non-member cockpit cwd under its own task-id/enc dir: is_member
+        # is false, so it is excluded even though it is inside the archive.
+        _write_session_gz(
+            root / '9999' / '-home-leo-src-dark-factory-cockpit',
+            'cockpit-session', COCKPIT_CWD, timestamp='2026-07-13T09:30:00.000Z',
+        )
+        return root
+
+    def test_enumerates_gz_and_plain_archive_sessions(self, tmp_path):
+        archive = self._build_archive(tmp_path / 'archive')
+        records = mod.enumerate_sessions(
+            tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
+            agent_transcript_roots=[archive],
+        )
+        assert {r.path.name for r in records} == {
+            'gz-session.jsonl.gz', 'plain-session.jsonl',
+        }
+
+    def test_archive_record_fields(self, tmp_path):
+        archive = self._build_archive(tmp_path / 'archive')
+        records = mod.enumerate_sessions(
+            tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
+            agent_transcript_roots=[archive],
+        )
+        gz = next(r for r in records if r.path.name == 'gz-session.jsonl.gz')
+        assert gz.encoded_dir == self.WT_ENC
+        assert gz.cwd == WORKTREE_CWD
+        assert gz.date == self.TARGET_DATE
+        assert gz.size_bytes == gz.path.stat().st_size
+
+    def test_non_member_cockpit_session_excluded(self, tmp_path):
+        archive = self._build_archive(tmp_path / 'archive')
+        records = mod.enumerate_sessions(
+            tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
+            agent_transcript_roots=[archive],
+        )
+        assert 'cockpit-session.jsonl.gz' not in {r.path.name for r in records}
+
+    def test_empty_agent_transcript_roots_is_byte_identical(self, tmp_path):
+        # A tree with BOTH a projects-root session and a populated archive.
+        projects_root = tmp_path / 'projects'
+        _write_session(
+            projects_root / '-home-leo-src-dark-factory', 'main-session', MAIN_CWD,
+            timestamp='2026-07-13T09:00:00.000Z',
+        )
+        self._build_archive(tmp_path / 'archive')
+
+        # No agent_transcript_roots kwarg at all == today's behavior.
+        default_records = mod.enumerate_sessions(projects_root, [MAIN_CWD], self.TARGET_DATE)
+        # Explicit empty tuple == same (the archive loop does not execute).
+        empty_records = mod.enumerate_sessions(
+            projects_root, [MAIN_CWD], self.TARGET_DATE, agent_transcript_roots=(),
+        )
+        assert {r.path.name for r in default_records} == {'main-session.jsonl'}
+        assert {r.path.name for r in empty_records} == {'main-session.jsonl'}
+
+    def test_absent_archive_root_yields_nothing_and_does_not_raise(self, tmp_path):
+        records = mod.enumerate_sessions(
+            tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
+            agent_transcript_roots=[tmp_path / 'does-not-exist'],
+        )
+        assert records == []
