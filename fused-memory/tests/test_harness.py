@@ -6230,6 +6230,174 @@ class TestHarnessDrainIdleShortCircuit:
         )
 
 
+# ── Busy-project drain convergence (task 2702) ────────────────────────────────
+
+
+class TestBusyProjectDrainConvergence:
+    """`_project_loop` must honor `_draining` so `drain()` converges under steady traffic.
+
+    Reproduces the task-2090 `--drain` hang: a project with steady traffic
+    (``buffer.should_trigger`` always returning True) previously kept launching
+    new reconciliation cycles forever because `_project_loop`'s `while True:`
+    never read `self._draining` — only the run_loop spawn gate did. `drain()`
+    would then hang waiting for `_no_active_loops()` to flip, since the busy
+    loop's task never finished.
+    """
+
+    def _wire_busy_harness(self, harness) -> None:
+        """Neutralize real I/O and force a perpetually-busy project.
+
+        `should_trigger` always reports a pending trigger and `mark_run_active`
+        always acquires, so the loop body reaches the cycle branch every
+        iteration; the other stubs let it get there without real I/O.
+        """
+        harness.judge = None
+        harness.buffer.should_trigger = AsyncMock(return_value=(True, 'busy'))
+        harness.buffer.mark_run_active = AsyncMock(return_value=True)
+        harness.buffer.mark_run_complete = AsyncMock(return_value=None)
+        harness.buffer.restore_drained = AsyncMock(return_value=0)
+        harness.buffer.heartbeat = AsyncMock(return_value=None)
+        harness._replay_deferred_writes = AsyncMock(return_value=None)
+        harness._select_tier = AsyncMock(return_value=None)
+        harness._heartbeat_loop = AsyncMock(return_value=None)
+
+    def _make_blocking_fake_rfc(self):
+        """A `run_full_cycle` fake that blocks until released, then completes once.
+
+        Lets the test call `drain()` at a deterministic in-flight instant (after
+        `entered` fires, before `release` is set) and then prove the in-flight
+        cycle finishes exactly once — finish-current-then-stop.
+        """
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        completed = {'n': 0}
+
+        async def fake_rfc(project_id, reason, **kwargs):
+            entered.set()
+            await release.wait()
+            completed['n'] += 1
+            return ReconciliationRun(
+                id=str(uuid.uuid4()),
+                project_id=project_id,
+                run_type=RunType.full,
+                trigger_reason=reason,
+                started_at=datetime.now(UTC),
+                events_processed=0,
+                status=RunStatus.completed,
+            )
+
+        return fake_rfc, entered, release, completed
+
+    @pytest.mark.asyncio
+    async def test_busy_project_loop_converges_on_drain(
+        self, journal, event_buffer, mock_memory_service, monkeypatch
+    ):
+        """drain() mid-cycle must let the in-flight cycle finish, then exit — no new cycle.
+
+        RED (pre-fix): `_project_loop` never reads `_draining`, so once `release`
+        is set the busy loop immediately starts another cycle (should_trigger is
+        still True) and spins forever; the `wait_for(loop_task, 2.0)` guard turns
+        that hang into a loud TimeoutError failure instead of an actual hang.
+        """
+        real_sleep = asyncio.sleep
+
+        async def fast_sleep(seconds: float) -> None:
+            await real_sleep(0)
+
+        # Patch the module-local _sleep binding so the 5s inter-cycle cooldown
+        # (and any idle-path sleep) yields instantly.
+        monkeypatch.setattr('fused_memory.reconciliation.harness._sleep', fast_sleep)
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        self._wire_busy_harness(harness)
+        fake_rfc, entered, release, completed = self._make_blocking_fake_rfc()
+
+        loop_task = None
+        try:
+            with patch.object(harness, 'run_full_cycle', side_effect=fake_rfc):
+                loop_task = asyncio.create_task(harness._project_loop('test-project'))
+                # Register the task the way the real spawn path does so
+                # `_no_active_loops()` (and thus `is_drained` below) reflects
+                # this loop's actual completion state instead of vacuously
+                # seeing an empty `_project_tasks` dict.
+                harness._project_tasks['test-project'] = loop_task
+                await asyncio.wait_for(entered.wait(), 2.0)
+
+                # Drain strictly while the cycle is in-flight.
+                harness.drain()
+                # Finish-current-then-stop: drain() must not abort in-flight work.
+                assert not loop_task.done()
+                assert completed['n'] == 0
+
+                release.set()
+                await asyncio.wait_for(loop_task, 2.0)
+
+            assert loop_task.done() and not loop_task.cancelled()
+            # Exactly one cycle completed — the in-flight cycle finished and no
+            # new cycle was started, even though should_trigger is still True.
+            assert completed['n'] == 1
+            assert harness.is_drained
+        finally:
+            if loop_task is not None and not loop_task.done():
+                loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await loop_task
+
+    @pytest.mark.asyncio
+    async def test_drain_exit_emits_drain_ack_structured_token(
+        self, journal, event_buffer, mock_memory_service, monkeypatch, caplog
+    ):
+        """A drain-triggered `_project_loop` exit must log a structured drain_ack token.
+
+        The message is the token (`drain_ack`) and `project_id` is a STRUCTURED
+        `extra=` field — consumers read `record.project_id`, never scrape prose.
+
+        RED (pre-fix): the drain exit added in step-2 is a bare `return` with no
+        log, so no `drain_ack` record exists and the assertion fails.
+        """
+        real_sleep = asyncio.sleep
+
+        async def fast_sleep(seconds: float) -> None:
+            await real_sleep(0)
+
+        monkeypatch.setattr('fused_memory.reconciliation.harness._sleep', fast_sleep)
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        self._wire_busy_harness(harness)
+        fake_rfc, entered, release, completed = self._make_blocking_fake_rfc()
+
+        loop_task = None
+        try:
+            with (
+                caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'),
+                patch.object(harness, 'run_full_cycle', side_effect=fake_rfc),
+            ):
+                loop_task = asyncio.create_task(harness._project_loop('test-project'))
+                await asyncio.wait_for(entered.wait(), 2.0)
+
+                harness.drain()
+
+                release.set()
+                await asyncio.wait_for(loop_task, 2.0)
+
+            assert completed['n'] == 1
+
+            acks = [r for r in caplog.records if 'drain_ack' in r.getMessage()]
+            assert acks, (
+                f"Expected a 'drain_ack' log record but got: "
+                f"{[r.getMessage() for r in caplog.records]}"
+            )
+            assert getattr(acks[0], 'project_id', None) == 'test-project', (
+                f"Expected drain_ack record.project_id == 'test-project', "
+                f"got {getattr(acks[0], 'project_id', None)!r}"
+            )
+        finally:
+            if loop_task is not None and not loop_task.done():
+                loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await loop_task
+
+
 # ── Deferred-write replay deduplication (Fix 2) ───────────────────────────────
 
 
