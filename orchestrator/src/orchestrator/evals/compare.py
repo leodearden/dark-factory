@@ -154,7 +154,17 @@ def _read_reviewer_verdict_envelopes(artifacts: TaskArtifacts) -> dict[str, Any]
     reviews: dict[str, Any] = {}
     for path in sorted(verdicts_dir.glob('reviewer*.json')):
         role = path.stem
-        envelope = artifacts.read_verdict(role)
+        try:
+            envelope = artifacts.read_verdict(role)
+        except ValueError as exc:
+            # read_verdict rejects a role that doesn't match its filename
+            # charset (e.g. a stray "reviewer.foo.json" -> stem
+            # "reviewer.foo"). Verdict files are always written by
+            # write_verdict() with a regex-validated role, so this should
+            # only happen for a manually-placed/stray file — skip it like
+            # any other malformed artifact rather than aborting the read.
+            logger.warning('Skipping malformed verdict filename %s: %s', path, exc)
+            continue
         if not envelope:
             continue
         payload = envelope.get('verdict')
@@ -163,6 +173,33 @@ def _read_reviewer_verdict_envelopes(artifacts: TaskArtifacts) -> dict[str, Any]
             continue
         name = payload.get('reviewer', role)
         reviews[name] = payload
+    return reviews
+
+
+def _read_legacy_reviews(artifacts: TaskArtifacts) -> dict[str, Any]:
+    """Read ``<root>/reviews/*.json`` directly, tolerating corrupt files.
+
+    ``TaskArtifacts.read_reviews()`` has no per-file exception handling, so
+    one corrupt/unreadable file would abort the whole read. This mirrors
+    the pre-envelope ``_read_review_artifacts`` behavior: a corrupt file is
+    skipped with a warning rather than raised, so the other reviewers in a
+    pre-migration run are still graded.
+
+    Returns ``{reviewer_name: {verdict, issues, summary}}``. Returns empty
+    dict if the reviews dir doesn't exist.
+    """
+    reviews_dir = artifacts.root / 'reviews'
+    if not reviews_dir.is_dir():
+        return {}
+
+    reviews: dict[str, Any] = {}
+    for path in sorted(reviews_dir.glob('*.json')):
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning('Failed to read review %s: %s', path, exc)
+            continue
+        reviews[data.get('reviewer', path.stem)] = data
     return reviews
 
 
@@ -186,10 +223,7 @@ def _read_review_artifacts(worktree_path: str) -> dict[str, Any]:
     if reviews:
         return reviews
 
-    return {
-        data.get('reviewer', stem): data
-        for stem, data in artifacts.read_reviews().items()
-    }
+    return _read_legacy_reviews(artifacts)
 
 
 def _format_review_artifacts(reviews: dict[str, Any]) -> str:
