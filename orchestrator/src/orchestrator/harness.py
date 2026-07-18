@@ -7293,6 +7293,15 @@ task, include it with an empty "files" list rather than omitting it.
         return (
             self._merge_queue.empty()
             and depth == 0
+            # NOTE: this polite-path grace term is intentionally UNBOUNDED. Each
+            # fresh note_merge_phase_entered restamps a new monotonic anchor, so
+            # under chronic merge saturation this arm can defer the polite
+            # redeploy for an unbounded wall-clock span. That is by design, NOT a
+            # missing bound: each individual stamp still auto-expires after
+            # grace_secs, and the eventual-redeploy guarantee comes from the
+            # force-fire ceiling (force_fire_after_secs + merge_phase_grace_secs,
+            # see maybe_restart) plus the watchdog staleness pass — the polite
+            # arm deliberately has no per-hold ceiling of its own.
             and not self._merge_phase_grace_active()
         )
 
