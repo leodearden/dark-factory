@@ -18,10 +18,18 @@ Design properties (see plans/agent-transcript-archival-prd.md, task α):
   copy via :func:`os.utime`; an already-current archive is skipped. A resumed
   session only ever grows its transcript, so mtime strictly advances and the
   grown transcript is re-archived (last-write-wins).
-* **Best-effort / never-raises** — any per-file I/O or gzip error is caught,
-  logged once as a structured WARNING, and counted in the module-level
-  :data:`_ARCHIVAL_FAILURES` counter. The function is total so the producer
-  can call it inside ``_invoke``'s ``finally`` during exception propagation.
+* **Best-effort / never-raises** — any per-file I/O or gzip error is caught and
+  logged once as a structured WARNING (``path``/``task_id``/``errno``) — the
+  production signal an operator greps for a systemic breakage — while the
+  module-level :data:`_ARCHIVAL_FAILURES` counter accrues the same failures as
+  machine-readable substrate for a future health/digest consumer. The function
+  is total so the producer can call it inside ``_invoke``'s ``finally`` during
+  exception propagation.
+
+Each transcript is streamed source → gzip in fixed-size chunks rather than
+slurped whole, so peak memory stays bounded even for the multi-MB transcripts a
+long or resumed session produces; the producer additionally offloads the whole
+call to a worker thread so the CPU-bound compression never stalls the event loop.
 """
 
 from __future__ import annotations
@@ -29,15 +37,22 @@ from __future__ import annotations
 import gzip
 import logging
 import os
+import shutil
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 # Module-level count of per-file archival failures this process.
-# Loud-over-silent (design-invariants INV-2/INV-4): a systemic breakage
-# (e.g. disk full → every archive fails) shows this counter climbing rather
-# than failing silently. A small read/reset accessor pair below keeps tests
-# isolated without reaching into module internals.
+#
+# Loud-over-silent (design-invariants INV-2/INV-4) is carried TODAY by the
+# per-file structured WARNING emitted in _record_failure (path/task_id/errno):
+# that log line is the production signal a systemic breakage (e.g. disk full →
+# every archive fails) surfaces on. This counter is the machine-readable
+# companion to that log — process-cumulative substrate a later health/digest
+# consumer can sample to render a climbing failure rate. It is deliberately
+# owned-but-not-yet-consumed by this α task, exactly as α lays down the
+# retention.* config knobs here for the δ GC consumer (task 2731) to enforce;
+# the small read/reset accessor pair below keeps tests isolated in the meantime.
 _ARCHIVAL_FAILURES: int = 0
 
 
@@ -99,9 +114,13 @@ def _archive_one(
     if dest.exists() and int(dest.stat().st_mtime) == int(st.st_mtime):
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
-    data = src.read_bytes()
-    with gzip.open(dest, 'wb') as fh:
-        fh.write(data)
+    # Stream source -> gzip in fixed-size chunks (shutil's default 64 KiB
+    # buffer) rather than slurping the whole transcript via read_bytes():
+    # agent-session JSONL can be many MB and only grows on resume, so streaming
+    # bounds peak RSS to one buffer instead of the full file. Any I/O/gzip error
+    # here is still an OSError, caught + counted by the caller (best-effort).
+    with src.open('rb') as sfh, gzip.open(dest, 'wb') as dfh:
+        shutil.copyfileobj(sfh, dfh)
     os.utime(dest, (st.st_atime, st.st_mtime))
     return True
 
