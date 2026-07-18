@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import os
 from pathlib import Path
 
 import pytest
@@ -110,3 +111,45 @@ class TestArchiveAll:
 
         archived = [p.name for p in root.rglob('*') if p.is_file()]
         assert not any(name.endswith('.txt') or name.endswith('.txt.gz') for name in archived)
+
+
+class TestIdempotencyAndResume:
+    """E3 (idempotency skip on unchanged source) + E6 (resume last-write-wins)."""
+
+    def test_skip_unchanged_then_rearchive_grown(self, tmp_path):
+        config_dir = tmp_path / 'claude-config-42'
+        root = tmp_path / 'archive'
+        task_id = '42'
+        sid = 'sess-x'
+
+        src = config_dir / 'projects' / ENC / f'{sid}.jsonl'
+        orig = b'{"line":1}\n'
+        _write(src, orig)
+
+        # First call writes the archive.
+        assert archive_task_transcripts(config_dir, task_id, sid, archive_root=root) == 1
+        dest = root / task_id / ENC / f'{sid}.jsonl.gz'
+        assert _gunzip(dest) == orig
+
+        # Robustly prove "not rewritten": replace the archive bytes with a
+        # sentinel and restore its mtime to the source's, so the skip predicate
+        # (int(dest.mtime) == int(src.mtime)) still holds. A genuine skip leaves
+        # the sentinel intact; an unconditional rewrite replaces it with gzip.
+        src_stat = src.stat()
+        sentinel = b'SENTINEL-not-rewritten'
+        dest.write_bytes(sentinel)
+        os.utime(dest, (src_stat.st_atime, src_stat.st_mtime))
+        before_mtime_ns = dest.stat().st_mtime_ns
+
+        # Second call, source unchanged → skipped (returns 0, archive untouched).
+        assert archive_task_transcripts(config_dir, task_id, sid, archive_root=root) == 0
+        assert dest.read_bytes() == sentinel
+        assert dest.stat().st_mtime_ns == before_mtime_ns
+
+        # Resume: grow the source AND advance its mtime → re-archived.
+        grown = orig + b'{"line":2}\n{"line":3}\n'
+        src.write_bytes(grown)
+        os.utime(src, (src_stat.st_atime + 10, src_stat.st_mtime + 10))
+
+        assert archive_task_transcripts(config_dir, task_id, sid, archive_root=root) == 1
+        assert _gunzip(dest) == grown
