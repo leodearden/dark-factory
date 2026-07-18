@@ -122,6 +122,18 @@ class EventJournal:
         )
         self._conn.commit()
 
+    def mark_processed(self, event_id: str) -> None:
+        """Delete the journal row for *event_id* (harmless no-op if absent).
+
+        A DELETE — not an ``UPDATE processed=1`` flag — so the write-ahead log
+        stays bounded to only in-flight events and needs no separate GC pass:
+        the event's durable record already lives in ``event_buffer`` (on commit)
+        or the dead-letter JSONL (on divert), so a processed row would be pure
+        dead weight. The commit is synchronous, matching :meth:`append`.
+        """
+        self._conn.execute('DELETE FROM event_journal WHERE id = ?', (event_id,))
+        self._conn.commit()
+
     def load_unprocessed(self) -> list[ReconciliationEvent]:
         """Reconstruct every surviving (unprocessed) row, oldest-first.
 
