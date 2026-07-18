@@ -250,9 +250,12 @@ def recompute_composite_from_metrics(metrics_dict: dict) -> float:
 
 
 async def rereview_one(cand: Candidate) -> RereviewOutcome:
-    # 1. Compute the diff (pinned to metadata base_commit via get_diff).
+    # 1. Compute the diff, pinned to cand.base_commit. enumerate_candidates
+    #    sources base_commit from the historical pre-relocation
+    #    <worktree>/.task/metadata.json (correct for the old worktrees this
+    #    rereview grades) and get_diff no longer reads metadata itself.
     try:
-        diff_text = await get_diff(cand.worktree_path)
+        diff_text = await get_diff(cand.worktree_path, cand.base_commit)
     except Exception as e:
         return RereviewOutcome.error(cand.run_id, f'get_diff failed: {e}')
     if not diff_text.strip():
