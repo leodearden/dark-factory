@@ -755,6 +755,24 @@ class ReconReportState:
                     exc_info=True,
                 )
                 continue
+            # Re-anchor the TTL baseline across the restart boundary.
+            # ``completed_at`` was stamped by the PRIOR process's clock, which
+            # defaults to ``asyncio.get_running_loop().time()`` (monotonic) —
+            # a value that restarts near 0 on a fresh event loop.  Restoring
+            # that large stale value verbatim would make ``tick()``'s
+            # ``now - completed_at`` negative against THIS process's fresh
+            # monotonic clock, so it never exceeds ``ttl_seconds``: the hydrated
+            # completed entry would never evict, its run would never quiesce,
+            # and ``store.delete_run`` (the run-quiescence GC, step-12) would
+            # never fire — ``recon_report_state.db`` rows (and their in-memory
+            # entries) would leak unboundedly across every restart.  Resetting
+            # to ``self._clock()`` counts the TTL from restart, so the entry
+            # evicts ``ttl_seconds`` after boot via that same GC path.
+            # In-progress entries (``completed_at is None``) are left untouched
+            # so they stay immortal by design (PRD §9.4).  ``created_at`` is
+            # diagnostics-only (not used for eviction) and is NOT re-anchored.
+            if entry.completed_at is not None:
+                entry.completed_at = self._clock()
             self._state[(run_id, stage)] = entry
             if row['is_active']:
                 self._active[run_id] = stage
