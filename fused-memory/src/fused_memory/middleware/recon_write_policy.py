@@ -452,14 +452,20 @@ def _pure_terminal_annotation_merge(update_kwargs: dict) -> dict | None:
         (any ``update_task`` parameter not on that allowlist, including a
         content-mutating field added after this predicate was written)
         disqualifies unconditionally: fail CLOSED, not open.
-    (b) The effective metadata merge mode is ``'merge'`` — mirroring
-        ``sqlite_task_backend._resolve_metadata_mode``'s precedence
-        (``metadata_mode`` wins; else ``append`` True->additive/False->replace;
-        else default merge) without importing the backend (keeps this module
-        dependency-light). ``replace`` would clobber load-bearing keys;
-        ``additive`` cannot overwrite/clear the target key (scalar-collision
-        old-wins) — only ``merge`` both preserves other keys and overwrites
-        the target.
+    (b) The effective metadata merge mode is ``'merge'`` — classified inline
+        (``metadata_mode == 'merge'``, or both ``metadata_mode`` and ``append``
+        omitted → the merge default) WITHOUT importing the backend (keeps this
+        module dependency-light). Anything else — an explicit non-merge
+        ``metadata_mode``, or ``append`` in any non-``None`` state (incl.
+        ``append=False``) — is treated as non-merge and disqualifies here. NB:
+        ``sqlite_task_backend._resolve_metadata_mode`` now REJECTS a bare
+        ``append=False`` metadata write outright (the task-2180 metadata-wipe
+        guard) rather than mapping it to 'replace'; that does not affect this
+        predicate, whose own conservative classification already treats
+        ``append=False`` as non-merge → disqualify. ``replace`` would clobber
+        load-bearing keys; ``additive`` cannot overwrite/clear the target key
+        (scalar-collision old-wins) — only ``merge`` both preserves other keys
+        and overwrites the target.
     (c) ``update_kwargs['metadata']`` coerces (via :func:`_coerce_metadata_dict`)
         to a non-empty ``dict`` — the dict returned on success.
     """

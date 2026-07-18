@@ -207,9 +207,14 @@ class TaskBackendProtocol(Protocol):
           scalar/type-collision OLD-wins.  Required by list-append callers.
         * ``metadata_mode='replace'`` — whole-blob overwrite.  Bypasses the
           corrupt-blob guard; the sanctioned repair path.
-        * ``append=True`` (legacy shim) → 'additive'; ``append=False`` → 'replace'.
-          Omit both to get the merge default.  ``append`` also governs
-          details-append when ``details``/``prompt`` is supplied.
+        * ``append=True`` (legacy shim) → 'additive'.  A bare ``append=False``
+          (no ``metadata_mode``) on a metadata write is **rejected** — it used
+          to silently 'replace' and wiped a live in-progress task (the task-2180
+          metadata-wipe incident); pass ``metadata_mode='replace'`` to CONFIRM a
+          whole-blob overwrite, or ``metadata_mode='merge'``/``append=True`` to
+          merge.  Omit both to get the merge default.  ``append`` also
+          independently governs details-append when ``details``/``prompt`` is
+          supplied — a bare ``append=False`` with NO metadata is not rejected.
 
         **Implementations MUST reject a non-None ``status`` by raising** (e.g.
         ``TaskmasterError('TASKMASTER_TOOL_ERROR', …)``).  ``set_task_status``

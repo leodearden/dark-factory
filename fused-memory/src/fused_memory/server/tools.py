@@ -3883,12 +3883,19 @@ def create_mcp_server(
                   OLD-wins. Use for list-append callers (dry_run_proposals, etc.).
                 - ``'replace'`` — whole-blob overwrite. Bypasses the corrupt-blob
                   guard; the sanctioned repair path.
-            append: DEPRECATED shim. ``True`` → ``'additive'``, ``False`` →
-                ``'replace'``. **Also the only knob that governs ``details``/
-                ``prompt`` append** — ``metadata_mode`` does NOT affect the
-                details path, so callers that need details-append must still
-                pass ``append=True`` even after migrating metadata writes to
-                ``metadata_mode``. Resolution is single-sourced in the backend.
+            append: DEPRECATED shim. ``True`` → ``'additive'``. A bare
+                ``append=False`` (no ``metadata_mode``) on a metadata write is
+                now **rejected** by the backend — it used to silently whole-blob
+                REPLACE the metadata and wiped a live in-progress task (the
+                task-2180 metadata-wipe incident). To overwrite, pass
+                ``metadata_mode='replace'`` to CONFIRM; to merge, pass
+                ``metadata_mode='merge'`` (or ``append=True``). This value is
+                forwarded raw to the backend, which resolves and enforces the
+                rejection (single-sourced). **Also the only knob that governs
+                ``details``/``prompt`` append** — ``metadata_mode`` does NOT
+                affect the details path, so callers that need details-append
+                must still pass ``append=True``; a bare ``append=False`` with NO
+                metadata is still fine (a details-only replace is not rejected).
             tag: Tag context (optional)
             title: New title (overwrites)
             description: New description (overwrites)
