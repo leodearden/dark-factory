@@ -4441,3 +4441,108 @@ def test_unit_active_enter_epoch_timeout_returns_none(monkeypatch: pytest.Monkey
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert wdog._unit_active_enter_epoch("some.service") is None
 
+
+# ---------------------------------------------------------------------------
+# Part C: _newest_fm_watched_commit_epoch() (step 5)
+#
+# fm sibling of _newest_watched_commit_epoch: identical body but diffs
+# FM_WATCHED_PATHS (fused-memory/src/ + shared/src/) rather than WATCHED_PATHS.
+# ---------------------------------------------------------------------------
+
+_EXPECTED_FM_WATCHED_PATHS = ["fused-memory/src/", "shared/src/"]
+
+
+def test_newest_fm_watched_commit_epoch_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_newest_fm_watched_commit_epoch parses git's %ct output to an int.
+
+    Also pins that the argv diffs the fm-watched paths (both fused-memory/src/
+    and shared/src/) rather than the orchestrator WATCHED_PATHS.
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="1783013906\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = wdog._newest_fm_watched_commit_epoch()
+
+    assert result == 1783013906
+    assert isinstance(result, int)
+    assert len(calls) == 1, f"Expected exactly one git call, got {calls}"
+    argv = calls[0]
+    assert argv[0] == "git"
+    assert argv[1] == "-C"
+    assert argv[2] == _EXPECTED_REPO_DIR
+    assert argv[3:7] == ["log", "-1", "--format=%ct", "HEAD"]
+    assert "--" in argv, f"argv must separate revision from pathspec with '--': {argv}"
+    watched_args = argv[argv.index("--") + 1 :]
+    for path in _EXPECTED_FM_WATCHED_PATHS:
+        assert path in watched_args, f"Expected fm-watched path {path!r} in argv {argv}"
+
+
+def test_newest_fm_watched_commit_epoch_empty_stdout_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_fm_watched_commit_epoch returns None on empty stdout (rc 0).
+
+    `git log -1 --format=%ct HEAD -- <paths>` exits 0 with empty stdout when no
+    commit touches the paths — this must be treated as undeterminable, NOT
+    epoch 0 (which would make fused-memory look infinitely stale).
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._newest_fm_watched_commit_epoch() is None
+
+
+def test_newest_fm_watched_commit_epoch_nonzero_rc_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_fm_watched_commit_epoch returns None when git exits non-zero."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(
+            cmd, 128, stdout="", stderr="fatal: not a git repository"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._newest_fm_watched_commit_epoch() is None
+
+
+def test_newest_fm_watched_commit_epoch_unparseable_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_fm_watched_commit_epoch returns None when stdout is not an int."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout="not-an-epoch\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._newest_fm_watched_commit_epoch() is None
+
+
+def test_newest_fm_watched_commit_epoch_broad_error_returns_none_and_warns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_fm_watched_commit_epoch returns None (and warns) on a broad subprocess error."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise RuntimeError("boom: git subprocess exploded")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    assert wdog._newest_fm_watched_commit_epoch() is None
+    assert any("WARNING" in m for m in logged), (
+        f"a swallowed subprocess error must emit a WARNING via logger.warning: {logged}"
+    )
+
