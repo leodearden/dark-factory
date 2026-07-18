@@ -13,6 +13,7 @@ real WriteJournal via set_write_journal.
 
 from __future__ import annotations
 
+import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -127,3 +128,142 @@ class TestAddMemoryIntentBracketing:
         failed = await journal.get_mem0_intents(status='failed')
         assert len(failed) == 1
         assert 'mem0 down' in (failed[0]['reason'] or '')
+
+
+# ---------------------------------------------------------------------------
+# recover_mem0_intents: startup reconciliation of crash-mid-write intents
+# ---------------------------------------------------------------------------
+
+
+async def _seed_pending_intent(
+    journal,
+    *,
+    write_op_id,
+    intent_id,
+    content='seeded content',
+    metadata=None,
+    payload_digest='dig',
+    project_id='proj-x',
+    agent_id='agent-a',
+    session_id='sess-1',
+):
+    await journal.log_mem0_intent(
+        intent_id=intent_id,
+        write_op_id=write_op_id,
+        project_id=project_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        category='preferences_and_norms',
+        content=content,
+        metadata=metadata if metadata is not None else {'category': 'preferences_and_norms'},
+        payload_digest=payload_digest,
+    )
+
+
+class TestRecoverMem0Intents:
+    @pytest.mark.asyncio
+    async def test_success_beop_marks_completed_no_reissue(self, recovery_service):
+        """A SUCCESS mem0 backend_op proves the write landed → completed, no re-issue."""
+        svc = recovery_service
+        journal = svc._write_journal
+        assert journal is not None
+        write_op_id = str(uuid.uuid4())
+        intent_id = str(uuid.uuid4())
+        await _seed_pending_intent(
+            journal, write_op_id=write_op_id, intent_id=intent_id
+        )
+        # A successful mem0 backend_op for the same write_op_id.
+        await journal.log_backend_op(
+            write_op_id=write_op_id, backend='mem0', operation='add', success=True
+        )
+        svc.mem0.add.reset_mock()
+
+        summary = await svc.recover_mem0_intents()
+
+        svc.mem0.add.assert_not_called()
+        assert await journal.get_incomplete_mem0_intents() == []
+        completed = await journal.get_mem0_intents(status='completed')
+        assert [r['id'] for r in completed] == [intent_id]
+        assert summary['scanned'] == 1
+        assert summary['reconciled'] == 1
+        assert summary['reissued'] == 0
+        assert summary['dead_lettered'] == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_only_beop_reissues(self, recovery_service):
+        """Only a FAILED mem0 backend_op → the add() provably raised → safe re-issue."""
+        svc = recovery_service
+        journal = svc._write_journal
+        assert journal is not None
+        write_op_id = str(uuid.uuid4())
+        intent_id = str(uuid.uuid4())
+        meta = {'category': 'preferences_and_norms', 'kind': 'note'}
+        await _seed_pending_intent(
+            journal,
+            write_op_id=write_op_id,
+            intent_id=intent_id,
+            content='reissue me faithfully',
+            metadata=meta,
+            payload_digest='dig-2',
+        )
+        await journal.log_backend_op(
+            write_op_id=write_op_id,
+            backend='mem0',
+            operation='add',
+            success=False,
+            error='timeout',
+        )
+        svc.mem0.add.reset_mock()
+        svc.mem0.add.return_value = {'results': [{'id': 'reissued-1'}]}
+
+        summary = await svc.recover_mem0_intents()
+
+        # Re-issued exactly once with the reconstructed content / Scope / metadata.
+        svc.mem0.add.assert_called_once()
+        call_kwargs = svc.mem0.add.call_args.kwargs
+        assert call_kwargs['content'] == 'reissue me faithfully'
+        assert call_kwargs['scope'].project_id == 'proj-x'
+        assert call_kwargs['scope'].agent_id == 'agent-a'
+        assert call_kwargs['scope'].session_id == 'sess-1'
+        assert call_kwargs['metadata'] == meta
+
+        assert await journal.get_incomplete_mem0_intents() == []
+        completed = await journal.get_mem0_intents(status='completed')
+        assert [r['id'] for r in completed] == [intent_id]
+        assert summary['scanned'] == 1
+        assert summary['reconciled'] == 0
+        assert summary['reissued'] == 1
+        assert summary['dead_lettered'] == 0
+
+    @pytest.mark.asyncio
+    async def test_no_beop_dead_letters_headline(self, recovery_service):
+        """HEADLINE: NO backend_op → outcome UNKNOWN → dead-letter, never a silent orphan."""
+        svc = recovery_service
+        journal = svc._write_journal
+        assert journal is not None
+        write_op_id = str(uuid.uuid4())
+        intent_id = str(uuid.uuid4())
+        await _seed_pending_intent(
+            journal,
+            write_op_id=write_op_id,
+            intent_id=intent_id,
+            content='ambiguous outcome',
+            payload_digest='dig-headline',
+        )
+        # NO backend_op at all — killed before/inside the await.
+        svc.mem0.add.reset_mock()
+
+        summary = await svc.recover_mem0_intents()
+
+        # A non-idempotent add is NOT blindly re-issued.
+        svc.mem0.add.assert_not_called()
+        assert await journal.get_incomplete_mem0_intents() == []
+        dead = await journal.get_mem0_intents(status='dead')
+        assert [r['id'] for r in dead] == [intent_id]
+        # Structured, non-empty reason embedding the payload_digest.
+        assert dead[0]['reason']
+        assert 'dig-headline' in dead[0]['reason']
+        assert summary['scanned'] == 1
+        assert summary['reconciled'] == 0
+        assert summary['reissued'] == 0
+        assert summary['dead_lettered'] == 1
