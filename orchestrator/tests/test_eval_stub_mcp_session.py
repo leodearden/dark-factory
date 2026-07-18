@@ -6,11 +6,11 @@ import json
 import logging
 
 import pytest
+from shared.mcp_envelope import parse_tool_result
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals.runner import _build_eval_scheduler, _StubMcpSession
 from orchestrator.scheduler import extract_rejection
-from shared.mcp_envelope import parse_tool_result
 
 
 class TestStubMcpSessionSetTaskStatus:
