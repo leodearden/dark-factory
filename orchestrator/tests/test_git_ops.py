@@ -10744,3 +10744,38 @@ class TestGitStderrIsUnresolvedRef:
     )
     def test_genuine_failures_classified_false(self, stderr: str) -> None:
         assert _git_stderr_is_unresolved_ref(stderr) is False
+
+
+@pytest.mark.asyncio
+class TestGetHeadTreeHash:
+    """Tests for GitOps.get_head_tree_hash — the verdict-cache key source."""
+
+    async def test_returns_head_tree_hash(self, git_ops: GitOps, git_repo: Path):
+        result = await git_ops.get_head_tree_hash(git_repo)
+        _, expected, _ = await _run(
+            ['git', 'rev-parse', 'HEAD^{tree}'], cwd=git_repo
+        )
+        assert result == expected.strip()
+        assert result  # non-empty
+
+    async def test_stable_across_calls(self, git_ops: GitOps, git_repo: Path):
+        first = await git_ops.get_head_tree_hash(git_repo)
+        second = await git_ops.get_head_tree_hash(git_repo)
+        assert first == second
+
+    async def test_changes_after_new_commit(self, git_ops: GitOps, git_repo: Path):
+        before = await git_ops.get_head_tree_hash(git_repo)
+        (git_repo / 'new_file.txt').write_text('new content\n')
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'Add new_file'], cwd=git_repo)
+        after = await git_ops.get_head_tree_hash(git_repo)
+        assert after != before
+        assert after  # non-empty
+
+    async def test_non_git_dir_returns_none(
+        self, git_ops: GitOps, tmp_path: Path
+    ):
+        not_a_repo = tmp_path / 'not-a-repo'
+        not_a_repo.mkdir()
+        # Fail-safe: a non-git directory yields None, never raises.
+        assert await git_ops.get_head_tree_hash(not_a_repo) is None
