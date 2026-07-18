@@ -20,6 +20,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.event_journal import EventJournal
 from fused_memory.reconciliation.event_queue import EventQueue, _iter_lines_reversed
 
 
@@ -1275,3 +1276,57 @@ def test_iter_lines_reversed_max_line_bytes_overflow(tmp_path, caplog):
     # (c) No bytes lost — all 500 'X's appear across the yielded fragments.
     total_x = sum(line.count('X') for line in results)
     assert total_x == 500, f"expected 500 X's across yields, got {total_x}"
+
+
+# ── Durable-at-enqueue journal (task 2709) ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_enqueue_is_durable_before_drain(real_buffer, tmp_path):
+    """With journal_path set, enqueue() persists the event durably BEFORE the
+    drainer runs — the kill-9-between-enqueue-and-drain guarantee.
+    """
+    ej_path = tmp_path / 'ej.db'
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        journal_path=ej_path,
+        maxsize=100,
+    )
+    try:
+        event = _make_event()
+        # NOTE: no q.start() — no drainer. The durable write must have already
+        # happened synchronously inside enqueue().
+        assert q.enqueue(event) is True
+        # The in-memory queue still holds it (dispatch cache over the durable row).
+        assert q._queue.qsize() == 1
+        # A FRESH EventJournal over the same path sees the durable row — proof
+        # the row survived independently of the (never-started) drainer.
+        journal = EventJournal(ej_path)
+        try:
+            recovered = journal.load_unprocessed()
+        finally:
+            journal.close()
+        assert [e.id for e in recovered] == [event.id]
+    finally:
+        if q._journal is not None:
+            q._journal.close()
+
+
+@pytest.mark.asyncio
+async def test_no_journal_path_creates_no_journal(real_buffer, tmp_path):
+    """Without journal_path (default None), no journal is created and enqueue
+    behaves exactly as today — regression guard for the sync/non-blocking WP-B
+    contract (no synchronous FULL commit is added to the hot path).
+    """
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        maxsize=100,
+    )
+    assert q._journal is None
+    assert q.enqueue(_make_event()) is True
+    assert q._queue.qsize() == 1
+    # No journal db file was created anywhere under tmp_path.
+    assert not (tmp_path / 'ej.db').exists()
+    assert list(tmp_path.glob('*.db')) == []
