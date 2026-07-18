@@ -671,7 +671,7 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # claimant_heartbeat_interval_secs mirrors the identical guard in
     # test_workflow_already_done.py:54 -- without it, a spec'd-MagicMock
     # config can leak into asyncio.sleep(MagicMock) in
-    # _claimant_heartbeat_loop (workflow.py:2064) under load-exposed
+    # _claimant_heartbeat_loop (workflow.py:2113) under load-exposed
     # teardown ordering, raising TypeError.
     config.claimant_heartbeat_interval_secs = 60.0
     config.orphan_l0_check_interval_secs = 60.0
