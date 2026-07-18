@@ -6590,6 +6590,72 @@ class TestParseDiffAddedLineRanges:
         assert fn('') == {}
 
 
+@pytest.mark.asyncio
+class TestGetNewSideChangedLineRanges:
+    """Unit tests for GitOps.get_new_side_changed_line_ranges (task 2750).
+
+    New-side counterpart of get_changed_line_ranges: runs the diff in the
+    *worktree* (not project_root), over ``{from_sha}..HEAD`` (not
+    ``main...ref``), and delegates to the new-side parser.
+    """
+
+    async def test_invokes_correct_git_command_in_worktree(
+        self, git_config, git_repo,
+    ):
+        """git diff {from_sha}..HEAD --unified=0 --no-color, cwd=worktree."""
+        ops = GitOps(git_config, git_repo)
+        worktree = git_repo / 'wt'
+        from_sha = 'abc123'
+
+        captured: list[tuple[list[str], object]] = []
+
+        async def mock_run(cmd, cwd=None):
+            captured.append((cmd, cwd))
+            return (0, CANNED_DIFF_TWO_FILES, '')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            await ops.get_new_side_changed_line_ranges(worktree, from_sha)
+
+        assert len(captured) == 1
+        cmd, cwd = captured[0]
+        assert 'git' in cmd
+        assert 'diff' in cmd
+        assert f'{from_sha}..HEAD' in cmd
+        assert '--unified=0' in cmd
+        assert '--no-color' in cmd
+        assert cwd == worktree
+
+    async def test_returns_new_side_parsed_ranges(self, git_config, git_repo):
+        """Returns exactly parse_diff_added_line_ranges(<canned diff>)."""
+        from orchestrator.git_ops import parse_diff_added_line_ranges
+        ops = GitOps(git_config, git_repo)
+        worktree = git_repo / 'wt'
+
+        async def mock_run(cmd, cwd=None):
+            return (0, CANNED_DIFF_TWO_FILES, '')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await ops.get_new_side_changed_line_ranges(
+                worktree, 'base-sha',
+            )
+
+        assert result == parse_diff_added_line_ranges(CANNED_DIFF_TWO_FILES)
+
+    async def test_empty_diff_returns_empty_dict(self, git_config, git_repo):
+        ops = GitOps(git_config, git_repo)
+        worktree = git_repo / 'wt'
+
+        async def mock_run(cmd, cwd=None):
+            return (0, '', '')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await ops.get_new_side_changed_line_ranges(
+                worktree, 'base-sha',
+            )
+
+        assert result == {}
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers: branch/worktree creation + clean-state assertion
 # ---------------------------------------------------------------------------
