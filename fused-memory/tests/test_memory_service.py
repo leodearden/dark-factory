@@ -259,6 +259,8 @@ class TestAddMemory:
         )
         mock_journal = MagicMock()
         mock_journal.log_write_op = AsyncMock()
+        mock_journal.log_mem0_intent = AsyncMock()
+        mock_journal.resolve_mem0_intent = AsyncMock()
         service._write_journal = mock_journal
 
         await service.add_memory(
@@ -280,6 +282,8 @@ class TestAddMemory:
         mock_journal = MagicMock()
         mock_journal.log_write_op = AsyncMock()
         mock_journal.log_backend_op = AsyncMock()
+        mock_journal.log_mem0_intent = AsyncMock()
+        mock_journal.resolve_mem0_intent = AsyncMock()
         service._write_journal = mock_journal
 
         await service.add_memory(
