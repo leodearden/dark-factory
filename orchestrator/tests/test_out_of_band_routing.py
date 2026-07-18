@@ -1,0 +1,266 @@
+"""Per-site adoption + parity tests for the out-of-band routing helper (task η,
+plans/adaptive-model-routing-prd.md).
+
+Each of the five out-of-band LLM dispatch sites now resolves its route through
+``orchestrator.routing_dispatch.resolve_and_record_route`` (which calls
+``orchestrator.routing.resolve_route`` and emits a ``routing_decision`` event),
+instead of reading (model, effort, budget, max_turns) straight from config.
+Backend stays each site's own ``config.backends.*`` / ``ua_cfg.backend`` read
+(resolver-external, PRD boundary under harness-backend-reconnect-pi).
+
+This file grows one section per site as task η's steps land:
+* steward main invoke + inner triage (steps 3-4)
+* deep_reviewer (steps 5-6)
+* module_tagger (steps 7-8)
+* unblock_auto (steps 9-10)
+* PRD boundary test 9 + cross-site byte-equivalence (steps 11-12)
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from _orch_helpers import pydantic_spec, stamp_stock_routing_config
+from _recording_event_store import _RecordingEventStore
+from escalation.models import Escalation
+
+from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventType
+from orchestrator.routing import RoutingDecision
+from orchestrator.steward import TaskSteward
+
+
+def _routing_entries(rec: _RecordingEventStore) -> list[dict]:
+    return [entry for (etype, entry) in rec.events if etype == EventType.routing_decision]
+
+
+def _stub_result():
+    from shared.cli_invoke import AgentResult
+    return AgentResult(
+        success=True,
+        output='done',
+        cost_usd=1.0,
+        duration_ms=1000,
+        turns=3,
+        session_id=None,
+        timed_out=False,
+    )
+
+
+def _fake_decision(*, model='sonnet', effort='low', budget_usd=1.23, max_turns=17,
+                   source_layer='config') -> RoutingDecision:
+    return RoutingDecision(
+        model=model, effort=effort, budget_usd=budget_usd, max_turns=max_turns,
+        source_layer=source_layer, rule_id=None, rejected=(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Steward (steps 3-4)
+# ---------------------------------------------------------------------------
+
+
+def _steward_config():
+    cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    cfg.project_root = Path('/tmp/fake-project')
+    cfg.fused_memory.project_id = 'dark_factory'
+    cfg.fused_memory.url = 'http://localhost:8002'
+    cfg.models.steward = 'opus'
+    cfg.budgets.steward = 5.0
+    cfg.max_turns.steward = 100
+    cfg.effort.steward = 'high'
+    cfg.backends.steward = 'claude'
+    cfg.timeouts.steward = 1800.0
+    cfg.models.triage = 'sonnet'
+    cfg.budgets.triage = 2.0
+    cfg.max_turns.triage = 25
+    cfg.effort.triage = 'medium'
+    cfg.backends.triage = 'claude'
+    cfg.escalation.host = 'localhost'
+    cfg.escalation.port = 8102
+    stamp_stock_routing_config(cfg)
+    return cfg
+
+
+def _build_steward(worktree: Path, *, task: dict, event_store=None, cost_store=None):
+    briefing = AsyncMock()
+    briefing.build_steward_initial_prompt.return_value = 'Full briefing.'
+    briefing.build_steward_continuation_prompt.return_value = 'Continuation.'
+    mcp = MagicMock()
+    mcp.mcp_config_json.return_value = {'mcpServers': {}}
+    queue = MagicMock()
+    queue.get_by_task.return_value = []
+    return TaskSteward(
+        task_id=task['id'],
+        task=task,
+        worktree=worktree,
+        config=_steward_config(),
+        mcp=mcp,
+        escalation_queue=queue,
+        briefing=briefing,
+        event_store=event_store,
+        cost_store=cost_store,
+    )
+
+
+def _mk_escalation(**overrides) -> Escalation:
+    defaults: dict = dict(
+        id='esc-42-1', task_id='42', agent_role='orchestrator',
+        severity='blocking', category='limit_exhausted', summary='s',
+    )
+    defaults.update(overrides)
+    return Escalation(**defaults)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+class TestStewardMainAdoptsResolveRoute:
+    """steward main invoke (`_invoke_with_session`) resolves via the helper."""
+
+    async def test_decision_feeds_invoke_and_keeps_budget_and_backend(
+        self, tmp_path: Path,
+    ) -> None:
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        task = {'id': '42', 'title': 't', 'description': 'd',
+                'metadata': {'dispatch_count': 2}}
+        steward = _build_steward(wt, task=task)
+        fake = _fake_decision(model='sonnet', effort='low', max_turns=17)
+
+        with (
+            patch('orchestrator.steward.resolve_and_record_route',
+                  new=AsyncMock(return_value=fake)) as mock_helper,
+            patch('orchestrator.steward.invoke_with_cap_retry',
+                  new=AsyncMock(return_value=_stub_result())) as mock_iwcr,
+        ):
+            await steward._invoke_with_session(
+                prompt='p', cwd=wt, mcp_config={'mcpServers': {}},
+                per_invocation_budget=3.0, escalation=_mk_escalation(),
+            )
+
+        mock_helper.assert_awaited_once()
+        hk = mock_helper.call_args.kwargs
+        assert hk['role_name'] == 'steward'
+        assert hk['task_metadata'] == {'dispatch_count': 2}
+        assert hk['task_id'] == '42'
+
+        kwargs = mock_iwcr.call_args.kwargs
+        assert kwargs['model'] == 'sonnet'
+        assert kwargs['effort'] == 'low'
+        assert kwargs['max_turns'] == 17
+        # Budget (lifetime-capped per-invocation) + backend are NOT resolver-owned.
+        assert kwargs['max_budget_usd'] == pytest.approx(3.0)
+        assert kwargs['backend'] == 'claude'
+
+    async def test_emits_one_routing_decision_event(self, tmp_path: Path) -> None:
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        rec = _RecordingEventStore()
+        task = {'id': '42', 'title': 't', 'description': 'd'}
+        steward = _build_steward(wt, task=task, event_store=rec)
+
+        with patch('orchestrator.steward.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_stub_result())):
+            await steward._invoke_with_session(
+                prompt='p', cwd=wt, mcp_config={'mcpServers': {}},
+                per_invocation_budget=3.0, escalation=_mk_escalation(),
+            )
+
+        entries = _routing_entries(rec)
+        assert len(entries) == 1
+        assert entries[0]['data']['role'] == 'steward'
+        # Stock config, no override → config-layer model.
+        assert entries[0]['data']['model'] == 'opus'
+
+    async def test_model_override_wins_boundary_test_9(self, tmp_path: Path) -> None:
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        rec = _RecordingEventStore()
+        task = {'id': '42', 'title': 't', 'description': 'd',
+                'metadata': {'model_overrides': {'steward': 'haiku'}}}
+        steward = _build_steward(wt, task=task, event_store=rec)
+
+        with patch('orchestrator.steward.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_stub_result())) as mock_iwcr:
+            await steward._invoke_with_session(
+                prompt='p', cwd=wt, mcp_config={'mcpServers': {}},
+                per_invocation_budget=3.0, escalation=_mk_escalation(),
+            )
+
+        assert mock_iwcr.call_args.kwargs['model'] == 'haiku'
+        assert _routing_entries(rec)[0]['data']['source_layer'] == 'metadata_override'
+
+
+@pytest.mark.asyncio
+class TestStewardTriageAdoptsResolveRoute:
+    """steward inner triage (`_pre_triage_suggestions`) resolves via the helper."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_triage(self):
+        from orchestrator.agents.triage import TRIAGE as _REAL_TRIAGE
+        triage_mod = MagicMock()
+        triage_mod.TRIAGE = _REAL_TRIAGE
+        triage_mod.build_triage_prompt = MagicMock(return_value='triage prompt')
+        triage_mod.extract_triage_verdict = MagicMock(return_value=None)
+        triage_mod.format_pretriaged_detail = MagicMock(return_value='## Pre-triaged')
+        with patch.dict(sys.modules, {'orchestrator.agents.triage': triage_mod}):
+            yield triage_mod
+
+    @staticmethod
+    def _esc(n: int = 12) -> Escalation:
+        suggestions = [
+            {'description': f's{i}', 'location': f'f{i}.py',
+             'reviewer': 'bot', 'category': 'style'}
+            for i in range(n)
+        ]
+        return _mk_escalation(detail=json.dumps(suggestions), category='review_suggestions')
+
+    def _wt(self, tmp_path: Path) -> Path:
+        wt = tmp_path / 'worktree'
+        wt.mkdir()
+        (wt / '.task').mkdir()
+        return wt
+
+    async def test_decision_feeds_triage_invoke_and_keeps_backend(
+        self, tmp_path: Path,
+    ) -> None:
+        wt = self._wt(tmp_path)
+        task = {'id': '42', 'title': 't', 'description': 'd'}
+        steward = _build_steward(wt, task=task)
+        fake = _fake_decision(model='sonnet', effort='medium', budget_usd=2.5, max_turns=25)
+
+        with (
+            patch('orchestrator.steward.resolve_and_record_route',
+                  new=AsyncMock(return_value=fake)) as mock_helper,
+            patch('orchestrator.steward.invoke_with_cap_retry',
+                  new=AsyncMock(return_value=_stub_result())) as mock_iwcr,
+        ):
+            await steward._pre_triage_suggestions(self._esc())
+
+        mock_helper.assert_awaited_once()
+        assert mock_helper.call_args.kwargs['role_name'] == 'triage'
+
+        kwargs = mock_iwcr.call_args.kwargs
+        assert kwargs['model'] == 'sonnet'
+        assert kwargs['effort'] == 'medium'
+        assert kwargs['max_budget_usd'] == 2.5
+        assert kwargs['max_turns'] == 25
+        assert kwargs['backend'] == 'claude'
+
+    async def test_emits_one_routing_decision_event(self, tmp_path: Path) -> None:
+        wt = self._wt(tmp_path)
+        rec = _RecordingEventStore()
+        task = {'id': '42', 'title': 't', 'description': 'd'}
+        steward = _build_steward(wt, task=task, event_store=rec)
+
+        with patch('orchestrator.steward.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_stub_result())):
+            await steward._pre_triage_suggestions(self._esc())
+
+        entries = _routing_entries(rec)
+        assert len(entries) == 1
+        assert entries[0]['data']['role'] == 'triage'
+        assert entries[0]['data']['model'] == 'sonnet'

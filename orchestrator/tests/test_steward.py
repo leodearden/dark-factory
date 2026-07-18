@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
-from _orch_helpers import pydantic_spec
+from _orch_helpers import pydantic_spec, stamp_stock_routing_config
 from escalation import archive
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -92,6 +92,17 @@ def mock_config():
     config.max_turns.steward = 100
     config.effort.steward = 'high'
     config.backends.steward = 'claude'
+    # Triage (inner pre-triage invoke) config layer — task η routes
+    # _pre_triage_suggestions through resolve_route too.
+    config.models.triage = 'sonnet'
+    config.budgets.triage = 2.0
+    config.max_turns.triage = 25
+    config.effort.triage = 'medium'
+    config.backends.triage = 'claude'
+    # task η: the two steward sites now call resolve_route, which does real
+    # membership/dict ops against config.routing.* that a bare MagicMock cannot
+    # satisfy — stamp the stock (haiku/sonnet/opus, no ceilings, no rules) shape.
+    stamp_stock_routing_config(config)
     config.escalation.host = 'localhost'
     config.escalation.port = 8102
     config.fused_memory.url = 'http://localhost:8002'
