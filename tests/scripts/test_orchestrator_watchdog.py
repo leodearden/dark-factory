@@ -4193,6 +4193,11 @@ def test_print_fused_memory_liveness_row(
         # shells out to `systemd-cat` via subprocess.run — no-op it so
         # fake_run only ever sees the `ss` probe call it's built to handle.
         monkeypatch.setattr(wdog, "log", lambda _m: None)
+        # The enriched row (step 16) also reads the fm deploy clock and the
+        # recon-busy verdict; stub both so this liveness-focused test neither
+        # hits a real socket for recon-busy nor depends on a real clock file.
+        monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+        monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
 
         wdog._print_fused_memory_liveness()
 
@@ -4228,6 +4233,10 @@ def test_print_fused_memory_liveness_row_survives_verdict_exception(
     monkeypatch.setattr(
         wdog, "restart_unit", lambda u: pytest.fail(f"must never restart {u}")
     )
+    # The enriched row also reads the fm clock and recon-busy verdict; stub
+    # both so this fail-soft test stays hermetic (no real socket / clock file).
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
     logged: list[str] = []
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
 
@@ -4254,6 +4263,10 @@ def test_cli_report_includes_fused_memory_row(
 
     monkeypatch.setattr(wdog, "report", lambda: 0)
     monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
+    # Stub the enriched-row helpers (step 16) so this test neither hits a real
+    # socket for the recon-busy verdict nor depends on a real clock file.
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
 
     exit_code = wdog._cli(["--report"])
 
@@ -4261,6 +4274,216 @@ def test_cli_report_includes_fused_memory_row(
     assert "fused-memory.service" in captured.out
     assert "healthy" in captured.out
     assert exit_code == 0, "report()'s staleness-only exit code must be unaffected by the fm row"
+
+
+# ---------------------------------------------------------------------------
+# Enriched --report fused-memory row: DEPLOY-AGE + recon-busy (steps 15/16)
+#
+# _fused_memory_recon_busy_verdict() lazily reuses scripts/recon_busy_check.py
+# — the SAME busy/idle/unreachable gate restart-fused-memory.sh's defer-if-busy
+# path consumes — so this column predicts the restart gate exactly; it degrades
+# to 'unknown' on any fetch/import failure. _print_fused_memory_liveness() is
+# enriched with a DEPLOY-AGE field (fm-clock age in hours) and a recon-busy
+# field, staying strictly read-only (no mutation, no clock write).
+# ---------------------------------------------------------------------------
+
+
+class _FakeHealthBodyResponse:
+    """urlopen stand-in whose .read() returns a fixed /health body as bytes.
+
+    Distinct from _FakeHealthResponse (which only models a status code for the
+    liveness probe): _fused_memory_recon_busy_verdict() reads the response
+    BODY and runs it through recon_busy_check.parse_health()/classify().
+    """
+
+    def __init__(self, body: str) -> None:
+        self._body = body.encode("utf-8")
+
+    def __enter__(self) -> "_FakeHealthBodyResponse":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def _run_recon_busy_verdict_with_body(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, body: str
+) -> str:
+    """Drive _fused_memory_recon_busy_verdict() with a faked /health *body*
+    flowing through the REAL lazy-imported recon_busy_check.classify()."""
+
+    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        return _FakeHealthBodyResponse(body)
+
+    monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
+    return wdog._fused_memory_recon_busy_verdict()
+
+
+def test_fused_memory_recon_busy_verdict_busy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-empty recon_busy list classifies as 'busy' (a full cycle is in flight)."""
+    wdog = _load_watchdog()
+    body = json.dumps(
+        {"status": "ok", "recon_busy": [{"project_id": "dark_factory", "run_id": "r1"}]}
+    )
+    assert _run_recon_busy_verdict_with_body(wdog, monkeypatch, body) == "busy"
+
+
+def test_fused_memory_recon_busy_verdict_idle_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty recon_busy list classifies as 'idle'."""
+    wdog = _load_watchdog()
+    body = json.dumps({"status": "ok", "recon_busy": []})
+    assert _run_recon_busy_verdict_with_body(wdog, monkeypatch, body) == "idle"
+
+
+def test_fused_memory_recon_busy_verdict_idle_absent_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent recon_busy field classifies as 'idle'."""
+    wdog = _load_watchdog()
+    body = json.dumps({"status": "ok"})
+    assert _run_recon_busy_verdict_with_body(wdog, monkeypatch, body) == "idle"
+
+
+def test_fused_memory_recon_busy_verdict_unreachable_on_blank_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blank/whitespace body (unreachable/degraded endpoint) → 'unreachable'.
+
+    The fetch SUCCEEDS but returns an unparseable body — recon_busy_check.
+    parse_health() returns None and classify() maps that to 'unreachable'.
+    This is the case distinct from an outright fetch exception (→ 'unknown').
+    """
+    wdog = _load_watchdog()
+    assert _run_recon_busy_verdict_with_body(wdog, monkeypatch, "   ") == "unreachable"
+
+
+def test_fused_memory_recon_busy_verdict_unknown_on_fetch_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Any fetch/import exception degrades to 'unknown' (fail-soft) and is logged."""
+    wdog = _load_watchdog()
+
+    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise ConnectionRefusedError("connection refused")
+
+    monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        wdog.logger, "warning", lambda m, *a, **k: warnings.append(str(m))
+    )
+
+    assert wdog._fused_memory_recon_busy_verdict() == "unknown"
+    assert warnings, "the swallowed fetch exception must be logged"
+
+
+def test_print_fused_memory_liveness_row_includes_deploy_age(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The enriched fm row renders DEPLOY-AGE as fm-clock age in hours (one decimal).
+
+    Mirrors report()'s DEPLOY-AGE column: (now - fm-clock epoch) / 3600 to one
+    decimal place, sourced from _read_last_fm_deploy_epoch (fm's OWN clock).
+    """
+    wdog = _load_watchdog()
+    now = 2_000_000_000.0
+    monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: now - 3 * 3600)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "DEPLOY-AGE" in out, f"expected DEPLOY-AGE label in fm row: {out!r}"
+    assert "3.0h" in out, f"expected DEPLOY-AGE ~3.0h in fm row: {out!r}"
+
+
+def test_print_fused_memory_liveness_row_deploy_age_unknown_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """DEPLOY-AGE renders 'unknown' when the fm deploy clock is absent (fail-open).
+
+    Mirrors _read_last_fm_deploy_epoch's fail-open contract (None when the fm
+    clock file has never been stamped / is unreadable).
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "DEPLOY-AGE" in out
+    assert "unknown" in out, f"expected DEPLOY-AGE 'unknown' in fm row: {out!r}"
+
+
+def test_print_fused_memory_liveness_row_includes_recon_busy(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The enriched fm row carries a labelled recon-busy field from the verdict."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "busy")
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "recon-busy: busy" in out, (
+        f"expected labelled recon-busy field carrying the verdict in fm row: {out!r}"
+    )
+
+
+def test_print_fused_memory_liveness_row_enriched_stays_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """I8 guard extended to the enriched fm row: no mutating systemctl call and
+    no write to FM_DEPLOY_CLOCK_PATH.
+
+    Drives the REAL _fused_memory_liveness_verdict() -> probe_port()/
+    probe_health() chain (faking `ss` + urlopen) so the zero-mutating-calls
+    assertion is meaningful, stubs the recon-busy verdict to avoid a second
+    socket, points the fm deploy clock at an absent tmp file, and asserts the
+    read-only row never creates it.
+    """
+    wdog = _load_watchdog()
+
+    recorded_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        recorded_calls.append(list(cmd))
+        assert cmd[0] == "ss", f"unexpected subprocess.run call: {cmd}"
+        return subprocess.CompletedProcess(cmd, 0, stdout=_SS_LISTEN_8002, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        wdog.urllib.request, "urlopen", lambda *a, **k: _FakeHealthResponse(200)
+    )
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda u: pytest.fail(f"must never restart {u}")
+    )
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
+
+    clock = tmp_path / "last_redeploy_fused_memory.json"
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock))
+
+    wdog._print_fused_memory_liveness()
+
+    captured = capsys.readouterr()
+    assert "fused-memory.service" in captured.out
+    _assert_zero_mutating_calls(recorded_calls)
+    assert not clock.exists(), (
+        "the read-only fm row must never write the fm deploy clock file"
+    )
 
 
 # ---------------------------------------------------------------------------
