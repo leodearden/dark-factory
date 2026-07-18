@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from _orch_helpers import pydantic_spec
 
@@ -86,6 +86,54 @@ def test_build_workflow_forwards_params():
     assert wf.initial_plan is initial_plan
     assert wf.usage_gate is usage_gate
     assert wf.escalation_queue is escalation_queue
+
+
+# Every ``build_workflow`` parameter, in ``TaskWorkflow.__init__`` order. The
+# instance-identity test above can only cover fields the constructor stores 1:1
+# on ``self``; several pass-through params are stored under a private name
+# (``steward_factory`` -> ``_steward_factory``, ``cancel_event`` ->
+# ``_cancel_event``, ``escalation_event`` -> ``_escalation_event``, ``run_id`` ->
+# ``_process_run_id``) and ``resume_session_id`` is decomposed via ``.get(...)``
+# and never stored whole — so none of those can be asserted by instance identity.
+_BUILD_WORKFLOW_PARAMS = (
+    'assignment', 'config', 'git_ops', 'scheduler', 'briefing', 'mcp',
+    'escalation_queue', 'escalation_event', 'usage_gate', 'initial_plan',
+    'steward_factory', 'merge_queue', 'merge_worker', 'merge_inflight_registry',
+    'event_store', 'cost_store', 'cancel_event', 'resume_session_id', 'run_id',
+)
+
+
+def test_build_workflow_forwards_every_param_by_keyword():
+    """Every param reaches ``TaskWorkflow(...)`` under its own keyword — no swaps.
+
+    ``build_workflow`` forwards each field by a hand-written ``name=name`` keyword,
+    so a copy/paste swap in the body (e.g. ``merge_queue=merge_worker``) would
+    misroute an argument silently and the instance-identity test would still pass
+    for any two interchangeable-looking params. Spying on the constructor and
+    asserting each keyword carries the *identical* sentinel catches that drift
+    class directly — and uniformly covers the params the identity test cannot:
+    the privately-stored ones and ``resume_session_id`` (decomposed via
+    ``.get(...)``, so never stored whole).
+    """
+    # One distinct opaque sentinel per constructor parameter. ``TaskWorkflow`` is
+    # patched out, so no attribute access happens on any sentinel — plain
+    # ``object()`` tokens are safe even for the required params.
+    params: dict[str, Any] = {name: object() for name in _BUILD_WORKFLOW_PARAMS}
+
+    with patch('orchestrator.workflow.TaskWorkflow') as mock_ctor:
+        result = build_workflow(**params)
+
+    mock_ctor.assert_called_once()
+    call = mock_ctor.call_args
+    # Every param is forwarded by keyword, never positionally.
+    assert call.args == ()
+    # Exactly the expected keyword set — nothing dropped, nothing extra.
+    assert set(call.kwargs) == set(_BUILD_WORKFLOW_PARAMS)
+    # Each keyword carries the identical sentinel; a mis-wired keyword fails here.
+    for name in _BUILD_WORKFLOW_PARAMS:
+        assert call.kwargs[name] is params[name], f'build_workflow misrouted {name!r}'
+    # The factory returns exactly what the constructor produced.
+    assert result is mock_ctor.return_value
 
 
 # ── Grep-guard tripwire (PRD eval-framework-revival §α, Invariant P2 / Boundary
