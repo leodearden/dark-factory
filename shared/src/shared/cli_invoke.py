@@ -142,6 +142,7 @@ __all__ = [
     'build_failure_message',
     'classify_agent_failure',
     'count_transcript_turns',
+    'detect_ended_awaiting_background',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
     'is_timed_out_with_progress',
@@ -358,6 +359,77 @@ def count_transcript_turns(
     if records is None:
         return None
     return sum(1 for r in records if r.get('type') == 'assistant')
+
+
+# Background-management tool names that "reap" a launched background task — a
+# poll (``BashOutput``) or a kill (``KillShell`` / ``KillBash``, the latter an
+# older CLI spelling).  Any of these AFTER the last background launch clears the
+# abandonment verdict.
+_BACKGROUND_REAP_TOOLS = frozenset({'BashOutput', 'KillShell', 'KillBash'})
+
+
+def detect_ended_awaiting_background(records: list[dict]) -> bool:
+    """Return True when the transcript's final background action was an unreaped
+    launch — i.e. the agent ended its turn while a backgrounded Bash command was
+    still pending, silently abandoning the work (the Reify-5164 RCA).
+
+    Contract (high-precision, no fragile parsing).  Over the ordered transcript
+    *records*:
+
+    - a **launch** = a ``Bash`` tool_use whose ``input.run_in_background`` is
+      truthy;
+    - a **reap** = any ``BashOutput`` / ``KillShell`` / ``KillBash`` tool_use.
+
+    Fire (True) iff ``index(last launch) > index(last reap)`` — the session's
+    final background-management action was a launch never followed by a
+    poll/kill.  Any engagement with a background task (a poll or kill after it)
+    clears the verdict, keeping precision high and avoiding fragile shell-id /
+    result-text parsing that differs across CLI versions.
+
+    Fail-safe / conservative by construction — a ``success``→failure downgrade
+    must NEVER re-run a genuinely complete task on ambiguous data:
+
+    - no launches, an empty/None/garbage record list, or a reap positioned after
+      the last launch → False;
+    - malformed records/blocks (non-dict, missing keys, wrong nesting) are
+      skipped, never raise.
+
+    Tolerant to both transcript content nestings:
+    ``record['message']['content']`` (the real CLI shape) and a flat
+    ``record['content']``.
+
+    Known conservative false negative (accepted): an agent that polls a
+    still-running task once with ``BashOutput`` and THEN ends its turn anyway
+    reaps after the launch → False.  Erring toward NOT downgrading a possibly
+    complete run is the safe direction for a success→failure flip.
+    """
+    if not records:
+        return False
+    last_launch_idx = -1
+    last_reap_idx = -1
+    pos = 0  # strictly-increasing position over tool_use blocks (record- then block-order)
+    for record in records:
+        if not isinstance(record, dict) or record.get('type') != 'assistant':
+            continue
+        message = record.get('message')
+        if isinstance(message, dict) and isinstance(message.get('content'), list):
+            blocks = message['content']
+        elif isinstance(record.get('content'), list):
+            blocks = record['content']
+        else:
+            continue
+        for block in blocks:
+            if not isinstance(block, dict) or block.get('type') != 'tool_use':
+                continue
+            pos += 1
+            name = block.get('name')
+            if name == 'Bash':
+                inp = block.get('input')
+                if isinstance(inp, dict) and inp.get('run_in_background'):
+                    last_launch_idx = pos
+            elif name in _BACKGROUND_REAP_TOOLS:
+                last_reap_idx = pos
+    return last_launch_idx != -1 and last_launch_idx > last_reap_idx
 
 
 def is_zero_output_timeout(result: AgentResult) -> bool:
