@@ -614,6 +614,41 @@ class EventBuffer:
             for row in rows
         ]
 
+    async def get_drained_events(
+        self, project_id: str, run_id: str,
+    ) -> list[ReconciliationEvent]:
+        """Read-only accessor for a run's drained events — no status mutation.
+
+        Returns the events that ``drain(project_id, run_id=run_id)`` stamped
+        ``status='drained', drained_by_run_id=run_id``, mapped to
+        ``ReconciliationEvent`` exactly like ``drain``/``peek_buffered``, ordered
+        by timestamp. Unlike ``restore_drained`` it does NOT flip the rows back
+        to ``buffered`` — the resume path (task σ) feeds these to FRESH later
+        stages while the events stay drained, so a resumed cycle never
+        double-processes them.
+        """
+        db = self._require_db()
+        async with db.execute(
+            """SELECT * FROM event_buffer
+               WHERE project_id = ? AND status = 'drained' AND drained_by_run_id = ?
+               ORDER BY timestamp""",
+            (project_id, run_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        return [
+            ReconciliationEvent(
+                id=row['id'],
+                project_id=row['project_id'],
+                type=EventType(row['event_type']),
+                source=EventSource(row['event_source']),
+                agent_id=row['agent_id'],
+                timestamp=datetime.fromisoformat(row['timestamp']),
+                payload=json.loads(row['payload']),
+            )
+            for row in rows
+        ]
+
     async def drain_by_ids(
         self, project_id: str, ids: list[str],
     ) -> int:
