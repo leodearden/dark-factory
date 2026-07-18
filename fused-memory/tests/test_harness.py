@@ -6182,6 +6182,111 @@ async def test_resume_interrupted_runs_falls_back_when_unresumable(
     harness._escalate.assert_not_called()
 
 
+def test_resume_failure_storm_escalates_once_per_window(
+    journal, event_buffer, mock_memory_service,
+):
+    """task σ (s20): ``_record_resume_failure`` is a rolling-window per-event
+    storm counter (config-driven threshold/window) with rate-limited
+    single-fire, mirroring ``_record_dead_owner_suppression`` /
+    ``_record_placeholder_finding_drop``.
+
+    Phase 1 — threshold crossing: with the default threshold (6) inside a 3600s
+      window, the first 5 calls return None and the 6th returns a storm dict
+      (count>=6, window_seconds==3600.0, sorted distinct project labels).
+    Phase 2 — no re-fire in the same window: two more calls return None
+      (rate-limited to <=1 escalation signal per window).
+    Phase 3 — re-fire after a full window: 6 calls at now=base+7200 → first 5
+      None, 6th a storm dict again (the prior window's entries pruned).
+
+    Follows the ``test_record_dead_owner_suppression_rolling_window`` shape with
+    now= time injection. RED because ``_record_resume_failure`` does not exist.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    # Policy thresholds are injected defaults (not accuracy claims).
+    assert harness.config.resume_failure_storm_threshold == 6
+    assert harness.config.resume_failure_storm_window_seconds == 3600.0
+
+    base = datetime(2026, 7, 18, 0, 0, 0, tzinfo=UTC)
+
+    # ── Phase 1: threshold crossing ──────────────────────────────────────────
+    projects = ['reify', 'dark_factory', 'reify', 'dark_factory', 'reify', 'dark_factory']
+    results = [
+        harness._record_resume_failure(proj, now=base + timedelta(seconds=i))
+        for i, proj in enumerate(projects)
+    ]
+    for i, r in enumerate(results[:5]):
+        assert r is None, f'Call {i+1} should be below threshold (None), got {r!r}'
+    storm = results[5]
+    assert storm is not None, 'Call 6 (threshold crossed) should return a storm dict'
+    assert storm['count'] >= 6, f'Expected count>=6, got {storm["count"]}'
+    assert storm['window_seconds'] == 3600.0
+    assert storm['projects'] == ['dark_factory', 'reify'], (
+        f'Expected sorted distinct project labels, got {storm["projects"]}'
+    )
+
+    # ── Phase 2: no re-fire in the same window ───────────────────────────────
+    r6 = harness._record_resume_failure('reify', now=base + timedelta(seconds=6))
+    r7 = harness._record_resume_failure('reify', now=base + timedelta(seconds=7))
+    assert r6 is None, f'Same-window call should be rate-limited to None, got {r6!r}'
+    assert r7 is None, f'Same-window call should be rate-limited to None, got {r7!r}'
+
+    # ── Phase 3: re-fire after a full window ─────────────────────────────────
+    future = base + timedelta(seconds=7200)
+    results3 = [
+        harness._record_resume_failure('reify', now=future + timedelta(seconds=i))
+        for i in range(6)
+    ]
+    for i, r in enumerate(results3[:5]):
+        assert r is None, f'Phase-3 call {i+1} should be None (new window), got {r!r}'
+    assert results3[5] is not None, 'Phase-3 call 6 should re-fire in the new window'
+    assert results3[5]['count'] >= 6
+
+
+@pytest.mark.asyncio
+async def test_resume_interrupted_runs_fallback_escalates_resume_failure_storm(
+    journal, event_buffer, mock_memory_service,
+):
+    """task σ (s20): when the fallback arm's ``_record_resume_failure`` reports a
+    storm, ``_resume_interrupted_runs`` fires exactly one recon-scoped
+    ``recon_resume_failure_storm`` escalation, keyed on the fallen-back run.
+
+    RED because the fallback arm does not yet call ``_record_resume_failure`` /
+    escalate the storm category.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    # Force the counter to report a storm for this one fallback.
+    storm_dict = {'count': 6, 'window_seconds': 3600.0, 'projects': ['test-project']}
+    harness._record_resume_failure = MagicMock(return_value=storm_dict)
+
+    # Stale-freshness → guaranteed unresumable → fallback arm runs.
+    run = await _setup_interrupted_dead_predecessor_run(
+        journal, event_buffer,
+        completed_at=datetime.now(UTC) - timedelta(seconds=7200),
+    )
+    harness.run_full_cycle = AsyncMock()
+
+    with patch('fused_memory.reconciliation.harness.gc_run_config_dir'):
+        await harness._resume_interrupted_runs()
+
+    # The fallback arm recorded the resume failure for this project once.
+    harness._record_resume_failure.assert_called_once_with('test-project')
+
+    # Exactly one recon_resume_failure_storm escalation, keyed on the run.
+    storm_calls = [
+        c for c in harness._escalate.call_args_list
+        if c.args and c.args[0] == 'recon_resume_failure_storm'
+    ]
+    assert len(storm_calls) == 1, (
+        f'Expected exactly one recon_resume_failure_storm escalation; got '
+        f'{harness._escalate.call_args_list!r}'
+    )
+    assert storm_calls[0].args[1] == run.id
+
+    # run_full_cycle never invoked on the fallback path.
+    harness.run_full_cycle.assert_not_awaited()
+
+
 # ── Tests for AllAccountsCappedException deferral in run_full_cycle ────
 
 
