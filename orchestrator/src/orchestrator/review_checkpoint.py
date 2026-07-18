@@ -14,6 +14,8 @@ from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import DEEP_REVIEWER, submit_only_instructions
 from orchestrator.config import OrchestratorConfig
+from orchestrator.routing import RoleDefaults
+from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.verify import VerifyResult, run_full_verification
 from orchestrator.workflow_types import classify_failure
 
@@ -21,6 +23,7 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
     from shared.cost_store import CostStore
 
+    from orchestrator.event_store import EventStore
     from orchestrator.mcp_lifecycle import McpLifecycle
     from orchestrator.usage_gate import UsageGate
 
@@ -60,6 +63,11 @@ class ReviewCheckpoint:
         self.cost_store: CostStore | None = None
         self.escalation_queue: EscalationQueue | None = None
         self.run_id: str = ''
+        # Wired post-construction in the harness (like cost_store/run_id) so the
+        # (config, mcp, usage_gate) constructor stays unchanged (task η). When
+        # set, _run_review emits a routing_decision event for the resolved
+        # deep_reviewer route.
+        self.event_store: EventStore | None = None
 
         self._merge_count = 0
         self._last_review_at_merge = 0
@@ -173,6 +181,22 @@ class ReviewCheckpoint:
 
         logger.info('Review [%s]: Phase 2+3 — invoking deep reviewer agent', review_id)
         started_at = datetime.now(UTC).isoformat()
+        # Route resolution (task η): resolve model/effort/budget/max_turns through
+        # the single layered resolver + emit a routing_decision event. deep_reviewer
+        # is STRUCTURALLY project-level (no task/task_metadata anywhere in scope),
+        # so no task_id/scheduler/in_memory_task is passed — no metadata.routing
+        # mirror. backend stays the site's own config.backends.deep_reviewer read
+        # (resolver-external, PRD boundary under harness-backend-reconnect-pi).
+        decision = await resolve_and_record_route(
+            role_name='deep_reviewer',
+            role_defaults=RoleDefaults(
+                DEEP_REVIEWER.default_model, 'high',
+                DEEP_REVIEWER.default_budget, DEEP_REVIEWER.default_max_turns,
+            ),
+            config=self.config,
+            event_store=self.event_store,
+            cost_store=self.cost_store,
+        )
         try:
             result = await invoke_with_cap_retry(
                 usage_gate=self.usage_gate,
@@ -181,13 +205,13 @@ class ReviewCheckpoint:
                 prompt=prompt,
                 system_prompt=DEEP_REVIEWER.system_prompt,
                 cwd=self.config.project_root,
-                model=getattr(self.config.models, 'deep_reviewer', 'opus'),
-                max_turns=getattr(self.config.max_turns, 'deep_reviewer', 100),
-                max_budget_usd=getattr(self.config.budgets, 'deep_reviewer', 15.0),
+                model=decision.model,
+                max_turns=decision.max_turns,
+                max_budget_usd=decision.budget_usd,
                 allowed_tools=DEEP_REVIEWER.allowed_tools or None,
                 disallowed_tools=DEEP_REVIEWER.disallowed_tools or None,
                 mcp_config=mcp_config,
-                effort=getattr(self.config.effort, 'deep_reviewer', 'max'),
+                effort=decision.effort,
                 backend=getattr(self.config.backends, 'deep_reviewer', 'claude'),
             )
         except AllAccountsCappedException as e:
@@ -221,7 +245,9 @@ class ReviewCheckpoint:
 
         if self.cost_store:
             try:
-                model_name = getattr(self.config.models, 'deep_reviewer', 'opus')
+                # Report the RESOLVED model (task η) — diverges from raw
+                # config.models.deep_reviewer under a policy rule / override.
+                model_name = decision.model
                 await self.cost_store.save_invocation(
                     run_id=self.run_id,
                     task_id=None,

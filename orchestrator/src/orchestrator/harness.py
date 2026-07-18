@@ -1559,6 +1559,10 @@ class Harness:
         if self.review_checkpoint and self.cost_store:
             self.review_checkpoint.cost_store = self.cost_store
             self.review_checkpoint.run_id = run_id
+            # Wire the event store too (task η) so the deep_reviewer route
+            # resolution emits a routing_decision event, matching the
+            # post-construction attribute-wiring pattern above.
+            self.review_checkpoint.event_store = self.event_store
 
         # Hoisted out of the try block so the finally clause can cancel
         # in-flight workflow tasks even if an exception fires before the
