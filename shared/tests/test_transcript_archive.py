@@ -69,3 +69,44 @@ class TestCoreArchiveAndCredentialSafety:
         assert not any(name.startswith('notes') for name in archived)
         assert not any(name.endswith('.txt') for name in archived)
         assert not any(name.endswith('.txt.gz') for name in archived)
+
+
+class TestArchiveAll:
+    """session_id=None archives every projects/**/*.jsonl."""
+
+    def test_archives_every_session_when_session_id_none(self, tmp_path):
+        config_dir = tmp_path / 'claude-config-42'
+        root = tmp_path / 'archive'
+        task_id = '42'
+
+        enc_a = '-home-leo-projA'
+        enc_b = '-home-leo-projB'
+        sid_a = 'sess-a'
+        sid_b = 'sess-b'
+
+        a_bytes = b'{"s":"a"}\n'
+        b_bytes = b'{"s":"b"}\n'
+        sub_bytes = b'{"s":"a-sub"}\n'
+
+        _write(config_dir / 'projects' / enc_a / f'{sid_a}.jsonl', a_bytes)
+        _write(config_dir / 'projects' / enc_b / f'{sid_b}.jsonl', b_bytes)
+        _write(
+            config_dir / 'projects' / enc_a / sid_a / 'subagents' / 'agent-1.jsonl',
+            sub_bytes,
+        )
+        # A non-transcript file must still be ignored by the recursive glob.
+        _write(config_dir / 'projects' / enc_a / 'notes.txt', b'ignore me')
+
+        count = archive_task_transcripts(config_dir, task_id, None, archive_root=root)
+
+        assert count == 3
+
+        a_gz = root / task_id / enc_a / f'{sid_a}.jsonl.gz'
+        b_gz = root / task_id / enc_b / f'{sid_b}.jsonl.gz'
+        sub_gz = root / task_id / enc_a / sid_a / 'subagents' / 'agent-1.jsonl.gz'
+        assert _gunzip(a_gz) == a_bytes
+        assert _gunzip(b_gz) == b_bytes
+        assert _gunzip(sub_gz) == sub_bytes
+
+        archived = [p.name for p in root.rglob('*') if p.is_file()]
+        assert not any(name.endswith('.txt') or name.endswith('.txt.gz') for name in archived)
