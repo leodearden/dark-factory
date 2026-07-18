@@ -4787,3 +4787,308 @@ def test_delegate_fm_restart_swallows_missing_binary(monkeypatch: pytest.MonkeyP
 
     assert len(log_messages) >= 1, "a missing systemd-run binary must be logged"
 
+
+# ---------------------------------------------------------------------------
+# Part C: fused_memory_staleness_pass() (step 11)
+#
+# Single-unit mirror of staleness_pass() over FUSED_MEMORY_UNIT: min-interval
+# gate (fm clock) -> commit epoch -> commit-grace head-start -> enabled /
+# startup-grace / ActiveEnterTimestamp-vs-commit -> delegate once. Every helper
+# is stubbed directly (the α-style unit level); the fm-deploy min-interval gate
+# is neutralized to False except where it is the subject under test.
+# ---------------------------------------------------------------------------
+
+
+def test_fused_memory_staleness_pass_core_stale_delegates_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 1: an enabled, past-startup-grace fused-memory.service whose
+    ActiveEnterTimestamp predates the newest fm-watched commit delegates a
+    fused-memory restart exactly once and logs a WARNING naming the unit."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+    log_messages: list[str] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_unit_active_enter_epoch", lambda _u: commit_epoch - 100)  # stale
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.fused_memory_staleness_pass()
+
+    assert len(delegated) == 1, f"Expected exactly one fm restart delegation, got {len(delegated)}"
+    assert any(("WARNING" in m and wdog.FUSED_MEMORY_UNIT in m) for m in log_messages), (
+        f"Expected a WARNING log naming {wdog.FUSED_MEMORY_UNIT}: {log_messages}"
+    )
+
+
+def test_fused_memory_staleness_pass_fresh_does_not_delegate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 2: ActiveEnterTimestamp >= commit (fm already running the newest
+    code) → no delegation."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_unit_active_enter_epoch", lambda _u: commit_epoch + 100)  # fresh
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+
+    assert delegated == [], f"A fresh unit must not delegate; got {delegated}"
+
+
+def test_fused_memory_staleness_pass_within_min_interval_logs_inside_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 3a: within fm's min-interval → early return (no commit read, no
+    delegate) and a throttled skip-log line emitted at a bucket boundary."""
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(wdog.time, "time", lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0)
+    monkeypatch.setattr(
+        wdog,
+        "_newest_fm_watched_commit_epoch",
+        lambda: pytest.fail("must not read commit when the fm-deploy gate is closed"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_delegate_fm_restart",
+        lambda: pytest.fail("must not delegate when the fm-deploy gate is closed"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.fused_memory_staleness_pass()
+
+    assert any(
+        "skip" in m and str(wdog.FM_RESTART_MIN_INTERVAL_SECS) in m for m in log_messages
+    ), f"Expected a skip log naming the fm-deploy min-interval: {log_messages}"
+
+
+def test_fused_memory_staleness_pass_within_min_interval_suppresses_log_outside_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 3b: within fm's min-interval but outside the log bucket → still
+    returns early, but emits NO skip line (rate-limit throttle)."""
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(
+        wdog.time,
+        "time",
+        lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 + wdog.SKIP_LOG_INTERVAL_SECS / 2,
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_newest_fm_watched_commit_epoch",
+        lambda: pytest.fail("must not read commit when the fm-deploy gate is closed"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.fused_memory_staleness_pass()
+
+    assert log_messages == [], f"Expected no skip log outside the bucket: {log_messages}"
+
+
+def test_fused_memory_staleness_pass_commit_grace_suppresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 4: a commit younger than STALENESS_GRACE_SECS gives the fm
+    event-driven coordinator its head start — no delegation."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - 300  # younger than STALENESS_GRACE_SECS=1800
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(
+        wdog,
+        "_unit_active_enter_epoch",
+        lambda _u: pytest.fail("must not probe activation inside the commit-grace window"),
+    )
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+
+    assert delegated == [], f"A young commit must suppress delegation; got {delegated}"
+
+
+def test_fused_memory_staleness_pass_noop_when_commit_epoch_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 5: an undeterminable commit epoch is a complete no-op (no
+    enabled/active probe, no delegate)."""
+    wdog = _load_watchdog()
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: None)
+    monkeypatch.setattr(
+        wdog,
+        "is_unit_enabled",
+        lambda _u: pytest.fail("must not probe enabled when commit epoch is None"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_delegate_fm_restart",
+        lambda: pytest.fail("must not delegate when commit epoch is None"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+
+
+def test_fused_memory_staleness_pass_skips_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Case 6: a disabled fused-memory.service (operator intent) → no
+    activation probe, no delegate."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
+    monkeypatch.setattr(
+        wdog,
+        "_unit_active_enter_epoch",
+        lambda _u: pytest.fail("must not probe activation for a disabled unit"),
+    )
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+
+    assert delegated == [], f"A disabled unit must not delegate; got {delegated}"
+
+
+def test_fused_memory_staleness_pass_skips_startup_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 7: a just-restarted fm within STARTUP_GRACE_SECS → no delegate
+    (avoid an indefinite restart loop before the new version converges)."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 30.0)  # < 120s grace
+    monkeypatch.setattr(
+        wdog,
+        "_unit_active_enter_epoch",
+        lambda _u: pytest.fail("must not probe activation inside the startup-grace window"),
+    )
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+
+    assert delegated == [], f"A unit within startup grace must not delegate; got {delegated}"
+
+
+def test_fused_memory_staleness_pass_active_none_does_not_delegate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 8: an undeterminable ActiveEnterTimestamp (None) → no delegate
+    (don't guess staleness)."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_unit_active_enter_epoch", lambda _u: None)  # undeterminable
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+
+    assert delegated == [], f"A None ActiveEnterTimestamp must not delegate; got {delegated}"
+
+
+def test_fused_memory_staleness_pass_isolates_probe_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 9: an exception raised inside the probe chain is caught (no raise),
+    mirroring fused_memory_liveness_pass()'s single-unit try/except isolation."""
+    wdog = _load_watchdog()
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    def _boom(_u: str) -> bool:
+        raise RuntimeError("systemctl exploded")
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", _boom)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    # Must not raise
+    wdog.fused_memory_staleness_pass()
+
+
+def test_fused_memory_staleness_pass_e2e_converges(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Case 10 (I6): a first pass with ActiveEnterTimestamp<commit delegates
+    once; after the restart advances ActiveEnterTimestamp past the commit, the
+    next pass no-ops — stateless self-heal, no stored flap state."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+    active = {"epoch": commit_epoch - 100}  # starts stale
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_unit_active_enter_epoch", lambda _u: active["epoch"])
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+    assert len(delegated) == 1, f"first pass must delegate once; got {len(delegated)}"
+
+    # Restart refreshed the unit — ActiveEnterTimestamp now past the commit.
+    delegated.clear()
+    active["epoch"] = commit_epoch + 50
+    wdog.fused_memory_staleness_pass()
+    assert delegated == [], f"a refreshed unit must self-clear; got {len(delegated)} delegation(s)"
+
