@@ -668,6 +668,12 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     config.escalation = MagicMock(spec_set=pydantic_spec(EscalationConfig))
     # Real numeric defaults for fields read by harness lifecycle loops —
     # MagicMock values would crash ``asyncio.sleep(<MagicMock>)``.
+    # claimant_heartbeat_interval_secs mirrors the identical guard in
+    # test_workflow_already_done.py:54 -- without it, a spec'd-MagicMock
+    # config can leak into asyncio.sleep(MagicMock) in
+    # _claimant_heartbeat_loop (workflow.py:2113) under load-exposed
+    # teardown ordering, raising TypeError.
+    config.claimant_heartbeat_interval_secs = 60.0
     config.orphan_l0_check_interval_secs = 60.0
     config.orphan_l0_reaper_enabled = False
     config.orphan_l0_timeout_secs = 600.0

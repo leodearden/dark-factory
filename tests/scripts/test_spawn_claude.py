@@ -582,16 +582,19 @@ def test_window_close_129_robust_to_delayed_trap_install(
 
     # Gate on BOTH the leader pid AND the readiness marker (post-trap proof).
     # The pid is published immediately; the readiness file appears only after
-    # the DELAY + $inner trap-install sequence completes.
-    _wait_for_path(pidfile, timeout=5.0)
-    _wait_for_path(readyfile, timeout=5.0 + DELAY + 5.0)  # generous budget
+    # the DELAY + $inner trap-install sequence completes. Budgets are
+    # load-scaled (task 2733's _load_scaled_grace, mirrored from the sibling
+    # transcript tests below) rather than fixed, so a load-slowed-but-correct
+    # run doesn't spuriously time out.
+    _wait_for_path(pidfile, timeout=_load_scaled_grace(5))
+    _wait_for_path(readyfile, timeout=_load_scaled_grace(5) + DELAY + _load_scaled_grace(5))
 
     leader_pid = int(pidfile.read_text().strip())
     # SIGHUP arrives after the HUP trap is armed — must yield exit 129.
     os.killpg(leader_pid, signal.SIGHUP)
 
     try:
-        rc = proc.wait(timeout=15)
+        rc = proc.wait(timeout=_load_scaled_grace(15))
     except subprocess.TimeoutExpired:
         proc.kill()
         pytest.fail(
