@@ -25,6 +25,7 @@ from orchestrator.git_ops import (
     WorktreeInfo,
     WorktreeMissing,
     _assert_no_conflict_markers,
+    _git_stderr_is_unresolved_ref,
     _merge_subject,
     _run,
     canonical_queued_branch_name,
@@ -10683,3 +10684,63 @@ class TestGetBranchChangedFiles:
         assert isinstance(err, Exception), (
             f'expected err to be an Exception; got {type(err)!r}'
         )
+
+    async def test_bogus_ref_logged_at_debug_not_warning(
+        self, git_ops: GitOps, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Amendment (reviewer efficiency-and-log-noise): a not-yet-branched
+        ref (git's "unknown/bad revision" fatal) is a quiet DEBUG skip, not a
+        WARNING — the merge-skew tripwire scans every in-flight task, so a
+        project with many pending (branchless) tasks must not burst one
+        WARNING per branchless task on every load-bearing landing. The (files,
+        error) contract is unchanged; only the log level drops."""
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.git_ops'):
+            files, err = await git_ops.get_branch_changed_files('does-not-exist-xyz')
+
+        assert files == [] and err is not None  # contract unchanged
+        recs = [r for r in caplog.records if 'get_branch_changed_files' in r.message]
+        assert recs, 'expected a get_branch_changed_files log record'
+        assert all(r.levelno < logging.WARNING for r in recs), (
+            'unresolved ref must not WARN; got '
+            f'{[(r.levelname, r.message) for r in recs]}'
+        )
+        assert any(r.levelno == logging.DEBUG for r in recs), (
+            'expected the unresolved-ref skip to be logged at DEBUG'
+        )
+
+
+class TestGitStderrIsUnresolvedRef:
+    """Amendment (reviewer efficiency-and-log-noise): _git_stderr_is_unresolved_ref
+    classifies git's "ref does not resolve" fatals (quiet DEBUG skip in
+    get_branch_changed_files) apart from genuine git faults (which still
+    WARN)."""
+
+    @pytest.mark.parametrize(
+        'stderr',
+        [
+            # three-dot diff with a `--` path separator, nonexistent ref
+            "fatal: bad revision 'main...task/999'",
+            # two-dot / no separator, nonexistent ref
+            "fatal: ambiguous argument 'main...nope': unknown revision or path "
+            "not in the working tree.",
+            # older git wording
+            "fatal: Not a valid object name main...task/7",
+            # case-insensitive
+            "FATAL: BAD REVISION 'x'",
+        ],
+    )
+    def test_unresolved_ref_markers_classified_true(self, stderr: str) -> None:
+        assert _git_stderr_is_unresolved_ref(stderr) is True
+
+    @pytest.mark.parametrize(
+        'stderr',
+        [
+            '',  # empty → not evidence of a mere absent ref → genuine failure
+            '   \n  ',  # whitespace-only → same
+            'fatal: unable to read tree (I/O error)',
+            "error: could not lock config file .git/config: Permission denied",
+            'fatal: index file corrupt',
+        ],
+    )
+    def test_genuine_failures_classified_false(self, stderr: str) -> None:
+        assert _git_stderr_is_unresolved_ref(stderr) is False
