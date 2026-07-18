@@ -717,7 +717,21 @@ def create_mcp_server(
             pass
 
         ok = graphiti_ok and mem0_ok
-        body = {'status': 'ok' if ok else 'degraded', 'graphiti': graphiti_ok, 'mem0': mem0_ok}
+        # Additive machine-readable in-flight full-cycle signal (task 2703 δ):
+        # a cycle-aware restart defers while this is non-empty. Purely
+        # informational — it does NOT affect ok/status_code (which stay
+        # graphiti AND mem0), so existing liveness consumers are unaffected.
+        recon_busy = (
+            reconciliation_harness.recon_busy_snapshot()
+            if reconciliation_harness is not None
+            else []
+        )
+        body = {
+            'status': 'ok' if ok else 'degraded',
+            'graphiti': graphiti_ok,
+            'mem0': mem0_ok,
+            'recon_busy': recon_busy,
+        }
         return JSONResponse(body, status_code=200 if ok else 503)
 
     # ------------------------------------------------------------------
