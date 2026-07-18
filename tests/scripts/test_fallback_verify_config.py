@@ -1,7 +1,7 @@
 """Config-integrity test for the FALLBACK full-suite verify command.
 
 Per task 2361: the monorepo FALLBACK full-suite verify path is driven by the
-fleet-chain ``test_command`` string in ``orchestrator/config.yaml``, returned
+fleet-chain ``test_command`` string in ``dark-factory-orchestrator.yaml``, returned
 verbatim by ``_build_fallback_config``'s ``__fallback__`` branch whenever
 touched files map to no single subproject (e.g. a change confined to the
 repo-root ``tests/scripts/`` suite, which is not a workspace member).
@@ -23,9 +23,9 @@ Two defects this guards against:
       defect. Raising the per-test timeout well above 60s (CLI ``--timeout``
       overrides the pyproject default) removes the trigger.
 
-This test loads the *committed* ``orchestrator/config.yaml`` directly (not
-through the verify.py fallback-builder code path) — mirrors the pattern in
-``test_orchestrator_restart_config_drift.py``.
+This test loads the *committed* ``dark-factory-orchestrator.yaml`` directly
+(not through the verify.py fallback-builder code path) — mirrors the pattern
+in ``test_orchestrator_restart_config_drift.py``.
 """
 
 import pathlib
@@ -34,7 +34,7 @@ import re
 import yaml
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
-DF_CONFIG_PATH = REPO_ROOT / "orchestrator" / "config.yaml"
+DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
 
 
 def _fleet_test_command() -> str:
@@ -62,7 +62,7 @@ def test_fallback_verify_runs_tests_scripts() -> None:
     cmd = _fleet_test_command()
     segments = _pytest_segments(cmd)
     assert any("tests/scripts" in seg for seg in segments), (
-        "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
+        "dark-factory-orchestrator.yaml test_command (FALLBACK full-suite verify) "
         "must have a pytest segment that runs the repo-root tests/scripts/ "
         f"suite (task 2361), not merely mention it elsewhere; got: {cmd!r}"
     )
@@ -84,7 +84,7 @@ def test_fanout_includes_sampler_member() -> None:
     """
     cmd = _fleet_test_command()
     assert re.search(r"cd \.\./sampler\b", cmd), (
-        "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
+        "dark-factory-orchestrator.yaml test_command (FALLBACK full-suite verify) "
         "must fan out to sampler/ via 'cd ../sampler' (task 2368) so "
         f"sampler's own tests run; got: {cmd!r}"
     )
@@ -96,7 +96,7 @@ def test_fanout_includes_sampler_member() -> None:
         r"cd \.\./sampler\s*&&\s*uv run pytest tests/\s*--timeout[=\s](\d+)", cmd,
     )
     assert match, (
-        "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
+        "dark-factory-orchestrator.yaml test_command (FALLBACK full-suite verify) "
         "must run a pytest segment for sampler's own tests/ suite immediately "
         f"after 'cd ../sampler' (task 2368); got: {cmd!r}"
     )
@@ -122,11 +122,11 @@ def test_fanout_includes_cockpit_presence_guarded() -> None:
     """
     cmd = _fleet_test_command()
     assert "cockpit" in cmd, (
-        "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
+        "dark-factory-orchestrator.yaml test_command (FALLBACK full-suite verify) "
         f"must reference cockpit (task 2368); got: {cmd!r}"
     )
     assert re.search(r"\[\s*-d\s+cockpit\s*\]", cmd), (
-        "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
+        "dark-factory-orchestrator.yaml test_command (FALLBACK full-suite verify) "
         "references cockpit but is not presence-guarded with a '[ -d cockpit ]' "
         "test (task 2368) — a hard 'cd ../cockpit' would abort the whole "
         f"&&-chain while cockpit is absent from main; got: {cmd!r}"
@@ -142,7 +142,7 @@ def test_fanout_includes_cockpit_presence_guarded() -> None:
         cmd,
     )
     assert match, (
-        "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
+        "dark-factory-orchestrator.yaml test_command (FALLBACK full-suite verify) "
         "must run a pytest segment for cockpit's own tests/ suite guarded by "
         f"'[ -d cockpit ]' (task 2368); got: {cmd!r}"
     )
@@ -166,13 +166,13 @@ def test_fallback_verify_raises_per_test_timeout() -> None:
     cmd = _fleet_test_command()
     segments = _pytest_segments(cmd)
     assert segments, (
-        "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
+        "dark-factory-orchestrator.yaml test_command (FALLBACK full-suite verify) "
         f"has no pytest segments to check (task 2361); got: {cmd!r}"
     )
     for seg in segments:
         match = re.search(r"--timeout[=\s](\d+)", seg)
         assert match, (
-            f"pytest segment {seg!r} in orchestrator/config.yaml test_command "
+            f"pytest segment {seg!r} in dark-factory-orchestrator.yaml test_command "
             "(FALLBACK full-suite verify) has no --timeout override (task "
             "2361) — the flaky 60s pyproject default is left in place, so "
             "xdist worker starvation under host oversubscription can still "
@@ -180,7 +180,7 @@ def test_fallback_verify_raises_per_test_timeout() -> None:
         )
         timeout_value = int(match.group(1))
         assert timeout_value > 60, (
-            f"pytest segment {seg!r} in orchestrator/config.yaml test_command "
+            f"pytest segment {seg!r} in dark-factory-orchestrator.yaml test_command "
             f"sets --timeout={timeout_value}, which does not raise the ceiling "
             "above the flaky 60s pyproject default (task 2361)"
         )

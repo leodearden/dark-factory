@@ -1,5 +1,5 @@
 """Fleet-staleness δ (task 2027): scenarios 9-10 — coordinator composition
-against the COMMITTED orchestrator/config.yaml, and burst-coalescing under
+against the COMMITTED dark-factory-orchestrator.yaml, and burst-coalescing under
 that same committed config.
 
 Context — what α/β/γ already cover vs. what δ adds
@@ -13,7 +13,7 @@ Context — what α/β/γ already cover vs. what δ adds
   watch_prefixes=``['orchestrator/src/']`` (a single-unit placeholder, not the
   fleet script the PRD ships).
 - ``tests/scripts/test_orchestrator_restart_config_drift.py`` (γ) guards the
-  COMMITTED ``orchestrator/config.yaml`` bytes and their pydantic round-trip,
+  COMMITTED ``dark-factory-orchestrator.yaml`` bytes and their pydantic round-trip,
   but never drives that config through the harness builder or a fire.
 
 δ closes the remaining gap: that ``_build_orchestrator_restart_coordinator``
@@ -47,11 +47,11 @@ from orchestrator.harness import Harness
 from orchestrator.service_restart import StaleServiceRestartCoordinator
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-DF_CONFIG_PATH = REPO_ROOT / 'orchestrator' / 'config.yaml'
+DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 
 
 def _load_committed_orchestrator_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
-    """Load the COMMITTED orchestrator/config.yaml through the real pydantic model.
+    """Load the COMMITTED dark-factory-orchestrator.yaml through the real pydantic model.
 
     Mirrors ``test_orchestrator_restart_config_drift.py``'s round-trip pattern
     (γ): this drives the ACTUAL parsed ``orchestrator_restart_*`` values, not
@@ -59,11 +59,12 @@ def _load_committed_orchestrator_config(monkeypatch: pytest.MonkeyPatch) -> Orch
     reverted-to-default value (``OrchestratorConfig`` uses ``extra='ignore'``)
     exactly as it would in the γ drift test.
 
-    Note: the orchestrator/tests autouse ``_isolate_orch_config`` fixture
-    deletes ``ORCH_CONFIG_PATH`` and pins ``ORCH_PROJECT_ROOT`` to ``tmp_path``
-    for every test in this package; setting ``ORCH_CONFIG_PATH`` here (via the
-    same function-scoped ``monkeypatch``) runs after that autouse setup and
-    wins, so this always loads the committed file. The resulting
+    Note: the orchestrator/tests autouse ``_isolate_orch_config`` fixture pins
+    ``ORCH_CONFIG_PATH`` to the canonical ``dark-factory-orchestrator.yaml`` and
+    ``ORCH_PROJECT_ROOT`` to ``tmp_path`` for every test in this package;
+    setting ``ORCH_CONFIG_PATH`` here (via the same function-scoped
+    ``monkeypatch``) runs after that autouse setup and wins, so this always
+    loads the committed file (here the same canonical path). The resulting
     ``project_root`` on the returned object is still pinned to ``tmp_path`` by
     that same autouse fixture, which is irrelevant here — only the
     ``orchestrator_restart_*`` fields are read off this object and grafted
@@ -174,7 +175,7 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         watched-path diff; once the merge pipeline is drained, the systemd-run
         argv targets the FLEET script (restart-all-orchestrators.sh) — not
         restart-orchestrator.sh — with the resulting on_active_secs. Note:
-        orchestrator/config.yaml does not set orchestrator_restart_on_active_secs,
+        dark-factory-orchestrator.yaml does not set orchestrator_restart_on_active_secs,
         so the asserted value (10) comes from config.py's pydantic default, not
         a value pinned in the committed YAML.
         """

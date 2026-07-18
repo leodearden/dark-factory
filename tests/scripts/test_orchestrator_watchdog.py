@@ -503,13 +503,13 @@ def test_watched_ports_match_configured_escalation_ports() -> None:
     unit_to_port = {unit: port for port, unit in wdog.WATCHED}
 
     # --- dark-factory orchestrator ---
-    df_config_path = REPO_ROOT / "orchestrator" / "config.yaml"
+    df_config_path = REPO_ROOT / "dark-factory-orchestrator.yaml"
     df_cfg = yaml.safe_load(df_config_path.read_text())
     df_port = _extract_escalation_port(df_cfg, df_config_path)
     assert unit_to_port["orchestrator-dark-factory.service"] == df_port, (
         f"WATCHED port for orchestrator-dark-factory.service "
         f"({unit_to_port['orchestrator-dark-factory.service']}) != "
-        f"orchestrator/config.yaml escalation.port ({df_port})"
+        f"dark-factory-orchestrator.yaml escalation.port ({df_port})"
     )
 
     # --- my-solar-challenge orchestrator (check if present) ---
@@ -1424,7 +1424,7 @@ def test_orch_restart_min_interval_secs_matches_config_default(
     # Anchor ORCH_CONFIG_PATH to this worktree's own committed config so the
     # comparison is deterministic regardless of the ambient shell env (which
     # may point ORCH_CONFIG_PATH at a different checkout).
-    monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "orchestrator" / "config.yaml"))
+    monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     wdog = _load_watchdog()
     assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == pytest.approx(
         OrchestratorConfig().orchestrator_restart_min_interval_secs

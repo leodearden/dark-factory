@@ -37,7 +37,7 @@ from orchestrator.service_restart import (
 # DF_CONFIG_PATH pattern (that file is outside this task's locked module
 # scope, so the guard lives here instead).
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DF_CONFIG_PATH = REPO_ROOT / "orchestrator" / "config.yaml"
+DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
 
 # ---------------------------------------------------------------------------
 # Fixture
