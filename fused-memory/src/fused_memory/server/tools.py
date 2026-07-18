@@ -94,6 +94,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Wall-clock bound on the thread-off ``FusedMemoryConfig()`` re-read inside the
+# reload_config tool (mirrors orchestrator.harness._RELOAD_LOAD_TIMEOUT_SECS): a
+# slow/hanging YAML parse must never block the event loop; on timeout the tool
+# returns a fail-closed report leaving the live config untouched.
+_RELOAD_LOAD_TIMEOUT_SECS = 30.0
+
 # ---------------------------------------------------------------------------
 # Scheduler-override constants
 #
@@ -4790,9 +4796,39 @@ def create_mcp_server(
         ``reloaded``: a successful reload can still leave restart-only edits
         unapplied.
         """
-        fresh = await asyncio.to_thread(FusedMemoryConfig)
+        config_path = os.environ.get('CONFIG_PATH')
+
+        def _load_failure_report(error: str) -> dict[str, Any]:
+            """Fail-closed report shape for a load/validation failure — the live
+            config is left completely untouched (no apply on this path)."""
+            logger.warning('config reload failed: %s', error)
+            return {
+                'reloaded': False,
+                'config_path': config_path,
+                'applied': {},
+                'restart_required': {},
+                'unchanged': 0,
+                'error': error,
+            }
+
+        # Fail-closed thread-off load: a slow/hanging YAML parse can't block the
+        # event loop (asyncio.wait_for + to_thread), and ANY load or validation
+        # failure returns a fail-closed report with memory_service.config left
+        # untouched rather than propagating — the loud-over-silent-degradation norm.
+        try:
+            fresh = await asyncio.wait_for(
+                asyncio.to_thread(FusedMemoryConfig),
+                timeout=_RELOAD_LOAD_TIMEOUT_SECS,
+            )
+        except TimeoutError:
+            return _load_failure_report(
+                f'config re-read timed out after {_RELOAD_LOAD_TIMEOUT_SECS}s'
+            )
+        except Exception as exc:
+            return _load_failure_report(str(exc))
+
         report = apply_reload(memory_service.config, fresh)
-        report['config_path'] = os.environ.get('CONFIG_PATH')
+        report['config_path'] = config_path
         if report['restart_required'] or not report['reloaded']:
             logger.warning(
                 'config reload: restart_required=%s error=%s',
