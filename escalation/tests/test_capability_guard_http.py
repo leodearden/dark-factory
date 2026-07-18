@@ -67,6 +67,27 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _drain_pending_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel and await every task still pending on *loop* before it closes.
+
+    Mirrors ``asyncio.run()``'s own internal shutdown sequence
+    (``_cancel_all_tasks``). Without this, a task still suspended
+    mid-``await`` when the loop is stopped -- the server's own root task
+    (``run_http_async``), or an internal one it spawns (e.g.
+    sse_starlette's ``_shutdown_watcher``) -- is only unwound later at
+    uncontrolled garbage-collection time, outside of any running task
+    context, which crashes anyio's shielded lifespan cleanup with an
+    unraisable ``TypeError``/``NoEventLoopError`` instead of shutting down
+    cleanly (task 2741).
+    """
+    pending = asyncio.all_tasks(loop)
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+
+
 @pytest.fixture(scope='module')
 def http_server(
     tmp_path_factory: pytest.TempPathFactory,
@@ -86,22 +107,51 @@ def http_server(
     ``fastmcp.Client(StreamableHttpTransport(f'{base_url}/mcp/', headers=...))``
     per scenario to send per-connection capability headers over real HTTP.
 
-    The serving thread is a daemon thread with no explicit shutdown: it is
-    killed automatically when the test process exits.
+    Teardown is explicit: the event loop is created here in the fixture
+    body (not inside the thread target), so it can be stopped thread-safely
+    at teardown — ``loop.call_soon_threadsafe(loop.stop)`` unblocks
+    ``run_until_complete`` in the serving thread, which is then joined
+    (bounded to 5s) before this fixture finishes tearing down. This
+    prevents the daemon thread's event loop from outliving the test and
+    acting as a background ``time.monotonic()`` caller for the rest of the
+    process (task 2741). Any task still pending at that point is cancelled
+    and drained (``_drain_pending_tasks``) inside the serving thread before
+    the loop closes, so cleanup runs inside a live task context instead of
+    at uncontrolled GC time. A ``stopping`` flag distinguishes that
+    deliberate, stop-induced ``RuntimeError`` from a genuine startup
+    failure, so ``serve_error`` below still reflects only real errors
+    (mirrors ``test_status_authority_gate.py``'s ``http_server`` fixture).
+    A teardown that fails to stop the thread within the 5s join bound is
+    asserted rather than swallowed, so a genuine hang surfaces loudly
+    instead of silently leaking a daemon thread past this fixture.
     """
     queue_dir = tmp_path_factory.mktemp('esc_capability_guard')
     queue = EscalationQueue(queue_dir)
     mcp = create_server(queue, startup_sweep=False)
     port = _free_port()
+    loop = asyncio.new_event_loop()
+    serve_error: BaseException | None = None
+    stopping = False
 
     def _serve_forever() -> None:
-        loop = asyncio.new_event_loop()
+        nonlocal serve_error
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(
-            mcp.run_http_async(
-                host='127.0.0.1', port=port, show_banner=False, log_level='error',
+        try:
+            loop.run_until_complete(
+                mcp.run_http_async(
+                    host='127.0.0.1', port=port, show_banner=False, log_level='error',
+                )
             )
-        )
+        except RuntimeError as exc:
+            # Expected when teardown stops the loop mid-serve ("Event loop
+            # stopped before Future completed") -- but only when *we*
+            # induced it; a RuntimeError raised before teardown began is a
+            # genuine startup failure and must be surfaced below.
+            if not stopping:
+                serve_error = exc
+        finally:
+            _drain_pending_tasks(loop)
+            loop.close()
 
     thread = threading.Thread(
         target=_serve_forever, name='escalation-capability-guard-http', daemon=True,
@@ -118,12 +168,23 @@ def http_server(
             break
         time.sleep(0.05)
     if not ready:
+        detail = f' (server thread raised: {serve_error!r})' if serve_error else ''
         raise RuntimeError(
             f'escalation HTTP test server did not become ready on '
-            f'127.0.0.1:{port} within 10s'
+            f'127.0.0.1:{port} within 10s{detail}'
         )
 
-    yield f'http://127.0.0.1:{port}', queue
+    try:
+        yield f'http://127.0.0.1:{port}', queue
+    finally:
+        stopping = True
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), (
+            'escalation-capability-guard-http serving thread did not stop '
+            'within the 5s teardown bound -- event loop stop is hung or the '
+            'server task is stuck in a non-cancellable await (task 2741)'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +321,50 @@ class TestHarnessSanity:
         assert result.data['id'] == esc.id, f'Expected id {esc.id!r}, got: {result.data}'
         assert result.data['level'] == 2
         assert result.data['status'] == 'pending'
+
+    def test_http_server_fixture_stops_serving_thread_on_teardown(
+        self, tmp_path_factory: pytest.TempPathFactory,
+    ) -> None:
+        """Regression test (task 2741): the module-scoped ``http_server``
+        fixture must explicitly stop its daemon serving thread + event loop
+        at teardown instead of relying on process exit to kill it.
+
+        Drives the fixture's own generator directly via ``__wrapped__``
+        (bypassing pytest's fixture caching) so this test's own serving
+        thread can be identified precisely — via a ``threading.enumerate()``
+        before/after diff — independently of the module-scoped fixture
+        instance already serving this class's other tests under the same
+        thread name.
+        """
+        before = set(threading.enumerate())
+        gen = http_server.__wrapped__(tmp_path_factory)  # pyright: ignore[reportAttributeAccessIssue]
+        try:
+            base_url, queue = next(gen)
+            new = [
+                t for t in set(threading.enumerate()) - before
+                if t.name == 'escalation-capability-guard-http'
+            ]
+            assert len(new) == 1, (
+                f'Expected exactly one new escalation-capability-guard-http '
+                f'serving thread; found {new}'
+            )
+            serving = new[0]
+            assert serving.is_alive(), 'Serving thread must be alive during yield'
+
+            with pytest.raises(StopIteration):
+                next(gen)
+
+            assert not serving.is_alive(), (
+                'http_server fixture leaked its daemon serving thread past '
+                'teardown (generator finalized via StopIteration) -- the '
+                'fixture must explicitly stop its event loop and join the '
+                'thread instead of relying on process exit to kill it.'
+            )
+        finally:
+            # Best-effort: ensure finalization ran even if an assertion
+            # above failed, so a RED failure does not leave extra servers
+            # running for the rest of the suite. No-op if already exhausted.
+            gen.close()
 
 
 # ---------------------------------------------------------------------------
