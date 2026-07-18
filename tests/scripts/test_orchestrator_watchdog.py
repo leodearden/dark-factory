@@ -4546,3 +4546,150 @@ def test_newest_fm_watched_commit_epoch_broad_error_returns_none_and_warns(
         f"a swallowed subprocess error must emit a WARNING via logger.warning: {logged}"
     )
 
+
+# ---------------------------------------------------------------------------
+# Part C: fm deploy-clock trio + --stamp-fm-deploy-clock CLI (step 7)
+#
+# fm's OWN deploy clock (data/fused-memory/last_redeploy_fused_memory.json):
+# _read_last_fm_deploy_epoch() (fail-open {ts,iso} reader), _stamp_fm_deploy_clock()
+# (atomic write, unlike restart-all-orchestrators.sh, restart-fused-memory.sh
+# does NOT self-stamp), _within_fm_deploy_min_interval() (the gate predicate),
+# and the `--stamp-fm-deploy-clock` CLI subcommand the detached restart chains
+# on its verified exit-0.
+# ---------------------------------------------------------------------------
+
+
+def test_stamp_and_read_fm_deploy_clock_roundtrip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_stamp_fm_deploy_clock writes a {ts,iso} body (creating the parent dir)
+    that _read_last_fm_deploy_epoch reads back as float(ts)."""
+    wdog = _load_watchdog()
+    # Parent dir does NOT exist yet — the stamp must create it (makedirs).
+    clock_file = tmp_path / "data" / "fused-memory" / "last_redeploy_fused_memory.json"
+    assert not clock_file.parent.exists()
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock_file))
+    monkeypatch.setattr(wdog.time, "time", lambda: 1783000000.5)
+
+    wdog._stamp_fm_deploy_clock()
+
+    assert clock_file.exists(), "stamp must create the clock file and its parent dir"
+    body = json.loads(clock_file.read_text())
+    assert "ts" in body and "iso" in body, f"clock body must carry ts+iso: {body}"
+    assert wdog._read_last_fm_deploy_epoch() == pytest.approx(1783000000.0)
+    assert isinstance(wdog._read_last_fm_deploy_epoch(), float)
+
+
+def test_read_last_fm_deploy_epoch_missing_file_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_read_last_fm_deploy_epoch returns None when the clock file is absent."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(tmp_path / "absent.json"))
+    assert wdog._read_last_fm_deploy_epoch() is None
+
+
+def test_read_last_fm_deploy_epoch_corrupt_json_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_read_last_fm_deploy_epoch returns None (fail-open) on a partial/corrupt file."""
+    wdog = _load_watchdog()
+    clock_file = tmp_path / "corrupt.json"
+    clock_file.write_text('{"ts": 178300')  # truncated / partially written
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock_file))
+    assert wdog._read_last_fm_deploy_epoch() is None
+
+
+def test_within_fm_deploy_min_interval_true_when_recent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fm_deploy_min_interval is True when now - last < FM_RESTART_MIN_INTERVAL_SECS."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 100.0)  # 100s ago
+
+    assert wdog._within_fm_deploy_min_interval() is True
+
+
+def test_within_fm_deploy_min_interval_false_when_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fm_deploy_min_interval is False once FM_RESTART_MIN_INTERVAL_SECS has elapsed."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 28800.0 + 1.0)
+
+    assert wdog._within_fm_deploy_min_interval() is False
+
+
+def test_within_fm_deploy_min_interval_false_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fm_deploy_min_interval is False when FM_RESTART_MIN_INTERVAL_SECS<=0.
+
+    0 disables the cap entirely — the clock file must not even be read.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(
+        wdog,
+        "_read_last_fm_deploy_epoch",
+        lambda: pytest.fail("must not be consulted when the cap is disabled"),
+    )
+
+    assert wdog._within_fm_deploy_min_interval() is False
+
+
+def test_within_fm_deploy_min_interval_false_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fm_deploy_min_interval is False when the clock is unreadable/absent.
+
+    A never-deployed fm (or an unreadable clock) must not block the backstop
+    indefinitely — fail toward running the backstop, not toward silence.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+
+    assert wdog._within_fm_deploy_min_interval() is False
+
+
+def test_cli_stamp_fm_deploy_clock_subcommand(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_cli(["--stamp-fm-deploy-clock"]) stamps exactly once, returns 0, and runs
+    NONE of the liveness/staleness/report paths.
+
+    This is the subcommand the detached _delegate_fm_restart chains after a
+    verified restart (`restart-fused-memory.sh && <self> --stamp-fm-deploy-clock`),
+    so it must do exactly one thing: stamp the fm clock.
+    """
+    wdog = _load_watchdog()
+    stamped: list[None] = []
+
+    monkeypatch.setattr(
+        wdog, "_stamp_fm_deploy_clock", lambda: stamped.append(None), raising=False
+    )
+    monkeypatch.setattr(wdog, "main", lambda: pytest.fail("main() must not run under --stamp"))
+    monkeypatch.setattr(
+        wdog,
+        "fused_memory_liveness_pass",
+        lambda: pytest.fail("fused_memory_liveness_pass() must not run under --stamp"),
+    )
+    monkeypatch.setattr(
+        wdog, "staleness_pass", lambda: pytest.fail("staleness_pass() must not run under --stamp")
+    )
+    monkeypatch.setattr(
+        wdog,
+        "fused_memory_staleness_pass",
+        lambda: pytest.fail("fused_memory_staleness_pass() must not run under --stamp"),
+        raising=False,
+    )
+    monkeypatch.setattr(wdog, "report", lambda: pytest.fail("report() must not run under --stamp"))
+
+    exit_code = wdog._cli(["--stamp-fm-deploy-clock"])
+
+    assert exit_code == 0
+    assert stamped == [None], f"Expected exactly one stamp call, got {stamped}"
+
