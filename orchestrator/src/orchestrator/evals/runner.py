@@ -28,6 +28,7 @@ from orchestrator.workflow import WorkflowOutcome, build_workflow
 
 from .configs import EVAL_CONFIGS, EvalConfig
 from .metrics import collect_metrics
+from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree
 
 logger = logging.getLogger(__name__)
@@ -151,27 +152,28 @@ def build_eval_orch_config(
         judge='claude',           # judge always on Claude (read-only quality call)
     )
 
-    return OrchestratorConfig(
-        models=models,
-        budgets=budgets,
-        effort=effort,
-        backends=backends,
-        max_turns=base.max_turns,
-        max_execute_iterations=task.get('max_execute_iterations', 20),
-        max_verify_attempts=base.max_verify_attempts,
-        max_review_cycles=task.get('max_review_cycles', 1),
-        judge_after_each_iteration=task.get('judge_after_each_iteration', True),
-        test_command=task.get('verify_commands', {}).get('test', base.test_command),
-        lint_command=task.get('verify_commands', {}).get('lint', base.lint_command),
-        type_check_command=task.get('verify_commands', {}).get('typecheck', base.type_check_command),
-        fused_memory=base.fused_memory,
-        sandbox=SandboxConfig(enabled=False),
-        escalation=base.escalation,
-        git=base.git,
-        usage_cap=base.usage_cap,
-        project_root=Path(task.get('project_root', str(base.project_root))),
-        env_overrides=config.env_overrides,
-    )
+    # D5 fix: derive from the live base via model_copy instead of the
+    # OrchestratorConfig(...) constructor — every field NOT named below is
+    # inherited from `base` (via apply_eval_profile's own model_copy), so a
+    # new production field can never silently regress to a pydantic default
+    # in eval. apply_eval_profile(base) applies the documented EVAL_PROFILE
+    # divergences (D3/D4); the update dict below layers this run's
+    # legitimate per-run overrides on top.
+    return apply_eval_profile(base).model_copy(update={
+        'models': models,
+        'budgets': budgets,
+        'effort': effort,
+        'backends': backends,
+        'max_execute_iterations': task.get('max_execute_iterations', 20),
+        'max_review_cycles': task.get('max_review_cycles', 1),
+        'judge_after_each_iteration': task.get('judge_after_each_iteration', True),
+        'test_command': task.get('verify_commands', {}).get('test', base.test_command),
+        'lint_command': task.get('verify_commands', {}).get('lint', base.lint_command),
+        'type_check_command': task.get('verify_commands', {}).get('typecheck', base.type_check_command),
+        'sandbox': SandboxConfig(enabled=False),
+        'project_root': Path(task.get('project_root', str(base.project_root))),
+        'env_overrides': config.env_overrides,
+    })
 
 
 async def run_eval(
