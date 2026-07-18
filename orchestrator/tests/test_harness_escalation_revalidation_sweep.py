@@ -39,7 +39,7 @@ import pytest
 from _orch_helpers import _init_harness_state_for_test
 from escalation.models import Escalation
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import RELOADABLE_FIELDS, OrchestratorConfig, diff_config
 from orchestrator.harness import EventType, Harness
 from orchestrator.verify import VerifyResult
 
@@ -63,6 +63,30 @@ def test_config_defaults_escalation_revalidation_allowlist() -> None:
     config = OrchestratorConfig()
     assert config.escalation_revalidation_allowlist == frozenset({'task_failure', 'stranded_blocked'})
     assert isinstance(config.escalation_revalidation_allowlist, frozenset)
+
+
+def test_escalation_revalidation_allowlist_is_green_tier_reloadable() -> None:
+    """escalation_revalidation_allowlist is green-tier hot-reloadable (task 2724):
+    its leaf is on RELOADABLE_FIELDS, and diff_config buckets a differing value
+    into applied_candidates (green-tier), NOT restart_required."""
+    # (a) the leaf is on the reload allowlist
+    assert 'escalation_revalidation_allowlist' in RELOADABLE_FIELDS
+
+    # (b) two configs differing ONLY in the allowlist -> applied_candidates
+    live = OrchestratorConfig()
+    fresh = live.model_copy(
+        update={
+            'escalation_revalidation_allowlist': frozenset(
+                {'task_failure', 'stranded_blocked', 'infra_issue'}
+            )
+        }
+    )
+    diff = diff_config(live, fresh)
+    assert 'escalation_revalidation_allowlist' in diff.applied_candidates, (
+        f"Expected the differing allowlist leaf in applied_candidates (green-tier); "
+        f"got applied={list(diff.applied_candidates)}, restart={list(diff.restart_required)}"
+    )
+    assert 'escalation_revalidation_allowlist' not in diff.restart_required
 
 
 # ---------------------------------------------------------------------------
