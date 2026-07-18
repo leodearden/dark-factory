@@ -35,6 +35,16 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # the same reconciliation submodel instance as memory_service.config),
     # never captured by value — a reload is observed on the next reaper pass.
     'reconciliation.stale_run_recovery_seconds',
+    # Read live per add_memory write by resolve_near_dup_guard_enabled
+    # (server/near_duplicate_guard.py) via memory_service.config.reconciliation.*
+    # — the resolver re-reads the shared config object on every call, so an
+    # in-place reload flips the guard without a restart (see
+    # TestBehaviorChangesWithoutRestart).
+    'reconciliation.procedural_knowledge_near_dup_guard_enabled',
+    # Read live per add_memory write by resolve_near_dup_threshold
+    # (server/near_duplicate_guard.py), same live-read path as the guard flag
+    # above — reload-safe for the same reason.
+    'reconciliation.procedural_knowledge_near_dup_threshold',
 })
 
 
