@@ -12,7 +12,7 @@ import re
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
@@ -55,7 +55,11 @@ from orchestrator.agents.roles import (
     SIMPLE_TASK,
     AgentRole,
 )
-from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
+from orchestrator.artifacts import (
+    PLAN_SCHEMA_VERSION,
+    ReviewAggregation,
+    TaskArtifacts,
+)
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
@@ -624,6 +628,34 @@ def classify_rebase_cohort(
     if distance_commits < threshold:
         return 'continuous'
     return 'post-unblock' if is_first_rebase else 'big-jump'
+
+
+# Context tolerance (lines) applied on each side of an amendment's new-side
+# changed ranges when partitioning post-amendment review suggestions.  Absorbs
+# reviewer line-number drift so genuine delta-adjacent findings are not routed
+# away, while fresh nits far from the amendment are still filtered (task 2750).
+_AMENDMENT_DELTA_CONTEXT_LINES = 3
+
+
+@dataclass(frozen=True)
+class AmendmentReviewContext:
+    """Consume-once loop state scoping ONE post-amendment review to its delta.
+
+    Captured in ``_execute_verify_review_loop`` immediately before an
+    amendment ``_amend`` call and consumed by the single ``_review`` that
+    immediately follows it, then reset to ``None`` so a later
+    blocking-replan/re-execute cycle (which produces a materially different
+    diff) is never scoped against this stale pre-amendment HEAD (task 2750).
+
+    Fields:
+        pre_amendment_head: the worktree HEAD SHA *before* the amendment, so
+            ``{pre_amendment_head}..HEAD`` is exactly the amendment delta.
+        amended_suggestions: the in-scope suggestions the amendment was asked
+            to address — threaded into the advisory reviewer prompt.
+    """
+
+    pre_amendment_head: str
+    amended_suggestions: list[dict]
 
 
 @dataclass(frozen=True)
@@ -6483,6 +6515,66 @@ class TaskWorkflow:
 
             if not debug_result.success:
                 logger.warning(f'Task {self.task_id}: debugger failed')
+
+    async def _apply_amendment_delta_scope(
+        self, reviews: ReviewAggregation, ctx: AmendmentReviewContext,
+    ) -> ReviewAggregation:
+        """Scope a post-amendment review verdict to the amendment delta (task 2750).
+
+        Deterministically partitions ``reviews.suggestions`` by whether each
+        finding's ``location`` (``file:line``) falls within the amendment's
+        NEW-side changed line ranges (``{pre_amendment_head}..HEAD``).  In-delta
+        suggestions stay in the returned verdict; out-of-delta suggestions are
+        routed to the curator via the existing
+        :meth:`_route_review_suggestions_to_curator` path so they neither
+        re-arm the amendment loop nor bloat the DONE-path verdict.
+
+        Blocking findings are NEVER filtered — ``blocking_issues`` /
+        ``has_blocking_issues`` pass through unchanged (the safety valve).
+
+        Fail-open: if the amendment delta is empty or uncomputable, all
+        suggestions are kept in the verdict and a WARNING is logged — a git
+        error or a pathological no-op amendment must never silently discard
+        real reviewer findings (loud-over-silent).
+        """
+        assert self.worktree is not None
+        from orchestrator.review_suggestions.amendment_scope import (
+            partition_suggestions_by_delta,
+        )
+
+        delta_ranges = await self.git_ops.get_new_side_changed_line_ranges(
+            self.worktree, ctx.pre_amendment_head,
+        )
+        if not delta_ranges:
+            logger.warning(
+                'Task %s: post-amendment delta empty/uncomputable '
+                '(pre_amendment_head=%s); keeping all %d suggestion(s) in the '
+                'verdict (fail-open)',
+                self.task_id, ctx.pre_amendment_head, len(reviews.suggestions),
+            )
+            return reviews
+
+        in_delta, out_of_delta = partition_suggestions_by_delta(
+            reviews.suggestions,
+            delta_ranges,
+            context_lines=_AMENDMENT_DELTA_CONTEXT_LINES,
+        )
+        if out_of_delta:
+            await self._route_review_suggestions_to_curator(
+                ReviewAggregation(
+                    has_blocking_issues=False,
+                    blocking_issues=[],
+                    suggestions=out_of_delta,
+                    reviews={},
+                    reviewer_errors=[],
+                )
+            )
+        logger.info(
+            'Task %s: post-amendment review scoped to amendment delta — '
+            '%d in-delta suggestion(s) kept, %d out-of-delta routed to curator',
+            self.task_id, len(in_delta), len(out_of_delta),
+        )
+        return replace(reviews, suggestions=in_delta)
 
     async def _review(self):
         """Run all 5 reviewers with stagger, retry errors."""
