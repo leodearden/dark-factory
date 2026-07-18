@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,8 @@ from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
+from fused_memory.config.reload import apply_reload
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
@@ -4765,5 +4768,37 @@ def create_mcp_server(
         finally:
             if db is not None:
                 await db.close()
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def reload_config() -> dict[str, Any]:
+        """Hot-apply the green-tier allowlisted subset of THIS server's own config.
+
+        Takes NO arguments: it re-reads the process's own ``CONFIG_PATH`` (set
+        once at startup) so a reload can never retarget the server at a different
+        project's config — the same cross-project safeguard the
+        escalation/orchestrator ``reload_config`` tools enforce. Applies only the
+        leaves in ``fused_memory.config.reload.RELOADABLE_FIELDS`` (genuinely
+        reload-safe knobs, read live from the shared config object), mutating them
+        in place on ``memory_service.config`` so held references observe the change
+        with no restart. Every other differing leaf is reported
+        ``restart_required`` and left untouched.
+
+        Returns the machine-checked disposition report
+        ``{reloaded, config_path, applied, restart_required, unchanged, error}``.
+        Callers MUST inspect ``applied`` / ``restart_required`` — NOT just
+        ``reloaded``: a successful reload can still leave restart-only edits
+        unapplied.
+        """
+        fresh = await asyncio.to_thread(FusedMemoryConfig)
+        report = apply_reload(memory_service.config, fresh)
+        report['config_path'] = os.environ.get('CONFIG_PATH')
+        if report['restart_required'] or not report['reloaded']:
+            logger.warning(
+                'config reload: restart_required=%s error=%s',
+                sorted(report['restart_required']),
+                report['error'],
+            )
+        return report
 
     return mcp
