@@ -8081,7 +8081,7 @@ task, include it with an empty "files" list rather than omitting it.
             # rather than promote a duplicate manual-triage L1.
             if _is_done_step_commit_orphan(esc):
                 task = await self.scheduler.get_task(esc.task_id)
-                if task is not None and task.get('status') == 'done':
+                if _is_terminal_merged(task):
                     self._escalation_queue.resolve(
                         esc.id,
                         (
