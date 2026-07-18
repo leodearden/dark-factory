@@ -125,6 +125,25 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 _LOCK_TOKEN_RE = re.compile(r'\b(?:flock|lock|slot|semaphore)\b', re.IGNORECASE)
 _TIMEOUT_TOKEN_RE = re.compile(r'\btimed?\s*out\b', re.IGNORECASE)
 
+# task 2748: deterministic-diagnostic veto for the SEMAPHORE_TIMEOUT arm. A
+# genuine flock/semaphore slot-acquisition timeout is emitted by the
+# concurrency-limiter WRAPPER (reify lib_slot_acquire.sh / `flock -w`) BEFORE
+# the wrapped tool ever runs, so its output CANNOT also contain a compiler/
+# lint diagnostic. `_LOCK_TOKEN_RE`/`_TIMEOUT_TOKEN_RE` are independent
+# whole-output searches, so a deterministic `cargo clippy`/rustc diagnostic
+# that quotes lock/slot/semaphore source and mentions "timed out" in a note
+# satisfies both and is misclassified SEMAPHORE_TIMEOUT. The clippy
+# lint-namespace token `clippy::` is present in every denied-lint note (e.g.
+# `-D clippy::await-holding-lock`) and a rustc error code (`_COMPILE_ERROR_
+# RUSTC_CODE_RE`, reused from the shared primitives above) is present in
+# every rustc compile-error diagnostic — either PROVES the wrapped command
+# ran, so both are used as the veto marker set rather than inventing a new
+# one.
+# Plain substring check (not a compiled regex — 'clippy::' has no
+# metacharacters to match and this mirrors the _ENOSPC_MARKERS substring
+# style used a few lines below).
+_CLIPPY_LINT_MARKER = 'clippy::'
+
 
 def _classify_environmental(output: str) -> FailureCategory | None:
     """Tool-blind host-infrastructure guard: DISK_FULL / SEMAPHORE_TIMEOUT.
@@ -135,13 +154,46 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     per-tool table is the right home for them. Returns ``None`` (the caller
     proceeds to per-tool dispatch) when neither condition is grounded in
     *output*.
+
+    SEMAPHORE_TIMEOUT deterministic-diagnostic veto (task 2748): a genuine
+    slot/lock-acquisition timeout is raised by the concurrency-limiter
+    wrapper BEFORE the wrapped tool runs, so its output can never carry a
+    Rust compiler/clippy diagnostic. When *output* carries the clippy
+    lint-namespace token (``clippy::``) or a rustc error code
+    (``error[E\\d+]:``), the lock/slot/semaphore + timeout tokens are
+    incidental to a deterministic lint/compile failure, so this returns
+    ``None`` instead of ``SEMAPHORE_TIMEOUT`` and defers to per-tool
+    dispatch. Applies ONLY to the SEMAPHORE_TIMEOUT arm — DISK_FULL's ENOSPC
+    markers are specific enough (and checked first) that a compile/lint
+    failure caused by a genuinely full disk must stay DISK_FULL.
+
+    Known gap (out of scope for task 2748): the veto marker set is
+    Rust-specific (clippy/rustc diagnostics only), because this guard runs
+    tool-blind, BEFORE per-tool dispatch, for every ``ToolKind``. A
+    deterministic non-Rust failure whose output incidentally quotes a
+    lock/slot/semaphore token together with a "timed out" token — e.g. a
+    pytest failure in a test named ``test_lock_timed_out``, or a similarly
+    incidental npm/tree-sitter message — still satisfies the loose
+    ``_LOCK_TOKEN_RE`` + ``_TIMEOUT_TOKEN_RE`` co-occurrence with no veto
+    marker to suppress it, and is still misclassified ``SEMAPHORE_TIMEOUT``.
+    That looseness predates task 2748 and is only narrowed for Rust here; a
+    future task extending the marker set per-tool, or tightening
+    ``_LOCK_TOKEN_RE``/``_TIMEOUT_TOKEN_RE`` to require wrapper-emitted
+    context (e.g. an anchored ``lib_slot_acquire.sh``/``flock -w`` marker so
+    a genuine slot timeout is matched positively instead of by loose
+    co-occurrence), would close it.
     """
     lower = output.lower()
     if any(marker in lower for marker in _ENOSPC_MARKERS):
         return FailureCategory.DISK_FULL
     if _LINKER_CONTEXT_RE.search(output) and _LINKER_SIGNAL_RE.search(output):
         return FailureCategory.DISK_FULL
-    if _LOCK_TOKEN_RE.search(output) and _TIMEOUT_TOKEN_RE.search(output):
+    if (
+        _LOCK_TOKEN_RE.search(output)
+        and _TIMEOUT_TOKEN_RE.search(output)
+        and _CLIPPY_LINT_MARKER not in output
+        and not _COMPILE_ERROR_RUSTC_CODE_RE.search(output)
+    ):
         return FailureCategory.SEMAPHORE_TIMEOUT
     return None
 
