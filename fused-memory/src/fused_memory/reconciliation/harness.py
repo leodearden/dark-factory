@@ -1382,6 +1382,74 @@ class ReconciliationHarness:
                 },
             )
 
+    async def _resume_interrupted_runs(self) -> None:
+        """One-shot startup pass: adopt and ``--resume`` runs a dead predecessor
+        left ``interrupted`` mid-stage (task σ / 2717).
+
+        Runs beside :meth:`_recover_predecessor_runs` and BEFORE the age-gated
+        :meth:`_recover_stale_runs` reaper. For each ``interrupted`` run owned by
+        an own-dead-predecessor (``instance_id`` not None and not this instance,
+        with the project lock still corroborating that owner — the same
+        ownership test the predecessor pass uses), adopt the project lock, source
+        the run's still-drained events read-only via
+        :meth:`EventBuffer.get_drained_events` (restoring them would
+        double-process on resume), and drive a resume-aware
+        :meth:`run_full_cycle` that skips already-completed stages and
+        ``--resume``s the ``stage_cursor`` stage. The adopted lock is released
+        after the resumed cycle — this pass cannot heartbeat it, so holding it
+        would wedge the normal project loop.
+
+        Guard rails (freshness / attempt-cap / one-resume-per-stage /
+        transcript-exists) and the ``_recover_one_run`` failed+restore fallback
+        are layered on in a later step; this is the happy path.
+        """
+        my_iid = self.buffer.instance_id
+        for run in await self.journal.get_interrupted_runs():
+            if run.instance_id is None or run.instance_id == my_iid:
+                continue
+            lock_holder, _lock_age = await self.buffer.get_lock_status(run.project_id)
+            if lock_holder != run.instance_id:
+                continue
+
+            # Adopt the project lock: release the dead predecessor's corroborated
+            # lock, then re-acquire as this instance so the resumed cycle owns the
+            # project and the reaper cannot clobber it mid-resume.
+            await self.buffer.mark_run_complete(
+                run.project_id, instance_id=run.instance_id,
+            )
+            acquired = await self.buffer.mark_run_active(run.project_id)
+            if not acquired:
+                # Lost the adopt race (not expected at single-instance startup);
+                # leave the run for the age-based backstop rather than resume
+                # without holding the lock.
+                logger.warning(
+                    'reconciliation.resume_adopt_lock_failed run_id=%s project=%s',
+                    run.id, run.project_id,
+                )
+                continue
+
+            try:
+                events = await self.buffer.get_drained_events(run.project_id, run.id)
+                await self.run_full_cycle(
+                    run.project_id, 'resume_after_restart',
+                    resume_run=run, events=events,
+                )
+                logger.info(
+                    'reconciliation.interrupted_run_resumed',
+                    extra={
+                        'run_id': run.id,
+                        'project_id': run.project_id,
+                        'instance_id': run.instance_id,
+                        'stage_cursor': run.stage_cursor,
+                    },
+                )
+            finally:
+                # Release the adopted lock so the normal project loop can
+                # re-acquire — a one-shot startup pass cannot heartbeat it.
+                await self.buffer.mark_run_complete(
+                    run.project_id, instance_id=self.buffer.instance_id,
+                )
+
     # ── Dead-owner suppression storm counter ─────────────────────────
 
     def _record_dead_owner_suppression(
@@ -1750,6 +1818,15 @@ class ReconciliationHarness:
             await self._recover_predecessor_runs()
         except Exception as e:
             logger.warning(f'_recover_predecessor_runs at startup failed: {e}')
+
+        # One-shot: adopt and --resume any interrupted runs a dead predecessor
+        # left mid-stage (task σ / 2717), before the age-gated _recover_stale_runs
+        # reaper gets its first tick. Guarded like the predecessor pass above so a
+        # resume hiccup can't crash harness startup.
+        try:
+            await self._resume_interrupted_runs()
+        except Exception as e:
+            logger.warning(f'_resume_interrupted_runs at startup failed: {e}')
 
         loop_count = 0
         try:
