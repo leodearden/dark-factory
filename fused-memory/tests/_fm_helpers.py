@@ -700,3 +700,56 @@ def _make_rate_limit_error(
     response = httpx.Response(429, request=request)
     body = {'message': message, 'type': 'insufficient_quota', 'param': None, 'code': code}
     return RateLimitError(message, response=response, body=body)
+
+
+# ---------------------------------------------------------------------------
+# Leaked TaskInterceptor curator-worker reaper (task 2737)
+# ---------------------------------------------------------------------------
+#
+# Mirrors orchestrator/tests/_orch_helpers.py::reap_leaked_aiosqlite_connections
+# (task 2413) and orchestrator/tests/conftest.py::_reap_leaked_merge_workers
+# (task 1907): a test that starts a TaskInterceptor per-project curator
+# worker (via submit_task or _start_worker_if_needed) and then raises before
+# its own inline cleanup runs — or relies on interceptor_with_store's
+# teardown, which only cancels workers it can enumerate — orphans a live
+# worker task onto that test's function-scoped event loop. The worker blocks
+# forever on an empty asyncio.Queue.get(), so nothing else ever cancels it.
+# Under asyncio_mode="strict" + `-n auto --dist loadgroup`
+# (fused-memory/pyproject.toml), pytest-asyncio then tears down the per-test
+# loop with the worker still pending; the resulting task-destroyed /
+# loop-closed noise (and any in-flight aiosqlite work it was mid-drain on)
+# surfaces as an order/xdist-dependent flake attributed to a later, innocent
+# test.
+# ---------------------------------------------------------------------------
+
+
+async def reap_leaked_ticket_workers() -> int:
+    """Cancel + drain any orphaned TaskInterceptor._curator_worker task.
+
+    Unlike MergeWorker.run (task 1907), _curator_worker has no
+    subprocess/child-loop machinery to gracefully unwind — it just blocks on
+    queue.get() — so a bare ``task.cancel()`` + bounded await is sufficient,
+    and deliberately avoids calling ``TaskInterceptor.close()`` (which would
+    also close the still-fixture-owned ticket store out from under its own
+    teardown).
+
+    Best-effort and bounded: never raises, and is a cheap no-op for the
+    (vast majority of) tests that leak no worker.
+
+    Returns:
+        The number of orphaned worker tasks cancelled and drained.
+    """
+    reaped = 0
+    for task in list(asyncio.all_tasks()):
+        if task.done():
+            continue
+        coro = task.get_coro()
+        if not getattr(coro, '__qualname__', '').endswith('TaskInterceptor._curator_worker'):
+            continue
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), timeout=10.0,
+            )
+        reaped += 1
+    return reaped
