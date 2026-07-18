@@ -14,7 +14,11 @@ from pathlib import Path
 import pytest
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.evals.compare import _read_reviewer_verdict_envelopes
+from orchestrator.evals.compare import (
+    _format_review_artifacts,
+    _read_review_artifacts,
+    _read_reviewer_verdict_envelopes,
+)
 
 
 @pytest.fixture
@@ -103,5 +107,83 @@ class TestReadReviewerVerdictEnvelopes:
         artifacts = TaskArtifacts(worktree)
 
         result = _read_reviewer_verdict_envelopes(artifacts)
+
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Cycle B: integrated _read_review_artifacts across both layouts
+# ---------------------------------------------------------------------------
+
+class TestReadReviewArtifacts:
+    def test_envelope_present_only(self, worktree: Path):
+        ta = TaskArtifacts(worktree)
+        ta.init('task-1', 'Test Task', 'desc')
+        payload = {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'ISSUES_FOUND',
+            'issues': [],
+            'summary': 'ENV',
+        }
+        ta.write_verdict('reviewer_comprehensive', _envelope('reviewer_comprehensive', payload))
+
+        result = _read_review_artifacts(str(worktree))
+
+        assert result == {'reviewer_comprehensive': payload}
+        formatted = _format_review_artifacts(result)
+        assert 'ENV' in formatted
+        assert '(no review data available)' not in formatted
+
+    def test_legacy_reviews_only(self, worktree: Path):
+        ta = TaskArtifacts(worktree)
+        ta.init('task-1', 'Test Task', 'desc')
+        legacy = {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'LEGACY',
+        }
+        ta.write_review('reviewer_comprehensive', legacy)
+
+        result = _read_review_artifacts(str(worktree))
+
+        assert result == {'reviewer_comprehensive': legacy}
+        formatted = _format_review_artifacts(result)
+        assert 'LEGACY' in formatted
+        assert '(no review data available)' not in formatted
+
+    def test_envelope_preferred_over_legacy(self, worktree: Path):
+        ta = TaskArtifacts(worktree)
+        ta.init('task-1', 'Test Task', 'desc')
+        env_payload = {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'ISSUES_FOUND',
+            'issues': [],
+            'summary': 'ENV',
+        }
+        legacy_payload = {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'LEGACY',
+        }
+        ta.write_verdict('reviewer_comprehensive', _envelope('reviewer_comprehensive', env_payload))
+        ta.write_review('reviewer_comprehensive', legacy_payload)
+
+        result = _read_review_artifacts(str(worktree))
+
+        assert result == {'reviewer_comprehensive': env_payload}
+
+    def test_neither_present_returns_empty(self, worktree: Path):
+        # worktree exists but .task/ was never initialized.
+        result = _read_review_artifacts(str(worktree))
+
+        assert result == {}
+        assert _format_review_artifacts(result) == '(no review data available)'
+
+    def test_neither_present_missing_worktree(self, tmp_path: Path):
+        missing = tmp_path / 'does-not-exist'
+
+        result = _read_review_artifacts(str(missing))
 
         assert result == {}
