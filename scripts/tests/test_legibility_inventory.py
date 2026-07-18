@@ -16,6 +16,7 @@ mechanics).
 """
 from __future__ import annotations
 
+import gzip
 import json
 from datetime import date as dt_date
 from pathlib import Path
@@ -51,6 +52,21 @@ def _write_session(dir_path: Path, session_id: str, cwd: str, timestamp: str = '
         {'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'message': {'content': 'hello'}},
     ]
     session_path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
+    return session_path
+
+
+def _write_session_gz(
+    dir_path: Path, session_id: str, cwd: str, timestamp: str = '2026-07-13T10:00:00.000Z'
+):
+    """Gzip sibling of :func:`_write_session`: write a ``<sid>.jsonl.gz``
+    fixture in the archived-fleet-transcript format (shared.transcript_archive)."""
+    dir_path.mkdir(parents=True, exist_ok=True)
+    session_path = dir_path / f'{session_id}.jsonl.gz'
+    lines = [
+        {'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'message': {'content': 'hello'}},
+    ]
+    with gzip.open(session_path, 'wt', encoding='utf-8') as f:
+        f.write('\n'.join(json.dumps(line) for line in lines) + '\n')
     return session_path
 
 
@@ -128,6 +144,45 @@ class TestSessionCwd:
 
     def test_returns_none_for_unreadable_path(self, tmp_path):
         assert mod.session_cwd(tmp_path / 'does-not-exist.jsonl') is None
+
+
+class TestGzAwareReader:
+    """The single low-level reader (``_iter_json_lines``, via
+    ``_session_cwd_and_date`` / ``session_cwd``) transparently reads
+    gzip-compressed ``.jsonl.gz`` transcripts — the archived fleet-transcript
+    format (shared.transcript_archive) — keeping byte-parity for plain
+    ``.jsonl`` and degrading a corrupt ``.gz`` to ``(None, None)`` rather than
+    raising (gzip.BadGzipFile subclasses OSError, so it flows through the
+    existing ``except OSError`` degrade path)."""
+
+    def test_session_cwd_reads_gz(self, tmp_path):
+        gz_path = _write_session_gz(tmp_path, 'sess', MAIN_CWD)
+        assert mod.session_cwd(gz_path) == MAIN_CWD
+
+    def test_session_cwd_and_date_reads_gz(self, tmp_path):
+        gz_path = _write_session_gz(
+            tmp_path, 'sess', WORKTREE_CWD, timestamp='2026-07-13T10:00:00.000Z'
+        )
+        cwd, session_date = mod._session_cwd_and_date(gz_path)
+        assert cwd == WORKTREE_CWD
+        assert session_date == dt_date(2026, 7, 13)
+
+    def test_plain_jsonl_parity(self, tmp_path):
+        # A plain .jsonl still reads exactly as before (no gz branch taken).
+        plain_path = _write_session(
+            tmp_path, 'sess', MAIN_CWD, timestamp='2026-07-13T10:00:00.000Z'
+        )
+        cwd, session_date = mod._session_cwd_and_date(plain_path)
+        assert cwd == MAIN_CWD
+        assert session_date == dt_date(2026, 7, 13)
+
+    def test_corrupt_gz_degrades_to_none(self, tmp_path):
+        # Raw non-gzip bytes under a .jsonl.gz name: gzip raises BadGzipFile
+        # (an OSError subclass) on first read, which _session_cwd_and_date's
+        # `except OSError` maps to (None, None) — no raise.
+        corrupt = tmp_path / 'corrupt.jsonl.gz'
+        corrupt.write_bytes(b'this is not gzip\n{"cwd": "/x", "timestamp": "2026-07-13T10:00:00Z"}\n')
+        assert mod.session_cwd(corrupt) is None
 
 
 class TestEnumerateSessions:
