@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,7 @@ from fused_memory.reconciliation.sandbox_guard import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from shared.config_dir import TaskConfigDir
     from shared.usage_gate import UsageGate
 
     from fused_memory.config.schema import ReconciliationConfig
@@ -262,6 +264,32 @@ class StageResult:
     error: str = ''
 
 
+def recon_config_base_dir(data_dir: Path) -> Path:
+    """Base dir under which per-run recon CLI config dirs live (task 2744).
+
+    Single source of truth for the config-dir root so the creator
+    (``BaseStage.run``) and the GC (``harness``) derive the same path from
+    ``(journal.data_dir, run_id)`` without passing a ``TaskConfigDir`` across
+    scopes.
+    """
+    return data_dir / 'recon-config'
+
+
+def gc_run_config_dir(data_dir: Path, run_id: str) -> None:
+    """Remove a run's per-run recon CLI config dir, if present (task 2744).
+
+    ``TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(data_dir)).path``
+    is ``recon_config_base_dir(data_dir) / f'claude-config-{run_id}'`` by
+    construction (config_dir.py's deterministic naming); this rmtrees exactly
+    that path. ``ignore_errors=True`` makes it a silent no-op when the dir was
+    never created (e.g. a run that short-circuited before any stage launch).
+    """
+    shutil.rmtree(
+        recon_config_base_dir(data_dir) / f'claude-config-{run_id}',
+        ignore_errors=True,
+    )
+
+
 async def run_stage_via_cli(
     system_prompt: str,
     payload: str,
@@ -272,11 +300,20 @@ async def run_stage_via_cli(
     model: str | None = None,
     cwd: Path | None = None,
     output_schema: dict | None = None,
+    session_id: str | None = None,
+    config_dir: TaskConfigDir | None = None,
 ) -> StageResult:
     """Invoke a reconciliation stage via Claude CLI with MCP tools.
 
     The stage agent has access to fused-memory (and optionally escalation)
     MCP tools, with per-stage restrictions via ``--disallowedTools``.
+
+    ``session_id`` / ``config_dir`` (task 2744) are forwarded straight to
+    ``invoke_with_cap_retry``, which writes ``CLAUDE_CONFIG_DIR`` + ``--session-id``
+    and activates ``_run_subprocess``'s transcript-liveness watchdog (it only
+    engages when BOTH are set). They default to None so existing cutover/sandbox
+    call sites keep today's behavior. BaseStage.run mints/persists the session
+    before calling here (mint-before-spawn); this runner stays generic.
     """
     effective_model = model or config.agent_llm_model
     # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT switched to
@@ -329,6 +366,8 @@ async def run_stage_via_cli(
             timeout_seconds=float(config.stage_timeout_seconds),
             cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             sandbox_wrap=sandbox_wrap,
+            session_id=session_id,
+            config_dir=config_dir,
         )
     except AllAccountsCappedException:
         logger.warning(

@@ -48,7 +48,10 @@ CREATE TABLE IF NOT EXISTS runs (
     stage_reports TEXT DEFAULT '{}',
     status TEXT DEFAULT 'running',
     triggered_by TEXT,
-    instance_id TEXT
+    instance_id TEXT,
+    session_id TEXT,
+    stage_cursor TEXT,
+    attempt INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
@@ -218,6 +221,26 @@ class ReconciliationJournal:
         except Exception:
             await self._safe_rollback()  # Column already exists
 
+        # Safe migration: add session-capture columns to existing DBs (task 2744).
+        # session_id / stage_cursor snapshot the in-flight stage subprocess's CLI
+        # session (cleared between stages); attempt is a monotonic count of
+        # stage-subprocess launches, the substrate task σ's resume gate consumes.
+        try:
+            await self._db.execute('ALTER TABLE runs ADD COLUMN session_id TEXT')
+            await self._db.commit()
+        except Exception:
+            await self._safe_rollback()  # Column already exists
+        try:
+            await self._db.execute('ALTER TABLE runs ADD COLUMN stage_cursor TEXT')
+            await self._db.commit()
+        except Exception:
+            await self._safe_rollback()  # Column already exists
+        try:
+            await self._db.execute('ALTER TABLE runs ADD COLUMN attempt INTEGER DEFAULT 0')
+            await self._db.commit()
+        except Exception:
+            await self._safe_rollback()  # Column already exists
+
         logger.info(f'Reconciliation journal initialized at {db_path}')
 
     async def _safe_rollback(self) -> None:
@@ -352,6 +375,49 @@ class ReconciliationJournal:
                 (json.dumps(serialized), run_id),
             )
 
+    async def record_run_session(
+        self, run_id: str, *, session_id: str, stage_cursor: str
+    ) -> None:
+        """Snapshot the in-flight stage's minted CLI session onto the run row.
+
+        Called by ``BaseStage.run`` right before it launches a stage subprocess
+        (mint-before-spawn). ``attempt`` auto-increments atomically in SQL so the
+        run row carries a monotonic count of stage invocations with no
+        read-modify-write race.
+
+        Best-effort snapshot — may be STALE after an internal cap retry: the
+        persisted ``session_id`` is the value ``BaseStage.run`` *minted* before
+        the launch, but ``invoke_with_cap_retry`` regenerates its own session id
+        internally on a cap retry (shared/src/shared/cli_invoke.py), so after
+        such a retry the CLI's live session differs from the value stored here.
+        Note too that ``attempt`` counts ``BaseStage.run`` stage invocations, not
+        the underlying subprocess spawns — a cap retry spawns again without
+        bumping ``attempt``. Task σ's resume gate therefore must treat this
+        snapshot as best-effort: validate that the transcript for the persisted
+        session actually exists before trusting it to ``--resume`` rather than
+        resuming the persisted id blindly.
+        """
+        async with self._txn() as db:
+            await db.execute(
+                """UPDATE runs
+                   SET session_id = ?, stage_cursor = ?, attempt = COALESCE(attempt, 0) + 1
+                   WHERE id = ?""",
+                (session_id, stage_cursor, run_id),
+            )
+
+    async def clear_run_session(self, run_id: str) -> None:
+        """Clear the in-flight session snapshot after a stage subprocess exits.
+
+        Nulls ``session_id``/``stage_cursor`` (so the row shows a session only
+        while a stage is actually in flight) but retains ``attempt`` as durable
+        launch history.
+        """
+        async with self._txn() as db:
+            await db.execute(
+                'UPDATE runs SET session_id = NULL, stage_cursor = NULL WHERE id = ?',
+                (run_id,),
+            )
+
     async def get_run(self, run_id: str) -> ReconciliationRun | None:
         db = self._require_db()
         async with db.execute('SELECT * FROM runs WHERE id = ?', (run_id,)) as cursor:
@@ -377,6 +443,9 @@ class ReconciliationJournal:
             status=row['status'],
             triggered_by=row['triggered_by'],
             instance_id=row['instance_id'],
+            session_id=row['session_id'],
+            stage_cursor=row['stage_cursor'],
+            attempt=row['attempt'] or 0,
         )
 
     async def get_recent_runs(
@@ -410,6 +479,9 @@ class ReconciliationJournal:
                     status=row['status'],
                     triggered_by=row['triggered_by'],
                     instance_id=row['instance_id'],
+                    session_id=row['session_id'],
+                    stage_cursor=row['stage_cursor'],
+                    attempt=row['attempt'] or 0,
                 )
             )
         return runs
@@ -855,4 +927,7 @@ def _row_to_run(row: aiosqlite.Row) -> ReconciliationRun:
         status=row['status'],
         triggered_by=row['triggered_by'],
         instance_id=row['instance_id'],
+        session_id=row['session_id'],
+        stage_cursor=row['stage_cursor'],
+        attempt=row['attempt'] or 0,
     )

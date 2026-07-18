@@ -184,3 +184,125 @@ class TestOutputSchemaNonePassthrough:
         assert report == {}, (
             f'_extract_report must return {{}} when output is empty, got {report!r}'
         )
+
+
+def _make_capture_invoke(captured_kwargs: dict):
+    """Build an async stand-in for invoke_with_cap_retry that records its kwargs."""
+
+    async def _capture_invoke(**kwargs):
+        captured_kwargs.update(kwargs)
+        result = MagicMock()
+        result.structured_output = None
+        result.output = None
+        result.turns = 0
+        result.cost_usd = 0.0
+        result.success = True
+        return result
+
+    return _capture_invoke
+
+
+class TestSessionAndConfigDirForwarding:
+    """run_stage_via_cli must forward session_id= and config_dir= into
+    invoke_with_cap_retry (task 2744), defaulting both to None when omitted so
+    existing cutover/sandbox call sites keep today's behavior."""
+
+    @pytest.mark.asyncio
+    async def test_session_id_and_config_dir_forwarded(self, tmp_path):
+        from shared.config_dir import TaskConfigDir
+
+        from fused_memory.config.schema import ReconciliationConfig
+        from fused_memory.reconciliation.cli_stage_runner import (
+            recon_config_base_dir,
+            run_stage_via_cli,
+        )
+
+        captured_kwargs: dict = {}
+        config = ReconciliationConfig()
+        mcp_config = {'mcpServers': {}}
+        cfg_dir = TaskConfigDir(task_id='run-xyz', base_dir=recon_config_base_dir(tmp_path))
+
+        with patch(
+            'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry',
+            new=_make_capture_invoke(captured_kwargs),
+        ):
+            await run_stage_via_cli(
+                system_prompt='test',
+                payload='test payload',
+                disallowed_tools=[],
+                config=config,
+                mcp_config=mcp_config,
+                session_id='sess-abc',
+                config_dir=cfg_dir,
+            )
+
+        assert captured_kwargs.get('session_id') == 'sess-abc'
+        assert captured_kwargs.get('config_dir') is cfg_dir
+
+    @pytest.mark.asyncio
+    async def test_session_id_and_config_dir_default_none(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        from fused_memory.reconciliation.cli_stage_runner import run_stage_via_cli
+
+        captured_kwargs: dict = {}
+        config = ReconciliationConfig()
+        mcp_config = {'mcpServers': {}}
+
+        with patch(
+            'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry',
+            new=_make_capture_invoke(captured_kwargs),
+        ):
+            await run_stage_via_cli(
+                system_prompt='test',
+                payload='test payload',
+                disallowed_tools=[],
+                config=config,
+                mcp_config=mcp_config,
+            )
+
+        assert 'session_id' in captured_kwargs
+        assert captured_kwargs['session_id'] is None
+        assert 'config_dir' in captured_kwargs
+        assert captured_kwargs['config_dir'] is None
+
+
+class TestReconConfigDirHelpers:
+    """recon_config_base_dir / gc_run_config_dir path determinism + GC (task 2744)."""
+
+    def test_recon_config_base_dir(self, tmp_path):
+        from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
+
+        assert recon_config_base_dir(tmp_path) == tmp_path / 'recon-config'
+
+    def test_config_dir_path_identity(self, tmp_path):
+        """Pins the creator↔GC coupling: TaskConfigDir builds exactly the path
+        gc_run_config_dir rmtrees (config_dir.py's claude-config-{id} naming)."""
+        from shared.config_dir import TaskConfigDir
+
+        from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
+
+        run_id = 'run-abc123'
+        base = recon_config_base_dir(tmp_path)
+        cfg = TaskConfigDir(task_id=run_id, base_dir=base)
+        assert cfg.path == base / f'claude-config-{run_id}'
+
+    def test_gc_removes_existing_dir(self, tmp_path):
+        from shared.config_dir import TaskConfigDir
+
+        from fused_memory.reconciliation.cli_stage_runner import (
+            gc_run_config_dir,
+            recon_config_base_dir,
+        )
+
+        run_id = 'run-to-gc'
+        cfg = TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(tmp_path))
+        assert cfg.path.exists()
+
+        gc_run_config_dir(tmp_path, run_id)
+        assert not cfg.path.exists()
+
+    def test_gc_is_noop_when_absent(self, tmp_path):
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        # No dir created — GC must be a silent no-op (ignore_errors), never raise.
+        gc_run_config_dir(tmp_path, 'never-created')

@@ -142,6 +142,14 @@ class ReconciliationRun(BaseModel):
     status: RunStatus = RunStatus.running
     triggered_by: str | None = None  # parent run_id for remediation runs
     instance_id: str | None = None  # EventBuffer.instance_id of the harness that started the run
+    # CLI session id minted for the in-flight stage subprocess (cleared between
+    # stages). Best-effort: reflects the value minted before launch and may be
+    # stale after an internal cap retry regenerates the session — σ's resume
+    # gate must validate the transcript exists before --resume. See
+    # ReconciliationJournal.record_run_session.
+    session_id: str | None = None
+    stage_cursor: str | None = None  # StageId.value of the in-flight stage (cleared between stages)
+    attempt: int = 0  # monotonic count of stage invocations for this run (not subprocess spawns; a cap retry doesn't bump it)
 
     @field_validator('project_id', mode='before')
     @classmethod

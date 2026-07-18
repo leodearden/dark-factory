@@ -202,6 +202,111 @@ async def test_get_running_runs_returns_all_running_regardless_of_age(journal):
 
 
 @pytest.mark.asyncio
+async def test_runs_table_has_session_columns(journal):
+    """A freshly-initialized runs table exposes session_id, stage_cursor, attempt."""
+    db = journal._require_db()
+    async with db.execute('PRAGMA table_info(runs)') as cursor:
+        rows = await cursor.fetchall()
+    colnames = {row['name'] for row in rows}
+    assert {'session_id', 'stage_cursor', 'attempt'} <= colnames, (
+        f'runs table missing session columns; got {sorted(colnames)!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_run_session_persists_and_increments_attempt(journal):
+    """record_run_session persists (session_id, stage_cursor) and auto-increments
+    attempt; a second call bumps attempt and overwrites the snapshot. Both the
+    get_run and get_running_runs (_row_to_run) read paths carry the fields."""
+    run_id = str(uuid.uuid4())
+    run = ReconciliationRun(
+        id=run_id,
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='session-capture',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+    )
+    await journal.start_run(run)
+
+    # First stage launch.
+    await journal.record_run_session(
+        run_id, session_id='S1', stage_cursor='memory_consolidator'
+    )
+    loaded = await journal.get_run(run_id)
+    assert loaded is not None
+    assert loaded.session_id == 'S1'
+    assert loaded.stage_cursor == 'memory_consolidator'
+    assert loaded.attempt == 1
+
+    # Same snapshot is visible via the _row_to_run recovery read path (σ).
+    running = {r.id: r for r in await journal.get_running_runs()}
+    assert running[run_id].session_id == 'S1'
+    assert running[run_id].stage_cursor == 'memory_consolidator'
+    assert running[run_id].attempt == 1
+
+    # Second stage launch bumps attempt and overwrites the snapshot.
+    await journal.record_run_session(
+        run_id, session_id='S2', stage_cursor='task_knowledge_sync'
+    )
+    loaded = await journal.get_run(run_id)
+    assert loaded is not None
+    assert loaded.session_id == 'S2'
+    assert loaded.stage_cursor == 'task_knowledge_sync'
+    assert loaded.attempt == 2
+
+
+@pytest.mark.asyncio
+async def test_clear_run_session_nulls_snapshot_but_retains_attempt(journal):
+    """clear_run_session nulls session_id/stage_cursor but leaves attempt intact."""
+    run_id = str(uuid.uuid4())
+    run = ReconciliationRun(
+        id=run_id,
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='session-capture',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+    )
+    await journal.start_run(run)
+    await journal.record_run_session(
+        run_id, session_id='S1', stage_cursor='memory_consolidator'
+    )
+    await journal.record_run_session(
+        run_id, session_id='S2', stage_cursor='task_knowledge_sync'
+    )
+
+    await journal.clear_run_session(run_id)
+
+    loaded = await journal.get_run(run_id)
+    assert loaded is not None
+    assert loaded.session_id is None
+    assert loaded.stage_cursor is None
+    assert loaded.attempt == 2
+
+
+@pytest.mark.asyncio
+async def test_run_without_session_roundtrips_defaults(journal):
+    """A run that never recorded a session round-trips None/None/0 through get_run."""
+    run_id = str(uuid.uuid4())
+    run = ReconciliationRun(
+        id=run_id,
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='no-session',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+    )
+    await journal.start_run(run)
+
+    loaded = await journal.get_run(run_id)
+    assert loaded is not None
+    assert loaded.session_id is None
+    assert loaded.stage_cursor is None
+    assert loaded.attempt == 0
+
+
+@pytest.mark.asyncio
 async def test_stats(journal):
     run_id = str(uuid.uuid4())
     now = datetime.now(UTC)
