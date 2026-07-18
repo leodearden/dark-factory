@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import UTC, datetime
@@ -233,6 +234,12 @@ class BaseStage:
         await self.journal.record_run_session(
             run_id, session_id=session_id, stage_cursor=self.stage_id.value
         )
+        # Clear the session snapshot on a normal stage exit (and on non-cancel
+        # errors) but PRESERVE it on asyncio.CancelledError: a restart cancelling
+        # the in-flight stage must leave (session_id, stage_cursor) on the run row
+        # so the startup adopt-and-resume pass (task σ) can --resume this run.
+        # A non-cancel exception still clears (the run is failing, not resuming).
+        cancelled = False
         try:
             stage_result = await run_stage_via_cli(
                 system_prompt=self.get_system_prompt(),
@@ -247,8 +254,12 @@ class BaseStage:
                 session_id=session_id,
                 config_dir=config_dir,
             )
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
-            await self.journal.clear_run_session(run_id)
+            if not cancelled:
+                await self.journal.clear_run_session(run_id)
 
         completed = datetime.now(UTC)
 
