@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
+from escalation.classify import effective_benign
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue, iter_all_escalation_paths
 
@@ -2864,6 +2865,39 @@ class TestResolveResolutionClassExplicit:
         assert record.resolution_class is None, (
             f"Record must remain unstamped (nothing persisted); got {record.resolution_class!r}"
         )
+
+    def test_resolve_accepts_moot_terminal_subject_class(self, tmp_path: Path):
+        """(d) resolve(..., dismiss=True, resolved_by='harness-escalation-revalidation-sweep',
+        resolution_class='moot-terminal-subject') does NOT raise, persists the distinct
+        stamp (overriding the reaper-sweep 'benign' default), and effective_benign reads
+        it as ('moot-terminal-subject', 'stamped') — i.e. neither benign nor actionable.
+        This is the evidence-preserving stamp the task-2724 revalidation sweep needs."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        # (a) does not raise on the new class
+        result = queue.resolve(
+            'esc-1-1', 'auto: subject task terminal',
+            dismiss=True,
+            resolved_by='harness-escalation-revalidation-sweep',
+            resolution_class='moot-terminal-subject',
+        )
+
+        # (b) explicit class wins over the reaper-sweep 'benign' default and is persisted
+        assert result is not None
+        assert result.status == 'dismissed'
+        assert result.resolution_class == 'moot-terminal-subject', (
+            f"Expected explicit 'moot-terminal-subject' to override the reaper-sweep "
+            f"'benign' default; got {result.resolution_class!r}"
+        )
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.resolution_class == 'moot-terminal-subject'
+
+        # (c) reads as its own distinct stamped class — not benign, not actionable
+        cls, provenance = effective_benign(updated)
+        assert (cls, provenance) == ('moot-terminal-subject', 'stamped')
+        assert cls not in ('benign', 'actionable')
 
 
 class TestResolveResolutionClassDefaults:

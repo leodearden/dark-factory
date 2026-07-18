@@ -1,15 +1,15 @@
-"""RED/GREEN tests for the completion judge routed through the verdict-tools
-MCP artifact, with a transition-window fallback to ``result.structured_output``.
+"""Tests for the completion judge routed through the verdict-tools MCP
+artifact — the artifact-only contract (post-task-η).
 
-Task 2486 (PRD ``plans/mcp-verdict-servers-prd.md`` task ζ): unlike the
-merger (task 2483 / PRD task γ) and reviewer (task 2484 / PRD task δ), which
-cut over to an artifact-only read, the judge is completion-gating and this
-orchestrator self-hosts the PRD's own tasks — a botched cutover that
-silently returned "not complete" would wedge completion. So
-``TaskWorkflow._run_completion_judge`` PREFERS
-``TaskArtifacts.read_verdict('judge')`` but FALLS BACK to
-``result.structured_output`` when the artifact is absent or malformed. Task
-η removes the fallback after real-run verification.
+Task 2487 (PRD ``plans/mcp-verdict-servers-prd.md`` task η) closes the ζ
+transition window: like the merger (task 2483 / PRD task γ) and reviewer
+(task 2484 / PRD task δ), the judge now reads
+``TaskArtifacts.read_verdict('judge')`` ONLY. The transition-window fallback
+to ``result.structured_output`` is GONE, and
+``TaskWorkflow._run_completion_judge`` no longer passes ``output_schema`` to
+``_invoke``. An absent or malformed verdict artifact yields ``None``
+(I-FAIL-SAFE: keep iterating, never a false completion) even when a legacy
+``result.structured_output`` payload is present.
 
 Driven directly through the ``_workflow_helpers._make`` factory (real
 on-disk ``TaskArtifacts``), mirroring ``test_merger_disposition_verdict.py``
@@ -70,8 +70,9 @@ def _invoke_with_judge_verdict(
 
 @pytest.mark.asyncio
 class TestRunCompletionJudgeVerdictRouting:
-    """``_run_completion_judge`` prefers the verdict artifact, falling back to
-    ``result.structured_output`` during the transition window.
+    """``_run_completion_judge`` reads the verdict artifact ONLY (post-η
+    artifact-only contract); an absent/malformed artifact ⇒ ``None`` even when
+    a legacy ``result.structured_output`` payload is present.
     """
 
     def _setup(self, tmp_path: Path):
@@ -111,8 +112,10 @@ class TestRunCompletionJudgeVerdictRouting:
             'uncovered_plan_steps': [], 'substantive_work': True,
         }
 
-    async def test_structured_output_fallback_when_no_artifact(self, tmp_path: Path):
-        """(b) no artifact written => falls back to structured_output (transition window)."""
+    async def test_no_artifact_returns_none(self, tmp_path: Path):
+        """(b) no artifact written ⇒ None, even with a complete legacy
+        structured_output present (post-η: the fallback is gone).
+        """
         f = self._setup(tmp_path)
         f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
             side_effect=_invoke_with_judge_verdict(
@@ -127,10 +130,7 @@ class TestRunCompletionJudgeVerdictRouting:
 
         verdict = await f.wf._run_completion_judge([])
 
-        assert verdict == {
-            'complete': True, 'reasoning': 'legacy path',
-            'uncovered_plan_steps': [], 'substantive_work': True,
-        }
+        assert verdict is None
 
     async def test_absent_both_returns_none(self, tmp_path: Path):
         """(c) no artifact and no structured_output => None (fail-safe, keep iterating)."""
@@ -169,13 +169,13 @@ class TestRunCompletionJudgeVerdictRouting:
         # would leak through instead.
         assert verdict is None
 
-    async def test_malformed_artifact_falls_back_to_structured_output(
+    async def test_malformed_artifact_returns_none(
         self, tmp_path: Path,
     ):
-        """(e) an envelope present but missing the 'verdict' key is untrusted
-        and degrades to the structured_output fallback (not straight to
-        None) — a malformed tool write must never discard a valid legacy
-        completion signal during the transition window.
+        """(e) an envelope present but missing a dict 'verdict' key ⇒ None,
+        even with a complete legacy structured_output present (post-η: a
+        malformed tool write is untrusted and no longer degrades to the
+        structured_output fallback).
         """
         f = self._setup(tmp_path)
 
@@ -193,7 +193,30 @@ class TestRunCompletionJudgeVerdictRouting:
 
         verdict = await f.wf._run_completion_judge([])
 
-        assert verdict == {
-            'complete': True, 'reasoning': 'legacy path',
-            'uncovered_plan_steps': [], 'substantive_work': True,
-        }
+        assert verdict is None
+
+    async def test_run_completion_judge_does_not_pass_output_schema(
+        self, tmp_path: Path,
+    ):
+        """(f) the judge no longer requests ``--json-schema`` structured output.
+
+        Post-η the completion verdict arrives via the submit_completion_verdict
+        tool + on-disk artifact, so ``_run_completion_judge`` must NOT pass
+        ``output_schema`` to ``_invoke`` at all. Mirrors
+        ``test_steward.py::test_pre_triage_invocation_uses_verdict_tools_mcp_config``
+        (the ε/triage precedent).
+        """
+        f = self._setup(tmp_path)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_with_judge_verdict(
+                f,
+                artifact={
+                    'complete': True, 'reasoning': 'r',
+                    'uncovered_plan_steps': [], 'substantive_work': True,
+                },
+            ),
+        )
+
+        await f.wf._run_completion_judge([])
+
+        assert 'output_schema' not in f.wf._invoke.call_args.kwargs

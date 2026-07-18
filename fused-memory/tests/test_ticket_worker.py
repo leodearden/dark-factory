@@ -2676,3 +2676,130 @@ async def test_janitor_reap_wakes_blocked_resolve_ticket_promptly(
     assert elapsed < 5.0, (
         f'resolve_ticket took {elapsed:.2f}s — expected prompt wake, not ~30s timeout'
     )
+
+
+# ---------------------------------------------------------------------------
+# task-2737: reap_leaked_ticket_workers — test-isolation reaper
+# ---------------------------------------------------------------------------
+#
+# _curator_worker tasks are long-running (blocked on an empty asyncio.Queue)
+# and are only stopped by an explicit close()/cancel. A test that raises
+# before its own inline cleanup runs — or that relies on
+# interceptor_with_store's teardown, which only cancels workers it can
+# enumerate — orphans a live worker task onto that test's function-scoped
+# event loop. Under asyncio_mode="strict" + `-n auto --dist loadgroup`,
+# pytest-asyncio then tears down the loop with the worker still pending, and
+# the resulting task-destroyed / loop-closed noise surfaces as an
+# order/xdist-dependent flake blamed on a later, unrelated test — the same
+# failure shape already fixed for merge workers (task 1907) and leaked
+# aiosqlite connections (task 2413). These two tests pin the standalone
+# reaper's contract in isolation, before it is wired as an autouse conftest
+# fixture (step-2).
+# ---------------------------------------------------------------------------
+
+
+def _live_curator_worker_tasks() -> list[asyncio.Task]:
+    """Return non-done asyncio Tasks whose coroutine is TaskInterceptor._curator_worker."""
+    return [
+        t for t in asyncio.all_tasks()
+        if not t.done()
+        and getattr(t.get_coro(), '__qualname__', '').endswith(
+            'TaskInterceptor._curator_worker'
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reap_leaked_ticket_workers_cancels_orphaned_worker(
+    taskmaster, event_buffer, ticket_store,
+):
+    """reap_leaked_ticket_workers() cancels + drains an orphaned per-project
+    curator worker.
+
+    Starts a worker directly via _start_worker_if_needed (no ticket
+    submitted, so it blocks immediately on its own empty queue.get()) and
+    deliberately does NOT call ti.close() — the point of this test is that
+    the reaper alone can halt the orphaned worker, exactly as it must for a
+    test that crashed before its own cleanup ran. The ticket_store fixture
+    still owns store teardown.
+    """
+    from _fm_helpers import reap_leaked_ticket_workers
+
+    ti = TaskInterceptor(taskmaster, None, event_buffer, ticket_store=ticket_store)
+    ti._start_worker_if_needed('project')
+    await asyncio.sleep(0)  # let the worker task start and block on queue.get()
+
+    assert _live_curator_worker_tasks(), (
+        'Precondition: expected a live TaskInterceptor._curator_worker task '
+        'after _start_worker_if_needed'
+    )
+
+    reaped = await reap_leaked_ticket_workers()
+
+    assert reaped >= 1, f'Expected reap_leaked_ticket_workers() to reap >= 1, got {reaped}'
+    assert _live_curator_worker_tasks() == [], (
+        'No live TaskInterceptor._curator_worker task should remain after reaping'
+    )
+
+
+@pytest.mark.asyncio
+async def test_reap_leaked_ticket_workers_noop_when_nothing_leaked():
+    """reap_leaked_ticket_workers() returns 0 when no worker was started.
+
+    Pins the cheap no-op path: this test's own runner task (and any other
+    live task) does not match the '..._curator_worker' qualname filter.
+    """
+    from _fm_helpers import reap_leaked_ticket_workers
+
+    assert await reap_leaked_ticket_workers() == 0
+
+
+@pytest.mark.asyncio
+async def test_reap_leaked_ticket_workers_does_not_count_timed_out_worker():
+    """A worker that fails to unwind within the drain bound is
+    cancel()-requested but NOT counted.
+
+    Pins the counting nuance documented on reap_leaked_ticket_workers: the
+    returned tally reflects workers actually drained to completion
+    (task.done() confirmed post-drain), not merely the workers it asked to
+    cancel. asyncio.wait_for is patched to simulate the bounded drain
+    blowing its deadline, so the test stays fast and deterministic instead
+    of waiting out the real 10s bound (and never risks hanging on a worker
+    that ignores cancellation).
+    """
+    from _fm_helpers import reap_leaked_ticket_workers
+
+    started = asyncio.Event()
+
+    # Local shim whose coroutine __qualname__ ends with
+    # 'TaskInterceptor._curator_worker', so the reaper's qualname filter
+    # matches it exactly like a real leaked worker.
+    class TaskInterceptor:
+        async def _curator_worker(self):
+            started.set()
+            await asyncio.sleep(3600)
+
+    worker = asyncio.ensure_future(TaskInterceptor()._curator_worker())
+    await started.wait()  # worker is live and blocked on sleep
+
+    async def _simulate_timeout(_awaitable, timeout):
+        # Model the bounded drain exceeding its deadline without waiting the
+        # real 10s and without yielding to the loop — so the reaper's
+        # cancel() is in flight but not yet processed when it re-checks
+        # task.done().
+        raise TimeoutError
+
+    with patch('asyncio.wait_for', _simulate_timeout):
+        reaped = await reap_leaked_ticket_workers()
+
+    # The reaper issued cancel() (cancel-requested)...
+    assert worker.cancelling() > 0, 'reaper must have requested worker cancellation'
+    # ...but the worker had not finished unwinding when the drain "timed
+    # out", so it is deliberately NOT counted.
+    assert not worker.done(), 'worker should still be pending after a timed-out drain'
+    assert reaped == 0, f'a timed-out worker must not be counted, got {reaped}'
+
+    # Clean up the still-pending worker so it does not leak into teardown.
+    worker.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await worker

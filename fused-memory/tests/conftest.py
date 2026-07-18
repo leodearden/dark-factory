@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 # Make this file's directory importable by test modules so
 # `from _fm_helpers import ...` resolves regardless of whether pytest
@@ -42,7 +43,7 @@ _escalation_src = os.path.join(
 if _escalation_src not in sys.path:
     sys.path.insert(0, _escalation_src)
 
-from _fm_helpers import pydantic_spec  # noqa: E402
+from _fm_helpers import pydantic_spec, reap_leaked_ticket_workers  # noqa: E402
 
 from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402
@@ -71,6 +72,24 @@ def preserve_config_path():
         os.environ.pop('CONFIG_PATH', None)
     else:
         os.environ['CONFIG_PATH'] = original
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reap_leaked_ticket_workers():
+    """Drain any orphaned TaskInterceptor._curator_worker task at every
+    test's teardown boundary.
+
+    Runs while the per-test event loop is still open, so a worker leaked by
+    a test that raised before its own cleanup (or by interceptor_with_store's
+    teardown, which only cancels workers it can enumerate) cannot be
+    destroyed-while-pending under a closing loop and surface as an
+    order/xdist-dependent flake in a later, unrelated test (task 1907
+    precedent for MergeWorker; see reap_leaked_ticket_workers in
+    _fm_helpers.py for the _curator_worker case — task 2737). Cheap no-op
+    for tests that leak nothing.
+    """
+    yield
+    await reap_leaked_ticket_workers()
 
 
 @pytest.fixture

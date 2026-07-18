@@ -32,7 +32,12 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.mcp.verdict_tools import _submit_review_verdict
+from orchestrator.mcp.verdict_tools import (
+    _envelope as _verdict_envelope,
+)
+from orchestrator.mcp.verdict_tools import (
+    _submit_review_verdict,
+)
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow
@@ -691,7 +696,7 @@ class AgentStub:
         elif role == 'merger':
             return self._merger()
         elif role == 'judge':
-            return self._judge()
+            return self._judge(cwd, session_id or 'sid')
         else:
             return AgentResult(success=True, output='OK')
 
@@ -802,13 +807,29 @@ class AgentStub:
     def _merger(self) -> AgentResult:
         return AgentResult(success=True, output='Merged', cost_usd=0.20)
 
-    def _judge(self) -> AgentResult:
+    def _judge(self, cwd: Path, session_id: str) -> AgentResult:
         """Return the next queued judge verdict.
 
         If the entry is an Exception, raise it (simulates invoke failure).
         If the entry is 'SUCCESS_FALSE', return success=False.
         If the entry is None, return success=True with structured_output=None.
         Otherwise treat the entry as a verdict dict.
+
+        Post-task-η the workflow reads the completion verdict from the
+        verdict-tools artifact (``verdicts/judge.json``) ONLY — the legacy
+        ``result.structured_output`` read is gone. So for a real verdict
+        dict this stub must mirror the agent-side submit_completion_verdict
+        tool call by routing through the actual ``_submit_completion_verdict``
+        implementation, writing to the ``.task-meta`` META_ROOT the
+        workflow's ``self.artifacts`` reads from (NOT ``TaskArtifacts(cwd)``,
+        the legacy ``.task`` root) — same root pattern as the reviewer/
+        architect stubs above. ``structured_output`` is retained belt-and-
+        braces but is no longer consulted by the workflow. The envelope is
+        written directly (``_envelope`` + ``write_verdict``) rather than
+        through ``_submit_completion_verdict`` so a deliberately malformed
+        verdict dict (missing required keys) is preserved verbatim on disk —
+        exercising the workflow's required-keys fall-through
+        (test_execute_iterations_continues_on_judge_malformed_output).
         """
         if not self._judge_verdicts:
             # No verdicts queued — default: incomplete
@@ -829,6 +850,13 @@ class AgentStub:
             return AgentResult(success=False, output='', cost_usd=0.05)
         if verdict is None:
             return AgentResult(success=True, output='', structured_output=None, cost_usd=0.05)
+
+        judge_artifacts = TaskArtifacts(
+            cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
+        )
+        judge_artifacts.write_verdict(
+            'judge', _verdict_envelope('judge', session_id, verdict)
+        )
         return AgentResult(
             success=True,
             output=json.dumps(verdict),

@@ -261,6 +261,13 @@ _DETERMINISTIC_ESCALATION_SENTINEL_ROLES: frozenset[str] = frozenset({
 # trail, distinguishing them from a human/steward resolve.
 _ESCALATION_REVALIDATION_SWEEP_ROLE: str = 'harness-escalation-revalidation-sweep'
 
+# resolution_class stamped on a terminal-subject sweep close (task 2724). A
+# DISTINCT, non-benign value (it must be a member of
+# escalation.models.RESOLUTION_CLASSES) so swept records stay auditable rather
+# than being mis-labelled 'benign' by the reaper-sweep resolver default. Passed
+# explicitly to queue.resolve(), overriding that per-resolver default.
+_ESCALATION_REVALIDATION_RESOLUTION_CLASS: str = 'moot-terminal-subject'
+
 # resolved_by sentinel for the main-tip-sweep self-heal (task 2114): closes a
 # pending orchestrator-main-sweep escalation once a later full-verify PASS
 # supersedes its (now-fixed) swept SHA.
@@ -8837,18 +8844,29 @@ Output JSON matching the schema. Every task must appear in the output.
         still-live task) for a human to triage, per this task's conservatism
         requirement.
 
-        Category-agnostic BY DESIGN (task 2114 design_decisions[3] in
-        .task/plan.json): this closes a terminal-subject L2 regardless of
-        ``category``, INCLUDING human-decision categories such as
-        ``milestone_gate`` and ``design_concern``.  Confirmed during the
-        2114 review pass rather than left implicit: once the SUBJECT task
-        itself has gone ``done``/``cancelled`` there is by construction
-        nothing left for a human to gate — a cancelled task cannot proceed
-        no matter what the pending decision was, and a done task already
-        completed via some other path — so the open L2 no longer blocks
-        anything real. This is distinct from (and does not affect) the
-        live-subject case, which always leaves the escalation open for a
-        human to triage.
+        Category-ALLOWLISTED (task 2724, superseding task 2114's category-
+        agnostic close): a terminal subject only moots the escalation when the
+        escalation was reliably ABOUT that task.  Task 2114 closed a terminal-
+        subject L2 regardless of ``category``, but that status-only heuristic
+        silently dropped still-required escalations whose real work lives
+        OUTSIDE the task record.  This method now closes only escalations whose
+        ``category`` is in ``config.escalation_revalidation_allowlist`` — by
+        default ``{'task_failure', 'stranded_blocked'}``, the categories where
+        a done/cancelled subject genuinely leaves nothing for a human to act
+        on.  ``infra_issue`` is deliberately EXCLUDED (its remediation can
+        outlive the task record; accepted tradeoff — a couple of historically-
+        correct closes return to the human queue).  Any non-allowlisted
+        category on a terminal subject is LEFT OPEN for a human to triage,
+        exactly like the live-subject case.  The allowlist is a green-tier
+        hot-reloadable knob, so operators can widen/narrow it live without a
+        restart.
+
+        Auditability (task 2724): the close stamps a DISTINCT
+        ``resolution_class='moot-terminal-subject'`` (see
+        ``_ESCALATION_REVALIDATION_RESOLUTION_CLASS``) — NOT ``'benign'`` — so
+        swept records remain findable as their own dashboard dimension rather
+        than being folded into the benign bucket the way task 2114's unstamped
+        reaper-sweep default did.
 
         Returns True when the escalation was closed this call (the caller
         uses this to skip further per-item handling for the same escalation
@@ -8867,12 +8885,20 @@ Output JSON matching the schema. Every task must appear in the output.
         if subject_status not in ('done', 'cancelled'):
             return False
 
+        # Category allowlist gate (task 2724): only auto-close categories where a
+        # terminal subject truly moots the escalation. A non-allowlisted category
+        # stays pending for a human even though its subject went terminal. The
+        # allowlist is a green-tier hot-reloadable knob (read live off config).
+        if esc.category not in self.config.escalation_revalidation_allowlist:
+            return False
+
         resolution = (
             f'escalation-revalidation-sweep: subject task {esc.task_id} is '
             f'{subject_status} (terminal) — escalation moot, auto-closed (close_only).'
         )
         self._escalation_queue.resolve(
             esc.id, resolution, dismiss=True, resolved_by=_ESCALATION_REVALIDATION_SWEEP_ROLE,
+            resolution_class=_ESCALATION_REVALIDATION_RESOLUTION_CLASS,
         )
         if self.event_store:
             self.event_store.emit(
@@ -8882,6 +8908,8 @@ Output JSON matching the schema. Every task must appear in the output.
                     'escalation_id': esc.id,
                     'subject_status': subject_status,
                     'reason': 'terminal-subject',
+                    'category': esc.category,
+                    'resolution_class': _ESCALATION_REVALIDATION_RESOLUTION_CLASS,
                 },
             )
         logger.info(

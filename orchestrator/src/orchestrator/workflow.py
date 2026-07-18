@@ -41,7 +41,6 @@ from shared.task_metadata import RetryLedger, RoutingDecisionMirror, RoutingStat
 from shared.task_statuses import TaskStatus
 
 from orchestrator import chronic_flake
-from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
 from orchestrator.agents.invoke import AgentResult, invoke_agent
 from orchestrator.agents.roles import (
     _ESCALATION_TOOLS,
@@ -5327,10 +5326,7 @@ class TaskWorkflow:
 
         pre_cost = self.metrics.total_cost_usd
         try:
-            result = await self._invoke(
-                JUDGE, prompt, self.worktree,
-                output_schema=COMPLETION_JUDGE_SCHEMA,
-            )
+            result = await self._invoke(JUDGE, prompt, self.worktree)
         except Exception as exc:
             logger.warning(
                 f'Task {self.task_id}: judge invocation raised '
@@ -5350,26 +5346,23 @@ class TaskWorkflow:
             )
             return None
 
-        # PRD task ζ / task 2486: prefer the verdict-tools artifact
-        # (verdicts/judge.json) over the legacy result.structured_output.
-        # FALL BACK to structured_output only when the artifact is absent,
-        # its envelope isn't a dict, or the envelope's 'verdict' payload
-        # isn't a dict — the judge is completion-gating and this
-        # orchestrator self-hosts the PRD's own tasks, so a botched
-        # cutover that silently returned "not complete" would wedge
-        # completion. A dict 'verdict' payload that is merely missing
-        # required keys is NOT rerouted to the fallback here: it is
-        # judged by the required-keys check below like any other
-        # selected verdict, and returns None (keep iterating) if
-        # incomplete — see design decision "Absent-both / final-invalid
-        # ⇒ None" (plan.json). Task η removes this fallback after
-        # real-run verification.
+        # PRD task η / task 2487: the completion verdict is read from the
+        # verdict-tools artifact (verdicts/judge.json) ONLY — the ζ
+        # transition-window fallback to result.structured_output is gone,
+        # so all four verdict roles (merger/reviewer/triage/judge) now read
+        # artifact-only. The judge is completion-gating and this
+        # orchestrator self-hosts the PRD's own tasks, so the fail-safe is
+        # deliberate: an absent artifact, a non-dict envelope, or a non-dict
+        # 'verdict' payload all yield None (keep iterating, never a false
+        # completion — I-FAIL-SAFE). A dict 'verdict' payload that is merely
+        # missing required keys is likewise judged by the required-keys
+        # check below and returns None if incomplete — see design decision
+        # "Absent-both / final-invalid ⇒ None" (plan.json).
         envelope = self.artifacts.read_verdict('judge')
-        artifact_verdict = envelope.get('verdict') if isinstance(envelope, dict) else None
-        verdict = artifact_verdict if isinstance(artifact_verdict, dict) else result.structured_output
+        verdict = envelope.get('verdict') if isinstance(envelope, dict) else None
         if not isinstance(verdict, dict):
             logger.warning(
-                f'Task {self.task_id}: judge returned non-dict structured_output — '
+                f'Task {self.task_id}: judge returned no/invalid verdict artifact — '
                 f'continuing iteration loop'
             )
             return None

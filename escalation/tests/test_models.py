@@ -455,9 +455,12 @@ class TestEscalationResolutionClass:
         """RESOLUTION_CLASSES is a frozenset."""
         assert isinstance(RESOLUTION_CLASSES, frozenset)
 
-    def test_resolution_classes_contains_exactly_benign_and_actionable(self):
-        """RESOLUTION_CLASSES contains exactly {'benign', 'actionable'} — no extras."""
-        assert frozenset({'benign', 'actionable'}) == RESOLUTION_CLASSES
+    def test_resolution_classes_contains_exactly_the_three_legal_values(self):
+        """RESOLUTION_CLASSES contains exactly {'benign', 'actionable',
+        'moot-terminal-subject'} — no extras. 'moot-terminal-subject' is the
+        distinct, non-benign stamp the task-2724 revalidation sweep writes."""
+        assert frozenset({'benign', 'actionable', 'moot-terminal-subject'}) == RESOLUTION_CLASSES
+        assert 'moot-terminal-subject' in RESOLUTION_CLASSES
 
     # --- (c) round-trip to_dict/from_dict and to_json/from_json ---
 

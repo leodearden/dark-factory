@@ -47,9 +47,17 @@ KNOWN_SEVERITIES: frozenset[str] = frozenset({'info', 'blocking'}) | BORN_AT_L2_
 
 # Legal values for Escalation.resolution_class (escalation-lifecycle-dashboard-prd.md
 # Seam 1).  Used to validate the resolve/dismiss chokepoint's optional
-# resolution_class param and return a clear error naming the two legal
+# resolution_class param and return a clear error naming the legal
 # values rather than silently accepting an arbitrary string.
-RESOLUTION_CLASSES: frozenset[str] = frozenset({'benign', 'actionable'})
+#
+# 'moot-terminal-subject' (task 2724) is the DISTINCT, non-benign stamp the
+# escalation-revalidation sweep writes when it auto-closes an allowlisted L2
+# whose subject task went terminal (done/cancelled).  It is deliberately
+# neither 'benign' nor 'actionable' so swept records stay auditable — the
+# dashboard's effective_benign/_origin_block/_workflow_block count it as
+# classified+stamped but bucket it into neither, preserving the evidence the
+# old 'benign' mis-label destroyed.
+RESOLUTION_CLASSES: frozenset[str] = frozenset({'benign', 'actionable', 'moot-terminal-subject'})
 
 
 @dataclass

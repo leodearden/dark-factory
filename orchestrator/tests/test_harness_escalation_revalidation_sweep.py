@@ -39,7 +39,7 @@ import pytest
 from _orch_helpers import _init_harness_state_for_test
 from escalation.models import Escalation
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import RELOADABLE_FIELDS, OrchestratorConfig, diff_config
 from orchestrator.harness import EventType, Harness
 from orchestrator.verify import VerifyResult
 
@@ -53,6 +53,40 @@ def test_config_defaults_escalation_revalidation() -> None:
     the single operator kill-switch for both new auto-closure paths."""
     config = OrchestratorConfig()
     assert config.escalation_revalidation_enabled is True
+
+
+def test_config_defaults_escalation_revalidation_allowlist() -> None:
+    """OrchestratorConfig exposes escalation_revalidation_allowlist (task 2724),
+    a frozenset defaulting to the two categories where a terminal subject task
+    truly moots the escalation — task_failure and stranded_blocked. infra_issue
+    is deliberately excluded (its real work can outlive the task record)."""
+    config = OrchestratorConfig()
+    assert config.escalation_revalidation_allowlist == frozenset({'task_failure', 'stranded_blocked'})
+    assert isinstance(config.escalation_revalidation_allowlist, frozenset)
+
+
+def test_escalation_revalidation_allowlist_is_green_tier_reloadable() -> None:
+    """escalation_revalidation_allowlist is green-tier hot-reloadable (task 2724):
+    its leaf is on RELOADABLE_FIELDS, and diff_config buckets a differing value
+    into applied_candidates (green-tier), NOT restart_required."""
+    # (a) the leaf is on the reload allowlist
+    assert 'escalation_revalidation_allowlist' in RELOADABLE_FIELDS
+
+    # (b) two configs differing ONLY in the allowlist -> applied_candidates
+    live = OrchestratorConfig()
+    fresh = live.model_copy(
+        update={
+            'escalation_revalidation_allowlist': frozenset(
+                {'task_failure', 'stranded_blocked', 'infra_issue'}
+            )
+        }
+    )
+    diff = diff_config(live, fresh)
+    assert 'escalation_revalidation_allowlist' in diff.applied_candidates, (
+        f"Expected the differing allowlist leaf in applied_candidates (green-tier); "
+        f"got applied={list(diff.applied_candidates)}, restart={list(diff.restart_required)}"
+    )
+    assert 'escalation_revalidation_allowlist' not in diff.restart_required
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +110,11 @@ def _make_harness() -> Harness:
 def _make_esc(
     *,
     level: int = 2,
-    category: str = 'design_concern',
+    # Default to an ALLOWLISTED category (task 2724) so close-path fixtures keep
+    # exercising the terminal-subject close branch; no-close tests below return
+    # before the allowlist gate, so the default is inert for them. Tests that
+    # need a non-allowlisted category pass it explicitly.
+    category: str = 'task_failure',
     agent_role: str = 'orchestrator-scheduler',
     esc_id: str = 'esc-tid-1',
     task_id: str = 'tid',
@@ -199,6 +237,103 @@ class TestRevalidateOpenL2:
         assert result is False
         h._escalation_queue.resolve.assert_not_called()  # type: ignore[union-attr, attr-defined]
 
+    # --- task 2724: category allowlist gate + distinguishable resolution_class ---
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_task_failure_category_closes(self) -> None:
+        """An allowlisted 'task_failure' category on a done subject still closes."""
+        h = _make_harness()
+        esc = _make_esc(level=2, category='task_failure', task_id='tid-done')
+        statuses = {'tid-done': 'done'}
+
+        result = await h._revalidate_open_l2(esc, statuses)
+
+        assert result is True
+        h._escalation_queue.resolve.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        _args, kwargs = h._escalation_queue.resolve.call_args  # type: ignore[union-attr, attr-defined]
+        assert kwargs.get('dismiss') is True
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_stranded_blocked_category_closes(self) -> None:
+        """An allowlisted 'stranded_blocked' category on a done subject still closes."""
+        h = _make_harness()
+        esc = _make_esc(level=2, category='stranded_blocked', task_id='tid-done')
+        statuses = {'tid-done': 'done'}
+
+        result = await h._revalidate_open_l2(esc, statuses)
+
+        assert result is True
+        h._escalation_queue.resolve.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        _args, kwargs = h._escalation_queue.resolve.call_args  # type: ignore[union-attr, attr-defined]
+        assert kwargs.get('dismiss') is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('category', [
+        'design_concern', 'infra_issue', 'risk_identified', 'dependency_discovered',
+    ])
+    async def test_non_allowlisted_category_not_closed(self, category: str) -> None:
+        """A terminal (done) subject NO LONGER moots a non-allowlisted category —
+        the escalation stays open for a human (task 2724 core behavior). Proves
+        task-done alone is no longer sufficient to auto-close, and that
+        infra_issue in particular is deliberately excluded."""
+        h = _make_harness()
+        esc = _make_esc(level=2, category=category, task_id='tid-done')
+        statuses = {'tid-done': 'done'}
+
+        result = await h._revalidate_open_l2(esc, statuses)
+
+        assert result is False
+        h._escalation_queue.resolve.assert_not_called()  # type: ignore[union-attr, attr-defined]
+        h.event_store.emit.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_close_stamps_moot_terminal_subject_resolution_class(self) -> None:
+        """An allowlisted terminal-subject close stamps the DISTINCT
+        resolution_class='moot-terminal-subject' (NOT 'benign'), and mirrors
+        category + resolution_class into the escalation_resolved event so the
+        swept record stays auditable (task 2724)."""
+        h = _make_harness()
+        esc = _make_esc(level=2, category='task_failure', task_id='tid-done')
+        statuses = {'tid-done': 'done'}
+
+        result = await h._revalidate_open_l2(esc, statuses)
+
+        assert result is True
+        _args, kwargs = h._escalation_queue.resolve.call_args  # type: ignore[union-attr, attr-defined]
+        assert kwargs.get('resolution_class') == 'moot-terminal-subject'
+        assert kwargs.get('resolution_class') != 'benign'
+        # audit fields mirrored to the escalation_resolved event
+        _emit_args, emit_kwargs = h.event_store.emit.call_args  # type: ignore[attr-defined]
+        data = emit_kwargs.get('data') or {}
+        assert data.get('category') == 'task_failure'
+        assert data.get('resolution_class') == 'moot-terminal-subject'
+        assert data.get('reason') == 'terminal-subject'
+
+    @pytest.mark.asyncio
+    async def test_allowlist_reload_changes_gate(self) -> None:
+        """The allowlist drives the gate at RUNTIME: an infra_issue escalation on
+        a done subject is withheld under the default allowlist, then closes after
+        a reload widens the allowlist to include 'infra_issue' — proving the
+        green-tier knob is live, not baked in (task 2724)."""
+        h = _make_harness()
+        esc = _make_esc(level=2, category='infra_issue', task_id='tid-done')
+        statuses = {'tid-done': 'done'}
+
+        # Before: infra_issue is NOT in the default allowlist -> not closed.
+        result_before = await h._revalidate_open_l2(esc, statuses)
+        assert result_before is False
+        h._escalation_queue.resolve.assert_not_called()  # type: ignore[union-attr, attr-defined]
+
+        # After: widen the allowlist to include infra_issue -> now closes.
+        h.config = h.config.model_copy(update={
+            'escalation_revalidation_allowlist': frozenset(
+                {'task_failure', 'stranded_blocked', 'infra_issue'}
+            )
+        })
+        result_after = await h._revalidate_open_l2(esc, statuses)
+        assert result_after is True
+        h._escalation_queue.resolve.assert_called_once()  # type: ignore[union-attr, attr-defined]
+
 
 # ---------------------------------------------------------------------------
 # step-5: _run_deterministic_recon_sweep — Source-C wiring
@@ -299,7 +434,7 @@ class TestReconSweepSourceC:
         that the wiring calls a mocked stand-in with the right arguments."""
         h = _make_harness()
         esc = _make_esc(
-            level=2, category='milestone_gate', task_id='tid-done-e2e',
+            level=2, category='task_failure', task_id='tid-done-e2e',
             esc_id='esc-l2-done-e2e',
         )
         h.scheduler.get_tasks = AsyncMock(return_value=[])  # type: ignore[method-assign]
