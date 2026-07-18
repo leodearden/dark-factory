@@ -2315,13 +2315,27 @@ class ReconciliationHarness:
           the 5-part identity), so a re-attempt after a transient failure is
           safe and cannot duplicate. It stamps a distinct
           ``stage1_cycle_summary_write_recovered_backstop`` marker on the
-          report (leaving ``stage1_cycle_summary_ledger_written`` at its
-          in-stage value of 0 — the ledger ROW is the authoritative presence
-          signal that ``get_cycle_summary_presence`` reads, not the stat)
-          and logs a WARNING distinct from arm 1's, with no ``_error``
+          report — optimistically ``True`` *before* the call, since
+          ``write_stage1_cycle_summary`` serializes ``report.stats`` into
+          the ledger row's ``payload_json`` synchronously at call time (see
+          ``write_cycle_summary``'s docstring), so this is the only way a
+          successful re-attempt's OWN ledger row ends up carrying the
+          marker. It is corrected back to ``False`` immediately afterward
+          if the re-attempt did NOT actually land a row
+          (``ledger_written`` is falsy, or the call raised) — the
+          correction cannot rewrite a ledger row (none exists in either
+          failure case), but it DOES reach the run's own
+          journal-persisted ``stage_reports`` copy
+          (``update_run_stage_reports``, called right after this method
+          returns), so that copy never falsely claims recovery succeeded
+          (task 2734 amendment). ``stage1_cycle_summary_ledger_written``
+          itself is left at its in-stage value of 0 either way — the
+          ledger row's mere EXISTENCE is the authoritative presence signal
+          that ``get_cycle_summary_presence`` reads, not either stat. Arm 2
+          logs a WARNING distinct from arm 1's, with no ``_error``
           breadcrumb stamp (unlike arm 1, which repurposes a pre-existing
-          ``_error`` record — the primary motivating scenario for arm 2 is a
-          cycle that completed cleanly end-to-end and has no ``_error``
+          ``_error`` record — the primary motivating scenario for arm 2 is
+          a cycle that completed cleanly end-to-end and has no ``_error``
           record to stamp).
 
         Must never raise: awaited unshielded in the ``finally``, immediately
@@ -2350,12 +2364,32 @@ class ReconciliationHarness:
                 # report — reusing it (not a zeroed synth) records honest
                 # llm_calls/tokens/stats; the upsert is idempotent so a
                 # re-attempt after a transient failure is safe.
+                #
+                # Stamped True *before* the call: write_stage1_cycle_summary
+                # serializes report.stats into the ledger row's payload_json
+                # synchronously, at call time (see write_cycle_summary's
+                # docstring) — a post-call mutation can never retroactively
+                # reach an already-persisted row, so this is the only way a
+                # successful re-attempt's OWN ledger row ends up carrying the
+                # marker. Corrected back to False below if the re-attempt did
+                # not actually land a row — that correction can't rewrite the
+                # (nonexistent, in the failure case) ledger row, but it DOES
+                # reach the run's own journal-persisted stage_reports copy
+                # (update_run_stage_reports, called right after this method
+                # returns), so that copy never falsely claims recovery
+                # succeeded (task 2734 amendment).
                 s1_report.stats['stage1_cycle_summary_write_recovered_backstop'] = True
-                ledger_written = await asyncio.shield(
-                    write_stage1_cycle_summary(
-                        self.memory, project_id, s1_report, run_id,
+                try:
+                    ledger_written = await asyncio.shield(
+                        write_stage1_cycle_summary(
+                            self.memory, project_id, s1_report, run_id,
+                        )
                     )
-                )
+                except BaseException:
+                    s1_report.stats['stage1_cycle_summary_write_recovered_backstop'] = False
+                    raise
+                if not ledger_written:
+                    s1_report.stats['stage1_cycle_summary_write_recovered_backstop'] = False
                 logger.warning(
                     'reconciliation.stage1_cycle_summary_write_recovered',
                     extra={

@@ -1155,6 +1155,97 @@ class TestStage1CycleSummaryHarnessBackstop:
         )
 
     @pytest.mark.asyncio
+    async def test_arm2_write_returns_false_stamps_marker_false_not_true(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Task 2734 amendment: the recovered-backstop marker must reflect
+        the re-attempt's ACTUAL outcome, not merely that a re-attempt was
+        made. If write_stage1_cycle_summary's re-attempt also fails
+        (returns False — e.g. the transient ledger fault hasn't cleared
+        yet), the marker must be stamped False, not a false-positive True
+        that would mislead an operator/dashboard keying on it as 'recovery
+        succeeded'."""
+        from fused_memory.models.reconciliation import StageId
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={'stage1_cycle_summary_ledger_written': 0},
+            llm_calls=6,
+            tokens_used=600,
+        )
+        harness.stages[0].run = AsyncMock(return_value=stage1_report)
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(return_value=False),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_awaited_once()
+        assert stage1_report.stats.get('stage1_cycle_summary_write_recovered_backstop') is False, (
+            'a re-attempt that itself fails must stamp False, not True — the marker '
+            'must never claim recovery succeeded when no ledger row was actually created'
+        )
+
+    @pytest.mark.asyncio
+    async def test_arm2_write_raises_corrects_marker_to_false_not_true(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Complements the False-return case above: if the re-attempt
+        itself raises (rather than returning False), the optimistic True
+        stamped before the call (needed so a genuinely successful
+        re-attempt's OWN ledger row — serialized synchronously at call
+        time — carries the marker; see the method's docstring) is caught
+        and corrected back to False by an inner except before re-raising
+        to this method's own outer ``except BaseException`` (which must
+        never let this raise out of the finally block, per its docstring).
+        The cycle itself must still complete successfully; only the
+        best-effort backstop write failed."""
+        from fused_memory.models.reconciliation import StageId
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={'stage1_cycle_summary_ledger_written': 0},
+            llm_calls=6,
+            tokens_used=600,
+        )
+        harness.stages[0].run = AsyncMock(return_value=stage1_report)
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(side_effect=RuntimeError('ledger boom again')),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed, (
+            'a failing backstop re-attempt must not fail the overall cycle'
+        )
+        mock_write.assert_awaited_once()
+        assert stage1_report.stats.get('stage1_cycle_summary_write_recovered_backstop') is False, (
+            'a re-attempt that raises must correct the marker to False, never leave '
+            'it falsely True'
+        )
+
+    @pytest.mark.asyncio
     async def test_remediation_stage1_completed_write_failed_does_not_fire_backstop(
         self, journal, event_buffer, mock_memory_service, ledger_store
     ):
