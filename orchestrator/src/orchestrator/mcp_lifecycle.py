@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -481,6 +482,37 @@ MCP_HEADERS = {
     'Accept': 'application/json, text/event-stream',
 }
 
+# Mutating task tools that must carry a client-supplied idempotency key so a
+# transport-level retry (after an ambiguous timeout/reset) dedupes server-side
+# instead of double-applying (task 2712). Reads/initialize are untouched.
+_MUTATING_TASK_TOOLS = frozenset({
+    'update_task',
+    'set_task_status',
+    'add_dependency',
+    'remove_dependency',
+})
+
+
+def _maybe_inject_client_op_id(
+    method: str, params: dict[str, Any] | None,
+) -> None:
+    """Inject a fresh ``client_op_id`` into a mutating tool call's arguments.
+
+    Called ONCE per logical ``_raw_call`` before the transport retry loop, so
+    every transport retry within that call reuses the same key (``payload``
+    holds ``params`` by reference and is re-serialized each attempt). No-op for
+    non-``tools/call`` methods, read tools, or a caller that already supplied a
+    key (forward-compat with higher-level retries that thread a stable key).
+    """
+    if (
+        method == 'tools/call'
+        and isinstance(params, dict)
+        and params.get('name') in _MUTATING_TASK_TOOLS
+        and isinstance(params.get('arguments'), dict)
+        and 'client_op_id' not in params['arguments']
+    ):
+        params['arguments']['client_op_id'] = str(uuid.uuid4())
+
 
 class McpSession:
     """Manages a single MCP Streamable HTTP session with initialization handshake."""
@@ -550,6 +582,11 @@ class McpSession:
         }
         if params is not None:
             payload['params'] = params
+
+        # Generate the idempotency key ONCE, before the retry loop, so all
+        # transport retries of this logical call post the same key (payload
+        # holds params by reference; each attempt re-serializes json=payload).
+        _maybe_inject_client_op_id(method, params)
 
         # Shared fm-restart retry window, applied to this generic transport by
         # design (fm-scoped in practice) — see the "Scope of the ~120s
