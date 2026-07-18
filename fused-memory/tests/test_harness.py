@@ -719,6 +719,45 @@ async def test_run_full_cycle_persists_judge_pending_marker_and_tracks_task(
     await asyncio.gather(*harness._judge_tasks, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+async def test_drain_judge_tasks_cancels_and_marker_persists(
+    journal, event_buffer, mock_memory_service
+):
+    """Shutdown drain cancels an in-flight judge task WITHOUT losing its
+    verdict: because the judge is cancelled mid-review (before add_verdict's
+    atomic clear), the judge_pending marker survives for a startup re-run (task 2708)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.judge = MagicMock()
+
+    never_set = asyncio.Event()
+
+    async def _blocking_judge(_run_id):
+        # Blocks mid-review, before any verdict is written.
+        await never_set.wait()
+
+    harness._run_judge = _blocking_judge
+
+    run_id = str(uuid.uuid4())
+    await harness._spawn_judge(run_id, 'test-project')
+    # Yield control so the judge task actually starts and blocks on the event.
+    await asyncio.sleep(0)
+
+    assert (run_id, 'test-project') in await journal.get_pending_judge_runs()
+    assert len(harness._judge_tasks) == 1
+    spawned = next(iter(harness._judge_tasks))
+
+    await harness._drain_judge_tasks()
+
+    assert spawned.done() and spawned.cancelled(), (
+        'drain must cancel and await the in-flight judge task'
+    )
+    assert harness._judge_tasks == set(), 'drain must clear _judge_tasks'
+    # The verdict was NOT lost — the marker persists for startup re-run.
+    assert (run_id, 'test-project') in await journal.get_pending_judge_runs(), (
+        'a judge cancelled mid-review must leave its judge_pending marker intact'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task 2734: pure predicate helper backing arm 2 of the widened Stage 1
 # cycle_summary harness backstop below — "Stage 1 completed but its own
