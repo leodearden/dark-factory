@@ -11,6 +11,7 @@ Follows the test_snapshots.py convention: drive the async entrypoints with
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -128,6 +129,92 @@ def test_assess_task_threads_pre_task_commit(
 
     assert len(recorded) == 2
     assert all(base == 'BASESHA' for _, base in recorded)
+
+
+def test_assess_task_missing_base_skips_get_diff_loudly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A task lacking pre_task_commit must fail loud, not silently empty-diff.
+
+    This is the exact D1 failure mode (task 2469): compare._assess_task can
+    receive the compare_models ``tasks.get(task_id, {'id':.., 'name':..})``
+    fallback dict, which lacks 'pre_task_commit'. The fix warns loudly and
+    skips get_diff entirely rather than diffing against a missing base and
+    silently grading an empty diff. This locks that behavior in:
+
+    - get_diff is NEVER called (the recorder stays empty),
+    - both diffs stay '' → the prompt renders the '(no diff available)'
+      placeholder and the get_diff SENTINEL never leaks in,
+    - the 'No pre_task_commit' warning fires.
+
+    Worktree dirs are REAL (is_dir() True) so the *only* reason get_diff is
+    skipped is the falsy base — not a missing worktree.
+    """
+    recorded: list[tuple[Path, str]] = []
+
+    async def rec(worktree_path: Path, base_commit: str) -> str:
+        recorded.append((worktree_path, base_commit))
+        return 'SENTINEL'
+
+    captured_prompts: list[str] = []
+
+    async def fake_invoke_agent(**kwargs: object) -> SimpleNamespace:
+        captured_prompts.append(str(kwargs.get('prompt', '')))
+        return SimpleNamespace(
+            structured_output={
+                'winner': 'tie',
+                'confidence': 0.0,
+                'summary': 's',
+                'strengths_a': [],
+                'weaknesses_a': [],
+                'strengths_b': [],
+                'weaknesses_b': [],
+                'circumstances': '',
+            },
+            output='{}',
+        )
+
+    monkeypatch.setattr('orchestrator.evals.compare.get_diff', rec)
+    monkeypatch.setattr(
+        'orchestrator.evals.compare.invoke_agent', fake_invoke_agent,
+    )
+
+    # Real dirs so wt.is_dir() is True: the ONLY reason get_diff is skipped
+    # is the missing base, not a missing worktree.
+    wt_a = tmp_path / 'wt_a'
+    wt_b = tmp_path / 'wt_b'
+    wt_a.mkdir()
+    wt_b.mkdir()
+
+    result_a = EvalResult(
+        task_id='t', config_name='A', outcome='done',
+        metrics={}, worktree_path=str(wt_a),
+    )
+    result_b = EvalResult(
+        task_id='t', config_name='B', outcome='done',
+        metrics={}, worktree_path=str(wt_b),
+    )
+    # NO 'pre_task_commit' key → the degraded, fail-loud branch.
+    task = {
+        'id': 't',
+        'name': 't',
+        'task_definition': {'description': 'd'},
+    }
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.evals.compare'):
+        asyncio.run(_assess_task(task, result_a, result_b, 'A', 'B'))
+
+    # get_diff was never invoked — no silent diff against a missing base.
+    assert recorded == []
+    # Both diffs stayed empty → prompt shows the empty-diff placeholder twice
+    # (one per model) and the SENTINEL (only returned if get_diff ran) is absent.
+    assert len(captured_prompts) == 1
+    assert captured_prompts[0].count('(no diff available)') == 2
+    assert 'SENTINEL' not in captured_prompts[0]
+    # The miss is loud, not swallowed.
+    assert any('No pre_task_commit' in m for m in caplog.messages)
 
 
 def test_rereview_one_threads_candidate_base_commit(
