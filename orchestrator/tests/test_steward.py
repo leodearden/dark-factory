@@ -32,6 +32,25 @@ from orchestrator.workflow_types import (
 )
 
 
+def _sole_invocation_end_data(emit_mock) -> dict:
+    """Return the ``data`` payload of the single ``invocation_end`` emit.
+
+    task η: ``_invoke_with_session`` now emits a ``routing_decision`` event
+    before the ``invocation_end`` event, so a bare ``emit.assert_called_once()``
+    no longer holds. Filter to the ``invocation_end`` call (asserting it fired
+    exactly once) rather than relaxing to the last-call heuristic.
+    """
+    from orchestrator.event_store import EventType
+    calls = [
+        c for c in emit_mock.call_args_list
+        if c.args and c.args[0] == EventType.invocation_end
+    ]
+    assert len(calls) == 1, (
+        f'expected exactly one invocation_end emit; got {emit_mock.call_args_list!r}'
+    )
+    return calls[0].kwargs['data']
+
+
 def _attach_invoke_slot(gate: MagicMock) -> MagicMock:
     """Install a real async-CM on gate.invoke_slot() that wires a real InvokeSlot.
 
@@ -1306,8 +1325,7 @@ class TestStewardTimeoutKillRecovery:
             )
             await steward._handle_escalation(esc)
 
-        steward.event_store.emit.assert_called_once()
-        data = steward.event_store.emit.call_args.kwargs['data']
+        data = _sole_invocation_end_data(steward.event_store.emit)
         assert data['timed_out'] is True
 
     async def test_invocation_end_event_contains_timed_out_false_on_normal_failure(
@@ -1331,8 +1349,7 @@ class TestStewardTimeoutKillRecovery:
             )
             await steward._handle_escalation(esc)
 
-        steward.event_store.emit.assert_called_once()
-        data = steward.event_store.emit.call_args.kwargs['data']
+        data = _sole_invocation_end_data(steward.event_store.emit)
         assert data['timed_out'] is False
 
     async def test_invocation_end_event_timed_out_true_via_stderr_fallback(
@@ -1361,8 +1378,7 @@ class TestStewardTimeoutKillRecovery:
             )
             await steward._handle_escalation(esc)
 
-        steward.event_store.emit.assert_called_once()
-        data = steward.event_store.emit.call_args.kwargs['data']
+        data = _sole_invocation_end_data(steward.event_store.emit)
         assert data['timed_out'] is True
 
     async def test_invocation_end_event_timed_out_false_on_success(
@@ -1389,8 +1405,7 @@ class TestStewardTimeoutKillRecovery:
             )
             await steward._handle_escalation(esc)
 
-        steward.event_store.emit.assert_called_once()
-        data = steward.event_store.emit.call_args.kwargs['data']
+        data = _sole_invocation_end_data(steward.event_store.emit)
         assert data['timed_out'] is False
 
 
