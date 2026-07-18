@@ -86,6 +86,56 @@ def _result(passed: bool, *, category: str = '') -> VerifyResult:
     )
 
 
+class _FakeEventStore:
+    """Records emit() calls without touching sqlite."""
+
+    def __init__(self) -> None:
+        self.emits: list[tuple] = []
+
+    def emit(self, event_type, *, task_id=None, data=None, **kwargs) -> None:
+        self.emits.append((event_type, task_id, data))
+
+
+class _FakeEscalationQueue:
+    """Records submit()/get_by_task()/make_id() for storm-escalation tests.
+
+    *open_l2* controls the dedup path: when truthy, get_by_task returns it so
+    the filer treats an open L2 as already present and does NOT re-submit.
+    """
+
+    def __init__(self, open_l2=None) -> None:
+        self.submitted: list = []
+        self.get_by_task_calls: list = []
+        self._open_l2 = open_l2
+
+    def make_id(self, task_id: str) -> str:
+        return f'esc-{task_id}-1'
+
+    def get_by_task(self, task_id, *, status=None, level=None):
+        self.get_by_task_calls.append((task_id, status, level))
+        return self._open_l2
+
+    def submit(self, esc) -> None:
+        self.submitted.append(esc)
+
+
+_SUPPRESSED_IDS = ['orchestrator/tests/test_x.py::test_y']
+_MERGE_SHA = 'd' * 40
+
+
+def _failing_with_logs() -> VerifyResult:
+    return VerifyResult(
+        passed=False,
+        test_output=_B1_TEST_OUTPUT,
+        lint_output='',
+        type_output='',
+        summary='fail',
+        category='test_failure',
+        worktree_log_paths=['/wt/verify.log'],
+        archive_log_paths=['/archive/verify.log'],
+    )
+
+
 class TestWithPytestTimeout:
     """with_pytest_timeout(cmd, secs) appends a `--timeout <secs>` flag to a
     structured pytest command's base_flags (PRD task α; INV-5 reuse).
@@ -376,3 +426,95 @@ class TestConfirmMergeVerifyFlakeSuppressible:
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
         assert result is None
+
+
+class TestApplyMergeFlakeSuppression:
+    """apply_merge_flake_suppression(failing_result, *, worktree, config,
+    module_configs, merge_sha, event_store=None, escalation_queue=None,
+    task_id=None, _confirm=...) — the merge-verify result handler (PRD task α).
+
+    On a confirmed flake: emits the merge_flake_suppressed fact, bumps the
+    storm streak, and returns a PASSED VerifyResult (category
+    'merge_flake_suppressed') so the merge proceeds into the unscoped gate.
+    On a non-confirmation: returns the ORIGINAL failing result unchanged, with
+    no fact and no streak bump.
+    """
+
+    def _apply(self, failing, tmp_path, *, confirm, event_store=None,
+               escalation_queue=None, task_id='2768'):
+        from orchestrator import verify as verify_module
+
+        return asyncio.run(
+            verify_module.apply_merge_flake_suppression(
+                failing,
+                worktree=tmp_path,
+                config=_make_config(tmp_path),
+                module_configs=[_orch_module_config()],
+                merge_sha=_MERGE_SHA,
+                event_store=event_store,
+                escalation_queue=escalation_queue,
+                task_id=task_id,
+                _confirm=confirm,
+            )
+        )
+
+    def test_b1_suppression_returns_passed_result_and_emits_fact(self, tmp_path: Path) -> None:
+        from orchestrator.event_store import EventType
+
+        failing = _failing_with_logs()
+        confirm = AsyncMock(return_value=list(_SUPPRESSED_IDS))
+        es = _FakeEventStore()
+
+        result = self._apply(failing, tmp_path, confirm=confirm, event_store=es)
+
+        # Suppressed -> a PASSED result with the sentinel category.
+        assert result.passed is True
+        assert result.timed_out is False
+        assert result.category == 'merge_flake_suppressed'
+        # replace() preserves the original log paths (durable evidence).
+        assert result.worktree_log_paths == ['/wt/verify.log']
+        assert result.archive_log_paths == ['/archive/verify.log']
+
+        # Exactly one structured fact, carrying the suppressed ids + sha + when.
+        assert len(es.emits) == 1
+        event_type, task_id, data = es.emits[0]
+        assert event_type == EventType.merge_flake_suppressed
+        assert task_id == '2768'
+        assert data['node_ids'] == _SUPPRESSED_IDS
+        assert data['merge_sha'] == _MERGE_SHA
+        assert data['measured_at']  # non-empty ISO timestamp
+
+    def test_b2_no_suppression_returns_original_unchanged_no_emit(self, tmp_path: Path) -> None:
+        failing = _failing_with_logs()
+        confirm = AsyncMock(return_value=None)
+        es = _FakeEventStore()
+
+        result = self._apply(failing, tmp_path, confirm=confirm, event_store=es)
+
+        # The SAME object is returned unchanged (merge stays red).
+        assert result is failing
+        assert result.passed is False
+        assert es.emits == []
+
+    def test_suppression_tolerates_none_event_store(self, tmp_path: Path) -> None:
+        """A suppression with event_store=None must not crash (None-safe emit)."""
+        failing = _failing_with_logs()
+        confirm = AsyncMock(return_value=list(_SUPPRESSED_IDS))
+
+        result = self._apply(failing, tmp_path, confirm=confirm, event_store=None)
+
+        assert result.passed is True
+        assert result.category == 'merge_flake_suppressed'
+
+    def test_confirm_called_with_config_and_failing_and_worktree(self, tmp_path: Path) -> None:
+        """The injected _confirm receives (config, failing_result) positionally
+        and worktree/module_configs as kwargs (the pure-gate contract)."""
+        failing = _failing_with_logs()
+        confirm = AsyncMock(return_value=None)
+
+        self._apply(failing, tmp_path, confirm=confirm)
+
+        confirm.assert_awaited_once()
+        assert confirm.call_args.args[1] is failing
+        assert confirm.call_args.kwargs['worktree'] == tmp_path
+        assert 'module_configs' in confirm.call_args.kwargs
