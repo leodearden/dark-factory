@@ -7,7 +7,9 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
+from shared.config_dir import TaskConfigDir
 from shared.safe_io import load_json_or_warn
 
 from fused_memory.config.schema import ReconciliationConfig
@@ -19,6 +21,7 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE_REPORT_SCHEMA,
+    recon_config_base_dir,
     run_stage_via_cli,
 )
 from fused_memory.utils.validation import require_project_id, require_run_id
@@ -214,17 +217,38 @@ class BaseStage:
             else self.get_report_schema()
         )
 
-        stage_result = await run_stage_via_cli(
-            system_prompt=self.get_system_prompt(),
-            payload=payload,
-            disallowed_tools=disallowed,
-            config=self.config,
-            mcp_config=mcp_config,
-            usage_gate=self._usage_gate,
-            model=model,
-            cwd=Path(self.config.explore_codebase_root),
-            output_schema=effective_output_schema,
+        # Session-capture substrate (task 2744): mint a CLI session and a per-run
+        # isolated config dir, persist the (session_id, stage) snapshot on the run
+        # row BEFORE launching the stage subprocess (mint-before-spawn, mirroring
+        # the orchestrator), then clear the snapshot once the subprocess exits so
+        # the row carries a session_id only while a stage is actually in flight.
+        # The config dir is derived deterministically from (data_dir, run_id) so
+        # all three stages of a run share it and the harness GCs the same path;
+        # attempt auto-increments per launch as durable history for task σ (resume).
+        session_id = str(uuid4())
+        config_dir = TaskConfigDir(
+            task_id=run_id,
+            base_dir=recon_config_base_dir(self.journal.data_dir),
         )
+        await self.journal.record_run_session(
+            run_id, session_id=session_id, stage_cursor=self.stage_id.value
+        )
+        try:
+            stage_result = await run_stage_via_cli(
+                system_prompt=self.get_system_prompt(),
+                payload=payload,
+                disallowed_tools=disallowed,
+                config=self.config,
+                mcp_config=mcp_config,
+                usage_gate=self._usage_gate,
+                model=model,
+                cwd=Path(self.config.explore_codebase_root),
+                output_schema=effective_output_schema,
+                session_id=session_id,
+                config_dir=config_dir,
+            )
+        finally:
+            await self.journal.clear_run_session(run_id)
 
         completed = datetime.now(UTC)
 

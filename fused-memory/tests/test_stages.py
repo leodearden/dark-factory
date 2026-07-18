@@ -8362,6 +8362,10 @@ def stage2_guard_mock_deps():
     write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
     journal_mock = MagicMock()
     journal_mock.write_journal = write_journal_mock
+    # Task 2744: BaseStage.run now records/clears a per-stage CLI session on the
+    # run row around the stage subprocess; these must be awaitable on the mock.
+    journal_mock.record_run_session = AsyncMock()
+    journal_mock.clear_run_session = AsyncMock()
     return {
         'memory_service': AsyncMock(),
         'taskmaster': AsyncMock(),
