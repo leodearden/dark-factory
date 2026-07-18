@@ -35,7 +35,8 @@ from escalation.models import Escalation
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.review_checkpoint import ReviewCheckpoint
-from orchestrator.routing import RoutingDecision
+from orchestrator.routing import RoleDefaults, RoutingDecision
+from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.steward import TaskSteward
 from orchestrator.verify import VerifyResult
 
@@ -622,3 +623,207 @@ class TestUnblockAutoAdoptsResolveRoute:
         entries = _routing_entries(rec)
         assert len(entries) == 1
         assert entries[0]['data']['source_layer'] == 'role_default'
+
+
+# ---------------------------------------------------------------------------
+# PRD boundary test 9 + cross-site byte-equivalence (steps 11-12)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBoundaryTest9CombinedOverrides:
+    """PRD boundary test 9, consolidated: ONE task's ``metadata.model_overrides``
+    carrying an entry for BOTH ``steward`` AND ``deep_reviewer``.
+
+    * The steward invocation (genuinely per-task) picks up ONLY its own
+      ``'steward'`` key and runs 'haiku', emitting a routing_decision with
+      ``source_layer='metadata_override'`` — the user-observable signal.
+    * deep_reviewer is STRUCTURALLY project-level (``_run_review(mode, modules)``
+      has no task in scope), so the SAME override dict never reaches it in
+      production: it resolves at the config layer and emits a routing_decision,
+      but cannot honor the task's ``deep_reviewer`` override. The "honor
+      override" half of boundary test 9 for deep_reviewer is therefore proven
+      at the shared-helper level (below, and in test_routing_dispatch.py's
+      step-1 helper unit tests), NOT via ReviewCheckpoint.
+    """
+
+    _COMBINED = {'model_overrides': {'steward': 'haiku', 'deep_reviewer': 'haiku'}}
+
+    async def test_steward_honors_only_its_own_override_key(
+        self, tmp_path: Path,
+    ) -> None:
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        rec = _RecordingEventStore()
+        task = {'id': '42', 'title': 't', 'description': 'd',
+                'metadata': dict(self._COMBINED)}
+        steward = _build_steward(wt, task=task, event_store=rec)
+
+        with patch('orchestrator.steward.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_stub_result())) as mock_iwcr:
+            await steward._invoke_with_session(
+                prompt='p', cwd=wt, mcp_config={'mcpServers': {}},
+                per_invocation_budget=3.0, escalation=_mk_escalation(),
+            )
+
+        # Picks up ONLY the 'steward' key from the combined dict (the
+        # 'deep_reviewer' entry is inert for the steward role).
+        assert mock_iwcr.call_args.kwargs['model'] == 'haiku'
+        entries = _routing_entries(rec)
+        assert len(entries) == 1
+        assert entries[0]['data']['role'] == 'steward'
+        assert entries[0]['data']['source_layer'] == 'metadata_override'
+        assert entries[0]['data']['model'] == 'haiku'
+
+    async def test_deep_reviewer_emits_but_cannot_see_task_override(self) -> None:
+        # deep_reviewer is project-level: no task/metadata flows into
+        # _run_review, so the combined override never reaches it. It still
+        # resolves through resolve_route and emits a routing_decision, but at
+        # the config layer (model='opus'), NOT the metadata_override the
+        # combined dict carries. Its override-honoring is proven at the helper
+        # level in the next test.
+        rec = _RecordingEventStore()
+        cp = _build_checkpoint(event_store=rec)
+        with (
+            patch('orchestrator.review_checkpoint.invoke_with_cap_retry',
+                  new=AsyncMock(return_value=_stub_result())) as mock_iwcr,
+            patch('orchestrator.review_checkpoint.run_full_verification',
+                  new=AsyncMock(return_value=_REVIEW_PHASE1)),
+            patch.object(ReviewCheckpoint, '_save_report', lambda *a, **k: None),
+        ):
+            await cp._run_review('full', [])
+
+        entries = _routing_entries(rec)
+        assert len(entries) == 1
+        assert entries[0]['data']['role'] == 'deep_reviewer'
+        # No task in scope → config layer, not metadata_override.
+        assert entries[0]['data']['source_layer'] == 'config'
+        assert mock_iwcr.call_args.kwargs['model'] == 'opus'
+
+    async def test_deep_reviewer_override_honored_at_helper_level(self) -> None:
+        # The reachable half of boundary test 9 for deep_reviewer: feed the
+        # override directly to the shared helper (the resolve path all five
+        # sites call). Mirrors test_routing_dispatch.py's helper-level override
+        # test, retargeted to role_name='deep_reviewer' — proving that WHERE a
+        # task IS in scope, deep_reviewer's override resolves to metadata_override.
+        rec = _RecordingEventStore()
+        decision = await resolve_and_record_route(
+            role_name='deep_reviewer',
+            role_defaults=RoleDefaults('opus', 'high', 10.0, 50),
+            config=_review_config(),
+            task_id='42',
+            task_metadata={'model_overrides': {'deep_reviewer': 'haiku'}},
+            event_store=rec,
+        )
+        assert decision.model == 'haiku'
+        assert decision.source_layer == 'metadata_override'
+        entries = _routing_entries(rec)
+        assert len(entries) == 1
+        assert entries[0]['data']['source_layer'] == 'metadata_override'
+        assert entries[0]['data']['model'] == 'haiku'
+
+
+def _full_role_config():
+    """Stock config carrying all four role-keyed out-of-band roles
+    (steward/triage/deep_reviewer/module_tagger) on the config sub-models, so
+    each resolves at ``resolve_route``'s layer-3 config (source_layer='config',
+    byte-equivalent to pre-η). unblock_auto is NOT here — its settings live on
+    the top-level ``config.unblock_auto`` block, not the role-keyed sub-models,
+    so it uses ``_unblock_config`` (``skip_role_config_layer``) instead."""
+    cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    cfg.fused_memory.project_id = 'dark_factory'
+    for role, model, budget, turns, effort in (
+        ('steward', 'opus', 5.0, 100, 'high'),
+        ('triage', 'sonnet', 2.0, 25, 'medium'),
+        ('deep_reviewer', 'opus', 10.0, 50, 'max'),
+        ('module_tagger', 'haiku', 1.0, 15, 'medium'),
+    ):
+        setattr(cfg.models, role, model)
+        setattr(cfg.budgets, role, budget)
+        setattr(cfg.max_turns, role, turns)
+        setattr(cfg.effort, role, effort)
+        setattr(cfg.backends, role, 'claude')
+    stamp_stock_routing_config(cfg)
+    return cfg
+
+
+# (role_name, config_factory, role_defaults, expected: layer/model/effort/budget/turns).
+# role_defaults for the config-layer roles are deliberately "wrong" sentinels so
+# the assertions prove the config layer (not the role_default base) supplied the
+# resolved values. For unblock_auto there is no config.models.unblock_auto field,
+# so layer-3 is skipped and the RoleDefaults base IS the resolved decision.
+_BYTE_EQUIV_CASES = [
+    pytest.param(
+        'steward', _full_role_config, RoleDefaults('haiku', 'low', 0.01, 1),
+        'config', 'opus', 'high', 5.0, 100, id='steward',
+    ),
+    pytest.param(
+        'triage', _full_role_config, RoleDefaults('haiku', 'low', 0.01, 1),
+        'config', 'sonnet', 'medium', 2.0, 25, id='triage',
+    ),
+    pytest.param(
+        'deep_reviewer', _full_role_config, RoleDefaults('haiku', 'low', 0.01, 1),
+        'config', 'opus', 'max', 10.0, 50, id='deep_reviewer',
+    ),
+    pytest.param(
+        'module_tagger', _full_role_config, RoleDefaults('haiku', 'low', 0.01, 1),
+        'config', 'haiku', 'medium', 1.0, 15, id='module_tagger',
+    ),
+    pytest.param(
+        'unblock_auto', _unblock_config, RoleDefaults('sonnet', 'high', 5.0, 50),
+        'role_default', 'sonnet', 'high', 5.0, 50, id='unblock_auto',
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'role_name, config_factory, role_defaults, exp_layer, exp_model, exp_effort, '
+    'exp_budget, exp_turns',
+    _BYTE_EQUIV_CASES,
+)
+async def test_cross_site_byte_equivalence_at_stock_config(
+    role_name, config_factory, role_defaults, exp_layer, exp_model, exp_effort,
+    exp_budget, exp_turns,
+) -> None:
+    """Cross-site byte-equivalence guard (PRD invariant 3 / decision 8): at stock
+    config (empty overrides, no shipped rule matching any of the five roles),
+    every out-of-band role resolves through the shared helper to EXACTLY its
+    pre-η (model, effort, budget_usd, max_turns) — config layer for
+    steward/triage/deep_reviewer/module_tagger, role_default for unblock_auto
+    (no config.models.unblock_auto field) — and the emitted routing_decision
+    faithfully carries that resolved tuple.
+
+    This is the resolver-contract table all five sites share; the per-site
+    tests above additionally assert how each site wires the decision into its
+    own ``invoke_with_cap_retry`` call (e.g. module_tagger deliberately does not
+    pass ``effort`` — the decision still records it here, for observability)."""
+    rec = _RecordingEventStore()
+    decision = await resolve_and_record_route(
+        role_name=role_name,
+        role_defaults=role_defaults,
+        config=config_factory(),
+        event_store=rec,
+    )
+
+    # The resolved decision equals the pre-η stock values, byte-for-byte.
+    assert decision.model == exp_model
+    assert decision.effort == exp_effort
+    assert decision.budget_usd == exp_budget
+    assert decision.max_turns == exp_turns
+    assert decision.source_layer == exp_layer
+    # No stock rule matches these roles, so none fired.
+    assert decision.rule_id is None
+    assert decision.rejected == ()
+
+    # Exactly one routing_decision event, carrying the same resolved tuple.
+    entries = _routing_entries(rec)
+    assert len(entries) == 1
+    data = entries[0]['data']
+    assert data['role'] == role_name
+    assert data['source_layer'] == exp_layer
+    assert data['model'] == exp_model
+    assert data['effort'] == exp_effort
+    assert data['budget_usd'] == exp_budget
+    assert data['max_turns'] == exp_turns
+    assert data['inputs_digest']
