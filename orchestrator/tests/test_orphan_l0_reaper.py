@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
@@ -60,6 +60,42 @@ def _submit_aged(
         timestamp=ts,
         worktree=worktree,
         level=level,
+    )
+    queue.submit(esc)
+    return esc
+
+
+def _submit_aged_done_step_commit_orphan(
+    queue: EscalationQueue,
+    task_id: str,
+    seconds_ago: float,
+    *,
+    step_id: str = 'step-7',
+    stale_commit: str = 'fb62c8e439abc123',
+) -> Escalation:
+    """Submit an aged L0 matching the done-step-commit class filed by
+    ``TaskWorkflow._escalate_unreconciled_done_step`` (workflow.py:5488) —
+    ``agent_role='orchestrator'``, ``category='infra_issue'``,
+    ``suggested_action='verify_wip_reconciliation'``.
+    """
+    ts = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
+    esc = Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role='orchestrator',
+        severity='info',
+        category='infra_issue',
+        summary=(
+            f"Done step {step_id}'s commit {stale_commit[:10]} is orphaned "
+            'and could not be auto-reconciled against WIP tip <none>'
+        ),
+        detail=(
+            f'Step {step_id} recorded commit {stale_commit}, which is no '
+            'longer reachable from HEAD.'
+        ),
+        suggested_action='verify_wip_reconciliation',
+        timestamp=ts,
+        level=0,
     )
     queue.submit(esc)
     return esc
@@ -196,6 +232,45 @@ class TestOrphanL0Reaper:
         l0s = [e for e in pending if e.level == 0]
         assert len(l1s) == 2
         assert len(l0s) == 1  # the young one remains
+
+    @pytest.mark.asyncio
+    async def test_done_step_commit_orphan_dismissed_when_subject_terminal_merged(
+        self, harness: Harness,
+    ):
+        """Task 2725: a done-step-commit-class orphan (filed by
+        ``TaskWorkflow._escalate_unreconciled_done_step``) whose subject
+        task is terminal ('done') and merged
+        (``done_provenance.kind='merged'``) is a rebase-superseded false
+        positive — the step's content landed on main under a new SHA, so
+        the reaper dismisses the orphan instead of promoting a duplicate
+        manual-triage L1.
+        """
+        assert harness._escalation_queue is not None
+        orphan = _submit_aged_done_step_commit_orphan(
+            harness._escalation_queue, 'task-2679', seconds_ago=300.0,
+        )
+        harness.scheduler.get_task = AsyncMock(
+            return_value={
+                'status': 'done',
+                'metadata': {'done_provenance': {'kind': 'merged'}},
+            },
+        )
+
+        count = await harness._reap_orphan_l0_escalations()
+        assert count == 0  # nothing promoted
+
+        refreshed = harness._escalation_queue.get(orphan.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolved_by == 'harness-orphan-reaper'
+
+        # No new L1 was created for this orphan.
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 0
 
 
 class TestReviewerEscalationPromotion:
