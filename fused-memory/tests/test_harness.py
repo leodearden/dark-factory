@@ -2145,6 +2145,93 @@ async def test_cancellation_cleanup_failure_preserves_cancelled_error(
 
 
 @pytest.mark.asyncio
+async def test_run_full_cycle_cancelled_marks_interrupted_and_keeps_events(
+    journal, event_buffer, mock_memory_service,
+):
+    """task σ: with resume_after_restart=True, a mid-cycle CancelledError marks the
+    run `interrupted` (not `failed`), leaves the drained events drained (no
+    restore_drained) and the per-run config dir intact (no gc), and preserves the
+    already-completed stage's report — so the startup pass can --resume it."""
+    import asyncio
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.resume_after_restart = True
+
+    # Stage 1 completes; Stage 2 is interrupted by a restart (CancelledError).
+    _mock_stage_run(harness.stages[0])
+
+    async def cancel_run(events, watermark, prior_reports, run_id, model=None):
+        raise asyncio.CancelledError()
+
+    harness.stages[1].run = cancel_run
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    restore_spy = AsyncMock(side_effect=event_buffer.restore_drained)
+    event_buffer.restore_drained = restore_spy
+
+    with patch(
+        'fused_memory.reconciliation.harness.gc_run_config_dir',
+    ) as gc_mock, pytest.raises(asyncio.CancelledError):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    # Events stay drained (resumed work must not be double-processed).
+    restore_spy.assert_not_awaited()
+    # Transcript kept for --resume — config dir NOT gc'd.
+    gc_mock.assert_not_called()
+
+    runs = await journal.get_recent_runs('test-project', limit=5)
+    assert len(runs) >= 1
+    run = runs[0]
+    assert run.status == RunStatus.interrupted
+    # The completed Stage 1 report survives for the resume pass to skip it.
+    assert 'memory_consolidator' in run.stage_reports
+    # And its drained events are still retrievable (not restored to 'buffered').
+    drained = await event_buffer.get_drained_events('test-project', run.id)
+    assert len(drained) >= 1
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_cancelled_falls_back_when_resume_disabled(
+    journal, event_buffer, mock_memory_service,
+):
+    """task σ: with resume_after_restart=False, a mid-cycle CancelledError keeps
+    today's behaviour verbatim — status `failed`, restore_drained called, config
+    dir gc'd."""
+    import asyncio
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.resume_after_restart = False
+
+    _mock_stage_run(harness.stages[0])
+
+    async def cancel_run(events, watermark, prior_reports, run_id, model=None):
+        raise asyncio.CancelledError()
+
+    harness.stages[1].run = cancel_run
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    restore_spy = AsyncMock(side_effect=event_buffer.restore_drained)
+    event_buffer.restore_drained = restore_spy
+
+    with patch(
+        'fused_memory.reconciliation.harness.gc_run_config_dir',
+    ) as gc_mock, pytest.raises(asyncio.CancelledError):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    # Legacy path: events restored, config dir GC'd, run failed.
+    restore_spy.assert_awaited()
+    gc_mock.assert_called_once()
+
+    runs = await journal.get_recent_runs('test-project', limit=5)
+    assert len(runs) >= 1
+    assert runs[0].status == RunStatus.failed
+
+
+@pytest.mark.asyncio
 async def test_cancellation_cleanup_shielded_from_second_cancel(
     journal,
     event_buffer,
