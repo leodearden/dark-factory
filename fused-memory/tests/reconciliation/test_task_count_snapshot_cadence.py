@@ -54,10 +54,12 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
     TASK_COUNT_SNAPSHOT_MISS_THRESHOLD,
     build_stale_snapshot_finding,
     build_task_count_snapshot_content,
+    build_task_count_snapshot_unavailable_content,
     compute_snapshot_miss_streak,
     evaluate_snapshot_cadence,
     extract_snapshot_written,
 )
+from fused_memory.reconciliation.task_filter import is_count_snapshot
 
 
 def _scope(project_id: str, project_root: str) -> ProjectScope:
@@ -296,6 +298,57 @@ class TestBuildTaskCountSnapshotContent:
         assert 'reify' in content
         assert '42' in content
         assert '99' in content
+
+
+class TestBuildTaskCountSnapshotUnavailableContent:
+    """build_task_count_snapshot_unavailable_content(...) -> str (task 2738).
+
+    Pure, dependency-free renderer for the UNKNOWN sentinel written by
+    ``_write_task_count_snapshot`` when a zero-count project_root is not a
+    readable git working tree -- i.e. the zero count is a false census from
+    SqliteTaskBackend.get_tasks auto-creating an empty tasks.db, not a
+    genuinely empty project. Sibling of TestBuildTaskCountSnapshotContent
+    above: no I/O, no mocks needed.
+    """
+
+    def test_content_is_non_empty_string(self):
+        out = build_task_count_snapshot_unavailable_content(
+            'my_solar_challenge', '/home/leo/src/my-solar-challenge',
+        )
+
+        assert isinstance(out, str)
+        assert out
+
+    def test_content_is_not_mistaken_for_a_numeric_count_snapshot(self):
+        out = build_task_count_snapshot_unavailable_content(
+            'my_solar_challenge', '/home/leo/src/my-solar-challenge',
+        )
+
+        assert is_count_snapshot(out) is False
+
+    def test_content_names_project_id_and_root(self):
+        out = build_task_count_snapshot_unavailable_content(
+            'my_solar_challenge', '/home/leo/src/my-solar-challenge',
+        )
+
+        assert 'my_solar_challenge' in out
+        assert '/home/leo/src/my-solar-challenge' in out
+
+    def test_content_signals_unavailability_and_reason(self):
+        out = build_task_count_snapshot_unavailable_content(
+            'my_solar_challenge', '/home/leo/src/my-solar-challenge',
+        )
+
+        assert 'UNAVAILABLE' in out or 'unavailable' in out
+        assert 'not a readable git working tree' in out
+
+    def test_content_carries_no_zeroed_numeric_census(self):
+        out = build_task_count_snapshot_unavailable_content(
+            'my_solar_challenge', '/home/leo/src/my-solar-challenge',
+        )
+
+        assert '0 total' not in out
+        assert '0 done' not in out
 
 
 # ---------------------------------------------------------------------------
