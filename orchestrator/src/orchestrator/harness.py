@@ -6080,6 +6080,16 @@ task, include it with an empty "files" list rather than omitting it.
             # uncovered.  The stamp is instead cleared at (re)dispatch (top of
             # _run_slot) and lazily pruned by the sweep's grace-check reader.
             self._workflow_slot_tasks.pop(assignment.task_id, None)
+            # Defensive merge-phase grace clear (task 2753): mirrors the
+            # inline clear at the durable-enqueue boundary in
+            # _submit_to_merge_queue, covering abnormal slot exits (e.g.
+            # WorkflowCancelled raised before that inline clear). Unlike
+            # _workflow_cancel_at above, clearing here is CORRECT: once the
+            # slot exits there is no more pre-enqueue verify to protect — the
+            # workflow either enqueued (and cleared inline) or died — so
+            # releasing the grace immediately is exactly right (the monotonic
+            # stamp would auto-expire regardless; this just does it promptly).
+            self.scheduler.clear_merge_phase(assignment.task_id)
             self._terminal_cancel_counts.pop(assignment.task_id, None)
             # W9-θ: the former B2 belt-and-suspenders release (any DONE/CANCELLED
             # that missed B1, e.g. authoritative-cancel returning normally from
@@ -7255,10 +7265,18 @@ task, include it with an empty "files" list rather than omitting it.
         a merge can still be queued or in-flight/verifying — restarting the
         orchestrator mid-merge would be disruptive. True only when there is
         nothing queued (``self._merge_queue.empty()``) AND nothing in-flight
-        or verifying (``worker.snapshot()['depth'] == 0``). True when
-        ``_merge_worker`` is None (bare / unit-test harness — no pipeline to
-        drain). Fail-safe: any exception reading the snapshot returns False
-        (never restart when drain state is unknown).
+        or verifying (``worker.snapshot()['depth'] == 0``) AND no pre-enqueue
+        MERGE-phase workflow is inside its grace window
+        (``not self._merge_phase_grace_active()`` — task 2753). The merge-phase
+        term closes the pre-enqueue gap: a workflow doing its Phase-1 rebase +
+        scoped re-verify has NOT yet reached the durable merge journal, so it
+        is invisible to the queue-depth + snapshot terms; without this a polite
+        redeploy would cancel it seconds before it becomes crash-recoverable.
+        True when ``_merge_worker`` is None (bare / unit-test harness — no
+        pipeline to drain). Fail-safe: any exception reading the snapshot
+        returns False (never restart when drain state is unknown); the
+        merge-phase term itself fails toward True-idle (see
+        ``_merge_phase_grace_active``).
         """
         if self._merge_worker is None:
             return True
@@ -7272,7 +7290,44 @@ task, include it with an empty "files" list rather than omitting it.
                 exc_info=True,
             )
             return False
-        return self._merge_queue.empty() and depth == 0
+        return (
+            self._merge_queue.empty()
+            and depth == 0
+            and not self._merge_phase_grace_active()
+        )
+
+    def _merge_phase_grace_active(self) -> bool:
+        """True iff a pre-enqueue MERGE-phase workflow is inside its grace window.
+
+        Reads ``config.orchestrator_restart_merge_phase_grace_secs`` and
+        delegates to ``scheduler.merge_phase_grace_active`` (task 2753). Used
+        BOTH as the polite path's ``_merge_pipeline_idle`` term and as the
+        force-fire path's bounded ``merge_phase_hold`` (see
+        ``_build_orchestrator_restart_coordinator``).
+
+        Fails toward FALSE (no grace, proceed) — deliberately UNLIKE
+        ``_merge_pipeline_idle``'s snapshot fail-safe which defers. This grace
+        is a protective ADD-ON layered on the durable-queue crash-recovery: if
+        the check itself errored and we deferred, we would introduce a NEW
+        indefinite-veto/livelock failure mode — the very class of bug this task
+        fixes. Degrading to "no grace considered" reproduces exact
+        pre-task-2753 behaviour (already shipping, safe), and a WARNING keeps
+        the failure loud. A ``grace_secs <= 0`` config disables the grace
+        entirely (kill switch) without consulting the scheduler.
+        """
+        try:
+            grace_secs = self.config.orchestrator_restart_merge_phase_grace_secs
+            if grace_secs <= 0:
+                return False
+            return self.scheduler.merge_phase_grace_active(grace_secs)
+        except Exception:
+            logger.warning(
+                '_merge_phase_grace_active: merge-phase grace check failed;'
+                ' treating as NO grace (fail toward proceeding, NOT deferring)'
+                ' — reproduces exact pre-task-2753 behaviour.',
+                exc_info=True,
+            )
+            return False
 
     def _build_service_restart_coordinator(self) -> StaleServiceRestartCoordinator:
         """Construct a StaleServiceRestartCoordinator from the current config.
@@ -7363,6 +7418,19 @@ task, include it with an empty "files" list rather than omitting it.
           merge interrupted mid-verify by that shutdown is recovered from the
           merge queue's durable, crash-safe journal (task 1772/2153) on the
           next startup — not from a merge-drain gate at restart time.
+        - ``merge_phase_hold`` / ``merge_phase_grace_secs`` (task 2753): the
+          PRE-enqueue MERGE-phase window (Phase-1 rebase + scoped re-verify,
+          before ``merge_queued``) is NOT yet on that durable journal, so it is
+          invisible to ``_merge_pipeline_idle``'s queue-depth + snapshot terms.
+          ``merge_phase_hold=self._merge_phase_grace_active`` additionally holds
+          BOTH the polite path (via the precondition term) and the force-fire
+          escape while such a workflow is racing to the queue — but the
+          force-fire hold is bounded by an absolute owed-age ceiling of
+          ``force_fire_after_secs + merge_phase_grace_secs`` (see
+          ``StaleServiceRestartCoordinator.maybe_restart``), so the grace
+          bounds rather than indefinitely vetoes. The check fails toward
+          proceeding (no grace) on any internal error, so it can never itself
+          introduce a new indefinite veto.
 
         ``require_idle=True`` and ``script_args=[]`` mirror the fused-memory
         coordinator (idle-only; restart-orchestrator.sh takes no positional
@@ -7431,6 +7499,16 @@ task, include it with an empty "files" list rather than omitting it.
             restart_executor=_systemd_run_restart_executor,
             min_interval_secs=self.config.orchestrator_restart_min_interval_secs,
             force_fire_after_secs=self.config.orchestrator_restart_force_fire_after_secs,
+            # Bounded pre-enqueue MERGE-phase hold (task 2753). merge_phase_hold
+            # is the same gate as the polite-path restart_precondition term
+            # (_merge_phase_grace_active); on the force-fire path maybe_restart
+            # honors it only up to the absolute owed-age ceiling
+            # force_fire_after_secs + merge_phase_grace_secs, so a rolling merge
+            # stream can never push the redeploy past that ceiling. The
+            # fused-memory/dashboard builders omit both (defaults None/0.0 → no
+            # hold, byte-identical).
+            merge_phase_hold=self._merge_phase_grace_active,
+            merge_phase_grace_secs=self.config.orchestrator_restart_merge_phase_grace_secs,
             state_path=redeploy_state_path,
             # restart-all-orchestrators.sh is the SOLE on-disk clock writer,
             # stamping only on its verified-fresh exit-0 path — the watchdog
