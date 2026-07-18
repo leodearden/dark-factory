@@ -172,6 +172,7 @@ class MemoryConsolidator(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
+        resume_session_id: str | None = None,
     ) -> StageReport:
         """Execute Stage 1 and post-process items_flagged through the flag deduplicator.
 
@@ -179,7 +180,10 @@ class MemoryConsolidator(BaseStage):
         point of a remediation pass is to re-emit a curated list, and running
         dedup on those flags would defeat the remediation contract.
         """
-        report = await super().run(events, watermark, prior_reports, run_id, model=model)
+        report = await super().run(
+            events, watermark, prior_reports, run_id, model=model,
+            resume_session_id=resume_session_id,
+        )
         report.stats['entity_summary_snapshot_lines_stripped'] = (
             self._entity_summary_snapshot_lines_stripped
         )

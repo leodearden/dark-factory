@@ -2846,6 +2846,7 @@ async def test_opus_tier_propagates_limits_to_consolidator(
         prior_reports,
         run_id,
         model=None,
+        resume_session_id=None,
         _s=stage0,
     ):
         captured['episode_limit'] = _s.episode_limit
@@ -5996,9 +5997,8 @@ async def test_resume_interrupted_runs_adopts_and_resumes(
         captured['lock_holder_during'] = (
             await event_buffer.get_lock_holder_instance_id(project_id)
         )
-        captured['resume_run_id'] = (
-            kwargs.get('resume_run').id if kwargs.get('resume_run') else None
-        )
+        _resume_run = kwargs.get('resume_run')
+        captured['resume_run_id'] = _resume_run.id if _resume_run else None
         captured['events'] = kwargs.get('events')
         return await orig_run_full_cycle(*args, **kwargs)
 
@@ -10575,7 +10575,8 @@ async def test_run_full_cycle_injects_filtered_task_tree_into_integrity_check(
     for stage in harness.stages:
         if isinstance(stage, IntegrityCheck):
             async def mock_stage3_run(
-                events, watermark, prior_reports, run_id, model=None, _s=stage
+                events, watermark, prior_reports, run_id, model=None,
+                resume_session_id=None, _s=stage
             ):
                 captured_tree['tree'] = _s.filtered_task_tree
                 return StageReport(
