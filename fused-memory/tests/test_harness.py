@@ -699,7 +699,7 @@ async def test_run_full_cycle_persists_judge_pending_marker_and_tracks_task(
     harness.judge = MagicMock()
     never_set = asyncio.Event()
 
-    async def _blocking_judge(_run_id):
+    async def _blocking_judge(run_id):
         await never_set.wait()
 
     harness._run_judge = _blocking_judge
@@ -731,7 +731,7 @@ async def test_drain_judge_tasks_cancels_and_marker_persists(
 
     never_set = asyncio.Event()
 
-    async def _blocking_judge(_run_id):
+    async def _blocking_judge(run_id):
         # Blocks mid-review, before any verdict is written.
         await never_set.wait()
 
