@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import re
@@ -864,6 +865,35 @@ class MemoryService:
                     error=str(e),
                 )
             raise
+
+    @staticmethod
+    def _mem0_payload_digest(
+        content: str,
+        project_id: str | None,
+        agent_id: str | None,
+        session_id: str | None,
+        category: str | None,
+        metadata: dict | None,
+    ) -> str:
+        """sha256 over the canonical mem0 write payload — audit/idempotency key.
+
+        Used to stamp the write-ahead ``mem0_intent`` (task 2710) so a
+        dead-lettered intent carries a stable fingerprint of exactly what
+        would have been written, for audit and manual replay.
+        """
+        canonical = json.dumps(
+            {
+                'content': content,
+                'project_id': project_id,
+                'agent_id': agent_id,
+                'session_id': session_id,
+                'category': category,
+                'metadata': metadata or {},
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
 
     # ------------------------------------------------------------------
     # Durable queue: execute write dispatcher
@@ -2129,6 +2159,35 @@ class MemoryService:
         # The _execute_durable_write 'mem0_add' dispatcher is kept intact for backward
         # compat — any in-flight queue items from before this fix still drain correctly.
         if write_mem0:
+            # Write-ahead intent (task 2710): durably journal the intended
+            # mem0 write BEFORE the risky await, so a crash mid-mem0-write
+            # leaves a 'pending' trace instead of a silently orphaned Graphiti
+            # twin. recover_mem0_intents reconciles any pending intent at
+            # startup. Keyed to the existing write_op_id so the reconciler can
+            # correlate with the per-call mem0 backend_op as evidence.
+            intent_id: str | None = None
+            if self._write_journal:
+                intent_id = str(uuid_mod.uuid4())
+                payload_digest = self._mem0_payload_digest(
+                    content,
+                    project_id,
+                    agent_id,
+                    session_id,
+                    resolved_category.value,
+                    meta,
+                )
+                await self._write_journal.log_mem0_intent(
+                    intent_id=intent_id,
+                    write_op_id=write_op_id,
+                    causation_id=causation_id,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    category=resolved_category.value,
+                    content=content,
+                    metadata=meta,
+                    payload_digest=payload_digest,
+                )
             try:
                 mem0_result = await self._journaled_backend_call(
                     write_op_id=write_op_id,
@@ -2145,6 +2204,11 @@ class MemoryService:
                 ]
                 memory_ids.extend(mem0_ids)
                 stores_written.append(SourceStore.mem0)
+                # In-request call resolved without raising → stamp terminal.
+                if self._write_journal and intent_id:
+                    await self._write_journal.resolve_mem0_intent(
+                        intent_id, 'completed'
+                    )
                 if not mem0_ids and _MEM0_ADD_INFER_PINNED_FALSE:
                     # mem0.add() did not raise but returned no results — a silent
                     # dedup/infer no-op drop (task 1974). Under the pinned
@@ -2163,6 +2227,13 @@ class MemoryService:
             except Exception as e:
                 logger.error(f'Mem0 write failed: {e}')
                 _mem0_error = str(e)
+                # add() provably raised → mem0 did NOT persist. Stamp the
+                # intent 'failed' (the reconciler treats a failed-only
+                # backend_op as safe to re-issue).
+                if self._write_journal and intent_id:
+                    await self._write_journal.resolve_mem0_intent(
+                        intent_id, 'failed', reason=str(e)
+                    )
 
         # Layer 1 journal entry
         if self._write_journal:
@@ -2209,6 +2280,148 @@ class MemoryService:
             category=resolved_category,
             message=msg,
         )
+
+    # ------------------------------------------------------------------
+    # Recovery: reconcile crash-mid-write mem0 intents (task 2710)
+    # ------------------------------------------------------------------
+
+    async def recover_mem0_intents(self) -> dict[str, int]:
+        """Reconcile every crash-mid-write mem0 intent still ``pending``.
+
+        A ``pending`` intent means the process died between the write-ahead
+        intent (committed before the mem0 await) and its terminal stamp.
+        Classify each by the existing per-call mem0 ``backend_op`` keyed on
+        ``write_op_id`` — reusing durable evidence rather than a second
+        bookkeeping channel:
+
+        - a SUCCESS mem0 backend_op → the write provably landed (only the
+          completion stamp was lost) → mark ``completed``; NOT an orphan, no
+          re-issue.
+        - only FAILED mem0 backend_op(s) → ``add()`` raised. In the common
+          (clean, pre-persist) failure mem0 did not land, so re-issue is safe
+          (0 prior writes + 1 = 1): rebuild ``Scope`` + metadata and call
+          ``mem0.add``; ``completed`` on success, ``dead`` on error.
+          RESIDUAL DUPLICATE RISK (accepted, documented): a failure raised
+          AFTER mem0 committed but at/near the response (e.g. a read-timeout
+          on an otherwise-successful add) ALSO records a FAILED backend_op
+          while the write actually landed — re-issuing then mints a duplicate
+          twin, since the pinned ``infer=False`` add is non-idempotent. We
+          accept this narrow post-send-failure risk to heal the far more
+          common clean-failure case; the fully UNKNOWN no-beop case below is
+          the one we refuse to auto-re-issue.
+        - NO mem0 backend_op → outcome UNKNOWN (killed before/inside the
+          await) → dead-letter with a structured reason. ``mem0.add`` pins
+          ``infer=False`` and is non-idempotent, so a blind re-issue risks a
+          duplicate twin; the goal is that a partial write is never SILENT,
+          not automatic healing. Manual replay remains available.
+
+        Every outcome is a durable row (readable via ``get_mem0_intents``)
+        plus a loud log line. Idempotent — no pending intents ⇒ zeroed
+        summary — so it is safe to run on every startup.
+        """
+        summary = {'scanned': 0, 'reconciled': 0, 'reissued': 0, 'dead_lettered': 0}
+        if self._write_journal is None:
+            return summary
+
+        pending = await self._write_journal.get_incomplete_mem0_intents()
+        for intent in pending:
+            summary['scanned'] += 1
+            intent_id = intent['id']
+            write_op_id = intent['write_op_id']
+            payload_digest = intent.get('payload_digest')
+
+            beops = await self._write_journal.get_backend_ops_for_write_op(
+                write_op_id
+            )
+            mem0_beops = [b for b in beops if b.get('backend') == 'mem0']
+            any_success = any(b.get('success') for b in mem0_beops)
+
+            if any_success:
+                # Write landed; only the completion stamp was lost.
+                await self._write_journal.resolve_mem0_intent(
+                    intent_id,
+                    'completed',
+                    reason='reconciled: mem0 backend_op confirms write landed',
+                )
+                summary['reconciled'] += 1
+                logger.info(
+                    'recover_mem0_intents: intent %s reconciled completed — '
+                    'mem0 backend_op confirms write landed (write_op_id=%s)',
+                    intent_id,
+                    write_op_id,
+                )
+            elif mem0_beops:
+                # Only failed backend_op(s) → add() raised → re-issue. Heals the
+                # common pre-persist failure; see the RESIDUAL DUPLICATE RISK
+                # note in this method's docstring for the narrow
+                # post-commit-failure case where this can mint a duplicate twin.
+                try:
+                    scope = Scope(
+                        project_id=intent.get('project_id') or 'main',
+                        agent_id=intent.get('agent_id'),
+                        session_id=intent.get('session_id'),
+                    )
+                    metadata = json.loads(intent.get('metadata') or '{}')
+                    await self.mem0.add(
+                        content=intent.get('content') or '',
+                        scope=scope,
+                        metadata=metadata,
+                    )
+                    await self._write_journal.resolve_mem0_intent(
+                        intent_id,
+                        'completed',
+                        reason='reconciled: re-issued after failed-only mem0 backend_op',
+                    )
+                    summary['reissued'] += 1
+                    logger.warning(
+                        'recover_mem0_intents: intent %s re-issued and completed — '
+                        'prior mem0 add failed (write_op_id=%s)',
+                        intent_id,
+                        write_op_id,
+                    )
+                except Exception as e:
+                    reason = (
+                        f're-issue failed: {type(e).__name__}: {e} '
+                        f'(write_op_id={write_op_id}, payload_digest={payload_digest})'
+                    )
+                    await self._write_journal.resolve_mem0_intent(
+                        intent_id, 'dead', reason=reason
+                    )
+                    summary['dead_lettered'] += 1
+                    logger.error(
+                        'recover_mem0_intents: intent %s dead-lettered — re-issue '
+                        'raised: %s',
+                        intent_id,
+                        e,
+                    )
+            else:
+                # No backend_op → UNKNOWN outcome → dead-letter (never silent).
+                reason = (
+                    'dead-lettered: no mem0 backend_op for '
+                    f'write_op_id={write_op_id} — outcome UNKNOWN (killed '
+                    'before/inside the mem0 await). '
+                    f'payload_digest={payload_digest} '
+                    f'project_id={intent.get("project_id")} '
+                    f'agent_id={intent.get("agent_id")} '
+                    f'session_id={intent.get("session_id")}. '
+                    'Not auto-re-issued: infer=False add is non-idempotent and '
+                    'would risk a duplicate twin; manual replay available.'
+                )
+                await self._write_journal.resolve_mem0_intent(
+                    intent_id, 'dead', reason=reason
+                )
+                summary['dead_lettered'] += 1
+                logger.warning(
+                    'recover_mem0_intents: intent %s dead-lettered — no mem0 '
+                    'backend_op, outcome UNKNOWN (write_op_id=%s, payload_digest=%s)',
+                    intent_id,
+                    write_op_id,
+                    payload_digest,
+                )
+
+        if summary['scanned']:
+            logger.info('recover_mem0_intents complete: %s', summary)
+        return summary
 
     async def add_system_record(
         self,

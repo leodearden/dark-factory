@@ -525,6 +525,22 @@ async def run_server():
     await write_journal.initialize()
     memory_service.set_write_journal(write_journal)
 
+    # Reconcile any crash-mid-write dual-store mem0 intents (task 2710).
+    # The journal is wired only after memory_service.initialize() (which sets
+    # self.mem0 / self.durable_queue), so this must run here rather than inside
+    # initialize(). Idempotent — no pending intents ⇒ no-op — so it is safe to
+    # run on every startup; a partial dual write is thus never left SILENT.
+    _mem0_recovery = await memory_service.recover_mem0_intents()
+    logger.info(f'mem0 intent recovery at startup: {_mem0_recovery}')
+
+    # Bounded retention: age out old terminal mem0_intents so the write-ahead
+    # journal does not grow without bound (one row accrues per successful mem0
+    # write). Runs after recovery so no still-pending intent is ever pruned;
+    # 'dead' dead-letters are preserved for manual replay. Fire-and-forget.
+    _mem0_pruned = await write_journal.prune_mem0_intents()
+    if _mem0_pruned:
+        logger.info(f'mem0 intent retention prune at startup: {_mem0_pruned} rows')
+
     # Initialize task backend (SqliteTaskBackend).
     taskmaster = None
     task_interceptor = None
