@@ -235,10 +235,10 @@ def _build_session_record(
     encoded worktree dir (``session_path.parent.name``) as *encoded_dir*.
     """
     try:
-        size_bytes = session_path.stat().st_size
+        st = session_path.stat()
     except OSError:
         return None
-    if size_bytes == 0:
+    if st.st_size == 0:
         return None
 
     cwd, session_date = _session_cwd_and_date(session_path)
@@ -246,10 +246,13 @@ def _build_session_record(
         return None
 
     if session_date is None:
+        # Reuse the single ``stat()`` above for the mtime fallback rather than
+        # re-stat'ing the same path (reviewer_comprehensive/efficiency, task
+        # 2730 amendment pass): ``datetime.fromtimestamp`` can still raise
+        # ``OSError`` for an out-of-range mtime, so the degrade-to-None guard
+        # is preserved verbatim.
         try:
-            session_date = datetime.fromtimestamp(
-                session_path.stat().st_mtime, tz=UTC
-            ).date()
+            session_date = datetime.fromtimestamp(st.st_mtime, tz=UTC).date()
         except OSError:
             return None
     if session_date != target_date:
@@ -260,7 +263,7 @@ def _build_session_record(
         encoded_dir=encoded_dir,
         cwd=cwd,
         date=session_date,
-        size_bytes=size_bytes,
+        size_bytes=st.st_size,
     )
 
 
@@ -277,10 +280,23 @@ def _iter_archive_transcripts(root: Path) -> Iterator[Path]:
     membership authority. Yields nothing when *root* is not an existing
     directory: an absent, not-yet-created archive root is normal (the tree
     is git-ignored and may not exist yet).
+
+    A SINGLE recursive walk (``rglob('*.jsonl*')``) filtered by suffix, not
+    two separate ``rglob`` passes for ``*.jsonl`` and ``*.jsonl.gz`` — the
+    combined glob is a strict superset of both, and the ``endswith`` filter
+    trims it back to exactly the two transcript classes, so the yielded set
+    (and its sort order) is byte-identical to the two-pass form while halving
+    the directory-tree traversal cost (reviewer_comprehensive/performance,
+    task 2730 amendment pass).
     """
     if not root.is_dir():
         return
-    yield from sorted([*root.rglob('*.jsonl'), *root.rglob('*.jsonl.gz')])
+    matches = [
+        p
+        for p in root.rglob('*.jsonl*')
+        if p.name.endswith('.jsonl') or p.name.endswith('.jsonl.gz')
+    ]
+    yield from sorted(matches)
 
 
 def enumerate_sessions(
