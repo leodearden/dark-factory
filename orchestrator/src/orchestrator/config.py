@@ -494,7 +494,13 @@ class StarvationWatchdogConfig(BaseModel):
     files exactly ONE INFO-level escalation so an AFK operator is notified.
     The escalation auto-resolves when the task finally dispatches.
 
-    Both gates must be crossed simultaneously:
+    The escalation fires when EITHER gate is crossed (OR, not AND):
+    - the dual gate — ``skip_threshold`` AND ``idle_secs`` both crossed; or
+    - the idle-only backstop — ``idle_only_secs`` crossed regardless of
+      skip_count (catches never-top-scored tasks that accrue zero skips and so
+      can never cross the dual gate — reify-5166 RCA, task 2755).
+
+    Dual-gate components:
     - ``skip_threshold`` — minimum consecutive top-skips (reuses ``_skip_count``).
     - ``idle_secs`` — minimum wall-clock seconds of continuous dispatch-eligibility
       (anchored on the first tick the task appears as a candidate; resets if it
@@ -544,6 +550,34 @@ class StarvationWatchdogConfig(BaseModel):
             'noise.'
         ),
     )
+    idle_only_secs: float = Field(
+        default=259200.0,
+        gt=0,
+        description=(
+            'Never-top-scored starvation backstop.  A task continuously '
+            'dispatch-eligible for this many wall-clock seconds files the '
+            'escalation on idle ALONE — the skip-gate is waived (OR, not AND). '
+            'This catches the structural blind spot where a low-priority task can '
+            'never outscore a medium/high candidate, is never the top-scored '
+            'candidate, accrues ZERO skips, and so can never cross the '
+            'skip_threshold+idle_secs dual gate (reify-5166 RCA, task 2755).  Must '
+            'be > 0 and >= idle_secs (enforced by a model_validator).  Default '
+            '259200s (72h) == idle_secs default, so it never fires on ordinary '
+            'contention (all 209 prior firings starved < 6h); raise it above '
+            'idle_secs to restore a two-tier fast-skip / slow-idle scheme.'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def _reject_idle_only_below_idle(self) -> 'StarvationWatchdogConfig':
+        if self.idle_only_secs < self.idle_secs:
+            raise ValueError(
+                f'StarvationWatchdogConfig.idle_only_secs ({self.idle_only_secs}) '
+                f'must be >= idle_secs ({self.idle_secs}); an idle-only backstop '
+                'narrower than the dual-gate idle component would silently pre-empt '
+                'the skip path for all tasks.  Set idle_only_secs >= idle_secs.'
+            )
+        return self
 
 
 class WarmBaseHardDownConfig(BaseModel):
@@ -3719,6 +3753,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'starvation_watchdog.enabled',
         'starvation_watchdog.skip_threshold',
         'starvation_watchdog.idle_secs',
+        'starvation_watchdog.idle_only_secs',
         'warm_base_hard_down.enabled',
         'warm_base_hard_down.l2_window_secs',
         # Loop-pass thresholds (+ the two crashloop-window params read live
