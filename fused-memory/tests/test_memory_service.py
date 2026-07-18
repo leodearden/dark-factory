@@ -8494,6 +8494,38 @@ class TestGetMemoryById:
         assert result['metadata'] == payload
 
     @pytest.mark.asyncio
+    async def test_content_fallback_to_content_key(self, service):
+        """With neither 'data' nor 'memory', content falls back to the third and
+        last key in the canonical _MEM0_CONTENT_KEYS order ('content')."""
+        payload = {'content': 'c', 'category': 'observations_and_summaries'}
+        service.mem0.get_point_by_id = AsyncMock(return_value=payload)
+
+        result = await service.get_memory_by_id(project_id='dark_factory', memory_id='u')
+
+        assert result is not None
+        assert result['content'] == 'c', f'expected content from content key, got {result!r}'
+        assert result['metadata'] == payload
+
+    @pytest.mark.asyncio
+    async def test_no_recognized_content_key_returns_found_with_empty_content(self, service):
+        """A present point whose payload carries NONE of _MEM0_CONTENT_KEYS is still
+        a hit (found), with content=='' and the full raw payload as metadata — the
+        documented ('data'→'memory'→'content'→'') precedence's fall-through arm.
+
+        This is a found-but-no-content-string result, NOT a miss: a consumer must
+        not treat empty content as absence (that's what None / found:False is for).
+        """
+        payload = {'category': 'observations_and_summaries', 'agent_id': 'y'}
+        service.mem0.get_point_by_id = AsyncMock(return_value=payload)
+
+        result = await service.get_memory_by_id(project_id='dark_factory', memory_id='u')
+
+        assert result is not None, 'a present point with no content key is still a hit, not a miss'
+        assert result['content'] == '', f'expected empty content on fall-through, got {result!r}'
+        assert result['metadata'] == payload
+        assert result['metadata'] is payload
+
+    @pytest.mark.asyncio
     async def test_not_found_returns_none(self, service):
         """get_point_by_id → None (genuine miss) propagates as a None service result."""
         service.mem0.get_point_by_id = AsyncMock(return_value=None)
