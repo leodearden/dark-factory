@@ -73,6 +73,18 @@ CREATE TABLE IF NOT EXISTS mem0_intents (
 );
 CREATE INDEX IF NOT EXISTS idx_mi_status ON mem0_intents(status);
 CREATE INDEX IF NOT EXISTS idx_mi_write_op ON mem0_intents(write_op_id);
+
+-- idempotent_ops: client-supplied idempotency keys for mutating task writes
+-- (task 2712). client_op_id PRIMARY KEY IS the required unique index, so a
+-- retry with the same key records once (INSERT OR IGNORE, first-write-wins)
+-- and replays the recorded outcome. CREATE TABLE IF NOT EXISTS runs on every
+-- initialize(), so existing DBs gain the table with no ALTER migration.
+CREATE TABLE IF NOT EXISTS idempotent_ops (
+    client_op_id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    result TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -287,6 +299,61 @@ class WriteJournal:
             (write_op_id,),
         ) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # idempotent_ops: client-supplied idempotency keys for mutating task
+    # writes (task 2712 / survey finding D5)
+    # ------------------------------------------------------------------
+
+    async def get_idempotent_result(self, client_op_id: str) -> dict | None:
+        """Replay a previously-recorded result for ``client_op_id``.
+
+        Returns the recorded outcome dict on a hit, or ``None`` on a miss.
+        Fails OPEN: any read error logs a warning and returns ``None`` (so a
+        rare DB hiccup lets the write proceed rather than wedging it) — the
+        journal's never-block discipline.
+        """
+        try:
+            db = self._require_db()
+            async with db.execute(
+                'SELECT result FROM idempotent_ops WHERE client_op_id = ?',
+                (client_op_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return None
+            return json.loads(row[0])
+        except Exception as e:
+            logger.warning(f'Failed to read idempotent_ops for {client_op_id}: {e}')
+            return None
+
+    async def record_idempotent_result(
+        self, client_op_id: str, operation: str, result: dict
+    ) -> None:
+        """Record the outcome of a mutating write under ``client_op_id``.
+
+        ``INSERT OR IGNORE`` on the ``client_op_id`` PRIMARY KEY makes the
+        first write win: a duplicate key (a rare concurrent double) is a no-op,
+        never a corruption or an overwrite. Fire-and-forget — logs on failure
+        but never raises (mirrors ``log_write_op``).
+        """
+        try:
+            async with self._txn() as db:
+                await db.execute(
+                    """INSERT OR IGNORE INTO idempotent_ops
+                       (client_op_id, operation, result, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (
+                        client_op_id,
+                        operation,
+                        json.dumps(result, default=str),
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+        except Exception as e:
+            logger.warning(
+                f'Failed to record idempotent_ops for {client_op_id}: {e}'
+            )
 
     # ------------------------------------------------------------------
     # mem0_intents: write-ahead intent journal for the dual-store add path
