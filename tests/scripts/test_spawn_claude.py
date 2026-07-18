@@ -7,6 +7,7 @@ branches by name (the script dispatches on the first word of $CLAUDE_TERMINAL_CM
 
 from __future__ import annotations
 
+import math
 import os
 import pathlib
 import signal
@@ -868,6 +869,86 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
         )
 
 
+# ===========================================================================
+# Task 2733 step-3/4: _load_scaled_grace -- load-adaptive SPAWN_STARTED_GRACE_SECS
+# ===========================================================================
+# Second recurrence of a started-grace flake in this file (task 2367 already
+# bumped the fixed 1s/2s -> 3s/8s six days ago). A fixed bump chases a moving
+# target as host load climbs; _load_scaled_grace instead scales the grace by
+# load-per-core -- floored at base_secs (an idle host is byte-identical to
+# today) and capped at cap_secs (a pathological host stays bounded).
+
+
+def _load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
+    """Scale a started-grace budget by host load-per-core, floored and capped.
+
+    A fixed started-grace chases a moving target as host load climbs (this
+    is the SECOND recurrence of a started-grace flake in this file -- task
+    2367 already bumped a fixed 1s/2s -> 3s/8s six days ago). Load-per-core
+    headroom tracks the actual contention that delays the fake claude
+    startup chain, instead of chasing that moving target with another
+    one-off bump.
+
+    Floored at base_secs: an idle host (loadavg_1min <= cpu_count) returns
+    base_secs unchanged, so this is byte-identical to the pre-existing fixed
+    grace there -- no regression. Capped at cap_secs so a pathologically
+    loaded host stays bounded. Fails safe to base_secs if getloadavg is
+    unavailable on this platform.
+    """
+    try:
+        load1 = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return base_secs
+    factor = max(1.0, load1 / (os.cpu_count() or 1))
+    return max(base_secs, min(cap_secs, math.ceil(base_secs * factor)))
+
+
+def test_load_scaled_grace_idle_host_returns_base_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """load-per-core <= 1 (idle host) floors at base_secs -- no scaling up."""
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    assert _load_scaled_grace(3, cap_secs=30) == 3
+
+
+def test_load_scaled_grace_scales_up_with_load_per_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """load-per-core > 1 scales grace up to ceil(base_secs * loadavg / cpu_count)."""
+    monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    assert _load_scaled_grace(3, cap_secs=30) == 6
+
+
+def test_load_scaled_grace_clamps_to_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pathological load is clamped at cap_secs instead of growing unbounded."""
+    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    assert _load_scaled_grace(3, cap_secs=30) == 30
+
+
+def test_load_scaled_grace_getloadavg_error_returns_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """getloadavg unavailable (OSError or AttributeError) fails safe to base_secs."""
+
+    def _raise_oserror() -> tuple[float, float, float]:
+        raise OSError("getloadavg not supported on this platform")
+
+    monkeypatch.setattr(os, "getloadavg", _raise_oserror)
+    assert _load_scaled_grace(3, cap_secs=30) == 3
+
+    def _raise_attributeerror() -> tuple[float, float, float]:
+        raise AttributeError("os has no getloadavg on this platform")
+
+    monkeypatch.setattr(os, "getloadavg", _raise_attributeerror)
+    assert _load_scaled_grace(3, cap_secs=30) == 3
+
+
 def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     """A fresh transcript file must suppress the failed-to-start flag.
 
@@ -879,18 +960,23 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     sentinel. <enc> mirrors session_registry.transcript_path_for_cwd's
     encoding: cwd with every '/' and '.' replaced by '-'.
 
-    Grace/sleep margins are deliberately generous, not tight: the watchdog's
-    deadline is computed from `date +%s` (whole-second resolution), so a
-    nominal N-second grace can grant anywhere from just-over-0 to just-under
-    (N+1) seconds of real time depending on where in the current second the
-    watchdog starts. A grace=1s/sleep=2s pairing is flaky under load for
-    exactly this reason (observed empirically); grace=3s/sleep=8s leaves
-    enough headroom to absorb that +/-1s truncation noise on a busy host.
+    Grace is load-adaptive (task 2733): SPAWN_STARTED_GRACE_SECS is
+    _load_scaled_grace(3), not a fixed 3s. Under merge-verify xdist
+    contention the fake launcher->claude->transcript startup chain can take
+    longer than any fixed margin -- this is the SECOND recurrence of this
+    exact flake (task 2367 already bumped the fixed value 1s/2s -> 3s/8s six
+    days before this one). Load-per-core headroom tracks the actual
+    contention instead of chasing a moving target with another fixed bump.
 
-    RED today: step-2's watchdog only knows the exit sentinel, so with grace
-    shorter than the sentinel delay it flags failed-to-start well before the
-    sentinel appears -> rc 144, not 0. GREEN after step-4 wires the
-    transcript probe.
+    The fake-claude sleep stays FIXED at 8s, decoupled from the now-larger
+    grace: the only validity requirement is that the exit sentinel lands
+    AFTER the transcript evidence appears, and since the transcript file
+    persists once written (and the watchdog polls continuously within the
+    grace window), a fixed modest sleep keeps the sentinel strictly after
+    evidence while keeping the happy path fast (runs ~startup+sleep, not
+    ~startup+grace). The outer _run_spawn timeout is grace-relative
+    (grace + sleep + margin) so the same load that enlarges grace cannot
+    convert a 144-flake into a subprocess-TimeoutExpired flake.
     """
     bin_dir = _make_bin_dir(tmp_path)
 
@@ -914,9 +1000,10 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     _write_detaching_terminal(bin_dir, "custom-term", pidfile)
 
     env = _base_env(bin_dir, "custom-term")
-    env["SPAWN_STARTED_GRACE_SECS"] = "3"
+    grace = _load_scaled_grace(3)
+    env["SPAWN_STARTED_GRACE_SECS"] = str(grace)
 
-    result = _run_spawn(env, tmp_path, timeout=20)
+    result = _run_spawn(env, tmp_path, timeout=grace + 8 + 6)
 
     stderr = result.stderr.decode()
     assert result.returncode == 0, (
@@ -954,11 +1041,20 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     launcher (setsid + background job, reparented once the launcher process
     exits), where this probe is correctly always empty.
 
-    Grace/sleep margins mirror test_transcript_appearance_suppresses_flag's
-    documented rationale: the watchdog's deadline is computed from whole-second
-    `date +%s`, so a nominal N-second grace can grant anywhere from
-    just-over-0 to just-under (N+1) seconds of real time. grace=2s/sleep=6s
-    leaves ample headroom to absorb that truncation noise on a busy host.
+    Grace is load-adaptive (task 2733) like
+    test_transcript_appearance_suppresses_flag: SPAWN_STARTED_GRACE_SECS is
+    _load_scaled_grace(2), not a fixed 2s, so the margin tracks host
+    contention instead of chasing a moving target with another fixed bump.
+
+    The fake-claude sleep stays FIXED at 6s, decoupled from the now-larger
+    grace: the only validity requirement is that the exit sentinel lands
+    AFTER _claude_descendant_alive observes the live descendant, and since
+    the 6s live window hugely exceeds the watchdog's 0.25s poll interval (and
+    the watchdog polls continuously within the grace window), a fixed modest
+    sleep keeps the sentinel strictly after evidence while keeping the happy
+    path fast. The outer _run_spawn timeout is grace-relative
+    (grace + sleep + margin) so the same load that enlarges grace cannot
+    convert a 144-flake into a subprocess-TimeoutExpired flake.
     """
     bin_dir = _make_bin_dir(tmp_path)
     _write_foreground_terminal(bin_dir, "xterm")
@@ -971,9 +1067,10 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     claude.chmod(0o755)
 
     env = _base_env(bin_dir, "xterm")
-    env["SPAWN_STARTED_GRACE_SECS"] = "2"
+    grace = _load_scaled_grace(2)
+    env["SPAWN_STARTED_GRACE_SECS"] = str(grace)
 
-    result = _run_spawn(env, tmp_path, timeout=20)
+    result = _run_spawn(env, tmp_path, timeout=grace + 6 + 6)
 
     stderr = result.stderr.decode()
     assert result.returncode == 0, (

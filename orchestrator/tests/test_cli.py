@@ -1649,6 +1649,36 @@ def _wait_for_file_cli(path: 'Path', timeout: float = 10.0, interval: float = 0.
     return False
 
 
+def _wait_pgid_gone(pgid: int, *, timeout: float = 20.0, interval: float = 0.1) -> None:
+    """Poll until process group *pgid* has no live members, else raise.
+
+    SIGKILL delivery and reaping are asynchronous: a one-shot os.killpg
+    immediately after child.wait() can observe a not-yet-reaped group member
+    (a lingering zombie, or a killed descendant that reparented to init)
+    even though the group is guaranteed to empty eventually. This asserts
+    the real contract -- eventual group death -- via a bounded poll on a
+    monotonic deadline instead of a synchronous one-shot check.
+
+    Mirrors the EPERM-vs-ESRCH errno discrimination formerly inlined in
+    test_verify_merge_cancel_end_to_end.
+    """
+    import errno
+    import os
+    import time
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, OSError) as exc:
+            if hasattr(exc, 'errno') and exc.errno == errno.EPERM:
+                raise AssertionError(f'pgid group {pgid}: got EPERM (unexpected)') from exc
+            return  # ESRCH → group is gone — expected
+        if time.monotonic() >= deadline:
+            raise AssertionError(f'verify-merge pgid group {pgid} still alive after cancel-verify')
+        time.sleep(interval)
+
+
 # NOTE (task 2350): widened from 30s -- fixed real-time deadlines starve
 # under heavy shared-host xdist contention even though the underlying
 # subprocess-cancel behavior is correct (timing flake, not a bug).
@@ -1666,7 +1696,6 @@ def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
     * verify-merge subprocess exits within seconds (SIGKILL delivered)
     * the recorded pgid group is gone (os.killpg raises ESRCH) after wait()
     """
-    import errno
     import os
     import subprocess as subprocess_mod
     import sys
@@ -1773,22 +1802,53 @@ def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
                 'verify-merge subprocess did not exit within 20s after cancel-verify'
             )
 
-        # --- Process group must be gone after the subprocess is reaped ---
-        # child.wait() above reaped the zombie; pgid == pid after setsid, so
-        # there should be no processes left in the group.
-        try:
-            os.killpg(pgid_val, 0)
-            pytest.fail(
-                f'verify-merge pgid group {pgid_val} still alive after cancel-verify'
-            )
-        except (ProcessLookupError, OSError) as exc:
-            if hasattr(exc, 'errno') and exc.errno == errno.EPERM:
-                pytest.fail(f'pgid group {pgid_val}: got EPERM (unexpected)')
-            # ESRCH → group is gone — expected
+        # --- Process group must eventually be gone after the subprocess is
+        # reaped. Bounded poll (not a one-shot check) -- see _wait_pgid_gone
+        # docstring: SIGKILL delivery + reaping is asynchronous. ---
+        _wait_pgid_gone(pgid_val, timeout=20)
     finally:
         if child.poll() is None:
             child.kill()
             child.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Task 2733 step-1/2 — _wait_pgid_gone: bounded poll-for-ESRCH helper (leg c)
+# ---------------------------------------------------------------------------
+#
+# De-flakes the pgid-liveness assertion above: SIGKILL delivery + reaping is
+# asynchronous, so a one-shot os.killpg(pgid, 0) immediately after child.wait()
+# can observe a not-yet-reaped group member.  _wait_pgid_gone asserts the real
+# contract (eventual group death) via a bounded poll instead.
+
+
+def test_wait_pgid_gone_returns_for_dead_group():
+    """A pgid with no live processes (ESRCH) returns without raising.
+
+    Uses the same well-above-pid_max idiom as NONEXISTENT_PID above: no
+    process/group can plausibly exist at this pgid, so os.killpg(pgid, 0)
+    inside _wait_pgid_gone raises ProcessLookupError/ESRCH on the first poll
+    and the helper returns cleanly.
+    """
+    NONEXISTENT_PID = 2 ** 22  # well above /proc/sys/kernel/pid_max on most systems
+
+    _wait_pgid_gone(NONEXISTENT_PID, timeout=1.0, interval=0.05)
+
+
+def test_wait_pgid_gone_raises_for_live_group():
+    """A still-live process group causes _wait_pgid_gone to raise after the deadline."""
+    import sys
+
+    child = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(30)'],
+        start_new_session=True,
+    )
+    try:
+        with pytest.raises(AssertionError, match='still alive'):
+            _wait_pgid_gone(child.pid, timeout=1.0, interval=0.05)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
 
 
 # ---------------------------------------------------------------------------
