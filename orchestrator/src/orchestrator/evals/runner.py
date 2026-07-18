@@ -539,8 +539,12 @@ class _StubMcpSession:
     so the production ``Scheduler`` can use it via duck-typing without any
     changes to its parsing code.
 
-    Currently handles: ``set_task_status``.
-    Other tool names raise ``NotImplementedError`` (filled in by later steps).
+    Handles every tool the eval ``Scheduler`` dispatches via ``dispatch_tool``:
+    ``set_task_status``, ``get_task``, ``get_tasks``, ``get_statuses``,
+    ``update_task``, ``set_task_claimant``, ``get_external_statuses`` (plus
+    ``add_dependency``, stubbed defensively though not yet dispatched).  The
+    ``test_scheduler_dispatch_literal_tripwire`` guard asserts every dispatched
+    literal has a branch here.  Any other tool name raises ``NotImplementedError``.
     """
 
     def __init__(self) -> None:
@@ -572,7 +576,7 @@ class _StubMcpSession:
 
         Supported tools: ``set_task_status``, ``get_task``, ``get_tasks``,
         ``get_statuses``, ``update_task``, ``set_task_claimant``,
-        ``get_external_statuses``.  Unknown tool names raise
+        ``get_external_statuses``, ``add_dependency``.  Unknown tool names raise
         ``NotImplementedError``.
 
         .. note::
@@ -625,6 +629,12 @@ class _StubMcpSession:
             deps = arguments.get('deps', [])
             mapping = {d: 'done' for d in deps}
             return self._envelope(json.dumps(mapping))
+        if name == 'add_dependency':
+            # Not currently dispatched by scheduler.py; added defensively per
+            # task spec so a future dispatch site is already stubbed. Echo the id
+            # in a clean envelope.
+            task_id = arguments['id']
+            return self._envelope(json.dumps({'id': task_id}))
         raise NotImplementedError(
             f'_StubMcpSession: unknown tool {name!r} — add a branch if this tool is needed'
         )
