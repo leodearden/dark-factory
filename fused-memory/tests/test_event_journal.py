@@ -69,3 +69,28 @@ def test_append_is_durable_across_reopen(tmp_path):
     assert got.timestamp == event.timestamp
     assert got.agent_id == event.agent_id
     assert got.payload == event.payload
+
+
+def test_mark_processed_removes_only_that_row(tmp_path):
+    """mark_processed(id) removes exactly that event; others remain unprocessed.
+
+    And mark_processed on an unknown id is a harmless no-op.
+    """
+    db_path = tmp_path / 'event_journal.db'
+    journal = EventJournal(db_path)
+    try:
+        first = _make_event()
+        second = _make_event()
+        journal.append(first)
+        journal.append(second)
+
+        # Unknown id → no-op (does not raise, removes nothing).
+        journal.mark_processed('nonexistent-id')
+        assert {e.id for e in journal.load_unprocessed()} == {first.id, second.id}
+
+        # Processing the first removes only its row.
+        journal.mark_processed(first.id)
+        remaining = journal.load_unprocessed()
+        assert [e.id for e in remaining] == [second.id]
+    finally:
+        journal.close()
