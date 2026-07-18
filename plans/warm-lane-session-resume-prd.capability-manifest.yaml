@@ -1,0 +1,102 @@
+prd: plans/warm-lane-session-resume-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 2771
+  title: Sidecar v2 + preserve-on-cancellation
+  capabilities:
+  - name: sidecar-v2-carries-task-id-and-resume-count
+    binding: capability→producer (α; substrate write_agent_session present — grep:orchestrator/src/orchestrator/artifacts.py
+      def write_agent_session). §7 fixes the field names.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: resume_count
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: preserve-on-cancellation-emits-agent_session_preserved
+    binding: capability→producer (α; seam self.artifacts.clear_agent_session() in
+      _invoke finally present on main). Clears only on completion; preserves + emits
+      agent_session_preserved on CancelledError.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: clear-only-on-completion is a control-flow property + the structured
+        fact is verified by α's own tests and the ω integration gate; the single resume_count
+        grep already gates a hollow-α schema.
+- label: β
+  task_id: 2772
+  title: Recovery adopts sessions alongside plans, lanes included
+  capabilities:
+  - name: recover-crashed-tasks-adopts-plan-bearing-lane-session
+    binding: capability→producer (β; _recover_crashed_tasks + _recovered_sessions
+      present on main — widens plan-present + lane branches to adopt the sidecar).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: wires a sidecar read into an existing plan-present branch — no clean
+        unique literal token; ω's B1/B3/B9/B11 legs are the real proof of adoption.
+- label: γ
+  task_id: 2774
+  title: Guarded injection + config + events + prompt note
+  capabilities:
+  - name: session-resume-green-tier-config-block-exists
+    binding: capability→producer (γ; config.py green-tier submodel pattern present
+      — RoutingConfig/DeliveredChecksConfig/_submodel_leaf_paths exemplars on main).
+      §3 fixes the key name session_resume.*
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: session_resume
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: guarded-injection-corroborates-and-storm-escapes
+    binding: capability→producer (γ; _run_slot resume_session_id injection + _dismiss_stale_escalations
+      present on main). Eligibility predicate (corroborate transcript+freshness+cap),
+      session_resume_* events, fallback-storm L1 streak, L0-dismissal prompt sentence.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: eligibility predicate + storm-streak are multi-line behavioral; the
+        session_resume config-key grep already gates a hollow-γ; ω proves guarded
+        injection end-to-end (B4/B5/B6/B7/B8).
+- label: ω
+  task_id: 2775
+  title: Integration gate — restart-resume end-to-end (B1–B11)
+  capabilities:
+  - name: restart-resume-end-to-end-green
+    binding: DAG-direction — all legs produced upstream (α schema, β adopt, γ inject);
+      pre-existing resume seam (--resume/--session) + DISK_BACKSTOP_REUSE wired on
+      main.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: ω IS the check suite; its signal is the CI-green B1–B11 boundary matrix
+        — a delivered_check would only re-assert its own green.
+- label: ε
+  task_id: 2776
+  title: Deploy capstone (deterministic auto-deploy, --drain)
+  capabilities:
+  - name: fleet-restart-all-drain-deploys-new-code
+    binding: capability→producer (deploy script present+executable on main — grep:scripts/restart-all-orchestrators.sh
+      --drain arm); resume-observable requires ω upstream.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: ε is a deterministic deploy leaf with no dependents — any delivered_check
+        would never be evaluated; the DeterministicRunner verify + born-at-L2-on-failure
+        is the deploy's own mechanism.
+- label: ψ
+  task_id: 2777
+  title: Companion cross-PRD prose update (docs-only)
+  capabilities:
+  - name: cross-prd-tables-name-this-seam
+    binding: capability→producer (ψ; both target PRDs — worktree-lane-lifecycle-prd.md,
+      agent-transcript-archival-prd.md — present on main).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: docs-only leaf with no dependents; check would never run; signal is
+        the git docs commit + the two PRDs' cross-PRD tables naming this seam.
