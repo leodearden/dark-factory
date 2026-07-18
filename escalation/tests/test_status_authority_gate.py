@@ -241,6 +241,57 @@ async def _promote_over_http(
 
 
 # ---------------------------------------------------------------------------
+# Harness sanity: http_server fixture teardown (mirrors
+# test_capability_guard_http.py's TestHarnessSanity).
+# ---------------------------------------------------------------------------
+
+
+def test_http_server_fixture_stops_serving_thread_on_teardown(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Regression test (task 2741): the module-scoped ``http_server``
+    fixture must explicitly stop its daemon serving thread + event loop at
+    teardown instead of relying on process exit to kill it (mirrors
+    test_capability_guard_http.py's identically-named test).
+
+    Drives the fixture's own generator directly via ``__wrapped__``
+    (bypassing pytest's fixture caching) so this test's own serving thread
+    can be identified precisely — via a ``threading.enumerate()``
+    before/after diff — independently of the module-scoped fixture instance
+    already serving this module's other tests under the same thread name.
+    """
+    before = set(threading.enumerate())
+    gen = http_server.__wrapped__(tmp_path_factory)
+    try:
+        base_url, queue = next(gen)
+        new = [
+            t for t in set(threading.enumerate()) - before
+            if t.name == 'status-authority-gate-http'
+        ]
+        assert len(new) == 1, (
+            f'Expected exactly one new status-authority-gate-http serving '
+            f'thread; found {new}'
+        )
+        serving = new[0]
+        assert serving.is_alive(), 'Serving thread must be alive during yield'
+
+        with pytest.raises(StopIteration):
+            next(gen)
+
+        assert not serving.is_alive(), (
+            'http_server fixture leaked its daemon serving thread past '
+            'teardown (generator finalized via StopIteration) -- the '
+            'fixture must explicitly stop its event loop and join the '
+            'thread instead of relying on process exit to kill it.'
+        )
+    finally:
+        # Best-effort: ensure finalization ran even if an assertion above
+        # failed, so a RED failure does not leave extra servers running for
+        # the rest of the suite. No-op if already exhausted.
+        gen.close()
+
+
+# ---------------------------------------------------------------------------
 # B5 — Table B gate rejects an unrecognised action before any record mutation.
 # ---------------------------------------------------------------------------
 
