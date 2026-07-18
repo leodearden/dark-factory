@@ -240,6 +240,33 @@ Use when you need context not in your briefing:
 MANDATED_STAGING_COMMAND = 'git add -- .'
 
 
+# Layer-1 guard against the headless --print background-task footgun (task
+# 2761).  A single source of truth concatenated into the IMPLEMENTER and
+# DEBUGGER system prompts (and injected into build_amender_prompt) — like
+# _ESCALATION_INSTRUCTIONS / MANDATED_STAGING_COMMAND, it is anchored by a
+# regression test (test_roles_background_warning.py) so a prompt refactor can't
+# silently drop it.  Plain text, NO literal `{`/`}` braces, so it is safe both
+# concatenated via `+` and interpolated into build_amender_prompt's f-string.
+BACKGROUND_TASK_WARNING = """
+## CRITICAL: Never end your turn while a backgrounded command is still running
+
+Do NOT launch a long-running command in the background (`Bash` with
+`run_in_background=true`) and then end your turn to "wait for it to finish" or
+"wait for the completion notification". This session is a headless, one-shot
+`claude --print` process: the moment you end your turn it exits reporting
+SUCCESS, and the still-pending background work is silently abandoned mid-task —
+leaving a half-done tree that is falsely recorded as a completed, successful run.
+
+- Run long commands (builds, full test suites, verification) in the FOREGROUND
+  and wait for them to complete. Per-role wall-clock ceilings exist for exactly
+  this — a foreground command that legitimately runs long is fine; an abandoned
+  background one is not.
+- If you genuinely must use `run_in_background=true`, you MUST poll it to
+  completion with `BashOutput` (or terminate it with `KillShell`) BEFORE ending
+  your turn. Never end the turn with a background command still pending.
+"""
+
+
 ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
@@ -412,7 +439,7 @@ expansion rather than trying to work around the restriction.
 - Run tests frequently to verify your work.
 - If you encounter an unexpected issue that the plan doesn't account for, note it and stop. Do NOT modify the plan.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS + BACKGROUND_TASK_WARNING,
     allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -476,7 +503,7 @@ expansion rather than trying to work around the restriction.
 
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS + BACKGROUND_TASK_WARNING,
     allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
