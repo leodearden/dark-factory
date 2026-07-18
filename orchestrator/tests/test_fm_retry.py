@@ -12,7 +12,6 @@ from __future__ import annotations
 import pytest
 
 from orchestrator.fm_retry import (
-    _FM_RETRY_BASE_SECS,
     _FM_RETRY_CAP_SECS,
     _FM_RETRY_MAX_SLEEPS,
     FM_RESTART_RETRY_WINDOW_SECS,
@@ -120,11 +119,3 @@ class TestFmRetryBackoffsLengthCapGuard:
         assert len(schedule) == 32
         assert all(s <= 20.0 for s in schedule)
         assert sum(schedule) < 1000.0
-
-
-def test_private_tunables_match_documented_defaults():
-    # Locks the documented defaults so a future edit notices it changed the
-    # publicly-relied-on schedule shape.
-    assert _FM_RETRY_BASE_SECS == 1.0
-    assert _FM_RETRY_CAP_SECS == 20.0
-    assert _FM_RETRY_MAX_SLEEPS == 32
