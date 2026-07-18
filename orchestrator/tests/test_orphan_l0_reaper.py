@@ -272,6 +272,68 @@ class TestOrphanL0Reaper:
         l1s = [e for e in all_escs if e and e.level == 1]
         assert len(l1s) == 0
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            pytest.param(
+                {'done_provenance': {'kind': 'found_on_main'}}, id='found_on_main',
+            ),
+            pytest.param(
+                {'done_provenance': {'kind': 'operational-verified'}},
+                id='operational-verified',
+            ),
+            pytest.param({}, id='provenance-absent'),
+        ],
+    )
+    async def test_done_step_commit_orphan_promoted_when_subject_not_merged(
+        self, harness: Harness, metadata: dict,
+    ):
+        """Task 2725: a done-step-commit-class orphan whose subject task is
+        'done' but NOT in the terminal+merged family must still be
+        promoted — the dismiss skip is scoped narrowly to positively
+        confirmed merges only:
+
+        - 'found_on_main' is deliberately excluded — it is the class this
+          skip might otherwise mask, and it already has its own dedicated
+          landing guards (PRD 5dd39a4c42, batch 2674-2683).
+        - 'operational-verified' is a commitless closure kind — never had
+          a step commit to orphan in the first place.
+        - Absent provenance can't be positively confirmed benign — fail
+          open (promote).
+
+        Fails against step-2's naive status=='done' impl, which wrongly
+        dismisses all three instead of promoting.
+        """
+        assert harness._escalation_queue is not None
+        orphan = _submit_aged_done_step_commit_orphan(
+            harness._escalation_queue, 'task-not-merged', seconds_ago=300.0,
+        )
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'status': 'done', 'metadata': metadata},
+        )
+
+        count = await harness._reap_orphan_l0_escalations()
+        assert count == 1
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 1
+        assert l1s[0].agent_role == 'harness-orphan-reaper'
+        assert l1s[0].task_id == 'task-not-merged'
+
+        refreshed = harness._escalation_queue.get(orphan.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        # Dismissed via the PROMOTION path (superseded-by-L1), not the
+        # benign rebase-superseded skip message.
+        assert refreshed.resolution is not None
+        assert 'Auto-promoted to level 1' in refreshed.resolution
+        assert 'rebase-superseded' not in refreshed.resolution
+
 
 class TestReviewerEscalationPromotion:
     """ReviewCheckpoint._promote_reviewer_escalations promotes reviewer L0s to L1."""
