@@ -97,7 +97,8 @@ def _health_app_with_harness(snapshot):
     """Build a /health app whose create_mcp_server got a stub harness whose
     recon_busy_snapshot() returns *snapshot*."""
     server = create_mcp_server(
-        _make_mock_service(), reconciliation_harness=_StubHarness(snapshot)
+        _make_mock_service(),
+        reconciliation_harness=_StubHarness(snapshot),  # type: ignore[arg-type]
     )
     return server.streamable_http_app()
 

@@ -59,10 +59,9 @@ def test_exit_removes_entry():
 
 def test_exit_clears_entry_on_exception_and_propagates():
     reg = ActiveRunRegistry()
-    with pytest.raises(ValueError):
-        with reg.track(RUN_ID, PROJECT_ID, STARTED_AT):
-            assert len(reg.snapshot()) == 1
-            raise ValueError("boom")
+    with pytest.raises(ValueError), reg.track(RUN_ID, PROJECT_ID, STARTED_AT):
+        assert len(reg.snapshot()) == 1
+        raise ValueError("boom")
     assert reg.snapshot() == []
 
 
@@ -72,10 +71,9 @@ def test_exit_clears_entry_on_cancelled_error_and_propagates():
     clear so a restart cancelled mid-cycle cannot leak a phantom-busy entry
     (survey E1)."""
     reg = ActiveRunRegistry()
-    with pytest.raises(asyncio.CancelledError):
-        with reg.track(RUN_ID, PROJECT_ID, STARTED_AT):
-            assert len(reg.snapshot()) == 1
-            raise asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError), reg.track(RUN_ID, PROJECT_ID, STARTED_AT):
+        assert len(reg.snapshot()) == 1
+        raise asyncio.CancelledError()
     assert reg.snapshot() == []
 
 
