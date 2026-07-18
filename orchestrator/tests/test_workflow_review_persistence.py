@@ -20,6 +20,7 @@ These tests drive the loop with ``_execute_iterations`` /
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -107,16 +108,17 @@ class TestVerdictCacheSkip:
         wf = _make_workflow(tmp_path=tmp_path)
         # Simulate a prior dispatch that already recorded a suggestions_only
         # verdict (and routed its suggestions) for this committed tree.
+        assert wf.artifacts is not None
         wf.artifacts.record_review_verdict('TREE1', 'suggestions_only', True)
 
         outcome = await wf._execute_verify_review_loop()
 
         assert outcome == WorkflowOutcome.DONE
         # The skip path re-mints nothing: no reviewer, no re-routing, no amend.
-        wf._review.assert_not_called()
-        wf._route_review_suggestions_to_curator.assert_not_called()
-        wf._write_suggestions_to_memory.assert_not_called()
-        wf._amend.assert_not_called()
+        cast(AsyncMock, wf._review).assert_not_called()
+        cast(AsyncMock, wf._route_review_suggestions_to_curator).assert_not_called()
+        cast(AsyncMock, wf._write_suggestions_to_memory).assert_not_called()
+        cast(AsyncMock, wf._amend).assert_not_called()
 
 
 _OUT_OF_SCOPE_SUGGESTION = {
@@ -149,8 +151,9 @@ class TestVerdictRecording:
         outcome = await wf._execute_verify_review_loop()
 
         assert outcome == WorkflowOutcome.DONE
-        wf._route_review_suggestions_to_curator.assert_awaited_once()
-        wf._amend.assert_not_called()
+        cast(AsyncMock, wf._route_review_suggestions_to_curator).assert_awaited_once()
+        cast(AsyncMock, wf._amend).assert_not_called()
+        assert wf.artifacts is not None
         rec = wf.artifacts.get_cached_verdict('TREE1')
         assert rec is not None
         assert rec['verdict'] == 'suggestions_only'
@@ -170,7 +173,8 @@ class TestVerdictRecording:
         outcome = await wf._execute_verify_review_loop()
 
         assert outcome == WorkflowOutcome.DONE
-        wf._write_suggestions_to_memory.assert_awaited_once()
+        cast(AsyncMock, wf._write_suggestions_to_memory).assert_awaited_once()
+        assert wf.artifacts is not None
         rec = wf.artifacts.get_cached_verdict('TREE1')
         assert rec is not None
         assert rec['verdict'] == 'PASS'
@@ -200,6 +204,7 @@ class TestVerdictRecording:
         assert outcome == WorkflowOutcome.ESCALATED
         wf._replan.assert_not_called()
         # Blocking verdicts are NEVER cached.
+        assert wf.artifacts is not None
         assert wf.artifacts.get_cached_verdict('TREE1') is None
 
 
@@ -235,14 +240,16 @@ class TestLifetimeCounters:
 
         assert outcome == WorkflowOutcome.DONE
         # Exactly one amend, then the cap is hit on the re-loop.
-        assert wf._amend.await_count == 1
+        assert cast(AsyncMock, wf._amend).await_count == 1
         # The increment was persisted as a task-lifetime total.
+        assert wf.artifacts is not None
         assert wf.artifacts.get_amendment_rounds_total() == 1
 
     async def test_amendment_cap_exhausted_across_lifetime(self, tmp_path: Path):
         # Pre-seed the persisted total at the cap — a prior dispatch already
         # used the one allowed amendment round.
         wf = _make_workflow(tmp_path=tmp_path, max_amendment_rounds=1)
+        assert wf.artifacts is not None
         wf.artifacts.set_review_counters(amendment_rounds_total=1)
         wf._review = AsyncMock(
             return_value=ReviewAggregation(
@@ -257,8 +264,8 @@ class TestLifetimeCounters:
 
         assert outcome == WorkflowOutcome.DONE
         # Cap already exhausted for the task lifetime → no fresh amendment.
-        wf._amend.assert_not_called()
-        wf._route_review_suggestions_to_curator.assert_awaited_once()
+        cast(AsyncMock, wf._amend).assert_not_called()
+        cast(AsyncMock, wf._route_review_suggestions_to_curator).assert_awaited_once()
 
     async def test_review_cycle_cap_exhausted_across_lifetime(
         self, tmp_path: Path
@@ -266,6 +273,7 @@ class TestLifetimeCounters:
         # Pre-seed the persisted review-cycle total at the cap; a blocking
         # review must escalate without a fresh replan.
         wf = _make_workflow(tmp_path=tmp_path, max_review_cycles=1)
+        assert wf.artifacts is not None
         wf.artifacts.set_review_counters(review_cycles_total=1)
         wf._review = AsyncMock(
             return_value=ReviewAggregation(
@@ -286,4 +294,5 @@ class TestLifetimeCounters:
 
         assert outcome == WorkflowOutcome.ESCALATED
         wf._replan.assert_not_called()
+        assert wf.artifacts is not None
         assert wf.artifacts.get_review_cycles_total() >= 1

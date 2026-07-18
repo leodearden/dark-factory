@@ -1469,13 +1469,16 @@ class TestReviewVerdictCache:
     def test_second_tree_hash_coexists(self, artifacts: TaskArtifacts):
         artifacts.record_review_verdict('tree_abc', 'suggestions_only', True)
         artifacts.record_review_verdict('tree_def', 'PASS', False)
-        assert artifacts.get_cached_verdict('tree_abc')['verdict'] == 'suggestions_only'
-        assert artifacts.get_cached_verdict('tree_def')['verdict'] == 'PASS'
+        rec_abc = artifacts.get_cached_verdict('tree_abc')
+        rec_def = artifacts.get_cached_verdict('tree_def')
+        assert rec_abc is not None and rec_abc['verdict'] == 'suggestions_only'
+        assert rec_def is not None and rec_def['verdict'] == 'PASS'
 
     def test_same_tree_hash_overwrites_last_wins(self, artifacts: TaskArtifacts):
         artifacts.record_review_verdict('tree_abc', 'suggestions_only', True)
         artifacts.record_review_verdict('tree_abc', 'PASS', False)
         rec = artifacts.get_cached_verdict('tree_abc')
+        assert rec is not None
         assert rec['verdict'] == 'PASS'
         assert rec['suggestions_routed'] is False
 
