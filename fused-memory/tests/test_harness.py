@@ -861,6 +861,11 @@ class TestStage1CycleSummaryHarnessBackstop:
         mock_memory_service.recon_ledger = ledger_store
         mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        # task σ: this test exercises the failed-cleanup CancelledError branch (it
+        # asserts the '_error' breadcrumb, which only that branch stamps). Since
+        # resume_after_restart now defaults True (a cancel → `interrupted`, no
+        # '_error'), opt out to keep exercising the failed path this test targets.
+        harness.config.resume_after_restart = False
         harness.stages[0].run = AsyncMock(side_effect=asyncio.CancelledError())
 
         with pytest.raises(asyncio.CancelledError):
@@ -2255,6 +2260,10 @@ async def test_cancellation_cleanup_shielded_from_second_cancel(
     import asyncio
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    # task σ: the second-cancel injection below fires on complete_run(status='failed'),
+    # so this shield test must take the failed-cleanup branch — opt out of resume
+    # (which defaults on and would take the 'interrupted' branch instead).
+    harness.config.resume_after_restart = False
 
     # Event set by slow_stage_run when it starts — ensures the first cancel fires
     # inside the try block (not during pre-try setup like _get_prior_s3_findings).

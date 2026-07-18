@@ -2202,6 +2202,35 @@ class ReconciliationHarness:
                 # 2. Independent try/except BaseException per cleanup step — each step
                 #    runs regardless of the other's outcome, and CancelledError is still
                 #    re-raised to the caller.
+                #
+                # Task σ: when resume_after_restart is enabled, a restart cancelling an
+                # in-flight stage is a RESUMABLE interrupt, not a failure. Mark the run
+                # `interrupted` and DELIBERATELY skip restore_drained — the drained
+                # events must stay drained so the startup adopt-and-resume pass can feed
+                # a resumed cycle's fresh later stages without double-processing. The
+                # (session_id, stage_cursor) snapshot survives on the run row (BaseStage
+                # .run skips clear_run_session on cancel), and the finally below skips the
+                # config-dir GC for interrupted runs so the transcript survives for
+                # --resume. When the knob is off, keep today's failed + restore path
+                # verbatim (a deploy that changed recon prompts/tooling opts out of resume
+                # this way, since a --resume'd session finishes under the OLD system
+                # prompt by construction).
+                if self.config.resume_after_restart:
+                    run.status = RunStatus.interrupted
+                    try:
+                        await asyncio.shield(
+                            self.journal.complete_run(run_id, 'interrupted')
+                        )
+                    except BaseException as cleanup_err:
+                        logger.error(
+                            'complete_run(interrupted) failed after cancellation: '
+                            f'{cleanup_err}'
+                        )
+                    logger.warning(
+                        f'Reconciliation run {run_id} INTERRUPTED (resumable) for '
+                        f'{project_id} (stage: {current_stage_name})'
+                    )
+                    raise
                 run.status = RunStatus.failed
                 run.stage_reports['_error'] = {
                     'error_type': 'CancelledError',
@@ -2258,15 +2287,18 @@ class ReconciliationHarness:
                     run, run_id, project_id, current_stage_name, cycle_start_time,
                 )
                 await self.journal.update_run_stage_reports(run_id, run.stage_reports)
-                # Task 2744: GC this run's per-run recon CLI config dir on every
-                # exit path (success/failure/cancel). Defensive — a filesystem
-                # hiccup must never mask the run's real terminal outcome.
-                try:
-                    gc_run_config_dir(self.journal.data_dir, run_id)
-                except Exception as gc_err:  # noqa: BLE001
-                    logger.warning(
-                        'gc_run_config_dir failed for run %s: %r', run_id, gc_err
-                    )
+                # Task 2744/σ: GC this run's per-run recon CLI config dir on every
+                # exit path (success/failure) EXCEPT an interrupted (resumable) run —
+                # its transcript must survive on disk for the startup --resume pass.
+                # Defensive — a filesystem hiccup must never mask the run's real
+                # terminal outcome.
+                if run.status != RunStatus.interrupted:
+                    try:
+                        gc_run_config_dir(self.journal.data_dir, run_id)
+                    except Exception as gc_err:  # noqa: BLE001
+                        logger.warning(
+                            'gc_run_config_dir failed for run %s: %r', run_id, gc_err
+                        )
 
     async def _ensure_stage1_cycle_summary(
         self,
