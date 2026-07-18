@@ -142,6 +142,34 @@ class TestFullConfigOverridesDefaults:
         assert cfg.census.saturation.consecutive_batches == 3
 
 
+class TestAgentTranscriptRoots:
+    """agent_transcript_roots — the additional archive roots the miner
+    enumerates alongside ~/.claude/projects. Defaults to [] (the parity
+    baseline) when omitted, round-trips a list of strings, and rejects a
+    non-list value with a pydantic.ValidationError."""
+
+    def test_defaults_to_empty_list_when_omitted(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
+        assert cfg.agent_transcript_roots == []
+
+    def test_present_list_round_trips(self, tmp_path):
+        text = MINIMAL_YAML + textwrap.dedent("""\
+            agent_transcript_roots:
+              - data/orchestrator/agent-transcripts
+              - /var/lib/agent-transcripts
+            """)
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.agent_transcript_roots == [
+            'data/orchestrator/agent-transcripts',
+            '/var/lib/agent-transcripts',
+        ]
+
+    def test_non_list_value_raises(self, tmp_path):
+        text = MINIMAL_YAML + 'agent_transcript_roots: data/orchestrator/agent-transcripts\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+
 class TestMalformedConfigRaises:
     """Malformed §7.4 configs raise pydantic.ValidationError — never a
     silently-defaulted or partially-applied model."""
