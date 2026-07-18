@@ -39,6 +39,7 @@ from shared.cost_store import CostStore
 from shared.task_claimant import compose_claimant_run_id
 from shared.task_metadata import RetryLedger, RoutingDecisionMirror, RoutingState
 from shared.task_statuses import TaskStatus
+from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator import chronic_flake
 from orchestrator.agents.invoke import AgentResult, invoke_agent
@@ -8606,6 +8607,61 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         finally:
             if self.artifacts is not None:
                 self.artifacts.clear_agent_session()
+            # Producer hook (task 2742, agent-transcript-archival-prd α): gzip
+            # this just-finished session's transcripts to a durable archive root
+            # OUTSIDE the worktree (project_root / config.root), so they survive
+            # worktree teardown. _last_invoke_session_id is set before the try,
+            # so it is present even when this finally runs during exception
+            # propagation.
+            ta = self.config.transcript_archive
+            if ta.enabled and self._config_dir is not None and self._last_invoke_session_id:
+                # Offload to a worker thread: archive_task_transcripts does
+                # blocking, CPU-bound work (glob + stream-gzip each transcript).
+                # This finally runs on the shared event loop for every role of
+                # every concurrent task, so a multi-MB transcript archived inline
+                # would stall all other in-flight tasks; to_thread keeps the loop
+                # free.
+                try:
+                    await asyncio.to_thread(
+                        archive_task_transcripts,
+                        self._config_dir.path,
+                        self.task_id,
+                        self._last_invoke_session_id,
+                        archive_root=self.config.project_root / ta.root,
+                    )
+                except asyncio.CancelledError:
+                    # Cancellation (loop teardown / hard-kill) surfaces here from
+                    # the await, NOT an archival error. Cooperative cancellation
+                    # must propagate, so we re-raise — meaning a KILLED
+                    # invocation's transcript is deliberately not archived by this
+                    # producer hook. That is an accepted, documented gap: shielding
+                    # the await to salvage it (asyncio.shield) risks a dangling
+                    # background task during loop close, and the abandoned-in-flight
+                    # tail is the explicit job of β/task 2729's idempotent
+                    # teardown backstop (agent-transcript-archival-prd §3), so it
+                    # is not lost overall.
+                    raise
+                except Exception:
+                    # Defense-in-depth for a finally that awaits cross-module work.
+                    # archive_task_transcripts is total by contract (per-file
+                    # OSErrors are swallowed + counted), but its top-level glob /
+                    # Path / archive_root construction is not individually guarded.
+                    # Should any unexpected non-cancellation error ever escape it,
+                    # swallow it here so the producer hook can never REPLACE the
+                    # in-flight exception this finally is unwinding (the classic
+                    # finally-masks-original antipattern) — independent of any
+                    # future change to the helper's guarantees. Loud, not silent:
+                    # the failure is logged as a structured fact.
+                    logger.warning(
+                        'Transcript archival hook failed for task %s (session %s)',
+                        self.task_id,
+                        self._last_invoke_session_id,
+                        exc_info=True,
+                        extra={
+                            'task_id': self.task_id,
+                            'session_id': self._last_invoke_session_id,
+                        },
+                    )
         completed_at = datetime.now(UTC).isoformat()
 
         # Record the last successfully-completed role (updated only on success,

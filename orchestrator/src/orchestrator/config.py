@@ -822,6 +822,66 @@ class SpeculationProbeConfig(BaseModel):
         return v
 
 
+class RetentionConfig(BaseModel):
+    """Retention bounds for the archived-transcript tree (task 2742, PRD α).
+
+    α owns the whole transcript_archive block including these knobs even
+    though the GC consumer (δ/task 2731) is what enforces them; the producer
+    hook here writes archives but never prunes. Plain BaseModel (no
+    frozen/validate_assignment) so _set_leaf can mutate it in place on reload.
+    """
+
+    max_age_days: int = Field(
+        default=90,
+        description=(
+            'Maximum age (days) an archived per-task transcript tree is kept '
+            'before the GC sweep (δ/task 2731) may prune it.'
+        ),
+    )
+    max_task_dirs: int = Field(
+        default=5000,
+        description=(
+            'Soft cap on the number of per-task archive dirs kept; the GC '
+            'sweep (δ/task 2731) prunes oldest-first beyond this.'
+        ),
+    )
+
+
+class TranscriptArchiveConfig(BaseModel):
+    """Agent-transcript archival (task 2742, plans/agent-transcript-archival-prd.md α).
+
+    The producer hook in TaskWorkflow._invoke's finally gzips each finished
+    agent session's transcripts (see shared.transcript_archive) to
+    ``<project_root>/<root>`` — a durable location OUTSIDE the per-task
+    worktree so the archive survives worktree teardown.
+
+    All fields are green-tier hot-reloadable via RELOADABLE_FIELDS (the
+    whole-submodel group for 'transcript_archive'); ``retention`` is compared
+    as one atomic BaseModel leaf, so any retention.* edit reloads as a
+    whole-retention swap. Plain BaseModels (no frozen/validate_assignment) so
+    _set_leaf can mutate them in place on reload.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to disable transcript archival entirely — the '
+            '_invoke producer hook short-circuits and never calls '
+            'archive_task_transcripts.'
+        ),
+    )
+    root: str = Field(
+        default='data/orchestrator/agent-transcripts',
+        description=(
+            'Archive root, resolved against project_root (NOT the worktree): '
+            'project_root / root. The durable, git-ignored orchestrator data '
+            'dir, reusing the project_root / data / ... idiom of the '
+            'verify-logs archive.'
+        ),
+    )
+    retention: RetentionConfig = Field(default_factory=RetentionConfig)
+
+
 class FusedMemoryConfig(BaseModel):
     """Fused-memory HTTP server connection."""
 
@@ -3095,6 +3155,12 @@ class OrchestratorConfig(BaseSettings):
     # the disabled-by-default instance (probe_fraction=0.0, byte-identical).
     speculation_probe: SpeculationProbeConfig = Field(default_factory=SpeculationProbeConfig)
 
+    # Agent-transcript archival (task 2742, plans/agent-transcript-archival-prd.md
+    # alpha). An absent stanza yields the enabled-by-default instance; the
+    # producer hook lives in TaskWorkflow._invoke's finally and resolves its
+    # archive root against project_root (not the worktree).
+    transcript_archive: TranscriptArchiveConfig = Field(default_factory=TranscriptArchiveConfig)
+
     # Value/h scheduler scoring (P2/P3 — age boost, CPM weighting).
     age_alpha: float = Field(
         default=10.0,
@@ -3744,6 +3810,14 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # (probe_fraction/probe_depths/suppress_flake_rate) is green-tier
     # hot-reloadable with no separate RELOADABLE_FIELDS edit.
     _submodel_leaf_paths('speculation_probe', SpeculationProbeConfig),
+    # Agent-transcript archival (task 2742, PRD alpha) — a new dedicated
+    # submodel, same whole-submodel-group idiom: enabled/root and the atomic
+    # .retention leaf are all green-tier hot-reloadable with no separate
+    # RELOADABLE_FIELDS edit. _iter_leaves descends exactly one level, so
+    # transcript_archive.retention is one atomic BaseModel leaf (whole-retention
+    # swap on any retention.* change), matching the delivered_checks/psi_admission
+    # whole-submodel-group precedent.
+    _submodel_leaf_paths('transcript_archive', TranscriptArchiveConfig),
     {
         # Steward grace
         'steward_completion_timeout',
