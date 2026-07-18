@@ -820,3 +820,242 @@ class TestStoreGC:
         assert evicted == 1
         assert (run_id, stage) not in state._state
         assert run_id not in state._run_finding_index
+
+
+# ---------------------------------------------------------------------------
+# step-13: fresh in-process runs stay byte-identical with/without a store —
+# RED until step-14 confirms every persistence touchpoint short-circuits on
+# store=None.  (The shadow store must NEVER feed back into a live run.)
+# ---------------------------------------------------------------------------
+
+
+class _StoreTouched(BaseException):
+    """Raised by :class:`_TripwireStore` on ANY store access.
+
+    Deliberately a ``BaseException`` (not ``Exception``) so it is NOT swallowed
+    by the ``except Exception`` guards inside ``_persist_run`` / ``tick`` /
+    ``hydrate_from_store``.  That makes it a true tripwire: if a persistence
+    touchpoint ever reaches the store when it should have short-circuited, the
+    tripwire propagates all the way out and fails the test loudly instead of
+    being logged-and-swallowed.
+    """
+
+
+class _TripwireStore:
+    """A store stand-in whose every method trips :class:`_StoreTouched`.
+
+    Used as a POSITIVE CONTROL (a non-None store IS reached by the persistence
+    code) and, by contrast, to prove a ``store=None`` state never reaches it.
+    """
+
+    def open(self):
+        raise _StoreTouched('open')
+
+    def close(self):
+        raise _StoreTouched('close')
+
+    def upsert_entry(self, **kwargs):
+        raise _StoreTouched('upsert_entry')
+
+    def delete_run(self, run_id):
+        raise _StoreTouched('delete_run')
+
+    def load_all(self):
+        raise _StoreTouched('load_all')
+
+
+class TestByteIdenticalFreshRun:
+    """Locks the no-regression constraint: a fresh in-process run behaves
+    identically whether or not a shadow store is attached.
+    """
+
+    def _make_state(self, store):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            memory_service=_WTFakeMemoryService(),
+            task_interceptor=_WTFakeTaskInterceptor(),
+            store=store,
+        )
+        state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        return state, t
+
+    async def _drive_lifecycle(self, state):
+        """Drive a rich single-stage lifecycle and return (run_id, stage).
+
+        Exercises start → add (real + null/null) → duplicate (dedup) → cite →
+        set/inc stat → delete → complete.  The delete is done BEFORE complete()
+        because delete_finding is rejected once the owning entry is completed
+        (report_already_completed guard) — same ordering constraint the
+        TestWriteThrough happy path documents.
+        """
+        run_id = 'bi-run'
+        stage = 'memory_consolidator'
+        state.start_report(run_id=run_id, stage=stage, project_id='dark_factory')
+        fid_real = state.add_finding(
+            run_id=run_id, severity='moderate', category='memory_stale',
+            description='real', suggested_action='act', actionable=True,
+            task_id='42', flag_type='orphaned_knowledge',
+        )['finding_id']
+        fid_null = state.add_finding(
+            run_id=run_id, severity='low', category='other',
+            description='null null observation', suggested_action='note',
+            actionable=False,
+        )['finding_id']
+        # Duplicate of the real (42, orphaned_knowledge) signature — returns the
+        # ORIGINAL finding_id and allocates no new uuid.
+        dup = state.add_finding(
+            run_id=run_id, severity='moderate', category='memory_stale',
+            description='restatement', suggested_action='act', actionable=True,
+            task_id='42', flag_type='orphaned_knowledge',
+        )
+        assert dup.get('error') == 'duplicate_finding'
+        assert dup['existing_finding_id'] == fid_real
+        assert 'error' not in await state.cite_task(run_id, fid_real, 'dark_factory', '42')
+        assert 'error' not in await state.cite_entity(run_id, fid_real, 'Foo')
+        state.set_stat(run_id, 'scanned', 10)
+        state.inc_stat(run_id, 'scanned', 5)
+        # Genuine deletion of the null/null finding while still in-progress.
+        assert state.delete_finding(run_id, fid_null) == {
+            'status': 'deleted', 'finding_id': fid_null,
+        }
+        state.complete(run_id, 'summary text')
+        return run_id, stage
+
+    def _patch_deterministic_uuids(self, monkeypatch):
+        """Pin recon_report.uuid.uuid4 to a fresh deterministic sequence.
+
+        finding_id is the only source of nondeterminism in the assembled/raw
+        readback, so pinning it lets the two runs' outputs be compared for
+        FULL dict equality (not merely equal-modulo-finding-id).  Re-called
+        before each run so both runs draw the identical uuid sequence.
+        """
+        import itertools
+
+        import fused_memory.server.recon_report as rr
+
+        counter = itertools.count(1)
+        monkeypatch.setattr(rr.uuid, 'uuid4', lambda: rr.uuid.UUID(int=next(counter)))
+
+    @pytest.mark.asyncio
+    async def test_outputs_byte_identical_with_and_without_store(self, tmp_path, monkeypatch):
+        """(a) get_assembled_report / get_findings_for_run are EQUAL dicts
+        whether the run used store=None or a live ReconReportStore — the shadow
+        store never alters live-run results."""
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        # Run 1 — no store.
+        self._patch_deterministic_uuids(monkeypatch)
+        state_none, _ = self._make_state(None)
+        run_id, stage = await self._drive_lifecycle(state_none)
+        report_none = state_none.get_assembled_report(run_id, stage)
+        findings_none = state_none.get_findings_for_run(run_id)
+
+        # Run 2 — live shadow store, identical deterministic uuid sequence.
+        self._patch_deterministic_uuids(monkeypatch)
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        try:
+            state_store, _ = self._make_state(store)
+            run_id2, stage2 = await self._drive_lifecycle(state_store)
+            report_store = state_store.get_assembled_report(run_id2, stage2)
+            findings_store = state_store.get_findings_for_run(run_id2)
+        finally:
+            store.close()
+
+        assert report_none == report_store
+        assert findings_none == findings_store
+        # And a sanity floor: the run actually produced content to compare.
+        assert report_none is not None
+        assert len(findings_none) == 1
+
+    @pytest.mark.asyncio
+    async def test_non_none_store_IS_reached_positive_control(self, tmp_path):
+        """Positive control for (b): a NON-None store IS reached by the
+        persistence code — start_report's _persist_run trips the tripwire.
+        Without this, the store=None no-op assertion below would be vacuous."""
+        state, _ = self._make_state(_TripwireStore())
+        with pytest.raises(_StoreTouched):
+            state.start_report(run_id='bi-run', stage='memory_consolidator', project_id='dark_factory')
+
+    @pytest.mark.asyncio
+    async def test_store_none_never_touches_a_store(self, tmp_path, caplog):
+        """(b) With store=None every persistence touchpoint short-circuits
+        BEFORE touching a store: the full lifecycle + tick() + hydrate run
+        without raising, and no persist-failure WARNING is ever logged (a
+        removed `is None` guard would fall into the `except Exception` arm and
+        log one per entry)."""
+        import logging
+
+        state, t = self._make_state(None)
+        assert state._store is None
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            run_id, stage = await self._drive_lifecycle(state)
+            # hydrate is a no-op when store is None (does not raise, changes nothing).
+            state.hydrate_from_store()
+            assert (run_id, stage) in state._state
+            # Advance past TTL and tick — the GC hook must also short-circuit.
+            t[0] = 10_000.0
+            evicted = state.tick()
+            assert evicted == 1
+            assert (run_id, stage) not in state._state
+
+        persist_warnings = [
+            r for r in caplog.records if 'failed to persist' in r.getMessage()
+            or 'failed to GC' in r.getMessage()
+        ]
+        assert persist_warnings == []
+
+    def test_store_none_happy_path_subset_unchanged(self):
+        """(c) A representative subset of the existing test_recon_report.py
+        happy-path assertions still holds verbatim with store=None."""
+        from fused_memory.server.recon_report import ReconReportState
+
+        state = ReconReportState(ttl_seconds=300, clock=lambda: 0.0, store=None)
+
+        # start_report → empty assembled report
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report == {
+            'summary': '', 'stats': {}, 'flagged_items': [], 'summary_warnings': [],
+        }
+
+        # add_finding → 36-char uuid finding_id
+        first = state.add_finding(
+            run_id='r1', severity='moderate', category='memory_stale',
+            description='d', suggested_action='a', actionable=True,
+            task_id='42', flag_type='orphaned_knowledge',
+        )
+        assert len(first['finding_id']) == 36
+
+        # second same signature → duplicate_finding with the original id
+        second = state.add_finding(
+            run_id='r1', severity='moderate', category='memory_stale',
+            description='different text same sig', suggested_action='a',
+            actionable=True, task_id='42', flag_type='orphaned_knowledge',
+        )
+        assert second['error'] == 'duplicate_finding'
+        assert second['existing_finding_id'] == first['finding_id']
+
+        # set/inc stat + complete → cached flagged_count/stats
+        state.set_stat('r1', 'scanned', 100)
+        state.inc_stat('r1', 'scanned', 5)
+        result = state.complete('r1', 'summary text')
+        assert result == {'flagged_count': 1, 'stats': {'scanned': 105}}
+
+        # assembled report full shape after complete
+        report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report is not None
+        assert report['summary'] == 'summary text'
+        assert report['stats'] == {'scanned': 105}
+        assert len(report['flagged_items']) == 1
+        item = report['flagged_items'][0]
+        assert item['finding_id'] == first['finding_id']
+        assert item['task_id'] == '42'
+        assert item['flag_type'] == 'orphaned_knowledge'
+        assert item['cited_entities'] == []
+        assert item['cited_tasks'] == []
