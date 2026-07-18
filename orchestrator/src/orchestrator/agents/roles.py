@@ -218,6 +218,16 @@ Use when you need context not in your briefing:
 - When you need context about prior decisions
 """
 
+# The single source-of-truth staging command mandated by every role's
+# "## CRITICAL: Git Staging Rules" section (implementer, debugger, merger,
+# steward, simple_task). `.task/` is gitignored at the repo root, so a plain
+# `git add -- .` already excludes it -- no `:!.task` exclusion pathspec is
+# needed. A prior form, `git add -- . ':!.task'`, named the gitignored
+# `.task` path directly in a pathspec, which trips git's "paths are ignored
+# by one of your .gitignore files" advice AND exits 1 (staging itself still
+# succeeded -- only the exit code/advice was spurious). Task 2745.
+MANDATED_STAGING_COMMAND = 'git add -- .'
+
 
 ARCHITECT = AgentRole(
     name='architect',
