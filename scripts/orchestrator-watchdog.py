@@ -1128,6 +1128,75 @@ def staleness_pass() -> None:
         _delegate_fleet_restart()
 
 
+def fused_memory_staleness_pass() -> None:
+    """Restart fused-memory.service if it is stale w.r.t. the newest fm commit.
+
+    Single-unit mirror of staleness_pass() targeting FUSED_MEMORY_UNIT — closes
+    survey finding A2 (no staleness signal drives fused-memory redeploys, so a
+    merged fm change sits undeployed until a human/PRD files a deploy task).
+    fused-memory has an on-merge event-driven StaleServiceRestartCoordinator
+    (survey finding A7) that can starve under load; this watchdog pass is the
+    BACKSTOP for it, exactly as staleness_pass() backstops the orchestrator
+    fleet's coordinator.
+
+    Gate order (mirrors staleness_pass): (1) fm-deploy min-interval clock cap
+    FIRST (fm's OWN clock, throttled skip-log); (2) newest fm-watched commit,
+    None -> no-op; (3) commit-grace head-start reusing STALENESS_GRACE_SECS so
+    the polite fm coordinator gets its head start before the backstop acts;
+    (4) enabled / startup-grace / ActiveEnterTimestamp-vs-commit -> delegate
+    once via _delegate_fm_restart().
+
+    Stateless (I6): staleness is recomputed from live systemd + git each tick,
+    so a successful restart (from this pass or the fm coordinator) advances
+    ActiveEnterTimestamp past the commit and the unit reads fresh on the very
+    next call — no stored state, no flap loop.
+
+    Wrapped in a single try/except Exception around the per-unit probes
+    (mirroring fused_memory_liveness_pass()'s isolation) so a probe hiccup is
+    logged and swallowed rather than crashing the oneshot watchdog. Uses
+    _delegate_fm_restart() (detached defer-if-busy chokepoint), never
+    restart_unit() directly — liveness stays the only uncapped, non-clock-gated
+    revive path (I5: brokenness is not a scheduled deploy).
+    """
+    if _within_fm_deploy_min_interval():
+        # Bucket on wall-clock time (no extra clock read beyond the gate's) —
+        # see SKIP_LOG_INTERVAL_SECS. The gate check still runs every tick;
+        # only the log emission is throttled.
+        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+            log(
+                "skip: within fm-deploy min-interval "
+                f"({FM_RESTART_MIN_INTERVAL_SECS}s) since last deploy"
+            )
+        return
+
+    commit_epoch = _newest_fm_watched_commit_epoch()
+    if commit_epoch is None:
+        return  # undeterminable — fall safe, no restart this tick
+    if time.time() - commit_epoch < STALENESS_GRACE_SECS:
+        # Give the polite event-driven fm coordinator its head start.
+        return
+
+    try:
+        if not is_unit_enabled(FUSED_MEMORY_UNIT):
+            # Disabled (or unknown) — respect operator intent, skip silently.
+            return
+        elapsed = _unit_start_elapsed_secs(FUSED_MEMORY_UNIT)
+        if elapsed is not None and elapsed < STARTUP_GRACE_SECS:
+            # None => grace does not apply, proceed (mirrors main()).
+            return
+        active = _unit_active_enter_epoch(FUSED_MEMORY_UNIT)
+        if active is None:
+            return  # undeterminable — skip, don't guess
+        if active < commit_epoch:
+            log(
+                f"WARNING: {FUSED_MEMORY_UNIT} activated at {active} before the newest "
+                f"fm-watched commit ({commit_epoch}); delegating fused-memory staleness redeploy"
+            )
+            _delegate_fm_restart()
+    except Exception as exc:  # noqa: BLE001
+        log(f"fm staleness probe error for {FUSED_MEMORY_UNIT}: {exc}")
+
+
 def _format_epoch(epoch: int | None) -> str:
     """Render a Unix epoch as a UTC timestamp string, or 'unknown' for None."""
     if epoch is None:
