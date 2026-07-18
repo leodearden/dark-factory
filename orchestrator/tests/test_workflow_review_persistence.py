@@ -201,3 +201,89 @@ class TestVerdictRecording:
         wf._replan.assert_not_called()
         # Blocking verdicts are NEVER cached.
         assert wf.artifacts.get_cached_verdict('TREE1') is None
+
+
+_IN_SCOPE_SUGGESTION = {
+    'reviewer': 'analyst',
+    'severity': 'suggestion',
+    'location': 'src/foo/bar.py:42',  # under modules=['src/foo'] → in scope
+    'category': 'coverage',
+    'description': 'Missing edge case',
+    'suggested_fix': 'Add a test',
+}
+
+
+@pytest.mark.asyncio
+class TestLifetimeCounters:
+    """The loop seeds its per-dispatch locals from the persisted totals, so
+    the amendment/review caps bound the WHOLE task lifetime.
+    """
+
+    async def test_amendment_counter_seeded_and_persisted(self, tmp_path: Path):
+        # Fresh task (amendment_rounds_total=0), one in-scope suggestion.
+        wf = _make_workflow(tmp_path=tmp_path, max_amendment_rounds=1)
+        wf._review = AsyncMock(
+            return_value=ReviewAggregation(
+                has_blocking_issues=False,
+                blocking_issues=[],
+                suggestions=[_IN_SCOPE_SUGGESTION],
+                reviews={'analyst': {}},
+            )
+        )
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        # Exactly one amend, then the cap is hit on the re-loop.
+        assert wf._amend.await_count == 1
+        # The increment was persisted as a task-lifetime total.
+        assert wf.artifacts.get_amendment_rounds_total() == 1
+
+    async def test_amendment_cap_exhausted_across_lifetime(self, tmp_path: Path):
+        # Pre-seed the persisted total at the cap — a prior dispatch already
+        # used the one allowed amendment round.
+        wf = _make_workflow(tmp_path=tmp_path, max_amendment_rounds=1)
+        wf.artifacts.set_review_counters(amendment_rounds_total=1)
+        wf._review = AsyncMock(
+            return_value=ReviewAggregation(
+                has_blocking_issues=False,
+                blocking_issues=[],
+                suggestions=[_IN_SCOPE_SUGGESTION],
+                reviews={'analyst': {}},
+            )
+        )
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        # Cap already exhausted for the task lifetime → no fresh amendment.
+        wf._amend.assert_not_called()
+        wf._route_review_suggestions_to_curator.assert_awaited_once()
+
+    async def test_review_cycle_cap_exhausted_across_lifetime(
+        self, tmp_path: Path
+    ):
+        # Pre-seed the persisted review-cycle total at the cap; a blocking
+        # review must escalate without a fresh replan.
+        wf = _make_workflow(tmp_path=tmp_path, max_review_cycles=1)
+        wf.artifacts.set_review_counters(review_cycles_total=1)
+        wf._review = AsyncMock(
+            return_value=ReviewAggregation(
+                has_blocking_issues=True,
+                blocking_issues=[{
+                    'reviewer': 'analyst',
+                    'category': 'bug',
+                    'description': 'boom',
+                }],
+                suggestions=[],
+                reviews={'analyst': {}},
+            )
+        )
+        wf._escalate_review_issues = MagicMock()
+        wf._replan = AsyncMock()
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.ESCALATED
+        wf._replan.assert_not_called()
+        assert wf.artifacts.get_review_cycles_total() >= 1
