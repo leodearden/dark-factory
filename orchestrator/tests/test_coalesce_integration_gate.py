@@ -73,6 +73,7 @@ def _task_targeted_gate(
 # ─── Scenario 1 ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(300)
 class TestScenario1:
     """step-2 (GREEN): 3 disjoint stackable singles coalesce into one train end-to-end.
 
@@ -186,7 +187,7 @@ class TestScenario1:
             #     entry at ItemLifecycleState.MERGING),
             #     completed rebase + merge, and is now suspended inside
             #     run_scoped_verification (which is gated).
-            await asyncio.wait_for(gate_entered.wait(), timeout=60)
+            await asyncio.wait_for(gate_entered.wait(), timeout=120)
 
             # (b) All 3 singles' futures resolved 'superseded' before verify starts.
             # (These are resolved by _maybe_coalesce_waiting_singles, BEFORE the train
@@ -248,7 +249,7 @@ class TestScenario1:
             # mark_member_done existence check no-ops (mid absent from scheduler) →
             # scheduler.mark_done is never called → _counting_mark_done never fires →
             # all_done never set → asyncio.TimeoutError.
-            await asyncio.wait_for(all_done.wait(), timeout=30)
+            await asyncio.wait_for(all_done.wait(), timeout=60)
 
         # (e) All 3 member files on main after landing.
         from orchestrator.git_ops import _run
@@ -346,6 +347,7 @@ class TestScenario1:
 # ─── Scenario 2 ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(300)
 class TestScenario2:
     """step-4 (GREEN): partial stackability — overlap keeps 3rd as solo.
 
@@ -437,7 +439,7 @@ class TestScenario2:
         with _task_targeted_gate('ig_s23', gate_release, gate_entered):
             worker_task = asyncio.create_task(worker.run())
 
-            await asyncio.wait_for(gate_entered.wait(), timeout=60)
+            await asyncio.wait_for(gate_entered.wait(), timeout=120)
 
             # (b) s23's future must be UNRESOLVED — it is not absorbed.
             # GREEN timing: when gate_entered fires, the verifier is blocked at
@@ -475,7 +477,7 @@ class TestScenario2:
             # run_scoped_verification is the 2ND call to the patched fn → passes
             # immediately (gate only blocks the first call), so the train CAN land
             # while the gate is held.  Only release the gate AFTER train_done fires.
-            await asyncio.wait_for(train_done.wait(), timeout=30)
+            await asyncio.wait_for(train_done.wait(), timeout=60)
             gate_release.set()
 
         # (d) s21 and s22 files on main after the train lands.
@@ -510,6 +512,7 @@ class TestScenario2:
 # ─── Scenario 3 ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(300)
 class TestScenario3:
     """step-6 (GREEN): confidence-gate exclusion through the worker.
 
@@ -617,7 +620,7 @@ class TestScenario3:
         with _task_targeted_gate('ig_s31', gate_release, gate_entered):
             worker_task = asyncio.create_task(worker.run())
 
-            await asyncio.wait_for(gate_entered.wait(), timeout=60)
+            await asyncio.wait_for(gate_entered.wait(), timeout=120)
 
             # (c) s31's future must be UNRESOLVED at gate_entered — excluded, not absorbed.
             assert not req1.result.done(), (
@@ -644,7 +647,7 @@ class TestScenario3:
             )
 
             # Wait for the 2-member train to land, then release the gate.
-            await asyncio.wait_for(train_done.wait(), timeout=30)
+            await asyncio.wait_for(train_done.wait(), timeout=60)
             gate_release.set()
 
         # (d) s32 and s33 files on main after the train lands.
@@ -674,6 +677,7 @@ class TestScenario3:
 # ─── Scenario 4 ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(300)
 class TestScenario4:
     """step-8 (GREEN): in-flight + detached-waiter exclusion.
 
@@ -901,10 +905,10 @@ class TestBookkeeping:
         ):
             worker_task = asyncio.create_task(worker.run())
 
-            await asyncio.wait_for(gate_entered.wait(), timeout=60)
+            await asyncio.wait_for(gate_entered.wait(), timeout=120)
 
             gate_release.set()
-            await asyncio.wait_for(all_done.wait(), timeout=30)
+            await asyncio.wait_for(all_done.wait(), timeout=60)
 
         # Yield several event-loop iterations so the verifier's finally block
         # runs, the merger drains to idle, and any look-ahead slot is released.

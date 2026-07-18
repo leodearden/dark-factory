@@ -1682,7 +1682,10 @@ def _wait_pgid_gone(pgid: int, *, timeout: float = 20.0, interval: float = 0.1) 
 # NOTE (task 2350): widened from 30s -- fixed real-time deadlines starve
 # under heavy shared-host xdist contention even though the underlying
 # subprocess-cancel behavior is correct (timing flake, not a bug).
-@pytest.mark.timeout(90)
+# NOTE (task 2770): widened 90s -> 120s -- _wait_pgid_gone's poll-for-drain
+# (up to 20s, landed via task 2733) can still push total wall time past 90s
+# under extreme load even though the underlying cancel behavior is correct.
+@pytest.mark.timeout(120)
 def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
     """End-to-end: real subprocess 'verify-merge --request-id X' is killed by cancel-verify.
 
