@@ -88,18 +88,19 @@ def archive_task_transcripts(
 
     When *session_id* is given, only that session's main transcript
     (``projects/*/<session_id>.jsonl``) and its subagent transcripts
-    (``projects/*/<session_id>/subagents/*.jsonl``) are archived. Returns the
-    number of files newly archived.
+    (``projects/*/<session_id>/subagents/*.jsonl``) are archived. When
+    *session_id* is ``None``, every ``projects/**/*.jsonl`` is archived.
+    Returns the number of files newly archived.
     """
     config_dir = Path(config_dir)
     archive_root = Path(archive_root)
     projects_root = config_dir / 'projects'
 
     if session_id is None:
-        return 0  # archive-all branch implemented in a later step
-
-    sources = list(projects_root.glob(f'*/{session_id}.jsonl'))
-    sources += list(projects_root.glob(f'*/{session_id}/subagents/*.jsonl'))
+        sources = list(projects_root.glob('**/*.jsonl'))
+    else:
+        sources = list(projects_root.glob(f'*/{session_id}.jsonl'))
+        sources += list(projects_root.glob(f'*/{session_id}/subagents/*.jsonl'))
 
     count = 0
     for src in sources:
