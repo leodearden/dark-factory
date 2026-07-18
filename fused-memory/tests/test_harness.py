@@ -679,6 +679,250 @@ async def test_mock_stage_run_before_return_callback(journal, event_buffer, mock
     )
 
 
+@pytest.mark.asyncio
+async def test_run_full_cycle_persists_judge_pending_marker_and_tracks_task(
+    journal, event_buffer, mock_memory_service
+):
+    """run_full_cycle's judge launch goes through _spawn_judge (task 2708): the
+    judge_pending marker is durably persisted BEFORE the task fires, and the
+    task is tracked in _judge_tasks so shutdown can drain it."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    # Clean stage reports (no actionable findings) so remediation does not also fire.
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    # Truthy judge stub + a _run_judge that blocks (and never clears the marker),
+    # so BOTH the persisted judge_pending marker AND the tracked task remain
+    # observable when we assert — a no-op judge would complete and self-discard
+    # from _judge_tasks (via its done-callback) before the assertion runs.
+    harness.judge = MagicMock()
+    never_set = asyncio.Event()
+
+    async def _blocking_judge(run_id):
+        await never_set.wait()
+
+    harness._run_judge = _blocking_judge
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+    assert harness._judge_tasks, '_spawn_judge must track the judge task in _judge_tasks'
+
+    pending = await journal.get_pending_judge_runs()
+    assert (run.id, 'test-project') in pending, (
+        'run_full_cycle must persist a judge_pending marker via _spawn_judge'
+    )
+
+    # Cleanup: cancel the blocked judge task(s) and drain.
+    for t in list(harness._judge_tasks):
+        t.cancel()
+    await asyncio.gather(*harness._judge_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_drain_judge_tasks_cancels_and_marker_persists(
+    journal, event_buffer, mock_memory_service
+):
+    """Shutdown drain cancels an in-flight judge task WITHOUT losing its
+    verdict: because the judge is cancelled mid-review (before add_verdict's
+    atomic clear), the judge_pending marker survives for a startup re-run (task 2708)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.judge = MagicMock()
+
+    never_set = asyncio.Event()
+
+    async def _blocking_judge(run_id):
+        # Blocks mid-review, before any verdict is written.
+        await never_set.wait()
+
+    harness._run_judge = _blocking_judge
+
+    run_id = str(uuid.uuid4())
+    await harness._spawn_judge(run_id, 'test-project')
+    # Yield control so the judge task actually starts and blocks on the event.
+    await asyncio.sleep(0)
+
+    assert (run_id, 'test-project') in await journal.get_pending_judge_runs()
+    assert len(harness._judge_tasks) == 1
+    spawned = next(iter(harness._judge_tasks))
+
+    await harness._drain_judge_tasks()
+
+    assert spawned.done() and spawned.cancelled(), (
+        'drain must cancel and await the in-flight judge task'
+    )
+    assert harness._judge_tasks == set(), 'drain must clear _judge_tasks'
+    # The verdict was NOT lost — the marker persists for startup re-run.
+    assert (run_id, 'test-project') in await journal.get_pending_judge_runs(), (
+        'a judge cancelled mid-review must leave its judge_pending marker intact'
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_pending_judge_reviews_reruns_and_clears(
+    journal, event_buffer, mock_memory_service
+):
+    """Startup recovery re-fires the judge for every pending marker; the
+    re-run's verdict atomically clears the marker (task 2708). A verdict
+    dropped by a restart is thus regenerated, not silently lost."""
+    from fused_memory.models.reconciliation import (
+        JudgeVerdict,
+        VerdictAction,
+        VerdictSeverity,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # Seed a completed run + a pending marker with NO verdict (the restart window).
+    run_id = str(uuid.uuid4())
+    run = ReconciliationRun(
+        id=run_id,
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.completed,
+    )
+    await journal.start_run(run)
+    await journal.complete_run(run_id, 'completed')
+    await journal.mark_judge_pending(run_id, 'test-project')
+
+    verdict = JudgeVerdict(
+        run_id=run_id,
+        reviewed_at=datetime.now(UTC),
+        severity=VerdictSeverity.ok,
+        findings=[],
+        action_taken=VerdictAction.none,
+    )
+
+    async def _review(_rid):
+        # Mirror the real judge: writing a verdict atomically clears the marker.
+        await journal.add_verdict(verdict)
+        return verdict
+
+    harness.judge = MagicMock()
+    harness.judge.review_run = AsyncMock(side_effect=_review)
+
+    await harness._recover_pending_judge_reviews()
+    await asyncio.gather(*harness._judge_tasks, return_exceptions=True)
+
+    assert await journal.get_pending_judge_runs() == [], (
+        'a recovered + reviewed run must no longer be pending'
+    )
+    verdicts = await journal.get_recent_verdicts('test-project', limit=10)
+    assert run_id in {v.run_id for v in verdicts}, (
+        'startup recovery must regenerate the dropped verdict'
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_judge_cancelled_retains_marker_and_warns(
+    journal, event_buffer, mock_memory_service, caplog
+):
+    """The REAL _run_judge's CancelledError branch (task 2708): a judge cancelled
+    mid-review re-raises to preserve asyncio cancellation semantics, logs a
+    retention warning, and leaves its judge_pending marker intact for a startup
+    re-run.
+
+    Unlike test_drain_judge_tasks_cancels_and_marker_persists /
+    test_run_full_cycle_* (which stub harness._run_judge with a plain blocker),
+    this drives the actual wrapper's except/raise on the real shutdown path —
+    covering the code the other judge tests bypass (task 2708 amendment)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # Real _run_judge (NOT patched); judge.review_run blocks mid-review so the
+    # task is still inside _run_judge's try when the drain cancels it.
+    never_set = asyncio.Event()
+
+    async def _blocking_review(_run_id):
+        await never_set.wait()
+
+    harness.judge = MagicMock()
+    harness.judge.review_run = AsyncMock(side_effect=_blocking_review)
+
+    run_id = str(uuid.uuid4())
+    with caplog.at_level(logging.WARNING):
+        await harness._spawn_judge(run_id, 'test-project')
+        await asyncio.sleep(0)  # let the real _run_judge start and block
+
+        assert (run_id, 'test-project') in await journal.get_pending_judge_runs()
+        spawned = next(iter(harness._judge_tasks))
+
+        await harness._drain_judge_tasks()
+
+    assert spawned.done() and spawned.cancelled(), (
+        'the real _run_judge must re-raise CancelledError so the task ends cancelled'
+    )
+    # The verdict was deferred, not lost — the marker survives for startup re-run.
+    assert (run_id, 'test-project') in await journal.get_pending_judge_runs(), (
+        'a judge cancelled mid-review must retain its judge_pending marker'
+    )
+    assert any(
+        run_id in r.message and 'retained for startup re-run' in r.message
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+    ), 'the real _run_judge CancelledError branch must log a retention warning'
+
+
+@pytest.mark.asyncio
+async def test_recover_pending_judge_reviews_caps_fanout_and_warns(
+    journal, event_buffer, mock_memory_service, caplog
+):
+    """Startup recovery bounds its fan-out (task 2708 amendment): with more
+    pending markers than the per-restart cap, only the oldest `cap` judge tasks
+    are spawned and a WARNING surfaces the backlog so a wedged judge is visible.
+    The un-spawned remainder's markers persist for a later restart."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.judge = MagicMock()
+
+    # Block the judge so spawned tasks stay tracked in _judge_tasks for counting
+    # (a no-op judge would self-discard via its done-callback before we assert).
+    never_set = asyncio.Event()
+
+    async def _blocking_judge(run_id):  # param name matches _run_judge (pyright)
+        await never_set.wait()
+
+    harness._run_judge = _blocking_judge
+
+    # Seed 3 pending markers (completed runs, no verdicts).
+    for _ in range(3):
+        rid = str(uuid.uuid4())
+        run = ReconciliationRun(
+            id=rid,
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='test',
+            started_at=datetime.now(UTC),
+            status=RunStatus.completed,
+        )
+        await journal.start_run(run)
+        await journal.complete_run(rid, 'completed')
+        await journal.mark_judge_pending(rid, 'test-project')
+
+    with (
+        patch('fused_memory.reconciliation.harness._JUDGE_RECOVERY_MAX_SPAWN', 2),
+        caplog.at_level(logging.WARNING),
+    ):
+        await harness._recover_pending_judge_reviews()
+
+    assert len(harness._judge_tasks) == 2, (
+        'recovery must spawn at most _JUDGE_RECOVERY_MAX_SPAWN judge tasks per restart'
+    )
+    assert any(
+        'recovery cap' in r.message
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+    ), 'a backlog exceeding the cap must be WARN-logged so a wedged judge is visible'
+    # All 3 markers persist — spawning does not clear them (only a committed
+    # verdict does), so the un-spawned remainder self-heals on a later restart.
+    assert len(await journal.get_pending_judge_runs()) == 3
+
+    # Cleanup: cancel the blocked judge tasks.
+    for t in list(harness._judge_tasks):
+        t.cancel()
+    await asyncio.gather(*harness._judge_tasks, return_exceptions=True)
+
+
 # ---------------------------------------------------------------------------
 # Task 2734: pure predicate helper backing arm 2 of the widened Stage 1
 # cycle_summary harness backstop below — "Stage 1 completed but its own

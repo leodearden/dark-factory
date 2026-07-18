@@ -144,6 +144,18 @@ _RECON_DEDUP_CONFIG = (
 
 logger = logging.getLogger(__name__)
 
+# Task 2708 amendment (reviewer_comprehensive): bound the startup judge-recovery
+# fan-out. Normal operation leaves at most a handful of judge_pending markers
+# (the cycle-end→verdict-commit window is tiny), but a persistently-failing
+# judge never clears its marker — _run_judge's `except Exception` path logs and
+# returns WITHOUT reaching add_verdict's atomic clear — so markers accumulate
+# and would otherwise ALL re-fire concurrently on every restart: a
+# thundering-herd of LLM calls. Cap the per-restart spawn; the un-spawned
+# remainder self-heals on later restarts (its markers persist until a verdict
+# commits). Exceeding the cap is WARN-logged so a wedged judge is visible rather
+# than silently re-run each restart.
+_JUDGE_RECOVERY_MAX_SPAWN = 20
+
 # Task 1755 / PRD β: stable finding identity for the dead_owner_shielded storm alarm.
 # The fingerprint is keyed on finding['category'] / affected_ids / description
 # (harness.py:_escalate), so keeping these fields constant — and putting all
@@ -523,6 +535,15 @@ class ReconciliationHarness:
 
         # Per-project concurrent loops
         self._project_tasks: dict[str, asyncio.Task] = {}
+
+        # Fire-and-forget judge review tasks (task 2708). Held so run_loop's
+        # shutdown finally can cancel + await them (see _drain_judge_tasks) and
+        # so orphaned tasks don't trigger 'Task was destroyed but it is pending'.
+        # DELIBERATELY separate from _active_runs / recon_busy_snapshot: the judge
+        # stays excluded from the cycle-aware-restart deferral signal (task 2703 δ);
+        # a durable judge_pending marker + startup re-run make that accepted
+        # cancellation non-lossy instead.
+        self._judge_tasks: set[asyncio.Task] = set()
 
         # Drain mode: stop starting new cycles, let current ones finish
         self._draining: bool = False
@@ -2067,6 +2088,17 @@ class ReconciliationHarness:
         except Exception as e:
             logger.warning(f'_resume_interrupted_runs at startup failed: {e}')
 
+        # One-shot: re-fire the judge for any run whose verdict a restart dropped
+        # in the cycle-end→verdict-commit window (task 2708). The durable
+        # judge_pending marker (written before the fire-and-forget judge task) is
+        # the recovery cursor. Judge is already .initialize()d above (2029-2030);
+        # guarded (self.judge is not None) inside the method. Fail-safe wrapped like
+        # the sibling one-shot passes so a recovery hiccup never crashes the loop.
+        try:
+            await self._recover_pending_judge_reviews()
+        except Exception as e:
+            logger.warning(f'_recover_pending_judge_reviews at startup failed: {e}')
+
         loop_count = 0
         try:
             while True:
@@ -2131,6 +2163,10 @@ class ReconciliationHarness:
                     *self._project_tasks.values(), return_exceptions=True,
                 )
             self._project_tasks.clear()
+            # Drain in-flight judge tasks too (task 2708). Cancelled judges leave
+            # their judge_pending markers intact for startup re-run, so no verdict
+            # is silently dropped by the shutdown.
+            await self._drain_judge_tasks()
             await self._stop_escalation_server()
 
     async def _project_loop(self, project_id: str) -> None:
@@ -2293,6 +2329,77 @@ class ReconciliationHarness:
             except Exception as e:
                 logger.warning(f'Heartbeat failed for {project_id}: {e}')
 
+    async def _spawn_judge(self, run_id: str, project_id: str) -> None:
+        """Durably mark a judge review pending, then fire a tracked judge task.
+
+        The single seam for both fresh cycle-end launches (run_full_cycle,
+        _run_remediation_pass) and startup recovery (task 2708). Awaiting the
+        judge_pending marker BEFORE creating the task means a process killed the
+        instant after cycle completion still has a recoverable marker; the
+        marker is cleared atomically inside ``add_verdict``. The task is tracked
+        in ``_judge_tasks`` (with a done-callback that discards it) so shutdown
+        can drain it deterministically.
+        """
+        await self.journal.mark_judge_pending(run_id, project_id)
+        task = asyncio.create_task(self._run_judge(run_id), name=f'judge-{run_id}')
+        self._judge_tasks.add(task)
+        task.add_done_callback(self._judge_tasks.discard)
+
+    async def _drain_judge_tasks(self) -> None:
+        """Cancel and await every in-flight judge task on shutdown (task 2708).
+
+        A cancelled judge is cancelled mid-review, before add_verdict's atomic
+        marker-clear, so its judge_pending marker survives for startup re-run —
+        durability rests on the uncleared marker, not on catching here. Snapshot
+        the set first because the per-task done-callback discards from it during
+        iteration.
+        """
+        pending = list(self._judge_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._judge_tasks.clear()
+
+    async def _recover_pending_judge_reviews(self) -> None:
+        """Re-fire the judge for every run left with a judge_pending marker (task 2708).
+
+        One-shot startup pass: a restart landing in the cycle-end→verdict-commit
+        window cancels the fire-and-forget judge before add_verdict's atomic
+        marker-clear, so the marker survives. Re-running the judge is safe — the
+        review is read-only over the run record, and the invariant 'marker present
+        ⟹ no committed verdict' (add_verdict clears atomically) means the re-run's
+        judge_verdicts INSERT never collides on the run_id PK. Routes through the
+        same _spawn_judge seam as fresh launches (idempotent re-mark + tracked task).
+        """
+        if self.judge is None:
+            return
+        pending = await self.journal.get_pending_judge_runs()
+        if not pending:
+            return
+        # Bound the fan-out (task 2708 amendment): get_pending_judge_runs is
+        # ordered oldest-marked first, so the oldest markers are re-fired first
+        # and any excess is deferred to a later restart. This caps the burst of
+        # concurrent judge LLM calls a wedged judge (markers never clear) would
+        # otherwise trigger on every restart.
+        total = len(pending)
+        to_spawn = pending[:_JUDGE_RECOVERY_MAX_SPAWN]
+        if total > _JUDGE_RECOVERY_MAX_SPAWN:
+            logger.warning(
+                f'{total} pending judge review(s) at startup exceeds the '
+                f'{_JUDGE_RECOVERY_MAX_SPAWN}-per-restart recovery cap — a judge may '
+                'be persistently failing (a judge_pending marker clears only on a '
+                f'committed verdict). Re-firing the {len(to_spawn)} oldest; the '
+                f'remaining {total - len(to_spawn)} will be recovered on '
+                'subsequent restarts.'
+            )
+        else:
+            logger.info(
+                f'Recovering {total} pending judge review(s) after restart'
+            )
+        for run_id, project_id in to_spawn:
+            await self._spawn_judge(run_id, project_id)
+
     async def _run_judge(self, run_id: str) -> None:
         """Fire-and-forget judge wrapper with error logging."""
         try:
@@ -2302,6 +2409,19 @@ class ReconciliationHarness:
                 logger.info(f'Judge verdict for {run_id}: severity={verdict.severity}')
             else:
                 logger.warning(f'Judge returned no verdict for run {run_id}')
+        except asyncio.CancelledError:
+            # Shutdown drain (or a cycle-aware restart) cancelled the judge
+            # mid-review, before add_verdict's atomic marker-clear ran. The
+            # judge_pending marker is therefore intact and startup recovery
+            # (_recover_pending_judge_reviews) will re-run this review — the
+            # verdict is deferred, not lost (task 2708). CancelledError is a
+            # BaseException, so the `except Exception` below cannot swallow it;
+            # re-raise to preserve asyncio cancellation semantics for the drain.
+            logger.warning(
+                f'Judge task for run {run_id} cancelled during shutdown; '
+                'judge_pending marker retained for startup re-run'
+            )
+            raise
         except Exception:
             logger.error(f'Judge task failed for run {run_id}', exc_info=True)
 
@@ -2551,9 +2671,10 @@ class ReconciliationHarness:
                 # scopes to the stage pipeline only — see recon_busy_snapshot).
                 # Stage reports are already persisted above, so a cycle-aware
                 # restart cancelling an in-flight judge here is an accepted
-                # trade-off (task 2703 δ).
+                # trade-off (task 2703 δ) — made non-lossy by the durable
+                # judge_pending marker _spawn_judge writes before firing (task 2708).
                 if self.judge:
-                    asyncio.create_task(self._run_judge(run_id))
+                    await self._spawn_judge(run_id, project_id)
 
                 # Remediation pass: thread scope resolved above (task 1163) and pass
                 # pre-fetched tree to avoid a redundant fetch (ref: task 478).
@@ -3661,9 +3782,10 @@ class ReconciliationHarness:
             # Persist stage reports before judge (same fix as run_full_cycle)
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
 
-            # Judge review for remediation run
+            # Judge review for remediation run. Same _spawn_judge seam as
+            # run_full_cycle: durable judge_pending marker + tracked task (task 2708).
             if self.judge:
-                asyncio.create_task(self._run_judge(run_id))
+                await self._spawn_judge(run_id, project_id)
 
             # After second-pass S3: gate escalation on persistence (task 1512 /
             # plans/afk-A7-recon-closure.md).  Never a third pass.

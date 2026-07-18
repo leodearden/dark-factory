@@ -136,6 +136,61 @@ async def test_judge_verdict(journal):
 
 
 @pytest.mark.asyncio
+async def test_judge_pending_marker_roundtrip(journal):
+    """mark_judge_pending / get_pending_judge_runs / clear_judge_pending
+    round-trip: two markers persist as (run_id, project_id) tuples, and a
+    targeted clear removes only the named run."""
+    await journal.mark_judge_pending('run-a', 'proj-1')
+    await journal.mark_judge_pending('run-b', 'proj-2')
+
+    pending = await journal.get_pending_judge_runs()
+    assert set(pending) == {('run-a', 'proj-1'), ('run-b', 'proj-2')}
+
+    await journal.clear_judge_pending('run-a')
+
+    pending = await journal.get_pending_judge_runs()
+    assert set(pending) == {('run-b', 'proj-2')}
+
+
+@pytest.mark.asyncio
+async def test_add_verdict_atomically_clears_pending_marker(journal):
+    """Writing a verdict clears the run's judge_pending marker in the same
+    transaction, establishing the invariant 'marker present ⟹ no verdict'."""
+    run_id = str(uuid.uuid4())
+    project_id = 'test-project'
+    run = ReconciliationRun(
+        id=run_id,
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.completed,
+    )
+    await journal.start_run(run)
+    await journal.complete_run(run_id, 'completed')
+
+    await journal.mark_judge_pending(run_id, project_id)
+    pending = await journal.get_pending_judge_runs()
+    assert (run_id, project_id) in pending
+
+    await journal.add_verdict(
+        JudgeVerdict(
+            run_id=run_id,
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.ok,
+            findings=[],
+            action_taken=VerdictAction.none,
+        )
+    )
+
+    pending = await journal.get_pending_judge_runs()
+    assert run_id not in {r for r, _ in pending}
+
+    verdicts = await journal.get_recent_verdicts(project_id, limit=10)
+    assert run_id in {v.run_id for v in verdicts}
+
+
+@pytest.mark.asyncio
 async def test_recent_runs(journal):
     for i in range(3):
         run = ReconciliationRun(
