@@ -12277,9 +12277,8 @@ class TestPerRunConfigDirGC:
 
         with patch(
             'fused_memory.reconciliation.harness.gc_run_config_dir',
-        ) as gc_spy:
-            with pytest.raises(RuntimeError, match='stage exploded'):
-                await harness.run_full_cycle('test-project', 'test-trigger')
+        ) as gc_spy, pytest.raises(RuntimeError, match='stage exploded'):
+            await harness.run_full_cycle('test-project', 'test-trigger')
 
         recent = await journal.get_recent_runs('test-project', limit=1)
         assert recent, 'expected the failed run to be persisted by the journal'

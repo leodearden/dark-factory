@@ -209,12 +209,13 @@ class TestSessionAndConfigDirForwarding:
 
     @pytest.mark.asyncio
     async def test_session_id_and_config_dir_forwarded(self, tmp_path):
+        from shared.config_dir import TaskConfigDir
+
         from fused_memory.config.schema import ReconciliationConfig
         from fused_memory.reconciliation.cli_stage_runner import (
             recon_config_base_dir,
             run_stage_via_cli,
         )
-        from shared.config_dir import TaskConfigDir
 
         captured_kwargs: dict = {}
         config = ReconciliationConfig()
@@ -276,8 +277,9 @@ class TestReconConfigDirHelpers:
     def test_config_dir_path_identity(self, tmp_path):
         """Pins the creator↔GC coupling: TaskConfigDir builds exactly the path
         gc_run_config_dir rmtrees (config_dir.py's claude-config-{id} naming)."""
-        from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
         from shared.config_dir import TaskConfigDir
+
+        from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
 
         run_id = 'run-abc123'
         base = recon_config_base_dir(tmp_path)
@@ -285,11 +287,12 @@ class TestReconConfigDirHelpers:
         assert cfg.path == base / f'claude-config-{run_id}'
 
     def test_gc_removes_existing_dir(self, tmp_path):
+        from shared.config_dir import TaskConfigDir
+
         from fused_memory.reconciliation.cli_stage_runner import (
             gc_run_config_dir,
             recon_config_base_dir,
         )
-        from shared.config_dir import TaskConfigDir
 
         run_id = 'run-to-gc'
         cfg = TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(tmp_path))

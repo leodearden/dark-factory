@@ -527,8 +527,9 @@ class TestSessionCaptureLifecycle:
 
     @pytest.mark.asyncio
     async def test_session_minted_persisted_and_forwarded(self, tmp_path):
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
         from shared.config_dir import TaskConfigDir
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
 
         stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
         watermark = Watermark(project_id='test_project')
@@ -588,9 +589,8 @@ class TestSessionCaptureLifecycle:
         with patch(
             'fused_memory.reconciliation.stages.base.run_stage_via_cli',
             new=AsyncMock(side_effect=RuntimeError('subprocess boom')),
-        ):
-            with pytest.raises(RuntimeError):
-                await stage.run([], watermark, [], run_id='run-sc2')
+        ), pytest.raises(RuntimeError):
+            await stage.run([], watermark, [], run_id='run-sc2')
 
         # Mint-before-spawn happened, and clear ran in the finally despite the raise.
         journal.record_run_session.assert_awaited_once()
