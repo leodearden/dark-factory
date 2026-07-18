@@ -851,3 +851,77 @@ class TestPrunableWorktreeSignal:
 
         assert result.worktree_registered is True
         assert result.is_live is True
+
+
+class TestBareBranchRecentCommit:
+    """A branch's tip timestamp does not count as `recent_commit` when the branch
+    has zero commits of its own — its tip is only the base-branch commit, not
+    task work (reify#5245's shape: the reflog held only a "Created from main"
+    entry with HEAD == main).
+    """
+
+    _NOW = datetime(2026, 6, 5, 12, 0, 0, tzinfo=UTC)
+
+    def _run_side_effect(
+        self,
+        commit_ts_str: str | None,
+        revlist_stdout: str = '0',
+        revlist_rc: int = 0,
+        revlist_raises: bool = False,
+    ):
+        """Return a subprocess.run side_effect: no worktree registered, a given
+        git-log tip timestamp, and a canned (or error/raising) rev-list count.
+        """
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=_worktree_porcelain_no_branch(), stderr=''
+                )
+            if 'rev-list' in args:
+                if revlist_raises:
+                    raise subprocess.TimeoutExpired(cmd=args, timeout=10)
+                return subprocess.CompletedProcess(
+                    args=args, returncode=revlist_rc, stdout=revlist_stdout, stderr=''
+                )
+            # git log call
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=commit_ts_str or '', stderr=''
+            )
+        return side_effect
+
+    def test_bare_branch_suppresses_recent_commit(self, tmp_path):
+        """A recent tip timestamp is suppressed when rev-list reports zero own
+        commits — the recent tip is only the base commit, not task work.
+        """
+        ts = (self._NOW - timedelta(hours=1)).isoformat()
+        side_effect = self._run_side_effect(ts, revlist_stdout='0', revlist_rc=0)
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.recent_commit is False
+
+    def test_recent_commit_preserved_when_branch_has_own_commits(self, tmp_path):
+        """A recent tip timestamp is preserved when rev-list reports own commits."""
+        ts = (self._NOW - timedelta(hours=1)).isoformat()
+        side_effect = self._run_side_effect(ts, revlist_stdout='3', revlist_rc=0)
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.recent_commit is True
+
+    def test_revlist_error_treated_as_not_bare(self, tmp_path):
+        """An unknown own-commit count (rev-list error or exception) fails safe:
+        not bare => no suppression => recent_commit stays True.
+        """
+        ts = (self._NOW - timedelta(hours=1)).isoformat()
+
+        side_effect_rc1 = self._run_side_effect(ts, revlist_rc=1)
+        with patch('subprocess.run', side_effect=side_effect_rc1):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        assert result.recent_commit is True
+
+        side_effect_raises = self._run_side_effect(ts, revlist_raises=True)
+        with patch('subprocess.run', side_effect=side_effect_raises):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        assert result.recent_commit is True
