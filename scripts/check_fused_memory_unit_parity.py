@@ -302,10 +302,30 @@ def main(argv: Sequence[str]) -> int:
     )
 
     if args.fix:
+        # fix_unit_text only ever synthesizes EXACT directives — a host-specific
+        # prefix directive (e.g. ExecStartPre=, whose value carries __REPO_ROOT__
+        # / host paths) cannot be guessed. So the count of lines actually
+        # appended is the number of missing EXACT directives, NOT len(drift)
+        # (which also counts un-synthesizable prefix misses).
+        appended = find_drift(unit_text, required_prefixes=())
         fixed_text = fix_unit_text(unit_text)
         installed_path.write_text(fixed_text, encoding="utf-8")
-        print(f"[fixed] Appended {len(drift)} directive(s) to {installed_path}")
+        print(f"[fixed] Appended {len(appended)} directive(s) to {installed_path}")
         daemon_reload()
+
+        # Re-check the written text with the default (prefix-aware) config. Any
+        # residual drift is an un-synthesizable prefix directive that --fix
+        # could not resolve; report it and exit 1 (drift) rather than falsely
+        # signalling parity with exit 0 — a follow-up plain verify would exit 1.
+        residual = find_drift(fixed_text)
+        if residual:
+            print(
+                f"[drift] {installed_path}: --fix cannot synthesize host-specific "
+                f"directive(s) (value carries host paths — add them by hand):\n"
+                + "".join(f"  - {d}\n" for d in residual),
+                file=sys.stderr,
+            )
+            return 1
         return 0
 
     print(

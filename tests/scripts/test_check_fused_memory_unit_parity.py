@@ -444,6 +444,59 @@ def test_main_fix_calls_daemon_reload(tmp_path: pathlib.Path, monkeypatch: pytes
 
 
 # ---------------------------------------------------------------------------
+# CLI --fix residual (un-synthesizable prefix) tests  (amendment)
+# ---------------------------------------------------------------------------
+
+
+def test_main_fix_returns_1_when_execstartpre_unsynthesizable(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """main(--fix) returns 1 (not a false 0) when a host-specific prefix directive remains.
+
+    _MISSING_MEM0_UNIT lacks every exact directive AND any ExecStartPre= line.
+    --fix appends the exact directives but cannot synthesize the host-specific
+    ExecStartPre value, so parity is NOT reached. The CLI must report the
+    residual drift and exit 1 — matching what a follow-up plain verify would
+    return — instead of falsely signalling parity with exit 0.
+    """
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "daemon_reload", lambda: None)
+    installed = _write_unit(tmp_path, _MISSING_MEM0_UNIT)
+    rc = mod.main(["--installed", str(installed), "--fix"])
+    assert rc == 1
+    combined = "".join(capsys.readouterr())
+    assert "ExecStartPre=" in combined, (
+        "The residual, un-synthesizable directive must be named in the output."
+    )
+
+
+def test_main_fix_appended_count_excludes_unsynthesizable_prefix(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The '[fixed] Appended N' count reflects only the EXACT directives appended.
+
+    find_drift(_MISSING_MEM0_UNIT) returns the 5 missing exact directives PLUS
+    the ExecStartPre= prefix miss (6 total), but fix_unit_text only appends the
+    5 exact directives. The reported count must therefore be 5, never the
+    inflated len(drift)==6.
+    """
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "daemon_reload", lambda: None)
+    full_drift = mod.find_drift(_MISSING_MEM0_UNIT)
+    exact_only = mod.find_drift(_MISSING_MEM0_UNIT, required_prefixes=())
+    assert len(full_drift) == len(exact_only) + 1  # exactly the ExecStartPre miss
+    installed = _write_unit(tmp_path, _MISSING_MEM0_UNIT)
+    mod.main(["--installed", str(installed), "--fix"])
+    out = capsys.readouterr().out
+    assert f"Appended {len(exact_only)} directive" in out
+    assert f"Appended {len(full_drift)} directive" not in out
+
+
+# ---------------------------------------------------------------------------
 # CLI subprocess test  (step-11 / step-12)
 # ---------------------------------------------------------------------------
 
