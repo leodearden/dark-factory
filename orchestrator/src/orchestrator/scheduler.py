@@ -5304,6 +5304,20 @@ class Scheduler:
         # grace/hold streak survives a one-tick disappearance around a main
         # advance and can still reach grace_cycles (task 2743). Every other
         # counter keeps the base terminal-or-absent stale_ids sweep.
+        #
+        # Accepted trade-off (task 2743): because these two streaks no longer
+        # sweep on the absent-from-tasks_by_id path, a non-terminal dependent
+        # that is *permanently* removed from the DB (deleted while gate-held,
+        # never reaching a terminal status in status_map) leaves its
+        # delivered_fail/delivered_hold int behind here. That entry is bounded
+        # — once the dependent is gone the gate phase stops bumping it, so it
+        # can't grow — and this sqlite-rowid scheme doesn't reuse task ids, so
+        # a stale key is never re-associated with a new task. We deliberately
+        # keep the leak (a negligible, frozen int per genuinely-vanished
+        # dependent) rather than reinstate the absent-path sweep, which would
+        # re-open the transient-absence reset this fix exists to close. The
+        # direction is fail-safe: it can only preserve a streak, never
+        # suppress a pending dependent's grace_cycles escalation.
         await self._streak_registry.gc(
             stale_ids,
             extra={'starvation': starvation_non_eligible},
