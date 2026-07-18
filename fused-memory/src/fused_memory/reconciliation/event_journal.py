@@ -21,16 +21,19 @@ genuinely synchronous (~1-5 ms) and applies the *same* durability pragmas as
 
 Threading invariant
 -------------------
-The single ``sqlite3`` connection is, in the hot path, only ever touched from
-the event-loop thread: synchronous ``enqueue`` and the ``drainer``/``recover``
-coroutines (which call ``append``/``mark_processed``/``load_unprocessed``
-without awaiting) all run on that one thread, so no application-level locking is
-needed. The connection is opened with ``check_same_thread=False`` purely to
-tolerate the rare operator-driven replay path, which offloads
-``EventQueue.replay_dead_letters`` (and therefore ``enqueue`` → ``append``) to
-an ``asyncio.to_thread`` worker; Python's ``sqlite3`` module serializes
-connection access internally under its default thread-safe build, so this stays
-correct without a caller-side lock.
+The single ``sqlite3`` connection is only ever touched from the event-loop
+thread: synchronous ``enqueue`` and the ``drainer``/``recover`` coroutines
+(which call ``append``/``mark_processed``/``load_unprocessed`` without awaiting)
+all run on that one thread, so no application-level locking is needed. The
+operator-driven replay path (``EventQueue.replay_dead_letters``) offloads only
+its blocking dead-letter *file* I/O to an ``asyncio.to_thread`` worker; the
+re-enqueue — and therefore every ``append``/``mark_processed`` it triggers — is
+marshalled back onto the loop thread (see
+``EventQueue._resolve_replay_enqueue``), because the in-memory ``asyncio.Queue``
+that ``enqueue`` mutates is not thread-safe. So the connection is never touched
+off the loop thread. ``check_same_thread=False`` is retained as
+defence-in-depth — Python's ``sqlite3`` serializes connection access internally
+under its default thread-safe build — not because any current path requires it.
 """
 
 from __future__ import annotations

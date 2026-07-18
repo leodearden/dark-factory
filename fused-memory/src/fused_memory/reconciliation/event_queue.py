@@ -26,7 +26,7 @@ import os
 import random
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -143,6 +143,11 @@ class EventQueue:
         self._max_bytes = max_bytes
         self._keep_rotations = keep_rotations
         self._drainer_task: asyncio.Task | None = None
+        # Event-loop reference captured at start(). Used only by
+        # replay_dead_letters to marshal enqueue() (which mutates the
+        # thread-unsafe asyncio.Queue) back onto the loop thread when replay is
+        # offloaded to an asyncio.to_thread worker. None until start() runs.
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._closed = False
         # Stats surface for WP-C watchdog / WP-D policy.
         self._last_commit_ts: float | None = None
@@ -162,6 +167,9 @@ class EventQueue:
         """Recover unprocessed journal rows, then spawn the background drainer."""
         if self._drainer_task is not None:
             raise RuntimeError('EventQueue already started')
+        # Capture the loop so replay_dead_letters can marshal enqueue() back to
+        # this thread when it is offloaded to an asyncio.to_thread worker.
+        self._loop = asyncio.get_running_loop()
         # Ensure dead-letter directory exists.
         self._dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
         # Re-enqueue any events that were durable in the journal but never
@@ -730,6 +738,54 @@ class EventQueue:
 
     # ── replay dead-letters ────────────────────────────────────────────
 
+    async def _enqueue_on_loop(self, event: ReconciliationEvent) -> bool:
+        """Coroutine wrapper around :meth:`enqueue`.
+
+        Lets :meth:`replay_dead_letters` marshal the (thread-unsafe)
+        ``asyncio.Queue`` mutation inside :meth:`enqueue` back onto the
+        event-loop thread via ``run_coroutine_threadsafe``. Always runs on the
+        loop thread.
+        """
+        return self.enqueue(event)
+
+    def _resolve_replay_enqueue(self) -> Callable[[ReconciliationEvent], object]:
+        """Return a callable that enqueues one event, safe for the CURRENT thread.
+
+        :meth:`enqueue` calls ``self._queue.put_nowait`` and ``asyncio.Queue`` is
+        NOT thread-safe: from a non-loop thread ``put_nowait`` would wake a
+        blocked getter via ``loop.call_soon`` (not ``call_soon_threadsafe``),
+        appending to the loop's ready-callback deque and touching Future
+        internals off-thread. :meth:`replay_dead_letters` runs either on the
+        event-loop thread (a direct call — e.g. from tests or another coroutine)
+        or in an ``asyncio.to_thread`` worker (the ``replay_event_dead_letters``
+        MCP tool offloads the blocking dead-letter file I/O). On the loop thread
+        we enqueue inline; off it we marshal each enqueue onto the loop via
+        ``run_coroutine_threadsafe`` and block the worker on the result, so every
+        ``asyncio.Queue`` mutation stays on the loop thread and replay stays
+        deterministic — counting and queue state are fully settled before the
+        method returns.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Off the event-loop thread (asyncio.to_thread worker): marshal.
+            loop = self._loop
+            if loop is None:
+                raise RuntimeError(
+                    'EventQueue.replay_dead_letters invoked off the event-loop '
+                    'thread before start() captured the loop — cannot marshal '
+                    'enqueue onto the loop safely'
+                )
+
+            def _marshalled(event: ReconciliationEvent) -> object:
+                return asyncio.run_coroutine_threadsafe(
+                    self._enqueue_on_loop(event), loop,
+                ).result()
+
+            return _marshalled
+        # On the event-loop thread: put_nowait is safe inline.
+        return self.enqueue
+
     def replay_dead_letters(self, *, project_id: str | None = None) -> dict[str, int]:
         """Re-enqueue dead-lettered reconciliation events through :meth:`enqueue`.
 
@@ -747,11 +803,25 @@ class EventQueue:
         dead-letter file — replay never silently drops data (loud-over-silent).
         Snapshots are unlinked once fully processed.
 
+        Thread-safety: the blocking dead-letter file I/O (snapshot/read/parse/
+        leftover-writeback) runs on whatever thread calls this method — the MCP
+        ``replay_event_dead_letters`` tool offloads it to an
+        ``asyncio.to_thread`` worker. The re-enqueue itself mutates the
+        thread-unsafe in-memory ``asyncio.Queue`` (via :meth:`enqueue` →
+        ``put_nowait``), so it is always performed on the event-loop thread:
+        :meth:`_resolve_replay_enqueue` enqueues inline when already on the loop
+        thread, or marshals each enqueue onto the loop (blocking the worker on
+        the result) when called from a worker thread.
+
         Note: ``project_id`` is NOT canonicalized (matches the dead-letter tool
         convention). Returns ``{'replayed': N, 'failed': M}``.
         """
         from fused_memory.models.reconciliation import ReconciliationEvent
 
+        # Resolve a thread-appropriate enqueue callable once (see
+        # _resolve_replay_enqueue): inline on the loop thread, marshalled onto
+        # the loop when this runs in an asyncio.to_thread worker.
+        enqueue = self._resolve_replay_enqueue()
         replayed = 0
         failed = 0
         leftovers: list[str] = []
@@ -800,7 +870,9 @@ class EventQueue:
                     continue
                 # Normal enqueue path → re-journaled (durable-at-enqueue) and
                 # overflow-safe (an overflow re-dead-letters via _write_dead_letter).
-                self.enqueue(event)
+                # `enqueue` is the thread-appropriate callable (inline on the
+                # loop thread, marshalled onto the loop from a worker thread).
+                enqueue(event)
                 replayed += 1
             snapshot.unlink(missing_ok=True)
 
