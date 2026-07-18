@@ -6182,6 +6182,74 @@ async def test_resume_interrupted_runs_falls_back_when_unresumable(
     harness._escalate.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_resume_interrupted_runs_honours_opt_out_on_resuming_side(
+    journal, event_buffer, mock_memory_service,
+):
+    """task σ (amendment): the ``resume_after_restart`` master switch must be
+    honoured on the RESUMING side, not only when marking a cancel `interrupted`.
+
+    Scenario the knob targets: the old (resume-enabled) process is restarted by
+    a prompt-changing deploy and marks its in-flight run `interrupted`; the new
+    process boots with ``resume_after_restart=False`` (operator opt-out). Even
+    though every guard rail would PASS (fresh interrupt, transcript on disk, no
+    attempt-cap), the run must NOT be ``--resume``d into the changed prompt.
+    Instead it routes to the failed+restore fallback — cleaned up (events
+    restored, config dir GC'd, lock released) rather than orphaned for the
+    age-based reaper. Because this is a deliberate opt-out (not a resume
+    failure), the ``_record_resume_failure`` storm counter is NOT consulted.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    # Opt this deploy out of resume (e.g. it changed recon prompts/tooling).
+    harness.config.resume_after_restart = False
+    project_id = 'test-project'
+
+    # An otherwise fully-resumable run: fresh interrupt, no cap, transcript on
+    # disk — so ONLY the opt-out (not a guard rail) can send it to the fallback.
+    run = await _setup_interrupted_dead_predecessor_run(journal, event_buffer)
+
+    # run_full_cycle must NEVER be awaited — the opt-out means no --resume at all.
+    harness.run_full_cycle = AsyncMock()
+    # Spy the storm counter to prove an opt-out is not miscounted as a failure.
+    harness._record_resume_failure = MagicMock(return_value=None)
+    # Spy restore_drained to prove the failed+restore cleanup ran.
+    restore_spy = AsyncMock(side_effect=event_buffer.restore_drained)
+    event_buffer.restore_drained = restore_spy
+
+    with patch(
+        'fused_memory.reconciliation.harness.read_transcript_records',
+        return_value=[{'sessionId': 'S'}], create=True,
+    ), patch(
+        'fused_memory.reconciliation.harness.gc_run_config_dir',
+    ) as gc_mock:
+        await harness._resume_interrupted_runs()
+
+    # Opt-out honoured: never resumed.
+    harness.run_full_cycle.assert_not_awaited()
+
+    # Cleaned up via the failed+restore fallback, stamped with the opt-out reason.
+    after = await journal.get_run(run.id)
+    assert after is not None
+    assert after.status == RunStatus.failed
+    err = after.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'InterruptedRunResumeDisabled', (
+        f'opt-out must error-stamp InterruptedRunResumeDisabled, '
+        f'got {err.get("error_type")!r}'
+    )
+
+    # Events restored, config dir GC'd, dead predecessor's lock released.
+    restore_spy.assert_awaited()
+    gc_mock.assert_called_once_with(journal.data_dir, run.id)
+    assert await event_buffer.get_lock_holder_instance_id(project_id) is None
+
+    # A deliberate opt-out is NOT a resume failure: the storm counter is not
+    # consulted and no escalation fires.
+    harness._record_resume_failure.assert_not_called()
+    harness._escalate.assert_not_called()
+
+
 def test_resume_failure_storm_escalates_once_per_window(
     journal, event_buffer, mock_memory_service,
 ):

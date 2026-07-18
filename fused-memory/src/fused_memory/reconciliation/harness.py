@@ -1431,6 +1431,39 @@ class ReconciliationHarness:
             if lock_holder != run.instance_id:
                 continue
 
+            # ── Master switch (honoured on the RESUMING side too): when a deploy
+            # opts out of resume via resume_after_restart=False — typically
+            # because it changed recon prompts/tooling — a run the OLD
+            # (resume-enabled) process already marked `interrupted` must NOT be
+            # --resume'd into the NEW system prompt (a --resume finishes under the
+            # OLD system prompt by construction). Route it to the same
+            # failed+restore fallback the guard rails use so it is cleaned up
+            # (drained events restored, config dir GC'd) rather than left orphaned
+            # for the age-based reaper. This is a deliberate operator opt-out, NOT
+            # a resume failure, so it deliberately does NOT feed the
+            # _record_resume_failure storm counter.
+            if not self.config.resume_after_restart:
+                await self._recover_one_run(
+                    run, lock_holder, lock_age,
+                    disposition='failed',
+                    error_type='InterruptedRunResumeDisabled',
+                    error_message=(
+                        'resume_after_restart disabled — interrupted run cleaned '
+                        'up via failed+restore instead of --resume (deploy opted '
+                        'out of resuming into a changed prompt/toolset)'
+                    ),
+                )
+                logger.info(
+                    'reconciliation.interrupted_run_resume_disabled',
+                    extra={
+                        'run_id': run.id,
+                        'project_id': run.project_id,
+                        'instance_id': run.instance_id,
+                        'stage_cursor': run.stage_cursor,
+                    },
+                )
+                continue
+
             # ── Guard rails: on ANY doubt, fall back to the failed+restore
             # recovery path rather than --resume a stale/unsafe run.  Checked
             # BEFORE adopting the lock so _recover_one_run's own ownership-scoped
