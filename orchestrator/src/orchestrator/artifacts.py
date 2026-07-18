@@ -431,6 +431,74 @@ class TaskArtifacts:
         """Remove ``.task/false_premise.json`` if present."""
         self._clear_path('false_premise.json')
 
+    # ──────────────────────────────────────────────────────────────────
+    # Review-state persistence (review_state.json)
+    #
+    # A single reseed-surviving artifact holding (a) the tree-hash-keyed
+    # verdict cache — so a re-dispatch on an unchanged committed tree does
+    # not re-mint a fresh reviewer nit — and (b) the task-lifetime
+    # amendment/review counters, so ``max_amendment_rounds`` /
+    # ``max_review_cycles`` bound the WHOLE task lifetime, not each
+    # dispatch.  Fail-safe: a corrupt/absent file reads as defaults; the
+    # cache is an optimization/churn guard, never load-bearing.
+    # ──────────────────────────────────────────────────────────────────
+
+    def read_review_state(self) -> dict:
+        """Read ``review_state.json`` — the tree-hash verdict cache plus the
+        task-lifetime amendment/review counters.
+
+        Returns a fresh default state ``{'amendment_rounds_total': 0,
+        'review_cycles_total': 0, 'verdicts': {}}`` when the file is absent,
+        and — mirroring ``read_created_at``'s fail-safe (:264-279) — logs a
+        warning and returns those same defaults on a corrupt/unreadable or
+        malformed file rather than raising.  A present-but-partial file is
+        merged over the defaults so all canonical keys are always exposed.
+        """
+        default = {
+            'amendment_rounds_total': 0,
+            'review_cycles_total': 0,
+            'verdicts': {},
+        }
+        path = self._read_path('review_state.json')
+        if not path.exists():
+            return default
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning('Corrupt review_state.json at %s: %s', path, exc)
+            return default
+        if not isinstance(data, dict):
+            logger.warning(
+                'Malformed review_state.json at %s: not an object', path
+            )
+            return default
+        merged = {**default, **data}
+        if not isinstance(merged.get('verdicts'), dict):
+            merged['verdicts'] = {}
+        return merged
+
+    def record_review_verdict(
+        self, tree_hash: str, verdict: str, suggestions_routed: bool
+    ) -> None:
+        """Record a non-blocking ``verdict`` for a committed ``tree_hash``.
+
+        Read-modify-write of ``review_state.json`` that preserves the
+        lifetime counters and any other recorded verdicts.  Only PASS /
+        suggestions_only verdicts are ever recorded by the caller — a
+        cache hit therefore unconditionally short-circuits REVIEW to DONE.
+        """
+        state = self.read_review_state()
+        state['verdicts'][tree_hash] = {
+            'verdict': verdict,
+            'suggestions_routed': bool(suggestions_routed),
+            'ts': datetime.now(UTC).isoformat(),
+        }
+        self._write_json(self.root / 'review_state.json', state)
+
+    def get_cached_verdict(self, tree_hash: str) -> dict | None:
+        """Return the recorded verdict record for ``tree_hash``, else ``None``."""
+        return self.read_review_state()['verdicts'].get(tree_hash)
+
     def _read_path(self, name: str) -> Path:
         """Resolve *name* under ``self.root``."""
         return self.root / name
