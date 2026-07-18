@@ -552,3 +552,42 @@ class TestMainCLI:
 
         assert 'zero-signal' in captured.err.lower()
         assert 'bytes used' in captured.err.lower()
+
+    def test_main_threads_resolved_archive_roots_into_enumerate(self, tmp_path, monkeypatch):
+        # Wiring proof (no operator flip): main() resolves the config's
+        # agent_transcript_roots against cfg.project_root and passes them to
+        # enumerate_sessions, so the shipped archive root is actually read.
+        # Patches sampling.enumerate_sessions (bare-imported into this module's
+        # namespace) to capture the kwargs the call site supplies.
+        config_path = tmp_path / 'legibility.yaml'
+        config_path.write_text(textwrap.dedent(f"""\
+            project_id: dark_factory
+            project_root: /home/leo/src/dark-factory
+            escalation_port: 8103
+            cwd_prefixes: [{MAIN_CWD}]
+            agent_transcript_roots:
+              - data/orchestrator/agent-transcripts
+            """))
+
+        captured = []
+
+        def fake_enumerate_sessions(projects_root, cwd_prefixes, target_date, **kwargs):
+            captured.append(kwargs)
+            return []
+
+        monkeypatch.setattr(mod, 'enumerate_sessions', fake_enumerate_sessions)
+
+        ret = mod.main([
+            '--config', str(config_path),
+            '--projects-root', str(tmp_path / 'projects'),
+            '--date', '2026-07-13',
+        ])
+
+        assert ret == 0
+        assert len(captured) == 1
+        cfg = config_mod.load_config(config_path)
+        expected = inventory.resolve_agent_transcript_roots(
+            cfg.project_root, cfg.agent_transcript_roots
+        )
+        assert expected == [Path('/home/leo/src/dark-factory') / 'data/orchestrator/agent-transcripts']
+        assert captured[0]['agent_transcript_roots'] == expected

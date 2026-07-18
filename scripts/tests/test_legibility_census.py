@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ import codebook
 import coder
 import config as config_mod
 import digest as digest_mod
+import inventory
 from legibility import census_trigger
 
 # ---------------------------------------------------------------------------
@@ -1310,13 +1312,17 @@ def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
 # ---------------------------------------------------------------------------
 
 def _write_legibility_yaml(config_path, *, project_id="dark_factory", project_root=None,
-                            escalation_port=8103, cwd_prefixes=None):
+                            escalation_port=8103, cwd_prefixes=None,
+                            agent_transcript_roots=None):
     """Write a minimal valid legibility.yaml to *config_path* (any path —
     the caller decides whether it lives at the default
     <project-root>/docs/legibility/legibility.yaml location or elsewhere,
     to exercise --config's override). Plain-text lines, not a yaml.safe_dump
     round trip — mirrors test_legibility_nightly.py's _write_config, kept
-    independent of the module under test's own YAML writer."""
+    independent of the module under test's own YAML writer.
+
+    When *agent_transcript_roots* is given, an ``agent_transcript_roots:``
+    block is appended so the loaded cfg opts into archive-root enumeration."""
     project_root = project_root if project_root is not None else config_path.parent
     cwd_prefixes = cwd_prefixes if cwd_prefixes is not None else [str(project_root)]
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1327,6 +1333,9 @@ def _write_legibility_yaml(config_path, *, project_id="dark_factory", project_ro
         "cwd_prefixes:",
     ]
     lines += [f"  - {prefix}" for prefix in cwd_prefixes]
+    if agent_transcript_roots is not None:
+        lines.append("agent_transcript_roots:")
+        lines += [f"  - {r}" for r in agent_transcript_roots]
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return config_path
 
@@ -1447,3 +1456,37 @@ def test_main_returns_nonzero_on_fail_loud_error(tmp_path, monkeypatch):
     exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
 
     assert exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# default_batch_source — the shipped agent_transcript_roots is threaded into
+# every enumerate_sessions call with NO operator flip (resolved against
+# cfg.project_root). Patches inventory.enumerate_sessions (the module object
+# census.py itself references via `import inventory`) to capture kwargs.
+# ---------------------------------------------------------------------------
+
+def test_default_batch_source_passes_resolved_archive_roots_to_enumerate(tmp_path, monkeypatch):
+    config_path = _write_legibility_yaml(
+        _default_config_path(tmp_path), project_root=tmp_path,
+        agent_transcript_roots=["data/orchestrator/agent-transcripts"],
+    )
+    cfg = config_mod.load_config(config_path)
+
+    captured = []
+
+    def fake_enumerate_sessions(projects_root, cwd_prefixes, target_date, **kwargs):
+        captured.append(kwargs)
+        return []
+
+    monkeypatch.setattr(inventory, "enumerate_sessions", fake_enumerate_sessions)
+
+    now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    # Consume the generator: nothing enumerates until it is iterated.
+    list(mod.default_batch_source(cfg, projects_root=tmp_path / "projects", now=now))
+
+    assert captured, "enumerate_sessions was never called"
+    expected = inventory.resolve_agent_transcript_roots(
+        cfg.project_root, cfg.agent_transcript_roots
+    )
+    assert expected == [tmp_path / "data" / "orchestrator" / "agent-transcripts"]
+    assert all(c["agent_transcript_roots"] == expected for c in captured)

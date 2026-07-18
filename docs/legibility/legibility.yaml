@@ -12,6 +12,13 @@ escalation_port: 8103
 # dark-factory today: main checkout + .worktrees/.claude-worktrees children).
 cwd_prefixes:
   - /home/leo/src/dark-factory
+# Additional archive roots the miner enumerates ALONGSIDE ~/.claude/projects:
+# the fleet-transcript tree produced by shared.transcript_archive (PRD task α,
+# plans/agent-transcript-archival-prd.md). Relative to project_root, git-ignored
+# (the dir may not exist yet). Shipping this SET turns the fleet corpus on with
+# no operator flip.
+agent_transcript_roots:
+  - data/orchestrator/agent-transcripts
 budgets:
   max_daily_digest_bytes: 300000
 sampling:

@@ -21,6 +21,7 @@ are written fire-and-forget and can have a truncated/corrupt trailing line.
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import sys
 from collections.abc import Sequence
@@ -31,13 +32,25 @@ from typing import Any
 def load_transcript(path: Any) -> list[dict[str, Any]]:
     """Parse a transcript JSONL file into an ordered list of record dicts.
 
+    Transparently reads gzip-compressed transcripts: a ``*.jsonl.gz`` path
+    (the archived fleet-transcript format written by
+    ``shared.transcript_archive``) is opened via ``gzip.open(..., 'rt')``,
+    while a plain path keeps the exact ``open(path, encoding='utf-8')`` call
+    for byte-parity. This lets census/nightly RENDER digests for archived gz
+    sessions rather than enumerate-then-drop them (the same gz idiom as
+    ``inventory._iter_json_lines``).
+
     Blank lines and lines that fail to parse as JSON are skipped rather
     than raising: fire-and-forget transcript writers can leave a truncated
     or corrupt trailing line, and one bad line must not abort the whole
     read (mirrors analyze_speculation_depth.load_events).
     """
     records: list[dict[str, Any]] = []
-    with open(path, encoding='utf-8') as f:
+    if str(path).endswith('.gz'):
+        f = gzip.open(path, 'rt', encoding='utf-8')
+    else:
+        f = open(path, encoding='utf-8')
+    with f:
         for line in f:
             line = line.strip()
             if not line:

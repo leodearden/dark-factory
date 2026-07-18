@@ -142,6 +142,34 @@ class TestFullConfigOverridesDefaults:
         assert cfg.census.saturation.consecutive_batches == 3
 
 
+class TestAgentTranscriptRoots:
+    """agent_transcript_roots — the additional archive roots the miner
+    enumerates alongside ~/.claude/projects. Defaults to [] (the parity
+    baseline) when omitted, round-trips a list of strings, and rejects a
+    non-list value with a pydantic.ValidationError."""
+
+    def test_defaults_to_empty_list_when_omitted(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
+        assert cfg.agent_transcript_roots == []
+
+    def test_present_list_round_trips(self, tmp_path):
+        text = MINIMAL_YAML + textwrap.dedent("""\
+            agent_transcript_roots:
+              - data/orchestrator/agent-transcripts
+              - /var/lib/agent-transcripts
+            """)
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.agent_transcript_roots == [
+            'data/orchestrator/agent-transcripts',
+            '/var/lib/agent-transcripts',
+        ]
+
+    def test_non_list_value_raises(self, tmp_path):
+        text = MINIMAL_YAML + 'agent_transcript_roots: data/orchestrator/agent-transcripts\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+
 class TestMalformedConfigRaises:
     """Malformed §7.4 configs raise pydantic.ValidationError — never a
     silently-defaulted or partially-applied model."""
@@ -208,3 +236,12 @@ class TestShippedDarkFactoryConfig:
         assert cfg.models.census_miner
         assert cfg.models.census_verify
         assert cfg.models.census_synthesis
+
+    def test_shipped_config_agent_transcript_roots_set_live(self):
+        # The CRITICAL Leo ask (plans/agent-transcript-archival-prd.md, task γ):
+        # the shipped config ships the fleet archive root SET (live), not empty,
+        # so the archived fleet-transcript corpus is enumerated with no operator
+        # flip. Relative to project_root; git-ignored; produced by task α's
+        # shared.transcript_archive.
+        cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+        assert cfg.agent_transcript_roots == ['data/orchestrator/agent-transcripts']
