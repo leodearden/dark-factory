@@ -10831,3 +10831,61 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 else await self._worktree_has_wip_commits()
             ),
         )
+
+
+def build_workflow(
+    *,
+    assignment: TaskAssignment,
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    scheduler: SchedulerFacade,
+    briefing: _BriefingLike,
+    mcp: _McpLike | None,
+    escalation_queue: EscalationQueue | None = None,
+    escalation_event: asyncio.Event | None = None,
+    usage_gate: UsageGate | None = None,
+    initial_plan: dict | None = None,
+    steward_factory=None,
+    merge_queue: asyncio.Queue | None = None,
+    merge_worker=None,
+    merge_inflight_registry: InFlightMergeRegistry | None = None,
+    event_store: EventStore | None = None,
+    cost_store: CostStore | None = None,
+    cancel_event: asyncio.Event | None = None,
+    resume_session_id: dict | None = None,
+    run_id: str | None = None,
+) -> TaskWorkflow:
+    """Single construction point for :class:`TaskWorkflow` (PRD C2 / Invariant P2).
+
+    Both dispatch sites — production ``harness.py`` and eval
+    ``evals/runner.py`` — construct their ``TaskWorkflow`` through this
+    factory rather than calling the constructor directly, so the two paths
+    can never drift silently: a new MANDATORY ``TaskWorkflow.__init__``
+    parameter is either threaded through here once (and thereby acquired by
+    both call sites) or surfaces as a single required edit that breaks BOTH
+    at once. The signature is a keyword-only, explicit pass-through mirroring
+    ``TaskWorkflow.__init__`` exactly — deliberately NOT a ``**kwargs``
+    forwarder, which would swallow that drift and defeat the tripwire guard
+    in ``tests/test_workflow_factory.py``.
+    """
+    return TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,
+        briefing=briefing,
+        mcp=mcp,
+        escalation_queue=escalation_queue,
+        escalation_event=escalation_event,
+        usage_gate=usage_gate,
+        initial_plan=initial_plan,
+        steward_factory=steward_factory,
+        merge_queue=merge_queue,
+        merge_worker=merge_worker,
+        merge_inflight_registry=merge_inflight_registry,
+        event_store=event_store,
+        cost_store=cost_store,
+        cancel_event=cancel_event,
+        resume_session_id=resume_session_id,
+        run_id=run_id,
+    )
