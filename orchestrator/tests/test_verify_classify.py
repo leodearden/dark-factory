@@ -799,6 +799,24 @@ _SEMAPHORE_TIMEOUT_CLIPPY_DIAGNOSTIC_OUTPUT = (
     'error: aborting due to previous error\n'
 )
 
+# rustc compile-error golden: starts with a rustc error code (error[E0308]:),
+# quotes lock/slot/semaphore source and mentions "timed out" in a note, but
+# carries NO `clippy::` token — proves the veto must also recognize a bare
+# rustc diagnostic marker, not just clippy's.
+_SEMAPHORE_TIMEOUT_RUSTC_DIAGNOSTIC_OUTPUT = (
+    'error[E0308]: mismatched types\n'
+    '  --> src/worker/pool.rs:42:20\n'
+    '   |\n'
+    "42 |         let guard: MutexGuard<'_, Slot> = self.semaphore.lock();\n"
+    "   |                    ^^^^^^^^^^^^^^^^^^^^ expected `Slot`, found "
+    "`MutexGuard<'_, Slot>`\n"
+    '   |\n'
+    '   = note: a peer that timed out waiting for the lock may have left the '
+    'semaphore in an inconsistent state\n'
+    '\n'
+    'error: aborting due to previous error\n'
+)
+
 
 class TestSemaphoreTimeoutDeterministicDiagnosticVeto:
     """task 2748: a deterministic Rust compiler/clippy diagnostic must veto
@@ -817,6 +835,29 @@ class TestSemaphoreTimeoutDeterministicDiagnosticVeto:
             f'a deterministic clippy lint diagnostic (clippy:: marker present) '
             f'with incidental lock/slot/semaphore + "timed out" tokens must not '
             f'classify infra-transient, got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_rustc_compile_error_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
+        self, tool
+    ):
+        result = _classify(tool, _SEMAPHORE_TIMEOUT_RUSTC_DIAGNOSTIC_OUTPUT, 1, False)
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a deterministic rustc compile-error diagnostic (rustc error-code '
+            f'marker present, no clippy:: marker) with incidental '
+            f'lock/slot/semaphore + "timed out" tokens must not classify '
+            f'infra-transient, got {result!r}'
+        )
+
+    @pytest.mark.parametrize(
+        'tool', [ToolKind.CARGO_TEST, ToolKind.CARGO_CLIPPY, ToolKind.OPAQUE]
+    )
+    def test_rustc_compile_error_with_incidental_lock_and_timeout_tokens_is_compile_error(
+        self, tool
+    ):
+        assert (
+            _classify(tool, _SEMAPHORE_TIMEOUT_RUSTC_DIAGNOSTIC_OUTPUT, 1, False)
+            == FailureCategory.COMPILE_ERROR
         )
 
 
