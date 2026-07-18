@@ -267,7 +267,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     )
     sem = asyncio.Semaphore(0)
 
-    # ── Patch TaskWorkflow to await the real cancel_event then return SOFT_CANCELLED ──
+    # ── Patch build_workflow to await the real cancel_event then return SOFT_CANCELLED ──
     cancel_event_holder: list[asyncio.Event] = []
 
     def _make_mock_workflow(*args, **kwargs):
@@ -295,7 +295,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
         mock_wf.run = _run_soft_cancelled
         return mock_wf
 
-    with patch('orchestrator.harness.TaskWorkflow', side_effect=_make_mock_workflow):
+    with patch('orchestrator.harness.build_workflow', side_effect=_make_mock_workflow):
         # Wire harness into the escalation server so release_workflow can reach it.
         server = create_server(queue, harness=h)
 
