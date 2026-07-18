@@ -148,7 +148,7 @@ If a single bulk call is rejected (e.g. payload-size cap), split into the smalle
 
 The decompose session then commits the stamped sidecar — `git commit --only <sidecar>` in the same skill turn — mirroring how the `.md` manifest is committed beside the PRD (see CLAUDE.md "Working in the main checkout" for the `--only` rationale: it avoids sweeping up unrelated concurrent state in a machine-operated checkout).
 
-> **Interim reality.** Until sibling task γ lands, `commit_planning` does not yet perform this stamp. Hand-stamp `task_id` into the sidecar and commit it yourself, matching the committed exemplar's file header.
+This stamping is live in `commit_planning` (landed via task 2578, live since 2026-07-16) — no hand-stamping needed; the call above performs it automatically as part of the batch flip.
 
 ### Step 6 — Verify
 
