@@ -141,6 +141,7 @@ async def resolve_and_record_route(
     scheduler: Any | None = None,
     in_memory_task: dict | None = None,
     cost_store: Any | None = None,
+    applied_budget_usd: float | None = None,
 ) -> RoutingDecision:
     """Resolve one out-of-band invocation's route and record the decision.
 
@@ -179,6 +180,18 @@ async def resolve_and_record_route(
         are given; mutated in-memory on ``in_memory_task`` when given.
     cost_store:
         Trailing-24h ceiling-spend source (only read when ceilings configured).
+    applied_budget_usd:
+        The per-invocation USD cap the CALLER actually enforces on its invoke,
+        when it differs in KIND from the resolver-owned ``decision.budget_usd``.
+        Today only the steward main invoke sets it: the steward applies a
+        lifetime-capped ``per_invocation_budget`` (``min(config.budgets.steward,
+        steward_lifetime_budget - spent)``) the resolver has no concept of, so
+        its resolved ``budget_usd`` is advisory-only. When given, the
+        ``routing_decision`` event carries ``applied_budget_usd`` plus a
+        ``budget_usd_advisory=True`` flag so cost triage is not misled into
+        reading the advisory ``budget_usd`` as the enforced ceiling. ``None``
+        (every other site) → the applied cap IS ``decision.budget_usd`` → no
+        annotation, byte-equivalent event.
     """
     md: Mapping[str, Any] = task_metadata or {}
     routing_state = RoutingState.from_metadata(dict(md))
@@ -230,11 +243,20 @@ async def resolve_and_record_route(
         # Derived from `mirror` (not hand-duplicated) so the event payload and
         # the metadata.routing mirror below are two serializations of the one
         # record + the event-only `inputs_digest`.
+        event_data = {**mirror.model_dump(), 'inputs_digest': digest}
+        if applied_budget_usd is not None:
+            # This site enforces a per-invocation cap distinct in kind from the
+            # resolver's advisory budget_usd (see the `applied_budget_usd`
+            # param doc). Surface the actually-applied cap + an explicit
+            # advisory flag so telemetry consumers do not read budget_usd as the
+            # enforced ceiling. Absent at every other site (byte-equivalent).
+            event_data['applied_budget_usd'] = applied_budget_usd
+            event_data['budget_usd_advisory'] = True
         event_store.emit(
             EventType.routing_decision,
             task_id=task_id,
             role=role_name,
-            data={**mirror.model_dump(), 'inputs_digest': digest},
+            data=event_data,
         )
 
     new_state_dump = routing_state.with_decision(mirror).model_dump()

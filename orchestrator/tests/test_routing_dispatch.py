@@ -144,6 +144,57 @@ class TestEmitsRoutingDecisionEvent:
 
 
 @pytest.mark.asyncio
+class TestAppliedBudgetAnnotation:
+    """`applied_budget_usd` surfaces a caller-enforced per-invocation cap that
+    differs in kind from the resolver's advisory ``budget_usd`` (today: the
+    steward's lifetime-capped ``per_invocation_budget``) in the
+    routing_decision event, so cost triage is not misled into reading the
+    advisory ``budget_usd`` as the enforced ceiling (reviewer suggestion, task
+    η amendment). Absent → byte-equivalent event for every other site."""
+
+    async def test_applied_budget_annotates_event(self) -> None:
+        cfg = _mk_cfg()
+        fake = _fake_decision()  # budget_usd=1.23 (resolver-advisory)
+        rec = _RecordingEventStore()
+        with patch(f'{_HELPER}.resolve_route', return_value=fake):
+            decision = await resolve_and_record_route(
+                role_name='steward',
+                role_defaults=_STEWARD_DEFAULTS,
+                config=cfg,
+                task_id='2537',
+                task_metadata={},
+                event_store=rec,
+                applied_budget_usd=3.0,
+            )
+        # The returned decision is untouched — the resolver still owns budget_usd.
+        assert decision.budget_usd == 1.23
+        data = _routing_entries(rec)[0]['data']
+        # Advisory resolved budget is still recorded verbatim...
+        assert data['budget_usd'] == 1.23
+        # ...alongside the actually-applied cap + an explicit advisory flag.
+        assert data['applied_budget_usd'] == 3.0
+        assert data['budget_usd_advisory'] is True
+
+    async def test_no_applied_budget_leaves_event_unannotated(self) -> None:
+        cfg = _mk_cfg()
+        fake = _fake_decision()
+        rec = _RecordingEventStore()
+        with patch(f'{_HELPER}.resolve_route', return_value=fake):
+            await resolve_and_record_route(
+                role_name='steward',
+                role_defaults=_STEWARD_DEFAULTS,
+                config=cfg,
+                task_id='2537',
+                task_metadata={},
+                event_store=rec,
+            )
+        data = _routing_entries(rec)[0]['data']
+        # Byte-equivalent event at every non-steward site: no annotation keys.
+        assert 'applied_budget_usd' not in data
+        assert 'budget_usd_advisory' not in data
+
+
+@pytest.mark.asyncio
 class TestHonorsModelOverride:
     """(d) a model_overrides entry in the supplied task_metadata wins via the
     real resolve_route path."""

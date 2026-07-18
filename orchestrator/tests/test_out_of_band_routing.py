@@ -153,6 +153,9 @@ class TestStewardMainAdoptsResolveRoute:
         assert hk['role_name'] == 'steward'
         assert hk['task_metadata'] == {'dispatch_count': 2}
         assert hk['task_id'] == '42'
+        # The enforced lifetime-capped cap is threaded to the helper so the
+        # routing_decision event records it (advisory-budget annotation).
+        assert hk['applied_budget_usd'] == pytest.approx(3.0)
 
         kwargs = mock_iwcr.call_args.kwargs
         assert kwargs['model'] == 'sonnet'
@@ -178,9 +181,15 @@ class TestStewardMainAdoptsResolveRoute:
 
         entries = _routing_entries(rec)
         assert len(entries) == 1
-        assert entries[0]['data']['role'] == 'steward'
+        data = entries[0]['data']
+        assert data['role'] == 'steward'
         # Stock config, no override → config-layer model.
-        assert entries[0]['data']['model'] == 'opus'
+        assert data['model'] == 'opus'
+        # The steward's enforced per-invocation cap is surfaced alongside the
+        # resolver's advisory budget_usd, flagged advisory-only (reviewer
+        # suggestion, task η amendment).
+        assert data['applied_budget_usd'] == pytest.approx(3.0)
+        assert data['budget_usd_advisory'] is True
 
     async def test_model_override_wins_boundary_test_9(self, tmp_path: Path) -> None:
         wt = tmp_path / 'wt'
@@ -826,4 +835,8 @@ async def test_cross_site_byte_equivalence_at_stock_config(
     assert data['effort'] == exp_effort
     assert data['budget_usd'] == exp_budget
     assert data['max_turns'] == exp_turns
+    # None of these calls pass applied_budget_usd (only the steward MAIN invoke
+    # does), so the advisory-budget annotation is absent — byte-equivalent event.
+    assert 'applied_budget_usd' not in data
+    assert 'budget_usd_advisory' not in data
     assert data['inputs_digest']

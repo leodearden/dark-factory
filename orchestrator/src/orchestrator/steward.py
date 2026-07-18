@@ -620,6 +620,11 @@ class TaskSteward:
         # stays per_invocation_budget (a lifetime-capped cross-invocation budget
         # the resolver has no concept of — see this task's plan design_decisions)
         # and backend stays self.config.backends.steward (resolver-external).
+        # Because the enforced cap (per_invocation_budget) differs in kind from
+        # the resolver's advisory decision.budget_usd, pass applied_budget_usd so
+        # the routing_decision event records the actually-applied cap + a
+        # budget_usd_advisory flag — otherwise cost triage would read the
+        # advisory resolved budget_usd as the enforced ceiling.
         decision = await resolve_and_record_route(
             role_name='steward',
             role_defaults=RoleDefaults(
@@ -632,6 +637,7 @@ class TaskSteward:
             in_memory_task=self.task,
             event_store=self.event_store,
             cost_store=self.cost_store,
+            applied_budget_usd=per_invocation_budget,
         )
         kwargs: dict = dict(
             prompt=prompt,
