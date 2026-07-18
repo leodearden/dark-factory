@@ -679,6 +679,38 @@ async def test_mock_stage_run_before_return_callback(journal, event_buffer, mock
     )
 
 
+@pytest.mark.asyncio
+async def test_run_full_cycle_persists_judge_pending_marker_and_tracks_task(
+    journal, event_buffer, mock_memory_service
+):
+    """run_full_cycle's judge launch goes through _spawn_judge (task 2708): the
+    judge_pending marker is durably persisted BEFORE the task fires, and the
+    task is tracked in _judge_tasks so shutdown can drain it."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    # Clean stage reports (no actionable findings) so remediation does not also fire.
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    # Truthy judge stub + no-op _run_judge that does NOT clear the marker, so the
+    # persisted judge_pending marker survives for the assertion below.
+    harness.judge = MagicMock()
+    harness._run_judge = AsyncMock()
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+    # Assert task-tracking BEFORE any further await so the done-callback discard
+    # cannot empty the set between the cycle returning and this check.
+    assert harness._judge_tasks, '_spawn_judge must track the judge task in _judge_tasks'
+
+    pending = await journal.get_pending_judge_runs()
+    assert (run.id, 'test-project') in pending, (
+        'run_full_cycle must persist a judge_pending marker via _spawn_judge'
+    )
+
+    await asyncio.gather(*harness._judge_tasks, return_exceptions=True)
+
+
 # ---------------------------------------------------------------------------
 # Task 2734: pure predicate helper backing arm 2 of the widened Stage 1
 # cycle_summary harness backstop below — "Stage 1 completed but its own
