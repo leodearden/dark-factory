@@ -87,6 +87,31 @@ _LOG_PREFIX = 'gc_agent_transcripts:'
 
 SECONDS_PER_DAY = 86_400
 
+# Stdlib-only mirrors of α's canonical retention config
+# (orchestrator.config.TranscriptArchiveConfig / RetentionConfig). Pinned
+# against silent drift by test_gc_agent_transcripts.py's drift-guard test —
+# see the module docstring for why the GC does not import OrchestratorConfig.
+# drain_check.py's DEFAULT_FLEET_DIR sets the precedent for the hardcoded
+# absolute project-root default.
+DEFAULT_PROJECT_ROOT = Path('/home/leo/src/dark-factory')
+# Mirrors TranscriptArchiveConfig().root — resolved against project_root, NOT
+# the per-task worktree (the archive is a durable, git-ignored data dir).
+ARCHIVE_ROOT_RELATIVE = 'data/orchestrator/agent-transcripts'
+DEFAULT_ARCHIVE_ROOT = DEFAULT_PROJECT_ROOT / ARCHIVE_ROOT_RELATIVE
+# Mirrors RetentionConfig().max_age_days / .max_task_dirs.
+DEFAULT_MAX_AGE_DAYS = 90
+DEFAULT_MAX_TASK_DIRS = 5000
+
+
+def default_archive_root() -> Path:
+    """Return the default archive root (``project_root / ARCHIVE_ROOT_RELATIVE``).
+
+    The single resolution site for the CLI ``--root`` default, mirroring the
+    ``resolve_*`` helper shape of :mod:`drain_check`. ``--root`` overrides it;
+    there is no env knob (the archive root is a fixed data-dir convention).
+    """
+    return DEFAULT_ARCHIVE_ROOT
+
 
 @dataclass
 class GcDecision:
