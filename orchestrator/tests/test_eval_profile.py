@@ -25,11 +25,13 @@ import pytest
 
 from orchestrator import config
 from orchestrator.config import OrchestratorConfig
+from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.profile import (
     EVAL_PROFILE,
     apply_eval_profile,
     resolve_eval_profile_update,
 )
+from orchestrator.evals.runner import build_eval_orch_config
 
 
 def _changed_leaf_paths(a: OrchestratorConfig, b: OrchestratorConfig) -> set[str]:
@@ -132,3 +134,34 @@ def test_parity_tripwire_trips_on_undocumented_divergence(tmp_path):
 
     assert changed != set(EVAL_PROFILE)
     assert 'max_amendment_rounds' in changed
+
+
+def test_build_eval_orch_config_applies_profile_and_inherits_base(tmp_path):
+    """build_eval_orch_config routes through the profile and derives from base end-to-end.
+
+    D3/D4: the 5 profile fields land False on the built config. D5: a
+    base-only field the constructor build never passed through
+    (``max_amendment_rounds``) is nonetheless inherited from *base* — proof
+    this derives from base rather than falling back to a pydantic default.
+    Per-run overrides (candidate model, sandbox-off) still apply on top.
+    """
+    base = OrchestratorConfig(project_root=tmp_path, max_amendment_rounds=7)
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+
+    result = build_eval_orch_config(cfg, task, base)
+
+    # D3/D4 — profile applied end-to-end.
+    assert result.rebase_before_verify is False
+    assert result.inter_iteration_rebase is False
+    assert result.auto_eval_enabled is False
+    assert result.simple_task_enabled is False
+    assert result.unblock_auto.enabled is False
+
+    # D5 — inherited from base, not the pydantic default (1) the old
+    # constructor build silently fell back to.
+    assert result.max_amendment_rounds == 7
+
+    # Per-run overrides still applied on top of the profile-resolved base.
+    assert result.models.implementer == 'sonnet'
+    assert result.sandbox.enabled is False
