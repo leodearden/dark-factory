@@ -350,6 +350,12 @@ class EventQueue:
             attempts += 1
             try:
                 await self._buffer.push(event)
+                # Committed durably to the buffer — drop the journal row. The
+                # push-then-mark order is deliberate: a crash in between leaves
+                # the row for recover() to redeliver, and EventBuffer.push is
+                # idempotent (INSERT OR IGNORE) so the redelivery is a no-op.
+                if self._journal is not None:
+                    self._journal.mark_processed(event.id)
                 self._last_commit_ts = time.time()
                 self._events_committed += 1
                 if self._retry_in_flight > 0 and attempts > 1:
@@ -384,6 +390,10 @@ class EventQueue:
                     event.id, exc, exc_info=True,
                 )
                 self._write_dead_letter(event, reason='non_retriable', attempts=attempts)
+                # Durability handed off to the dead-letter file — drop the
+                # journal row so recover() doesn't redeliver it next startup.
+                if self._journal is not None:
+                    self._journal.mark_processed(event.id)
                 if self._retry_in_flight > 0 and attempts > 1:
                     self._retry_in_flight = max(0, self._retry_in_flight - 1)
                 self._recent_ops.append(
