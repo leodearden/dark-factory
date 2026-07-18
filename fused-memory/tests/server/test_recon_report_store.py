@@ -179,3 +179,176 @@ class TestReconReportStore:
     def test_close_before_open_is_safe(self, tmp_path):
         store = self._make_store(tmp_path)
         store.close()  # must not raise even though open() was never called
+
+
+# ---------------------------------------------------------------------------
+# step-5: _serialize_entry / _deserialize_entry round-trip — RED until step-6
+# ---------------------------------------------------------------------------
+
+
+class TestEntrySerialization:
+    """Round-trip a _ReportEntry (+ run-level fold-anchor slices) through JSON."""
+
+    def _build_entry(self, *, completed_at):
+        from fused_memory.server.recon_report import _Finding, _ReportEntry
+
+        f_real = _Finding(
+            finding_id='11111111-1111-1111-1111-111111111111',
+            severity='moderate',
+            category='memory_stale',
+            description='real sig finding',
+            suggested_action='investigate',
+            actionable=True,
+            task_id='42',
+            flag_type='orphaned_knowledge',
+        )
+        f_nullnull = _Finding(
+            finding_id='22222222-2222-2222-2222-222222222222',
+            severity='low',
+            category='other',
+            description='null null finding',
+            suggested_action='note',
+            actionable=False,
+            task_id=None,
+            flag_type=None,
+        )
+        f_cited = _Finding(
+            finding_id='33333333-3333-3333-3333-333333333333',
+            severity='high',
+            category='cross_project_routing',
+            description='fully cited finding',
+            suggested_action='route it',
+            actionable=True,
+            task_id='99',
+            flag_type='cross_project_info',
+            cited_entities=[{'entity_uuid': 'e1', 'canonical_name': 'Foo'}],
+            cited_edges=[{'edge_uuid': 'ed1', 'fact_text_snapshot': 'fact'}],
+            cited_tasks=[{'project_id': 'dark_factory', 'task_id': '99', 'title': 'T'}],
+            cited_memories=[{'memory_id': 'm1', 'store': 'mem0', 'metadata_fingerprint': 'fp'}],
+            cited_runs=[{'run_id': 'r-cited', 'match_count': 3}],
+        )
+
+        entry = _ReportEntry(
+            run_id='run-1',
+            stage='memory_consolidator',
+            project_id='dark_factory',
+            findings=[f_real, f_nullnull, f_cited],
+            stats={'scanned': 10, 'ratio': 0.5, 'label': 'ok'},
+            summary='summary text',
+            summary_warnings=['warn 1', 'warn 2'],
+            completed_at=completed_at,
+            created_at=100.0,
+        )
+        entry._signature_to_finding = {
+            ('42', 'orphaned_knowledge'): f_real.finding_id,
+            (None, 'ft'): 'ffffffff-ffff-ffff-ffff-ffffffffffff',
+            ('123', None): 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        }
+        entry._deschash_to_finding = {
+            'deadbeef' * 8: f_nullnull.finding_id,
+        }
+        return entry
+
+    def _slices(self):
+        sig_anchor_slice = {
+            ('99', 'cross_project_info'): '33333333-3333-3333-3333-333333333333',
+            (None, 'other_ft'): 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+        }
+        cited_task_slice = {
+            'dark_factory:99': '33333333-3333-3333-3333-333333333333',
+        }
+        return sig_anchor_slice, cited_task_slice
+
+    def test_roundtrip_preserves_entry_with_completed_at_set(self):
+        from fused_memory.server.recon_report import _deserialize_entry, _serialize_entry
+
+        entry = self._build_entry(completed_at=555.5)
+        sig_anchor_slice, cited_task_slice = self._slices()
+        raw = _serialize_entry(
+            entry, sig_anchor_slice=sig_anchor_slice, cited_task_slice=cited_task_slice
+        )
+        restored = _deserialize_entry(raw)
+        assert restored == entry
+        assert restored.completed_at == 555.5
+
+    def test_roundtrip_preserves_entry_with_completed_at_none(self):
+        from fused_memory.server.recon_report import _deserialize_entry, _serialize_entry
+
+        entry = self._build_entry(completed_at=None)
+        sig_anchor_slice, cited_task_slice = self._slices()
+        raw = _serialize_entry(
+            entry, sig_anchor_slice=sig_anchor_slice, cited_task_slice=cited_task_slice
+        )
+        restored = _deserialize_entry(raw)
+        assert restored == entry
+        assert restored.completed_at is None
+
+    def test_roundtrip_preserves_findings_and_all_five_citation_lists(self):
+        from fused_memory.server.recon_report import _deserialize_entry, _serialize_entry
+
+        entry = self._build_entry(completed_at=None)
+        sig_anchor_slice, cited_task_slice = self._slices()
+        raw = _serialize_entry(
+            entry, sig_anchor_slice=sig_anchor_slice, cited_task_slice=cited_task_slice
+        )
+        restored = _deserialize_entry(raw)
+
+        assert [f.finding_id for f in restored.findings] == [f.finding_id for f in entry.findings]
+        cited = restored.findings[2]
+        expected = entry.findings[2]
+        assert cited.cited_entities == expected.cited_entities
+        assert cited.cited_edges == expected.cited_edges
+        assert cited.cited_tasks == expected.cited_tasks
+        assert cited.cited_memories == expected.cited_memories
+        assert cited.cited_runs == expected.cited_runs
+
+    def test_roundtrip_preserves_per_entry_dedup_mirrors_with_tuple_keys(self):
+        from fused_memory.server.recon_report import _deserialize_entry, _serialize_entry
+
+        entry = self._build_entry(completed_at=None)
+        sig_anchor_slice, cited_task_slice = self._slices()
+        raw = _serialize_entry(
+            entry, sig_anchor_slice=sig_anchor_slice, cited_task_slice=cited_task_slice
+        )
+        restored = _deserialize_entry(raw)
+
+        assert restored._signature_to_finding == entry._signature_to_finding
+        # None must survive as real None, never coerced to the string 'None'.
+        assert (None, 'ft') in restored._signature_to_finding
+        assert ('123', None) in restored._signature_to_finding
+        assert restored._deschash_to_finding == entry._deschash_to_finding
+
+    def test_fold_anchor_slices_roundtrip_preserving_tuple_keys_and_none(self):
+        from fused_memory.server.recon_report import (
+            _deserialize_fold_anchor_slices,
+            _serialize_entry,
+        )
+
+        entry = self._build_entry(completed_at=None)
+        sig_anchor_slice, cited_task_slice = self._slices()
+        raw = _serialize_entry(
+            entry, sig_anchor_slice=sig_anchor_slice, cited_task_slice=cited_task_slice
+        )
+
+        out_sig_slice, out_cited_task_slice = _deserialize_fold_anchor_slices(raw)
+        assert out_sig_slice == sig_anchor_slice
+        assert out_cited_task_slice == cited_task_slice
+        assert (None, 'other_ft') in out_sig_slice
+        # Keys must be real tuples with a real None, not '(None, ...)' strings.
+        assert all(isinstance(k, tuple) for k in out_sig_slice)
+        assert all(k[0] is None or isinstance(k[0], str) for k in out_sig_slice)
+
+    def test_stats_summary_and_summary_warnings_roundtrip(self):
+        from fused_memory.server.recon_report import _deserialize_entry, _serialize_entry
+
+        entry = self._build_entry(completed_at=None)
+        sig_anchor_slice, cited_task_slice = self._slices()
+        raw = _serialize_entry(
+            entry, sig_anchor_slice=sig_anchor_slice, cited_task_slice=cited_task_slice
+        )
+        restored = _deserialize_entry(raw)
+
+        assert restored.stats == entry.stats
+        assert restored.summary == entry.summary
+        assert restored.summary_warnings == entry.summary_warnings
+        assert restored.created_at == entry.created_at
