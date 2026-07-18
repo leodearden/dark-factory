@@ -135,7 +135,8 @@ def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
                        subtype='', output='', duration_ms=1000,
                        timed_out=False, transcript_turns=None, session_id='',
                        stderr='', turns=0, api_error_status=None,
-                       schema_salvaged=False, output_tokens=None):
+                       schema_salvaged=False, output_tokens=None,
+                       ended_awaiting_background=False):
     # NOTE: duplicated verbatim in test_b3_gate.py (task 2020 review:
     # code_duplication). Both copies must be extended together whenever
     # shared.cli_invoke.AgentResult gains/renames a field consumed by
@@ -167,6 +168,11 @@ def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
     r.api_error_status = api_error_status
     r.schema_salvaged = schema_salvaged
     r.output_tokens = output_tokens
+    # task 2761: classify_agent_failure now reads .ended_awaiting_background
+    # (rule 2, above the timed_out rule). A bare MagicMock auto-vivifies it as
+    # a truthy stand-in, which would misclassify every failure as
+    # ENDED_AWAITING_BACKGROUND -> investigation_failed. Default it False.
+    r.ended_awaiting_background = ended_awaiting_background
     return r
 
 
