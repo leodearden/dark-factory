@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 
 import httpx
 
@@ -21,6 +22,35 @@ MCP_HEADERS = {
     'Content-Type': 'application/json',
     'Accept': 'application/json, text/event-stream',
 }
+
+# Twin of orchestrator.mcp_lifecycle._MUTATING_TASK_TOOLS (task 2712): mutating
+# task tools get a client-supplied idempotency key so a retried write dedupes
+# server-side instead of double-applying. Inert today (the dashboard issues
+# only reads) but keeps the two McpSession twins aligned and write-safe by
+# construction if the dashboard ever gains a mutating call.
+_MUTATING_TASK_TOOLS = frozenset({
+    'update_task',
+    'set_task_status',
+    'add_dependency',
+    'remove_dependency',
+})
+
+
+def _maybe_inject_client_op_id(method: str, params: dict | None) -> None:
+    """Inject a fresh ``client_op_id`` into a mutating tool call's arguments.
+
+    No-op for non-``tools/call`` methods, read tools, or a caller that already
+    supplied a key. Mutates ``params['arguments']`` in place (``payload``
+    references the same object), so the key rides along on the posted body.
+    """
+    if (
+        method == 'tools/call'
+        and isinstance(params, dict)
+        and params.get('name') in _MUTATING_TASK_TOOLS
+        and isinstance(params.get('arguments'), dict)
+        and 'client_op_id' not in params['arguments']
+    ):
+        params['arguments']['client_op_id'] = str(uuid.uuid4())
 
 
 def _parse_mcp_response(resp: httpx.Response) -> dict:
@@ -114,6 +144,8 @@ class McpSession:
         payload: dict = {'jsonrpc': '2.0', 'id': self._next_id(), 'method': method}
         if params is not None:
             payload['params'] = params
+
+        _maybe_inject_client_op_id(method, params)
 
         headers = dict(MCP_HEADERS)
         if self._session_id:
