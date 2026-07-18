@@ -670,3 +670,87 @@ class TestPollUntil:
 
         with pytest.raises(AssertionError, match='0.05'):
             await poll_until(lambda: False, timeout=0.05, interval=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared ensure_fresh_collection() helper (task 2773, item 3)
+# ---------------------------------------------------------------------------
+# Idempotent + 409-tolerant collection (re)creation, used by the qdrant
+# integration fixture. No real Qdrant is used here — the client is a
+# MagicMock and qdrant_client.http.exceptions.UnexpectedResponse is
+# constructed directly — so this suite runs in the default merge-verify lane
+# even though its one live consumer (the qdrant fixture) is integration-only.
+# Assertions are on call counts and ordering only, never on live Qdrant.
+
+class TestEnsureFreshCollection:
+    """Unit tests for ensure_fresh_collection(client, collection_name, *, size, distance)."""
+
+    def test_creates_once_when_absent(self):
+        """collection_exists()->False: create_collection called exactly once, no delete."""
+        from _fm_helpers import ensure_fresh_collection
+
+        client = MagicMock()
+        client.collection_exists.return_value = False
+
+        ensure_fresh_collection(client, 'c', size=8)
+
+        client.create_collection.assert_called_once()
+        client.delete_collection.assert_not_called()
+
+    def test_deletes_then_recreates_when_present(self):
+        """collection_exists()->True: delete_collection precedes create_collection."""
+        from _fm_helpers import ensure_fresh_collection
+
+        client = MagicMock()
+        client.collection_exists.return_value = True
+
+        ensure_fresh_collection(client, 'c', size=8)
+
+        names = [c[0] for c in client.method_calls]
+        assert names == ['collection_exists', 'delete_collection', 'create_collection']
+
+    def test_conflict_on_create_triggers_single_delete_and_retry(self):
+        """A 409 on the first create_collection triggers exactly one delete then a second create.
+
+        Models the swallowed-teardown stale-collection case the helper exists
+        to self-heal: the collection was reported absent but a concurrent /
+        prior run left it behind, so the create 409-conflicts; the helper
+        deletes and recreates rather than propagating the conflict.
+        """
+        from _fm_helpers import ensure_fresh_collection
+        from qdrant_client.http.exceptions import UnexpectedResponse
+
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        client.create_collection.side_effect = [
+            UnexpectedResponse(409, 'Conflict', b'{}', {}),
+            None,
+        ]
+
+        # Must not raise — the 409 is tolerated.
+        ensure_fresh_collection(client, 'c', size=8)
+
+        assert client.create_collection.call_count == 2
+        assert client.delete_collection.call_count == 1
+        names = [c[0] for c in client.method_calls]
+        assert names == [
+            'collection_exists',
+            'create_collection',
+            'delete_collection',
+            'create_collection',
+        ]
+
+    def test_non_conflict_create_error_propagates(self):
+        """A non-409 UnexpectedResponse (e.g. 500) propagates — fail loud, no retry."""
+        from _fm_helpers import ensure_fresh_collection
+        from qdrant_client.http.exceptions import UnexpectedResponse
+
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        client.create_collection.side_effect = UnexpectedResponse(500, 'err', b'{}', {})
+
+        with pytest.raises(UnexpectedResponse):
+            ensure_fresh_collection(client, 'c', size=8)
+
+        client.delete_collection.assert_not_called()
+        assert client.create_collection.call_count == 1
