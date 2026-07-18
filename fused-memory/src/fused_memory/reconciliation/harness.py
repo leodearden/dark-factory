@@ -2140,6 +2140,10 @@ class ReconciliationHarness:
                     *self._project_tasks.values(), return_exceptions=True,
                 )
             self._project_tasks.clear()
+            # Drain in-flight judge tasks too (task 2708). Cancelled judges leave
+            # their judge_pending markers intact for startup re-run, so no verdict
+            # is silently dropped by the shutdown.
+            await self._drain_judge_tasks()
             await self._stop_escalation_server()
 
     async def _project_loop(self, project_id: str) -> None:
@@ -2318,6 +2322,22 @@ class ReconciliationHarness:
         self._judge_tasks.add(task)
         task.add_done_callback(self._judge_tasks.discard)
 
+    async def _drain_judge_tasks(self) -> None:
+        """Cancel and await every in-flight judge task on shutdown (task 2708).
+
+        A cancelled judge is cancelled mid-review, before add_verdict's atomic
+        marker-clear, so its judge_pending marker survives for startup re-run —
+        durability rests on the uncleared marker, not on catching here. Snapshot
+        the set first because the per-task done-callback discards from it during
+        iteration.
+        """
+        pending = list(self._judge_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._judge_tasks.clear()
+
     async def _run_judge(self, run_id: str) -> None:
         """Fire-and-forget judge wrapper with error logging."""
         try:
@@ -2327,6 +2347,19 @@ class ReconciliationHarness:
                 logger.info(f'Judge verdict for {run_id}: severity={verdict.severity}')
             else:
                 logger.warning(f'Judge returned no verdict for run {run_id}')
+        except asyncio.CancelledError:
+            # Shutdown drain (or a cycle-aware restart) cancelled the judge
+            # mid-review, before add_verdict's atomic marker-clear ran. The
+            # judge_pending marker is therefore intact and startup recovery
+            # (_recover_pending_judge_reviews) will re-run this review — the
+            # verdict is deferred, not lost (task 2708). CancelledError is a
+            # BaseException, so the `except Exception` below cannot swallow it;
+            # re-raise to preserve asyncio cancellation semantics for the drain.
+            logger.warning(
+                f'Judge task for run {run_id} cancelled during shutdown; '
+                'judge_pending marker retained for startup re-run'
+            )
+            raise
         except Exception:
             logger.error(f'Judge task failed for run {run_id}', exc_info=True)
 
