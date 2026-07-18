@@ -4985,6 +4985,14 @@ def test_delegate_fm_restart_argv_shape(monkeypatch: pytest.MonkeyPatch) -> None
         f"argv must fire the fixed transient unit name (the overlap guard): {argv}"
     )
 
+    # systemd-run --user does NOT propagate this process's env into the detached
+    # unit, so the chained --stamp-fm-deploy-clock must be pinned to the reader's
+    # resolved clock path via --setenv or it would default a divergent path.
+    assert f"--setenv=FM_DEPLOY_CLOCK={wdog.FM_DEPLOY_CLOCK_PATH}" in argv, (
+        "argv must forward the reader's resolved FM_DEPLOY_CLOCK_PATH via "
+        f"--setenv so the detached stamp writes the same file the reader reads: {argv}"
+    )
+
     # The bash -c payload chains restart-fused-memory.sh && <self> --stamp.
     payload = next(
         (a for a in argv if "restart-fused-memory.sh" in a), None
@@ -5006,6 +5014,44 @@ def test_delegate_fm_restart_argv_shape(monkeypatch: pytest.MonkeyPatch) -> None
     # The referenced restart script must actually exist on disk.
     assert (REPO_ROOT / "scripts" / "restart-fused-memory.sh").exists(), (
         "scripts/restart-fused-memory.sh must exist on disk (task 2703 δ dependency)"
+    )
+
+
+def test_delegate_fm_restart_forwards_clock_override_via_setenv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A FM_DEPLOY_CLOCK override is forwarded into the detached unit via --setenv.
+
+    systemd-run --user runs the transient unit under the systemd user manager's
+    environment, not the watchdog process's — so without an explicit --setenv the
+    chained --stamp-fm-deploy-clock would recompute FM_DEPLOY_CLOCK_PATH from the
+    session env and default it, diverging from the overridden path the in-process
+    reader (_within_fm_deploy_min_interval) consults. Forwarding keeps
+    writer==reader so the min-interval cap actually engages under an override.
+    """
+    monkeypatch.setenv("FM_DEPLOY_CLOCK", "/tmp/custom_fm_clock.json")
+    wdog = _load_watchdog()
+    # Sanity: the reader resolved the override at import.
+    assert wdog.FM_DEPLOY_CLOCK_PATH == "/tmp/custom_fm_clock.json"
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    wdog._delegate_fm_restart()
+
+    assert len(calls) == 1, f"Expected exactly one subprocess.run call, got {calls}"
+    argv = calls[0]
+    # The forwarded --setenv value must equal the reader's resolved override —
+    # writer (detached stamp) and reader consult the identical file.
+    assert "--setenv=FM_DEPLOY_CLOCK=/tmp/custom_fm_clock.json" in argv, (
+        f"argv must forward the FM_DEPLOY_CLOCK override into the detached unit: {argv}"
+    )
+    assert f"--setenv=FM_DEPLOY_CLOCK={wdog.FM_DEPLOY_CLOCK_PATH}" in argv, (
+        "the forwarded --setenv value must track the reader's FM_DEPLOY_CLOCK_PATH"
     )
 
 

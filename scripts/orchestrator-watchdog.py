@@ -997,6 +997,16 @@ def _delegate_fm_restart() -> None:
       Essential because restart-fused-memory.sh's default defer-if-busy path can
       hold up to RECON_GATE_TIMEOUT (35 min) while a full recon cycle runs — the
       60s oneshot watchdog must never block on that (task 2703 δ).
+    - ``--setenv=FM_DEPLOY_CLOCK=<path>`` forwards the reader's RESOLVED clock
+      path into the detached unit. ``systemd-run --user`` runs the transient
+      unit under the systemd user *manager's* environment, NOT this watchdog
+      process's — so without this, the chained ``--stamp-fm-deploy-clock`` would
+      recompute FM_DEPLOY_CLOCK_PATH from the session env and default it,
+      silently diverging from the path the reader
+      (_within_fm_deploy_min_interval, in THIS process) consults whenever
+      FM_DEPLOY_CLOCK is overridden. Pinning the stamp to FM_DEPLOY_CLOCK_PATH
+      keeps writer==reader in all cases (a no-op at the default path;
+      load-bearing under an operator/test override).
 
     KEY divergence from _delegate_fleet_restart (task ο design decision):
     restart-fused-memory.sh is invoked in its DEFAULT defer-if-busy mode (NO
@@ -1024,6 +1034,12 @@ def _delegate_fm_restart() -> None:
                 "--user",
                 "--collect",
                 "--no-block",
+                # Pin the detached stamp to the SAME clock file the reader
+                # consults — systemd-run --user does not propagate this
+                # process's env, so the chained --stamp-fm-deploy-clock would
+                # otherwise default the path (see docstring). No-op at the
+                # default path; load-bearing under a FM_DEPLOY_CLOCK override.
+                f"--setenv=FM_DEPLOY_CLOCK={FM_DEPLOY_CLOCK_PATH}",
                 f"--unit={FM_STALENESS_REDEPLOY_UNIT}",
                 "/bin/bash",
                 "-c",
