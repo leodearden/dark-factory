@@ -1707,6 +1707,10 @@ async def _run_post_merge_verify(
                 run_unscoped=_run_unscoped_typechecks,
                 task_id=req.task_id,
                 archive_root=req.config.project_root / 'data' / 'verify-logs',
+                # PRD task α: thread the fact-emission + storm-escalation stores
+                # into the merge-flake suppression gate (LocalRunner.run_merge_verify).
+                event_store=event_store,
+                escalation_queue=escalation_queue,
             )],
             event_store=event_store,
             task_id=req.task_id,

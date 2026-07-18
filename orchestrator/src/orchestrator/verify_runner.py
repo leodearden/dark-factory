@@ -47,6 +47,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
+from orchestrator import verify
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
 from orchestrator.verify_cancel import HEARTBEAT_INTERVAL_SECS
@@ -54,6 +55,7 @@ from orchestrator.verify_categories import FailureCategory, _assert_sentinels_di
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
+    from orchestrator.event_store import EventStore
 
 __all__ = [
     "VerifyCommand",
@@ -555,6 +557,8 @@ class LocalRunner:
         run_unscoped: Callable[..., Awaitable[Any]],
         task_id: str | None = None,
         archive_root: Path | None = None,
+        event_store: 'EventStore | None' = None,
+        escalation_queue: Any = None,
     ) -> None:
         """Initialise LocalRunner.
 
@@ -564,6 +568,14 @@ class LocalRunner:
         Policy lives in the caller (merge_queue.py wires the concrete path);
         cold-shadow / drift intentionally leave this ``None`` so they are
         auto-excluded from archival without any extra deny-list logic.
+
+        *event_store* / *escalation_queue* thread the merge-flake suppression gate's
+        (PRD task α) fact-emission and storm-escalation side-effects.  Both default
+        to ``None`` — byte-identical for the CLI ``run_merge_verify_on_worktree`` /
+        remote-runner paths, which cannot reach the dispatching host's stores; only
+        the authoritative local merge path (merge_queue.py) wires them.  The gate
+        still runs when they are ``None`` (it just emits no fact and bumps no streak),
+        mirroring the optional ``archive_root`` threading above.
         """
         self._merge_wt = merge_wt
         self._config = config
@@ -573,6 +585,8 @@ class LocalRunner:
         self._run_unscoped = run_unscoped
         self._task_id = task_id
         self._archive_root = archive_root
+        self._event_store = event_store
+        self._escalation_queue = escalation_queue
 
     async def health(self) -> bool:
         return True
@@ -609,7 +623,26 @@ class LocalRunner:
             archive_root=self._archive_root,
         )
         if not scoped.passed:
-            return scoped
+            # PRD task α: single flake-retry gate. Re-run the named failing tests
+            # isolated + serial in THIS merge worktree; if they all pass, the red
+            # was a CPU-starvation flake — suppress it (returns a PASSED result)
+            # so the merge proceeds INTO the unscoped gate below, rather than
+            # short-circuiting here.  On a non-confirmation the original failing
+            # result is returned unchanged (merge stays red).  Never raises
+            # (fail-closed) — merge_queue.py has no VerifyInfraError handler.
+            # Resolved via the verify module so it stays monkeypatchable.
+            scoped = await verify.apply_merge_flake_suppression(
+                scoped,
+                worktree=self._merge_wt,
+                config=self._config,
+                module_configs=self._module_configs,
+                merge_sha=merge_sha,
+                event_store=self._event_store,
+                escalation_queue=self._escalation_queue,
+                task_id=self._task_id,
+            )
+            if not scoped.passed:
+                return scoped
 
         gate = await self._run_unscoped(
             self._merge_wt,
