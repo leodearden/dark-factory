@@ -31,6 +31,8 @@ from shared.config_dir import TaskConfigDir
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.merge_completion import merge_completion_eligible
+from orchestrator.routing import RoleDefaults
+from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.unblock_types import BlockClass, BlockRecord, classify_block_reason
 from orchestrator.workflow_types import BlockDisposition, classify_failure
 
@@ -304,6 +306,36 @@ async def run_dry_run_unblock(
 
         mcp_config = mcp.mcp_config_json() if mcp is not None else None
 
+        # Route resolution (task η): resolve model/effort/budget/max_turns
+        # through the single layered resolver + emit a routing_decision event.
+        # unblock_auto is genuinely per-task, so best-effort fetch the task's
+        # metadata (fail-safe → {}) to honor model_overrides['unblock_auto'] /
+        # routing_tier, and pass scheduler+task_id so the helper mirrors
+        # metadata.routing via update_task(metadata_mode='merge'). Backend
+        # stays ua_cfg.backend (resolver-external). role_defaults derive from
+        # the dedicated config.unblock_auto block: there is no
+        # config.models.unblock_auto field, so resolve_route's layer-3 config
+        # read is skipped and this RoleDefaults base stands (byte-equivalent to
+        # pre-η at stock config). Resolved ONCE here (not inside _one_attempt)
+        # so the single zero-output-timeout retry does not double-emit.
+        try:
+            _fetched = await scheduler.get_task(task_id)
+            md = (_fetched or {}).get('metadata') or {}
+        except Exception:
+            md = {}
+        decision = await resolve_and_record_route(
+            role_name='unblock_auto',
+            role_defaults=RoleDefaults(
+                ua_cfg.model, ua_cfg.effort, ua_cfg.budget_usd, ua_cfg.max_turns,
+            ),
+            config=config,
+            task_id=task_id,
+            task_metadata=md,
+            event_store=event_store,
+            scheduler=scheduler,
+            cost_store=cost_store,
+        )
+
         async def _one_attempt(session_id: str) -> Any:
             return await invoke_with_cap_retry(
                 usage_gate=usage_gate,
@@ -321,14 +353,14 @@ async def run_dry_run_unblock(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 cwd=Path(worktree),
-                model=ua_cfg.model,
-                max_turns=ua_cfg.max_turns,
-                max_budget_usd=ua_cfg.budget_usd,
+                model=decision.model,
+                max_turns=decision.max_turns,
+                max_budget_usd=decision.budget_usd,
                 allowed_tools=_ALLOWED_TOOLS,
                 disallowed_tools=_DISALLOWED_TOOLS,
                 mcp_config=mcp_config,
                 output_schema=DRY_RUN_PROPOSAL_SCHEMA,
-                effort=ua_cfg.effort,
+                effort=decision.effort,
                 timeout_seconds=ua_cfg.timeout_seconds,
                 # Working-regime progress extension (task 2360, reify-4827):
                 # config_dir + session_id (above) already revive the startup
