@@ -52,6 +52,31 @@ def _reset_archival_failures() -> None:
     _ARCHIVAL_FAILURES = 0
 
 
+def _archive_one(
+    src: Path,
+    projects_root: Path,
+    archive_root: Path,
+    task_id: str,
+) -> bool:
+    """Gzip a single transcript *src* to its mirror under *archive_root*.
+
+    The destination mirrors *src*'s path relative to ``projects/`` with a
+    ``.gz`` suffix: ``<archive_root>/<task_id>/<relpath-under-projects>.gz``.
+    The source mtime is mirrored onto the ``.gz`` so idempotency (a later
+    step) can detect an already-current archive. Returns ``True`` when a file
+    was written.
+    """
+    rel = src.relative_to(projects_root)
+    dest = archive_root / task_id / rel.parent / (rel.name + '.gz')
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    data = src.read_bytes()
+    with gzip.open(dest, 'wb') as fh:
+        fh.write(data)
+    st = src.stat()
+    os.utime(dest, (st.st_atime, st.st_mtime))
+    return True
+
+
 def archive_task_transcripts(
     config_dir: Path,
     task_id: str,
@@ -61,6 +86,23 @@ def archive_task_transcripts(
 ) -> int:
     """Archive a task's agent transcripts to a durable gzipped mirror.
 
-    STUB — behaviour is filled in over the plan's TDD steps.
+    When *session_id* is given, only that session's main transcript
+    (``projects/*/<session_id>.jsonl``) and its subagent transcripts
+    (``projects/*/<session_id>/subagents/*.jsonl``) are archived. Returns the
+    number of files newly archived.
     """
-    return 0
+    config_dir = Path(config_dir)
+    archive_root = Path(archive_root)
+    projects_root = config_dir / 'projects'
+
+    if session_id is None:
+        return 0  # archive-all branch implemented in a later step
+
+    sources = list(projects_root.glob(f'*/{session_id}.jsonl'))
+    sources += list(projects_root.glob(f'*/{session_id}/subagents/*.jsonl'))
+
+    count = 0
+    for src in sources:
+        if _archive_one(src, projects_root, archive_root, task_id):
+            count += 1
+    return count
