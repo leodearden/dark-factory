@@ -119,8 +119,12 @@ CAP_HIT_RESUME_PROMPT = (
 # Prompt sent to a session that the orchestrator is resuming after a crash.
 # Kept separate from CAP_HIT_RESUME_PROMPT because the cause differs
 # (orchestrator restart, not a usage-cap interrupt) and the agent message
-# should stay a plain "continue" rather than mentioning usage limits.
-CRASH_RECOVERY_RESUME_PROMPT = 'continue'
+# should stay a short crash-recovery continuation prompt rather than mentioning usage limits.
+CRASH_RECOVERY_RESUME_PROMPT = (
+    'You were interrupted by an orchestrator restart. '
+    'Re-check your working context (plan.json if present) and current '
+    'git/worktree state, then continue where you left off.'
+)
 
 # The NON_CAP_CLI_ERROR_MARKERS table and its _is_non_cap_cli_error scanner
 # that used to live here have moved to shared.invocation_outcome (task
@@ -787,8 +791,8 @@ async def invoke_with_cap_retry(
     (e.g. the steward's per-escalation continuation prompt).  Defaults to
     ``False``, which preserves the crash-recovery contract used by
     ``workflow._invoke``: a crash-recovered session already holds the full
-    task context, so the short ``'continue'`` placeholder is sufficient and
-    the real prompt is kept only as ``original_prompt`` for fresh-fallback.
+    task context, so the short crash-recovery continuation prompt is sufficient
+    and the real prompt is kept only as ``original_prompt`` for fresh-fallback.
 
     The ``session_lost`` argument is currently always ``True`` — every wired
     call site is an unresumable cap retry.  It is kept as an explicit
@@ -820,7 +824,8 @@ async def invoke_with_cap_retry(
     # existing non-cap-hit resume-failure branch (below) then correctly restores
     # `original_prompt` (the real task prompt) for any subsequent fresh invocation.
     # `resume_delivers_prompt` opts a live-continuation caller (the steward) out of
-    # this swap: its resumed session must receive the real prompt, not 'continue'.
+    # this swap: its resumed session must receive the real prompt, not the short
+    # crash-recovery continuation prompt.
     if invoke_kwargs.get('resume_session_id'):
         if not original_prompt:
             raise TypeError(

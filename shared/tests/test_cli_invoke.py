@@ -1220,6 +1220,23 @@ class TestEnvOverrides:
 class TestSpawnEnv:
     """Verify spawn_env (CLAUDE_SPAWN_*) is merged into the subprocess env."""
 
+    @pytest.fixture(autouse=True)
+    def _hermetic_spawn_env(self, monkeypatch):
+        """Strip any ambient CLAUDE_SPAWN_* vars before each test.
+
+        invoke_claude_agent seeds the child env from os.environ, so this
+        class's "no CLAUDE_SPAWN_* leaks" assertions only hold in a clean
+        ambient environment. That never holds when the suite is run from
+        inside an orchestrator-spawned agent's own shell (which exports
+        CLAUDE_SPAWN_ROLE/PROJECT/PARENT_ID/TASK_ID for the agent it drives),
+        as opposed to a clean CI/dev shell. Delete them here so the class is
+        hermetic regardless of who runs it; monkeypatch restores them after.
+        Tests that need specific CLAUDE_SPAWN_* values set their own via
+        spawn_env or patch.dict, which run after this fixture.
+        """
+        for key in [k for k in os.environ if k.startswith('CLAUDE_SPAWN_')]:
+            monkeypatch.delenv(key, raising=False)
+
     async def test_spawn_env_merged_into_subprocess_env(self, tmp_path):
         """spawn_env keys appear verbatim in the env dict passed to create_subprocess_exec."""
         captured_kwargs = {}
@@ -3711,11 +3728,11 @@ class TestRunSubprocessWatchdog:
         return proc, call_count
 
     async def test_startup_wedge_killed_at_grace_not_ceiling(self, tmp_path):
-        """Startup wedge (0 turns) is killed at startup_grace_secs, not the 5s ceiling.
+        """Startup wedge (0 turns) is killed at startup_grace_secs, not the 12s ceiling.
 
-        With startup_grace_secs=0.05 and timeout_seconds=5.0, the watchdog
+        With startup_grace_secs=0.05 and timeout_seconds=12.0, the watchdog
         should detect 0 turns after ~0.05s and kill fast.  Wall-clock must be
-        well under the 5s ceiling, proving the kill happened at the grace bound.
+        well under the 12s ceiling, proving the kill happened at the grace bound.
         """
         import time as _time
 
@@ -3737,16 +3754,25 @@ class TestRunSubprocessWatchdog:
             t0 = _time.monotonic()
             result = await _run_subprocess(
                 ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=5.0, startup_grace_secs=0.05,
+                timeout_seconds=12.0, startup_grace_secs=0.05,
                 session_id=sid, config_dir=cfg_dir,
             )
             wall = _time.monotonic() - t0
 
         assert result.timed_out is True, 'Expected timed_out=True for startup wedge kill'
         terminate_pg_mock.assert_called_once()
-        # Upper bound is generous (2s) to avoid CI flakiness under scheduler pressure;
-        # the key assertion is that terminate_process_group fired (not just a ceiling kill).
-        assert wall < 2.0, f'Expected fast kill (<2s), got {wall:.3f}s — wedge not killed at grace bound'
+        # Discriminates the correct ~0.05s-grace kill from the WRONG 12.0s ceiling
+        # (widened from 5.0s — task 2723). The wedge kill itself fires near the grace
+        # bound (see the "Startup wedge detected" log); wall additionally captures
+        # real post-kill teardown — an UNMOCKED snapshot_process_group /proc walk,
+        # comm_task cancellation/await, the second (SIGTERM-window) communicate()
+        # call, and event-loop scheduling — which under parallel verify/host load has
+        # been observed to drift to ~3.3s. 7.0s keeps full discriminating power
+        # against the 12.0s wrong ceiling while comfortably tolerating that teardown
+        # latency — same load-drift de-flake shape as the sibling absolute-cap-vs-
+        # idle-bound and UNREADABLE-DEGRADE tests in this class (commits
+        # f1aae9678e, fda97df621af).
+        assert wall < 7.0, f'Expected fast kill (<7s), got {wall:.3f}s — wedge not killed at grace bound'
 
     async def test_none_transcript_degrades_to_ceiling_not_grace(self, tmp_path):
         """B7 conservative degrade: unreadable/absent transcript (None) must NOT trigger
@@ -4096,7 +4122,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
                 ['fake'], cwd=tmp_path, env={}, model='opus',
                 timeout_seconds=0.05, startup_grace_secs=0.02,
                 session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=0.3, absolute_cap_secs=5.0,
+                working_idle_secs=0.3, absolute_cap_secs=10.0,
             )
             wall = _time.monotonic() - t0
 
@@ -4104,14 +4130,22 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
         terminate_pg_mock.assert_called_once()
         # idle_bound = max(0.3, 0.05) = 0.3s of no-progress, on top of the ~0.06s
         # growth phase → kill at ~0.36s.  Well past the old 0.05s ceiling (proves
-        # it wasn't killed there) and well under the 5s absolute cap (proves it
-        # wasn't killed there either).
+        # it wasn't killed there) and well under the 10s absolute cap (proves it
+        # wasn't killed there either; widened from 5.0s — task 2723).
         assert wall >= 0.2, (
             f'Expected idle-kill at ~0.36s (after progress stalls), '
             f'killed too early at {wall:.3f}s — looks like the old ceiling fired'
         )
-        assert wall < 2.0, (
-            f'Expected idle-kill well under the 5s absolute cap, got {wall:.3f}s'
+        # Discriminates the correct ~0.36s idle-kill from the WRONG 10.0s absolute
+        # cap. wall additionally captures real post-kill teardown (unmocked
+        # snapshot_process_group /proc walk, comm_task cancellation/await, the
+        # second communicate() call, event-loop scheduling), observed to drift to
+        # ~2.5s under heavy host load. 5.0s keeps full discriminating power against
+        # the 10.0s wrong ceiling while tolerating that teardown latency — same
+        # load-drift de-flake shape as the sibling tests in this class (commits
+        # f1aae9678e, fda97df621af, and the grace-not-ceiling fix in this task).
+        assert wall < 5.0, (
+            f'Expected idle-kill well under the 10s absolute cap, got {wall:.3f}s'
         )
 
     async def test_b6_long_synchronous_tool_call_survives_between_ceiling_and_idle_bound(self, tmp_path):
@@ -4191,15 +4225,25 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
                 ['fake'], cwd=tmp_path, env={}, model='opus',
                 timeout_seconds=0.05, startup_grace_secs=0.02,
                 session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=2.0, absolute_cap_secs=0.3,
+                working_idle_secs=10.0, absolute_cap_secs=0.3,
             )
             wall = _time.monotonic() - t0
 
         assert result.timed_out is True
         terminate_pg_mock.assert_called_once()
-        # absolute_cap_secs=0.3 « idle_bound=max(2.0, 0.05)=2.0 — only the cap can fire.
+        # absolute_cap_secs=0.3 « idle_bound=max(10.0, 0.05)=10.0 — only the cap can fire.
         assert wall >= 0.2, f'Expected cap-kill at ~0.3s, killed too early at {wall:.3f}s'
-        assert wall < 1.5, f'Expected cap-kill at ~0.3s, not at the 2.0s idle bound ({wall:.3f}s)'
+        # Discriminates the correct ~0.3s cap-kill from the WRONG 10.0s idle bound. The
+        # cap-kill itself fires at ~0.3s (see the "Working-regime absolute cap reached"
+        # log); wall additionally captures the post-kill teardown (an UNMOCKED
+        # snapshot_process_group /proc walk + comm_task cancellation + event-loop
+        # scheduling), which under parallel verify/host load has been observed to drift
+        # to ~2.0s (task 2723). 4.0s keeps full discriminating power against the 10.0s
+        # wrong ceiling while tolerating that teardown latency — mirrors the same
+        # load-drift de-flake applied to the sibling UNREADABLE-DEGRADE test (e) below
+        # (commit fda97df621af), widened further here since 2.0s of observed drift
+        # already ate the old idle_bound=2.0s/wall<1.5s margin outright.
+        assert wall < 4.0, f'Expected cap-kill at ~0.3s, not at the 10.0s idle bound ({wall:.3f}s)'
 
     async def test_unreadable_transcript_degrades_to_old_ceiling_even_with_extension_params_set(self, tmp_path):
         """(e) UNREADABLE-DEGRADE: count_transcript_turns always returns None (B7
