@@ -1571,8 +1571,7 @@ async def _run_post_merge_verify(
     Args:
         on_result: Optional callback invoked with the final :class:`~orchestrator.verify.VerifyResult`
             BEFORE the pass/fail branch — additive, default ``None`` keeps
-            the test-local ``MergeWorker`` reference's call sites
-            byte-identical.  Used by
+            every existing call site byte-identical.  Used by
             :class:`SpeculativeMergeWorker` to capture warm per-test results
             for PRD §10 invariant 6(b) shadow compare.
         keep_worktrees: Additional worktrees to protect during any disk-pressure
@@ -1605,10 +1604,10 @@ async def _run_post_merge_verify(
             :func:`_spawn_merge_verify_dry_run`.
         main_health_probe_handles: Opaque bundle carrying the worker's
             ``background_tasks`` set (task 2564, reify 5067 merge-slot-stall
-            fix).  ``None`` (default) keeps the solo-reverify, train, and
-            merge_gates module-level callers — and any bare test-local
-            caller — running the main-health probe SYNCHRONOUSLY exactly as
-            before this task (byte-identical).  Only the production
+            fix).  ``None`` (default) keeps the solo-reverify, train,
+            merge_gates module-level callers, and any other caller running
+            the main-health probe SYNCHRONOUSLY exactly as before this task.
+            Only the production
             ``SpeculativeMergeWorker._run_inflight_verify`` call site passes
             a live bundle, at which point a main-health-eligible failure
             SKIPS the synchronous ``_classify_main_health_red`` probe,
@@ -1671,11 +1670,10 @@ async def _run_post_merge_verify(
     spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
 
     # γ decision 4: additive runner= param selects the verify host.
-    # runner=None (default) → LOCAL-ONLY pool, byte-identical to β (all legacy
-    # callers: the test-local MergeWorker reference's _do_merge,
-    # _reverify_rebased_tree, reverify_member_solo, _do_train_merge,
-    # _run_cold_shadow_verify — recovery/train paths stay on the trust anchor
-    # and out of slot accounting).
+    # runner=None (default) → LOCAL-ONLY pool, byte-identical to β for every
+    # legacy caller (_do_merge, _reverify_rebased_tree, reverify_member_solo,
+    # _do_train_merge, _run_cold_shadow_verify — recovery/train paths stay on
+    # the trust anchor and out of slot accounting).
     # runner=<RemoteRunner> → pool=[runner] (no LocalRunner); warm-swap is skipped
     # (per-host persistent worktree — handled by γ's _run_inflight_verify caller).
     # The `quarantine` parameter is reserved/unused here; it remains in the signature
@@ -1800,8 +1798,7 @@ async def _run_post_merge_verify(
     # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
     # called with the FINAL VerifyResult (after any ENOSPC retry) so the
     # warm per-test results are always the last-observed verify for this commit.
-    # Default None keeps the test-local MergeWorker reference's call sites
-    # byte-identical.
+    # Default None keeps existing call sites byte-identical.
     if on_result is not None:
         on_result(verify)
 
@@ -1912,9 +1909,9 @@ async def _run_post_merge_verify(
         # pre-existing break is escalated separately, off the critical path,
         # by _run_deferred_main_health_probe once it completes.
         #
-        # SYNCHRONOUS mode (handles is None — solo-reverify, train,
-        # merge_gates, and test-local callers): unchanged, byte-identical
-        # behaviour to before this task.
+        # SYNCHRONOUS mode (handles is None — solo-reverify, train, merge_gates,
+        # and any other caller that does not pass a probe-handles bundle):
+        # unchanged behaviour from before this task.
         if main_health_probe_handles is None:
             main_health_outcome = await _classify_main_health_red(
                 git_ops, req, verify, event_store,
@@ -2677,9 +2674,10 @@ def _emit_merge_queued(
 ) -> None:
     """Emit a merge_queued event.  No-op when *event_store* is None.
 
-    Centralises the emit payload so both :func:`enqueue_merge_request` and
-    the test-local ``MergeWorker`` reference's CAS-retry path use an
-    identical record shape.  If
+    Centralises the emit payload so every caller produces the same record
+    shape — currently :func:`enqueue_merge_request` and the retired
+    worker's CAS-retry re-enqueue path (a historical fixture; see
+    :class:`_TrainMergeHost`).  If
     *reason* is provided (e.g. ``'cas_retry'``) it is stored in ``data``.
 
     *queue_depth* (when provided) records how deep the main queue was at the
@@ -3356,6 +3354,15 @@ class _TrainMergeHost(Protocol):
     point back here instead of repeating the file path, so there is a single
     place to update if the fixture is ever moved or renamed.
 
+    The fixture is a TEST DOUBLE and a historical artifact of the R7b
+    retirement — not a normative behavioral spec.  :class:`SpeculativeMergeWorker`
+    is the sole production implementer and the sole behavioral authority for
+    this Protocol; other docstrings/comments in this module that describe
+    shared logic in terms also satisfied by the fixture are describing the
+    CURRENT shared behavior — the fixture still exercises that same code
+    path (so it keeps working), but it does not define what that code path
+    is supposed to do.
+
     The surface is intentionally narrow — only the state that the shared
     train-merge pipeline actually touches.  Adding new attributes here does
     NOT require touching ``_WipHaltMixin``; both implementers already
@@ -3575,9 +3582,9 @@ async def classify_and_merge(
 ) -> MergedOk | Decided:
     """Shared pre-merge guard + merge + drop-guard pipeline (MQ-refactor kappa).
 
-    Covers the EQUIVALENCE-MATRIX CORE common to the retired serial worker's
-    test-local reference (``_do_merge``; see :class:`_TrainMergeHost`),
-    ``SpeculativeMergeWorker._merger_loop``, and
+    The shared core used by all three current callers: the retired serial
+    worker's test-local reference (``_do_merge``; a historical fixture, see
+    :class:`_TrainMergeHost`), ``SpeculativeMergeWorker._merger_loop``, and
     ``SpeculativeMergeWorker._remerge``: branch-presence guard →
     already-merged detection → merge → conflict / non-conflict-failure →
     drop-guard.  Returns :class:`MergedOk` on success or :class:`Decided`
@@ -3593,10 +3600,11 @@ async def classify_and_merge(
     * Worker CAPABILITY — ``isinstance(worker, SpeculativeMergeWorker)`` —
       gates the drift-bookkeeping (``_note_conflict_detected``) and the rich
       failure diagnostic (``_build_merge_failure_diagnostic`` +
-      ``_render_failure_diagnostic``).  The test-local ``MergeWorker``
-      reference has neither, so routing ``_do_merge`` through this function
-      reproduces its plain ``MergeOutcome('blocked', reason=details)``
-      byte-identically.
+      ``_render_failure_diagnostic``).  A non-``SpeculativeMergeWorker``
+      caller (currently only the retired worker's test-local ``_do_merge``)
+      gets neither, so its blocked outcomes stay a plain
+      ``MergeOutcome('blocked', reason=details)`` — gated by capability, not
+      special-cased for that caller.
 
     ``req.snapshot_tip`` (an orthogonal per-request field, not a parameter of
     this function) is honored uniformly for already-merged detection
@@ -4112,8 +4120,7 @@ async def _do_train_merge(
     the ``worker`` parameter's type above).
 
     BEHAVIOUR-ADDING (task 1596): trains now inherit the full shared post-merge
-    core at PARITY with the test-local MergeWorker reference's ``_do_merge`` —
-    specifically:
+    core already used by single-branch merges — specifically:
       • disk-guard pre-verify short-circuit (_run_post_merge_verify)
       • verify-timeout loop-breaker (worker._post_merge_verify_timeouts)
       • post-merge content-equivalence gate (_finalize_advanced_merge)
@@ -4123,15 +4130,14 @@ async def _do_train_merge(
         (_map_advance_failure via worker.halt_for_wip)
 
     DEFENSIBLE DELTAS — behaviours intentionally absent from the train path
-    despite being present in the test-local MergeWorker reference or
-    SpeculativeMergeWorker:
+    despite being present in ``SpeculativeMergeWorker``'s own single-branch
+    advance path:
 
-    1. No ``reverify_on_rebase``: the 1595 disjoint-delta gate lives ONLY in
-       SpeculativeMergeWorker._verify_and_advance's CAS loop.  The test-local
-       MergeWorker reference (the readable serial reference) also does NOT
-       pass it.  "Parity" means parity with that reference, not the
-       spec-worker CAS loop.  Adding the gate here would duplicate
-       speculative-worker logic that has no business in the train.
+    1. No ``reverify_on_rebase``: the 1595 disjoint-delta gate is CAS-loop
+       machinery that lives ONLY in
+       ``SpeculativeMergeWorker._verify_and_advance``'s CAS loop — adding it
+       here would duplicate speculative-worker-specific logic that has no
+       business in the train's own atomic pipeline.
 
     2. Pyright redundant-but-harmless: the train always rebases its tip onto
        main before merging, so the type surface is fresh.  The post-merge
@@ -4244,9 +4250,9 @@ async def _do_train_merge(
 
     # Loop-breaker: if this train's tip has timed out in post-merge verify
     # MAX_POST_MERGE_VERIFY_TIMEOUTS times in a row, abandon without any git
-    # work — mirrors the test-local MergeWorker reference's ``_do_merge``.  A
-    # stuck verify can otherwise burn merge-queue capacity for 30+ minutes
-    # per attempt.
+    # work — the same threshold single-branch merges use (see
+    # worker.MAX_POST_MERGE_VERIFY_TIMEOUTS).  A stuck verify can otherwise
+    # burn merge-queue capacity for 30+ minutes per attempt.
     prior_timeouts = worker._post_merge_verify_timeouts.get(req.task_id, 0)
     if prior_timeouts >= worker.MAX_POST_MERGE_VERIFY_TIMEOUTS:
         logger.warning(
@@ -6065,14 +6071,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # across submissions so an orchestrator re-queue of the same task
         # continues to feed the same counter.
         self._post_merge_verify_timeouts: dict[str, int] = {}
-        # Per-task ENOSPC prune-and-retry counter (mirrors the test-local
-        # MergeWorker reference's; see MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).
-        # Persists across submissions, reset on a successful CAS advance.
+        # Per-task ENOSPC prune-and-retry counter; every _TrainMergeHost
+        # implementer defines a matching MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES
+        # class constant (see the Protocol above).  Persists across
+        # submissions, reset on a successful CAS advance.
         self._post_merge_verify_enospc_retries: dict[str, int] = {}
-        # γ2 per-branch generation auto-chain counter (mirrors the test-local
-        # MergeWorker reference's).  Incremented on each consecutive
-        # tip-advance equivalence failure; popped on a clean 'done' landing
-        # or bound-exceeded escalation.
+        # γ2 per-branch generation auto-chain counter, bounded by the
+        # module-level MAX_AUTO_CHAINED_GENERATIONS.  Incremented on each
+        # consecutive tip-advance equivalence failure; popped on a clean
+        # 'done' landing or bound-exceeded escalation.
         self._generation_chain_counts: dict[str, int] = {}
         # task 2420 (DEFECT 1): per-task consecutive in-flight-verify
         # no-progress-abort counter (abort trigger 3).  Incremented each time
@@ -6143,9 +6150,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # merges; cleared by unhalt_all_lanes(). Distinct from the per-lane halt
         # state so the automatic WIP-halt path (halt_for_wip) never aborts a verify.
         self._operator_halt = asyncio.Event()
-        # Cross-workflow auto-heal attempt counter (mirrors the test-local
-        # MergeWorker reference's; shared via self.merge_worker on
-        # TaskWorkflow instances).
+        # Cross-workflow auto-heal attempt counter; shared via
+        # self.merge_worker on TaskWorkflow instances.
         self.auto_heal_registry: MainHealthAutoHealRegistry = MainHealthAutoHealRegistry()
         # Internal tasks created by run()
         self._merger_task: asyncio.Task | None = None
