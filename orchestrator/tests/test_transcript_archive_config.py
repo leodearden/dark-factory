@@ -11,6 +11,7 @@ from __future__ import annotations
 from orchestrator.config import (
     RELOADABLE_FIELDS,
     OrchestratorConfig,
+    RetentionConfig,
     TranscriptArchiveConfig,
     apply_reload,
 )
@@ -55,3 +56,32 @@ class TestTranscriptArchiveReloadable:
             'new': False,
         }
         assert live.transcript_archive.enabled is False
+
+    def test_retention_edit_hot_applies_as_whole_submodel_swap(
+        self, monkeypatch, tmp_path
+    ):
+        """A retention.* edit reloads as the claimed atomic whole-retention swap.
+
+        _iter_leaves descends exactly one level, so transcript_archive.retention
+        is one atomic BaseModel leaf: changing a single nested knob
+        (max_age_days) swaps the whole RetentionConfig, carrying the untouched
+        sibling (max_task_dirs) along. Guards against a regression in
+        _iter_leaves/_set_leaf descent depth for this nested submodel.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        assert live.transcript_archive.retention.max_age_days == 90
+        fresh = OrchestratorConfig(
+            transcript_archive=TranscriptArchiveConfig(
+                retention=RetentionConfig(max_age_days=30)
+            )
+        )
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        # The whole retention submodel is the reloaded leaf (green-tier).
+        assert 'transcript_archive.retention' in report['applied']
+        # The nested edit is live, and the untouched sibling rode along in the
+        # whole-submodel swap (retention.max_task_dirs still at its default).
+        assert live.transcript_archive.retention.max_age_days == 30
+        assert live.transcript_archive.retention.max_task_dirs == 5000
