@@ -344,6 +344,44 @@ def build_stale_run_diagnostics(
     }
 
 
+def _stage1_ledger_write_missing(report: object) -> bool:
+    """Return True iff *report* is a Stage 1 report whose own in-stage
+    ``cycle_summary`` ledger upsert failed (task 2734).
+
+    Backs arm 2 of :meth:`ReconciliationHarness._ensure_stage1_cycle_summary`
+    — the "Stage 1 completed but its own write failed" case, as opposed to
+    task 2440's arm 1 ("Stage 1 raised before producing a report at all").
+
+    Keys on the EXPLICIT failure value
+    ``stats['stage1_cycle_summary_ledger_written'] == 0``, deliberately
+    never ``!= 1``: a real full-cycle
+    :meth:`~fused_memory.reconciliation.stages.memory_consolidator.MemoryConsolidator.run`
+    always stamps this stat to 0 (in-stage write failed) or 1 (succeeded),
+    so ``== 0`` captures exactly the defect. An ABSENT stat is produced only
+    by test stubs / reports that never reached the write — treating an
+    absent stat as no-fire (rather than ``!= 1``, which an absent stat would
+    also satisfy) keeps every stubbed-Stage-1 test (``stats={}``) and the
+    happy path (``stat == 1``) untouched.
+
+    Also excludes arm 1's own harness-synthesized degraded report (stamped
+    ``stats['stage1_cycle_summary_degraded_backstop'] = True``), so the two
+    arms of ``_ensure_stage1_cycle_summary`` can never double-process the
+    same run.
+
+    Returns False for anything whose ``.stats`` isn't a dict — including a
+    non-``StageReport`` object (e.g. a plain dict, the shape
+    ``run.stage_reports['_error']`` entries use) — since
+    ``run.stage_reports`` is typed ``dict[str, StageReport | dict]`` and
+    this predicate must never raise when handed one of those.
+    """
+    stats = getattr(report, 'stats', None)
+    if not isinstance(stats, dict):
+        return False
+    if stats.get('stage1_cycle_summary_degraded_backstop') is True:
+        return False
+    return stats.get('stage1_cycle_summary_ledger_written') == 0
+
+
 class ReconciliationHarness:
     """Orchestrates the three-stage reconciliation pipeline."""
 
