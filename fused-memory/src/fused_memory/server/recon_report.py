@@ -572,6 +572,14 @@ class ReconReportState:
                         Inject a fake clock in tests.
         reaper_interval: How many seconds the background reaper sleeps between
                         sweeps.  Default 60.
+        store:          Optional :class:`~fused_memory.server.recon_report_store.ReconReportStore`
+                        (task 2716). When provided, every mutator write-throughs
+                        its owning run's entries to durable SQLite after the
+                        mutation succeeds (see :meth:`_persist_run`), and
+                        :meth:`hydrate_from_store` can rebuild in-memory state
+                        from it at startup. ``None`` (the default) makes
+                        persistence a complete no-op — fresh in-process runs are
+                        byte-identical whether or not a store is attached.
     """
 
     def __init__(
@@ -581,6 +589,7 @@ class ReconReportState:
         reaper_interval: float = 60.0,
         memory_service: Any = None,
         task_interceptor: Any = None,
+        store: Any = None,
     ) -> None:
         self._ttl_seconds = ttl_seconds
         self._clock_fn = clock
@@ -608,11 +617,80 @@ class ReconReportState:
         self._memory_service = memory_service
         self._task_interceptor = task_interceptor
         self.known_projects: dict[str, str] = {}  # project_id → project_root
+        # SQLite write-through persistence (task 2716); None = fully inert.
+        self._store = store
 
     def _clock(self) -> float:
         if self._clock_fn is not None:
             return self._clock_fn()
         return asyncio.get_running_loop().time()
+
+    # ------------------------------------------------------------------
+    # Persistence (task 2716)
+    # ------------------------------------------------------------------
+
+    def _persist_run(self, run_id: str) -> None:
+        """Write every ``(run_id, *)`` entry through to the store.  No-op if
+        ``self._store is None``.
+
+        Upserts ALL of the run's entries (bounded to the handful of recon
+        stages), not just the one a caller just mutated: several mutators have
+        cross-stage effects (``delete_finding`` purges from the finding's
+        OWNING entry, which may be an earlier stage; ``cite_task``'s in-run
+        folds purge the losing finding from ITS owning entry) — upserting the
+        whole run is trivially correct where "persist only what changed" would
+        need fragile per-method reasoning about which stage's row to write.
+
+        For each entry, computes its OWNED slice of the two run-level fold
+        anchors (``_run_cited_task_index`` / the derived-signature entries in
+        ``_run_sig_index``) fresh from the live indices — see
+        :func:`_serialize_entry`'s docstring for why these ride along instead
+        of a companion table. ``is_active`` is set per row from
+        ``self._active.get(run_id) == stage``, so an active-stage transition
+        self-corrects on the very next persist.
+
+        Best-effort: a store failure is logged loudly (WARNING, structured)
+        but never raised — a shadow-store hiccup must not abort a recon stage
+        (mirrors ``start_report``'s existing degradation posture).
+        """
+        if self._store is None:
+            return
+        active_stage = self._active.get(run_id)
+        for (rid, stage), entry in self._state.items():
+            if rid != run_id:
+                continue
+            try:
+                finding_ids = {f.finding_id for f in entry.findings}
+                sig_anchor_slice = {
+                    sig: finding_id
+                    for sig, finding_id in self._run_sig_index.get(run_id, {}).items()
+                    if finding_id in finding_ids and sig not in entry._signature_to_finding
+                }
+                cited_task_slice = {
+                    key: finding_id
+                    for key, finding_id in self._run_cited_task_index.get(run_id, {}).items()
+                    if finding_id in finding_ids
+                }
+                entry_json = _serialize_entry(
+                    entry,
+                    sig_anchor_slice=sig_anchor_slice,
+                    cited_task_slice=cited_task_slice,
+                )
+                self._store.upsert_entry(
+                    run_id=rid,
+                    stage=stage,
+                    project_id=entry.project_id,
+                    is_active=(active_stage == stage),
+                    entry_json=entry_json,
+                    updated_at=self._clock(),
+                )
+            except Exception:
+                logger.warning(
+                    'recon_report: failed to persist run_id=%r stage=%r to store',
+                    rid,
+                    stage,
+                    exc_info=True,
+                )
 
     # ------------------------------------------------------------------
     # Tool implementations
@@ -633,6 +711,7 @@ class ReconReportState:
         )
         self._state[(run_id, stage)] = entry
         self._active[run_id] = stage
+        self._persist_run(run_id)
         return {'run_id': run_id, 'stage': stage}
 
     def add_finding(
@@ -820,6 +899,7 @@ class ReconReportState:
         result: dict[str, Any] = {'finding_id': finding_id}
         if warnings:
             result['warnings'] = warnings
+        self._persist_run(run_id)
         return result
 
     def delete_finding(self, run_id: str, finding_id: str) -> dict[str, Any]:
@@ -873,6 +953,7 @@ class ReconReportState:
             return _ERR_ALREADY_COMPLETED.copy()
 
         self._purge_finding(run_id, owning_entry, finding)
+        self._persist_run(run_id)
 
         return {'status': 'deleted', 'finding_id': finding_id}
 
@@ -897,6 +978,7 @@ class ReconReportState:
             return _ERR_ALREADY_COMPLETED.copy()
 
         entry.stats[key] = value
+        self._persist_run(run_id)
         return {'value': value}
 
     def inc_stat(
@@ -935,6 +1017,7 @@ class ReconReportState:
             return _stat_type_mismatch_error(key)
         new_value = current_raw + delta
         entry.stats[key] = new_value
+        self._persist_run(run_id)
         return {'value': new_value}
 
     def complete(
@@ -970,11 +1053,13 @@ class ReconReportState:
                     run_id,
                     entry.stage,
                 )
+                self._persist_run(run_id)
                 return cached_response
 
         # First-time path
         entry.completed_at = self._clock()
         entry.summary = summary
+        self._persist_run(run_id)
         return cached_response
 
     def get_assembled_report(
@@ -1292,6 +1377,7 @@ class ReconReportState:
         node = nodes[0]
         citation = {'entity_uuid': node['uuid'], 'canonical_name': node['name']}
         finding.cited_entities.append(citation)
+        self._persist_run(run_id)
         return citation
 
     async def cite_edge(
@@ -1329,6 +1415,7 @@ class ReconReportState:
 
         citation = {'edge_uuid': edge_uuid, 'fact_text_snapshot': result['fact']}
         finding.cited_edges.append(citation)
+        self._persist_run(run_id)
         return citation
 
     async def cite_task(
@@ -1470,9 +1557,11 @@ class ReconReportState:
         # both would hit, purge runs exactly once, either way.
         if project_existing_id is not None and project_existing_id != finding.finding_id:
             self._purge_finding(run_id, finding_entry, finding)
+            self._persist_run(run_id)
             return _duplicate_finding_error(project_existing_id)
         if entity_existing_id is not None and entity_existing_id != finding.finding_id:
             self._purge_finding(run_id, finding_entry, finding)
+            self._persist_run(run_id)
             return _duplicate_finding_error(entity_existing_id)
 
         if project_fold_eligible:
@@ -1496,6 +1585,7 @@ class ReconReportState:
         )
         if not already_cited:
             finding.cited_tasks.append(citation)
+        self._persist_run(run_id)
         return citation
 
     async def cite_memory(
@@ -1536,6 +1626,7 @@ class ReconReportState:
 
         citation = {'memory_id': memory_id, 'store': store, 'metadata_fingerprint': fingerprint}
         finding.cited_memories.append(citation)
+        self._persist_run(run_id)
         return citation
 
     async def cite_run(
@@ -1624,6 +1715,7 @@ class ReconReportState:
 
         citation = {'run_id': cited_run_id, 'match_count': count}
         finding.cited_runs.append(citation)
+        self._persist_run(run_id)
         return citation
 
     # ------------------------------------------------------------------
