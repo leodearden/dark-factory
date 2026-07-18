@@ -39,7 +39,10 @@ import uuid
 
 import httpx
 
-from fused_memory.backends.sqlite_task_backend import _drop_reserved_control_keys
+from fused_memory.backends.sqlite_task_backend import (
+    _RESERVED_METADATA_CONTROL_KEYS,
+    _drop_reserved_control_keys,
+)
 
 DEFAULT_SERVER = 'http://127.0.0.1:8002'
 DEFAULT_ROOTS = ['/home/leo/src/dark-factory']
@@ -165,18 +168,33 @@ async def _clean_one_project(
             print(f'  [{project_root}] task={task_id} no-op (clean)')
             continue
 
-        # Safety: correct_task_metadata must differ from the fetched blob
-        # ONLY by removing the reported dropped keys — never touch or drop
-        # any other key. Refuse the replace-mode write (rather than
-        # silently persist a truncated blob) if that invariant doesn't
-        # hold, e.g. because get_task's returned metadata was already
-        # unexpectedly partial.
-        expected = {k: v for k, v in meta.items() if k not in dropped}
-        if cleaned != expected:
+        # Safety net for the destructive replace-mode write below, which
+        # OVERWRITES the task's full metadata blob. Assert the imported
+        # backend transform honored its key-removal contract before we
+        # persist its output:
+        #   1. it dropped ONLY declared reserved control-flag keys —
+        #      compared against `_RESERVED_METADATA_CONTROL_KEYS`, the one
+        #      reference NOT re-derived from `meta`, so this genuinely
+        #      fails if that shared backend contract ever drifts to strip
+        #      more than the reserved set;
+        #   2. it added no key and removed nothing beyond `dropped`; and
+        #   3. it left every surviving key byte-identical.
+        # This validates the TRANSFORM, not the fetch: it deliberately
+        # cannot detect a `meta` that get_task already returned truncated
+        # — there is no independent copy of the true blob to compare
+        # against (the earlier draft's cleaned-vs-source check, which
+        # re-derived `expected` from the same `meta`, was tautological and
+        # gave false assurance of exactly that).
+        contract_ok = (
+            set(dropped) <= _RESERVED_METADATA_CONTROL_KEYS
+            and set(cleaned) == set(meta) - set(dropped)
+            and all(cleaned[k] == meta[k] for k in cleaned)
+        )
+        if not contract_ok:
             print(
                 f'  [error][{project_root}] task={task_id} refusing to write: '
-                f'cleaned metadata differs from source by more than the '
-                f'dropped keys {dropped} (before={meta!r} cleaned={cleaned!r})',
+                f'transform breached its reserved-key-removal contract '
+                f'(dropped={dropped} before={meta!r} cleaned={cleaned!r})',
                 file=sys.stderr,
             )
             error_count += 1
@@ -246,7 +264,7 @@ async def main_async(args: argparse.Namespace) -> int:
     for k, v in totals.items():
         print(f'  {k}: {v}')
     # Non-zero exit on any per-task failure (get_task/update_task errors,
-    # or the cleaned-vs-source safety check above) so an automated caller
+    # or the transform-contract safety check above) so an automated caller
     # can detect partial failure instead of reading a bare 0 as success.
     return 1 if totals['errors'] else 0
 
