@@ -1212,3 +1212,105 @@ class TestReconReportStoreWiredAtBoot:
         assert state._store is None
         state.start_persistence()  # must not raise
         state.stop_persistence()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# step-17: hydrate re-anchors each completed entry's TTL baseline across the
+# restart boundary, so the reaper still evicts (and GCs) a hydrated completed
+# run instead of leaking its rows forever — RED until step-18 adds the re-anchor
+# ---------------------------------------------------------------------------
+
+
+class TestHydrateReanchorEviction:
+    """A completed entry hydrated across a restart must have its TTL measured
+    from the RESTART baseline, not the prior process's clock value.
+
+    The reaper's default clock is ``asyncio.get_running_loop().time()``
+    (monotonic), which restarts near 0 on a fresh event loop.  A verbatim-
+    restored ``completed_at`` stamped by the prior process is therefore a large
+    STALE value: in ``tick()`` the age ``now - completed_at`` comes out negative
+    and never exceeds ``ttl_seconds``, so a hydrated completed run would never
+    evict, its run would never quiesce, and ``store.delete_run`` would never fire
+    — its ``recon_report_state.db`` rows (and their in-memory entries) leak
+    unboundedly across every restart cycle.  This pins the fix: re-anchor each
+    hydrated ``completed_at`` to ``_clock()`` inside ``hydrate_from_store`` so the
+    TTL counts from restart and the existing run-quiescence GC path reclaims it.
+    """
+
+    def _make_state(self, store, clock_holder):
+        from fused_memory.server.recon_report import ReconReportState
+
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: clock_holder[0],
+            memory_service=_WTFakeMemoryService(),
+            task_interceptor=_WTFakeTaskInterceptor(),
+            store=store,
+        )
+        state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        return state
+
+    def test_hydrated_completed_run_evicts_and_gcs_from_restart_baseline(
+        self, tmp_path
+    ):
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        run_id = 'reanchor-run'
+        stage = 'memory_consolidator'
+
+        # ---- PHASE 1: long-lived "old process" with a LARGE monotonic clock ----
+        # t_a=500_000 simulates a server whose asyncio loop time has run for days.
+        t_a = [500_000.0]
+        store_a = ReconReportStore(db)
+        state_a = self._make_state(store_a, t_a)
+        state_a.start_persistence()  # opens store_a (fresh DB → hydrate is a no-op)
+        try:
+            state_a.start_report(
+                run_id=run_id, stage=stage, project_id='dark_factory'
+            )
+            fid = state_a.add_finding(
+                run_id=run_id, severity='low', category='other',
+                description='old-process finding', suggested_action='note',
+                actionable=False,
+            )['finding_id']
+            # completed_at is stamped ~500_000 and write-through persisted.
+            state_a.complete(run_id, 'old process done')
+            rows_a = [r for r in store_a.load_all() if r['run_id'] == run_id]
+            assert len(rows_a) == 1
+        finally:
+            # Simulate the process dying — close the connection.
+            state_a.stop_persistence()
+
+        # ---- PHASE 2: fresh event-loop clock near 0 = "restart" ----
+        t_b = [10.0]
+        store_b = ReconReportStore(db)
+        state_b = self._make_state(store_b, t_b)
+        state_b.start_persistence()  # open the SAME db + hydrate_from_store
+        try:
+            # (a) The completed finding hydrated back into memory.
+            findings = state_b.get_findings_for_run(run_id)
+            assert [f['finding_id'] for f in findings] == [fid]
+
+            # (b) TTL is measured from the RESTART baseline (10), NOT the stale
+            #     500_000: just BEFORE ttl elapses, nothing evicts and the finding
+            #     is still present.
+            t_b[0] = 10.0 + 300.0 - 1.0  # 309 → 309-10=299 < ttl(300)
+            assert state_b.tick() == 0
+            assert [
+                f['finding_id'] for f in state_b.get_findings_for_run(run_id)
+            ] == [fid]
+
+            # (c) Just AFTER ttl elapses (from restart), the run evicts, fully
+            #     quiesces, and its persisted rows are GC'd (delete_run fired).
+            #     This is RED under a verbatim completed_at restore: 311-500_000 is
+            #     always negative, so tick() never evicts, the run never quiesces,
+            #     and its recon_report_state.db rows leak forever.
+            t_b[0] = 10.0 + 300.0 + 1.0  # 311 → 311-10=301 > ttl(300)
+            assert state_b.tick() >= 1
+            assert state_b.get_findings_for_run(run_id) == []
+            assert [
+                r for r in store_b.load_all() if r['run_id'] == run_id
+            ] == []
+        finally:
+            state_b.stop_persistence()
