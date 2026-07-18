@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -595,3 +596,44 @@ class TestSessionCaptureLifecycle:
         # Mint-before-spawn happened, and clear ran in the finally despite the raise.
         journal.record_run_session.assert_awaited_once()
         journal.clear_run_session.assert_awaited_once_with('run-sc2')
+
+    @pytest.mark.asyncio
+    async def test_preserves_session_snapshot_on_cancel(self, tmp_path):
+        """On asyncio.CancelledError from the runner (a restart interrupting an
+        in-flight stage), the session snapshot is PRESERVED — clear_run_session
+        is NOT called — so the interrupted run row retains session_id +
+        stage_cursor for the startup adopt-and-resume pass (task σ).
+
+        Contrast test_clear_runs_even_when_runner_raises: a NON-cancel exception
+        still clears (only a genuine cancellation preserves the snapshot)."""
+        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
+        watermark = Watermark(project_id='test_project')
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(side_effect=asyncio.CancelledError()),
+        ), pytest.raises(asyncio.CancelledError):
+            await stage.run([], watermark, [], run_id='run-cancel')
+
+        # Mint-before-spawn happened...
+        journal.record_run_session.assert_awaited_once()
+        # ...but clear_run_session was NOT called on cancellation — the snapshot
+        # survives on the interrupted run row for the resume pass.
+        journal.clear_run_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clear_called_exactly_once_on_normal_return(self, tmp_path):
+        """Complement to the cancel case: a normal runner return DOES clear the
+        session snapshot, exactly once."""
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
+        watermark = Watermark(project_id='test_project')
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            await stage.run([], watermark, [], run_id='run-normal')
+
+        journal.clear_run_session.assert_awaited_once_with('run-normal')
