@@ -97,6 +97,12 @@ DEFAULT_MAX_COMMIT_AGE_HOURS: float = 6.0
 # Orchestrator branch naming convention: ``task/<id>``.
 DEFAULT_BRANCH_PREFIX: str = 'task/'
 
+# Default base branch a task branch is created from.  Used to compute a
+# branch's own commit count via ``git rev-list --count <base>..<branch>`` —
+# see `_branch_own_commit_count` and the `base_branch` param on
+# `detect_live_workflow`.
+DEFAULT_BASE_BRANCH: str = 'main'
+
 # Timeout for each individual git subprocess call (seconds).
 _GIT_TIMEOUT: int = 10
 
@@ -157,6 +163,7 @@ def detect_live_workflow(
     now: datetime | None = None,
     max_commit_age_hours: float = DEFAULT_MAX_COMMIT_AGE_HOURS,
     branch_prefix: str = DEFAULT_BRANCH_PREFIX,
+    base_branch: str = DEFAULT_BASE_BRANCH,
     status: str | None = None,
     task_kind: str | None = None,
     _orchestrator_live: bool | None = None,
@@ -172,6 +179,16 @@ def detect_live_workflow(
         max_commit_age_hours: Commits newer than this many hours count as recent.
         branch_prefix: Branch name prefix; combined with *task_id* to form the
             branch name (e.g. ``"task/4321"``).
+        base_branch: The branch *branch* is created from.  Used to compute the
+            branch's own commit count via ``git rev-list --count
+            <base_branch>..<branch>`` — a count of ``0`` means the branch is
+            "bare" (no commits beyond *base_branch*, e.g. only a
+            `git worktree add`/branch-creation reflog entry), which forces
+            ``recent_commit`` to ``False`` even if the branch tip's timestamp
+            would otherwise be within *max_commit_age_hours* (the tip is just
+            the base-branch commit, not task work — reify#5245's shape). A
+            branch missing entirely, or any rev-list error, yields an unknown
+            count and does NOT count as bare (fail-safe toward live).
         status: The task's current status, when known.  When this is a member
             of :data:`ORCH_LIVE_INELIGIBLE_STATUSES` (statuses never actively
             dispatched: ``deferred``, ``done``, ``cancelled``), the project-wide
@@ -214,6 +231,14 @@ def detect_live_workflow(
     last_commit_at, recent_commit = _check_recent_commit(
         root, branch, now=now, max_commit_age_hours=max_commit_age_hours
     )
+    # branch_bare: branch carries zero commits of its own beyond base_branch
+    # (its tip is just the base-branch commit — reify#5245's shape). An
+    # unknown count (missing branch, rev-list error) is NOT bare (fail-safe
+    # toward live). A bare branch's recent-looking tip timestamp is not
+    # evidence of task work, so it is stripped from recent_commit here.
+    own_commit_count = _branch_own_commit_count(root, base_branch, branch)
+    branch_bare = own_commit_count == 0
+    recent_commit = recent_commit and not branch_bare
     # orchestrator_live is the project-level lock signal (True when the
     # orchestrator process holds an active lock for this project_root, regardless
     # of which task it is currently dispatching).  Pre-computed callers may pass
@@ -406,6 +431,49 @@ def _check_recent_commit(
     age = reference - last_commit_at
     recent_commit = age <= timedelta(hours=max_commit_age_hours)
     return last_commit_at, recent_commit
+
+
+def _branch_own_commit_count(project_root: str, base_branch: str, branch: str) -> int | None:
+    """Return the number of commits *branch* carries beyond *base_branch*.
+
+    Runs ``git -C <root> rev-list --count <base_branch>..<branch>``.  A result
+    of ``0`` means *branch* is "bare" — created from *base_branch* but with no
+    commits of its own (e.g. only a ``git worktree add``/branch-creation
+    reflog entry — reify#5245's shape).  Any subprocess error, non-zero
+    returncode (e.g. *base_branch* or *branch* missing), or unparseable output
+    silently returns ``None`` (fail-safe: an unknown count is never treated as
+    ``0``/bare by callers).
+    """
+    try:
+        result = subprocess.run(
+            ['git', '-C', project_root, 'rev-list', '--count', f'{base_branch}..{branch}'],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.debug(
+            'live_workflow_detector: rev-list failed for %s..%s: %s',
+            base_branch, branch, exc,
+        )
+        return None
+
+    if result.returncode != 0:
+        logger.debug(
+            'live_workflow_detector: rev-list returned %d for %s..%s: %s',
+            result.returncode, base_branch, branch, result.stderr.strip(),
+        )
+        return None
+
+    stdout = result.stdout.strip()
+    try:
+        return int(stdout)
+    except (TypeError, ValueError):
+        logger.debug(
+            'live_workflow_detector: cannot parse rev-list count %r for %s..%s',
+            stdout, base_branch, branch,
+        )
+        return None
 
 
 def _parse_iso_timestamp(ts_str: str) -> datetime | None:
