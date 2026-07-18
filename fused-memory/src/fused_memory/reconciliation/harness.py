@@ -18,7 +18,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from shared.cli_invoke import AllAccountsCappedException
+from shared.cli_invoke import AllAccountsCappedException, read_transcript_records
+from shared.config_dir import TaskConfigDir
 from shared.usage_gate import UsageGate
 
 from fused_memory.config.schema import FusedMemoryConfig
@@ -39,7 +40,10 @@ from fused_memory.models.scope import (
 )
 from fused_memory.reconciliation.active_runs import ActiveRunRegistry
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
-from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+from fused_memory.reconciliation.cli_stage_runner import (
+    gc_run_config_dir,
+    recon_config_base_dir,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
@@ -1390,26 +1394,72 @@ class ReconciliationHarness:
         :meth:`_recover_stale_runs` reaper. For each ``interrupted`` run owned by
         an own-dead-predecessor (``instance_id`` not None and not this instance,
         with the project lock still corroborating that owner — the same
-        ownership test the predecessor pass uses), adopt the project lock, source
-        the run's still-drained events read-only via
-        :meth:`EventBuffer.get_drained_events` (restoring them would
-        double-process on resume), and drive a resume-aware
-        :meth:`run_full_cycle` that skips already-completed stages and
-        ``--resume``s the ``stage_cursor`` stage. The adopted lock is released
-        after the resumed cycle — this pass cannot heartbeat it, so holding it
-        would wedge the normal project loop.
+        ownership test the predecessor pass uses), the guard rails below decide
+        between two paths:
 
-        Guard rails (freshness / attempt-cap / one-resume-per-stage /
-        transcript-exists) and the ``_recover_one_run`` failed+restore fallback
-        are layered on in a later step; this is the happy path.
+        * **Resume** — when every guard rail passes, adopt the project lock,
+          source the run's still-drained events read-only via
+          :meth:`EventBuffer.get_drained_events` (restoring them would
+          double-process on resume), and drive a resume-aware
+          :meth:`run_full_cycle` that skips already-completed stages and
+          ``--resume``s the ``stage_cursor`` stage. The adopted lock is released
+          after the resumed cycle — this pass cannot heartbeat it, so holding it
+          would wedge the normal project loop.
+        * **Fallback** — on ANY doubt (see :meth:`_resume_guard_reason`:
+          freshness expired, per-run attempt cap reached, this stage_cursor
+          already resumed once, or the session transcript is missing) route to
+          :meth:`_recover_one_run` with ``disposition='failed'``, which
+          error-stamps the run, restores its drained events, and GCs the config
+          dir — today's failed+restore path, verbatim.
         """
         my_iid = self.buffer.instance_id
         for run in await self.journal.get_interrupted_runs():
             if run.instance_id is None or run.instance_id == my_iid:
                 continue
-            lock_holder, _lock_age = await self.buffer.get_lock_status(run.project_id)
+            lock_holder, lock_age = await self.buffer.get_lock_status(run.project_id)
             if lock_holder != run.instance_id:
                 continue
+
+            # ── Guard rails: on ANY doubt, fall back to the failed+restore
+            # recovery path rather than --resume a stale/unsafe run.  Checked
+            # BEFORE adopting the lock so _recover_one_run's own ownership-scoped
+            # release (lock_holder == run.instance_id) cleans up the dead
+            # predecessor's lock exactly as the predecessor-recovery pass does.
+            unresumable_reason = self._resume_guard_reason(run)
+            if unresumable_reason is not None:
+                await self._recover_one_run(
+                    run, lock_holder, lock_age,
+                    disposition='failed',
+                    error_type='InterruptedRunUnresumable',
+                    error_message=unresumable_reason,
+                )
+                logger.info(
+                    'reconciliation.interrupted_run_unresumable',
+                    extra={
+                        'run_id': run.id,
+                        'project_id': run.project_id,
+                        'instance_id': run.instance_id,
+                        'stage_cursor': run.stage_cursor,
+                        'reason': unresumable_reason,
+                    },
+                )
+                # Storm counter / escalation on the fallback arm is wired in s20.
+                continue
+
+            # Persist the incremented resume bookkeeping BEFORE adopting/resuming
+            # so the per-run cap and one-resume-per-stage rails survive a
+            # re-interrupt of this very resume.  Stored out-of-band in
+            # stage_reports['_resume'] (mirroring the '_error' entry) — no new
+            # runs-table column.
+            resume_meta = run.stage_reports.get('_resume')
+            prior_count = (
+                resume_meta.get('count', 0) if isinstance(resume_meta, dict) else 0
+            )
+            run.stage_reports['_resume'] = {
+                'count': prior_count + 1,
+                'last_stage': run.stage_cursor,
+            }
+            await self.journal.update_run_stage_reports(run.id, run.stage_reports)
 
             # Adopt the project lock: release the dead predecessor's corroborated
             # lock, then re-acquire as this instance so the resumed cycle owns the
@@ -1449,6 +1499,71 @@ class ReconciliationHarness:
                 await self.buffer.mark_run_complete(
                     run.project_id, instance_id=self.buffer.instance_id,
                 )
+
+    def _resume_guard_reason(self, run: ReconciliationRun) -> str | None:
+        """Return a reason string if *run* is NOT safe to ``--resume``, else None.
+
+        The task σ guard rails, evaluated cheapest-first (all config-driven). On
+        ANY doubt this returns a non-None reason and the caller falls back to
+        :meth:`_recover_one_run` (failed+restore). None means every rail passed
+        and the run may be adopted and resumed.
+
+        Rails:
+        * **freshness** — ``now - run.completed_at`` (the interrupt instant
+          stamped by ``complete_run``) must be within
+          ``resume_freshness_window_seconds``.
+        * **per-run cap** — ``stage_reports['_resume'].count`` must be below
+          ``resume_max_attempts_per_run`` (bounds a resume→re-interrupt loop).
+        * **one-resume-per-stage** — ``stage_reports['_resume'].last_stage``
+          must differ from ``run.stage_cursor`` (never re-resume the same stage).
+        * **transcript-exists** — only when a session was captured
+          (``run.session_id`` non-null): its transcript must still be on disk in
+          the per-run config dir.  ``record_run_session``'s snapshot is
+          best-effort (can go stale after an internal cap retry), so a missing
+          transcript means there is nothing to ``--resume``.  A NULL session_id
+          is NOT a failure — the interrupt landed between stages, so the run
+          resumes with every remaining stage fresh (no --resume), degrading
+          cleanly.
+        """
+        # Freshness — measured from the interrupt instant (completed_at).
+        if run.completed_at is None:
+            return 'run has no completed_at (interrupt instant) — cannot verify freshness'
+        age_secs = (datetime.now(UTC) - run.completed_at).total_seconds()
+        if age_secs > self.config.resume_freshness_window_seconds:
+            return (
+                f'interrupt is {age_secs:.0f}s old (> '
+                f'resume_freshness_window_seconds={self.config.resume_freshness_window_seconds})'
+            )
+
+        # Per-run attempt cap + one-resume-per-stage (out-of-band _resume meta).
+        resume_meta = run.stage_reports.get('_resume')
+        resume_meta = resume_meta if isinstance(resume_meta, dict) else {}
+        count = resume_meta.get('count', 0)
+        if count >= self.config.resume_max_attempts_per_run:
+            return (
+                f'resume attempt cap reached (count={count} >= '
+                f'resume_max_attempts_per_run={self.config.resume_max_attempts_per_run})'
+            )
+        if resume_meta.get('last_stage') == run.stage_cursor:
+            return (
+                f'stage_cursor {run.stage_cursor!r} already resumed once '
+                '(one-resume-per-stage)'
+            )
+
+        # Transcript existence — only meaningful when a session was captured.
+        if run.session_id:
+            config_dir = TaskConfigDir(
+                task_id=run.id,
+                base_dir=recon_config_base_dir(self.journal.data_dir),
+            )
+            transcript = read_transcript_records(config_dir.path, run.session_id)
+            if not transcript:
+                return (
+                    f'session {run.session_id} has no transcript on disk '
+                    f'({config_dir.path}) — unresumable'
+                )
+
+        return None
 
     # ── Dead-owner suppression storm counter ─────────────────────────
 
