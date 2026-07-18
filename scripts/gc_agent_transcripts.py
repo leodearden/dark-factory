@@ -123,26 +123,40 @@ def select_prunable(
 ) -> GcDecision:
     """Classify ``(path, mtime)`` task dirs into keep / prune sets (pure).
 
-    AGE arm only (this step): a dir is age-prunable iff ``max_age_days > 0``
-    and its ``mtime`` is strictly older than ``now - max_age_days * 86400`` —
-    so a dir sitting exactly on the cutoff (``now - mtime == max_age_days*86400``)
-    is KEPT, and one second older is pruned. A non-positive ``max_age_days``
-    disables the age axis entirely.
+    Prune = UNION of the two bounds; a dir failing either (or both) is dropped:
 
-    ``max_task_dirs`` is accepted but treated as unlimited for now (the count
-    arm lands in a later step).
+    * **age** — ``max_age_days > 0`` and ``mtime`` is strictly older than
+      ``now - max_age_days * 86400``. A dir sitting exactly on the cutoff
+      (``now - mtime == max_age_days*86400``) is KEPT (strict ``<``), and one
+      second older is pruned.
+    * **count** — dirs are ranked newest-first by ``mtime`` (deterministic
+      tiebreak on path); a dir whose newest-first rank is ``>= max_task_dirs``
+      falls outside the retained window.
+
+    A non-positive cap disables that axis entirely (fail-safe: a mis-set ``0``
+    imposes no bound rather than pruning everything). The prune reason is
+    tagged ``age`` / ``count`` / ``age+count`` accordingly; ``keep`` is the
+    complement. Result ordering is newest-first and deterministic regardless of
+    input order.
     """
-    del max_task_dirs  # count arm not yet implemented; accepted, treated as unlimited
-
     age_cutoff: float | None = None
     if max_age_days > 0:
         age_cutoff = now - max_age_days * SECONDS_PER_DAY
 
+    # Newest-first rank (mtime desc, path asc as a deterministic tiebreak).
+    ordered = sorted(task_dirs, key=lambda item: (-item[1], str(item[0])))
+
     keep: list[Path] = []
     prune: list[tuple[Path, str]] = []
-    for path, mtime in task_dirs:
-        if age_cutoff is not None and mtime < age_cutoff:
+    for rank, (path, mtime) in enumerate(ordered):
+        is_age = age_cutoff is not None and mtime < age_cutoff
+        is_count = max_task_dirs > 0 and rank >= max_task_dirs
+        if is_age and is_count:
+            prune.append((path, 'age+count'))
+        elif is_age:
             prune.append((path, 'age'))
+        elif is_count:
+            prune.append((path, 'count'))
         else:
             keep.append(path)
 
