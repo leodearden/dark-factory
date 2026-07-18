@@ -4230,3 +4230,98 @@ def test_cli_report_includes_fused_memory_row(
     assert "healthy" in captured.out
     assert exit_code == 0, "report()'s staleness-only exit code must be unaffected by the fm row"
 
+
+# ---------------------------------------------------------------------------
+# Part C: fused-memory staleness — constants (step 1)
+#
+# fm-staleness siblings of the orchestrator staleness constants. These pin the
+# new FM_* constants that fused_memory_staleness_pass() and its clock/delegate
+# helpers consume: the watched-paths list, fm's OWN deploy-clock file + env
+# override, the min-interval knob (env-with-fallback like
+# ORCH_RESTART_MIN_INTERVAL_SECS), and the fixed transient redeploy unit name.
+# ---------------------------------------------------------------------------
+
+
+def test_fm_watched_paths_constant() -> None:
+    """FM_WATCHED_PATHS is exactly [fused-memory/src/, shared/src/].
+
+    fused-memory imports shared.* (e.g. shared.task_metadata), so a change to
+    shared/src/ can alter fm's behavior and must count toward fm staleness —
+    hence both prefixes are watched.
+    """
+    wdog = _load_watchdog()
+    assert wdog.FM_WATCHED_PATHS == ["fused-memory/src/", "shared/src/"]
+
+
+def test_fm_deploy_clock_path_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_DEPLOY_CLOCK_PATH defaults to fm's OWN clock file under REPO_DIR."""
+    monkeypatch.delenv("FM_DEPLOY_CLOCK", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_DEPLOY_CLOCK_PATH == os.path.join(
+        wdog.REPO_DIR, "data", "fused-memory", "last_redeploy_fused_memory.json"
+    )
+
+
+def test_fm_deploy_clock_path_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_DEPLOY_CLOCK_PATH honors the FM_DEPLOY_CLOCK env override.
+
+    _load_watchdog() re-execs the module, so an env var set before the call is
+    picked up at (re)import time — mirrors FLEET_DEPLOY_CLOCK_PATH's
+    ORCH_FLEET_DEPLOY_CLOCK override.
+    """
+    monkeypatch.setenv("FM_DEPLOY_CLOCK", "/tmp/custom_fm_clock.json")
+    wdog = _load_watchdog()
+    assert wdog.FM_DEPLOY_CLOCK_PATH == "/tmp/custom_fm_clock.json"
+
+
+def test_fm_deploy_clock_path_separate_from_fleet_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fm's deploy clock must be a DIFFERENT file than the orchestrator fleet clock.
+
+    fused-memory and the orchestrator fleet are independent deploy targets
+    whose redeploy cadences must not couple — an orchestrator fleet redeploy
+    must not reset fm's min-interval window and vice-versa.
+    """
+    monkeypatch.delenv("FM_DEPLOY_CLOCK", raising=False)
+    monkeypatch.delenv("ORCH_FLEET_DEPLOY_CLOCK", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_DEPLOY_CLOCK_PATH != wdog.FLEET_DEPLOY_CLOCK_PATH
+
+
+def test_fm_restart_min_interval_secs_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_RESTART_MIN_INTERVAL_SECS defaults to 28800 (8h) with no env override.
+
+    Mirrors ORCH_RESTART_MIN_INTERVAL_SECS's 8h backstop cadence, but as fm's
+    OWN independent knob.
+    """
+    monkeypatch.delenv("FM_RESTART_MIN_INTERVAL_SECS", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_RESTART_MIN_INTERVAL_SECS == 28800
+
+
+def test_fm_restart_min_interval_secs_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_RESTART_MIN_INTERVAL_SECS honors a valid env override."""
+    monkeypatch.setenv("FM_RESTART_MIN_INTERVAL_SECS", "60")
+    wdog = _load_watchdog()
+    assert wdog.FM_RESTART_MIN_INTERVAL_SECS == 60
+
+
+def test_fm_restart_min_interval_secs_malformed_env_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed FM_RESTART_MIN_INTERVAL_SECS env value falls back to 28800.
+
+    A typo'd env var must not crash the oneshot watchdog — fall-safe ethos,
+    mirroring ORCH_RESTART_MIN_INTERVAL_SECS's malformed-env test.
+    """
+    monkeypatch.setenv("FM_RESTART_MIN_INTERVAL_SECS", "not-an-int")
+    wdog = _load_watchdog()
+    assert wdog.FM_RESTART_MIN_INTERVAL_SECS == 28800
+
+
+def test_fm_staleness_redeploy_unit_constant() -> None:
+    """FM_STALENESS_REDEPLOY_UNIT is the fixed transient redeploy unit name."""
+    wdog = _load_watchdog()
+    assert wdog.FM_STALENESS_REDEPLOY_UNIT == "fm-staleness-redeploy.service"
+
