@@ -551,3 +551,83 @@ async def test_get_incomplete_returns_only_pending(journal):
     assert len(incomplete) == 1
     assert incomplete[0]['id'] == pending_id
     assert incomplete[0]['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_prune_mem0_intents_ages_out_terminal_rows(journal):
+    """prune deletes old completed/failed; preserves dead + recent + pending."""
+
+    async def _seed(status, resolved_at=None):
+        iid = str(uuid.uuid4())
+        await journal.log_mem0_intent(
+            intent_id=iid,
+            write_op_id=str(uuid.uuid4()),
+            content=f'c-{status}',
+            metadata={},
+            payload_digest='d',
+        )
+        if status != 'pending':
+            await journal.resolve_mem0_intent(iid, status)
+            if resolved_at is not None:
+                # Backdate resolved_at to simulate an aged terminal row.
+                await journal._db.execute(
+                    'UPDATE mem0_intents SET resolved_at = ? WHERE id = ?',
+                    (resolved_at, iid),
+                )
+                await journal._db.commit()
+        return iid
+
+    old = '2000-01-01T00:00:00+00:00'
+    old_completed = await _seed('completed', resolved_at=old)
+    old_failed = await _seed('failed', resolved_at=old)
+    old_dead = await _seed('dead', resolved_at=old)
+    recent_completed = await _seed('completed')  # resolved_at = now
+    pending = await _seed('pending')
+
+    deleted = await journal.prune_mem0_intents(older_than_days=7)
+    assert deleted == 2  # old completed + old failed only
+
+    remaining = {r['id'] for r in await journal.get_mem0_intents()}
+    assert old_completed not in remaining
+    assert old_failed not in remaining
+    # dead-letter preserved regardless of age (manual-replay signal)
+    assert old_dead in remaining
+    # recent terminal + pending untouched
+    assert recent_completed in remaining
+    assert pending in remaining
+
+
+@pytest.mark.asyncio
+async def test_prune_mem0_intents_can_include_dead_explicitly(journal):
+    """Overriding statuses to include 'dead' ages out old dead-letters too."""
+    iid = str(uuid.uuid4())
+    await journal.log_mem0_intent(
+        intent_id=iid,
+        write_op_id=str(uuid.uuid4()),
+        content='c',
+        metadata={},
+        payload_digest='d',
+    )
+    await journal.resolve_mem0_intent(iid, 'dead', reason='unknown outcome')
+    await journal._db.execute(
+        'UPDATE mem0_intents SET resolved_at = ? WHERE id = ?',
+        ('2000-01-01T00:00:00+00:00', iid),
+    )
+    await journal._db.commit()
+
+    # Default statuses preserve dead...
+    assert await journal.prune_mem0_intents(older_than_days=7) == 0
+    # ...explicit override ages it out.
+    deleted = await journal.prune_mem0_intents(
+        older_than_days=7, statuses=('completed', 'failed', 'dead')
+    )
+    assert deleted == 1
+    assert await journal.get_mem0_intents(status='dead') == []
+
+
+@pytest.mark.asyncio
+async def test_prune_mem0_intents_never_raises(journal):
+    """A prune hiccup must not crash startup — returns 0, no raise."""
+    await journal.close()
+    journal._db = None
+    assert await journal.prune_mem0_intents() == 0

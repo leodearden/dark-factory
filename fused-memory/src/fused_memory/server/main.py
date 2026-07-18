@@ -533,6 +533,14 @@ async def run_server():
     _mem0_recovery = await memory_service.recover_mem0_intents()
     logger.info(f'mem0 intent recovery at startup: {_mem0_recovery}')
 
+    # Bounded retention: age out old terminal mem0_intents so the write-ahead
+    # journal does not grow without bound (one row accrues per successful mem0
+    # write). Runs after recovery so no still-pending intent is ever pruned;
+    # 'dead' dead-letters are preserved for manual replay. Fire-and-forget.
+    _mem0_pruned = await write_journal.prune_mem0_intents()
+    if _mem0_pruned:
+        logger.info(f'mem0 intent retention prune at startup: {_mem0_pruned} rows')
+
     # Initialize task backend (SqliteTaskBackend).
     taskmaster = None
     task_interceptor = None
