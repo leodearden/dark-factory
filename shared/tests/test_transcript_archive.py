@@ -9,3 +9,63 @@ import pytest
 
 from shared import transcript_archive as transcript_archive_module
 from shared.transcript_archive import archive_task_transcripts
+
+# A representative encoded-project directory name (Claude Code encodes the
+# absolute project path into this leaf; the exact encoding is irrelevant here).
+ENC = '-home-leo-src-dark-factory'
+
+
+def _write(path: Path, data: bytes) -> Path:
+    """Create *path* (and parents) and write *data*; return the path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
+def _gunzip(path: Path) -> bytes:
+    with gzip.open(path, 'rb') as fh:
+        return fh.read()
+
+
+class TestCoreArchiveAndCredentialSafety:
+    """E1 (core archive) + E4 (credential-safety)."""
+
+    def test_archives_main_and_subagent_but_never_credentials(self, tmp_path):
+        config_dir = tmp_path / 'claude-config-42'
+        root = tmp_path / 'archive'
+        sid = 'sess-aaaa'
+        task_id = '42'
+
+        main_bytes = b'{"type":"main","line":1}\n{"type":"main","line":2}\n'
+        sub_bytes = b'{"type":"subagent","line":1}\n'
+        creds_bytes = b'{"claudeAiOauth":{"accessToken":"SECRET"}}'
+        notes_bytes = b'not a transcript'
+
+        _write(config_dir / 'projects' / ENC / f'{sid}.jsonl', main_bytes)
+        _write(
+            config_dir / 'projects' / ENC / sid / 'subagents' / 'agent-1.jsonl',
+            sub_bytes,
+        )
+        # .credentials.json at the config-dir ROOT (outside projects/).
+        _write(config_dir / '.credentials.json', creds_bytes)
+        # A non-transcript file under projects/ (must not be archived).
+        _write(config_dir / 'projects' / ENC / 'notes.txt', notes_bytes)
+
+        count = archive_task_transcripts(config_dir, task_id, sid, archive_root=root)
+
+        assert count == 2
+
+        main_gz = root / task_id / ENC / f'{sid}.jsonl.gz'
+        sub_gz = root / task_id / ENC / sid / 'subagents' / 'agent-1.jsonl.gz'
+        assert main_gz.exists()
+        assert sub_gz.exists()
+        assert _gunzip(main_gz) == main_bytes
+        assert _gunzip(sub_gz) == sub_bytes
+
+        # Credential-safety: nothing matching the credential or the non-jsonl
+        # file appears anywhere under the archive root.
+        archived = [p.name for p in root.rglob('*') if p.is_file()]
+        assert not any('credentials' in name for name in archived)
+        assert not any(name.startswith('notes') for name in archived)
+        assert not any(name.endswith('.txt') for name in archived)
+        assert not any(name.endswith('.txt.gz') for name in archived)
