@@ -13,11 +13,12 @@ import asyncio
 import contextlib
 import hashlib
 import inspect
+import json
 import logging
 import re
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from graphiti_core.errors import EdgeNotFoundError
@@ -332,6 +333,117 @@ class _ReportEntry:
 
 
 # ---------------------------------------------------------------------------
+# Entry (de)serialization — SQLite write-through persistence (task 2716)
+# ---------------------------------------------------------------------------
+#
+# entry_json's shape is an internal implementation detail of the persistence
+# write-through path (ReconReportState._persist_run / hydrate_from_store) and
+# ReconReportStore rows — never surfaced to MCP tool callers.
+
+
+def _encode_sig_map(
+    sig_map: dict[tuple[str | None, str | None], str],
+) -> list[list[str | None]]:
+    """Encode a ``(task_id|None, flag_type|None) -> finding_id`` map as a JSON-safe
+    list of ``[task_id, flag_type, finding_id]`` triples.
+
+    A dict with a tuple key is not JSON-serializable directly, and coercing the
+    tuple to a string key (e.g. ``str((task_id, flag_type))``) would collapse
+    ``None`` into the literal string ``'None'`` — indistinguishable from a real
+    ``'None'`` task_id/flag_type string on decode.  A flat list of triples sidesteps
+    both problems: ``None`` round-trips through JSON ``null`` unchanged.
+    """
+    return [[sig[0], sig[1], finding_id] for sig, finding_id in sig_map.items()]
+
+
+def _decode_sig_map(
+    rows: list[list[str | None]],
+) -> dict[tuple[str | None, str | None], str]:
+    """Inverse of :func:`_encode_sig_map`."""
+    return {(row[0], row[1]): row[2] for row in rows}  # type: ignore[misc]
+
+
+def _serialize_entry(
+    entry: _ReportEntry,
+    *,
+    sig_anchor_slice: dict[tuple[str | None, str | None], str],
+    cited_task_slice: dict[str, str],
+) -> str:
+    """Serialize *entry* (plus its run-level fold-anchor slices) to a JSON string.
+
+    *sig_anchor_slice* and *cited_task_slice* are NOT part of ``_ReportEntry`` —
+    they are this entry's OWNED portion of the run-scoped
+    ``ReconReportState._run_sig_index`` / ``_run_cited_task_index``, computed by
+    the caller (``ReconReportState._persist_run``) from the live indices at
+    persist time.  They ride along in the same JSON blob (rather than a second
+    row/table) purely so one row still fully describes one ``(run_id, stage)``
+    entry; :func:`_deserialize_entry` ignores them (they are not part of
+    ``_ReportEntry``'s fields) — use :func:`_deserialize_fold_anchor_slices` to
+    read them back for rebuilding the run-level indices on hydrate.
+
+    ``_Finding`` and the entry's own scalar/collection fields are all built from
+    JSON-safe primitives already (str / bool / float / None / list[dict]), so
+    ``dataclasses.asdict`` needs no custom encoder.
+    """
+    payload = {
+        'run_id': entry.run_id,
+        'stage': entry.stage,
+        'project_id': entry.project_id,
+        'findings': [asdict(f) for f in entry.findings],
+        'stats': dict(entry.stats),
+        'summary': entry.summary,
+        'summary_warnings': list(entry.summary_warnings),
+        'completed_at': entry.completed_at,
+        'created_at': entry.created_at,
+        'signature_to_finding': _encode_sig_map(entry._signature_to_finding),
+        'deschash_to_finding': dict(entry._deschash_to_finding),
+        'sig_anchor_slice': _encode_sig_map(sig_anchor_slice),
+        'cited_task_slice': dict(cited_task_slice),
+    }
+    return json.dumps(payload)
+
+
+def _deserialize_entry(entry_json: str) -> _ReportEntry:
+    """Inverse of :func:`_serialize_entry`'s ``_ReportEntry``-shaped fields.
+
+    Does NOT restore the fold-anchor slices — call
+    :func:`_deserialize_fold_anchor_slices` on the same *entry_json* for those;
+    they are run-level, not part of ``_ReportEntry``.
+    """
+    data = json.loads(entry_json)
+    findings = [_Finding(**fd) for fd in data['findings']]
+    return _ReportEntry(
+        run_id=data['run_id'],
+        stage=data['stage'],
+        project_id=data['project_id'],
+        findings=findings,
+        stats=dict(data['stats']),
+        summary=data['summary'],
+        summary_warnings=list(data['summary_warnings']),
+        completed_at=data['completed_at'],
+        created_at=data['created_at'],
+        _signature_to_finding=_decode_sig_map(data['signature_to_finding']),
+        _deschash_to_finding=dict(data['deschash_to_finding']),
+    )
+
+
+def _deserialize_fold_anchor_slices(
+    entry_json: str,
+) -> tuple[dict[tuple[str | None, str | None], str], dict[str, str]]:
+    """Return ``(sig_anchor_slice, cited_task_slice)`` persisted by
+    :func:`_serialize_entry` — this entry's owned slice of the run-scoped
+    ``_run_sig_index`` / ``_run_cited_task_index``.  Used by
+    :meth:`ReconReportState.hydrate_from_store` to rebuild those indices by
+    unioning every entry's slice.
+    """
+    data = json.loads(entry_json)
+    return (
+        _decode_sig_map(data['sig_anchor_slice']),
+        dict(data['cited_task_slice']),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Error helpers
 # ---------------------------------------------------------------------------
 
@@ -460,6 +572,14 @@ class ReconReportState:
                         Inject a fake clock in tests.
         reaper_interval: How many seconds the background reaper sleeps between
                         sweeps.  Default 60.
+        store:          Optional :class:`~fused_memory.server.recon_report_store.ReconReportStore`
+                        (task 2716). When provided, every mutator write-throughs
+                        its owning run's entries to durable SQLite after the
+                        mutation succeeds (see :meth:`_persist_run`), and
+                        :meth:`hydrate_from_store` can rebuild in-memory state
+                        from it at startup. ``None`` (the default) makes
+                        persistence a complete no-op — fresh in-process runs are
+                        byte-identical whether or not a store is attached.
     """
 
     def __init__(
@@ -469,6 +589,7 @@ class ReconReportState:
         reaper_interval: float = 60.0,
         memory_service: Any = None,
         task_interceptor: Any = None,
+        store: Any = None,
     ) -> None:
         self._ttl_seconds = ttl_seconds
         self._clock_fn = clock
@@ -496,11 +617,285 @@ class ReconReportState:
         self._memory_service = memory_service
         self._task_interceptor = task_interceptor
         self.known_projects: dict[str, str] = {}  # project_id → project_root
+        # SQLite write-through persistence (task 2716); None = fully inert.
+        self._store = store
 
     def _clock(self) -> float:
         if self._clock_fn is not None:
             return self._clock_fn()
         return asyncio.get_running_loop().time()
+
+    # ------------------------------------------------------------------
+    # Persistence (task 2716)
+    # ------------------------------------------------------------------
+
+    def _persist_run(self, run_id: str) -> None:
+        """Write every ``(run_id, *)`` entry through to the store.  No-op if
+        ``self._store is None``.
+
+        Upserts ALL of the run's entries (bounded to the handful of recon
+        stages), not just the one a caller just mutated: several mutators have
+        cross-stage effects (``delete_finding`` purges from the finding's
+        OWNING entry, which may be an earlier stage; ``cite_task``'s in-run
+        folds purge the losing finding from ITS owning entry) — upserting the
+        whole run is trivially correct where "persist only what changed" would
+        need fragile per-method reasoning about which stage's row to write.
+
+        For each entry, computes its OWNED slice of the two run-level fold
+        anchors (``_run_cited_task_index`` / the derived-signature entries in
+        ``_run_sig_index``) fresh from the live indices — see
+        :func:`_serialize_entry`'s docstring for why these ride along instead
+        of a companion table. ``is_active`` is set per row from
+        ``self._active.get(run_id) == stage``, so an active-stage transition
+        self-corrects on the very next persist.
+
+        All of the run's serialized rows are written through in ONE
+        ``store.upsert_many`` transaction — a single commit / fsync per
+        mutation rather than one per entry (review: performance).
+
+        Best-effort: a store failure is logged loudly (WARNING, structured)
+        but never raised — a shadow-store hiccup must not abort a recon stage
+        (mirrors ``start_report``'s existing degradation posture).  Per-entry
+        serialization is likewise resilient: an entry that fails to serialize
+        is skipped-and-logged, and the rest of the run still persists.
+        """
+        if self._store is None:
+            return
+        active_stage = self._active.get(run_id)
+        updated_at = self._clock()
+        rows: list[dict[str, Any]] = []
+        for (rid, stage), entry in self._state.items():
+            if rid != run_id:
+                continue
+            # Serialize each entry independently so a single un-serializable
+            # entry is skipped-and-logged without dropping the rest of the run.
+            # This loop touches ONLY in-memory state (never the store), so the
+            # single store write is the batched upsert_many below — one
+            # transaction / one fsync for the whole run (review: performance),
+            # instead of a commit per entry.
+            try:
+                finding_ids = {f.finding_id for f in entry.findings}
+                sig_anchor_slice = {
+                    sig: finding_id
+                    for sig, finding_id in self._run_sig_index.get(run_id, {}).items()
+                    if finding_id in finding_ids and sig not in entry._signature_to_finding
+                }
+                cited_task_slice = {
+                    key: finding_id
+                    for key, finding_id in self._run_cited_task_index.get(run_id, {}).items()
+                    if finding_id in finding_ids
+                }
+                entry_json = _serialize_entry(
+                    entry,
+                    sig_anchor_slice=sig_anchor_slice,
+                    cited_task_slice=cited_task_slice,
+                )
+            except Exception:
+                logger.warning(
+                    'recon_report: failed to serialize run_id=%r stage=%r for '
+                    'persistence; skipping this entry',
+                    rid,
+                    stage,
+                    exc_info=True,
+                )
+                continue
+            rows.append(
+                {
+                    'run_id': rid,
+                    'stage': stage,
+                    'project_id': entry.project_id,
+                    'is_active': (active_stage == stage),
+                    'entry_json': entry_json,
+                    'updated_at': updated_at,
+                }
+            )
+        if not rows:
+            return
+        try:
+            self._store.upsert_many(rows)
+        except Exception:
+            logger.warning(
+                'recon_report: failed to persist run_id=%r (%d entr%s) to store',
+                run_id,
+                len(rows),
+                'y' if len(rows) == 1 else 'ies',
+                exc_info=True,
+            )
+
+    def hydrate_from_store(self) -> None:
+        """Rebuild in-memory state from the persisted store — run ONCE at boot.
+
+        A full no-op when ``self._store is None`` (the byte-identical no-store
+        path) or when the store is empty (a fresh boot).  Otherwise, for every
+        persisted row it restores ``_state[(run_id, stage)]`` and ``_active``
+        (the row flagged ``is_active`` is the run's live stage), then rebuilds
+        all four run-level dedup indices by UNIONING each entry's persisted
+        per-entry mirrors and fold-anchor slices:
+
+        * ``_run_finding_index`` — ``{finding_id -> owning entry}`` for every
+          finding in every entry.
+        * ``_run_sig_index`` — each entry's ``_signature_to_finding`` PLUS its
+          persisted derived-signature slice (the ``cite_task`` entity-scoped
+          fold anchors owned by this entry's findings but absent from its own
+          ``_signature_to_finding``).
+        * ``_run_desc_index`` — each entry's ``_deschash_to_finding``.
+        * ``_run_cited_task_index`` — each entry's persisted cited-task slice
+          (the ``cite_task`` project-scoped fold anchors).
+
+        The union is faithful by construction — each sig / desc-hash /
+        cited-task key maps to exactly one finding_id owned by exactly one
+        entry — so no re-derivation of ``cite_task`` fold-eligibility is
+        needed (see :func:`_serialize_entry`).  This gives σ a correct dedup
+        substrate for continued filing against a run whose earlier stages were
+        filed before the restart.
+
+        Best-effort, mirroring :meth:`_persist_run`: a store read failure is
+        logged loudly (WARNING, structured) but never raised — a hydrate
+        hiccup must not abort server boot.  On a total read failure the process
+        simply starts with empty in-memory state, exactly as if the persisted
+        rows were absent; a single undeserializable row is skipped (logged)
+        without discarding the rest.
+
+        Durable-leak tradeoff (in-progress rows).  Only entries whose
+        ``completed_at`` is set are TTL-evictable; an IN-PROGRESS entry
+        (``completed_at is None``) is immortal by design (PRD §9.4), so its
+        run never quiesces and :meth:`ReconReportStore.delete_run` (the only GC
+        path) never fires for it.  With persistence this immortality becomes
+        DURABLE: an abandoned/crashed run that files a stage but never reaches
+        :meth:`complete` leaves its rows in ``recon_report_state.db``
+        permanently, and this method resurrects them into memory on EVERY
+        subsequent boot — an unbounded on-disk growth path the pure in-memory
+        version bounded at process lifetime.  This mirrors the existing
+        in-memory immortal-in-progress semantics (not a new regression, just a
+        longer-lived one), and is a bounded practical risk because a completed
+        run's rows DO self-GC at quiescence and only genuinely abandoned runs
+        accumulate.  A bounded durable backstop (drop hydrated in-progress rows
+        older than N) is deliberately NOT added here: every persisted timestamp
+        (``created_at`` / ``completed_at`` / the row's ``updated_at``) is a
+        MONOTONIC event-loop clock value, not wall-clock, and is not comparable
+        across a restart (a fresh event loop restarts the clock near 0), so a
+        reliable age-based sweep would require adding a wall-clock column — a
+        store/serialization FORMAT change out of scope for this task (task 2716;
+        the σ resume work owns interrupted-run adoption).  Operators reclaim
+        space by deleting the abandoned run's rows (or the whole DB, which a
+        fresh boot recreates empty).
+        """
+        if self._store is None:
+            return
+        try:
+            rows = self._store.load_all()
+        except Exception:
+            logger.warning(
+                'recon_report: failed to load persisted state on hydrate; '
+                'starting with empty in-memory state',
+                exc_info=True,
+            )
+            return
+        for row in rows:
+            run_id = row['run_id']
+            stage = row['stage']
+            entry_json = row['entry_json']
+            try:
+                entry = _deserialize_entry(entry_json)
+                sig_anchor_slice, cited_task_slice = _deserialize_fold_anchor_slices(
+                    entry_json
+                )
+            except Exception:
+                logger.warning(
+                    'recon_report: failed to deserialize persisted row '
+                    'run_id=%r stage=%r on hydrate; skipping',
+                    run_id,
+                    stage,
+                    exc_info=True,
+                )
+                continue
+            # Re-anchor the TTL baseline across the restart boundary.
+            # ``completed_at`` was stamped by the PRIOR process's clock, which
+            # defaults to ``asyncio.get_running_loop().time()`` (monotonic) —
+            # a value that restarts near 0 on a fresh event loop.  Restoring
+            # that large stale value verbatim would make ``tick()``'s
+            # ``now - completed_at`` negative against THIS process's fresh
+            # monotonic clock, so it never exceeds ``ttl_seconds``: the hydrated
+            # completed entry would never evict, its run would never quiesce,
+            # and ``store.delete_run`` (the run-quiescence GC, step-12) would
+            # never fire — ``recon_report_state.db`` rows (and their in-memory
+            # entries) would leak unboundedly across every restart.  Resetting
+            # to ``self._clock()`` counts the TTL from restart, so the entry
+            # evicts ``ttl_seconds`` after boot via that same GC path.
+            # In-progress entries (``completed_at is None``) are left untouched
+            # so they stay immortal by design (PRD §9.4).  ``created_at`` is
+            # diagnostics-only (not used for eviction) and is NOT re-anchored.
+            if entry.completed_at is not None:
+                entry.completed_at = self._clock()
+            self._state[(run_id, stage)] = entry
+            if row['is_active']:
+                self._active[run_id] = stage
+            # Rebuild the four run-level dedup indices by unioning this entry's
+            # persisted per-entry mirrors / fold-anchor slices.  Keys never
+            # collide across a run's entries (each sig/desc/cited-task key is
+            # owned by exactly one entry), so plain dict.update is a safe union.
+            finding_index = self._run_finding_index.setdefault(run_id, {})
+            for f in entry.findings:
+                finding_index[f.finding_id] = entry
+            sig_index = self._run_sig_index.setdefault(run_id, {})
+            sig_index.update(entry._signature_to_finding)
+            sig_index.update(sig_anchor_slice)
+            self._run_desc_index.setdefault(run_id, {}).update(
+                entry._deschash_to_finding
+            )
+            self._run_cited_task_index.setdefault(run_id, {}).update(cited_task_slice)
+
+    def start_persistence(self) -> None:
+        """Open the shadow store and hydrate in-memory state — call ONCE at boot.
+
+        A full no-op when ``self._store is None`` (persistence disabled — fresh
+        in-process runs stay byte-identical).  Otherwise opens the persistent
+        SQLite connection and replays any persisted rows into memory via
+        :meth:`hydrate_from_store`, so a mid-stage restart resumes with the
+        findings earlier stages already filed.
+
+        Deliberately NOT called by the socket-free
+        ``_build_recon_report_components`` factory (which only constructs the
+        store) — mirroring the reaper-not-started-at-build invariant, only
+        ``run_server`` opens it, right before :meth:`start_reaper`.  Paired with
+        :meth:`stop_persistence` at shutdown.
+
+        Best-effort, matching the loud-but-non-fatal posture of every other
+        persistence touchpoint (:meth:`_persist_run`, :meth:`hydrate_from_store`,
+        :meth:`tick`'s GC hook): a failure to open/hydrate the shadow store is
+        logged loudly (WARNING, structured) and then DEGRADES to no persistence
+        (``self._store`` is dropped to ``None``) rather than crashing server
+        boot or spamming a per-write warning from a half-open store.  The
+        server keeps running with an in-memory-only report state — exactly the
+        byte-identical no-store path — instead of dying because the shadow
+        store hiccuped.
+        """
+        if self._store is None:
+            return
+        try:
+            self._store.open()
+            self.hydrate_from_store()
+        except Exception:
+            logger.warning(
+                'recon_report: failed to open/hydrate persistence store %r; '
+                'continuing WITHOUT write-through persistence',
+                getattr(self._store, 'db_path', None),
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                self._store.close()
+            self._store = None
+
+    def stop_persistence(self) -> None:
+        """Close the shadow store — call at shutdown.
+
+        A no-op when ``self._store is None`` (persistence disabled or already
+        degraded).  :meth:`ReconReportStore.close` is itself idempotent, so
+        repeated calls are safe.
+        """
+        if self._store is None:
+            return
+        self._store.close()
 
     # ------------------------------------------------------------------
     # Tool implementations
@@ -521,6 +916,7 @@ class ReconReportState:
         )
         self._state[(run_id, stage)] = entry
         self._active[run_id] = stage
+        self._persist_run(run_id)
         return {'run_id': run_id, 'stage': stage}
 
     def add_finding(
@@ -708,6 +1104,7 @@ class ReconReportState:
         result: dict[str, Any] = {'finding_id': finding_id}
         if warnings:
             result['warnings'] = warnings
+        self._persist_run(run_id)
         return result
 
     def delete_finding(self, run_id: str, finding_id: str) -> dict[str, Any]:
@@ -761,6 +1158,7 @@ class ReconReportState:
             return _ERR_ALREADY_COMPLETED.copy()
 
         self._purge_finding(run_id, owning_entry, finding)
+        self._persist_run(run_id)
 
         return {'status': 'deleted', 'finding_id': finding_id}
 
@@ -785,6 +1183,7 @@ class ReconReportState:
             return _ERR_ALREADY_COMPLETED.copy()
 
         entry.stats[key] = value
+        self._persist_run(run_id)
         return {'value': value}
 
     def inc_stat(
@@ -823,6 +1222,7 @@ class ReconReportState:
             return _stat_type_mismatch_error(key)
         new_value = current_raw + delta
         entry.stats[key] = new_value
+        self._persist_run(run_id)
         return {'value': new_value}
 
     def complete(
@@ -858,11 +1258,13 @@ class ReconReportState:
                     run_id,
                     entry.stage,
                 )
+                self._persist_run(run_id)
                 return cached_response
 
         # First-time path
         entry.completed_at = self._clock()
         entry.summary = summary
+        self._persist_run(run_id)
         return cached_response
 
     def get_assembled_report(
@@ -1180,6 +1582,7 @@ class ReconReportState:
         node = nodes[0]
         citation = {'entity_uuid': node['uuid'], 'canonical_name': node['name']}
         finding.cited_entities.append(citation)
+        self._persist_run(run_id)
         return citation
 
     async def cite_edge(
@@ -1217,6 +1620,7 @@ class ReconReportState:
 
         citation = {'edge_uuid': edge_uuid, 'fact_text_snapshot': result['fact']}
         finding.cited_edges.append(citation)
+        self._persist_run(run_id)
         return citation
 
     async def cite_task(
@@ -1358,9 +1762,11 @@ class ReconReportState:
         # both would hit, purge runs exactly once, either way.
         if project_existing_id is not None and project_existing_id != finding.finding_id:
             self._purge_finding(run_id, finding_entry, finding)
+            self._persist_run(run_id)
             return _duplicate_finding_error(project_existing_id)
         if entity_existing_id is not None and entity_existing_id != finding.finding_id:
             self._purge_finding(run_id, finding_entry, finding)
+            self._persist_run(run_id)
             return _duplicate_finding_error(entity_existing_id)
 
         if project_fold_eligible:
@@ -1384,6 +1790,7 @@ class ReconReportState:
         )
         if not already_cited:
             finding.cited_tasks.append(citation)
+        self._persist_run(run_id)
         return citation
 
     async def cite_memory(
@@ -1424,6 +1831,7 @@ class ReconReportState:
 
         citation = {'memory_id': memory_id, 'store': store, 'metadata_fingerprint': fingerprint}
         finding.cited_memories.append(citation)
+        self._persist_run(run_id)
         return citation
 
     async def cite_run(
@@ -1512,6 +1920,7 @@ class ReconReportState:
 
         citation = {'run_id': cited_run_id, 'match_count': count}
         finding.cited_runs.append(citation)
+        self._persist_run(run_id)
         return citation
 
     # ------------------------------------------------------------------
@@ -1605,6 +2014,21 @@ class ReconReportState:
                     self._run_finding_index.pop(rid, None)
                     self._run_desc_index.pop(rid, None)
                     self._run_cited_task_index.pop(rid, None)
+                    # GC the run's persisted rows at quiescence (task 2716) —
+                    # "rows are GC'd with their run".  Best-effort: a shadow-store
+                    # hiccup must not abort the reaper sweep or the in-memory
+                    # eviction just performed (mirrors _persist_run's
+                    # loud-but-non-fatal posture).  No-op when store is None.
+                    if self._store is not None:
+                        try:
+                            self._store.delete_run(rid)
+                        except Exception:
+                            logger.warning(
+                                'recon_report: failed to GC persisted rows for '
+                                'run_id=%r at quiescence',
+                                rid,
+                                exc_info=True,
+                            )
         if to_evict:
             logger.debug('recon_report reaper evicted %d entries', len(to_evict))
         return len(to_evict)

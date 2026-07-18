@@ -702,6 +702,18 @@ class ReconciliationConfig(BaseModel):
         description='TTL after complete() before reaper sweeps the entry (PRD §9.4)',
     )
 
+    # Recon-report SQLite write-through persistence (task 2716)
+    recon_report_persist_enabled: bool = Field(
+        default=True,
+        description=(
+            'When True (and reconciliation.enabled), back ReconReportState with '
+            "a durable SQLite store (recon_report_state.db) so a mid-stage server "
+            'restart does not lose previously-filed findings. Fresh in-process '
+            'runs are byte-identical either way; this only controls whether '
+            'writes are also shadowed to disk.'
+        ),
+    )
+
     # Write-time near-duplicate guard for procedural_knowledge add_memory writes (task 2467).
     # Moves dedup from reactive Stage-1 consolidation to write time: a high-similarity match
     # against an existing procedural_knowledge Mem0 entry soft-blocks the write instead of
