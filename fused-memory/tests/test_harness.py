@@ -2237,6 +2237,125 @@ async def test_run_full_cycle_cancelled_falls_back_when_resume_disabled(
 
 
 @pytest.mark.asyncio
+async def test_run_full_cycle_resume_run_skips_completed_and_resumes_cursor(
+    journal, event_buffer, mock_memory_service,
+):
+    """task σ: run_full_cycle(resume_run=R) reuses R's id, skips stages already
+    present in R.stage_reports, threads resume_session_id into ONLY the
+    stage_cursor stage, runs the remaining stages fresh, does NOT re-drain, and
+    completes the SAME run_id."""
+    from fused_memory.models.reconciliation import StageId
+
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # Pre-persist an interrupted run whose Stage 1 already completed (a real
+    # persisted report), interrupted at Stage 2 (stage_cursor) with a captured
+    # session id 'S'.
+    stage1_report = StageReport(
+        stage=StageId.memory_consolidator,
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        items_flagged=[],
+        stats={},
+        llm_calls=1,
+        tokens_used=10,
+    )
+    resume_run = ReconciliationRun(
+        id='run-to-resume',
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        status=RunStatus.interrupted,
+        stage_reports={'memory_consolidator': stage1_report},
+        session_id='S',
+        stage_cursor='task_knowledge_sync',
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(resume_run)  # inserts the row (status='interrupted')
+
+    # Stage 1 must be SKIPPED (persisted report present) — never awaited.
+    harness.stages[0].run = AsyncMock()
+
+    # Stage 2 (the stage_cursor) must be resumed with resume_session_id='S';
+    # Stage 3 must run fresh (resume_session_id=None). Capture each stage's kwarg.
+    captured: dict = {}
+
+    async def stage2_run(events, watermark, prior_reports, run_id, model=None,
+                         resume_session_id=None):
+        captured['stage2_resume'] = resume_session_id
+        captured['stage2_run_id'] = run_id
+        return StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    async def stage3_run(events, watermark, prior_reports, run_id, model=None,
+                         resume_session_id=None):
+        captured['stage3_resume'] = resume_session_id
+        return StageReport(
+            stage=StageId.integrity_check,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    harness.stages[1].run = stage2_run
+    harness.stages[2].run = stage3_run
+
+    # A resumed cycle must NOT re-drain or re-attribute events — the caller
+    # supplies the already-drained events.
+    drain_spy = AsyncMock(side_effect=event_buffer.drain)
+    event_buffer.drain = drain_spy
+    mark_spy = AsyncMock(side_effect=event_buffer.mark_drained_run_id)
+    event_buffer.mark_drained_run_id = mark_spy
+
+    events = [_make_event('test-project')]
+
+    run = await harness.run_full_cycle(
+        'test-project', 'test-trigger', resume_run=resume_run, events=events,
+    )
+
+    # Same run_id — no fresh run started.
+    assert run.id == 'run-to-resume'
+    assert run.status == RunStatus.completed
+
+    # Stage 1 skipped via its persisted report.
+    harness.stages[0].run.assert_not_awaited()
+
+    # Stage 2 resumed with the captured session id; ran against the SAME run_id.
+    assert captured.get('stage2_resume') == 'S'
+    assert captured.get('stage2_run_id') == 'run-to-resume'
+    # Stage 3 ran fresh — no resume.
+    assert captured.get('stage3_resume') is None
+
+    # No re-drain / re-attribution of events.
+    drain_spy.assert_not_awaited()
+    mark_spy.assert_not_awaited()
+
+    # Exactly one run row for the project — the resumed run, not a new one.
+    all_runs = await journal.get_recent_runs('test-project', limit=10)
+    assert [r.id for r in all_runs] == ['run-to-resume']
+    persisted = await journal.get_run('run-to-resume')
+    assert persisted is not None
+    assert persisted.status == RunStatus.completed
+    # All three stages' reports are persisted on the resumed run.
+    assert set(persisted.stage_reports) >= {
+        'memory_consolidator', 'task_knowledge_sync', 'integrity_check',
+    }
+
+
+@pytest.mark.asyncio
 async def test_cancellation_cleanup_shielded_from_second_cancel(
     journal,
     event_buffer,
