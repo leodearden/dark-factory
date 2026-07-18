@@ -8138,6 +8138,68 @@ async def test_journaled_write_logs_failure_row(
         await journal.close()
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Client idempotency keys (task 2712)
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_update_task_client_op_id_dedups(
+    taskmaster,
+    reconciler,
+    event_buffer,
+    tmp_path,
+):
+    """A retried update_task with the same client_op_id applies ONCE and
+    returns the recorded outcome on the replay."""
+    from fused_memory.services.write_journal import WriteJournal
+
+    journal = WriteJournal(tmp_path / 'wj_idem')
+    await journal.initialize()
+    try:
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+        interceptor.set_write_journal(journal)
+
+        first = await interceptor.update_task(
+            '1', '/project', client_op_id='op-1', title='new'
+        )
+        second = await interceptor.update_task(
+            '1', '/project', client_op_id='op-1', title='new'
+        )
+
+        # The backend write happened exactly once — the replay short-circuits.
+        assert taskmaster.update_task.call_count == 1
+        # Both calls return the same recorded outcome.
+        assert first == second
+    finally:
+        await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_update_task_without_client_op_id_applies_each_time(
+    taskmaster,
+    reconciler,
+    event_buffer,
+    tmp_path,
+):
+    """Control: absent client_op_id, behavior is byte-identical to today —
+    every call applies the write."""
+    from fused_memory.services.write_journal import WriteJournal
+
+    journal = WriteJournal(tmp_path / 'wj_noidem')
+    await journal.initialize()
+    try:
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+        interceptor.set_write_journal(journal)
+
+        await interceptor.update_task('1', '/project', title='new')
+        await interceptor.update_task('1', '/project', title='new')
+
+        assert taskmaster.update_task.call_count == 2
+    finally:
+        await journal.close()
+
+
 # ── Tests for update_task status-kwarg rejection (defence-in-depth) ─────────
 
 
