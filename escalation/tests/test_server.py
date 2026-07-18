@@ -5092,3 +5092,64 @@ class TestReloadConfigTool:
 
         assert result == canned_report, 'must return the harness report verbatim'
         assert calls == [((), {})], 'harness.reload_config must be awaited exactly once with no arguments'
+
+
+# ---------------------------------------------------------------------------
+# TestEscalateEvidenceParam: escalate_blocker/escalate_info structured evidence
+# ---------------------------------------------------------------------------
+
+
+class TestEscalateEvidenceParam:
+    """escalate_blocker/escalate_info accept an optional `evidence` list stored verbatim (task 2558)."""
+
+    _EVIDENCE: list[dict[str, Any]] = [
+        {'observation': 'exit code 134', 'measured_at': 'sha=abc123', 'ref': 'rerun#2'},
+    ]
+
+    @pytest.mark.asyncio
+    async def test_blocker_stores_evidence_verbatim(self, tmp_path: Path):
+        """escalate_blocker(evidence=[...]) persists an escalation whose evidence == that list verbatim."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, evidence=self._EVIDENCE, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.evidence == self._EVIDENCE, f"Expected evidence stored verbatim, got: {esc.evidence!r}"
+
+    @pytest.mark.asyncio
+    async def test_info_stores_evidence_verbatim(self, tmp_path: Path):
+        """escalate_info(evidence=[...]) persists an escalation whose evidence == that list verbatim."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _info(server, evidence=self._EVIDENCE, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.evidence == self._EVIDENCE, f"Expected evidence stored verbatim, got: {esc.evidence!r}"
+
+    @pytest.mark.asyncio
+    async def test_blocker_without_evidence_defaults_empty(self, tmp_path: Path):
+        """escalate_blocker() with no evidence kwarg → on-disk evidence == [] (free-form callers unaffected)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.evidence == [], f"Expected evidence=[], got: {esc.evidence!r}"
+
+    @pytest.mark.asyncio
+    async def test_info_without_evidence_defaults_empty(self, tmp_path: Path):
+        """escalate_info() with no evidence kwarg → on-disk evidence == [] (free-form callers unaffected)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _info(server, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.evidence == [], f"Expected evidence=[], got: {esc.evidence!r}"
