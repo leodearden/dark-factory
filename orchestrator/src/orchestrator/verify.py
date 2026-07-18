@@ -5666,3 +5666,134 @@ async def confirm_main_tip_failure_is_real(
         if tmp_path is not None:
             with contextlib.suppress(Exception):
                 shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Merge-gate single flake-retry (PRD task α, cpu-load-robust-verify-prd.md)
+# ---------------------------------------------------------------------------
+
+#: Generous per-test timeout (seconds) injected into the α confirm gate's
+#: isolated re-run command via ``_with_pytest_timeout_str``. Must comfortably
+#: exceed any legitimate single-test wall time: the serial recovery's
+#: ``-o addopts=`` clears pyproject ``addopts`` but NOT the
+#: ``[tool.pytest.ini_options] timeout=60`` default, so without this explicit
+#: override the isolated confirm re-run could itself starve under residual load
+#: into a false non-suppression. A tunable (PRD §9).
+_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS = 300
+
+
+async def confirm_merge_verify_flake_suppressible(
+    config: 'OrchestratorConfig',
+    failing_result: VerifyResult,
+    *,
+    worktree: Path,
+    module_configs: list[ModuleConfig],
+) -> list[str] | None:
+    """PURE gate: is *failing_result* a suppressible CPU-starvation flake?
+
+    The merge-path analogue of ``confirm_main_tip_failure_is_real``, with three
+    deliberate differences (PRD task α):
+
+    * SAME-TREE (INV-3): re-runs the named failing tests in the GIVEN merge
+      *worktree* at the merge SHA — the exact tree being gated — rather than
+      minting a fresh probe worktree for a different SHA. No ``git worktree
+      add``/``remove``, no cleanup ``finally``.
+    * Returns a VERDICT (``list[str]`` of confirmed-flake node-ids, or
+      ``None``) and NEVER raises: the merge path (merge_queue.py) has no
+      ``VerifyInfraError`` handler, so an uncaught raise there stalls the merge
+      queue. The whole body is defensively wrapped — any unexpected exception
+      fails CLOSED to ``None`` (merge stays red).
+    * Single-shot per node-id group (PRD §5.1), not the sweep's 2-attempt loop.
+
+    Returns the extracted node-id list ONLY when every named failing test
+    demonstrably PASSES on a scoped + forced-serial + generous-timeout isolated
+    re-run. Returns ``None`` (fail-closed to red — never mask a REAL red) for:
+    no recoverable node-id (opaque/lint/type failure), any node-id that maps to
+    no given subproject, a re-run that still fails / errors / times out, or an
+    infra-sentinel re-run category (``INFRA_TRANSIENT_CATEGORIES`` — never
+    trusted as confirmation).
+
+    Node-id -> subproject mapping mirrors ``confirm_main_tip_failure_is_real``
+    but over the GIVEN *module_configs* + *worktree* (the merge tree already on
+    disk), never re-discovered. Empty *module_configs* / files-not-on-disk
+    (unit-test fakes) naturally map nothing -> ``None``, which keeps existing
+    ``LocalRunner.run_merge_verify`` tests byte-identical.
+    """
+    try:
+        node_ids = _extract_failing_test_ids(failing_result.test_output)
+        if not node_ids:
+            return None
+
+        # Map each node-id to its owning subproject over the given
+        # module_configs + the on-disk merge worktree. Any unmapped node-id
+        # fails CLOSED to red (no guessing which subproject a node-id belongs
+        # to). Mirrors confirm_main_tip_failure_is_real's existence mapping;
+        # first match by module_configs order wins.
+        mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
+        groups: dict[str, list[str]] = {}
+        for node_id in node_ids:
+            file_part = node_id.split('::', 1)[0]
+            matched: tuple[str, str] | None = None
+            for mc in module_configs:
+                prefix = mc.prefix
+                if (worktree / prefix / file_part).exists():
+                    matched = (prefix, f'{prefix}/{node_id}')
+                    break
+                if file_part.startswith(f'{prefix}/') and (worktree / file_part).exists():
+                    matched = (prefix, node_id)
+                    break
+            if matched is None:
+                logger.info(
+                    'confirm_merge_verify_flake_suppressible: node-id %r did '
+                    'not map to any given subproject in %s — unconfirmable, '
+                    'not suppressing',
+                    node_id, worktree,
+                )
+                return None
+            matched_prefix, matched_node_id = matched
+            groups.setdefault(matched_prefix, []).append(matched_node_id)
+
+        # Each subproject group gets its own scoped + forced-serial +
+        # generous-timeout isolated re-run in the SAME merge worktree. ALL
+        # groups must confirm green to suppress.
+        for prefix, group_node_ids in groups.items():
+            mc = mc_by_prefix[prefix]
+            scoped_cmd = _with_pytest_timeout_str(
+                _serial_pytest_str(
+                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                ),
+                _MERGE_FLAKE_CONFIRM_TIMEOUT_SECS,
+            )
+            scoped_mc = replace(
+                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            )
+            result = await run_verification(
+                worktree, config, scoped_mc,
+                max_retries=0, is_merge_verify=True, role='merge',
+            )
+            # An infra-sentinel category is never trusted as confirmation, even
+            # paired with passed=True (mirrors _run_isolated_confirm_group).
+            if result.category in INFRA_TRANSIENT_CATEGORIES or not result.passed:
+                logger.info(
+                    'confirm_merge_verify_flake_suppressible: isolated re-run '
+                    'for %s did not confirm green (category=%r, passed=%s) — '
+                    'not suppressing',
+                    prefix, result.category, result.passed,
+                )
+                return None
+
+        logger.info(
+            'confirm_merge_verify_flake_suppressible: merge-verify flake '
+            'confirmed suppressible: %s failed under load, passed on isolated '
+            're-run in %s',
+            node_ids, worktree,
+        )
+        return node_ids
+
+    except Exception:
+        logger.debug(
+            'confirm_merge_verify_flake_suppressible: unexpected error — '
+            'failing closed to red',
+            exc_info=True,
+        )
+        return None
