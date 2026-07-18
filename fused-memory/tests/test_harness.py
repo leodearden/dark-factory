@@ -758,6 +758,63 @@ async def test_drain_judge_tasks_cancels_and_marker_persists(
     )
 
 
+@pytest.mark.asyncio
+async def test_recover_pending_judge_reviews_reruns_and_clears(
+    journal, event_buffer, mock_memory_service
+):
+    """Startup recovery re-fires the judge for every pending marker; the
+    re-run's verdict atomically clears the marker (task 2708). A verdict
+    dropped by a restart is thus regenerated, not silently lost."""
+    from fused_memory.models.reconciliation import (
+        JudgeVerdict,
+        VerdictAction,
+        VerdictSeverity,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # Seed a completed run + a pending marker with NO verdict (the restart window).
+    run_id = str(uuid.uuid4())
+    run = ReconciliationRun(
+        id=run_id,
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.completed,
+    )
+    await journal.start_run(run)
+    await journal.complete_run(run_id, 'completed')
+    await journal.mark_judge_pending(run_id, 'test-project')
+
+    verdict = JudgeVerdict(
+        run_id=run_id,
+        reviewed_at=datetime.now(UTC),
+        severity=VerdictSeverity.ok,
+        findings=[],
+        action_taken=VerdictAction.none,
+    )
+
+    async def _review(_rid):
+        # Mirror the real judge: writing a verdict atomically clears the marker.
+        await journal.add_verdict(verdict)
+        return verdict
+
+    harness.judge = MagicMock()
+    harness.judge.review_run = AsyncMock(side_effect=_review)
+
+    await harness._recover_pending_judge_reviews()
+    await asyncio.gather(*harness._judge_tasks, return_exceptions=True)
+
+    assert await journal.get_pending_judge_runs() == [], (
+        'a recovered + reviewed run must no longer be pending'
+    )
+    verdicts = await journal.get_recent_verdicts('test-project', limit=10)
+    assert run_id in {v.run_id for v in verdicts}, (
+        'startup recovery must regenerate the dropped verdict'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task 2734: pure predicate helper backing arm 2 of the widened Stage 1
 # cycle_summary harness backstop below — "Stage 1 completed but its own
