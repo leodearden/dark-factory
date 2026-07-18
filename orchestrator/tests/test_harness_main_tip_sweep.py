@@ -283,3 +283,113 @@ class TestRunMainTipSweepHarness:
             f'got {h._last_swept_main_sha!r}'
         )
 
+    # -----------------------------------------------------------------------
+    # task 2558: current-tip re-confirmation arm (composes with task 2370's
+    # confirm_main_tip_failure_is_real subset re-run).  Filing now requires
+    # BOTH the subset confirm AND the current main tip still being the observed
+    # bad SHA — closing the "evidence since mutated" gap (main advancing past
+    # the observed SHA during the minutes-long verify).
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_run_main_tip_sweep_tip_advanced_suppresses_no_escalation(self) -> None:
+        """task 2558: FAIL + confirm=True but the main tip ADVANCED past swept_sha
+        during the verify → NOT filed.  The observed bad SHA is stale/superseded,
+        so alarming (and recommending a destructive rewind to it) would repeat the
+        survey §1.7 precedent where a 'last-green' rewind named a commit that also
+        failed / had since mutated.  get_main_sha is called twice (once to resolve
+        the sweep SHA, once to re-confirm the current tip); confirm is still called
+        once."""
+        from orchestrator import verify as verify_module
+
+        h = _make_sweep_harness()
+        # 1st call = initial sweep SHA resolve (MAIN_SHA); 2nd = current-tip re-confirm
+        # (advanced to a different SHA -> tip_unchanged=False).
+        h.git_ops.get_main_sha = AsyncMock(side_effect=[MAIN_SHA, 'c' * 40])  # type: ignore[union-attr]
+
+        with (
+            patch.object(
+                verify_module,
+                'run_main_tip_sweep',
+                new=AsyncMock(return_value=(MAIN_SHA, FAILING_RESULT)),
+            ),
+            patch.object(
+                verify_module,
+                'confirm_main_tip_failure_is_real',
+                new=AsyncMock(return_value=True),
+            ) as mock_confirm,
+        ):
+            await h._run_main_tip_sweep()
+
+        mock_confirm.assert_called_once()
+        assert h.git_ops.get_main_sha.call_count == 2, (  # type: ignore[union-attr]
+            f'Expected get_main_sha called twice (sweep resolve + tip re-confirm), '
+            f'got {h.git_ops.get_main_sha.call_count}'  # type: ignore[union-attr]
+        )
+        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_run_main_tip_sweep_tip_unchanged_still_escalates(self) -> None:
+        """task 2558: FAIL + confirm=True + current tip UNCHANGED (default
+        get_main_sha return_value=MAIN_SHA -> tip_unchanged=True) → filed exactly
+        once via critical_filing_gate(rerun_confirmed=True).  The default path
+        (tip has not moved) must still alarm on a genuine confirmed red main."""
+        from orchestrator import verify as verify_module
+
+        h = _make_sweep_harness()  # get_main_sha constant MAIN_SHA -> tip_unchanged=True
+
+        with (
+            patch.object(
+                verify_module,
+                'run_main_tip_sweep',
+                new=AsyncMock(return_value=(MAIN_SHA, FAILING_RESULT)),
+            ),
+            patch.object(
+                verify_module,
+                'confirm_main_tip_failure_is_real',
+                new=AsyncMock(return_value=True),
+            ) as mock_confirm,
+        ):
+            await h._run_main_tip_sweep()
+
+        mock_confirm.assert_called_once()
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        submitted_esc = h._escalation_queue.submit.call_args[0][0]  # type: ignore[union-attr, attr-defined]
+        assert submitted_esc.level == 1
+        assert submitted_esc.category == 'infra_issue'
+
+    @pytest.mark.asyncio
+    async def test_run_main_tip_sweep_rerun_confirm_disabled_legacy_path(self) -> None:
+        """task 2558: with main_tip_sweep_rerun_confirm_enabled=False the tip arm
+        is disabled — FAIL + confirm=True files exactly as the legacy post-2370
+        path did, with NO second get_main_sha re-resolution (tip_unchanged forced
+        True).  The kill-switch restores byte-identical pre-2558 filing."""
+        from orchestrator import verify as verify_module
+
+        h = _make_sweep_harness()
+        h.config = OrchestratorConfig(main_tip_sweep_rerun_confirm_enabled=False)
+        # side_effect with a single value: a second get_main_sha call would raise
+        # StopIteration, proving the disabled arm never re-resolves the tip.
+        h.git_ops.get_main_sha = AsyncMock(side_effect=[MAIN_SHA])  # type: ignore[union-attr]
+
+        with (
+            patch.object(
+                verify_module,
+                'run_main_tip_sweep',
+                new=AsyncMock(return_value=(MAIN_SHA, FAILING_RESULT)),
+            ),
+            patch.object(
+                verify_module,
+                'confirm_main_tip_failure_is_real',
+                new=AsyncMock(return_value=True),
+            ) as mock_confirm,
+        ):
+            await h._run_main_tip_sweep()
+
+        mock_confirm.assert_called_once()
+        assert h.git_ops.get_main_sha.call_count == 1, (  # type: ignore[union-attr]
+            f'Disabled tip arm must not re-resolve the tip; get_main_sha called '
+            f'{h.git_ops.get_main_sha.call_count} times'  # type: ignore[union-attr]
+        )
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+
