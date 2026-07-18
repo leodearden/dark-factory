@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.evals.runner import _build_eval_scheduler, _StubMcpSession
+from orchestrator.scheduler import extract_rejection
 
 
 class TestStubMcpSessionSetTaskStatus:
@@ -79,6 +82,79 @@ class TestStubMcpSessionSetTaskStatus:
         r1 = await stub.call_tool('set_task_status', {'id': 'x', 'status': 'done'})
         r2 = await stub.call_tool('set_task_status', {'id': 'y', 'status': 'done'})
         assert r2['id'] > r1['id']
+
+
+class TestStubMcpSessionSetTaskClaimant:
+    """Tests for _StubMcpSession.call_tool('set_task_claimant', ...).
+
+    ``set_task_claimant`` is a REAL dispatched tool: ``Scheduler.set_task_claimant``
+    heartbeats via ``dispatch_tool('set_task_claimant', ...)`` every ~60s, so a
+    >=90s eval run exercises it.  Without a stub branch each heartbeat raised
+    ``NotImplementedError`` (swallowed + logged as a best-effort WARNING) — the
+    B9 warning spam this branch removes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_set_task_claimant_returns_clean_envelope(self):
+        """set_task_claimant returns a well-formed, non-rejection envelope.
+
+        The response must (a) be a correctly-shaped JSON-RPC envelope and
+        (b) parse to a clean payload so ``extract_rejection`` (the exact parse
+        the Scheduler applies to the response) returns None — i.e. the heartbeat
+        is treated as success, not a rejection.
+        """
+        stub = _StubMcpSession()
+        resp = await stub.call_tool(
+            'set_task_claimant',
+            {
+                'id': 't1',
+                'project_root': '/p',
+                'claimant_run_id': 'r1',
+                'heartbeat_at': '2026-01-01T00:00:00Z',
+            },
+        )
+        # Envelope shape.
+        assert resp['jsonrpc'] == '2.0'
+        assert isinstance(resp['id'], int)
+        content = resp['result']['content']
+        assert isinstance(content, list) and len(content) >= 1
+        assert content[0]['type'] == 'text'
+        # The Scheduler parses this exact response with extract_rejection;
+        # a clean payload (no 'error'/'success:False') must yield None.
+        assert extract_rejection(resp) is None
+
+    @pytest.mark.asyncio
+    async def test_scheduler_set_task_claimant_logs_no_warning(self, caplog):
+        """B9: a real Scheduler.set_task_claimant heartbeat logs ZERO warnings.
+
+        Builds a production Scheduler wired to the stub via _build_eval_scheduler,
+        then invokes the same status-untouching heartbeat path the eval loop runs
+        every ~60s.  With the stub branch present, dispatch succeeds and
+        extract_rejection returns None, so no 'set_task_claimant'/'unknown tool'
+        WARNING is emitted (the B9 heartbeat-spam regression).
+        """
+        scheduler, _ = _build_eval_scheduler(
+            OrchestratorConfig(), 'task-99', ['some_module']
+        )
+        caplog.set_level(logging.WARNING)
+        await scheduler.set_task_claimant(
+            'task-99',
+            claimant_run_id='r1',
+            heartbeat_at='2026-01-01T00:00:00Z',
+        )
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+        offenders = [
+            m for m in warnings
+            if 'set_task_claimant' in m or 'unknown tool' in m
+        ]
+        assert not offenders, (
+            'set_task_claimant heartbeat emitted WARNING(s) (B9 regression):\n'
+            + '\n'.join(offenders)
+        )
 
 
 class TestStubMcpSessionGetTask:
