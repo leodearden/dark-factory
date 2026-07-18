@@ -5252,9 +5252,12 @@ def test_resolve_metadata_mode_bare_append_false_raises():
     assert "metadata_mode='replace'" in msg, (
         f"message must instruct the metadata_mode='replace' co-signal; got: {msg!r}"
     )
-    assert '2180' in msg, (
-        f'message must reference the task-2180 incident; got: {msg!r}'
-    )
+    # NB: intentionally do NOT assert on the '2180' incident number. That tag is
+    # cosmetic prose, not part of the actionable contract — the load-bearing
+    # requirement is that the message points the caller at the metadata_mode=
+    # 'replace' escape hatch (asserted above). Incident traceability lives in the
+    # source error message and the _resolve_metadata_mode docstring, not here, so
+    # a future reword that keeps the guidance but drops the tag won't break this.
 
 
 def test_resolve_metadata_mode_append_false_cosignal_replace():
