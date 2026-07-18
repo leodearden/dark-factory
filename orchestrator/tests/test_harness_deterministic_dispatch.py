@@ -97,7 +97,7 @@ class TestRunSlotRouting:
         harness._escalation_queue = EscalationQueue(tmp_path)
 
         with (
-            patch('orchestrator.harness.TaskWorkflow') as mock_tw,
+            patch('orchestrator.harness.build_workflow') as mock_tw,
             patch('orchestrator.harness.DeterministicRunner') as mock_dr,
         ):
             # DeterministicRunner.run() returns BLOCKED
@@ -187,7 +187,7 @@ class TestRunSlotRouting:
         # needing to stub anything on the mocked scheduler.
 
         with (
-            patch('orchestrator.harness.TaskWorkflow') as mock_tw,
+            patch('orchestrator.harness.build_workflow') as mock_tw,
             patch('orchestrator.harness.DeterministicRunner') as mock_dr,
         ):
             mock_wf = MagicMock()

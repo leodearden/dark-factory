@@ -110,7 +110,7 @@ class TestSlotSetupFailureReblockGuard:
         )
         harness = _make_harness(config, scheduler)
 
-        monkeypatch.setattr(harness_module, 'TaskWorkflow', _RaisingWorkflow)
+        monkeypatch.setattr(harness_module, 'build_workflow', _RaisingWorkflow)
 
         assignment = TaskAssignment(
             task_id='2928',
@@ -156,7 +156,7 @@ class TestSlotSetupFailureReblockGuard:
         )
         harness = _make_harness(config, scheduler)
 
-        monkeypatch.setattr(harness_module, 'TaskWorkflow', _CancelledWorkflow)
+        monkeypatch.setattr(harness_module, 'build_workflow', _CancelledWorkflow)
 
         assignment = TaskAssignment(
             task_id='2928',

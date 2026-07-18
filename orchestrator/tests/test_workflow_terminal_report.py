@@ -706,7 +706,7 @@ class TestHarnessBlockPhaseFromWorkingPhase:
         harness.scheduler.record_requeue.return_value = 0  # type: ignore[attr-defined]
         harness.scheduler.transient_requeue_count.return_value = 0  # type: ignore[attr-defined]
 
-        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = MagicMock()
             mock_wf.run = AsyncMock(return_value=report)
             mock_wf._steward = None

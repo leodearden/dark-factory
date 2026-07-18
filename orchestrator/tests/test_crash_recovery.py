@@ -259,7 +259,7 @@ class TestRecoverCrashedTasks:
         sem = MagicMock()
         sem.release = MagicMock()
 
-        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = AsyncMock()
             mock_wf.run.return_value = MagicMock(value='done')
             mock_wf.metrics = MagicMock(
@@ -287,7 +287,7 @@ class TestRecoverCrashedTasks:
         sem = MagicMock()
         sem.release = MagicMock()
 
-        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = AsyncMock()
             mock_wf.run.return_value = MagicMock(value='done')
             mock_wf.metrics = MagicMock(
@@ -315,7 +315,7 @@ class TestRecoverCrashedTasks:
         sem = MagicMock()
         sem.release = MagicMock()
 
-        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = AsyncMock()
             mock_wf.run.return_value = MagicMock(value='done')
             mock_wf.metrics = MagicMock(
@@ -400,7 +400,7 @@ class TestRecoverCrashedTasks:
         sem = MagicMock()
         sem.release = MagicMock()
 
-        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = AsyncMock()
             mock_wf.run.return_value = MagicMock(value='done')
             mock_wf.metrics = MagicMock(

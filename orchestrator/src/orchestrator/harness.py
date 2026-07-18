@@ -93,7 +93,7 @@ from orchestrator.task_status import (
     is_infra_held,
 )
 from orchestrator.usage_gate import UsageGate
-from orchestrator.workflow import TaskWorkflow, TerminalReport, WorkflowOutcome
+from orchestrator.workflow import TerminalReport, WorkflowOutcome, build_workflow
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 if TYPE_CHECKING:
@@ -5828,7 +5828,7 @@ task, include it with an empty "files" list rather than omitting it.
                 )
             # ────────────────────────────────────────────────────────────────
 
-            workflow = TaskWorkflow(
+            workflow = build_workflow(
                 assignment=assignment,
                 config=self.config,
                 git_ops=self.git_ops,

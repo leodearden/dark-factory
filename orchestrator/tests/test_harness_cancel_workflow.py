@@ -190,7 +190,7 @@ async def test_run_slot_returns_cancelled_report_when_hard_cancelled(
     # main loop).  _run_slot's finally calls sem.release() → value becomes 1.
     sem = asyncio.Semaphore(0)
 
-    with patch('orchestrator.harness.TaskWorkflow') as mock_wf_cls:
+    with patch('orchestrator.harness.build_workflow') as mock_wf_cls:
         # Stub workflow.run() to wedge until hard-cancelled.
         async def _wedge() -> None:
             await asyncio.sleep(3600)
@@ -271,7 +271,7 @@ async def test_run_slot_clears_stale_grace_stamp_at_dispatch(
     assignment = TaskAssignment(task_id=tid, task={'title': 't'}, modules=[])
     sem = asyncio.Semaphore(0)
 
-    with patch('orchestrator.harness.TaskWorkflow') as mock_wf_cls:
+    with patch('orchestrator.harness.build_workflow') as mock_wf_cls:
         async def _wedge() -> None:
             await asyncio.sleep(3600)
 

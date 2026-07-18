@@ -921,7 +921,7 @@ class TestRunSlotSubstrateGateWiring:
         sem = MagicMock()
         sem.release = MagicMock()
 
-        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             MockWorkflow.return_value = _make_mock_workflow()
             await h._run_slot(assignment, sem)
 
@@ -952,7 +952,7 @@ class TestRunSlotSubstrateGateWiring:
         sem = MagicMock()
         sem.release = MagicMock()
 
-        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
             await h._run_slot(assignment, sem)
@@ -977,7 +977,7 @@ class TestRunSlotSubstrateGateWiring:
         sem = MagicMock()
         sem.release = MagicMock()
 
-        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
             await h._run_slot(assignment, sem)
@@ -1057,7 +1057,7 @@ class TestRunSlotSubstrateFailClosed:
         proc_mock = AsyncMock(return_value=_fake_proc(0))
         with (
             patch('asyncio.create_subprocess_exec', proc_mock),
-            patch('orchestrator.harness.TaskWorkflow') as MockWorkflow,
+            patch('orchestrator.harness.build_workflow') as MockWorkflow,
         ):
             MockWorkflow.return_value = _make_mock_workflow()
             await h._run_slot(assignment, sem)
@@ -1115,7 +1115,7 @@ class TestRunSlotSubstrateFailClosed:
         proc_mock = AsyncMock(return_value=_fake_proc(0))
         with (
             patch('asyncio.create_subprocess_exec', proc_mock),
-            patch('orchestrator.harness.TaskWorkflow') as MockWorkflow,
+            patch('orchestrator.harness.build_workflow') as MockWorkflow,
         ):
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf

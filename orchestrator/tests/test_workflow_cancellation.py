@@ -918,7 +918,7 @@ class TestHarnessSyntheticCancelRetirement:
         )
         sem = asyncio.Semaphore(0)
 
-        with patch('orchestrator.harness.TaskWorkflow') as mock_wf_cls:
+        with patch('orchestrator.harness.build_workflow') as mock_wf_cls:
             async def _wedge() -> None:
                 await asyncio.sleep(3600)
 
