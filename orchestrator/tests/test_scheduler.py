@@ -26,6 +26,7 @@ from orchestrator.scheduler import (
     ExternalResolverError,
     ModuleLockTable,
     Scheduler,
+    TickContext,
     files_to_modules,
     normalize_lock,
 )
@@ -12613,3 +12614,145 @@ class TestAcquireNextAlreadyLandedGate:
         assert result is not None, 'a raising consult must fail open, not withhold dispatch'
         assert result.task_id == 'Z'
         assert 'Z' in scheduler._dispatched
+
+
+class TestExternalDepEscalationSurvivesTransientAbsence:
+    """End-to-end regression (task 2746, follow-up to 2743).
+
+    The two ESCALATING external-dep streaks (``external_unresolved`` /
+    ``resolver_degraded``) must survive a still-pending dependent's transient
+    one-tick drop-out of the active-only fetch (the merge/reconcile churn that
+    coincides with a main advance). Pre-fix, the intervening ``_phase_stale_sweep``
+    GC'd the grace streak on that transient absence, so it never reached
+    ``max_external_dep_unresolved_cycles`` and the born-at-L2 escalation never
+    fired (RED). Post-fix (task 2746 extended the ``overrides`` narrowing to
+    these two counters) the streak survives the one-tick disappearance and
+    fires exactly once at threshold (GREEN).
+
+    Drives the REAL per-tick phase order — ``_phase_stale_sweep`` then
+    ``_phase_external_dep_policy`` — across a present/present/absent/present tick
+    sequence with ``get_external_statuses`` mocked and the escalation callback
+    wired via ``dataclasses.replace``. Colocated with the sibling external-dep
+    escalation suites (TestApplyExternalDepPolicyUnresolved,
+    TestExternalDepResolverDegradedEscalation) whose fixtures/patterns it reuses.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(
+            max_per_module=1,
+            max_external_dep_unresolved_cycles=3,  # default threshold
+        )
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
+
+    def _pending_task(self) -> dict:
+        return {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+
+    @pytest.mark.asyncio
+    async def test_sentinel_escalation_survives_transient_absence(
+        self, scheduler: Scheduler
+    ):
+        """external_unresolved streak (sentinel dep → dependency_discovered)
+        survives a one-tick absence and still fires at threshold."""
+        callback = AsyncMock()
+        scheduler._callbacks = dataclasses.replace(
+            scheduler._callbacks, on_external_dep_block=callback
+        )
+        scheduler.get_external_statuses = AsyncMock(
+            return_value=({'dark_factory:5': 'unknown_task'}, None)
+        )
+        task = self._pending_task()
+
+        async def _tick(*, present: bool) -> None:
+            if present:
+                # Model the real tick's _update_age_anchors: the pending-age
+                # anchor is stamped every tick the dependent appears in the
+                # fetch, so the ONE absent tick exercises the stale_sweep
+                # absence-GC path under test.
+                scheduler._pending_anchor['10'] = 10
+                ctx = TickContext(
+                    tasks=[task],
+                    status_map={'10': 'pending'},
+                    tasks_by_id={'10': task},
+                )
+            else:
+                # '10' transiently drops out of the active-only fetch: absent
+                # from ctx.tasks AND tasks_by_id, non-terminal, still tracked
+                # via the anchor stamped on the prior tick.
+                ctx = TickContext(tasks=[], status_map={}, tasks_by_id={})
+            await scheduler._phase_stale_sweep(ctx)
+            await scheduler._phase_external_dep_policy(ctx)
+
+        await _tick(present=True)   # sentinel -> streak 1
+        await _tick(present=True)   # sentinel -> streak 2
+        callback.assert_not_called()
+        assert scheduler._streak_external_unresolved.value(('10', 'dark_factory:5')) == 2
+
+        # Transient absence coinciding with a main advance: stale_sweep runs,
+        # the gate can't bump an absent task. The grace streak must FREEZE at 2.
+        await _tick(present=False)
+        assert scheduler._streak_external_unresolved.value(('10', 'dark_factory:5')) == 2
+        callback.assert_not_called()
+
+        await _tick(present=True)   # sentinel -> streak 3 -> ESCALATE
+
+        callback.assert_called_once()
+        call = callback.call_args
+        assert call.args[0] == '10'
+        assert 'EXTERNAL_DEP_UNRESOLVED' in call.kwargs['summary']
+        assert call.kwargs['category'] == 'dependency_discovered'
+
+    @pytest.mark.asyncio
+    async def test_resolver_degraded_escalation_survives_transient_absence(
+        self, scheduler: Scheduler
+    ):
+        """resolver_degraded streak (resolver error → infra_issue) survives a
+        one-tick absence and still fires at threshold."""
+        callback = AsyncMock()
+        scheduler._callbacks = dataclasses.replace(
+            scheduler._callbacks, on_external_dep_block=callback
+        )
+        scheduler.get_external_statuses = AsyncMock(
+            return_value=({}, ExternalResolverError('degraded'))
+        )
+        task = self._pending_task()
+
+        async def _tick(*, present: bool) -> None:
+            if present:
+                scheduler._pending_anchor['10'] = 10
+                ctx = TickContext(
+                    tasks=[task],
+                    status_map={'10': 'pending'},
+                    tasks_by_id={'10': task},
+                )
+            else:
+                ctx = TickContext(tasks=[], status_map={}, tasks_by_id={})
+            await scheduler._phase_stale_sweep(ctx)
+            await scheduler._phase_external_dep_policy(ctx)
+
+        await _tick(present=True)   # degraded -> streak 1
+        await _tick(present=True)   # degraded -> streak 2
+        callback.assert_not_called()
+        assert scheduler._streak_resolver_degraded.value('10') == 2
+
+        # Transient absence: on an absent tick there are no pending ext-dep
+        # tasks, so get_external_statuses is never called (no error surfaced)
+        # and the policy is a no-op. The degraded streak must FREEZE at 2.
+        await _tick(present=False)
+        assert scheduler._streak_resolver_degraded.value('10') == 2
+        callback.assert_not_called()
+
+        await _tick(present=True)   # degraded -> streak 3 -> ESCALATE
+
+        callback.assert_called_once()
+        call = callback.call_args
+        assert call.args[0] == '10'
+        assert 'EXTERNAL_DEP_RESOLVER_DEGRADED' in call.kwargs['summary']
+        assert call.kwargs['category'] == 'infra_issue'

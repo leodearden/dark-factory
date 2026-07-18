@@ -5267,13 +5267,22 @@ class Scheduler:
         ``self._streak_registry.gc`` — CONSUMED here, not re-collapsed
         into a hand loop — unioning in tasks that left the candidate pool
         for a non-terminal, non-eligible status (starvation-only sweep
-        set). The two delivered-check streaks (``delivered_fail`` /
-        ``delivered_hold``) are NARROWED via ``overrides`` to sweep ONLY on
-        genuinely-terminal dependents (``terminal_ids``), NOT on transient
-        active-fetch absence — so a still-pending gate-held dependent's
-        grace/hold streak survives a one-tick disappearance around a main
-        advance and can still reach ``grace_cycles`` and fire the born-at-L2
-        escalation (task 2743). Always continues.
+        set). The FOUR *escalating* streaks — the two delivered-check
+        streaks (``delivered_fail`` / ``delivered_hold``, task 2743) plus
+        the two external-dep streaks (``external_unresolved`` /
+        ``resolver_degraded``, task 2746) — are NARROWED via ``overrides``
+        to sweep ONLY on genuinely-terminal dependents (``terminal_ids``),
+        NOT on transient active-fetch absence — so a still-pending
+        gate-held dependent's grace streak survives a one-tick
+        disappearance around a main advance and can still reach its
+        clear-then-fire threshold and emit the born-at-L2 escalation. The
+        two NON-escalating external-dep streaks — ``hold`` (visibility-only
+        ``external_dep_gate_held`` events) and ``local_backfill``
+        (``logger.warning`` only) — are deliberately LEFT on the broad
+        terminal-or-absent ``stale_ids`` sweep: neither has a born-at-L2
+        escalation that a transient-absence reset could permanently
+        suppress, so narrowing them would only keep their counters alive
+        unnecessarily. Always continues.
         """
         stale_ids: set[str] = set()
         terminal_ids: set[str] = set()
@@ -5298,30 +5307,42 @@ class Scheduler:
             tid for tid in self._starvation_escalated
             if ctx.status_map.get(tid) in _STARVATION_NON_ELIGIBLE
         }
-        # The delivered-check streaks are GC'd ONLY on genuinely-terminal
-        # dependents (terminal_ids ⊆ stale_ids), never on transient
-        # active-fetch absence — so a still-pending gate-held dependent's
-        # grace/hold streak survives a one-tick disappearance around a main
-        # advance and can still reach grace_cycles (task 2743). Every other
-        # counter keeps the base terminal-or-absent stale_ids sweep.
+        # The FOUR escalating streaks — delivered_fail/delivered_hold
+        # (task 2743) and external_unresolved/resolver_degraded (task 2746)
+        # — are GC'd ONLY on genuinely-terminal dependents (terminal_ids ⊆
+        # stale_ids), never on transient active-fetch absence — so a
+        # still-pending gate-held dependent's grace streak survives a
+        # one-tick disappearance around a main advance and can still reach
+        # its clear-then-fire threshold. The two NON-escalating external-dep
+        # streaks — hold (visibility-only external_dep_gate_held events) and
+        # local_backfill (logger.warning only) — are deliberately LEFT on
+        # the base terminal-or-absent stale_ids sweep: neither escalates, so
+        # a transient-absence reset suppresses nothing worth protecting, and
+        # narrowing them would only keep their counters alive unnecessarily.
         #
-        # Accepted trade-off (task 2743): because these two streaks no longer
-        # sweep on the absent-from-tasks_by_id path, a non-terminal dependent
-        # that is *permanently* removed from the DB (deleted while gate-held,
-        # never reaching a terminal status in status_map) leaves its
-        # delivered_fail/delivered_hold int behind here. That entry is bounded
-        # — once the dependent is gone the gate phase stops bumping it, so it
-        # can't grow — and this sqlite-rowid scheme doesn't reuse task ids, so
-        # a stale key is never re-associated with a new task. We deliberately
-        # keep the leak (a negligible, frozen int per genuinely-vanished
-        # dependent) rather than reinstate the absent-path sweep, which would
-        # re-open the transient-absence reset this fix exists to close. The
-        # direction is fail-safe: it can only preserve a streak, never
-        # suppress a pending dependent's grace_cycles escalation.
+        # Accepted trade-off (tasks 2743/2746): because the four narrowed
+        # streaks no longer sweep on the absent-from-tasks_by_id path, a
+        # non-terminal dependent that is *permanently* removed from the DB
+        # (deleted while gate-held, never reaching a terminal status in
+        # status_map) leaves its delivered_fail/delivered_hold/
+        # external_unresolved/resolver_degraded int behind here. That entry
+        # is bounded — once the dependent is gone the gate phase stops
+        # bumping it, so it can't grow — and this sqlite-rowid scheme doesn't
+        # reuse task ids, so a stale key is never re-associated with a new
+        # task. We deliberately keep the leak (a negligible, frozen int per
+        # genuinely-vanished dependent) rather than reinstate the absent-path
+        # sweep, which would re-open the transient-absence reset this fix
+        # exists to close. The direction is fail-safe: it can only preserve a
+        # streak, never suppress a pending dependent's threshold escalation.
         await self._streak_registry.gc(
             stale_ids,
             extra={'starvation': starvation_non_eligible},
-            overrides={'delivered_fail': terminal_ids, 'delivered_hold': terminal_ids},
+            overrides={
+                'delivered_fail': terminal_ids,
+                'delivered_hold': terminal_ids,
+                'external_unresolved': terminal_ids,
+                'resolver_degraded': terminal_ids,
+            },
         )
         ctx.stale_ids = stale_ids
         return _CONTINUE

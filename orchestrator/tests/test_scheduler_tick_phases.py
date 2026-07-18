@@ -164,6 +164,72 @@ class TestHygienePhases:
         assert '11' not in scheduler._pending_anchor
 
     @pytest.mark.asyncio
+    async def test_phase_stale_sweep_protects_external_streaks_on_transient_absence(
+        self, scheduler: Scheduler
+    ):
+        """The two ESCALATING external-dep streaks (external_unresolved,
+        resolver_degraded) must survive a still-pending dependent's transient
+        drop-out of the active-only fetch (absent from tasks_by_id, non-terminal
+        status) — otherwise the clear-then-fire born-at-L2 escalation never
+        reaches its threshold (task 2746, mirroring 2743). The two NON-escalating
+        streaks (hold, local_backfill) are deliberately left on the broad
+        stale_ids sweep and still GC on absence (over-narrowing guard).
+        """
+        # The two escalating external-dep streaks for dependent '10'.
+        scheduler._streak_external_unresolved.counts[('10', 'dark_factory:5')] = 2
+        scheduler._streak_resolver_degraded.counts['10'] = 2
+        # Over-narrowing guards: the two non-escalating streaks for the same
+        # dependent — these must STILL be swept on the base stale_ids path.
+        scheduler._streak_hold.counts['10'] = 2
+        scheduler._streak_local_backfill.counts[('10', '9')] = 2
+        # '10' is tracked (pending-age anchor) but drops out of the fetch.
+        scheduler._pending_anchor['10'] = 10
+
+        ctx = TickContext(
+            tasks=[],
+            status_map={'10': 'pending'},  # NON-terminal
+            tasks_by_id={},  # ABSENT — the transient active-fetch churn
+        )
+        result = await scheduler._phase_stale_sweep(ctx)
+
+        assert result is _CONTINUE
+        # Escalating streaks SURVIVE the transient absence (the fix).
+        assert scheduler._streak_external_unresolved.value(('10', 'dark_factory:5')) == 2
+        assert scheduler._streak_resolver_degraded.value('10') == 2
+        # Non-escalating streaks are still swept (base stale_ids path unchanged).
+        assert scheduler._streak_hold.value('10') == 0
+        assert scheduler._streak_local_backfill.value(('10', '9')) == 0
+        # Bookkeeping cleanup preserved — '10' is still stale-swept.
+        assert '10' in ctx.stale_ids
+        assert '10' not in scheduler._pending_anchor
+
+    @pytest.mark.asyncio
+    async def test_phase_stale_sweep_still_gcs_external_streaks_on_terminal_status(
+        self, scheduler: Scheduler
+    ):
+        """A genuinely-terminal dependent's escalating external-dep streaks ARE
+        still GC'd — the protection is narrowed to non-terminal transient
+        absence, not a blanket exemption, so there's no leak on real completion
+        (task 2746)."""
+        scheduler._streak_external_unresolved.counts[('11', 'dark_factory:5')] = 2
+        scheduler._streak_resolver_degraded.counts['11'] = 2
+        scheduler._pending_anchor['11'] = 11
+
+        ctx = TickContext(
+            tasks=[],
+            status_map={'11': 'done'},  # genuinely TERMINAL
+            tasks_by_id={},  # absent from the active fetch
+        )
+        result = await scheduler._phase_stale_sweep(ctx)
+
+        assert result is _CONTINUE
+        # Terminal → still cleaned up (no leak on genuine completion).
+        assert scheduler._streak_external_unresolved.value(('11', 'dark_factory:5')) == 0
+        assert scheduler._streak_resolver_degraded.value('11') == 0
+        assert '11' in ctx.stale_ids
+        assert '11' not in scheduler._pending_anchor
+
+    @pytest.mark.asyncio
     async def test_phase_cooldown_gc_drops_expired(self, scheduler: Scheduler):
         scheduler._requeue_until['A'] = scheduler._time_source() - 1.0
 
