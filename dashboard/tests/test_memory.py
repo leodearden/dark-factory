@@ -265,6 +265,58 @@ class TestMcpToolCall:
         )
 
 
+# ── client_op_id injection (twin of orchestrator McpSession) ────
+
+
+class TestDashboardClientOpIdInjection:
+    """The dashboard McpSession twin injects a client_op_id for mutating task
+    tools, mirroring the orchestrator (task 2712). Inert today (the dashboard
+    issues only reads) but keeps the two twins from diverging and is write-safe
+    by construction if the dashboard ever gains a mutating call.
+    """
+
+    async def test_injects_client_op_id_for_mutating_tool(self):
+        from dashboard.data.memory import McpSession
+
+        session = McpSession('http://localhost:8000')
+        resp = _make_mcp_response({'ok': True})
+        # MockTransport normally attaches the request; set it here since we
+        # bypass the transport and return the response from a mocked client.
+        resp.request = httpx.Request('POST', 'http://localhost:8000/mcp')
+        mock_client = AsyncMock()
+        mock_client.post.return_value = resp
+
+        await session._raw_call(
+            mock_client, 'tools/call',
+            {'name': 'update_task', 'arguments': {'id': '1'}},
+        )
+
+        posted = mock_client.post.call_args.kwargs['json']
+        op_id = posted['params']['arguments'].get('client_op_id')
+        assert isinstance(op_id, str) and op_id, (
+            'a mutating tool call must get a non-empty client_op_id injected'
+        )
+
+    async def test_no_injection_for_read_tool(self):
+        from dashboard.data.memory import McpSession
+
+        session = McpSession('http://localhost:8000')
+        resp = _make_mcp_response({'ok': True})
+        resp.request = httpx.Request('POST', 'http://localhost:8000/mcp')
+        mock_client = AsyncMock()
+        mock_client.post.return_value = resp
+
+        await session._raw_call(
+            mock_client, 'tools/call',
+            {'name': 'get_status', 'arguments': {}},
+        )
+
+        posted = mock_client.post.call_args.kwargs['json']
+        assert 'client_op_id' not in posted['params']['arguments'], (
+            'read tools must not get a client_op_id injected'
+        )
+
+
 # ── SSE response parsing ───────────────────────────────────────
 
 
